@@ -621,6 +621,34 @@ fn daemon_resources_are_keyboard_browsable_and_copy_exact_json(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
+fn the_fitted_footer_wraps_status_text_at_200_percent(cx: &mut TestAppContext) {
+    let size = size(px(1100.), px(720.));
+    let (handle, shell) = open(cx, size, 4, 120);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Whole);
+        let footer = window.find("status").bounds();
+        let fixture = window.find("status-fixture").bounds();
+        let detail = window.find("status-detail").bounds();
+        for id in ["status-fixture", "status-intent", "status-detail"] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                bounds.left() >= footer.left() && bounds.right() <= footer.right(),
+                "{id}: {bounds:?}"
+            );
+            assert!(
+                bounds.top() >= footer.top() && bounds.bottom() <= footer.bottom(),
+                "{id}: {bounds:?}"
+            );
+        }
+        assert!(detail.top() >= fixture.bottom());
+        assert!(footer.bottom() <= size.height);
+        assert!(window.find_by_label("Message").visible());
+    });
+}
+
+#[gpui_kit::test]
 fn daemon_resource_error_and_status_reflow_at_200_percent(cx: &mut TestAppContext) {
     use formless_desktop::client::Update;
     let (handle, shell) = open(cx, size(px(480.), px(360.)), 0, 0);
@@ -7322,6 +7350,44 @@ fn native_find_shortcut_keeps_modals_and_composition_owned_by_the_current_contro
             .marked_text_range(window, cx)
             .is_some()));
         assert!(shell.read(cx).last_intent().is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn composer_escape_cancels_replaced_preedit_without_an_undo_entry(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 4, 8);
+    let draft = "👩🏽‍💻 left ไทย right";
+    let selection = "👩🏽‍💻 left ".len().."👩🏽‍💻 left ไทย".len();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input(draft, cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let composer = shell.read(cx).composer().clone();
+        composer.update(cx, |input, cx| {
+            input.set_selected_range_with_direction(selection.clone(), true, cx);
+        });
+        let bounds = window.find_by_label("Message").bounds();
+        let mut input = TestInput::new(ElementInputHandler::new(bounds, composer.clone()), window);
+        input.compose_text(None, "´", None, cx);
+        input.compose_text(None, "にほん", None, cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "👩🏽‍💻 left にほん right");
+        window.press("escape", cx);
+        assert!(composer.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_none()));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
+        assert_eq!(composer.read(cx).selected_range(), selection);
+        assert!(composer.read(cx).is_selection_reversed());
+        assert!(gpui_kit::Focusable::focus_handle(&composer, cx).is_focused(window));
+        window.press("escape", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
+        assert!(shell.read(cx).last_intent().is_none());
+        window.press(&chord("z"), cx);
+        assert!(shell.read(cx).draft(cx).is_empty());
+        window.press(&chord("shift-z"), cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
     });
 }
 

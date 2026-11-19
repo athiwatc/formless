@@ -20,7 +20,7 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     h_flex, v_flex, v_virtual_list, ActiveTheme as _, Disableable as _, FocusTrapElement as _,
-    Selectable as _, Sizable as _, Theme, ThemeMode, VirtualListScrollHandle,
+    RopeExt as _, Selectable as _, Sizable as _, Theme, ThemeMode, VirtualListScrollHandle,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -86,6 +86,7 @@ gpui_kit::actions!(
         ShowCommands,
         FindLoadedText,
         ComposerModifiedEnter,
+        ComposerCancelComposition,
         SelectPreviousCommand,
         SelectNextCommand,
         RunSelectedCommand,
@@ -226,6 +227,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             commands::composer_submit_key(),
             ComposerModifiedEnter,
+            Some("FormlessComposer > Input"),
+        ),
+        KeyBinding::new(
+            "escape",
+            ComposerCancelComposition,
             Some("FormlessComposer > Input"),
         ),
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
@@ -1272,6 +1278,40 @@ impl Shell {
             }
         });
         cx.notify();
+    }
+
+    fn cancel_composer_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.destination != Destination::Chat
+            || self.background_inert(window)
+            || !self.composer.focus_handle(cx).contains_focused(window, cx)
+        {
+            return false;
+        }
+        let accepted = self.accepted_draft.clone();
+        self.composer
+            .update(cx, |composer, cx| {
+                let marked = composer.marked_text_range(window, cx)?;
+                let start = composer.text().offset_utf16_to_offset(marked.start);
+                let end = composer.text().offset_utf16_to_offset(marked.end);
+                let draft = composer.value();
+                // The marked range owns only the changed middle. Restore it
+                // inside the open composition transaction, so a canceled
+                // edit cannot appear in the undo history.
+                let original = accepted
+                    .strip_prefix(draft.get(..start)?)?
+                    .strip_suffix(draft.get(end..)?)?;
+                let reversed = composer
+                    .selected_text_range(false, window, cx)
+                    .is_some_and(|selection| selection.reversed);
+                composer.replace_text_in_range(Some(marked), original, window, cx);
+                composer.set_selected_range_with_direction(
+                    start..start + original.len(),
+                    reversed,
+                    cx,
+                );
+                Some(())
+            })
+            .is_some()
     }
 
     /// Runs whenever the composer changes, whatever path the text came by.
@@ -6081,12 +6121,14 @@ impl Shell {
         } else {
             status
                 .items_center()
-                .h(self.scaled(STATUS_HEIGHT))
-                .gap_3()
-                .child(fixture)
-                .child(intent)
+                .min_h(self.scaled(STATUS_HEIGHT))
+                .flex_wrap()
+                .gap_x_3()
+                .gap_y_1()
+                .child(fixture.min_w_0().max_w_full())
+                .child(intent.min_w_0().max_w_full())
                 .child(div().flex_1())
-                .child(readable("status-detail", detail))
+                .child(readable("status-detail", detail).min_w_0().max_w_full())
         }
     }
 
@@ -6228,6 +6270,13 @@ impl Render for Shell {
                     );
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &ComposerCancelComposition, window, cx| {
+                    if !this.cancel_composer_composition(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &FindLoadedText, window, cx| {
                     this.find_loaded_text(window, cx)
