@@ -1650,9 +1650,19 @@
         continue;
       }
       if (L.q.includes(c)) {
-        let j = i + 1;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || c === "`")) j += code[j] === "\\" ? 2 : 1;
-        const stop = Math.min(j + 1, code.length);
+        const multiline = lang === "toml" && code.startsWith(c.repeat(3), i);
+        const delimiter = multiline ? c.repeat(3) : c;
+        const escapes = lang !== "toml" || c !== "'";
+        let j = i + delimiter.length;
+        while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || c === "`" || multiline)) {
+          j += code[j] === "\\" && escapes ? 2 : 1;
+        }
+        let stop = Math.min(j + delimiter.length, code.length);
+        // Include up to two quotes immediately before the TOML closing delimiter.
+        if (multiline) {
+          const trailing = stop + 2;
+          while (stop < trailing && code[stop] === c) stop++;
+        }
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;

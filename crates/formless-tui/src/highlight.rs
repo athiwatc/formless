@@ -297,6 +297,10 @@ const CONFIG: Lang = Lang {
     raw_strings: false,
     regex: false,
 };
+const TOML: Lang = Lang {
+    multiline: &["\"\"\"", "'''"],
+    ..CONFIG
+};
 /// INI and properties: `;` comments too.
 const INI: Lang = Lang {
     line_comments: &["#", ";"],
@@ -446,7 +450,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "php" | "zig" | "objc" => &C_LIKE,
         "lua" | "haskell" | "hs" => &SQL_DASH,
         "json" | "jsonc" | "json5" => &JSON,
-        "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
+        "yaml" | "yml" | "env" | "dotenv" => &CONFIG,
+        "toml" => &TOML,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
         "sql" | "sqlite" | "postgres" | "postgresql" | "mysql" => &SQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
@@ -472,6 +477,7 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    toml_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -591,6 +597,7 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            toml_strings: name == "toml",
             color,
             in_block: 0,
             in_str: None,
@@ -616,6 +623,7 @@ impl Highlighter {
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
+        let toml = self.toml_strings;
         let chars: Vec<char> = line.chars().collect();
         let at = |i: usize, pat: &str| {
             (i..)
@@ -635,7 +643,7 @@ impl Highlighter {
         };
         let mut i = 0;
         // Config keys: `  name:` / `name =` at line start.
-        if let Some(sep) = l.key_sep {
+        if let Some(sep) = l.key_sep.filter(|_| self.in_str.is_none()) {
             let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
             let end = (lead..chars.len()).find(|&j| chars[j] == sep || chars[j] == '=');
             if let Some(end) = end {
@@ -654,14 +662,26 @@ impl Highlighter {
         // Where the string closed by `close` ends, scanning from `from`:
         // just past the delimiter, or None when it runs past the line.
         let close_at = |from: usize, close: &str| -> Option<usize> {
+            let escapes = !(l.raw_strings || toml && close.starts_with('\''));
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' {
+                if chars[j] == '\\' && escapes {
                     j += 2;
                     continue;
                 }
                 if at(j, close) {
-                    return Some(j + close.chars().count());
+                    let end = j + close.chars().count();
+                    // TOML allows up to two quotes before the closing delimiter.
+                    let trailing = if toml {
+                        chars[end..]
+                            .iter()
+                            .take(2)
+                            .take_while(|&&c| c == chars[j])
+                            .count()
+                    } else {
+                        0
+                    };
+                    return Some(end + trailing);
                 }
                 j += 1;
             }
@@ -669,14 +689,7 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
-                // Raw strings (`"#…` closers) have no escapes.
-                let stop = if l.raw_strings {
-                    (i..chars.len())
-                        .find(|&j| at(j, &close))
-                        .map(|j| j + close.chars().count())
-                } else {
-                    close_at(i, &close)
-                };
+                let stop = close_at(i, &close);
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_some() {
                     self.in_str = None;
@@ -853,7 +866,11 @@ impl Highlighter {
             if l.quotes.contains(&c) {
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
-                    j += if chars[j] == '\\' { 2 } else { 1 };
+                    j += if chars[j] == '\\' && !(toml && c == '\'') {
+                        2
+                    } else {
+                        1
+                    };
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
@@ -1286,6 +1303,36 @@ mod tests {
         h.line(line)
             .iter()
             .all(|s| s.style.fg == Some(Color::Green))
+    }
+
+    #[test]
+    fn toml_multiline_strings_keep_hashes_and_keys_until_the_closer() {
+        for (delimiter, middle, closing) in [
+            ("\"\"\"", r#"\""" keep # escaped quote"#, "\"\"\"\"\""),
+            ("'''", "keep # literal", "\\'''''"),
+        ] {
+            let mut h = Highlighter::new("TOML", true).unwrap();
+            h.line(&format!("text = {delimiter}"));
+            for source in [middle, "name = not a key", "# still content"] {
+                let spans = h.line(source);
+                assert_eq!(spans.len(), 1, "{spans:?}");
+                assert_eq!(spans[0].content, source);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+            }
+            let spans = h.line(&format!("{closing} # outside"));
+            assert_eq!(spans[0].content, closing);
+            assert_eq!(spans[0].style.fg, Some(Color::Green));
+            assert_eq!(spans.last().unwrap().content, "# outside");
+            assert_eq!(spans.last().unwrap().style.fg, Some(Color::DarkGray));
+            let next = h.line("name = \"formless\" # comment");
+            assert!(next
+                .iter()
+                .any(|s| s.content.trim_end() == "name" && s.style.fg == Some(Color::Blue)));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "\"formless\"" && s.style.fg == Some(Color::Green)));
+            assert_eq!(next.last().unwrap().style.fg, Some(Color::DarkGray));
+        }
     }
 
     /// Strings that run across lines stay strings until they close (#876).
