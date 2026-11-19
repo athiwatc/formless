@@ -190,7 +190,7 @@ fn fixture_roots_with_the_same_timestamp_are_distinct() {
         create_fixture_root(&parent.0, 0)
     };
     let (first, second) = std::thread::scope(|scope| {
-        let first = scope.spawn(&allocate);
+        let first = scope.spawn(allocate);
         let second = allocate();
         (first.join().unwrap(), second)
     });
