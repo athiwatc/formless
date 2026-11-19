@@ -31,7 +31,7 @@ use gpui_kit::{
 };
 
 use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpdate};
-use crate::commands::{self, Command};
+use crate::commands::{self, Command, HistoryMove};
 use crate::directory::{self, Directory};
 use crate::forecast;
 mod approval_review;
@@ -128,6 +128,8 @@ const QUESTIONS_CONTEXT: &str = "FormlessQuestions";
 const SESSION_EDITOR_CONTEXT: &str = "FormlessSessionEditor";
 const QUESTIONS_READ_CONTEXT: &str = "FormlessQuestions && !Input";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
+const TRANSCRIPT_CONTEXT: &str = "FormlessTranscript";
+const TRANSCRIPT_KEYS: &str = "FormlessTranscript && !FormlessComposer && !Input";
 const RESOURCE_CONTEXT: &str = "FormlessResource";
 const VIEWER_DESCRIPTION: &str =
     "Modal. The whole block as plain text. Tab reaches the summary and controls. \
@@ -200,6 +202,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::ToggleEnterSends
                 | Command::SaveDesktopPreferences
                 | Command::ReloadDesktopPreferences
+                | Command::MoveHistory(_)
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
     });
@@ -383,6 +386,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", ScrollViewerStart, Some(VIEWER_CONTEXT)),
         KeyBinding::new("end", ScrollViewerEnd, Some(VIEWER_CONTEXT)),
         KeyBinding::new("escape", CloseViewer, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("up", ScrollViewerUp, Some(TRANSCRIPT_KEYS)),
+        KeyBinding::new("down", ScrollViewerDown, Some(TRANSCRIPT_KEYS)),
+        KeyBinding::new("home", ScrollViewerStart, Some(TRANSCRIPT_KEYS)),
+        KeyBinding::new("end", ScrollViewerEnd, Some(TRANSCRIPT_KEYS)),
         KeyBinding::new("down", ResourceNext, Some(RESOURCE_CONTEXT)),
         KeyBinding::new("up", ResourcePrevious, Some(RESOURCE_CONTEXT)),
     ]);
@@ -1090,6 +1097,7 @@ impl Shell {
             commands: commands::State {
                 composer: ComposerActions::for_state(RunState::Idle, true),
                 has_composer: true,
+                has_history: false,
                 can_recover: false,
                 can_questions: false,
                 can_approvals: false,
@@ -3195,6 +3203,7 @@ impl Shell {
         commands::State {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
+            has_history: self.timeline.read(cx).item_count() > 0,
             can_recover: self.client_connected
                 && self.client_snapshot_ready
                 && self
@@ -3336,6 +3345,9 @@ impl Shell {
         {
             return Some("Close the open dialog before opening Session details");
         }
+        if matches!(command, Command::MoveHistory(_)) && self.background_inert(window) {
+            return Some("Close the open dialog before navigating the transcript");
+        }
         let state = self.command_state(window, cx);
         if let Some(reason) = commands::entry(command, &state).disabled_reason {
             // Other refusals are as silent as they always were, but a
@@ -3351,6 +3363,8 @@ impl Shell {
                     format!("Model / Role: {reason}.").into()
                 } else if command == Command::SessionPendingFiles {
                     format!("Pending files: {reason}.").into()
+                } else if matches!(command, Command::MoveHistory(_)) {
+                    format!("Transcript navigation: {reason}.").into()
                 } else {
                     format!("Not sent: {reason}.").into()
                 });
@@ -3370,6 +3384,7 @@ impl Shell {
             Command::SessionPendingFiles => {
                 self.open_session_editor(SessionEditorStart::PendingFiles, window, cx)
             }
+            Command::MoveHistory(direction) => self.move_history(direction, cx),
             Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
@@ -4388,12 +4403,46 @@ impl Shell {
                     .children(below)
                     .into_any_element()
             }
+        })
+        .with_jump_button_renderer({
+            let shell = cx.entity().downgrade();
+            let generation = self.composer_generation;
+            move |button| {
+                button
+                    .accessibility_label("Jump to latest")
+                    .on_click(move |_, window, cx| {
+                        let _ = shell.update(cx, |this, cx| {
+                            if this.composer_generation == generation
+                                && this
+                                    .run_command(Command::MoveHistory(HistoryMove::Latest), window, cx)
+                                    .is_none()
+                            {
+                                // The transient button disappears at the tail.
+                                this.focus_section(PageSection::Conversation, window, cx);
+                            }
+                        });
+                    })
+            }
         });
         v_flex()
             .id("region-conversation")
             .test_support()
             .role(Role::Main)
             .aria_label("Conversation")
+            .aria_description("With Conversation focused, Up and Down move between messages. Home moves to the first message, and End returns to the latest.")
+            .key_context(TRANSCRIPT_CONTEXT)
+            .on_action(cx.listener(|this, _: &ScrollViewerUp, window, cx| {
+                this.move_history_from_key(HistoryMove::Older, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerDown, window, cx| {
+                this.move_history_from_key(HistoryMove::Newer, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerStart, window, cx| {
+                this.move_history_from_key(HistoryMove::First, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerEnd, window, cx| {
+                this.move_history_from_key(HistoryMove::Latest, window, cx)
+            }))
             .map(|region| inert_while(region, self.background_inert(window)))
             .track_focus(&self.conversation_focus)
             .map(|region| Self::main_size(region, page_height))

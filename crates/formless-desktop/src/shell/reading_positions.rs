@@ -1,6 +1,45 @@
 use super::*;
 
 impl Shell {
+    pub(super) fn move_history_from_key(
+        &mut self,
+        direction: HistoryMove,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversation_focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        self.run_command(Command::MoveHistory(direction), window, cx);
+    }
+
+    pub(super) fn move_history(&mut self, direction: HistoryMove, cx: &mut Context<Self>) {
+        self.timeline.update(cx, |timeline, cx| {
+            let top = timeline.logical_scroll_top();
+            match direction {
+                HistoryMove::First => {
+                    timeline.scroll_to_item(0, cx);
+                }
+                HistoryMove::Older if top.offset_in_item > px(0.) => {
+                    timeline.scroll_to_item(top.item_ix, cx);
+                }
+                HistoryMove::Older if top.item_ix > 0 => {
+                    timeline.scroll_to_item(top.item_ix - 1, cx);
+                }
+                HistoryMove::Older => {}
+                HistoryMove::Newer
+                    if timeline.is_scrolled_up() && top.item_ix + 1 < timeline.item_count() =>
+                {
+                    timeline.scroll_to_item(top.item_ix + 1, cx);
+                }
+                HistoryMove::Newer | HistoryMove::Latest => timeline.scroll_to_end(cx),
+            }
+        });
+        self.reading_notice = None;
+        cx.notify();
+    }
+
     /// Only a decoded snapshot of the Session being left can own a bookmark.
     /// Do not overwrite it when the user leaves another still-loading view.
     pub(super) fn park_reading_position(&mut self, session: &str, cx: &App) {

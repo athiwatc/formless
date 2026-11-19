@@ -77,6 +77,135 @@ fn older(shell: &Entity<Shell>, window: &mut Window, cx: &mut App) -> u64 {
     assert!(!shell.read(cx).following_latest(cx));
     message
 }
+
+#[gpui_kit::test]
+fn keyboard_history_uses_loaded_messages_without_stealing_draft_or_modal_keys(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let id = &sessions[0].id;
+        let generation = select(&shell, id, window, cx);
+        assert_eq!(
+            shell.update(cx, |shell, cx| {
+                shell.run_command(
+                    Command::MoveHistory(commands::HistoryMove::Latest),
+                    window,
+                    cx,
+                )
+            }),
+            Some("No loaded messages")
+        );
+        reply(&shell, id, generation, 1, 100, window, cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("Draft ไทย 😀", cx);
+        window.press("shift-left", cx);
+        let selection = shell.read(cx).composer_selection(cx);
+
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        for (key, top) in [("home", 1), ("up", 1), ("down", 2), ("up", 1)] {
+            window.press(key, cx);
+            settle_frames(window, cx);
+            assert_eq!(shell.read(cx).reading_message(cx), Some(top), "{key}");
+            assert!(!shell.read(cx).following_latest(cx), "{key}");
+            assert_eq!(window.find("region-conversation").focused(), Some(true));
+        }
+        assert_eq!(shell.read(cx).composer_selection(cx), selection);
+
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        settle_frames(window, cx);
+        window.press("end", cx);
+        assert_eq!(shell.read(cx).reading_message(cx), Some(1));
+        assert!(!shell.read(cx).following_latest(cx));
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        window.press("end", cx);
+        settle_frames(window, cx);
+        assert!(shell.read(cx).following_latest(cx));
+        assert!(window.try_find(("block", 100usize)).is_some());
+
+        window.press("home", cx);
+        settle_frames(window, cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.press("end", cx);
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).reading_message(cx), Some(1));
+        assert!(!shell.read(cx).following_latest(cx));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "Draft ไทย 😀");
+        assert!(shell.read(cx).last_intent().is_none());
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn keyboard_history_and_named_jump_survive_200_percent_reflow(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let id = &sessions[0].id;
+        let generation = select(&shell, id, window, cx);
+        reply(&shell, id, generation, 1, 100, window, cx);
+    });
+    cx.simulate_window_resize(handle.into(), MINIMUM);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx);
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        window.press("home", cx);
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).reading_message(cx), Some(1));
+    });
+    cx.executor().advance_clock(Duration::from_millis(250));
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(
+            window.find_by_label("Jump to latest").role(),
+            Some(Role::Button)
+        );
+        for _ in 0..40 {
+            if window.find_by_label("Jump to latest").focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find_by_label("Jump to latest").focused(), Some(true));
+        window.press("enter", cx);
+        settle_frames(window, cx);
+        assert!(shell.read(cx).following_latest(cx));
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        window.press("home", cx);
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).reading_message(cx), Some(1));
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        window.input("jump latest message", cx);
+        window.render_frame(cx);
+        assert_eq!(palette_titles(window), ["Jump to latest message"]);
+        window.press("enter", cx);
+        settle_frames(window, cx);
+        assert!(shell.read(cx).following_latest(cx));
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        assert!(window.try_find(("block", 100usize)).is_some());
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+}
+
 #[gpui_kit::test]
 fn reading_positions_restore_message_identity_after_loading_and_keep_drafts(
     cx: &mut TestAppContext,

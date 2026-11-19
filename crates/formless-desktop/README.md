@@ -457,6 +457,12 @@ copy a same-ID replacement after navigation or snapshot changes. A status
 notice confirms the clipboard write; focus and composer drafts stay in place.
 This does not provide cross-block selection or a separate code-fence copy action.
 
+With Conversation focused, Up and Down move through loaded messages, Home
+moves to the first message, and End returns to the latest and resumes following.
+The same actions are in Commands. The timeline's Jump to latest button has an
+accessible name and returns keyboard focus to Conversation when it disappears.
+These actions scroll the loaded view without fetching history or editing a draft.
+
 The text is always the
 size asked for. A window smaller than that size needs (480 x 360 times the
 size) is reflowed: every part is as wide as the window, the parts stack,

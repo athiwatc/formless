@@ -15,6 +15,14 @@
 use crate::model::{send_mode_label, ComposerActions, Destination, TextScale};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryMove {
+    First,
+    Older,
+    Newer,
+    Latest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
     /// The composer's primary action: Send, or Steer while a Run is going.
     Send,
@@ -46,6 +54,7 @@ pub enum Command {
     ResetTextSize,
     FocusNextRegion,
     FocusPreviousRegion,
+    MoveHistory(HistoryMove),
     GoTo(Destination),
     /// Open the command palette, or close it if it is open.
     ShowCommands,
@@ -85,6 +94,7 @@ pub struct State {
     pub composer: ComposerActions,
     /// Whether the open destination has a composer (only Chat does).
     pub has_composer: bool,
+    pub has_history: bool,
     /// A current, connected canonical snapshot has a recoverable last Run.
     pub can_recover: bool,
     pub can_questions: bool,
@@ -207,6 +217,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::ToggleEnterSends
         | Command::SaveDesktopPreferences
         | Command::ReloadDesktopPreferences
+        | Command::MoveHistory(_)
         | Command::GoTo(_) => &[],
     }
 }
@@ -301,6 +312,15 @@ pub fn palette(state: &State) -> Vec<Entry> {
     commands.extend(Destination::NAVIGATION.map(Command::GoTo));
     commands.push(Command::GoTo(Destination::Search));
     commands.push(Command::GoTo(Destination::ProfileSearch));
+    commands.extend(
+        [
+            HistoryMove::First,
+            HistoryMove::Older,
+            HistoryMove::Newer,
+            HistoryMove::Latest,
+        ]
+        .map(Command::MoveHistory),
+    );
     commands.extend([
         Command::FocusNextRegion,
         Command::FocusPreviousRegion,
@@ -584,6 +604,31 @@ pub fn entry(command: Command, state: &State) -> Entry {
             None,
             None,
         ),
+        Command::MoveHistory(direction) => {
+            let (label, hint) = match direction {
+                HistoryMove::First => ("First message", "Home when the Conversation is focused"),
+                HistoryMove::Older => ("Previous message", "Up when the Conversation is focused"),
+                HistoryMove::Newer => ("Next message", "Down when the Conversation is focused"),
+                HistoryMove::Latest => (
+                    "Jump to latest message",
+                    "End when the Conversation is focused and resumes following",
+                ),
+            };
+            (
+                label,
+                label.into(),
+                Group::Navigation,
+                hint,
+                None,
+                if state.destination != Destination::Chat {
+                    Some("Open Chat first")
+                } else if state.composing {
+                    Some(COMPOSING)
+                } else {
+                    (!state.has_history).then_some("No loaded messages")
+                },
+            )
+        }
         Command::GoTo(destination) => (
             destination.label(),
             format!("Go to {}", destination.label()),
@@ -632,6 +677,7 @@ mod tests {
         State {
             composer: ComposerActions::for_state(run, draft_is_empty),
             has_composer: true,
+            has_history: true,
             can_recover: false,
             can_questions: false,
             can_approvals: false,
