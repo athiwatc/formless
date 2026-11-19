@@ -1,0 +1,2013 @@
+{
+  "audit": "Pinned source collection only; no claim of complete licensing obligations, asset/stdlib audit or distribution acceptance.",
+  "cargo_lock_sha256": "56d23d7f24ad4912b77bd29c54e2ae28513f96f945df62565a73deacda60d736",
+  "packages": [
+    {
+      "files": [
+        {
+          "git_blob": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+          "local": "upstream/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "31aa79387f27e730e33d871925e152e35e428031",
+          "local": "upstream/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE-MIT"
+        },
+        {
+          "git_blob": "a32e00ce6be3620adca152e53734f7de8fda38cf",
+          "local": "upstream/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE.chromium",
+          "resolved_source": "LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "source": "LICENSE.chromium",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969/LICENSE.chromium"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "accesskit",
+      "path_in_vcs": "common",
+      "registry_checksum": "d3b7f7f85a7e5f68090000ed7622545829afd484d210358702ae4cb97dd0c320",
+      "repo": "AccessKit/accesskit",
+      "repository": "https://github.com/AccessKit/accesskit",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/AccessKit/accesskit",
+      "revision": "a55d3e1a18bb9ef0e4bccc9083fb13c3e0ad8969",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "daafa1d693ed173c378e2cfb0eb804955b9486e85d2bb7c6606cdc4b5a09dc22",
+      "version": "0.24.1"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "31aa79387f27e730e33d871925e152e35e428031",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+        },
+        {
+          "git_blob": "a32e00ce6be3620adca152e53734f7de8fda38cf",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium",
+          "resolved_source": "LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "source": "LICENSE.chromium",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "accesskit_consumer",
+      "path_in_vcs": "consumer",
+      "registry_checksum": "5d10a236f96f87d70732e44520046785431ef01d5bcd6b041317bfadd2f88245",
+      "repo": "AccessKit/accesskit",
+      "repository": "https://github.com/AccessKit/accesskit",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/AccessKit/accesskit",
+      "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "3272bb704f4ccc9eda927d7b19878684fee12ada387116f5331d1c2e6e95e892",
+      "version": "0.38.0"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "31aa79387f27e730e33d871925e152e35e428031",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE-MIT"
+        },
+        {
+          "git_blob": "a32e00ce6be3620adca152e53734f7de8fda38cf",
+          "local": "upstream/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium",
+          "resolved_source": "LICENSE.chromium",
+          "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+          "source": "LICENSE.chromium",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "accesskit_macos",
+      "path_in_vcs": "platforms/macos",
+      "registry_checksum": "ce02dc63b43f0c9296af9ac946312a2dc8814427d7a64d2d600971dac55b6076",
+      "repo": "AccessKit/accesskit",
+      "repository": "https://github.com/AccessKit/accesskit",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/AccessKit/accesskit",
+      "revision": "c88605b96d04431f9c3c792464a0f2f253480e94",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "a78a4422501108a7d1091ec6781c65b5a839a7035f18607a446ff2bf3fdce6e4",
+      "version": "0.26.3"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "block2",
+      "path_in_vcs": "crates/block2",
+      "registry_checksum": "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "b4167b582b2f75f9a1be75495c41b765344fd03c",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "5b87885cad87999d141e83cc8af4b073192f584b2b92cea77e2d87636621a264",
+      "version": "0.6.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "dispatch2",
+      "path_in_vcs": "crates/dispatch2",
+      "registry_checksum": "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "26f5e6d699ba3ce13b8eea253ad7a7f7feb9345e9da3c01bb9b9bd911a6a7dba",
+      "version": "0.3.1"
+    },
+    {
+      "files": [
+        {
+          "local": "project/LICENSE",
+          "project_license": true,
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+          "source": "LICENSE"
+        }
+      ],
+      "license": "Apache-2.0",
+      "name": "formless-desktop",
+      "source_kind": "workspace",
+      "version": "0.1.0"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "1e9e81e7dc6d9c0a7490c9c5debd67697284ee25",
+          "local": "upstream/longbridge/gpui-kit/39ab849a93b5f15507b969164d49891db8d5b470/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "d1b0449e5478c574ba4f686c2656df7fe77d66821a61f8b6ed3378a58ed9a811",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/longbridge/gpui-kit/39ab849a93b5f15507b969164d49891db8d5b470/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "645d5d4eb3e806ce68f08b2b76aba4a3b462cf9d",
+          "local": "upstream/longbridge/gpui-kit/39ab849a93b5f15507b969164d49891db8d5b470/LICENSE-DOCS.md",
+          "resolved_source": "LICENSE-DOCS.md",
+          "sha256": "8a9ccf144b2d5bf5aae56abdc6e723e17e1ba4de1f5d515b3b644288fd4fc16f",
+          "source": "LICENSE-DOCS.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/longbridge/gpui-kit/39ab849a93b5f15507b969164d49891db8d5b470/LICENSE-DOCS.md"
+        }
+      ],
+      "license": "Apache-2.0",
+      "name": "gpui-kit",
+      "path_in_vcs": "crates/kit",
+      "registry_checksum": "aca1dedfea73645b60b5893c9c16de0b1396f2cf4251d19e5f03a295c1b61879",
+      "repo": "longbridge/gpui-kit",
+      "repository": "https://github.com/longbridge/gpui-kit",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/longbridge/gpui-kit",
+      "revision": "39ab849a93b5f15507b969164d49891db8d5b470",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "a39f8431f1c29fdae405c835b3007a7876618e237d204d425a837eb9bdb1edc6",
+      "version": "0.9.1"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "47f4fd0e8982271e9b7662380fae36a1ac007cf1",
+          "local": "upstream/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "e6d4b179949c58d7a4143d661ccdfecabcebcf54",
+          "local": "upstream/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "lyon",
+      "path_in_vcs": "crates/lyon",
+      "registry_checksum": "bd0578bdecb7d6d88987b8b2b1e3a4e2f81df9d0ece1078623324a567904e7b7",
+      "repo": "nical/lyon",
+      "repository": "https://github.com/nical/lyon",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/lyon",
+      "revision": "56219c95c658d4f39de7b190d98e57d5773ba241",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "0817d84704983bef636dae6a02068bf392a771d349ef4b74a6ea49cef106e526",
+      "version": "1.0.19"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "47f4fd0e8982271e9b7662380fae36a1ac007cf1",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "e6d4b179949c58d7a4143d661ccdfecabcebcf54",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "lyon_algorithms",
+      "path_in_vcs": "crates/algorithms",
+      "registry_checksum": "f3a6b9d4e8b48acd531fbf1241ad9b270df6e60b6b92bdea1469f4f40899d805",
+      "repo": "nical/lyon",
+      "repository": "https://github.com/nical/lyon",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/lyon",
+      "revision": "db98d26a1a90076a7a894262dcb51117eef643c8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "b7a00c86b546ad8b4312a5f6ada1a04f44b805c9199061b4b1d9d92c1288c548",
+      "version": "1.0.22"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "47f4fd0e8982271e9b7662380fae36a1ac007cf1",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "e6d4b179949c58d7a4143d661ccdfecabcebcf54",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "lyon_geom",
+      "path_in_vcs": "crates/geom",
+      "registry_checksum": "d82dd26aa4dc0b5b70b9115de59824842bcb43cf4a28e1b1e6d0ad148c93f93e",
+      "repo": "nical/lyon",
+      "repository": "https://github.com/nical/lyon",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/lyon",
+      "revision": "db98d26a1a90076a7a894262dcb51117eef643c8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "020cea44447d9d22bfd03a4fb7d6ea0de72b79b1905959290a44b65968bdec74",
+      "version": "1.0.20"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "47f4fd0e8982271e9b7662380fae36a1ac007cf1",
+          "local": "upstream/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "e6d4b179949c58d7a4143d661ccdfecabcebcf54",
+          "local": "upstream/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "lyon_path",
+      "path_in_vcs": "crates/path",
+      "registry_checksum": "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e",
+      "repo": "nical/lyon",
+      "repository": "https://github.com/nical/lyon",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/lyon",
+      "revision": "56219c95c658d4f39de7b190d98e57d5773ba241",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "7332c8538553197480afd9a72955203fadc9ee52bf9103fbaed9b741a42b056d",
+      "version": "1.0.19"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "47f4fd0e8982271e9b7662380fae36a1ac007cf1",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "e6d4b179949c58d7a4143d661ccdfecabcebcf54",
+          "local": "upstream/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "lyon_tessellation",
+      "path_in_vcs": "crates/tessellation",
+      "registry_checksum": "fd4872650e70dc907dd4f7ebc449d7d657a0d2658e423b2e724970870bbbf75b",
+      "repo": "nical/lyon",
+      "repository": "https://github.com/nical/lyon",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/lyon",
+      "revision": "db98d26a1a90076a7a894262dcb51117eef643c8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "ecb0a28274db3cee6ecd563dcff69efd83c4046a86ee1da1194acc52f1d06416",
+      "version": "1.0.23"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc-sys",
+      "path_in_vcs": "crates/objc-sys",
+      "registry_checksum": "cdb91bdd390c7ce1a8607f35f3ca7151b65afc0ff5ff3b34fa350f7d7c7e4310",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "4fc083f1c6d6784577e38b0ee8dbd344481e2fd2",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "e29ffefb7383547f359963a78b8b7edaffe36b4ac85b4fd7561e8f7bb976f53c",
+      "version": "0.3.5"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2",
+      "path_in_vcs": "crates/objc2",
+      "registry_checksum": "19d5490aaf8f1d7cf7688dfa9b0ce07900e168852c45cd2c03f534dfd27cfd0b",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "5237cbf081d04ef75a1f6a207b4018e7c1ae7438",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "e3b13b0418c8c874aa5d26218abc2b2642d76c37ec3984d749652c406f0720d1",
+      "version": "0.5.3"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2",
+      "path_in_vcs": "crates/objc2",
+      "registry_checksum": "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "5f7c8e095d3933c477ff1f71021b551cbfe497a62346a1dc8615debd9846e257",
+      "version": "0.6.5"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2-app-kit",
+      "path_in_vcs": "framework-crates/objc2-app-kit",
+      "registry_checksum": "e4e89ad9e3d7d297152b17d39ed92cd50ca8063a89a9fa569046d41568891eff",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "e282618be4c3a3b9542957e0c8540e9588472ce8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "00c185f1f53bfb1ce12e84970c71060b2a14fded09d5a12d3c8dcb80a3ddc880",
+      "version": "0.2.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-app-kit",
+      "path_in_vcs": "framework-crates/objc2-app-kit",
+      "registry_checksum": "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "07762c2a438c287ac124300928c9da0f96cefc1932ff8cadac13716fd1e195eb",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-cloud-kit",
+      "path_in_vcs": "framework-crates/objc2-cloud-kit",
+      "registry_checksum": "73ad74d880bb43877038da939b7427bba67e9dd42004a18b809ba7d87cee241c",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "62f199c0f8876bdc6d78976603201d3684c925632b1fe158f2d6816b28baf121",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-data",
+      "path_in_vcs": "framework-crates/objc2-core-data",
+      "registry_checksum": "0b402a653efbb5e82ce4df10683b6b28027616a2715e90009947d50b8dd298fa",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "7f8e9d957f5352b458a53d6e594c3f0f9033433224c6fb77823a6f0f421ef9e8",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-foundation",
+      "path_in_vcs": "framework-crates/objc2-core-foundation",
+      "registry_checksum": "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "1c1a87985a2bd25015f5e2413f4041379bea0172b2fce88dae3e6482b50aab26",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-graphics",
+      "path_in_vcs": "framework-crates/objc2-core-graphics",
+      "registry_checksum": "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "264ea4e6453d508410c33c7e5c05ef71f067cac56efc06603862b36d1fe5dfc3",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-image",
+      "path_in_vcs": "framework-crates/objc2-core-image",
+      "registry_checksum": "e5d563b38d2b97209f8e861173de434bd0214cf020e3423a52624cd1d989f006",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "c894249d194f6678eab85405db96965489b93eba3863198439f1014a21421c31",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-services",
+      "path_in_vcs": "framework-crates/objc2-core-services",
+      "registry_checksum": "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "291451d0b2f737993ae289f232ae5959ea61bbefbf2ba1c4f6354369e4253851",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-text",
+      "path_in_vcs": "framework-crates/objc2-core-text",
+      "registry_checksum": "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "505aa6c21bf36109e6e050055d239bcaf791b18e63cdefb7d601922b9f864545",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-core-video",
+      "path_in_vcs": "framework-crates/objc2-core-video",
+      "registry_checksum": "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "05c4588ec0cd5ff712e111b6a56224d5c9fef6b63bc11fc069ff0f2fa7f96b2a",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2-encode",
+      "path_in_vcs": "crates/objc2-encode",
+      "registry_checksum": "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "b23c761215887d90ac44e18b18c8b386f93139c65a4a14f110e22405830cb3f1",
+      "version": "4.1.0"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2-foundation",
+      "path_in_vcs": "framework-crates/objc2-foundation",
+      "registry_checksum": "0ee638a5da3799329310ad4cfa62fbf045d5f56e3ef5ba4149e7452dcf89d5a8",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "e282618be4c3a3b9542957e0c8540e9588472ce8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "7b719bdefdecba77a57c93b272ea0dff6e087bc3d2fa8576cd812d6c6af38c27",
+      "version": "0.2.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
+        }
+      ],
+      "license": "MIT",
+      "name": "objc2-foundation",
+      "path_in_vcs": "framework-crates/objc2-foundation",
+      "registry_checksum": "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "de34f3c84d7cb1cafcedb4e83b7efdd64047872566827477b954f8a853536bb1",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-metal",
+      "path_in_vcs": "framework-crates/objc2-metal",
+      "registry_checksum": "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "ea5eaec8d2785ebed65a43cdf097051d8900c7547797cea4bb3c7ba4476e052a",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-quartz-core",
+      "path_in_vcs": "framework-crates/objc2-quartz-core",
+      "registry_checksum": "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "d18b21bb115491577880f7f8c491ac10dd8d9947bd27fdc3f6dafcf4cf92b2e9",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-security",
+      "path_in_vcs": "framework-crates/objc2-security",
+      "registry_checksum": "709fe137109bd1e8b5a99390f77a7d8b2961dafc1a1c5db8f2e60329ad6d895a",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "7984dc30856267fc3fa55dcfafe860b9baf79c417ae43881859b7aa2838236a3",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-uniform-type-identifiers",
+      "path_in_vcs": "framework-crates/objc2-uniform-type-identifiers",
+      "registry_checksum": "7902ac02859fc1f7045f8b598c63f1ae0cc7efeaa06a9bc9f3d9a3c955974fa4",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "024671701b8939b14fd6f30542019a7223a8e92f54f91565e88983d6f0b1a71c",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
+      ],
+      "files": [
+        {
+          "git_blob": "540ae4c81adb5f64a9f61e222b688880da24300e",
+          "local": "upstream/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "7f976f7e9cb2d87df7230606feb932c3f21ac0e664045a775b600046ff850c54",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
+        }
+      ],
+      "license": "Zlib OR Apache-2.0 OR MIT",
+      "name": "objc2-user-notifications",
+      "path_in_vcs": "framework-crates/objc2-user-notifications",
+      "registry_checksum": "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e",
+      "repo": "madsmtm/objc2",
+      "repository": "https://github.com/madsmtm/objc2",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/madsmtm/objc2",
+      "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
+      "source_kind": "registry",
+      "vcs_sha256": "f9f9fc21b411afa8a20002f259187760b838f8fb6db54814db214c1682a14344",
+      "version": "0.3.2"
+    },
+    {
+      "collection_limitations": [
+        "Published source copyright and dual-license headers only; complete chosen-license terms and distribution obligations remain unresolved. No standalone upstream notice or legal clearance is claimed."
+      ],
+      "files": [
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/angle.rs.txt",
+          "prefix_bytes": 398,
+          "published_source": "src/angle.rs",
+          "published_source_sha256": "dce9c08facbaceccb920035477ac53ffc2798247b42b2ddef9338f2e35ab9c80",
+          "role": "published-source-header",
+          "sha256": "b95e9cd7044b43469edadeccf46c4f0b30a92746deedcc0eae54e267d3f1f142",
+          "source": "src/angle.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/lib.rs.txt",
+          "prefix_bytes": 396,
+          "published_source": "src/lib.rs",
+          "published_source_sha256": "cedfb2d85e682e9b9e327a169347bf0cebecd52668e1ed91a3af05ec91b42090",
+          "role": "published-source-header",
+          "sha256": "a830c3e1ca7ae32b804500428e0dd1fbaf34e997174af1ff2296227bd537c0d3",
+          "source": "src/lib.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/line_segment.rs.txt",
+          "prefix_bytes": 411,
+          "published_source": "src/line_segment.rs",
+          "published_source_sha256": "4af21598890aef0ffec10abd5460c0416cb1bb56b003fb499f0cd75fc68177da",
+          "role": "published-source-header",
+          "sha256": "60511d4ce2b174c61ffe79edec0fe18ead020b586c0104a5d2caafa62e805d75",
+          "source": "src/line_segment.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/rect.rs.txt",
+          "prefix_bytes": 403,
+          "published_source": "src/rect.rs",
+          "published_source_sha256": "68d48ddd9934ac11f0ed0e81c2cc6ede9271528dc318c3dd49cc9c9f51cb15ca",
+          "role": "published-source-header",
+          "sha256": "a1149034fccc7d5141af10c261360e12fda0f8c32043e4825105bfc3cdf5a5b3",
+          "source": "src/rect.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/transform2d.rs.txt",
+          "prefix_bytes": 410,
+          "published_source": "src/transform2d.rs",
+          "published_source_sha256": "36514cf158f7bd2118a1e2f2586e439f6484d61f0505919e8005fb733e3c917c",
+          "role": "published-source-header",
+          "sha256": "3df91c57a2efe17ebbbfdb98d84c43e253b4f7a8f6dc96279069a78a9a189391",
+          "source": "src/transform2d.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/transform3d.rs.txt",
+          "prefix_bytes": 410,
+          "published_source": "src/transform3d.rs",
+          "published_source_sha256": "d42aa24d02570376c429256f24891f489bd71ef257d9691f80b4fb6528e09275",
+          "role": "published-source-header",
+          "sha256": "7926ee19e910aa36f41b10b6e8fac49bcc2ef8ca2230756e5df1728ef445f213",
+          "source": "src/transform3d.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/unit_vector.rs.txt",
+          "prefix_bytes": 404,
+          "published_source": "src/unit_vector.rs",
+          "published_source_sha256": "a6c30c98aaf859492746696b9d67999322b18117fbe891b53f38ccfca5b28a5f",
+          "role": "published-source-header",
+          "sha256": "5cbe3b292e035ddd2e0cbd43d4965be51091160b691c1e4277190e8f3fbcac57",
+          "source": "src/unit_vector.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/util.rs.txt",
+          "prefix_bytes": 397,
+          "published_source": "src/util.rs",
+          "published_source_sha256": "33a05481be71f5cf41128eeeb3e378248249d0f6f30ebc057e4c05f11344a0e5",
+          "role": "published-source-header",
+          "sha256": "5570b4fa3949d5d0dc71e6e169d5d32fe372082a71eadac3019d1d5a41905cf5",
+          "source": "src/util.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        },
+        {
+          "local": "published-source-headers/pathfinder_geometry/0.5.1/vector.rs.txt",
+          "prefix_bytes": 404,
+          "published_source": "src/vector.rs",
+          "published_source_sha256": "cfcaad0394c5489a412bcdbbbe6928e1875d4a422eb5a7da1a3e415fdbc0790c",
+          "role": "published-source-header",
+          "sha256": "1cc6584237b6a4d3c6d14adaa13fc384220c770df391e315e096cdb63431217f",
+          "source": "src/vector.rs leading comment block",
+          "url": "https://static.crates.io/crates/pathfinder_geometry/pathfinder_geometry-0.5.1.crate"
+        }
+      ],
+      "license": "MIT/Apache-2.0",
+      "name": "pathfinder_geometry",
+      "registry_checksum": "0b7b7e7b4ea703700ce73ebf128e1450eb69c3a8329199ffbfb9b2a0418e5ad3",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/servo/pathfinder",
+      "revision": "a5e98fac00f433fe2ff4b2135383d82491b8bfc5",
+      "source_kind": "registry",
+      "vcs_sha256": "b36b0a8e5664ad1cad900cc2d9bc2a878aec10ff6200a33b6bab74bf7ae24d7b",
+      "version": "0.5.1"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "16fe87b06e802f094b3fbb0894b137bca2b16ef1",
+          "local": "upstream/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "25597d5838fa4cd7ff5c3c2bb1d1b4c3731eda7f",
+          "local": "upstream/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "0621878e61f0d0fda054bcbe02df75192c28bde1ecc8289cbd86aeba2dd72720",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/servo/pathfinder/6c3c0466f451c5bd2007087728cd168798cd64e8/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "pathfinder_simd",
+      "path_in_vcs": "simd",
+      "registry_checksum": "4500030c302e4af1d423f36f3b958d1aecb6c04184356ed5a833bf6b60435777",
+      "repo": "servo/pathfinder",
+      "repository": "https://github.com/servo/pathfinder",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/servo/pathfinder",
+      "revision": "6c3c0466f451c5bd2007087728cd168798cd64e8",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "469961ff70bc7fc4f3b724386f38cd0719936e18aae4a44b6c7c469ba30228fc",
+      "version": "0.5.6"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "139dce95d473c201a8561ef17536314d8b8cda65",
+          "local": "upstream/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "6a84e059ad8b43e03c2b06bc2af4dc1d8442808d",
+          "local": "upstream/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "profiling",
+      "path_in_vcs": "profiling",
+      "registry_checksum": "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5",
+      "repo": "aclysma/profiling",
+      "repository": "https://github.com/aclysma/profiling",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/aclysma/profiling",
+      "revision": "8271551172eb6fa4cba47369aedd93790c623df9",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "15498e60d175e3e5a4a1c4d30a3a4c836c130c79a93b5dd27944d5ae9a3b3b82",
+      "version": "1.0.18"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "139dce95d473c201a8561ef17536314d8b8cda65",
+          "local": "upstream/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+          "resolved_source": "LICENSE-APACHE",
+          "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551",
+          "source": "LICENSE-APACHE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+        },
+        {
+          "git_blob": "6a84e059ad8b43e03c2b06bc2af4dc1d8442808d",
+          "local": "upstream/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+          "resolved_source": "LICENSE-MIT",
+          "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333",
+          "source": "LICENSE-MIT",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+        }
+      ],
+      "license": "MIT OR Apache-2.0",
+      "name": "profiling-procmacros",
+      "path_in_vcs": "profiling-procmacros",
+      "registry_checksum": "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb",
+      "repo": "aclysma/profiling",
+      "repository": "https://github.com/aclysma/profiling",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/aclysma/profiling",
+      "revision": "8271551172eb6fa4cba47369aedd93790c623df9",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "c12ac018384c3216963c746bd4078bc5c3e0371439b4192aded2f692f3ff11a5",
+      "version": "1.0.18"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "b276fc5af9586ff23f664513917341f41960a33e",
+          "local": "upstream/longbridge/rust-i18n/5f3ea5ba03395f2f2908e3587e01788cfdfd3555/LICENSE",
+          "resolved_source": "LICENSE",
+          "sha256": "d6fde6c28ecbccfc7f6d97c0badbb14bbea2cc8f5e81a8c1537204bdfed9a6d5",
+          "source": "LICENSE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/longbridge/rust-i18n/5f3ea5ba03395f2f2908e3587e01788cfdfd3555/LICENSE"
+        }
+      ],
+      "license": "MIT",
+      "name": "rust-i18n-macro",
+      "path_in_vcs": "crates/macro",
+      "registry_checksum": "d54a28dd9d46108d56b9f0c85b220908844233e561c03087890325104f90f2c6",
+      "repo": "longbridge/rust-i18n",
+      "repository": "https://github.com/longbridge/rust-i18n",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/longbridge/rust-i18n",
+      "revision": "5f3ea5ba03395f2f2908e3587e01788cfdfd3555",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "4ea9ef121715adc33ce29b8d9eff89debe6117b1f2dd3e8bd8105be8c21b19c4",
+      "version": "4.2.4"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "b276fc5af9586ff23f664513917341f41960a33e",
+          "local": "upstream/longbridge/rust-i18n/5f3ea5ba03395f2f2908e3587e01788cfdfd3555/LICENSE",
+          "resolved_source": "LICENSE",
+          "sha256": "d6fde6c28ecbccfc7f6d97c0badbb14bbea2cc8f5e81a8c1537204bdfed9a6d5",
+          "source": "LICENSE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/longbridge/rust-i18n/5f3ea5ba03395f2f2908e3587e01788cfdfd3555/LICENSE"
+        }
+      ],
+      "license": "MIT",
+      "name": "rust-i18n-support",
+      "path_in_vcs": "crates/support",
+      "registry_checksum": "e806c2a9701cbd6043992cd935c30cb1fdb128fa15e7b506f3b46f97045737c0",
+      "repo": "longbridge/rust-i18n",
+      "repository": "https://github.com/longbridge/rust-i18n",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/longbridge/rust-i18n",
+      "revision": "5f3ea5ba03395f2f2908e3587e01788cfdfd3555",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "5338c7f35da036c151c91c1bd3cc268a5c6259983e2062d5d347f0546fc3073a",
+      "version": "4.2.4"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "9ad7b40bcf7bb89a9866e5e2e8fdb370fb528e36",
+          "local": "upstream/nical/rust_debug/93f414cd572b5c2781df93dbdc068ed13443d05a/LICENSE",
+          "resolved_source": "LICENSE",
+          "sha256": "7e98bed7f100747aaae7d82ab94fbe6b76fd6b84b09a3aaa413bff8196d0fbb1",
+          "source": "LICENSE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/nical/rust_debug/93f414cd572b5c2781df93dbdc068ed13443d05a/LICENSE"
+        }
+      ],
+      "license": "MIT/Apache-2.0",
+      "name": "svg_fmt",
+      "path_in_vcs": "svg_fmt",
+      "registry_checksum": "0193cc4331cfd2f3d2011ef287590868599a2f33c3e69bc22c1a3d3acf9e02fb",
+      "repo": "nical/rust_debug",
+      "repository": "https://github.com/nical/rust_debug",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/nical/rust_debug",
+      "revision": "93f414cd572b5c2781df93dbdc068ed13443d05a",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "559575e2ad0bb3d09cde0aac106e9ad2021efad87259da068bffe440e1b4138f",
+      "version": "0.4.5"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "f6b3d8f95569d0dfca076b6b24901b2a4a89aca8",
+          "local": "upstream/DioxusLabs/taffy/eb6450694f33e2b7413e40677f230ff63f0fc194/LICENSE",
+          "resolved_source": "LICENSE",
+          "sha256": "f97daf1a0124413dccf399a4e6626b4b74acd05282f80b6d64ac82225650b77a",
+          "source": "LICENSE",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/DioxusLabs/taffy/eb6450694f33e2b7413e40677f230ff63f0fc194/LICENSE"
+        }
+      ],
+      "license": "MIT",
+      "name": "taffy",
+      "path_in_vcs": "",
+      "registry_checksum": "3c8480887e8803986d96a7173729565520d4bbb721ad6b7ad6941a22897207aa",
+      "repo": "DioxusLabs/taffy",
+      "repository": "https://github.com/DioxusLabs/taffy",
+      "repository_field": "repository",
+      "repository_metadata_value": "https://github.com/DioxusLabs/taffy",
+      "revision": "eb6450694f33e2b7413e40677f230ff63f0fc194",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "3c19f12237fb7901753eae888e83807bea2bfcdd3f554a6f94965248e472b581",
+      "version": "0.15.0"
+    },
+    {
+      "files": [
+        {
+          "git_blob": "582ec653390adaf4893b71f3e113a6ac4d392463",
+          "local": "upstream/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE-ZLIB",
+          "resolved_source": "LICENSE-ZLIB",
+          "sha256": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352",
+          "source": "LICENSE-ZLIB",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE-ZLIB"
+        },
+        {
+          "git_blob": "ee9ce454f54f6dfd13d10218af4178f07497fde0",
+          "local": "upstream/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE.md",
+          "resolved_source": "LICENSE.md",
+          "sha256": "e870d7fd7819a9f0453c62798cb52ae95d148a8c91dc2de1d983f997143c72de",
+          "source": "LICENSE.md",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/etemesi254/zune-image/69502ce83fdfecdd0beefd677e2abb3781b29d98/LICENSE.md"
+        }
+      ],
+      "license": "MIT OR Apache-2.0 OR Zlib",
+      "name": "zune-inflate",
+      "path_in_vcs": "zune-inflate",
+      "registry_checksum": "73ab332fe2f6680068f3582b16a24f90ad7096d5d39b974d1c0aff0125116f02",
+      "repo": "etemesi254/zune-image",
+      "repository": "https://github.com/etemesi254/zune-image",
+      "repository_field": "homepage",
+      "repository_metadata_value": "https://github.com/etemesi254/zune-image/tree/main/zune-inflate",
+      "revision": "69502ce83fdfecdd0beefd677e2abb3781b29d98",
+      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "source_kind": "registry",
+      "vcs_sha256": "1aa1fe13706244305622b464deb9216c9bd081ba93f6b43a97034b6d21db6273",
+      "version": "0.2.54"
+    }
+  ],
+  "review_limitations": {
+    "heuristic_only": true,
+    "manual_review": "Presence is not licensing clearance. In particular objc2 upstream notes explicitly discuss Apple SDK implications and external terms.",
+    "upstream_notice_without_obvious_full_grant_text": [
+      "block2-0.6.2",
+      "dispatch2-0.3.1",
+      "objc2-0.6.5",
+      "objc2-app-kit-0.3.2",
+      "objc2-cloud-kit-0.3.2",
+      "objc2-core-data-0.3.2",
+      "objc2-core-foundation-0.3.2",
+      "objc2-core-graphics-0.3.2",
+      "objc2-core-image-0.3.2",
+      "objc2-core-services-0.3.2",
+      "objc2-core-text-0.3.2",
+      "objc2-core-video-0.3.2",
+      "objc2-encode-4.1.0",
+      "objc2-foundation-0.3.2",
+      "objc2-metal-0.3.2",
+      "objc2-quartz-core-0.3.2",
+      "objc2-security-0.3.2",
+      "objc2-uniform-type-identifiers-0.3.2",
+      "objc2-user-notifications-0.3.2"
+    ]
+  },
+  "schema": 1,
+  "unresolved": [
+    {
+      "name": "mac",
+      "reason": "Published release tag and complete Rust source/Cargo manifest match the locked crate archive, but that upstream tree has no notice files. No grant text synthesized.",
+      "registry_checksum": "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4",
+      "release_revision": "66afc663b68a65633ea165c742b5a9c6734581c2",
+      "release_tag": "0.1.1",
+      "version": "0.1.1"
+    },
+    {
+      "name": "pathfinder_geometry",
+      "reason": "HTTP 422: https://api.github.com/repos/servo/pathfinder/git/trees/a5e98fac00f433fe2ff4b2135383d82491b8bfc5?recursive=1",
+      "revision": "a5e98fac00f433fe2ff4b2135383d82491b8bfc5",
+      "version": "0.5.1"
+    },
+    {
+      "name": "seahash",
+      "probe_result": "The declared pinned GitLab raw LICENSE URL returned HTTP 404; no alternate repository or current-branch notice substituted.",
+      "reason": "Pinned declared GitLab tree is available, but contains no root notice file; published crate also contains no notice file. No grant text synthesized.",
+      "registry_checksum": "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b",
+      "repository": "https://gitlab.redox-os.org/redox-os/seahash",
+      "revision": "94b632aeac099031c373599313d5b5f0acbbaec0",
+      "root_paths": [
+        "benches",
+        "src",
+        "tests",
+        ".gitignore",
+        ".gitlab-ci.yml",
+        "Cargo.toml",
+        "README.md",
+        "logo.png"
+      ],
+      "tree_response_sha256": "4dbe2460db91bd3a4e7e7adb4d597d74331457bcab2e37c33b813169900b8ee0",
+      "tree_url": "https://gitlab.redox-os.org/api/v4/projects/redox-os%2Fseahash/repository/tree?ref=94b632aeac099031c373599313d5b5f0acbbaec0&per_page=100",
+      "version": "4.1.0"
+    }
+  ]
+}

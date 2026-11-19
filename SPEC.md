@@ -3386,6 +3386,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
   list and Run start/end stay global. A new connection receives everything;
   the TUI, web and headless clients subscribe to the Session they show.
+- Optional capability `future_transcript_attempts_v1` adds per-connection
+  `SubscribeTranscriptAttempts`, `GetTranscriptBarrier`, and correlated
+  answer-only `TranscriptAttempt` start/delta/close frames. It admits complete
+  future attempts after a later producer barrier; it is not mid-attempt replay
+  or a canonical commit watermark. Canonical events cannot be discarded by
+  that cursor. Existing Subscribe restores legacy mode. The native desktop
+  keeps this path disabled pending full transport acceptance. See
+  [the exact contract and acceptance gates](docs/desktop/future-attempt-protocol-20261115.md).
 - **Compatibility.** `Ping` and `Status` report `min_protocol`,
   `max_protocol` and `features` (named optional capabilities); peers use
   the highest version both speak, and the daemon accepts any envelope
