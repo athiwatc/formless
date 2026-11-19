@@ -186,6 +186,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::Questions
                 | Command::Approvals
                 | Command::SessionDetails
+                | Command::SessionModel
                 | Command::MarkComparisonLeft
                 | Command::CompareMarked
                 | Command::InspectRun
@@ -887,11 +888,13 @@ pub struct Shell {
     inspector_toggle_focus: FocusHandle,
     theme_toggle_focus: FocusHandle,
     commands_toggle_focus: FocusHandle,
+    composer_model_focus: FocusHandle,
     resume_focus: FocusHandle,
     abandon_focus: FocusHandle,
     resume_anchor: gpui_kit::ScrollAnchor,
     abandon_anchor: gpui_kit::ScrollAnchor,
     composer_anchor: gpui_kit::ScrollAnchor,
+    composer_model_anchor: gpui_kit::ScrollAnchor,
     mode_enable_anchor: gpui_kit::ScrollAnchor,
     /// The status line is a tab stop on a reflowed page, where it can be
     /// off screen and holds nothing else that focus could bring into view.
@@ -1054,6 +1057,7 @@ impl Shell {
             resume_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             abandon_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             composer_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            composer_model_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             mode_enable_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             page_scroll,
             reveal_frames: 0,
@@ -1155,6 +1159,7 @@ impl Shell {
             inspector_toggle_focus: cx.focus_handle(),
             theme_toggle_focus: cx.focus_handle(),
             commands_toggle_focus: cx.focus_handle(),
+            composer_model_focus: cx.focus_handle(),
             resume_focus: cx.focus_handle(),
             abandon_focus: cx.focus_handle(),
             status_focus: cx.focus_handle().tab_stop(true),
@@ -1612,6 +1617,7 @@ impl Shell {
     /// an overlay panel is in none of them.
     pub fn focused_section(&self, window: &Window, cx: &App) -> Option<PageSection> {
         if self.composer.focus_handle(cx).contains_focused(window, cx)
+            || self.composer_model_focus.is_focused(window)
             || self.resume_focus.is_focused(window)
             || self.abandon_focus.is_focused(window)
         {
@@ -1666,6 +1672,8 @@ impl Shell {
         // its focused descendant instead of trying to fit the whole section.
         let anchor = if self.mode_enable_focus.is_focused(window) {
             Some(&self.mode_enable_anchor)
+        } else if self.composer_model_focus.is_focused(window) {
+            Some(&self.composer_model_anchor)
         } else if self.resume_focus.is_focused(window) {
             Some(&self.resume_anchor)
         } else if self.abandon_focus.is_focused(window) {
@@ -3315,6 +3323,9 @@ impl Shell {
         if command == Command::ToggleEnterSends && self.background_inert(window) {
             return Some("Close the open dialog before changing send keys");
         }
+        if command == Command::SessionModel && self.background_inert(window) {
+            return Some("Close the open dialog before reviewing the Session model");
+        }
         let state = self.command_state(window, cx);
         if let Some(reason) = commands::entry(command, &state).disabled_reason {
             // Other refusals are as silent as they always were, but a
@@ -3326,6 +3337,8 @@ impl Shell {
                     format!("Preferences unchanged: {reason}.").into()
                 } else if command == Command::ToggleEnterSends {
                     format!("Send keys unchanged: {reason}.").into()
+                } else if command == Command::SessionModel {
+                    format!("Model / Role: {reason}.").into()
                 } else {
                     format!("Not sent: {reason}.").into()
                 });
@@ -3336,7 +3349,10 @@ impl Shell {
         match command {
             Command::Questions => self.open_questions(window, cx),
             Command::Approvals => self.open_approvals(window, cx),
-            Command::SessionDetails => self.open_session_editor(window, cx),
+            Command::SessionDetails => self.open_session_editor(None, window, cx),
+            Command::SessionModel => {
+                self.open_session_editor(Some(crate::session_edit::Field::Model), window, cx)
+            }
             Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
@@ -3796,6 +3812,7 @@ impl Shell {
         // The composer is drawn inside the conversation column, so it has to
         // be told apart from the conversation before the containment checks.
         if self.composer.focus_handle(cx).contains_focused(window, cx)
+            || self.composer_model_focus.is_focused(window)
             || self.resume_focus.is_focused(window)
             || self.abandon_focus.is_focused(window)
         {
@@ -4984,7 +5001,7 @@ impl Shell {
             .iter()
             .any(|row| row.id == id && row.group == SessionGroup::Archived)
         {
-            self.open_session_editor(window, cx);
+            self.open_session_editor(None, window, cx);
         } else {
             self.sidebar.select_id(id);
             self.activate_selected(window, cx);
@@ -5498,6 +5515,30 @@ impl Shell {
             .map(|_| button("composer-secondary", Command::SendSecondary, cx).outline());
         // Stop keeps its own fixed slot, apart from the primary action.
         let stop = button("composer-stop", Command::Stop, cx).danger();
+        let model = self.client_identity().zip(self.sidebar.active_id()).map(|(identity, id)| {
+            let session = id.to_owned();
+            let generation = self.composer_generation;
+            let entry = commands::entry(Command::SessionModel, &self.commands);
+            div()
+                .id("composer-model-anchor")
+                .anchor_scroll(Some(self.composer_model_anchor.clone()))
+                .child(
+                    Button::new("composer-model")
+                        .label(entry.label)
+                        .outline()
+                        .disabled(!entry.enabled())
+                        .tooltip(tooltip(&entry))
+                        .track_focus(&self.composer_model_focus)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if this.composer_generation == generation
+                                && this.sidebar.active_id() == Some(session.as_str())
+                                && this.client_identity() == Some(identity)
+                            {
+                                this.run_command(Command::SessionModel, window, cx);
+                            }
+                        })),
+                )
+        });
         let modified_enter = commands::shortcut_text(commands::composer_submit_key());
         let primary_label = send_mode_label(self.commands.composer.primary);
         v_flex()
@@ -5561,6 +5602,7 @@ impl Shell {
                     .gap_2()
                     .child(stop)
                     .child(div().flex_1())
+                    .children(model)
                     .children(secondary)
                     .child(primary),
             )

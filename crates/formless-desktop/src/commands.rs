@@ -26,6 +26,7 @@ pub enum Command {
     Questions,
     Approvals,
     SessionDetails,
+    SessionModel,
     MarkComparisonLeft,
     CompareMarked,
     InspectRun,
@@ -192,6 +193,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::Questions
         | Command::Approvals
         | Command::SessionDetails
+        | Command::SessionModel
         | Command::MarkComparisonLeft
         | Command::CompareMarked
         | Command::InspectRun
@@ -282,6 +284,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::Questions,
         Command::Approvals,
         Command::SessionDetails,
+        Command::SessionModel,
         Command::MarkComparisonLeft,
         Command::CompareMarked,
         Command::InspectRun,
@@ -448,6 +451,20 @@ pub fn entry(command: Command, state: &State) -> Entry {
             "Edit the chosen Sessions-list entry, or the open Session outside that list",
             None,
             if state.composing {
+                Some(COMPOSING)
+            } else {
+                (!state.can_edit_session).then_some("Choose a Session while connected")
+            },
+        ),
+        Command::SessionModel => (
+            "Model / Role",
+            "Review Session model or Role".into(),
+            Group::Composer,
+            "Open Chat's model and reasoning effort settings for the current Session",
+            None,
+            if !state.has_composer {
+                Some(NO_COMPOSER)
+            } else if state.composing {
                 Some(COMPOSING)
             } else {
                 (!state.can_edit_session).then_some("Choose a Session while connected")

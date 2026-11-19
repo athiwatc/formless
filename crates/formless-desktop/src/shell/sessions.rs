@@ -176,7 +176,12 @@ impl Shell {
         );
     }
 
-    pub(super) fn open_session_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_session_editor(
+        &mut self,
+        initial_field: Option<Field>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.session_editor.is_some() || !self.client_connected {
             return;
         }
@@ -193,15 +198,17 @@ impl Shell {
         self.viewer = None;
         self.prefs.close_overlays();
         let scroll = ScrollHandle::new();
-        let field = if self
-            .client_sessions
-            .iter()
-            .any(|session| session.id == id && session.archived)
-        {
-            Field::Archive
-        } else {
-            Field::Name
-        };
+        let field = initial_field.unwrap_or_else(|| {
+            if self
+                .client_sessions
+                .iter()
+                .any(|session| session.id == id && session.archived)
+            {
+                Field::Archive
+            } else {
+                Field::Name
+            }
+        });
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
             catalog: catalog::State::default(),
@@ -240,8 +247,9 @@ impl Shell {
             scale: self.text_scale,
             frames: 2,
         });
-        self.reload_session_details(window, cx);
+        // Record the opener before the metadata read focuses Cancel.
         self.settle(window, cx);
+        self.reload_session_details(window, cx);
     }
 
     fn rebuild_session_edit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -636,6 +644,13 @@ impl Shell {
                     .unwrap_or_else(|| self.conversation_focus.clone()),
                 region: Some(Region::Conversation),
             });
+        } else if !self.client_connected
+            && self
+                .restore_focus
+                .as_ref()
+                .is_some_and(|origin| origin.handle == self.composer_model_focus)
+        {
+            self.restore_focus = None;
         }
         self.session_editor = None;
         self.settle(window, cx);

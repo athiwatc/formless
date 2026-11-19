@@ -2,6 +2,189 @@ use super::*;
 use formless_desktop::client::{Command as Wire, Update};
 use formless_desktop::session_edit::{Change, Metadata, Outcome};
 use gpui_kit::Focusable;
+
+#[gpui_kit::test]
+fn composer_model_control_opens_the_current_session_and_preserves_the_draft(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    let mut current = sessions[0].clone();
+    current.model = Some("role:reviewer".into());
+    current.reasoning_effort = Some("low".into());
+    let composer = step(cx, handle, |window, cx| {
+        window.click(session_row_id(&current.id), cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("Keep this draft ไทย 😀", cx);
+        window.press("shift-left", cx);
+        shell.update(cx, |shell, _| shell.take_client_commands());
+        shell.read(cx).composer().clone()
+    });
+    cx.simulate_window_resize(handle.into(), MINIMUM);
+    step(cx, handle, |window, cx| {
+        let selection = shell.read(cx).composer_selection(cx);
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx)
+        });
+        settle_frames(window, cx);
+        tab_to(window, "composer-model", cx);
+        settle_frames(window, cx);
+        assert!(window.find("composer-model").visible());
+        assert_eq!(
+            shell.read(cx).focused_section(window, cx),
+            Some(PageSection::Composer)
+        );
+        window.press("enter", cx);
+        settle_frames(window, cx);
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        let [Wire::ReadSessionDetails {
+            connection,
+            operation,
+            session_id,
+        }] = commands.as_slice()
+        else {
+            panic!(
+                "expected one metadata read, got {} commands",
+                commands.len()
+            );
+        };
+        assert_eq!(session_id, &current.id);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::SessionDetails {
+                    connection: *connection,
+                    operation: *operation,
+                    session_id: session_id.clone(),
+                    result: Ok(Metadata::from_session(&current).unwrap()),
+                },
+                window,
+                cx,
+            )
+        });
+        settle_frames(window, cx);
+        assert!(window
+            .find("session-model-confirmed")
+            .value()
+            .unwrap()
+            .contains("role:reviewer"));
+        assert_eq!(
+            shell
+                .read(cx)
+                .session_edit_input()
+                .unwrap()
+                .read(cx)
+                .value()
+                .as_ref(),
+            "role:reviewer"
+        );
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert_eq!(window.find("composer-model").focused(), Some(true));
+        assert_eq!(shell.read(cx).composer(), &composer);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "Keep this draft ไทย 😀");
+        assert_eq!(shell.read(cx).composer_selection(cx), selection);
+        assert!(shell.read(cx).last_intent().is_none());
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+        window.press("enter", cx);
+        shell.update(cx, |shell, cx| {
+            shell.take_client_commands();
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert!(composer.focus_handle(cx).contains_focused(window, cx));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "Keep this draft ไทย 😀");
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn composer_model_palette_reuses_the_chat_and_composition_guards(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.click(session_row_id(&sessions[0].id), cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.render_frame(cx);
+        shell.update(cx, |shell, _| shell.take_client_commands());
+        let composer = shell.read(cx).composer().clone();
+        let bounds = window.find_by_label("Message").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, composer.clone()), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+        assert_eq!(
+            shell.update(cx, |shell, cx| {
+                shell.run_command(Command::SessionModel, window, cx)
+            }),
+            Some(commands::COMPOSING)
+        );
+        assert!(composer.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+        composer.update(cx, |input, cx| input.unmark_text(window, cx));
+
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        window.input("review model role", cx);
+        window.render_frame(cx);
+        assert_eq!(palette_titles(window), ["Review Session model or Role"]);
+        assert!(shell
+            .update(cx, |shell, cx| {
+                shell.run_command(Command::SessionModel, window, cx)
+            })
+            .is_some());
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.find("session-edit-cancel").visible());
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        assert!(
+            matches!(commands.as_slice(), [Wire::ReadSessionDetails { session_id, .. }] if session_id == &sessions[0].id)
+        );
+        window.press("escape", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "にほんご");
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
+        });
+        shell.update(cx, |shell, _| shell.take_client_commands());
+        assert_eq!(
+            shell.update(cx, |shell, cx| {
+                shell.run_command(Command::SessionModel, window, cx)
+            }),
+            Some(commands::NO_COMPOSER)
+        );
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+}
+
 fn setup(
     cx: &mut TestAppContext,
 ) -> (
