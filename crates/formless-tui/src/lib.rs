@@ -19623,7 +19623,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                 };
                 app.chat_area
                     .map(|a| {
-                        links::scan_with_explicit(
+                        links::scan_with_layout_links(
                             frame.buffer,
                             a,
                             &app.chat_markdown_links,
@@ -25813,7 +25813,7 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buffer = term.backend().buffer();
-        let found = links::scan_with_explicit(
+        let found = links::scan_with_layout_links(
             buffer,
             app.chat_area.unwrap(),
             &app.chat_markdown_links,
@@ -25837,7 +25837,7 @@ mod tests {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(28, 9)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buffer = term.backend().buffer();
-        let found = links::scan_with_explicit(
+        let found = links::scan_with_layout_links(
             buffer,
             app.chat_area.unwrap(),
             &app.chat_markdown_links,
