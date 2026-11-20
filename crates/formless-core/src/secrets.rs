@@ -21,6 +21,11 @@ const PREFIXES: &[(&str, &str)] = &[
     ("github_pat_", "GitHub token"),
     ("glpat-", "GitLab token"),
     ("xoxb-", "Slack token"),
+    ("xoxe.xapp-", "Slack token"),
+    ("xoxe.xoxb-", "Slack token"),
+    ("xoxe.xoxp-", "Slack token"),
+    ("xoxe-", "Slack token"),
+    ("xapp-", "Slack token"),
     ("xoxp-", "Slack token"),
     ("AIza", "Google API key"),
     ("AKIA", "AWS access key"),
@@ -249,6 +254,19 @@ pub fn scan(text: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slack_app_and_rotating_tokens_are_redacted_as_whole_values() {
+        let suffix = "0123456789-abcdefghijklmnop";
+        for prefix in ["xapp-", "xoxe.xapp-", "xoxe.xoxb-", "xoxe.xoxp-", "xoxe-"] {
+            assert_eq!(
+                redact(&format!("({prefix}{suffix})")),
+                ("([REDACTED])".into(), Some("Slack token"))
+            );
+        }
+        let note = "documentation mentions tools-xapp and xapp-short";
+        assert_eq!(redact(note), (note.into(), None));
+    }
+
     #[test]
     fn exact_credential_masking_decodes_json_escapes_without_changing_usage() {
         let body = r#"{"error":{"message":"echo \u006fpaque-access"},"usage":{"prompt_tokens":12,"completion_tokens":3}}"#;
