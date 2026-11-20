@@ -237,12 +237,12 @@ fn invocation_snapshot(value: &Value) -> Result<String> {
             let milliseconds = entry[key]
                 .as_u64()
                 .context("Invocation duration was not an unsigned millisecond value")?;
-            writeln!(
-                out,
-                "  {label}: {}.{:03}s",
-                milliseconds / 1000,
-                milliseconds % 1000
-            )?;
+            let duration = if milliseconds < 60_000 {
+                format!("{}.{:03}s", milliseconds / 1000, milliseconds % 1000)
+            } else {
+                super::format_duration(std::time::Duration::from_millis(milliseconds))
+            };
+            writeln!(out, "  {label}: {duration}")?;
         }
         writeln!(
             out,
@@ -268,11 +268,16 @@ fn invocation_snapshot(value: &Value) -> Result<String> {
                 "no"
             }
         )?;
-        if entry["last_fraction"].is_number() {
-            writeln!(out, "  Progress fraction: {}", entry["last_fraction"])?;
-        }
-        if entry["last_label"].is_string() {
-            writeln!(out, "  Progress label: {}", text(entry, "last_label"))?;
+        let label = text(entry, "last_label");
+        if let Some(fraction) = entry["last_fraction"].as_f64() {
+            let percent = (fraction.clamp(0.0, 1.0) * 100.0).abs();
+            if label.is_empty() {
+                writeln!(out, "  Progress: {percent:.0}%")?;
+            } else {
+                writeln!(out, "  Progress: {percent:.0}% — {label}")?;
+            }
+        } else if !label.is_empty() {
+            writeln!(out, "  Progress: {label}")?;
         }
     }
     Ok(out)
@@ -682,6 +687,55 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["formless", "runs", "running", "--limit", "20"]).is_err());
+    }
+
+    #[test]
+    fn invocation_snapshot_formats_human_times_and_clamps_progress_without_rewriting_json() {
+        for (fraction, label, expected) in [
+            (Some(0.0), None, Some("0%")),
+            (Some(-0.0), None, Some("0%")),
+            (Some(1.0), None, Some("100%")),
+            (
+                Some(5.0 / 12.0),
+                Some("indexing files"),
+                Some("42% — indexing files"),
+            ),
+            (Some(1.5), Some(""), Some("100%")),
+            (Some(-0.1), None, Some("0%")),
+            (None, Some("waiting"), Some("waiting")),
+            (None, Some(""), None),
+            (None, None, None),
+        ] {
+            let value = serde_json::json!([{
+                "handle":"fixture",
+                "elapsed_ms":3_725_120,
+                "silent_ms":59_999,
+                "stalled":false,
+                "abandoned":false,
+                "last_fraction":fraction,
+                "last_label":label
+            }]);
+            let raw = serde_json::to_string_pretty(&value).unwrap();
+            let report = invocation_snapshot(&value).unwrap();
+            assert!(report.contains("  Elapsed: 1h2m5s\n"));
+            assert!(report.contains("  Silent: 59.999s\n"));
+            assert_eq!(
+                report
+                    .lines()
+                    .find_map(|line| line.strip_prefix("  Progress: ")),
+                expected
+            );
+            assert_eq!(serde_json::to_string_pretty(&value).unwrap(), raw);
+        }
+        let report = invocation_snapshot(&serde_json::json!([{
+            "elapsed_ms":60_000,
+            "silent_ms":5,
+            "stalled":false,
+            "abandoned":false,
+        }]))
+        .unwrap();
+        assert!(report.contains("  Elapsed: 1m\n"));
+        assert!(report.contains("  Silent: 0.005s\n"));
     }
 
     #[test]

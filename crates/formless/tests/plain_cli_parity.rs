@@ -2143,7 +2143,9 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
     let fixture = Fixture::new();
     let entries = json!([
         {"handle":"handle-first-very-long-unclipped-1234567890","invocation_id":"invocation-full-id","tool_name":"日本語\u{1b}[31m","session_id":"session\nfull","elapsed_ms":1234,"silent_ms":0,"stalled":true,"abandoned":false,"last_fraction":0,"last_label":null},
-        {"handle":"handle-second-very-long-unclipped-1234567890","invocation_id":null,"tool_name":"second","session_id":"session-two","elapsed_ms":86400001_u64,"silent_ms":60001,"stalled":false,"abandoned":true,"last_fraction":null,"last_label":"label only\tไทย"}
+        {"handle":"handle-second-very-long-unclipped-1234567890","invocation_id":null,"tool_name":"second","session_id":"session-two","elapsed_ms":86400001_u64,"silent_ms":60001,"stalled":false,"abandoned":true,"last_fraction":null,"last_label":"label only\tไทย"},
+        {"handle":"third","tool_name":"third","session_id":"session-three","elapsed_ms":3725120,"silent_ms":59999,"stalled":false,"abandoned":false,"last_fraction":5.0 / 12.0,"last_label":"indexing \u{1b}\u{202e}files"},
+        {"handle":"fourth","tool_name":"fourth","session_id":"session-four","elapsed_ms":0,"silent_ms":0,"stalled":false,"abandoned":false,"last_fraction":1.5,"last_label":null}
     ]);
     *fixture.invocations.lock().unwrap() = entries.clone();
     for args in [
@@ -2177,22 +2179,27 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
                 "Invocation ID: invocation-full-id",
                 "Elapsed: 1.234s",
                 "Silent: 0.000s",
-                "Elapsed: 86400.001s",
-                "Silent: 60.001s",
+                "Elapsed: 24h\n",
+                "Silent: 1m\n",
+                "Elapsed: 1h2m5s\n",
+                "Silent: 59.999s\n",
                 "Stalled: yes",
                 "Stalled: no",
                 "Abandoned: no",
                 "Abandoned: yes — no longer awaited; may still finish",
-                "Progress fraction: 0",
-                "Progress label: label only\\u{9}ไทย",
+                "Progress: 0%\n",
+                "Progress: label only\\u{9}ไทย\n",
+                "Progress: 42% — indexing \\u{1b}\\u{202e}files\n",
+                "Progress: 100%\n",
                 "日本語\\u{1b}[31m",
                 "Session: session\\u{a}full",
             ] {
                 assert!(text.contains(expected), "missing {expected:?}: {text}");
             }
-            assert_eq!(text.matches("Progress fraction:").count(), 1);
-            assert_eq!(text.matches("Progress label:").count(), 1);
-            assert!(!text.contains('\u{1b}'));
+            assert_eq!(text.matches("  Progress: ").count(), 4);
+            assert!(!text.contains("Progress fraction:"));
+            assert!(!text.contains("Progress label:"));
+            assert!(!text.contains(['\u{1b}', '\u{202e}']));
         }
         let requests = fixture.requests.lock().unwrap();
         assert_eq!(requests.len(), 2, "{requests:?}");

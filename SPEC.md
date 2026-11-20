@@ -6759,9 +6759,12 @@ Existing `runs --limit N --json` remains a list (default limit 20).
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
 Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
-returned stalled/abandoned flags and optional progress fraction/label.
-Abandoned means no longer awaited and may still finish. Human metadata is
-terminal-escaped; JSON retains the original array and millisecond values.
+returned stalled/abandoned flags and optional progress. Abandoned means no
+longer awaited and may still finish. Human output uses millisecond precision
+below a minute and compact hours, minutes, and seconds for longer durations.
+It displays a rounded progress percentage when available, with any label on
+the same line. Human metadata is terminal-escaped. JSON retains the original
+array, millisecond values, and progress fractions.
 Outer `runs --json running` is also supported. An explicitly supplied
 `--limit` conflicts with this unbounded snapshot and fails before connection.
 There is no polling or Invocation control action.
