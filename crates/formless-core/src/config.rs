@@ -2711,7 +2711,14 @@ pub fn write_atomic(file: &Path, bytes: &[u8]) -> Result<()> {
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -2908,6 +2915,28 @@ mod secret_file_tests {
 #[cfg(test)]
 mod save_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_and_backup_are_private_and_existing_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("fl-cfg-private-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let config = Config::default();
+        config.save(&paths).unwrap();
+        let file = paths.config_file();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let original = "[invalid toml";
+        std::fs::write(&file, original).unwrap();
+        config.save(&paths).unwrap();
+        assert_eq!(mode(&file), 0o640);
+        let backup = file.with_extension("toml.bak");
+        assert_eq!(mode(&backup), 0o600);
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// `[[hooks]]` entries and inline tables keep their comments and
     /// unknown keys through an unrelated change; a symlinked config is
