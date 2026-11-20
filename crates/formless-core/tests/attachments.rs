@@ -36,6 +36,16 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn detects_azure_cli_cache_in_attachment_paths() {
+    for name in [".azure/accessTokens.json", ".Azure/msal_token_cache.json"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/accessTokens.json", ".azure-example/notes.txt"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");

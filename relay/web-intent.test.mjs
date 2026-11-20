@@ -1016,3 +1016,10 @@ test('Session selection pruning reads each loaded ID once for a large selection'
   assert.equal(c.S.marked.size,4000);
   assert.equal(reads,4000,'one loaded-ID index, independent of selected-ID count');
 });
+test('Azure directory warnings match on Unix and Windows paths', () => {
+  const c = setup(['pathNote']);
+  for (const path of ['/work/.Azure/accessTokens.json', 'C:\\Users\\fixture\\.azure\\msal_token_cache.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds cloud credentials']);
+  }
+  assert.deepEqual(Array.from(c.pathNote('fs:read:/work/accessTokens.json', '/work')), [false, 'inside the working folder']);
+});

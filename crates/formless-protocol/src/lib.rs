@@ -811,6 +811,12 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
             return Some((true, format!("holds {what}")));
         }
     }
+    if std::path::Path::new(path).iter().any(|part| {
+        part.to_str()
+            .is_some_and(|part| part.eq_ignore_ascii_case(".azure"))
+    }) {
+        return Some((true, "holds cloud credentials".into()));
+    }
     if segments
         .windows(2)
         .any(|w| w == [".config", "gh"] || w == [".config", "gcloud"])
@@ -4032,6 +4038,18 @@ mod tests {
         ] {
             assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");
         }
+    }
+
+    #[test]
+    fn azure_approval_warning_checks_the_credential_directory() {
+        assert_eq!(
+            path_note("fs:read:/work/.Azure/accessTokens.json", Some("/work")),
+            Some((true, "holds cloud credentials".into()))
+        );
+        assert_eq!(
+            path_note("fs:read:/work/accessTokens.json", Some("/work")),
+            Some((false, "inside the working folder".into()))
+        );
     }
 
     #[test]

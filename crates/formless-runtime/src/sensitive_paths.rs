@@ -280,7 +280,14 @@ fn builtin(path: &Path) -> Option<&'static str> {
     for (index, name) in parts.iter().enumerate() {
         if matches!(
             name.as_str(),
-            ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
+            ".ssh"
+                | ".aws"
+                | ".azure"
+                | ".gnupg"
+                | ".pki"
+                | ".kube"
+                | ".docker"
+                | ".password-store"
         ) {
             return Some("credential directory");
         }
@@ -378,6 +385,30 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn protects_azure_cli_cache_in_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [".azure/accessTokens.json", ".Azure/msal_token_cache.json"] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in ["project/accessTokens.json", ".azure-example/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);
