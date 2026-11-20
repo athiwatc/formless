@@ -695,6 +695,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             "sh" | "bash"
                 | "zsh"
                 | "fish"
+                | "elvish"
                 | "dash"
                 | "cmd"
                 | "powershell"
@@ -3829,6 +3830,21 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_elvish() {
+        for spec in [
+            "process:elvish",
+            "process:/usr/bin/elvish",
+            "process:elvish.exe",
+            "process:elvish:--version",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:elvish-doc", "process:elvish2", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
