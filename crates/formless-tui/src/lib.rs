@@ -16540,8 +16540,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let now = chrono::Utc::now();
-    let name_w = (area.width as usize / 3).clamp(10, 40);
+    // Leave room for the border, highlight, three status markers and the
+    // metadata separator. In a narrow panel, give metadata at least half
+    // of the remaining content columns. A zero-width name cell is omitted.
+    let content_w = usize::from(area.width).saturating_sub(11);
+    let name_w = (content_w / 3).clamp(10, 40).min(content_w / 2);
     let rows = app.session_rows();
     let visible: Vec<_> = rows.iter().map(|row| row.index).collect();
     let archived = app.sessions.iter().filter(|s| s.archived).count();
@@ -16575,13 +16581,8 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 if !row.note.is_empty() {
                     meta.push_str(&format!(" · {}", row.note));
                 }
-                let name = format!(
-                    "{}{}{}",
-                    "  ".repeat(row.depth),
-                    if row.depth > 0 { "↳ " } else { "" },
-                    s.name
-                );
-                ListItem::new(Line::from(vec![
+                let name = session_ui::name_cell(&s.name, row.depth, name_w);
+                let mut spans = vec![
                     Span::styled(
                         if app.marked.contains(&s.id) {
                             "✓ "
@@ -16597,7 +16598,15 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         if s.pinned { "★ " } else { "  " },
                         fg(app.color, Color::Yellow),
                     ),
-                    Span::raw(ui::pad(&name, name_w.max(text::width(&name)))),
+                ];
+                if text::width(&name) == name_w {
+                    spans.push(Span::raw(name));
+                } else {
+                    // Span advances by whole-string width, even though
+                    // it draws each grapheme separately.
+                    spans.extend(name.graphemes(true).map(|g| Span::raw(g.to_owned())));
+                }
+                spans.extend([
                     Span::styled(format!(" {meta}"), ui::dim(app.color)),
                     Span::styled(
                         s.preview
@@ -16606,7 +16615,8 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                             .unwrap_or_default(),
                         fg(app.color, Color::Gray),
                     ),
-                ]))
+                ]);
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -26489,6 +26499,86 @@ mod tests {
             row("a work").contains('⏸') && row("b work").contains('◐'),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn session_list_bounds_names_and_lineage_without_losing_row_targets() {
+        let mut app = test_app();
+        let long_name = "研究👩‍💻e\u{301} plus a very long session name";
+        app.view = View::Sessions;
+        app.session_filter.tree = true;
+        app.sessions = (0..=9)
+            .map(|depth| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{depth}"),
+                    "name": if depth == 9 { long_name } else { "short" },
+                    "forked_from": (depth > 0).then(|| format!("s{}", depth - 1)),
+                    "fork_point_seq": (depth > 0).then_some(3),
+                    "message_count": 12,
+                    "created_at": "2000-01-01T00:00:00Z",
+                    "updated_at": "2099-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect();
+        app.session_idx = 9;
+        let before = app.session_rows();
+        assert_eq!(before[9].depth, 9);
+        let screen = render(&mut app, 48, 18);
+        let row = screen.lines().find(|row| row.contains('研')).unwrap();
+        assert!(row.replace(' ', "").contains("↳研究👩‍💻e\u{301}…"), "{row}");
+        assert!(row.contains("just now · 12 msgs"), "{row}");
+        assert!(screen
+            .lines()
+            .any(|row| row.contains("short") && row.contains("12 msgs")));
+
+        for width in [1, 7, 11, 12, 13, 20, 48, 80] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+            app.click_targets.borrow_mut().clear();
+            terminal
+                .draw(|frame| draw_sessions(frame, Rect::new(0, 0, width, 18), &app))
+                .unwrap();
+            let targets = app.click_targets.borrow();
+            assert_eq!(targets.len(), 10);
+            assert_eq!(
+                targets[9],
+                (
+                    Rect::new(1, 10, width.saturating_sub(2), 1),
+                    Click::Session(9)
+                )
+            );
+        }
+        assert_eq!(app.session_rows(), before);
+        assert_eq!(app.session_idx, 9);
+        assert_eq!(app.sessions[9].name, long_name);
+
+        app.sessions[0].name = "لا".repeat(9);
+        let screen = render(&mut app, 48, 18);
+        let row = screen.lines().find(|row| row.contains('ل')).unwrap();
+        assert!(row.contains("لالالالالال… just now · 12 msgs"), "{row}");
+    }
+
+    #[test]
+    fn session_name_column_measures_the_graphemes_the_list_paints() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let arabic = "لا".repeat(9);
+        assert_eq!(session_ui::name_cell(&arabic, 0, 12), "لالالالالال…");
+        for name in [arabic.as_str(), "研究👩‍💻e\u{301} sample", "short"] {
+            for depth in [0, 1, 9, 12] {
+                for width in 0..=40 {
+                    let cell = session_ui::name_cell(name, depth, width);
+                    assert_eq!(
+                        cell.graphemes(true).map(text::width).sum::<usize>(),
+                        width,
+                        "{name}, depth {depth}: {cell}"
+                    );
+                    if depth > 0 && width > 0 {
+                        assert!(cell.contains('↳'));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
