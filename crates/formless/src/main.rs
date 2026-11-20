@@ -2671,23 +2671,10 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 None if session.is_none() => std::env::current_dir().ok(),
                 None => None,
             };
-            let restore = match (&session, pick_was_set || cwd.is_some()) {
-                (Some(id), true) => {
-                    formless_core::daemon::ensure_daemon(&paths)?;
-                    let list: Vec<SessionInfo> = serde_json::from_value(
-                        formless_tui::client::request_once(&paths, Request::ListSessions)?,
-                    )?;
-                    list.into_iter().find(|s| &s.id == id)
-                }
-                _ => None,
-            };
-            // `--effort` alone keeps the Session's model.
-            let pick = if pipeline_mode { None } else { pick }.map(|(model, effort)| {
-                (
-                    model.or_else(|| restore.as_ref().and_then(|s| s.model.clone())),
-                    effort,
-                )
-            });
+            // Capture the restoration record from the same Session lookup
+            // that supplies the canonical ID for the Run.
+            let mut restore = None;
+            let pick = if pipeline_mode { None } else { pick };
             let code = run_headless(
                 paths.clone(),
                 task,
@@ -2703,6 +2690,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 max_steps,
                 prepared.options,
                 pipeline.output_file,
+                &mut restore,
             );
             if let Some(s) = restore {
                 if pick_was_set {
@@ -4493,13 +4481,32 @@ fn last_run_session(paths: &Paths) -> Result<String, String> {
     }
 }
 
+fn prepare_existing_headless_session(
+    session: SessionInfo,
+    pick: &mut Option<ModelPick>,
+    override_cwd: bool,
+    restore: &mut Option<SessionInfo>,
+) -> String {
+    let id = session.id.clone();
+    if let Some((model, _)) = pick {
+        // An effort-only override keeps the existing Session model.
+        if model.is_none() {
+            *model = session.model.clone();
+        }
+    }
+    if pick.is_some() || override_cwd {
+        *restore = Some(session);
+    }
+    id
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     paths: Paths,
     task: String,
     files: Vec<(String, Vec<u8>)>,
     session: Option<String>,
-    pick: Option<ModelPick>,
+    mut pick: Option<ModelPick>,
     dir: Option<std::path::PathBuf>,
     yes: bool,
     answer: Option<String>,
@@ -4509,6 +4516,7 @@ fn run_headless(
     max_steps: Option<u32>,
     options: formless_protocol::RunOptions,
     output_file: Option<std::path::PathBuf>,
+    restore: &mut Option<SessionInfo>,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let json_out = output == RunOutput::JsonlEvents;
@@ -4557,7 +4565,7 @@ fn run_headless(
     let session_id = match session {
         // An id, an id prefix or a name, confirmed to exist (#893).
         Some(id) => match find_session(&paths, &id) {
-            Ok(s) => s.id,
+            Ok(s) => prepare_existing_headless_session(s, &mut pick, dir.is_some(), restore),
             Err(e) => {
                 eprintln!("{e}");
                 return Ok(2);
@@ -9018,6 +9026,78 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    fn override_fixture(id: &str, name: &str) -> super::SessionInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "model": "stored-model",
+            "reasoning_effort": "low",
+            "cwd": "stored-directory",
+            "created_at": "",
+            "updated_at": "",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn headless_overrides_use_the_resolved_target_and_snapshot() {
+        use super::{find_session_in, prepare_existing_headless_session};
+
+        let sessions = [
+            override_fixture("abc-one", "Primary"),
+            override_fixture("abc-two", "Other"),
+            override_fixture("xyz-three", "Other"),
+        ];
+        for selector in ["abc-one", "abc-o", "pRiMaRy"] {
+            let resolved = find_session_in(&sessions, selector).unwrap();
+            let mut pick = Some((None, Some("high".into())));
+            let mut restore = None;
+            let id = prepare_existing_headless_session(resolved, &mut pick, true, &mut restore);
+            assert_eq!(id, "abc-one");
+            assert_eq!(
+                pick,
+                Some((Some("stored-model".into()), Some("high".into())))
+            );
+            let snapshot = restore.unwrap();
+            assert_eq!(snapshot.id, id);
+            assert_eq!(snapshot.model.as_deref(), Some("stored-model"));
+            assert_eq!(snapshot.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(snapshot.cwd.as_deref(), Some("stored-directory"));
+        }
+        for selector in ["abc-", "Other", "missing", ""] {
+            assert!(find_session_in(&sessions, selector).is_err());
+        }
+    }
+
+    #[test]
+    fn headless_snapshot_is_needed_only_for_temporary_overrides() {
+        use super::prepare_existing_headless_session;
+
+        let mut pick = None;
+        for override_cwd in [false, true] {
+            let mut restore = None;
+            let id = prepare_existing_headless_session(
+                override_fixture("abc-one", "Primary"),
+                &mut pick,
+                override_cwd,
+                &mut restore,
+            );
+            assert_eq!(id, "abc-one");
+            assert!(pick.is_none());
+            assert_eq!(restore.is_some(), override_cwd);
+        }
+        let mut pick = Some((Some("explicit-model".into()), None));
+        let mut restore = None;
+        prepare_existing_headless_session(
+            override_fixture("abc-one", "Primary"),
+            &mut pick,
+            false,
+            &mut restore,
+        );
+        assert_eq!(pick, Some((Some("explicit-model".into()), None)));
+        assert_eq!(restore.unwrap().model.as_deref(), Some("stored-model"));
+    }
+
     #[test]
     fn tool_result_preview_marks_omission_at_complete_grapheme_boundaries() {
         use super::tool_result_preview;
