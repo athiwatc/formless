@@ -700,6 +700,10 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "powershell"
                 | "pwsh"
                 | "osascript"
+                | "awk"
+                | "gawk"
+                | "mawk"
+                | "nawk"
                 | "env"
                 | "xargs"
                 | "sudo"
@@ -3829,6 +3833,29 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_awk_interpreters() {
+        for spec in [
+            "process:awk",
+            "process:gawk",
+            "process:mawk",
+            "process:nawk",
+            "process:/usr/bin/awk",
+            "process:gawk.exe",
+            "process:awk:--version",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:awkward",
+            "process:awk2",
+            "process:gawk-helper",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
