@@ -281,7 +281,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
         if matches!(
             name.as_str(),
             ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
-        ) {
+        ) || (name == "gcloud" && (index + 1 < parts.len() || path.is_dir()))
+        {
             return Some("credential directory");
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
@@ -378,6 +379,35 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn gcloud_paths_require_credential_consent() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for name in [
+            ".config/gcloud/application_default_credentials.json",
+            "AppData/Roaming/GCloud/application_default_credentials.json",
+        ] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Sensitive("credential directory".into()),
+                "{name}"
+            );
+        }
+        for name in [
+            "application_default_credentials.json",
+            "bin/gcloud",
+            "notes.txt",
+        ] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);
