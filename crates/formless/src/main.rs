@@ -4567,23 +4567,28 @@ fn run_headless(
             let id = client.send(Request::CreateSession {
                 name: Some("headless".into()),
             });
-            let mut found = None;
-            while found.is_none() {
+            loop {
                 match rx.recv() {
                     Ok(ServerMessage::Response {
                         id: rid,
-                        ok: true,
+                        ok,
                         result,
-                        ..
+                        error,
                     }) if rid == id => {
+                        if !ok {
+                            let error = error
+                                .as_deref()
+                                .unwrap_or("the daemon could not create a Session");
+                            eprintln!("error: {error}");
+                            return Ok(2);
+                        }
                         let s: SessionInfo = serde_json::from_value(result.unwrap_or_default())?;
-                        found = Some(s.id);
+                        break s.id;
                     }
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::anyhow!("daemon closed: {e}")),
                 }
             }
-            found.unwrap()
         }
     };
     let _ = std::fs::write(paths.last_run_session_file(), &session_id);
