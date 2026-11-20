@@ -854,7 +854,7 @@ enum ToolsAction {
         /// Inline JSON object (the default is {} when neither input flag is used)
         #[arg(long, value_name = "JSON", conflicts_with = "input_file")]
         input: Option<String>,
-        /// Read a UTF-8 JSON object from FILE or '-' (stdin), at most 1 MiB
+        /// Read a UTF-8 JSON object from a regular FILE or '-' (stdin), at most 1 MiB
         #[arg(long, value_name = "FILE|-")]
         input_file: Option<std::path::PathBuf>,
         /// Approve this run's Capabilities once (nothing is remembered)
@@ -867,7 +867,7 @@ enum ToolsAction {
         /// non-GET requests aren't made; prints what it would have done
         #[arg(long)]
         dry_run: bool,
-        /// Print the complete daemon reply as one JSON value
+        /// Print the complete Tool result from the daemon as one JSON value
         #[arg(long)]
         json: bool,
     },

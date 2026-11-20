@@ -5705,8 +5705,7 @@ previous headless Run's Session.
   exclusive and the default input is `{}`. Invalid input exits 2 before
   profile setup or daemon dispatch. `tools run --json` prints one complete
   daemon result, including dry-run effects and logs. Request errors go
-  to stderr. `formless man` documents every
-  subcommand's options, two levels deep.
+  to stderr. `formless man` documents every subcommand's options, two levels deep.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.
 
