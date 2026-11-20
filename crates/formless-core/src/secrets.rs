@@ -23,6 +23,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("xoxb-", "Slack token"),
     ("xoxp-", "Slack token"),
     ("AIza", "Google API key"),
+    ("SG.", "SendGrid API key"),
     ("AKIA", "AWS access key"),
     ("ASIA", "AWS access key"),
 ];
@@ -260,6 +261,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn sendgrid_keys_are_redacted_as_one_dotted_value() {
+        let key = [
+            "SG",
+            "0123456789abcdefghijkl",
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+        ]
+        .join(".");
+        assert_eq!(
+            redact(&format!("({key})")),
+            ("([REDACTED])".into(), Some("SendGrid API key"))
+        );
+        assert_eq!(redact("SG.tooshort"), ("SG.tooshort".into(), None));
+    }
 
     #[test]
     fn finds_and_blanks_secret_shapes_not_key_names() {
