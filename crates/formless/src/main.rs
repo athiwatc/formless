@@ -227,7 +227,7 @@ enum Cmd {
     },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --limit 50 --json"
+        after_help = "Examples:\n  formless jobs list\n  formless jobs preview \"every weekday at 9am\"\n  formless jobs history JOB_ID --limit 50 --json"
     )]
     Jobs {
         #[command(subcommand)]
@@ -1102,6 +1102,17 @@ enum JobsAction {
         /// POST the answer (JSON) to this URL
         #[arg(long)]
         webhook: Option<String>,
+    },
+    /// Preview projected times for a recurring schedule
+    #[command(
+        long_about = "Preview a recurring schedule (cron or supported plain English). Times are projected from the daemon's current local time. The preview leaves jobs unchanged and is not a guarantee of validation by jobs add or future execution."
+    )]
+    Preview {
+        /// Recurring schedule expression, quoted if it contains spaces
+        schedule: String,
+        /// Print the daemon's cron and next times as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Fire a job now (its schedule is unchanged)
     Run {
@@ -7041,6 +7052,31 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             }
             if let Some(w) = j["warning"].as_str() {
                 eprintln!("warning: {w}");
+            }
+        }
+        JobsAction::Preview { schedule, json } => {
+            let preview = daemon(Request::PreviewSchedule { schedule })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+                return Ok(());
+            }
+            let cron = preview["cron"]
+                .as_str()
+                .context("schedule preview did not return a cron expression")?;
+            let next = preview["next"]
+                .as_array()
+                .context("schedule preview did not return a list of times")?
+                .iter()
+                .map(|time| time.as_str().context("invalid time in schedule preview"))
+                .collect::<Result<Vec<_>>>()?;
+            println!("Cron: {cron}");
+            if next.is_empty() {
+                println!("No upcoming times were returned.");
+            } else {
+                println!("Projected from the daemon's current local time:");
+                for time in next {
+                    println!("  {time}");
+                }
             }
         }
         JobsAction::Run { id } => {

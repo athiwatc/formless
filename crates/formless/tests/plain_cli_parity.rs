@@ -226,6 +226,24 @@ impl Fixture {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":"run-one", "restored":["dir/a.txt"], "skipped":[{"path":"dir/changed.txt","reason":"changed since Run"}]})
                         }
+                        Request::PreviewSchedule { schedule } => {
+                            match schedule_preview_fixture(schedule) {
+                                Ok(preview) => preview,
+                                Err(error) => {
+                                    seen.lock().unwrap().push(envelope.request);
+                                    let reply = formless_protocol::ServerMessage::err(
+                                        envelope.id,
+                                        error.to_string(),
+                                    );
+                                    let reply = serde_json::to_string(&reply).unwrap();
+                                    if writeln!(socket, "{reply}").is_err() {
+                                        break;
+                                    }
+                                    line.clear();
+                                    continue;
+                                }
+                            }
+                        }
                         Request::Gc { dry_run } => gc_report(*dry_run),
                         Request::RestartMcpServer { name } => mcp_test_report(name),
                         Request::AddMcpServer { .. } => {
@@ -887,6 +905,116 @@ fn shipped_session_organization_uses_exact_mutations_and_returned_stored_state()
         "--json",
     ] {
         assert!(text.contains(expected), "{text}");
+    }
+}
+
+fn schedule_preview_fixture(schedule: &str) -> anyhow::Result<Value> {
+    let cron = formless_core::jobs::to_cron(schedule)?;
+    let next: &[&str] = match cron.as_str() {
+        "0 9 * * 1-5" => &[
+            "2026-11-23T09:00:00+07:00",
+            "2026-11-24T09:00:00+07:00",
+            "2026-11-25T09:00:00+07:00",
+        ],
+        "0 0 29 2 *" => &["2096-02-29T00:00:00+07:00"],
+        "0 0 31 2 *" => &[],
+        _ => panic!("unexpected preview cron: {cron}"),
+    };
+    Ok(json!({"cron":cron,"next":next,"future":"日本語 · เวลา"}))
+}
+
+#[test]
+fn shipped_jobs_preview_requests_only_the_daemons_schedule_preview() {
+    let fixture = Fixture::new();
+    for (schedule, count) in [
+        ("every weekday at 9am", 3),
+        ("0 9 * * 1-5", 3),
+        ("0 0 29 2 *", 1),
+        ("0 0 31 2 *", 0),
+    ] {
+        let expected = schedule_preview_fixture(schedule).unwrap();
+        let next = expected["next"].as_array().unwrap();
+        assert_eq!(next.len(), count);
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["jobs", "preview", schedule];
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            if json_mode {
+                assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), expected);
+                assert!(stdout.contains("日本語 · เวลา"));
+            } else {
+                let mut lines = stdout.lines();
+                let cron = expected["cron"].as_str().unwrap();
+                assert_eq!(lines.next(), Some(format!("Cron: {cron}").as_str()));
+                if count == 0 {
+                    assert_eq!(lines.next(), Some("No upcoming times were returned."));
+                    assert!(lines.next().is_none());
+                } else {
+                    assert_eq!(
+                        lines.next(),
+                        Some("Projected from the daemon's current local time:")
+                    );
+                    assert_eq!(
+                        lines.map(str::trim).collect::<Vec<_>>(),
+                        next.iter()
+                            .map(|time| time.as_str().unwrap())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::PreviewSchedule { schedule: sent }] if sent == schedule
+            ));
+        }
+    }
+}
+
+#[test]
+fn shipped_jobs_preview_help_and_parser_errors_leave_jobs_untouched() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["jobs", "preview", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    for expected in [
+        "recurring schedule",
+        "daemon's current local time",
+        "jobs add",
+        "--json",
+    ] {
+        assert!(help.contains(expected), "{help}");
+    }
+    let invalid_flag = fixture.run(&["jobs", "preview", "--at", "in 30m"]);
+    assert!(!invalid_flag.status.success() && invalid_flag.stdout.is_empty());
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    for schedule in ["60 9 * * *", "in 30m"] {
+        let expected_error = formless_core::jobs::to_cron(schedule)
+            .unwrap_err()
+            .to_string();
+        for extra in [&[][..], &["--json"]] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["jobs", "preview", schedule];
+            args.extend_from_slice(extra);
+            let out = fixture.run(&args);
+            assert!(!out.status.success() && out.stdout.is_empty());
+            assert!(String::from_utf8(out.stderr)
+                .unwrap()
+                .contains(&expected_error));
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::PreviewSchedule { schedule: sent }] if sent == schedule
+            ));
+        }
     }
 }
 

@@ -3705,8 +3705,12 @@ refresh a cache, nightly cleanup.
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron.
-    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
-    which `jobs add` prints to confirm.
+    `PreviewSchedule {schedule}` returns the cron and up to three projected
+    recurring times from the daemon's current local time. `jobs add` prints
+    them after creation. `formless jobs preview SCHEDULE [--json]` requests
+    the same preview without creating or updating a Job. An empty preview
+    means no upcoming times were returned. Adding a Job performs its own
+    validation.
   - Both entry points require a nonblank prompt and a one-shot time strictly
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
