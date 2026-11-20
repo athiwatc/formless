@@ -424,6 +424,14 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+/// MySQL requires whitespace or a control character after a double dash.
+const MYSQL: Lang = Lang {
+    line_comments: &["--", "#"],
+    quotes: &['\'', '"', '`'],
+    multiline: &["'", "\"", "`"],
+    ..SQL
+};
+
 /// `--` comments: Lua, Haskell.
 const SQL_DASH: Lang = Lang {
     line_comments: &["--"],
@@ -461,7 +469,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "json5" => &JSON5,
         "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
-        "sql" | "sqlite" | "postgres" | "postgresql" | "mysql" => &SQL,
+        "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
+        "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
         "css" | "scss" | "less" => &CSS,
         _ => return None,
@@ -485,6 +494,7 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    mysql_comments: bool,
     json5_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
@@ -605,6 +615,7 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            mysql_comments: name == "mysql",
             json5_strings: name == "json5",
             color,
             in_block: 0,
@@ -631,6 +642,7 @@ impl Highlighter {
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
+        let mysql = self.mysql_comments;
         let chars: Vec<char> = line.chars().collect();
         let continues_string =
             self.json5_strings && line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0;
@@ -673,7 +685,7 @@ impl Highlighter {
         let close_at = |from: usize, close: &str| -> Option<usize> {
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' {
+                if chars[j] == '\\' && !(mysql && close == "`") {
                     j += 2;
                     continue;
                 }
@@ -764,8 +776,17 @@ impl Highlighter {
                     continue;
                 }
             }
-            if l.line_comments.iter().any(|p| at(i, p))
-                && (c != '#' || self.python_comments || i == 0 || chars[i - 1].is_whitespace())
+            let hash_comment =
+                c != '#' || self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace();
+            if hash_comment
+                && l.line_comments.iter().any(|p| {
+                    at(i, p)
+                        && (!mysql
+                            || *p != "--"
+                            || chars
+                                .get(i + 2)
+                                .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
+                })
             {
                 push(Tok::Comment, &chars[i..]);
                 break;
@@ -1165,6 +1186,54 @@ mod tests {
             highlighter.line("// comment")[0].style.fg,
             Some(Color::DarkGray)
         );
+    }
+
+    #[test]
+    fn mysql_comments_do_not_change_generic_sql() {
+        let tokens = toks("mysql", "SELECT 1;# keep /* false");
+        assert!(tokens.contains(&("# keep /* false".into(), Some(Color::DarkGray))));
+        let tokens = toks("mysql", "SELECT 1--2 AS n");
+        assert!(!tokens.iter().any(|(_, c)| *c == Some(Color::DarkGray)));
+        assert!(tokens
+            .iter()
+            .any(|(s, c)| s == "AS" && *c == Some(Color::Magenta)));
+        for source in ["--", "-- comment", "--\tcomment"] {
+            assert_eq!(
+                toks("mysql", source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+        }
+        for quoted in ["'# -- /*'", r##""# -- /*""##, "`# -- /*`", "`a\\`"] {
+            assert_eq!(
+                toks("mysql", quoted),
+                vec![(quoted.into(), Some(Color::Green))]
+            );
+        }
+        let mut h = Highlighter::new("mysql", true).unwrap();
+        h.line("# keep /* false");
+        assert!(h.line("SELECT 1").iter().any(|s| s.content == "SELECT"));
+        h.line("/* real block");
+        assert!(h
+            .line("# --")
+            .iter()
+            .all(|s| s.style.fg == Some(Color::DarkGray)));
+        assert!(h.line("*/ SELECT 2").iter().any(|s| s.content == "SELECT"));
+        h.line(r#"SELECT "first"#);
+        let closing = h.line(r##"# continued" AS label # comment"##);
+        assert_eq!(closing[0].content, "# continued\"");
+        assert_eq!(closing[0].style.fg, Some(Color::Green));
+        assert!(closing
+            .iter()
+            .any(|s| s.content == "# comment" && s.style.fg == Some(Color::DarkGray)));
+        assert!(
+            toks("mysql", "`a\\`# comment").contains(&("# comment".into(), Some(Color::DarkGray)))
+        );
+        for lang in ["sql", "sqlite", "postgres", "postgresql"] {
+            assert!(toks(lang, "1--2 AS n").contains(&("--2 AS n".into(), Some(Color::DarkGray))));
+            assert!(!toks(lang, "# drop table")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::DarkGray)));
+        }
     }
 
     #[test]

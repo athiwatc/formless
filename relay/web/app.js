@@ -1672,6 +1672,7 @@
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
+  HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
@@ -1680,7 +1681,7 @@
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
@@ -1742,7 +1743,9 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
+      const hashComment = c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]);
+      if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
+          (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
         tok("tok-com", code.slice(i, stop));
@@ -1751,7 +1754,10 @@
       }
       if (L.q.includes(c)) {
         let j = i + 1;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || c === "`")) j += code[j] === "\\" ? 2 : 1;
+        const multiline = c === "`" || L.mysqlComments;
+        while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
+          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+        }
         const stop = Math.min(j + 1, code.length);
         tok("tok-str", code.slice(i, stop));
         i = stop;
