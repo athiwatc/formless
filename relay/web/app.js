@@ -5732,6 +5732,11 @@
     } }, "Free " + humanBytes(r.total_bytes));
     close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)), { trigger });
   }
+  function daemonUptime(seconds) {
+    return seconds >= 3600
+      ? Math.floor(seconds / 3600) + "h " + Math.floor(seconds % 3600 / 60) + "m"
+      : Math.floor(seconds / 60) + "m " + Math.floor(seconds % 60) + "s";
+  }
   // The daemon and what it is using (SPEC §9.3).
   async function showStatus() {
     const trigger = document.activeElement;
@@ -5740,7 +5745,7 @@
     const r = v.resources || {};
     const rows = [
       ["daemon", "pid " + v.pid + " · " + v.version],
-      ["uptime", r.uptime_secs != null ? Math.floor(r.uptime_secs / 60) + " min" : "?"],
+      ["uptime", r.uptime_secs != null ? daemonUptime(r.uptime_secs) : "?"],
       ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? uiFixed(r.cpu_percent, 1) : "?") + "%" : "n/a"],
       ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
       ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
