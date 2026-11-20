@@ -5569,9 +5569,12 @@
     if (!supported) return h("span", { class: "muted" }, "not supported in this browser");
     navigator.serviceWorker.getRegistration().then(async (reg) => {
       const sub = reg && (await reg.pushManager.getSubscription());
+      const refused = sub && S.pushRefusal?.room === S.room && S.pushRefusal?.endpoint === sub.endpoint;
       box.replaceChildren(sub
-        ? h("span", null, "on · ", h("button", { class: "btn ghost small", type: "button", onclick: () => pushOff(sub) }, "Turn off"))
-        : h("button", { class: "btn small", type: "button", onclick: pushOn }, "Notify me about approvals"));
+        ? h("span", null, refused ? S.pushRefusal.message + " " : "on · ",
+            refused ? h("button", { class: "btn small", type: "button", onclick: () => pushOn(sub) }, "Retry") : null,
+            h("button", { class: "btn ghost small", type: "button", onclick: () => pushOff(sub) }, "Turn off"))
+        : h("button", { class: "btn small", type: "button", onclick: () => pushOn() }, "Notify me about approvals"));
     });
     return box;
   }
@@ -5579,10 +5582,14 @@
     const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
     return Uint8Array.from(b, (c) => c.charCodeAt(0));
   }
-  async function pushOn() {
+  async function pushOn(existing) {
     if (S.forgetting || S.pushRemoval || S.pushEnabling) return;
     S.pushEnabling = true;
     try {
+      if (existing) {
+        registerRelayPush(S.ws, existing, true);
+        return;
+      }
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
@@ -5592,8 +5599,7 @@
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
       const sub = await S.pushSubscribe;
       if (S.forgetting || S.pushRemoval) return;
-      registerRelayPush(S.ws, sub);
-      note("This device gets a notification when an approval or question waits.");
+      registerRelayPush(S.ws, sub, true);
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
     } finally {
@@ -5610,29 +5616,55 @@
     try {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
+      if (sub && S.pushRefusal?.room === room && S.pushRefusal?.endpoint === sub.endpoint) return;
       if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
         registerRelayPush(ws, sub);
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
   const PUSH_CLEANUP_MS = 1500;
-  function registerRelayPush(ws, sub) {
+  function registerRelayPush(ws, sub, interactive = false) {
     if (ws?.readyState !== 1) throw new Error("not connected to the relay");
     if (S.pushRegistration?.socket === ws) return;
+    const room = S.room;
+    const wire = sub.toJSON();
     let resolve;
     const settled = new Promise((done) => { resolve = done; });
-    const finish = (socket) => {
+    const finish = (socket, outcome) => {
       if (socket !== ws) return;
       ws.removeEventListener("close", closed);
-      if (S.pushRegistration === pending) S.pushRegistration = null;
+      if (S.pushRegistration === pending) {
+        S.pushRegistration = null;
+        if (outcome && S.ws === ws && S.room === room) {
+          if (outcome === "accepted") {
+            if (S.pushRefusal?.room === room && S.pushRefusal?.endpoint === wire.endpoint) S.pushRefusal = null;
+            if (interactive && !S.forgetting) note("This device gets a notification when an approval or question waits.");
+          } else {
+            S.pushRefusal = { room, endpoint: wire.endpoint, message: outcome };
+            if (!S.forgetting) toast(outcome, true);
+          }
+          if (!S.forgetting && S.view === "settings") renderView();
+        }
+      }
       resolve();
     };
     const closed = () => finish(ws);
     const pending = { socket: ws, settled, finish };
     S.pushRegistration = pending;
     ws.addEventListener("close", closed, { once: true });
-    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() })); }
+    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: wire })); }
     catch (error) { finish(ws); throw error; }
+  }
+  function pushRefused(ws, value) {
+    if (value.operation === "unsubscribe") {
+      S.pushRemovalAck?.(ws, value.id, false);
+      return;
+    }
+    if (value.operation !== "subscribe") return;
+    const message = value.reason === "capacity" ? "The relay has reached its notification device limit."
+      : value.reason === "busy" ? "The relay is busy. Retry notification setup."
+      : "The relay refused this browser's notification subscription.";
+    S.pushRegistration?.finish(ws, message);
   }
   async function boundedPushCleanup(promise) {
     let timer;
@@ -5660,7 +5692,7 @@
       };
       const closed = () => done(false);
       const timer = setTimeout(closed, PUSH_CLEANUP_MS);
-      S.pushRemovalAck = (socket, ack) => { if (ws === socket && ack === id) done(true); };
+      S.pushRemovalAck = (socket, ack, confirmed = true) => { if (ws === socket && ack === id) done(confirmed); };
       ws.addEventListener("close", closed, { once: true });
       try { ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint, id })); }
       catch (_) { closed(); }
@@ -7726,8 +7758,9 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws); return; }
+              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws, "accepted"); return; }
               if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
+              if (value.relay === "push_refused") { pushRefused(ws, value); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");
                 S.relayRoomReady = true;
