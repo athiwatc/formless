@@ -7,6 +7,9 @@ import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+test('web actions avoid native synchronous prompt and confirm calls', () => {
+  assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ''), /\b(?:prompt|confirm)\s*\(/);
+});
 const fn = (name) => {
   const start = source.search(new RegExp('  (?:async )?function ' + name + '\\('));
   assert.ok(start >= 0, name);
@@ -29,6 +32,9 @@ function setup(names, extras = {}) {
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
+  if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
+    vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
+  }
   const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
