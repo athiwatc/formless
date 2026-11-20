@@ -118,9 +118,9 @@ For rollback, stop the new container and any other writers. Before starting
 the previous image, check whether that version can open the post-upgrade
 state. If compatibility is not documented, restore the pre-upgrade data and
 config backup into separate volumes first. Then recreate the container with
-the previous tag or digest and point it at the restored volumes, not the
-migrated originals. Keep the post-upgrade volumes intact; the restored copy
-does not contain changes made since the backup.
+the previous tag or digest. If you restored the backup, mount the restored
+volumes instead of the migrated originals. Keep the post-upgrade volumes
+intact; the restored copy does not contain changes made since the backup.
 
 ## The API key
 
