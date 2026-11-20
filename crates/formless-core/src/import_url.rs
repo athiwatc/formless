@@ -17,12 +17,16 @@ type ResolveHost = fn(&str, u16, Instant) -> Result<Vec<SocketAddr>, String>;
 pub enum Source {
     /// Fetch this URL and read it as a bundle.
     Direct(String),
-    /// A gist: read its files through the GitHub API.
-    Gist(String),
+    /// A gist page: read its files from the specified revision through the GitHub API.
+    Gist {
+        id: String,
+        revision: Option<String>,
+        file_anchor: Option<String>,
+    },
 }
 
 /// Check the URL (https only) and map GitHub pages to what holds the file:
-/// a gist page to its id, a `github.com/…/blob/…` page to its raw file.
+/// a gist page to its GitHub API selection and a GitHub blob page to its raw file.
 pub fn resolve(url: &str) -> Result<Source> {
     resolve_with_label(url).map(|(source, _)| source)
 }
@@ -52,12 +56,7 @@ fn resolve_with_label(url: &str) -> Result<(Source, String)> {
     // with direct requests and is never carried to the API/raw authority.
     let source = match (parsed.port(), host) {
         (None, "gist.github.com" | "gist.githubusercontent.com") => {
-            let id = path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .find(|s| s.len() >= 20 && s.chars().all(|c| c.is_ascii_hexdigit()))
-                .ok_or_else(|| anyhow!("no gist id in {label}"))?;
-            Source::Gist(id.to_string())
+            resolve_gist(&parsed, host, path, &label)?
         }
         (None, "github.com") if path.split('/').nth(2) == Some("blob") => {
             let parts: Vec<&str> = path.splitn(4, '/').collect();
@@ -71,6 +70,47 @@ fn resolve_with_label(url: &str) -> Result<(Source, String)> {
         _ => Source::Direct(url.to_string()),
     };
     Ok((source, label))
+}
+
+fn resolve_gist(url: &reqwest::Url, host: &str, path: &str, label: &str) -> Result<Source> {
+    let mut parts = path.trim_end_matches('/').split('/');
+    let is_id = |part: &str| part.len() >= 20 && part.bytes().all(|c| c.is_ascii_hexdigit());
+    let first = parts.next().unwrap_or_default();
+    let id = if is_id(first) {
+        first
+    } else {
+        parts
+            .next()
+            .filter(|part| is_id(part))
+            .ok_or_else(|| anyhow!("no gist id in {label}"))?
+    };
+    let next = parts.next();
+    if host == "gist.githubusercontent.com" && next == Some("raw") {
+        return Ok(Source::Direct(display_url(url)));
+    }
+    let revision = match next {
+        None => None,
+        Some(sha)
+            if (7..=40).contains(&sha.len())
+                && sha.bytes().all(|c| c.is_ascii_hexdigit())
+                && parts.next().is_none() =>
+        {
+            Some(sha.to_owned())
+        }
+        Some(_) => bail!("invalid gist revision in {label}"),
+    };
+    Ok(Source::Gist {
+        id: id.to_owned(),
+        revision,
+        file_anchor: url
+            .fragment()
+            .filter(|fragment| fragment.starts_with("file-"))
+            .map(str::to_owned),
+    })
+}
+
+fn gist_file_anchor(name: &str) -> String {
+    format!("file-{}", name.to_lowercase().replace('.', "-"))
 }
 
 /// A Tool bundle (`formless.tool/1`) or a registry export
@@ -89,11 +129,19 @@ enum GistChoices {
     Raw(Vec<(String, String)>),
 }
 
-fn gist_choices(gist: &Value) -> Result<GistChoices> {
+fn gist_choices(gist: &Value, file_anchor: Option<&str>) -> Result<GistChoices> {
     let files = gist["files"]
         .as_object()
         .ok_or_else(|| anyhow!("the gist has no files"))?;
     let mut names: Vec<_> = files.keys().collect();
+    if let Some(anchor) = file_anchor {
+        names.retain(|name| gist_file_anchor(name) == anchor);
+        match names.len() {
+            0 => bail!("no gist file matches #{anchor}"),
+            1 => (),
+            _ => bail!("more than one gist file matches #{anchor}"),
+        }
+    }
     names.sort();
     // A complete bundle wins over unrelated truncated files anywhere in the
     // gist. Truncated inline content is never treated as the complete file.
@@ -129,6 +177,9 @@ fn gist_choices(gist: &Value) -> Result<GistChoices> {
     };
     raw.sort_by(|a, b| (!json(&a.0)).cmp(&!json(&b.0)).then_with(|| a.0.cmp(&b.0)));
     if raw.is_empty() {
+        if let Some(anchor) = file_anchor {
+            bail!("gist file #{anchor} is not a Formless Tool bundle");
+        }
         bail!("no file in the gist is a Formless Tool bundle");
     }
     Ok(GistChoices::Raw(raw))
@@ -137,7 +188,7 @@ fn gist_choices(gist: &Value) -> Result<GistChoices> {
 /// Prefer a complete valid gist bundle; otherwise return the first raw
 /// candidate (JSON filenames first), which still needs fetching/validation.
 pub fn bundle_in_gist(gist: &Value) -> Result<(String, Option<Value>, Option<String>)> {
-    match gist_choices(gist)? {
+    match gist_choices(gist, None)? {
         GistChoices::Inline(name, bundle) => Ok((name, Some(bundle), None)),
         GistChoices::Raw(raw) => {
             let (name, url) = raw
@@ -149,12 +200,16 @@ pub fn bundle_in_gist(gist: &Value) -> Result<(String, Option<Value>, Option<Str
     }
 }
 
-async fn fetch_gist_bundle<F, Fut>(gist: &Value, mut fetch: F) -> Result<(String, Value)>
+async fn fetch_gist_bundle<F, Fut>(
+    gist: &Value,
+    file_anchor: Option<&str>,
+    mut fetch: F,
+) -> Result<(String, Value)>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<Value>>,
 {
-    match gist_choices(gist)? {
+    match gist_choices(gist, file_anchor)? {
         GistChoices::Inline(name, bundle) => Ok((name, bundle)),
         GistChoices::Raw(raw) => {
             let mut last_error = None;
@@ -167,11 +222,13 @@ where
                     Err(error) => last_error = Some(error),
                 }
             }
-            Err(last_error
-                .unwrap_or_else(|| anyhow!("no raw gist candidate"))
-                .context(
+            let error = last_error.unwrap_or_else(|| anyhow!("no raw gist candidate"));
+            Err(match file_anchor {
+                Some(anchor) => error.context(format!("cannot import gist file #{anchor}")),
+                None => error.context(
                     "no file in the gist is a Formless Tool bundle after checking truncated files",
-                ))
+                ),
+            })
         }
     }
 }
@@ -193,7 +250,7 @@ impl std::error::Error for DownloadTooLarge {}
 fn gist_metadata_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<DownloadTooLarge>() {
         error.context(
-            "gist metadata is too large for preview; download the selected bundle JSON from the Gist and import the saved local file with `formless tools import FILE` (raw Gist URLs also use metadata)",
+            "gist metadata is too large for preview; download the selected bundle JSON from the Gist and import the saved local file with `formless tools import FILE`",
         )
     } else {
         error
@@ -339,20 +396,25 @@ async fn fetch_from_until(
             None,
             get_json_until(&u, allow_private, deadline, resolve).await?,
         ),
-        Source::Gist(id) => {
-            let gist = get_json_until(
-                &format!("https://api.github.com/gists/{id}"),
-                allow_private,
-                deadline,
-                resolve,
-            )
-            .await
-            .map_err(gist_metadata_error)?;
+        Source::Gist {
+            id,
+            revision,
+            file_anchor,
+        } => {
+            let mut api = format!("https://api.github.com/gists/{id}");
+            if let Some(sha) = revision {
+                api.push('/');
+                api.push_str(&sha);
+            }
+            let gist = get_json_until(&api, allow_private, deadline, resolve)
+                .await
+                .map_err(gist_metadata_error)?;
             // Every raw candidate uses the same checked, capped downloader.
-            let (name, bundle) = fetch_gist_bundle(&gist, |raw| async move {
-                get_json_until(&raw, allow_private, deadline, resolve).await
-            })
-            .await?;
+            let (name, bundle) =
+                fetch_gist_bundle(&gist, file_anchor.as_deref(), |raw| async move {
+                    get_json_until(&raw, allow_private, deadline, resolve).await
+                })
+                .await?;
             (Some(name), bundle)
         }
     };
@@ -533,6 +595,53 @@ mod fetch_tests {
     }
 
     #[tokio::test]
+    async fn anchored_gist_file_controls_selection_and_raw_fetch() {
+        let bundle = |name| serde_json::json!({"format":"formless.tool/1","name":name});
+        let gist = serde_json::json!({"files":{
+            "A.json":{"content":bundle("first").to_string()},
+            "Fetch.JSON":{"content":bundle("anchor").to_string()},
+            "broken.txt":{"content":"not json"},
+            "Data.json":{"truncated":true,"raw_url":"https://example.invalid/data"}
+        }});
+        let unexpected = |_| std::future::ready(Err(anyhow!("unexpected raw fetch")));
+        let (name, value) = fetch_gist_bundle(&gist, Some("file-fetch-json"), unexpected)
+            .await
+            .unwrap();
+        assert_eq!(name, "Fetch.JSON");
+        assert_eq!(value, bundle("anchor"));
+
+        let (name, value) = fetch_gist_bundle(&gist, Some("file-data-json"), |url| {
+            assert_eq!(url, "https://example.invalid/data");
+            std::future::ready(Ok(bundle("raw")))
+        })
+        .await
+        .unwrap();
+        assert_eq!(name, "Data.json");
+        assert_eq!(value, bundle("raw"));
+
+        for (anchor, message) in [
+            ("file-broken-txt", "is not a Formless Tool bundle"),
+            ("file-absent-json", "no gist file matches"),
+        ] {
+            let error = fetch_gist_bundle(&gist, Some(anchor), unexpected)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+
+        let ambiguous = serde_json::json!({"files":{
+            "Foo.Bar.json":{"content":bundle("dot").to_string()},
+            "foo-bar.json":{"content":bundle("hyphen").to_string()}
+        }});
+        let error = fetch_gist_bundle(&ambiguous, Some("file-foo-bar-json"), unexpected)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("more than one gist file matches"));
+    }
+
+    #[tokio::test]
     async fn complete_gist_bundle_needs_no_raw_fetch() {
         let bundle = serde_json::json!({"format":"formless.tool/1","name":"inline"});
         let gist = serde_json::json!({"files":{
@@ -540,7 +649,7 @@ mod fetch_tests {
             "tool.json":{"content":bundle.to_string()}
         }});
         let mut calls = Vec::new();
-        let result = fetch_gist_bundle(&gist, |url| {
+        let result = fetch_gist_bundle(&gist, None, |url| {
             calls.push(url);
             std::future::ready(Err(anyhow!("unexpected raw fetch")))
         })
@@ -561,7 +670,7 @@ mod fetch_tests {
         }});
         assert_eq!(bundle_in_gist(&gist).unwrap().0, "b.json");
         let mut calls = Vec::new();
-        let result = fetch_gist_bundle(&gist, |url| {
+        let result = fetch_gist_bundle(&gist, None, |url| {
             calls.push(url.clone());
             std::future::ready(match url.as_str() {
                 "broken" => Err(anyhow!("not JSON")),
@@ -584,7 +693,7 @@ mod fetch_tests {
             "tool.json":{"truncated":true,"raw_url":"invalid"}
         }});
         let mut calls = Vec::new();
-        let result = fetch_gist_bundle(&gist, |url| {
+        let result = fetch_gist_bundle(&gist, None, |url| {
             calls.push(url.clone());
             std::future::ready(Ok(if url == "valid" {
                 bundle.clone()
@@ -596,7 +705,7 @@ mod fetch_tests {
         .unwrap();
         assert_eq!(result, ("README.md".into(), bundle));
         assert_eq!(calls, ["invalid", "valid"]);
-        let error = fetch_gist_bundle(&gist, |_| {
+        let error = fetch_gist_bundle(&gist, None, |_| {
             std::future::ready(Err(anyhow!("fixture unavailable")))
         })
         .await
@@ -608,21 +717,29 @@ mod fetch_tests {
     #[tokio::test]
     async fn raw_gist_candidates_keep_checked_download_refusals() {
         let gist = serde_json::json!({"files":{"tool.json":{"truncated":true,"raw_url":"http://localhost:9/never-requested"}}});
-        let error = fetch_gist_bundle(&gist, |url| async move { get_json(&url, false).await })
-            .await
-            .unwrap_err();
+        let error = fetch_gist_bundle(
+            &gist,
+            None,
+            |url| async move { get_json(&url, false).await },
+        )
+        .await
+        .unwrap_err();
         assert!(format!("{error:#}").contains("only https://"));
     }
 
     #[test]
     fn oversized_gist_guidance_avoids_the_raw_metadata_loop() {
         let id = "0123456789abcdef0123456789abcdef";
-        for url in [
-            format!("https://gist.github.com/ada/{id}"),
-            format!("https://gist.githubusercontent.com/ada/{id}/raw/abcdef/tool.json"),
-        ] {
-            assert_eq!(resolve(&url).unwrap(), Source::Gist(id.into()));
-        }
+        assert_eq!(
+            resolve(&format!("https://gist.github.com/ada/{id}")).unwrap(),
+            Source::Gist {
+                id: id.into(),
+                revision: None,
+                file_anchor: None
+            }
+        );
+        let raw = format!("https://gist.githubusercontent.com/ada/{id}/raw/abcdef/tool.json");
+        assert_eq!(resolve(&raw).unwrap(), Source::Direct(raw));
         let error = gist_metadata_error(DownloadTooLarge("gist metadata".into()).into());
         let advice = error.to_string();
         assert!(

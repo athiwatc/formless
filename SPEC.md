@@ -2443,8 +2443,11 @@ are unchanged.
 - **From a URL:** `formless tools import <https-url>` and the web's
   "Import URL" take a link instead of a file.
   - **What counts as a link:** an https URL to a bundle, a GitHub file page
-    (`github.com/…/blob/…`, read from its raw file), or a gist (the first
-    of its files that is a bundle, through the GitHub API). Anything not
+    (`github.com/…/blob/…`, read from its raw file), or a gist. Raw gist
+    links fetch the linked file directly. Gist pages use the GitHub API
+    for the linked revision and use the file selected by a `#file-…`
+    anchor when supplied. Without a file anchor the preview selects a
+    bundle from the requested revision. Anything not
     https, larger than 2 MB, or not a `formless.tool/1` or
     `formless.tools/1` bundle is refused.
   - **Fetched by the daemon** (`FetchToolBundle {url}` → `{source, file,
