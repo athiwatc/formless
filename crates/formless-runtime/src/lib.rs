@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use rquickjs::{context::EvalOptions, Context, Function, Runtime};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,6 +99,19 @@ pub trait HostOps: Send + Sync {
         _key: &str,
         _value: Option<&Value>,
     ) -> Result<Value, String> {
+        Err("store is not available in this context".into())
+    }
+    /// Exact membership, including keys whose stored value is JSON null.
+    fn kv_contains(&self, _namespace: &str, _key: &str) -> Result<bool, String> {
+        Err("store is not available in this context".into())
+    }
+    /// Return up to 1,000 matching keys in ascending order, after the cursor.
+    fn kv_list_page(
+        &self,
+        _namespace: &str,
+        _prefix: &str,
+        _after: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         Err("store is not available in this context".into())
     }
     /// A live `fs.write` / `fs.append` / `fs.remove` / `fs.rename` is about
@@ -402,7 +415,7 @@ struct State {
     /// poll it so Esc stops them, not only the JS interpreter.
     cancel: Arc<AtomicBool>,
     /// Smoke/Replay key-value store: in memory, gone after the run.
-    kv_overlay: Mutex<std::collections::BTreeMap<(String, String), Value>>,
+    kv_overlay: Mutex<HashMap<String, BTreeMap<String, Option<Value>>>>,
     /// `tools.call` bookkeeping: each call runs on its own thread.
     calls: Mutex<AsyncCalls>,
     settled_tx: std::sync::mpsc::Sender<Settled>,
@@ -1496,49 +1509,43 @@ impl State {
                 let value = a.get("value").filter(|v| !v.is_null());
                 match self.mode {
                     HostMode::Live => self.ops.kv(op, ns, key, value),
-                    // Reads see real values (and this run's writes); writes
-                    // stay in memory.
-                    HostMode::DryRun => {
-                        let mut kv = self.kv_overlay.locked();
-                        let k = (ns.to_string(), key.to_string());
+                    mode => {
+                        let mut overlay = self.kv_overlay.locked();
+                        let values = overlay.entry(ns.to_owned()).or_default();
+                        let dry_run = mode == HostMode::DryRun;
                         match op {
-                            "get" => match kv.get(&k) {
-                                Some(v) => Ok(v.clone()),
-                                None => self.ops.kv(op, ns, key, None),
+                            "get" => match values.get(key) {
+                                Some(value) => Ok(value.clone().unwrap_or(Value::Null)),
+                                None if dry_run => self.ops.kv(op, ns, key, None),
+                                None => Ok(Value::Null),
                             },
                             "set" => {
-                                self.would(format!(
-                                    "store {key} = {}",
-                                    value.cloned().unwrap_or(Value::Null)
-                                ));
-                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
+                                let value = value.cloned().unwrap_or(Value::Null);
+                                if dry_run {
+                                    self.would(format!("store {key} = {value}"));
+                                }
+                                values.insert(key.to_owned(), Some(value));
                                 Ok(Value::Null)
                             }
-                            "delete" => {
+                            "delete" if dry_run => {
+                                let present = match values.get(key) {
+                                    Some(value) => value.is_some(),
+                                    None => self.ops.kv_contains(ns, key)?,
+                                };
                                 self.would(format!("delete the stored {key}"));
-                                kv.insert(k, Value::Null);
-                                Ok(json!(true))
+                                values.insert(key.to_owned(), None);
+                                Ok(json!(present))
                             }
-                            _ => self.ops.kv(op, ns, key, value),
-                        }
-                    }
-                    HostMode::Smoke | HostMode::Replay => {
-                        let mut kv = self.kv_overlay.locked();
-                        let k = (ns.to_string(), key.to_string());
-                        Ok(match op {
-                            "get" => kv.get(&k).cloned().unwrap_or(Value::Null),
-                            "set" => {
-                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
-                                Value::Null
+                            "delete" => Ok(json!(values.remove(key).is_some())),
+                            "list" if dry_run => {
+                                Ok(json!(self.dry_run_store_keys(ns, key, values)?))
                             }
-                            "delete" => json!(kv.remove(&k).is_some()),
-                            "list" => json!(kv
+                            "list" => Ok(json!(values
                                 .keys()
-                                .filter(|(n, key2)| n == ns && key2.starts_with(key))
-                                .map(|(_, key2)| key2.clone())
-                                .collect::<Vec<_>>()),
-                            other => return Err(format!("unknown store op {other}")),
-                        })
+                                .filter(|name| name.starts_with(key))
+                                .collect::<Vec<_>>())),
+                            other => Err(format!("unknown store op {other}")),
+                        }
                     }
                 }
             }
@@ -1854,6 +1861,50 @@ impl State {
             }
             other => Err(format!("unknown host op: {other}")),
         }
+    }
+
+    fn dry_run_store_keys(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        values: &BTreeMap<String, Option<Value>>,
+    ) -> Result<Vec<String>, String> {
+        const LIST_LIMIT: usize = 1_000;
+        // SQLite's text-prefix expression cannot match a prefix containing NUL.
+        if prefix.contains('\0') {
+            return Ok(Vec::new());
+        }
+        let mut keys: BTreeSet<_> = values
+            .range(prefix.to_owned()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .filter(|(_, value)| value.is_some())
+            .take(LIST_LIMIT)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut after = None;
+        'pages: loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("interrupted".into());
+            }
+            let page = self.ops.kv_list_page(namespace, prefix, after.as_deref())?;
+            let exhausted = page.len() < LIST_LIMIT;
+            after = page.last().cloned();
+            for key in page {
+                if keys.len() == LIST_LIMIT && keys.last().is_some_and(|last| key >= *last) {
+                    break 'pages;
+                }
+                if !values.contains_key(&key) {
+                    keys.insert(key);
+                    if keys.len() > LIST_LIMIT {
+                        keys.pop_last();
+                    }
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(keys.into_iter().collect())
     }
 
     /// Overlay entry for `p`: `Some(None)` if it or an ancestor was removed.
@@ -4676,6 +4727,24 @@ mod tests {
             json!({"$type":"Set","values":[2],"properties":[["extra",{"nested":4}]]})
         );
         assert_eq!(outcome.logs[3], "[Unformattable]");
+    }
+
+    #[test]
+    fn smoke_and_replay_store_use_only_their_own_membership() {
+        for mode in [HostMode::Smoke, HostMode::Replay] {
+            let mut request = live(
+                r#"function run() {
+                const before = store.list('');
+                store.set('n', null);
+                const after = store.list('n');
+                return [before, after, store.get('n'), store.delete('n'), store.delete('n'), store.list('')];
+            }"#,
+            );
+            request.mode = mode;
+            request.caps = Capabilities::parse(&["store".into()]).unwrap();
+            let result = execute(&request, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(result, json!([[], ["n"], null, true, false, []]));
+        }
     }
 
     #[test]

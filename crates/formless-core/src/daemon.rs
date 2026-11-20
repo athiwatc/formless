@@ -16468,6 +16468,14 @@ struct NestedOps {
 }
 
 impl NestedOps {
+    fn store_namespace(&self, namespace: &str) -> std::borrow::Cow<'_, str> {
+        if namespace.is_empty() {
+            self.kv_scope.as_str().into()
+        } else {
+            format!("shared:{namespace}").into()
+        }
+    }
+
     /// Block the sandbox thread on provider work, returning "interrupted"
     /// as soon as the Run is cancelled instead of waiting the call out.
     fn block_cancellable<T>(
@@ -16655,11 +16663,7 @@ impl HostOps for NestedOps {
         key: &str,
         value: Option<&Value>,
     ) -> std::result::Result<Value, String> {
-        let ns = if namespace.is_empty() {
-            self.kv_scope.clone()
-        } else {
-            format!("shared:{namespace}")
-        };
+        let ns = self.store_namespace(namespace);
         self.daemon
             .with_store(|st| match op {
                 "get" => Ok(st.kv_get(&ns, key)?.unwrap_or(Value::Null)),
@@ -16671,6 +16675,25 @@ impl HostOps for NestedOps {
                 other => Err(anyhow!("unknown store op {other}")),
             })
             .map_err(|e| e.to_string())
+    }
+
+    fn kv_contains(&self, namespace: &str, key: &str) -> std::result::Result<bool, String> {
+        let ns = self.store_namespace(namespace);
+        self.daemon
+            .with_reader(|st| st.kv_contains(&ns, key))
+            .map_err(|error| error.to_string())
+    }
+
+    fn kv_list_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let ns = self.store_namespace(namespace);
+        self.daemon
+            .with_reader(|st| st.kv_list_page(&ns, prefix, after))
+            .map_err(|error| error.to_string())
     }
 
     fn run_subagent(
