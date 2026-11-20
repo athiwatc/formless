@@ -754,7 +754,31 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     // The native client only observes it; it issues no Tool control request.
     let created=daemon.call_tool_direct(&b,"create_tool",json!({"name":"desktop_invocation_fixture","description":"private snapshot fixture","input_schema":{"type":"object"},"output_schema":{},"implementation_js":"async function run(){ progress(0.5, 'private fixture running'); await sleep(8000); return {done:true}; }","capabilities":[]})).await;
     assert!(created.contains("created"), "{created}");
-    let tool_call = tokio::spawn({
+    // Start the timed Tool only after a fresh subscription. If the client
+    // is already in backoff, first wait for a live generation before
+    // requesting a reconnect, which an offline worker would discard.
+    let mut retired = None;
+    let mut invocation_connection = None;
+    until(&client, "invocations-reconnect", |update| {
+        let connection = client.connection();
+        if !client.is_ready() || client.connection() != connection {
+            return false;
+        }
+        let Some(previous) = retired else {
+            client.send(Command::Reconnect).unwrap();
+            retired = Some(connection);
+            return false;
+        };
+        if matches!(update, Update::Connection { ready: true, .. }) && connection > previous {
+            invocation_connection = Some(connection);
+            true
+        } else {
+            false
+        }
+    })
+    .await;
+    let invocation_connection = invocation_connection.unwrap();
+    let mut tool_call = tokio::spawn({
         let daemon = daemon.clone();
         let session = b.clone();
         async move {
@@ -765,6 +789,9 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let expected = loop {
+        // Keep consuming canonical updates while polling the private daemon
+        // directly, just as the desktop does while the Tool is running.
+        for _ in client.drain() {}
         let raw = daemon.handle(Request::ListInvocations).await.unwrap();
         let report = formless_desktop::invocations::Report::decode(raw.clone()).unwrap();
         if let Some(key) = report
@@ -785,19 +812,26 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
+    assert!(
+        client.is_ready(),
+        "Invocation fixture connection is offline"
+    );
+    assert_eq!(client.connection(), invocation_connection);
     let operation = uuid::Uuid::new_v4();
     client
         .send(Command::ReadInvocations {
-            connection: client.connection(),
+            connection: invocation_connection,
             operation,
         })
         .unwrap();
     until(&client, "invocations-active", |update| match update {
         Update::Invocations {
+            connection,
             operation: ack,
-            result: Ok(report),
-            ..
+            result,
         } if ack == operation => {
+            assert_eq!(connection, invocation_connection);
+            let report = result.expect("active Invocation read must succeed");
             let index = report
                 .keys
                 .iter()
@@ -818,23 +852,50 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         1,
         "Invocation reads never call a Provider"
     );
-    let completed = tokio::time::timeout(Duration::from_secs(15), tool_call)
-        .await
-        .unwrap()
-        .unwrap();
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                result = &mut tool_call => break result.unwrap(),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    for _ in client.drain() {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("private Invocation completion deadline");
     assert!(completed.contains("done"), "{completed}");
     assert_eq!(
         daemon.handle(Request::ListInvocations).await.unwrap(),
         json!([])
     );
     let operation = uuid::Uuid::new_v4();
+    assert!(
+        client.is_ready(),
+        "Invocation fixture connection is offline"
+    );
+    assert_eq!(client.connection(), invocation_connection);
     client
         .send(Command::ReadInvocations {
-            connection: client.connection(),
+            connection: invocation_connection,
             operation,
         })
         .unwrap();
-    until(&client,"invocations-empty",|update|matches!(update,Update::Invocations{operation:ack,result:Ok(report),..} if ack==operation&&report.keys.is_empty()&&report.page.rows[0].detail=="[]")).await;
+    until(&client, "invocations-empty", |update| match update {
+        Update::Invocations {
+            connection,
+            operation: ack,
+            result,
+        } if ack == operation => {
+            assert_eq!(connection, invocation_connection);
+            let report = result.expect("empty Invocation read must succeed");
+            assert!(report.keys.is_empty());
+            assert_eq!(report.page.rows[0].detail, "[]");
+            true
+        }
+        _ => false,
+    })
+    .await;
     assert_eq!(
         requests.lock().unwrap().len(),
         1,

@@ -1558,7 +1558,7 @@ impl Engine {
                 };
                 if let Some(error) = error {
                     self.updates.push(Update::Invocations {
-                        connection: self.connection,
+                        connection,
                         operation,
                         result: Err(error.into()),
                     });
@@ -3152,6 +3152,22 @@ struct WorkerState {
     forks: Arc<session_fork::Ledger>,
 }
 
+fn disconnected_update(command: Command, fallback: &str) -> Update {
+    match command {
+        Command::ReadInvocations {
+            connection,
+            operation,
+        } => Update::Invocations {
+            // Match the unsent command, even if the worker already advanced
+            // its connection. The caller decides whether this owner is stale.
+            connection,
+            operation,
+            result: Err("Not connected; the Invocation read was not sent. Read Invocations again explicitly after reconnecting.".into()),
+        },
+        _ => Update::Notice(fallback.into()),
+    }
+}
+
 async fn worker(
     endpoint: Endpoint,
     mut commands: queue::Receiver<Command>,
@@ -3191,9 +3207,10 @@ async fn worker(
                     &action,
                     "Fork was not written before disconnect. Review again explicitly.",
                 ),
-                _ => {
-                    let _ = tx.try_send(Update::Notice(
-                        "A queued action was not sent after disconnect. Draft kept.".into(),
+                command => {
+                    let _ = tx.try_send(disconnected_update(
+                        command,
+                        "A queued action was not sent after disconnect. Draft kept.",
                     ));
                 }
             }
@@ -3240,7 +3257,7 @@ async fn worker(
                 command = commands.recv() => match command {
                     Some(Command::Select { session_id, generation }) => retained.active = (session_id, generation),
                     Some(Command::Page(destination)) => retained.page = Some(destination),
-                    Some(_) => { let _ = tx.try_send(Update::Notice("Not connected; the action was not sent. Draft kept.".into())); }
+                    Some(command) => { let _ = tx.try_send(disconnected_update(command, "Not connected; the action was not sent. Draft kept.")); }
                     None => return,
                 }
             }
@@ -3993,11 +4010,171 @@ mod tests {
         respond(&mut engine, a.id, Value::Null);
         assert!(engine.updates.iter().any(|update|matches!(update,Update::Invocations{operation,result:Err(_),..} if *operation==operations[0])));
         engine.outgoing.clear();
+        let stale = uuid::Uuid::new_v4();
         engine.command(Command::ReadInvocations {
             connection: 1,
-            operation: uuid::Uuid::new_v4(),
+            operation: stale,
         });
         assert!(engine.outgoing.is_empty());
+        assert!(matches!(engine.updates.last(),
+            Some(Update::Invocations { connection: 1, operation, result: Err(_) }) if *operation == stale));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn offline_invocation_reads_keep_their_owner_and_are_not_replayed() {
+        struct SocketDir(PathBuf);
+        impl Drop for SocketDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        async fn next_update(rx: &Receiver<Update>, deadline: tokio::time::Instant) -> Update {
+            tokio::time::timeout_at(deadline, async {
+                loop {
+                    match rx.try_recv() {
+                        Ok(update) => return update,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(error) => panic!("private worker stopped: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("private worker update deadline")
+        }
+        fn assert_offline(update: Update, generation: u64, id: uuid::Uuid) {
+            assert!(
+                matches!(&update, Update::Invocations { connection, operation, result: Err(error) }
+                    if *connection == generation && *operation == id && error.contains("not sent")),
+                "{update:?}"
+            );
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("fl-di-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        std::fs::create_dir(&root).unwrap();
+        let root = SocketDir(root);
+        let endpoint = Endpoint(root.0.join("s"));
+        let (commands, incoming) = queue::channel(QUEUE);
+        let (updates, rx) = mpsc::sync_channel(QUEUE);
+        let (stop, cancelled) = watch::channel(false);
+        let ready = Arc::new(AtomicBool::new(false));
+        let connection = Arc::new(AtomicU64::new(7));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let queued = uuid::Uuid::new_v4();
+        commands
+            .try_send(Command::ReadInvocations {
+                connection: 6,
+                operation: queued,
+            })
+            .unwrap();
+        let task = tokio::spawn(worker(
+            endpoint.clone(),
+            incoming,
+            updates,
+            cancelled,
+            WorkerState {
+                instance: uuid::Uuid::new_v4(),
+                stream_epoch: Arc::default(),
+                future_attempts: false,
+                ready: ready.clone(),
+                epoch: Arc::default(),
+                connection: connection.clone(),
+                forks: Arc::default(),
+            },
+        ));
+        assert_offline(next_update(&rx, deadline).await, 6, queued);
+        assert!(
+            matches!(next_update(&rx, deadline).await, Update::Connection { ready: false, notice } if notice.starts_with("Connecting"))
+        );
+        assert!(
+            matches!(next_update(&rx, deadline).await, Update::Connection { ready: false, notice } if notice.starts_with("Cannot connect"))
+        );
+        let offline_generation = connection.load(Ordering::Acquire);
+        let during_backoff = uuid::Uuid::new_v4();
+        commands
+            .try_send(Command::ReadInvocations {
+                connection: offline_generation,
+                operation: during_backoff,
+            })
+            .unwrap();
+        loop {
+            if let update @ Update::Invocations { .. } = next_update(&rx, deadline).await {
+                assert_offline(update, offline_generation, during_backoff);
+                break;
+            }
+        }
+        assert!(!ready.load(Ordering::Acquire));
+
+        // The endpoint exists only after both failures. Its wire log must
+        // contain the one explicit read issued after the new handshake.
+        let listener = tokio::net::UnixListener::bind(&endpoint.0).unwrap();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut server = BufReader::new(socket);
+            let mut count = 0;
+            let mut line = String::new();
+            while server.read_line(&mut line).await.unwrap() != 0 {
+                let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                let result = match request.request {
+                    Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                    Request::Subscribe { .. } => json!({"subscribed":true}),
+                    Request::ListSessions => json!([]),
+                    Request::ListInvocations => {
+                        count += 1;
+                        crate::invocations::test_value()
+                    }
+                    other => panic!("unexpected private fixture request: {other:?}"),
+                };
+                let mut reply = serde_json::to_vec(&ServerMessage::ok(request.id, result)).unwrap();
+                reply.push(b'\n');
+                server.write_all(&reply).await.unwrap();
+                line.clear();
+            }
+            count
+        });
+        let fresh_generation = loop {
+            if matches!(
+                next_update(&rx, deadline).await,
+                Update::Connection { ready: true, .. }
+            ) {
+                break connection.load(Ordering::Acquire);
+            }
+        };
+        assert!(fresh_generation >= offline_generation);
+        assert!(ready.load(Ordering::Acquire));
+        let fresh = uuid::Uuid::new_v4();
+        commands
+            .try_send(Command::ReadInvocations {
+                connection: fresh_generation,
+                operation: fresh,
+            })
+            .unwrap();
+        loop {
+            if let Update::Invocations {
+                connection,
+                operation,
+                result,
+            } = next_update(&rx, deadline).await
+            {
+                assert_eq!((connection, operation), (fresh_generation, fresh));
+                assert_eq!(result.unwrap().keys[0].session_id, "session-a");
+                break;
+            }
+        }
+        stop.send(true).unwrap();
+        let invocation_requests = tokio::time::timeout_at(deadline, async {
+            task.await.unwrap();
+            peer.await.unwrap()
+        })
+        .await
+        .expect("private worker shutdown deadline");
+        assert_eq!(invocation_requests, 1);
+        assert!(!rx
+            .try_iter()
+            .any(|update| matches!(update, Update::Invocations { .. })));
     }
 
     #[test]
