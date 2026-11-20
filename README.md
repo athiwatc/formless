@@ -418,8 +418,9 @@ can exceed the remaining amount. Unknown spend or pricing pauses further calls.
 A budget stop exits 1 and reports observed usage cost on stderr. Stopped pipeline
 Runs must be resubmitted with their options; `/resume` cannot recover ephemeral
 instructions. `--output-file` leaves stdout empty and atomically replaces the
-file only after successful output (at most 8 MiB); failure leaves the previous
-file intact.
+file only after successful output (at most 8 MiB). An existing output keeps
+its Unix access bits and group or its Windows DACL. New files are private.
+A write failure leaves the previous file intact.
 
 Schema files and `--schema -` accept one leading UTF-8 BOM; the 64 KiB input
 limit includes those bytes. With `--schema --output json`, the envelope keeps
