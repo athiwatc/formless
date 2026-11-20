@@ -267,6 +267,12 @@ const C_LIKE: Lang = Lang {
     regex: false,
 };
 
+// PHP hash comments are distinct from C preprocessor directives.
+const PHP: Lang = Lang {
+    line_comments: &["//", "#"],
+    ..C_LIKE
+};
+
 const JSON: Lang = Lang {
     line_comments: NONE,
     block_comment: None,
@@ -462,7 +468,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         | "dockerfile" | "docker" | "make" | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir"
         | "ex" | "exs" | "perl" | "pl" => &SHELL,
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
-        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "php" | "zig" | "objc" => &C_LIKE,
+        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "zig" | "objc" => &C_LIKE,
+        "php" => &PHP,
         "lua" | "haskell" | "hs" => &SQL_DASH,
         "json" => &JSON,
         "jsonc" => &JSONC,
@@ -495,6 +502,7 @@ pub(crate) struct Highlighter {
     rust_numbers: bool,
     python_comments: bool,
     mysql_comments: bool,
+    php_comments: bool,
     json5_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
@@ -616,6 +624,7 @@ impl Highlighter {
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
             mysql_comments: name == "mysql",
+            php_comments: name == "php",
             json5_strings: name == "json5",
             color,
             in_block: 0,
@@ -643,6 +652,7 @@ impl Highlighter {
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
         let mysql = self.mysql_comments;
+        let php = self.php_comments;
         let chars: Vec<char> = line.chars().collect();
         let continues_string =
             self.json5_strings && line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0;
@@ -776,8 +786,12 @@ impl Highlighter {
                     continue;
                 }
             }
-            let hash_comment =
-                c != '#' || self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace();
+            let hash_comment = c != '#'
+                || if php {
+                    chars.get(i + 1) != Some(&'[')
+                } else {
+                    self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace()
+                };
             if hash_comment
                 && l.line_comments.iter().any(|p| {
                     at(i, p)
@@ -788,8 +802,17 @@ impl Highlighter {
                                 .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
                 })
             {
-                push(Tok::Comment, &chars[i..]);
-                break;
+                // A PHP closing tag ends a line comment as well as the code.
+                let end = if php {
+                    (i..chars.len())
+                        .find(|&j| at(j, "?>"))
+                        .unwrap_or(chars.len())
+                } else {
+                    chars.len()
+                };
+                push(Tok::Comment, &chars[i..end]);
+                i = end;
+                continue;
             }
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
@@ -1415,6 +1438,71 @@ mod tests {
                     .contains(&("# comment".into(), Some(Color::DarkGray))),
                 "{lang}"
             );
+        }
+    }
+
+    #[test]
+    fn php_hash_comments_do_not_open_blocks_or_consume_attributes() {
+        for lang in ["php", "PHP"] {
+            for first in ["# note: /* not a block", "foo();# /* note"] {
+                let mut h = Highlighter::new(lang, true).unwrap();
+                let spans = h.line(first);
+                assert_eq!(
+                    spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                    first
+                );
+                let comments: String = spans
+                    .iter()
+                    .filter(|s| s.style.fg == Some(Color::DarkGray))
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(comments, &first[first.find('#').unwrap()..]);
+                assert_eq!(h.in_block, 0);
+                for line in [r#"return "hi";"#, "class User {}"] {
+                    let spans = h.line(line);
+                    assert!(spans.iter().all(|s| s.style.fg != Some(Color::DarkGray)));
+                    assert!(spans.iter().any(|s| {
+                        s.content == line.split_whitespace().next().unwrap()
+                            && s.style.fg == Some(Color::Magenta)
+                    }));
+                }
+            }
+            for line in [r##"#[Route("/users")]"##, r##""# not a comment""##] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+            assert!(toks(lang, "// return").contains(&("// return".into(), Some(Color::DarkGray))));
+        }
+        for lang in ["c", "cpp", "java", "rust"] {
+            for line in ["#include <stdio.h>", "#define VALUE 1"] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+        }
+        assert!(toks("python", "x=1# note").contains(&("# note".into(), Some(Color::DarkGray))));
+        assert!(toks("yaml", "key: foo#bar")
+            .iter()
+            .all(|(_, color)| *color != Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn php_line_comments_stop_before_a_closing_tag() {
+        for opener in ["#", "//"] {
+            let line = format!("<?php foo();{opener} note ?> <p>outside</p>");
+            let tokens = toks("php", &line);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                line
+            );
+            assert!(tokens.contains(&(format!("{opener} note "), Some(Color::DarkGray))));
+            assert!(!tokens.iter().any(|(text, color)| {
+                *color == Some(Color::DarkGray) && text.contains("outside")
+            }));
         }
     }
 
