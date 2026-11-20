@@ -488,8 +488,10 @@
       const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
-      if (credentialKey || k.endsWith("_PAT") ||
-          ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
+      const credentialPart = k !== "SSH_AUTH_SOCK" && k.split(/[^A-Z0-9]+/).some((part) =>
+        ["TOKEN", "TOKENS", "SECRET", "SECRETS", "PASSWORD", "PASSWORDS", "PASSWD",
+          "CREDENTIAL", "CREDENTIALS", "PRIVATE", "AUTH", "AUTHORIZATION"].includes(part));
+      if (credentialKey || k.endsWith("_PAT") || credentialPart) {
         return "a secret from your environment";
       }
     }
