@@ -14,6 +14,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("sk_live_", "API key"),
     ("sk_test_", "API key"),
     ("rk_live_", "API key"),
+    ("whsec_", "API key"),
     ("ghp_", "GitHub token"),
     ("gho_", "GitHub token"),
     ("ghu_", "GitHub token"),
@@ -345,6 +346,21 @@ mod tests {
                 "redaction stays idempotent"
             );
         }
+    }
+
+    #[test]
+    fn stripe_webhook_signing_secrets_use_the_shared_token_floor() {
+        for suffix in [
+            "0123456789abcdef0123456789abcdef",
+            "abcdefghijklmnop0123456789",
+        ] {
+            assert_eq!(
+                redact(&format!("signature setting (whsec_{suffix})")),
+                ("signature setting ([REDACTED])".into(), Some("API key"))
+            );
+        }
+        let note = "docs mention whsec_abc in a webhook example";
+        assert_eq!(redact(note), (note.into(), None));
     }
 
     #[test]
