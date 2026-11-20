@@ -36,6 +36,24 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn detects_github_cli_credentials_in_attachment_paths() {
+    for name in [
+        ".config/gh/hosts.yml",
+        ".CONFIG/GH/hosts.yml",
+        "AppData/Roaming/GitHub CLI/hosts.yml",
+    ] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in [
+        "project/gh/hosts.yml",
+        "project/.config/other/hosts.yml",
+        "GitHub CLI docs/notes.txt",
+    ] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");

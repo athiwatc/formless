@@ -211,6 +211,7 @@ fn credential_name(name: &std::ffi::OsStr) -> String {
 }
 
 const DIRECTORY_SEQUENCES: &[&[&str]] = &[
+    &[".config", "gh"],
     &["library", "keychains"],
     &[".local", "share", "keyrings"],
     &["microsoft", "credentials"],
@@ -280,7 +281,14 @@ fn builtin(path: &Path) -> Option<&'static str> {
     for (index, name) in parts.iter().enumerate() {
         if matches!(
             name.as_str(),
-            ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
+            ".ssh"
+                | ".aws"
+                | ".gnupg"
+                | ".pki"
+                | ".kube"
+                | ".docker"
+                | ".password-store"
+                | "github cli"
         ) {
             return Some("credential directory");
         }
@@ -378,6 +386,38 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn protects_github_cli_credentials_in_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".config/gh/hosts.yml",
+            ".CONFIG/GH/hosts.yml",
+            "AppData/Roaming/GitHub CLI/hosts.yml",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            "project/gh/hosts.yml",
+            "project/.config/other/hosts.yml",
+            "GitHub CLI docs/notes.txt",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);

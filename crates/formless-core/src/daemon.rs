@@ -17182,8 +17182,13 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    let mut under_config = false;
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
+        if p.eq_ignore_ascii_case("GitHub CLI") || (under_config && p.eq_ignore_ascii_case("gh")) {
+            return Some("GitHub CLI credentials");
+        }
+        under_config = p.eq_ignore_ascii_case(".config");
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
             return Some(why);
         }
