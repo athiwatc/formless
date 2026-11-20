@@ -17198,6 +17198,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".netrc",
         ".npmrc",
         ".pypirc",
+        "rclone.conf",
+        ".rclone.conf",
         "credentials",
         ".git-credentials",
     ]

@@ -36,6 +36,23 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn detects_rclone_config_in_attachment_paths() {
+    for name in [
+        ".config/rclone/rclone.conf",
+        ".rclone.conf",
+        "AppData/Roaming/rclone/RCLONE.CONF",
+    ] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in [
+        ".config/rclone/notes.txt",
+        ".config/rclone/rclone.conf.example",
+    ] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");
