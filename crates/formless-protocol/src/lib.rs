@@ -725,6 +725,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             }
             "find" => return Some("find can run any program (-exec)"),
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
+            "docker" | "podman" | "nerdctl" => {
+                return Some("a container tool can run programs with host resources")
+            }
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
             }
@@ -3829,6 +3832,28 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_container_clis() {
+        for spec in [
+            "process:docker",
+            "process:podman",
+            "process:nerdctl",
+            "process:/usr/bin/docker",
+            "process:podman.exe",
+            "process:docker:run",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:dockerize",
+            "process:podman-helper",
+            "process:nerdctl-doc",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
