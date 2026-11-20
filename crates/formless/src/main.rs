@@ -378,7 +378,7 @@ enum Cmd {
         /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
         /// Continue an existing session by id, or `last` (default: ephemeral)
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         session: Option<String>,
         /// Continue the Session the last `formless run` used (= --session last)
         #[arg(long = "continue", short = 'c', conflicts_with = "session")]
@@ -2116,6 +2116,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             session.clone()
         };
         let session = if let Some(wanted) = session {
+            validate_session_selector(&wanted)?;
             let sessions: Vec<SessionInfo> = if live {
                 serde_json::from_value(formless_tui::client::request_once(
                     &paths,
@@ -5709,6 +5710,7 @@ enum SessionsAction {
     /// Inventory stored sub-agents for a resolved Session
     Subagents {
         /// Session id, unambiguous prefix or name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Preserve the complete daemon sub-agent array as JSON
         #[arg(long)]
@@ -5729,6 +5731,7 @@ enum SessionsAction {
     /// Read recorded Session usage and the current prompt/context estimate
     Usage {
         /// Session selector, using the existing ID/prefix/name resolution
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print both complete daemon reports as one JSON value
         #[arg(long)]
@@ -5737,6 +5740,7 @@ enum SessionsAction {
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Name for the new branch Session
         #[arg(long)]
@@ -5751,8 +5755,10 @@ enum SessionsAction {
     /// Compare stored branch messages and recorded local usage (no model call)
     Compare {
         /// First Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         left: String,
         /// Second Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         right: String,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -5776,6 +5782,7 @@ enum SessionsAction {
     /// Pin a Session using its stored returned state
     Pin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5784,6 +5791,7 @@ enum SessionsAction {
     /// Unpin a Session using its stored returned state
     Unpin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5795,6 +5803,7 @@ enum SessionsAction {
     )]
     Tag {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Replacement tags, passed unchanged to storage; omission only reads
         tags: Vec<String>,
@@ -5808,6 +5817,7 @@ enum SessionsAction {
     /// Show a Session's transcript
     Show {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
@@ -5822,6 +5832,7 @@ enum SessionsAction {
     /// Show a Run's tracked files and diffs
     Files {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Run ID whose tracked files to inspect; omit for the latest Run
         #[arg(long)]
@@ -5833,6 +5844,7 @@ enum SessionsAction {
     /// Attempt safe restoration of one path or all tracked files
     Rewind {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Tracked path to restore; omit to consider all tracked files
         path: Option<String>,
@@ -5846,6 +5858,7 @@ enum SessionsAction {
     /// Rename a Session
     Rename {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// New display name for the Session
         name: String,
@@ -5853,11 +5866,13 @@ enum SessionsAction {
     /// Delete a Session (restorable for daemon.delete_undo_secs)
     Rm {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring back a Session deleted moments ago (full id)
     Restore {
         /// Full ID of the recently deleted Session
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Import a Session bundle (from `sessions export --format json`)
@@ -5887,17 +5902,20 @@ enum SessionsAction {
     /// Hide a Session from the default list (kept and searchable)
     Archive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring an archived Session back
     Unarchive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Export a Session: the re-importable JSON bundle, or a readable
     /// Markdown or HTML transcript
     Export {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Export format; omit to infer from the output extension, otherwise json
         #[arg(long, value_enum)]
@@ -6363,7 +6381,15 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
     out
 }
 
+fn validate_session_selector(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(usage("Session selector must not be empty"));
+    }
+    Ok(())
+}
+
 fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
         Request::ListSessions,
@@ -6372,6 +6398,7 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
 }
 
 fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     // An exact id, else an id prefix, else a name (SPEC §12, Session selectors).
     if let Some(s) = list.iter().find(|s| s.id == id) {
         return Ok(s.clone());
