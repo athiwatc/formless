@@ -723,6 +723,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
                 )
             }
+            _ if stem == "go" => {
+                return Some("the Go tool can build and execute repository code")
+            }
             "find" => return Some("find can run any program (-exec)"),
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
             "make" | "cmake" | "ninja" => {
@@ -3829,6 +3832,32 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn go_requires_broad_process_confirmation() {
+        for spec in [
+            "process:go",
+            "process:/usr/local/go/bin/go",
+            "process:go.exe",
+            "process:GO",
+            "process:go1.22.5",
+            "process:go:test",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("the Go tool can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:gofmt",
+            "process:godoc",
+            "process:goreleaser",
+            "process:golangci-lint",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
