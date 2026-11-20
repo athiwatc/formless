@@ -495,10 +495,72 @@ fn jobs_history_distinguishes_missing_empty_and_populated_jobs_in_both_formats()
                 text.contains("completed") && text.contains("รายละเอียด 日本語"),
                 "{text}"
             );
+            assert!(!text.contains("More may exist."), "{text}");
         }
     }
     assert_eq!(
         fixture.provider.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn jobs_history_limits_the_newest_firings_in_both_formats() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let job = store
+        .create_job(
+            "private limit fixture",
+            None,
+            None,
+            "2999-01-01T00:00:00Z",
+            false,
+            "user",
+        )
+        .unwrap();
+    for n in 1..=501 {
+        store
+            .job_run_start(&job.id, None, "manual", "completed", &format!("firing-{n}"))
+            .unwrap();
+    }
+    let _daemon = fixture.daemon();
+    for (option, limit, notice) in [
+        (None, 20, "Showing newest 20 firings. More may exist."),
+        (Some("50"), 50, "Showing newest 50 firings. More may exist."),
+        (
+            Some("500"),
+            500,
+            "Showing the maximum of 500 firings. More may exist.",
+        ),
+    ] {
+        let mut args = vec!["jobs", "history", &job.id];
+        if let Some(option) = option {
+            args.extend(["--limit", option]);
+        }
+        let expected = store.job_runs(&job.id, limit).unwrap();
+        assert_eq!(expected.len(), limit);
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<_> = text
+            .split_whitespace()
+            .filter(|s| s.starts_with("firing-"))
+            .collect();
+        assert_eq!(
+            lines,
+            expected
+                .iter()
+                .map(|row| row.detail.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(text.contains(notice), "{text}");
+
+        args.push("--json");
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
 }

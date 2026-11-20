@@ -227,7 +227,7 @@ enum Cmd {
     },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
+        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --limit 50 --json"
     )]
     Jobs {
         #[command(subcommand)]
@@ -1110,6 +1110,9 @@ enum JobsAction {
     History {
         /// Scheduled job ID
         id: String,
+        /// Maximum number of recent firings to show (1–500)
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -7012,10 +7015,11 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             let r = daemon(Request::RunJobNow { id: id.clone() })?;
             println!("{id}: {}", r["status"].as_str().unwrap_or_default());
         }
-        JobsAction::History { id, json } => {
+        JobsAction::History { id, limit, json } => {
+            let limit = usize::from(limit);
             let runs = daemon(Request::JobRuns {
                 id: id.clone(),
-                limit: None,
+                limit: Some(limit),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&runs)?);
@@ -7025,6 +7029,7 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             if runs.is_empty() {
                 println!("{id} has not run yet");
             }
+            let at_limit = runs.len() == limit;
             let mut tbl = Table::new(&[
                 "STARTED", "TRIGGER", "OUTCOME", "TOOK", "COST", "SESSION", "DETAIL",
             ]);
@@ -7054,6 +7059,13 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             }
             if !tbl.is_empty() {
                 tbl.print();
+            }
+            if at_limit {
+                if limit == 500 {
+                    println!("Showing the maximum of 500 firings. More may exist.");
+                } else {
+                    println!("Showing newest {limit} firings. More may exist. Use --limit to request up to 500.");
+                }
             }
         }
         JobsAction::Enable { id } => {
