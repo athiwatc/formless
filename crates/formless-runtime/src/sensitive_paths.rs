@@ -328,7 +328,13 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
+        "api_key"
+            | "oauth_tokens.json"
+            | "relay_secret"
+            | ".netrc"
+            | "_netrc"
+            | ".git-credentials"
+            | ".vault-token"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
@@ -378,6 +384,30 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn protects_vault_token_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [".vault-token", "project/.VAULT-TOKEN"] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in ["project/vault/notes.txt", ".vault-token.example"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);
