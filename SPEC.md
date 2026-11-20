@@ -3749,8 +3749,11 @@ refresh a cache, nightly cleanup.
 - **History:** every firing is a `job_runs` row: trigger (`schedule` or
   `manual`), outcome (the Run's final status, or `skipped`), duration,
   cost, Session and details. `JobRuns {id}`, `formless jobs history ID`,
-  `/jobs history ID` and the web "History" button show it. A firing whose
-  Run doesn't complete posts a note to every client.
+  `/jobs history ID` and the web "History" button show it. The CLI shows the
+  newest 20 firings by default. `--limit N` accepts 1–500, and the human
+  output warns when that many rows were returned. JSON remains an array of
+  firings in newest-first order. A firing whose Run doesn't complete posts
+  a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
   schedule is unchanged. A successful manual retry records its outcome in
@@ -5262,7 +5265,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
-| `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
+| `formless jobs` | `list`, `add`, `run`, `history ID [--limit N]`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
