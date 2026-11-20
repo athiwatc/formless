@@ -72,9 +72,10 @@ Pin a published version tag or an image digest on servers so a recreate
 does not silently switch versions.
 
 Before upgrading, record the current image tag or digest and the original run
-options. Choose a maintenance window, let active Runs finish, and stop the
-daemon before copying both the data and config volumes to a separate backup
-location. Keep the pairing secret and backup private. The daemon cannot run
+options. Choose a maintenance window, let active Runs finish, and stop all
+containers and other processes that write to either volume before copying
+both volumes to a separate backup location. This includes any other Formless
+profiles that share the volumes. Keep the pairing secret and backup private. The daemon cannot run
 jobs while it is stopped; check Runs and the job schedule after restart rather
 than assuming interrupted work resumed.
 
@@ -113,11 +114,12 @@ container and `docker logs formless` if startup or `doctor` fails.
 Do not use `formless update` inside the container. The binary belongs to the
 image; replace the image and preserve the volumes instead.
 
-For rollback, stop the new container and recreate with the previous tag or
-digest. Do not assume an older binary can open state migrated by a newer
-version. If compatibility is not documented for those versions, restore the
-pre-upgrade data and config backup into separate volumes and point the old
-container at them. Keep the post-upgrade volumes intact; the restored copy
+For rollback, stop the new container and any other writers. Before starting
+the previous image, check whether that version can open the post-upgrade
+state. If compatibility is not documented, restore the pre-upgrade data and
+config backup into separate volumes first. Then recreate the container with
+the previous tag or digest and point it at the restored volumes, not the
+migrated originals. Keep the post-upgrade volumes intact; the restored copy
 does not contain changes made since the backup.
 
 ## The API key
