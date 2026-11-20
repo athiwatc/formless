@@ -19,6 +19,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("ghu_", "GitHub token"),
     ("ghs_", "GitHub token"),
     ("github_pat_", "GitHub token"),
+    ("npm_", "npm token"),
     ("glpat-", "GitLab token"),
     ("xoxb-", "Slack token"),
     ("xoxp-", "Slack token"),
@@ -357,6 +358,15 @@ mod tests {
             redact("password is [REDACTED]"),
             ("password is [REDACTED]".into(), None)
         );
+    }
+
+    #[test]
+    fn npm_access_tokens_are_redacted_without_matching_short_prefix_mentions() {
+        let token = format!("npm_{}", "abcdefghijklmnopqrstuvwxyz012345");
+        assert_eq!(scan(&token), Some("npm token"));
+        assert_eq!(redact(&token), (MARK.into(), Some("npm token")));
+        let note = "npm documentation mentions npm_short";
+        assert_eq!(redact(note), (note.into(), None));
     }
 
     #[test]
