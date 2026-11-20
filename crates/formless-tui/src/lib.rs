@@ -1,5 +1,6 @@
 mod branch_summary;
 pub mod client;
+mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
@@ -1706,6 +1707,7 @@ struct App {
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
     inbox: Option<mpsc::Receiver<ServerMessage>>,
+    clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
     session_idx: usize,
     session_filter: lists::ListFilter,
@@ -2095,6 +2097,7 @@ impl App {
             view: View::Chat,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -15766,13 +15769,23 @@ impl App {
     /// system clipboard too.
     fn copy_text(&mut self, text: &str, what: &str) {
         let mut out = stdout();
-        let _ = out.write_all(osc52(text).as_bytes());
-        let _ = out.flush();
-        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
-            let _ = formless_runtime::clipboard_write(text);
+        match out
+            .write_all(osc52(text).as_bytes())
+            .and_then(|()| out.flush())
+        {
+            Ok(()) => self.notes.push(format!(
+                "sent {what} to the terminal clipboard ({} chars)",
+                text.chars().count()
+            )),
+            Err(error) => self
+                .notes
+                .push(format!("terminal clipboard write failed: {error}")),
         }
-        self.notes
-            .push(format!("copied {what} ({} chars)", text.chars().count()));
+        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
+            if let Err(error) = self.clipboard_write.submit(text.to_owned()) {
+                self.notes.push(format!("system clipboard: {error}"));
+            }
+        }
     }
 
     /// The queue binding to advertise: one that works in this terminal.
@@ -19559,6 +19572,9 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
+            if let Err(error) = app.clipboard_write.poll() {
+                app.notes.push(format!("system clipboard: {error}"));
+            }
             // SettingsChanged may have arrived through any connected client.
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
@@ -19764,6 +19780,7 @@ mod tests {
             wizard: None,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -25434,7 +25451,10 @@ mod tests {
         assert_eq!(app.call_focus.as_deref(), Some("msg:a2"));
         assert!(render(&mut app, 100, 30).contains("c copy · C copy as Markdown"));
         app.key(key(KeyCode::Char('c')));
-        assert_eq!(app.notes.last().unwrap(), "copied the answer (17 chars)");
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "sent the answer to the terminal clipboard (17 chars)"
+        );
         app.key(key(KeyCode::Char('[')));
         app.key(key(KeyCode::Char('C')));
         assert_eq!(
