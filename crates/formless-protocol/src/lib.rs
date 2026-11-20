@@ -706,7 +706,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "doas"
         ) || matches!(
             stem,
-            "python" | "node" | "deno" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
+            "python" | "node" | "deno" | "dart" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -3829,6 +3829,22 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn dart_require_broad_process_confirmation() {
+        for spec in [
+            "process:dart",
+            "process:dart3.2",
+            "process:/usr/bin/dart",
+            "process:dart.exe",
+            "process:dart:run",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:dartdoc", "process:dart2js", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
