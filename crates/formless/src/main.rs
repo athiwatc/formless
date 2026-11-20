@@ -799,12 +799,15 @@ enum ToolsAction {
         /// Tool name or ID
         name: String,
     },
-    /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
+    /// Read or replace a Tool's tags
     Tag {
         /// Tool name or id
         name: String,
-        /// Tags to assign to this Tool; omit all tags to clear them
+        /// Replacement tags; omission only reads
         tags: Vec<String>,
+        /// Explicitly remove all tags
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
@@ -8002,17 +8005,23 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),
         ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
-        ToolsAction::Tag { name, tags } => {
+        ToolsAction::Tag { name, tags, clear } => {
             let tool = find_tool(&paths, &name)?;
-            let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(
-                &paths,
-                Request::SetToolTags { id: tool.id, tags },
-            )?)?;
-            if t.tags.is_empty() {
-                println!("{}: no tags", t.name);
+            let tool = if clear || !tags.is_empty() {
+                serde_json::from_value(request_once(
+                    &paths,
+                    Request::SetToolTags { id: tool.id, tags },
+                )?)?
             } else {
-                println!("{}: {}", t.name, t.tags.join(" "));
-            }
+                tool
+            };
+            let name = comparison_terminal_text(&tool.name);
+            let tags = if tool.tags.is_empty() {
+                "no tags".into()
+            } else {
+                comparison_terminal_text(&tool.tags.join(" "))
+            };
+            println!("{name}: {tags}");
             Ok(())
         }
         ToolsAction::Retire { name, force } => set_tool_retired(&paths, &name, true, force),

@@ -1996,8 +1996,9 @@ pattern (§4.4).
 - **Tags:** Tools carry topic tags (`git`, `web`, `finance`).
   - **Setting them:** the agent passes `create_tool`'s optional `tags`; a
     new version without tags keeps the old ones. Users use `SetToolTags`:
-    `formless tools tag NAME [TAG…]`, `/tooltag NAME [TAG…]` in the TUI,
-    or the Tags field in the web Tool detail. None given clears them.
+    `formless tools tag NAME TAG…` or `formless tools tag NAME --clear`,
+    `/tooltag NAME [TAG…]` in the TUI, or the Tags field in the web Tool
+    detail. `formless tools tag NAME` reads the existing tags.
   - **Normalised:** lowercase, without `#`, spaces become `-`, only
     letters, digits, `-` and `_`, at most 24 characters each and 8 per
     Tool.
