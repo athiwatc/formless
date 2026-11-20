@@ -32,6 +32,7 @@ pub mod qr;
 mod query;
 mod review_wrap;
 mod search_jump;
+mod session_rename;
 mod session_ui;
 mod settings;
 mod tab_view;
@@ -389,7 +390,9 @@ enum Pending {
     SetTags,
     ContextReport,
     Security,
-    SuggestName,
+    SuggestName {
+        target: String,
+    },
     ToolMetrics,
     ProposalDiff,
     /// Apply, reject or roll back a Proposal: the answer is a note (errors already are).
@@ -1921,7 +1924,7 @@ struct App {
     subagents: Vec<SubagentInfo>,
     import_mode: Option<ImportKind>,
     /// The Session being renamed (the input holds its new name).
-    renaming: Option<String>,
+    renaming: Option<session_rename::Rename>,
     /// The Session whose instructions the input is editing.
     instructing: Option<String>,
     /// Sessions marked with Space for a bulk action (SPEC §10.4), and a
@@ -2306,6 +2309,13 @@ impl App {
 
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(session_rename::Rename::suggesting)
+        {
+            self.cancel_rename();
+        }
         self.cancel_branch_summary();
         self.hunk_review.clear();
         self.clear_attention();
@@ -2370,6 +2380,13 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(session_rename::Rename::suggesting)
+        {
+            self.cancel_rename();
+        }
         self.cancel_branch_summary();
         self.hunk_review.clear();
         self.forecast = ForecastUi::default();
@@ -2504,6 +2521,7 @@ impl App {
         }
         self.reconnect_read_failed(id);
         if self.current.as_deref() == Some(session_id.as_str()) {
+            self.cancel_rename();
             // Do not move an old Session's retained input into another Session.
             self.stash_current_draft(&session_id);
             self.current = None;
@@ -2878,6 +2896,9 @@ impl App {
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
+            if matches!(kind, Pending::SuggestName { .. }) {
+                self.cancel_rename();
+            }
             if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation == self.branch_summary.generation)
             {
                 self.cancel_branch_summary();
@@ -3089,6 +3110,14 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::SuggestName { target } = &kind {
+                        self.finish_rename_suggestion(
+                            target,
+                            if ok { result } else { None },
+                            if ok { None } else { error },
+                        );
+                        continue;
+                    }
                     if let Pending::ProviderRetry { session_id } = &kind {
                         let text = if ok {
                             match result.as_ref().and_then(|r| r["retrying"].as_bool()) {
@@ -3256,6 +3285,7 @@ impl App {
                                         continue;
                                     }
                                     if self.on_start == "picker" {
+                                        self.cancel_rename();
                                         self.view = View::Sessions;
                                     }
                                     if let Some(first) = self.start_session() {
@@ -3359,7 +3389,7 @@ impl App {
                                 self.notes.push(format!("{} search hit(s)", v.len()));
                                 self.search_hits = v;
                                 self.search_idx = 0;
-                                self.view = View::Search;
+                                self.open_view(View::Search);
                             }
                         }
                         Pending::ListBuiltinStats => {
@@ -3887,17 +3917,8 @@ impl App {
                                 })
                                 .collect();
                         }
-                        Pending::SuggestName => {
-                            match (self.current.clone(), result["name"].as_str()) {
-                                (Some(id), Some(name)) => {
-                                    self.start_rename(&id, name);
-                                    self.notes.push(
-                                        "suggested name: Enter to use it, edit it first, or Esc"
-                                            .into(),
-                                    );
-                                }
-                                _ => self.notes.push("no name to suggest yet".into()),
-                            }
+                        Pending::SuggestName { .. } => {
+                            unreachable!("name suggestions handled above")
                         }
                         Pending::Security => {
                             self.pager = Some(Pager {
@@ -5483,6 +5504,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
             self.cancel_branch_summary();
@@ -6589,6 +6611,14 @@ impl App {
                 }
             }
             Event::SessionDeleted { id } => {
+                if self.is_current(&id)
+                    || self
+                        .renaming
+                        .as_ref()
+                        .is_some_and(|rename| rename.target == id)
+                {
+                    self.cancel_rename();
+                }
                 let selected = self.selected_session().map(|s| s.id.clone());
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
@@ -6904,13 +6934,6 @@ impl App {
         }
         if let Some(id) = self.instructing.take() {
             self.set_instructions(id, &text);
-            return;
-        }
-        if let Some(id) = self.renaming.take() {
-            let name = text.trim().to_string();
-            if !name.is_empty() {
-                self.fire(Request::RenameSession { id, name });
-            }
             return;
         }
         if self.search_mode {
@@ -7448,6 +7471,7 @@ impl App {
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
         if view != View::Chat {
+            self.cancel_rename();
             self.search_jump = None;
         }
         self.view = view;
@@ -9098,7 +9122,11 @@ impl App {
         if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
             self.selecting_draft = false;
         }
-        if matches!(
+        if self.editor.is_none() && self.renaming.is_some() {
+            if self.rename_mouse(m) {
+                return;
+            }
+        } else if matches!(
             m.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
         ) {
@@ -9393,7 +9421,9 @@ impl App {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
         {
             // Some application shortcuts act before they reach Vim.
-            self.vim_input.cancel_pending_argument();
+            if self.renaming.is_none() {
+                self.vim_input.cancel_pending_argument();
+            }
             if let Some(editor) = &mut self.editor {
                 editor.vim.cancel_pending_argument();
             }
@@ -9494,7 +9524,10 @@ impl App {
             self.rollback_key(key);
             return;
         }
-        if self.model_overlay.is_some() {
+        if self.model_overlay.is_some()
+            && (self.renaming.is_none()
+                || (self.approvals.is_empty() && self.promotions.is_empty()))
+        {
             self.model_key(key);
             return;
         }
@@ -9762,6 +9795,21 @@ impl App {
                     return;
                 }
             }
+        }
+        if self.view == View::Chat && self.renaming.is_some() {
+            if modal_keys {
+                return;
+            }
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                self.cycle_view(key.code == KeyCode::Tab);
+            } else if self.find.is_some()
+                || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.find_key(&key);
+            } else {
+                self.rename_key(key);
+            }
+            return;
         }
         // The first composer Insert Escape only changes mode. Thereafter
         // completion dialogs keep their normal Escape/navigation ownership
@@ -11497,8 +11545,7 @@ impl App {
             KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
                 self.toasts.clear();
             }
-            KeyCode::Esc if self.renaming.is_some() || self.instructing.is_some() => {
-                self.renaming = None;
+            KeyCode::Esc if self.instructing.is_some() => {
                 self.instructing = None;
                 self.input.clear();
                 self.notes.push("cancelled".into());
@@ -11671,6 +11718,10 @@ impl App {
                 find.scroll = true;
                 return;
             }
+            if self.renaming.is_some() {
+                self.rename_paste(text);
+                return;
+            }
             if self.input.searching().is_some() {
                 let history: Vec<_> =
                     input_history(&self.messages, self.current.as_deref()).collect();
@@ -11696,7 +11747,6 @@ impl App {
             // A dragged file arrives as a pasted path. Only the message
             // composer uses that path as an attachment.
             if self.bulk.is_none()
-                && self.renaming.is_none()
                 && self.instructing.is_none()
                 && !self.search_mode
                 && self.import_mode.is_none()
@@ -11725,6 +11775,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
     app.draft_hits.borrow_mut().clear();
+    if let Some(rename) = &app.renaming {
+        rename.clear_hits();
+    }
     app.refresh_toasts();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
@@ -11774,7 +11827,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         typing && (modal.is_none() || app.input_focus),
     );
     draw_status(f, chunks[3], app);
-    if app.view == View::Chat {
+    if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
         if let Some(q) = question.filter(|_| palette.is_empty() && modal.is_none()) {
@@ -12650,10 +12703,9 @@ fn selection_navigation(line: &mut input::InputLine, key: KeyEvent) -> bool {
 }
 
 /// Hit regions follow rendered grapheme cells, not UTF-8 bytes or char counts.
-fn draft_row_hits(app: &App, row: &str, byte: usize, area: Rect, left: usize) {
+fn draft_row_hits(hits: &mut Vec<(Rect, usize)>, row: &str, byte: usize, area: Rect, left: usize) {
     use unicode_segmentation::UnicodeSegmentation;
     let mut col = 0usize;
-    let mut hits = app.draft_hits.borrow_mut();
     for (at, g) in row.grapheme_indices(true) {
         let end = col + text::width(g);
         if end > left && col < left + area.width as usize {
@@ -12694,8 +12746,6 @@ fn composer_prompt(app: &App) -> (&'static str, Color) {
             },
             Color::Red,
         )
-    } else if app.renaming.is_some() {
-        ("rename › ", Color::Magenta)
     } else if app.instructing.is_some() {
         ("instructions › ", Color::Magenta)
     } else if app.search_mode {
@@ -12735,8 +12785,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         f.render_widget(Paragraph::new(line).block(block), area);
         return;
     }
+    if let Some(rename) = app.renaming.as_ref().filter(|_| app.view == View::Chat) {
+        rename.draw(f, area, app, show_cursor);
+        return;
+    }
     let (prompt, color) = composer_prompt(app);
-    let prompt_w = Span::raw(prompt).width();
     let avail = input_text_width(area.width, prompt);
     app.composer_text_width.set(avail);
     let mut lines: Vec<Line> = Vec::new();
@@ -12758,55 +12811,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
             Span::styled("Ask Formless to do something…", ui::dim(app.color)),
         ]));
     } else {
-        let (rows, cur) = app.input.layout(avail);
-        let height = area.height.saturating_sub(2).max(1) as usize;
-        // Keep the cursor row on screen.
-        let top = cur.0.saturating_sub(height - 1);
-        let styled = app.input.styled_rows(avail, top, height);
-        let mut byte = 0;
-        let offsets: Vec<_> = rows
-            .iter()
-            .map(|row| {
-                let at = byte;
-                byte += row.len();
-                if app.input.as_bytes().get(byte) == Some(&b'\n') {
-                    byte += 1;
-                }
-                at
-            })
-            .collect();
-        for (i, row) in rows.into_iter().enumerate().skip(top).take(height) {
-            draft_row_hits(
-                app,
-                &row,
-                offsets[i],
-                Rect::new(
-                    area.x + 1 + prompt_w as u16,
-                    area.y + 1 + (i - top) as u16,
-                    avail as u16,
-                    1,
-                ),
-                0,
-            );
-            let lead = if i == 0 {
-                Span::styled(prompt, bold_fg(app.color, color))
-            } else {
-                Span::raw(" ".repeat(prompt_w))
-            };
-            let mut spans = vec![lead];
-            spans.extend(styled[i - top].iter().map(|(text, selected)| {
-                Span::styled(
-                    text.clone(),
-                    if *selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    },
-                )
-            }));
-            lines.push(Line::from(spans));
-        }
-        cursor = Some((cur.0 - top, cur.1));
+        let (rows, position) = draft_editor_rows(
+            &app.input,
+            area,
+            prompt,
+            bold_fg(app.color, color),
+            Some(&app.draft_hits),
+        );
+        lines = rows;
+        cursor = Some(position);
     }
     // Which Session gets this message (SPEC §10.2).
     let target = app
@@ -12874,14 +12887,76 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         ));
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
-    if let Some((row, col)) = cursor.filter(|_| show_cursor) {
-        let x = area.x + 1 + prompt_w as u16 + col as u16;
-        let y = area.y + 1 + row as u16;
-        f.set_cursor_position((
-            x.min(area.right().saturating_sub(2)),
-            y.min(area.bottom().saturating_sub(2)),
-        ));
+    if let Some(cursor) = cursor.filter(|_| show_cursor) {
+        set_draft_cursor(f, area, prompt, cursor);
     }
+}
+
+fn set_draft_cursor(f: &mut Frame, area: Rect, prompt: &str, (row, col): (usize, usize)) {
+    let x = usize::from(area.x) + 1 + text::width(prompt) + col;
+    let y = usize::from(area.y) + 1 + row;
+    f.set_cursor_position((
+        x.min(usize::from(area.right().saturating_sub(2))) as u16,
+        y.min(usize::from(area.bottom().saturating_sub(2))) as u16,
+    ));
+}
+
+fn draft_editor_rows(
+    input: &input::InputLine,
+    area: Rect,
+    prompt: &'static str,
+    prompt_style: Style,
+    hits: Option<&std::cell::RefCell<Vec<(Rect, usize)>>>,
+) -> (Vec<Line<'static>>, (usize, usize)) {
+    let prompt_w = Span::raw(prompt).width();
+    let avail = input_text_width(area.width, prompt);
+    let (rows, cursor) = input.layout(avail);
+    let height = area.height.saturating_sub(2).max(1) as usize;
+    let top = cursor.0.saturating_sub(height - 1);
+    let styled = input.styled_rows(avail, top, height);
+    let mut byte = 0;
+    let mut hits = hits.map(|hits| hits.borrow_mut());
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i >= top && i < top + height {
+            if let Some(hits) = &mut hits {
+                draft_row_hits(
+                    hits,
+                    row,
+                    byte,
+                    Rect::new(
+                        area.x + 1 + prompt_w as u16,
+                        area.y + 1 + (i - top) as u16,
+                        avail as u16,
+                        1,
+                    ),
+                    0,
+                );
+            }
+            let lead = if i == 0 {
+                Span::styled(prompt, prompt_style)
+            } else {
+                Span::raw(" ".repeat(prompt_w))
+            };
+            let mut spans = vec![lead];
+            spans.extend(styled[i - top].iter().map(|(text, selected)| {
+                Span::styled(
+                    text.clone(),
+                    if *selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }));
+            lines.push(Line::from(spans));
+        }
+        byte += row.len();
+        if input.as_bytes().get(byte) == Some(&b'\n') {
+            byte += 1;
+        }
+    }
+    (lines, (cursor.0 - top, cursor.1))
 }
 
 /// `240 KB`, `1.2 MB`.
@@ -12902,7 +12977,13 @@ fn input_text_width(box_width: u16, prompt: &str) -> usize {
 
 /// The input box's height: its wrapped rows (up to 8) plus borders.
 fn input_height(app: &App, width: u16) -> u16 {
-    if composer_find(app).is_some() || app.input.searching().is_some() {
+    if composer_find(app).is_some() {
+        return 3;
+    }
+    if let Some(rename) = app.renaming.as_ref().filter(|_| app.view == View::Chat) {
+        return rename.height(width);
+    }
+    if app.input.searching().is_some() {
         return 3;
     }
     let (prompt, _) = composer_prompt(app);
@@ -14759,14 +14840,14 @@ impl App {
                 let name = self.session_name(&id);
                 self.start_rename(&id, &name);
             }
-            "auto" => {
-                self.notes.push("suggesting a name…".into());
-                self.request(Pending::SuggestName, Request::SuggestSessionName { id });
+            "auto" => self.suggest_rename(id),
+            name => {
+                self.cancel_rename();
+                self.fire(Request::RenameSession {
+                    id,
+                    name: name.to_string(),
+                });
             }
-            name => self.fire(Request::RenameSession {
-                id,
-                name: name.to_string(),
-            }),
         }
     }
 
@@ -15204,16 +15285,6 @@ impl App {
             self.call_focus = Some(id);
             self.scroll_to_focus = true;
         }
-    }
-
-    /// Rename Session `id` in the input, starting from `name` (Esc
-    /// cancels).
-    fn start_rename(&mut self, id: &str, name: &str) {
-        self.renaming = Some(id.to_string());
-        self.view = View::Chat;
-        self.input.set(name);
-        self.notes
-            .push("Edit the name, then Enter (Esc cancels).".into());
     }
 
     /// Sessions matching the switcher's query, best first (newest first
@@ -15655,6 +15726,10 @@ impl App {
         if self.wizard.is_some() {
             self.flush_wizard_draft(true);
             self.should_quit = true;
+            return;
+        }
+        if self.renaming.is_some() {
+            self.cancel_rename();
             return;
         }
         let armed = self.ctrl_c_at.is_some_and(|t| t.elapsed() < CTRL_C_WINDOW);
@@ -18824,7 +18899,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     for (i, row) in text.split('\n').enumerate() {
         if i >= scroll_y && i < scroll_y + height {
             draft_row_hits(
-                app,
+                &mut app.draft_hits.borrow_mut(),
                 row,
                 byte,
                 Rect::new(
@@ -20424,7 +20499,7 @@ mod tests {
         }
     }
 
-    fn reconnect_approval(id: &str, session: &str) -> Event {
+    pub(super) fn reconnect_approval(id: &str, session: &str) -> Event {
         Event::ApprovalRequested {
             context: None,
             session_id: session.into(),
@@ -27258,56 +27333,40 @@ mod tests {
     }
 
     #[test]
-    fn rename_starts_from_the_current_name() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    fn cancel_session_rename_preserves_the_existing_draft_and_cursor() {
         let mut app = test_app();
-        app.sessions = vec![SessionInfo {
-            forked_from: None,
-            fork_point_seq: None,
-            id: "a".into(),
-            name: "Refactor auth".into(),
-            model: None,
-            reasoning_effort: None,
-            created_at: "2026-01-01".into(),
-            updated_at: "2026-01-01".into(),
-            cwd: None,
-            message_count: 0,
-            preview: None,
-            last_run_status: None,
-            pinned: false,
-            archived: false,
-            tags: vec![],
-            instructions: None,
-        }];
-        app.view = View::Sessions;
+        app.sessions = vec![serde_json::from_value(serde_json::json!({
+            "id": "other",
+            "name": "Other Session",
+            "created_at": "2026-01-01",
+            "updated_at": "2026-01-01",
+        }))
+        .unwrap()];
+        app.input.set("draft for the current Session");
+        app.input.left();
+        let cursor = app.input.cursor_byte();
+        app.open_view(View::Sessions);
         app.key(key(KeyCode::Char('r')));
-        assert_eq!(app.view, View::Chat);
-        assert_eq!(&*app.input, "Refactor auth");
         assert!(render(&mut app, 80, 20).contains("rename ›"));
         app.key(key(KeyCode::Esc));
-        assert!(app.renaming.is_none());
-        assert_eq!(&*app.input, "");
-        // `/rename auto` offers the daemon's suggestion for editing.
-        app.current = Some("a".into());
-        app.slash("rename auto");
-        let (tx, rx) = mpsc::channel();
-        app.inbox = Some(rx);
-        app.pending.insert(7, Pending::SuggestName);
-        tx.send(ServerMessage::Response {
-            id: 7,
-            ok: true,
-            result: Some(serde_json::json!({"name": "Token code split"})),
-            error: None,
-        })
-        .unwrap();
-        app.drain_daemon();
-        assert_eq!(app.renaming.as_deref(), Some("a"));
-        assert_eq!(&*app.input, "Token code split");
-        // `/instructions` edits them the same way.
-        app.renaming = None;
+        assert_eq!(app.current.as_deref(), Some("s1"));
+        assert_eq!(app.input.expanded(), "draft for the current Session");
+        assert_eq!(app.input.cursor_byte(), cursor);
+    }
+
+    #[test]
+    fn instructions_start_from_the_current_session() {
+        let mut app = test_app();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({
+            "id": "s1",
+            "name": "Current Session",
+            "created_at": "",
+            "updated_at": "",
+        }))
+        .unwrap()];
         app.sessions[0].instructions = Some("answer in Thai".into());
         app.slash("instructions");
-        assert_eq!(app.instructing.as_deref(), Some("a"));
+        assert_eq!(app.instructing.as_deref(), Some("s1"));
         assert_eq!(&*app.input, "answer in Thai");
         assert!(render(&mut app, 80, 20).contains("instructions ›"));
         app.key(key(KeyCode::Esc));
@@ -28905,7 +28964,7 @@ mod tests {
             "keeps the latest rows"
         );
     }
-    fn forecast_reply(hint: &str, required: bool) -> RunForecast {
+    pub(super) fn forecast_reply(hint: &str, required: bool) -> RunForecast {
         let st = formless_core::Store::open_in_memory().unwrap();
         let mut cfg = Config::default();
         cfg.provider.model = "model".into();
