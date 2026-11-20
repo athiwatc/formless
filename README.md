@@ -152,7 +152,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls to the configured provider endpoint.
+5. **Local-first, zero telemetry.** Formless works with a configured provider, can connect to the [Relay](#37-browser-access-via-the-relay-v2) when you enable it, and can automatically download assets for [local session naming](#7-sessions-runs-and-steer). Zero telemetry does not mean zero network traffic.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config and Session checkpoints keep history; destructive actions are user-only and confirmed.
 
@@ -202,7 +202,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | Async runtime | [Tokio](https://tokio.rs/) |
 | Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
 | HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |
-| Local session naming | [Candle](https://github.com/huggingface/candle) with [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) |
+| Local session naming | [Candle](https://github.com/huggingface/candle) with [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) by default |
 
 ---
 
@@ -1185,7 +1185,8 @@ formless memory rm m1a2b3c4
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
 * **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
-* **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
+* **Auto-naming** — when a Run finishes, the daemon can give an eligible Session with a provisional title a short name. Naming runs in the background, never replaces a name you set, and uses no provider tokens. The configured naming model runs locally on the CPU.
+  Naming and automatic downloads are enabled by default. In a build with `embedded-llm`, these settings let an eligible Session with naming text fetch its missing configured catalogue model and tokenizer from Hugging Face. These are pinned assets verified with SHA-256 and stored under `<data dir>/models/`. If the model is unavailable, fails, or exceeds `naming.timeout_secs`, the daemon can use a first-words title instead. Set `naming.enabled = false` to turn off automatic naming or `naming.auto_download = false` to disable automatic downloads. These settings do not delete installed assets or disable the explicit `formless naming pull` command.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
@@ -1215,6 +1216,16 @@ in the TUI, or pass `formless run --max-steps N`. Reaching a step threshold
 pauses that Run. See the existing [step-limit and resume/abandon behavior](SPEC.md#54-interruption-and-resumption)
 and [spending-limit rules](SPEC.md#52-run-lifecycle). The client's `--timeout`
 is a separate interruption option.
+
+### Naming model catalogue
+
+| Model ID | Model | GGUF quantization | GGUF weights (bytes) | Upstream license |
+|---|---|---|---:|---|
+| `qwen2.5-0.5b` | Qwen2.5-0.5B-Instruct (default) | Q4_0 | 428,730,208 | [Apache-2.0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/LICENSE) |
+| `lfm2.5-350m` | LFM2.5-350M (alternative) | Q4_K_M | 229,312,224 | [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE) |
+
+Weights exclude the separate tokenizer files. The CLI displays whole decimal
+MB by truncating: 428 MB and 229 MB, respectively.
 
 ---
 
@@ -1260,7 +1271,7 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Zero telemetry and no phone-home: nothing leaves the machine except calls to the configured provider endpoint, and `formless update check` only runs when you ask it to ([§3.12](#312-updating)).
+* **Local-first.** Network activity can include provider requests, a [user-enabled Relay](#37-browser-access-via-the-relay-v2), and the [automatic naming asset download](#7-sessions-runs-and-steer). There is no automatic update checker; [`formless update check`](#312-updating) runs only when asked.
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
 
@@ -1404,7 +1415,7 @@ Contributions are welcome, whether it is a bug report, a Tool, a client improvem
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
 
-The optional session-naming model, LFM2.5-230M, is not part of this repository or the binary. It is downloaded at runtime and covered by Liquid AI's [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE) ([§7](#7-sessions-runs-and-steer)).
+Session-naming models are not bundled in this repository or binary. See the [model catalogue](#naming-model-catalogue) for the separate upstream licenses of the default Qwen model and the optional Liquid AI model.
 
 ---
 
@@ -1419,7 +1430,7 @@ The optional session-naming model, LFM2.5-230M, is not part of this repository o
 ## Acknowledgments
 
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template) for the README structure this page follows.
-- [Liquid AI](https://www.liquid.ai/) for LFM2.5-230M, the optional local session-naming model.
+- [Qwen](https://huggingface.co/Qwen) and [Liquid AI](https://www.liquid.ai/) for the local session-naming models.
 - The Rust, [ratatui](https://ratatui.rs/), [rquickjs](https://github.com/DelSkayn/rquickjs), [Tokio](https://tokio.rs/) and SQLite communities.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
