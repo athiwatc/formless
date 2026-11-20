@@ -4949,6 +4949,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   it and a double-click opens it (as Enter), and clicking a tool call's
   header in the chat expands or collapses it. Each frame records its
   clickable regions, list rows from the widgets' own scroll offsets.
+  The wheel over an active Sessions, Tools or Proposals list moves the
+  selection by up to three filtered items without activating a row.
 
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the

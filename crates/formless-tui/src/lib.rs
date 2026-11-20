@@ -2017,6 +2017,8 @@ struct App {
     /// Clickable regions of the last frame (SPEC §10.5), and the last
     /// click for double-click detection.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// The visible list panel in the last frame, if it can show a selectable row.
+    list_wheel_region: std::cell::Cell<Option<(View, Rect)>>,
     draft_hits: std::cell::RefCell<Vec<(Rect, usize)>>,
     selecting_draft: bool,
     last_click: Option<(Click, Instant)>,
@@ -2278,6 +2280,7 @@ impl App {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -5124,6 +5127,11 @@ impl App {
 
     fn invalidate_rollback_viewport(&self) {
         self.rollback_visible_version.set(None);
+    }
+
+    fn resized(&self) {
+        self.invalidate_rollback_viewport();
+        self.list_wheel_region.set(None);
     }
 
     fn rollback_key(&mut self, key: KeyEvent) {
@@ -9167,8 +9175,13 @@ impl App {
         if self.editor.is_some() {
             return;
         }
-        if self.view != View::Chat && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
+        if self.view != View::Chat {
+            match m.kind {
+                MouseEventKind::ScrollUp => return self.wheel_list(m.column, m.row, false),
+                MouseEventKind::ScrollDown => return self.wheel_list(m.column, m.row, true),
+                MouseEventKind::Down(MouseButton::Left) => {}
+                _ => return,
+            }
         }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(3),
@@ -9196,6 +9209,51 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn list_wheel_blocked(&self) -> bool {
+        self.renaming.is_some()
+            || !self.approvals.is_empty()
+            || !self.promotions.is_empty()
+            || self.rollback_pick.is_some()
+            || self.model_overlay.is_some()
+            || self.forecast.modal.is_some()
+            || self.quit_confirm
+            || self.switcher.is_some()
+            || self.pager.is_some()
+            || self.external_edit.awaiting_confirmation()
+    }
+
+    fn record_list_wheel_region(&self, view: View, area: Rect, rows: usize) {
+        self.list_wheel_region
+            .set((rows > 0 && area.width > 2).then_some((view, area)));
+    }
+
+    fn wheel_list(&mut self, column: u16, row: u16, down: bool) {
+        let Some((view, area)) = self.list_wheel_region.get() else {
+            return;
+        };
+        // A modal may have opened since the last paint.
+        if view != self.view
+            || !(area.x..area.right()).contains(&column)
+            || !(area.y..area.bottom()).contains(&row)
+            || self.list_wheel_blocked()
+        {
+            return;
+        }
+        let (len, index) = match view {
+            View::Sessions => (self.visible_sessions().len(), &mut self.session_idx),
+            View::Tools => (self.visible_tools().len(), &mut self.tool_idx),
+            View::Proposals => (self.visible_proposals().len(), &mut self.proposal_idx),
+            _ => return,
+        };
+        let last = len.saturating_sub(1);
+        let current = (*index).min(last);
+        *index = if down {
+            current.saturating_add(3).min(last)
+        } else {
+            current.saturating_sub(3)
+        };
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
@@ -11774,6 +11832,7 @@ impl App {
 fn draw(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
+    app.list_wheel_region.set(None);
     app.draft_hits.borrow_mut().clear();
     if let Some(rename) = &app.renaming {
         rename.clear_hits();
@@ -11917,6 +11976,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
+    // Dismissing a modal in an input burst must wait for an unobscured
+    // frame before the list can receive wheel events.
+    if app.list_wheel_blocked() {
+        app.list_wheel_region.set(None);
+    }
     if let Some(target) = rollback.filter(|target| target.is_visible(f.buffer_mut())) {
         app.rollback_visible_version.set(Some(target.version));
     }
@@ -16853,10 +16917,9 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         &mut state,
     );
     clickable_rows(app, area, 0, state.offset(), count, Click::Session);
-    app.record_list_capacity(
-        View::Sessions,
-        count.min(area.height.saturating_sub(2) as usize),
-    );
+    let rows = count.min(area.height.saturating_sub(2) as usize);
+    app.record_list_capacity(View::Sessions, rows);
+    app.record_list_wheel_region(View::Sessions, area, rows);
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -17646,10 +17709,9 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_proposals();
-    app.record_list_capacity(
-        View::Proposals,
-        visible.len().min(area.height.saturating_sub(3) as usize),
-    );
+    let rows = visible.len().min(area.height.saturating_sub(3) as usize);
+    app.record_list_capacity(View::Proposals, rows);
+    app.record_list_wheel_region(View::Proposals, area, rows);
     let mut title = app.proposal_filter.title(
         "Prompt proposals",
         visible.len(),
@@ -18257,15 +18319,14 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         // Clicks select Tools; headers between them take rows too.
         let top = parts[0].y + 2;
         let height = parts[0].height.saturating_sub(3) as usize;
-        app.record_list_capacity(
-            View::Tools,
-            layout
-                .iter()
-                .skip(state.offset())
-                .take(height)
-                .filter(|row| row.is_ok())
-                .count(),
-        );
+        let rows = layout
+            .iter()
+            .skip(state.offset())
+            .take(height)
+            .filter(|row| row.is_ok())
+            .count();
+        app.record_list_capacity(View::Tools, rows);
+        app.record_list_wheel_region(View::Tools, parts[0], rows);
         for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
             if let Ok(p) = r {
                 clickable(
@@ -19566,7 +19627,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::Paste(text) => app.paste(&text),
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
-                    CtEvent::Resize(_, _) => app.invalidate_rollback_viewport(),
+                    CtEvent::Resize(_, _) => app.resized(),
                 }
                 wait = Duration::ZERO;
                 if started.elapsed() > Duration::from_millis(100) {
@@ -19885,6 +19946,7 @@ mod tests {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -26120,6 +26182,170 @@ mod tests {
         assert!(app.notes.last().unwrap().starts_with("usage: /panes"));
     }
 
+    fn list_wheel(app: &mut App, column: u16, row: u16, down: bool) {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.mouse(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn wheel_fixture_sessions(count: usize) -> Vec<SessionInfo> {
+        (0..count)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"),
+                    "name": format!("Session {i}"),
+                    "archived": i % 2 == 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_moves_filtered_sessions_and_reveals_selection_without_opening() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.input_focus = true;
+        assert_eq!(app.visible_sessions().len(), 4);
+        let current = app.current.clone();
+        let pending = app.pending.len();
+        render(&mut app, 100, 9);
+        let region = {
+            let targets = app.click_targets.borrow();
+            assert!(!targets.iter().any(|(_, hit)| hit == &Click::Session(3)));
+            targets
+                .iter()
+                .find_map(|(r, hit)| (hit == &Click::Session(0)).then_some(*r))
+                .unwrap()
+        };
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        render(&mut app, 100, 9);
+        assert!(app
+            .click_targets
+            .borrow()
+            .iter()
+            .any(|(_, hit)| hit == &Click::Session(3)));
+        list_wheel(&mut app, region.x, region.y, false);
+        assert_eq!(app.session_idx, 0);
+        assert_eq!(app.current, current);
+        assert_eq!(app.pending.len(), pending);
+        assert!(app.input_focus);
+    }
+
+    fn wheel_fixture_proposals() -> Vec<PromptProposalInfo> {
+        (0..2)
+            .map(|i| PromptProposalInfo {
+                id: format!("p{i}"),
+                kind: "prompt".into(),
+                content: "synthetic".into(),
+                rationale: String::new(),
+                status: "measured".into(),
+                baseline_score: None,
+                candidate_score: None,
+                eval_total: 0,
+                est_tokens: 0,
+                created_at: String::new(),
+                applied_at: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_clamps_short_and_empty_proposals_without_review() {
+        let mut app = test_app();
+        app.view = View::Proposals;
+        render(&mut app, 100, 16);
+        assert!(app.list_wheel_region.get().is_none());
+        list_wheel(&mut app, 5, 5, true);
+        assert_eq!(app.proposal_idx, 0);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.proposal_idx, 0);
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.proposal_idx, 1);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.proposal_idx, 0);
+        assert!(app.reviewing.is_none());
+        assert!(app.pager.is_none());
+        assert_eq!(app.pending.len(), pending);
+    }
+
+    #[test]
+    fn wheel_rejects_stale_regions_during_modal_view_and_size_changes() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let (column, row) = (area.x + 1, area.y + 2);
+        app.quit_confirm = true;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal opened before redraw");
+        render(&mut app, 100, 16);
+        app.quit_confirm = false;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal dismissed before redraw");
+        render(&mut app, 100, 16);
+        app.view = View::Proposals;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "tab switched before redraw");
+        render(&mut app, 100, 16);
+        app.resized();
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "terminal resized before redraw");
+        render(&mut app, 100, 16);
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 1, "fresh unobscured frame");
+    }
+
+    #[test]
+    fn wheel_ignores_lists_without_room_for_a_rendered_row() {
+        let mut app = test_app();
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        app.tools = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let mut tool = description_fixture_detail().tool;
+                tool.id = name.into();
+                tool.name = name.into();
+                tool
+            })
+            .collect();
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            for (width, height) in [(1, 1), (2, 16), (100, 5)] {
+                render(&mut app, width, height);
+                assert!(
+                    app.list_wheel_region.get().is_none(),
+                    "{view:?} at {width}x{height}"
+                );
+                for row in 0..height {
+                    list_wheel(&mut app, width / 2, row, true);
+                }
+                assert_eq!((app.session_idx, app.tool_idx, app.proposal_idx), (0, 0, 0));
+            }
+        }
+    }
+
     #[test]
     fn mouse_clicks_switch_tabs_select_rows_and_toggle_calls() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -28048,6 +28274,16 @@ mod tests {
             screen.contains("▾ fs (1)") && screen.contains("▾ net (1)"),
             "{screen}"
         );
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.tool_idx, 0, "details pane does not move selection");
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        assert!(app.tool_detail.is_none());
+        assert_eq!(app.pending.len(), pending);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.selected_tool().unwrap().name, "read_file");
         // The first Tool (fs) is selected; z folds its group.
         app.key(key('z'));
         let screen = render(&mut app, 140, 30);
