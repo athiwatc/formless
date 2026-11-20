@@ -1673,11 +1673,12 @@
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.php = { ...HL.c, lc: ["//", "#"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
-    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
@@ -1693,6 +1694,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const php = L === HL.php;
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1743,11 +1745,14 @@
         i = stop;
         continue;
       }
-      const hashComment = c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]);
+      const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]));
       if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
           (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
-        const stop = end < 0 ? code.length : end;
+        const lineEnd = end < 0 ? code.length : end;
+        const tag = php ? code.slice(i, lineEnd).indexOf("?>") : -1;
+        const stop = tag < 0 ? lineEnd : i + tag;
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
