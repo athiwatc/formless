@@ -1695,6 +1695,7 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const php = L === HL.php;
+    const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1760,8 +1761,9 @@
       if (L.q.includes(c)) {
         let j = i + 1;
         const multiline = c === "`" || L.mysqlComments;
+        const literal = (shellLiteralQuotes && c === "'" && code[i - 1] !== "$") || (L.mysqlComments && c === "`");
         while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
-          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+          j += code[j] === "\\" && !literal ? 2 : 1;
         }
         const stop = Math.min(j + 1, code.length);
         tok("tok-str", code.slice(i, stop));

@@ -23,6 +23,14 @@ FAMILIES = [
       ('tok-lit', 'nil'), ('tok-com', '-- comment')]),
     (('sql',), 'SELECT true -- comment',
      [('tok-kw', 'SELECT'), ('tok-lit', 'true'), ('tok-com', '-- comment')]),
+    (('sh', 'Bash', 'zsh', 'shell', 'console'), r"echo 'path\'; if true",
+     [('tok-kw', 'echo'), ('tok-str', r"'path\'"), ('tok-kw', 'if'), ('tok-lit', 'true')]),
+    (('sh', 'bash', 'zsh'), r'echo "say \"hi\""; if true',
+     [('tok-kw', 'echo'), ('tok-str', r'"say \"hi\""'), ('tok-kw', 'if'), ('tok-lit', 'true')]),
+    (('bash', 'zsh'), r"echo $'it\'s'; if true",
+     [('tok-kw', 'echo'), ('tok-str', r"'it\'s'"), ('tok-kw', 'if'), ('tok-lit', 'true')]),
+    (('fish', 'ruby', 'perl'), r"echo 'it\'s'; if true",
+     [('tok-kw', 'echo'), ('tok-str', r"'it\'s'"), ('tok-kw', 'if'), ('tok-lit', 'true')]),
     (('dash', 'no-such-language', ''), 'local let 2 -- comment', []),
 ]
 
