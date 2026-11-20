@@ -3772,7 +3772,7 @@
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
   function planStateLabel(state) {
     if (!state) return "";
-    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", state.updated_at ? "updated " + state.updated_at : ""].filter(Boolean).join(" · ");
+    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", Number.isFinite(Date.parse(state.updated_at)) ? "updated " + relTime(state.updated_at) : ""].filter(Boolean).join(" · ");
   }
   function renderPlan() {
     const box = $("plan");
@@ -3780,10 +3780,20 @@
     box.classList.toggle("hidden", !items.length);
     if (!items.length) return box.replaceChildren();
     const done = items.filter((i) => i.status === "completed").length;
-    const lifecycle = planStateLabel(S.planState);
-    if (done === items.length && !isRunning() && !lifecycle) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    const state = S.planState, lifecycle = planStateLabel(state);
+    const updated = Date.parse(state?.updated_at);
+    const title = Number.isFinite(updated) ? uiFormat(new Date(updated), {
+      year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+    }) : null;
+    // A successful resumed current task is complete too; copied/imported/legacy
+    // and previous-task plans retain their provenance and checklist.
+    const completedCurrent = state && !state.previous_task && state.run_status === "completed" &&
+      (state.origin === "live" || state.origin === "resumed");
+    if (done === items.length && !isRunning() && ((!lifecycle && !state?.updated_at) || completedCurrent)) {
+      return box.replaceChildren(h("span", { class: "muted", title }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    }
     const mark = { completed: "✓", in_progress: "▸" };
-    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
+    box.replaceChildren(h("span", { class: "muted", title }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
       h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
