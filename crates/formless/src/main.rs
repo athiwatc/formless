@@ -6506,19 +6506,23 @@ fn comparison_terminal_text(text: &str) -> String {
 }
 
 fn comparison_quoted_metadata(text: &str) -> Result<String> {
+    Ok(escape_json_terminal_controls(&serde_json::to_string(text)?))
+}
+
+/// Keep JSON text parseable while escaping terminal controls left by Serde.
+fn escape_json_terminal_controls(json: &str) -> String {
     use std::fmt::Write as _;
-    let quoted = serde_json::to_string(text)?;
-    let mut visible = String::with_capacity(quoted.len());
-    for c in quoted.chars() {
-        if table::terminal_control(c) {
-            // All relevant control/format characters are in the BMP. Keep a
-            // valid JSON string while making bidi and C1 controls visible too.
-            write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
+    let mut visible = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && table::terminal_control(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(&mut visible, "\\u{unit:04x}").expect("writing to String");
+            }
         } else {
             visible.push(c);
         }
     }
-    Ok(visible)
+    visible
 }
 
 fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> Result<()> {
