@@ -336,6 +336,7 @@ fn hunk_review_wrong_owner_hidden_modal_and_reconnect_cannot_mutate() {
         lines: vec!["data".into()],
         top: 0,
         left: 0,
+        viewport: Default::default(),
         styled: vec![],
     });
     for c in ['a', 'r', 'u', 'c'] {
