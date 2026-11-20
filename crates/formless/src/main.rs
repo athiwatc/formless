@@ -248,6 +248,9 @@ enum Cmd {
         /// How many of the latest entries to show (default 200; 0 = all)
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
+        /// Print one JSON object per selected entry (snapshot only)
+        #[arg(long, conflicts_with = "follow")]
+        jsonl: bool,
     },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
@@ -2424,7 +2427,8 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             level,
             since,
             lines,
-        }) => logs_cmd(&paths, follow, level, since, lines),
+            jsonl,
+        }) => logs_cmd(&paths, follow, level, since, lines, jsonl),
         Some(Cmd::Completions { .. } | Cmd::Man | Cmd::Commands { .. }) => {
             unreachable!("handled before the profile is set up")
         }
@@ -8320,6 +8324,7 @@ fn logs_cmd(
     level: Option<String>,
     since: Option<std::time::Duration>,
     lines: usize,
+    jsonl: bool,
 ) -> Result<()> {
     let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
     let cutoff =
@@ -8333,7 +8338,12 @@ fn logs_cmd(
             }
     };
     let live = paths.log_file();
-    let summary = log_output::history(paths, lines, &keep, &mut std::io::stdout().lock())?;
+    let format = if jsonl {
+        log_output::Format::Jsonl
+    } else {
+        log_output::Format::Text
+    };
+    let summary = log_output::history(paths, lines, &keep, format, &mut std::io::stdout().lock())?;
     log_truncation_notice(&summary);
     if summary.entries == 0 && !follow {
         eprintln!(

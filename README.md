@@ -486,8 +486,13 @@ formless doctor --json   # the same checks, machine-readable
 
 ```bash
 formless logs --level warn --since 1h      # recent warnings and errors
+formless logs --jsonl --lines 20           # one JSON object per selected entry
 formless logs -f                           # follow as it's written
 ```
+
+`--jsonl` is for snapshots and conflicts with `--follow`. Each record contains
+an RFC 3339 `timestamp` (or `null`), the effective `filter_level` (`info`
+for unknown or missing levels), and the same grouped `text` as raw output.
 
 ### Shell completions
 
@@ -722,7 +727,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
-| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
