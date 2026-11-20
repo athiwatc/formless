@@ -282,6 +282,17 @@ const JSON: Lang = Lang {
     regex: false,
 };
 
+// Strict JSON stays comment-free; the extensions opt into their own grammar.
+const JSONC: Lang = Lang {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    ..JSON
+};
+const JSON5: Lang = Lang {
+    quotes: &['"', '\''],
+    ..JSONC
+};
+
 /// YAML and TOML: `#` comments only, so `key: a;b` keeps its `;` (#877).
 const CONFIG: Lang = Lang {
     line_comments: &["#"],
@@ -445,7 +456,9 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
         | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "php" | "zig" | "objc" => &C_LIKE,
         "lua" | "haskell" | "hs" => &SQL_DASH,
-        "json" | "jsonc" | "json5" => &JSON,
+        "json" => &JSON,
+        "jsonc" => &JSONC,
+        "json5" => &JSON5,
         "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
         "sql" | "sqlite" | "postgres" | "postgresql" | "mysql" => &SQL,
@@ -472,6 +485,7 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    json5_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -591,6 +605,7 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            json5_strings: name == "json5",
             color,
             in_block: 0,
             in_str: None,
@@ -617,6 +632,8 @@ impl Highlighter {
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
         let chars: Vec<char> = line.chars().collect();
+        let continues_string =
+            self.json5_strings && line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0;
         let at = |i: usize, pat: &str| {
             (i..)
                 .zip(pat.chars())
@@ -857,6 +874,9 @@ impl Highlighter {
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
+                if continues_string && j >= chars.len() {
+                    self.in_str = Some(c.to_string());
+                }
                 i = stop;
                 continue;
             }
@@ -942,6 +962,11 @@ impl Highlighter {
             }
             push(Tok::Plain, &chars[i..i + 1]);
             i += 1;
+        }
+        // JSON5 needs a fresh escape on every physical line of a
+        // continued string, including when the next line is empty.
+        if self.json5_strings && !continues_string {
+            self.in_str = None;
         }
         toks.into_iter()
             .map(|(t, s)| Span::styled(s, self.style(t)))
@@ -1067,6 +1092,79 @@ mod tests {
             .into_iter()
             .map(|s| (s.content.to_string(), s.style.fg))
             .collect()
+    }
+
+    #[test]
+    fn json_extensions_keep_comments_and_strings_separate() {
+        for lang in ["jsonc", "json5"] {
+            let source = r#"// keep "draft": true /*"#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+            let mut h = Highlighter::new(lang, true).unwrap();
+            h.line(r#"/* "draft": true"#);
+            let next = h.line("// keep */ null");
+            assert_eq!(next[0].style.fg, Some(Color::DarkGray));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "null" && s.style.fg != Some(Color::DarkGray)));
+            let source = r#""https://example.com/ /* \" true""#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::Green))]
+            );
+            let non_nested = toks(lang, "/* outer /* inner */ true");
+            assert!(non_nested
+                .iter()
+                .any(|(s, c)| s == "true" && *c != Some(Color::DarkGray)));
+        }
+        let source = r"'it\'s // /* true'";
+        assert_eq!(
+            toks("json5", source),
+            vec![(source.into(), Some(Color::Green))]
+        );
+        for lang in ["json", "jsonc"] {
+            assert!(!toks(lang, "'formless'")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::Green)));
+        }
+        assert!(!toks("json", r#"// "draft": true /* false */"#)
+            .iter()
+            .any(|(_, c)| *c == Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn json5_string_continuation_keeps_comment_markers_literal() {
+        for quote in ['"', '\''] {
+            let first = format!("{{{quote}message{quote}: {quote}first\\");
+            let mut highlighter = Highlighter::new("json5", true).unwrap();
+            highlighter.line(&first);
+            let middle = "// continued \\";
+            let second = highlighter.line(middle);
+            assert_eq!(second[0].style.fg, Some(Color::Green));
+            assert_eq!(second[0].content, middle);
+            let last = format!("/* literal */{quote}, ok: true}}");
+            let third = highlighter.line(&last);
+            assert_eq!(third[0].content, format!("/* literal */{quote}"));
+            assert_eq!(third[0].style.fg, Some(Color::Green));
+            assert!(third.iter().any(|span| {
+                span.content == "true" && span.style.fg == Some(Color::LightMagenta)
+            }));
+        }
+
+        let mut highlighter = Highlighter::new("json5", true).unwrap();
+        highlighter.line(r"'even slashes \\");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
+        highlighter.line(r"'continued \");
+        highlighter.line("");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
     }
 
     #[test]
