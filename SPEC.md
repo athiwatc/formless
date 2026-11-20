@@ -5525,7 +5525,10 @@ previous headless Run's Session.
   - `json`: one `{session_id, status, answer, result, error}` object at the end;
     `answer` retains its text form. `result` carries the validated JSON value
     on a successful schema Run and is null otherwise;
-  - `jsonl-events`: every event, one per line; `--json` is the same.
+  - `jsonl-events`: every event, one per line; `--json` is the same for a Run.
+  - With `--estimate`, `text` prints the human forecast and `json` prints one
+    forecast object. `--json` is an alias for the forecast object in this
+    mode. `final` and `jsonl-events` are usage errors for estimates.
 
   Pipeline options are per Run, never edits to the profile configuration or
   Session's standing instructions. `--system TEXT` appends exact bounded
