@@ -712,7 +712,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         }
         if matches!(
             base.as_str(),
-            "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat"
+            "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat" | "sftp" | "socat" | "netcat"
         ) {
             return Some("it can reach any host and write files, like net plus fs:write");
         }
@@ -3829,6 +3829,26 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_network_clients() {
+        for spec in [
+            "process:sftp",
+            "process:/usr/bin/socat",
+            "process:netcat.exe",
+            "process:sftp:--version",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:lftp",
+            "process:socat-helper",
+            "process:netcat6",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
