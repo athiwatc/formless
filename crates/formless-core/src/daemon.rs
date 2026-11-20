@@ -17199,6 +17199,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".npmrc",
         ".pypirc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
     ]
     .contains(&name.as_str())

@@ -329,7 +329,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
     if matches!(
         name.as_str(),
         "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
-    ) || name.ends_with(".keychain")
+    ) || name == "credentials.toml"
+        || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
         return Some("credential store file");
@@ -340,6 +341,30 @@ fn builtin(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cargo_credential_files_are_sensitive_without_classifying_the_cache() {
+        let home = std::env::temp_dir().join("formless-home");
+        let policy = PathPolicy::default();
+        for relative in [".cargo/credentials.toml", "custom-cargo/CREDENTIALS.TOML"] {
+            let path = home.join(relative);
+            assert!(matches!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            ".cargo/registry/cache.txt",
+            ".cargo/credentials.toml.example",
+            "notes.txt",
+        ] {
+            let path = home.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
     #[test]
     fn ordinary_paths_stay_quiet_and_all_required_shapes_are_sensitive() {
         let root = std::env::temp_dir();

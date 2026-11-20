@@ -107,6 +107,14 @@ async fn names_cannot_break_the_reference_line() {
     );
 }
 
+#[test]
+fn cargo_credentials_are_detected_for_attachment_warnings() {
+    let home = std::env::temp_dir().join("formless-home");
+    assert!(credential_path(&home.join(".cargo/credentials.toml")).is_some());
+    assert!(credential_path(&home.join("custom-cargo/CREDENTIALS.TOML")).is_some());
+    assert!(credential_path(&home.join(".cargo/credentials.toml.example")).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn held_attachments_survive_a_restart_and_detach_deletes() {
     let (paths, sid) = setup("hold");
