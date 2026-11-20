@@ -4339,8 +4339,12 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
 fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a duration (like 90s, 10m or 1h30m)");
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(std::time::Duration::from_secs(secs));
+    let too_long = || format!("duration '{s}' is too long");
+    match s.parse::<u64>() {
+        Ok(0) => return Err(bad()),
+        Ok(secs) => return Ok(std::time::Duration::from_secs(secs)),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => return Err(too_long()),
+        Err(_) => {}
     }
     let (mut total, mut num) = (0u64, String::new());
     for c in s.chars() {
@@ -4348,7 +4352,10 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
             num.push(c);
             continue;
         }
-        let n: u64 = num.parse().map_err(|_| bad())?;
+        let n = num.parse::<u64>().map_err(|e| match e.kind() {
+            std::num::IntErrorKind::PosOverflow => too_long(),
+            _ => bad(),
+        })?;
         num.clear();
         let unit = match c {
             's' => 1,
@@ -4360,7 +4367,7 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         total = n
             .checked_mul(unit)
             .and_then(|part| total.checked_add(part))
-            .ok_or_else(bad)?;
+            .ok_or_else(too_long)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
@@ -8327,8 +8334,10 @@ fn logs_cmd(
     jsonl: bool,
 ) -> Result<()> {
     let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
-    let cutoff =
-        since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap_or_default());
+    let cutoff = since.and_then(|d| {
+        let delta = chrono::Duration::from_std(d).ok()?;
+        chrono::Utc::now().checked_sub_signed(delta)
+    });
     let keep = |e: &LogEntry| {
         e.level <= max_level
             && match (cutoff, e.at) {
@@ -9956,6 +9965,17 @@ mod tests {
         assert_eq!(d("10m"), Ok(600));
         assert_eq!(d("1h30m"), Ok(5400));
         assert!(d("10x").is_err() && d("m").is_err() && d("1h3").is_err() && d("0s").is_err());
+        assert!(d("0").unwrap_err().contains("is not a duration"));
+        for too_long in [
+            "18446744073709551616",
+            "5124095576030432h",
+            "18446744073709551615s1s",
+        ] {
+            assert!(
+                d(too_long).unwrap_err().contains("is too long"),
+                "{too_long}"
+            );
+        }
         assert_eq!(
             format_duration(std::time::Duration::from_secs(5400)),
             "1h30m"
