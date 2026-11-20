@@ -5699,11 +5699,13 @@ previous headless Run's Session.
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
   `--plain`/`-c`/`--new` only go with starting the TUI. `relay enable`
   keeps the configured `relay.url` unless `--url` is given. `tools run`
-  exits from the daemon's `ok`, not the result's wording. Supply an inline
+  exits from the daemon's `ok` when present. Supply an inline
   JSON object with `--input JSON` or read one from a UTF-8 regular file or
   stdin with `--input-file FILE|-` (1 MiB maximum). The flags are mutually
   exclusive and the default input is `{}`. Invalid input exits 2 before
-  profile setup or daemon dispatch. `formless man` documents every
+  profile setup or daemon dispatch. `tools run --json` prints one complete
+  daemon result, including dry-run effects and logs. Request errors go
+  to stderr. `formless man` documents every
   subcommand's options, two levels deep.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.

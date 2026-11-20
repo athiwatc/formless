@@ -867,6 +867,9 @@ enum ToolsAction {
         /// non-GET requests aren't made; prints what it would have done
         #[arg(long)]
         dry_run: bool,
+        /// Print the complete daemon reply as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Write one Tool or the whole registry as an importable bundle
     Export {
@@ -7982,6 +7985,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
             yes,
             session,
             dry_run,
+            json,
             ..
         } => {
             let input = prepared_input.context("Tool Run input was not prepared")?;
@@ -7990,7 +7994,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                 eprintln!("error: {e:#}");
                 std::process::exit(2);
             }
-            let code = tool_run(&paths, tool, input, yes, session, dry_run)?;
+            let code = tool_run(&paths, tool, input, yes, session, dry_run, json)?;
             std::process::exit(code);
         }
         ToolsAction::Undo => {
@@ -8492,6 +8496,7 @@ fn tool_run(
     yes: bool,
     session: Option<String>,
     dry_run: bool,
+    json: bool,
 ) -> Result<i32> {
     let (client, rx) = formless_tui::client::DaemonClient::connect(paths)?;
     let wait = |id: u64| -> Result<serde_json::Value> {
@@ -8598,6 +8603,7 @@ fn tool_run(
         let _ = wait(id);
     }
     match result {
+        Ok(v) if json => write_tool_run_json(&v, dry_run, &mut std::io::stdout().lock()),
         Ok(v) if dry_run => {
             let effects: Vec<&str> = v["effects"]
                 .as_array()
@@ -8680,6 +8686,21 @@ fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
         Ok(())
     }
     section(&cli, "formless", 1, out)
+}
+
+fn write_tool_run_json(
+    reply: &serde_json::Value,
+    dry_run: bool,
+    out: &mut impl Write,
+) -> Result<i32> {
+    serde_json::to_writer_pretty(&mut *out, reply)?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(if dry_run {
+        i32::from(reply["ok"] != true)
+    } else {
+        tool_run_exit(reply, reply["result"].as_str().unwrap_or_default())
+    })
 }
 
 /// `tools run`'s exit code: from the daemon's `ok` (#901); an older daemon
@@ -9858,6 +9879,21 @@ mod tests {
         assert_eq!(super::tool_run_exit(&failed, "boom"), 1);
         let old = serde_json::json!({"result": "error: x"});
         assert_eq!(super::tool_run_exit(&old, "error: x"), 1);
+    }
+
+    #[test]
+    fn tool_run_json_propagates_output_errors() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let reply = serde_json::json!({"ok":true,"result":"success"});
+        assert!(super::write_tool_run_json(&reply, false, &mut BrokenPipe).is_err());
     }
 
     #[test]

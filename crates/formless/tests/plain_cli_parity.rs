@@ -22,6 +22,15 @@ fn run_report() -> Value {
     json!({"summary":{"runs":4,"completed":0.5,"interrupted":0.25,"paused":0.25,"edited":0.0,"corrected":0.0,"avg_steps":4.0,"avg_tool_calls":2.0,"avg_tokens":100.0,"avg_duration_ms":1200.0},"runs":rows,"future":{"preserved":true}})
 }
 
+type ToolRunReply = Result<Value, &'static str>;
+
+fn tool_run_response(id: u64, reply: ToolRunReply) -> Value {
+    match reply {
+        Ok(value) => json!({"kind":"response","id":id,"ok":true,"result":value}),
+        Err(error) => json!({"kind":"response","id":id,"ok":false,"error":error}),
+    }
+}
+
 struct Fixture {
     root: std::path::PathBuf,
     stop: Arc<AtomicBool>,
@@ -34,6 +43,7 @@ struct Fixture {
     gc_failure: Arc<AtomicBool>,
     session_rows: Arc<Mutex<Value>>,
     organization_failure: Arc<AtomicBool>,
+    tool_run_reply: Arc<Mutex<Option<ToolRunReply>>>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -95,6 +105,8 @@ impl Fixture {
         let invocation_reply = invocations.clone();
         let invocation_error = Arc::new(AtomicBool::new(false));
         let fail_invocations = invocation_error.clone();
+        let tool_run_reply = Arc::new(Mutex::new(None::<ToolRunReply>));
+        let tool_result = tool_run_reply.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (socket, _) = match listener.accept() {
@@ -167,29 +179,22 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
-                    if let Request::RunTool { session_id, .. } = &envelope.request {
-                        assert!(awaiting_tool_approval.replace(envelope.id).is_none());
-                        let event = json!({
-                            "kind": "event", "type": "approval_requested",
-                            "approval_id": "fixture-approval", "session_id": session_id,
-                            "tool_name": "FetchPage", "version": 1,
-                            "capabilities": ["fixture-capability"], "memory_mb": 16
-                        });
-                        seen.lock().unwrap().push(envelope.request);
-                        if writeln!(socket, "{event}").is_err() {
-                            break;
-                        }
-                        line.clear();
-                        continue;
-                    }
-                    if let Request::ApprovalDecision { approved, .. } = &envelope.request {
-                        let run = awaiting_tool_approval
-                            .take()
-                            .expect("private mock Tool Run");
-                        let reply = if *approved {
-                            json!({"kind":"response","id":run,"ok":true,"result":{"ok":true,"result":"synthetic result"}})
+                    if let Request::RunTool { id, session_id, .. } | Request::DryRunTool { id, session_id, .. } = &envelope.request {
+                        assert_eq!(id, "full-tool-id");
+                        assert_eq!(session_id, "owned-tool-session");
+                        let fixture_reply = tool_result.lock().unwrap().clone();
+                        let reply = if let Some(fixture_reply) = fixture_reply {
+                            tool_run_response(envelope.id, fixture_reply)
+                        } else if matches!(&envelope.request, Request::RunTool { .. }) {
+                            assert!(awaiting_tool_approval.replace(envelope.id).is_none());
+                            json!({
+                                "kind": "event", "type": "approval_requested",
+                                "approval_id": "fixture-approval", "session_id": session_id,
+                                "tool_name": "FetchPage", "version": 1,
+                                "capabilities": ["fixture-capability"], "memory_mb": 16
+                            })
                         } else {
-                            json!({"kind":"response","id":run,"ok":false,"error":"fixture call denied"})
+                            tool_run_response(envelope.id, Ok(json!({"ok":true,"result":"synthetic preview","effects":[]})))
                         };
                         seen.lock().unwrap().push(envelope.request);
                         if writeln!(socket, "{reply}").is_err() {
@@ -198,15 +203,30 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    if let Request::ApprovalDecision { approved, .. } = &envelope.request {
+                        let run = awaiting_tool_approval.take().expect("private mock Tool Run");
+                        let result = if *approved {
+                            Ok(json!({"ok":true,"result":"synthetic result"}))
+                        } else {
+                            Err("fixture call denied")
+                        };
+                        let reply = tool_run_response(run, result);
+                        seen.lock().unwrap().push(envelope.request);
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
-                        Request::CreateSession { .. } => json!({"id":"owned-tool-session"}),
+                        Request::CreateSession { name } => {
+                            assert_eq!(name.as_deref(), Some("tools run FetchPage"));
+                            json!({"id":"owned-tool-session"})
+                        }
                         Request::SetSessionArchived { id, archived } => {
                             assert_eq!(id, "owned-tool-session");
                             assert!(*archived);
                             json!({})
-                        }
-                        Request::DryRunTool { .. } => {
-                            json!({"ok":true,"result":"synthetic preview","effects":[]})
                         }
                         Request::SetSessionPinned { id, pinned } => {
                             organization_reply(id, Some(!pinned), false)
@@ -415,6 +435,7 @@ impl Fixture {
             gc_failure,
             session_rows,
             organization_failure,
+            tool_run_reply,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -501,6 +522,93 @@ fn module_detail() -> Value {
         {"version":1,"author":"user","created_at":"first","code":"// source 日本語\n"},
         {"version":2,"author":"agent","created_at":"last","code":"// source ไทย"}
     ],"used_by":["alpha","日本語 tool"],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_tool_run_json_preserves_replies_verdicts_and_cleanup() {
+    let fixture = Fixture::new();
+    let run = |dry_run: bool, json: bool, reply: ToolRunReply| {
+        *fixture.tool_run_reply.lock().unwrap() = Some(reply);
+        fixture.requests.lock().unwrap().clear();
+        let mut args = vec!["tools", "run", "FetchPage", "--input", r#"{"x":"ไทย"}"#];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        if json {
+            args.push("--json");
+        }
+        let output = fixture.run(&args);
+        let requests = fixture.requests.lock().unwrap();
+        assert!(
+            matches!(&requests[..], [
+                Request::ListTools,
+                Request::CreateSession { .. },
+                Request::RunTool { .. },
+                Request::SetSessionArchived { archived: true, .. }
+            ] if !dry_run)
+                || matches!(&requests[..], [
+                Request::ListTools,
+                Request::CreateSession { .. },
+                Request::DryRunTool { .. },
+                Request::SetSessionArchived { archived: true, .. }
+            ] if dry_run),
+            "{requests:?}"
+        );
+        output
+    };
+    let text_json = json!({"ok":true,"result":"  {\"text\": \"ไทย 🦀\"}\n","extra":{"n":0}});
+    for (dry_run, status, value) in [
+        (
+            false,
+            0,
+            json!({"ok":true,"result":"error is part of this successful text"}),
+        ),
+        (false, 0, text_json.clone()),
+        (
+            false,
+            1,
+            json!({"ok":false,"result":"unavailable","extra":null}),
+        ),
+        (false, 1, json!({"result":"\n error: legacy"})),
+        (false, 0, json!({"result":"ordinary legacy reply"})),
+        (
+            true,
+            0,
+            json!({"ok":true,"result":{"text":"ไทย","n":false},"effects":["write fixture"],"logs":["debug ไทย"],"extra":{"kept":true}}),
+        ),
+        (
+            true,
+            1,
+            json!({"ok":false,"error":"preview failed","effects":[],"logs":["fixture report"]}),
+        ),
+    ] {
+        let out = run(dry_run, true, Ok(value.clone()));
+        assert_eq!(out.status.code(), Some(status), "{:?}", out.stderr);
+        assert_eq!(
+            out.stdout,
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap()).into_bytes()
+        );
+        assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    }
+    for dry_run in [false, true] {
+        let out = run(dry_run, true, Err("mock request refused"));
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.stderr, b"mock request refused\n");
+        assert!(out.stdout.is_empty());
+    }
+    let human = run(false, false, Ok(text_json));
+    assert_eq!(human.stdout, "{\n  \"text\": \"ไทย 🦀\"\n}\n".as_bytes());
+    assert_eq!(human.status.code(), Some(0));
+    let human_dry = run(
+        true,
+        false,
+        Ok(
+            json!({"ok":false,"error":"preview failed","effects":["write fixture"],"logs":["invisible"]}),
+        ),
+    );
+    assert_eq!(human_dry.status.code(), Some(1));
+    assert!(human_dry.stdout.is_empty());
+    assert_eq!(human_dry.stderr, b"dry run: nothing was changed.\nit would have:\n  - write fixture\nerror: preview failed\n");
 }
 
 #[test]
