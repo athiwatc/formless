@@ -244,6 +244,12 @@ impl Fixture {
                                 }
                             }
                         }
+                        Request::SearchSessions { .. } => timestamp_search_hits(),
+                        Request::ListApprovals => timestamp_grants(),
+                        Request::ListDenials => timestamp_denials(),
+                        Request::ListRelayClients => timestamp_devices(),
+                        Request::ListJobs => timestamp_jobs(),
+                        Request::JobRuns { id, .. } => timestamp_job_runs(id),
                         Request::Gc { dry_run } => gc_report(*dry_run),
                         Request::RestartMcpServer { name } => mcp_test_report(name),
                         Request::AddMcpServer { .. } => {
@@ -381,7 +387,17 @@ impl Fixture {
         command
     }
     fn run(&self, args: &[&str]) -> std::process::Output {
-        let mut child = self.command(args).spawn().unwrap();
+        Self::capture(self.command(args))
+    }
+
+    fn run_in_timezone(&self, args: &[&str], timezone: &str) -> std::process::Output {
+        let mut command = self.command(args);
+        command.env("TZ", timezone);
+        Self::capture(command)
+    }
+
+    fn capture(mut command: Command) -> std::process::Output {
+        let mut child = command.spawn().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let out = std::thread::spawn(move || {
@@ -556,7 +572,7 @@ fn shipped_sessions_explain_archive_emptiness_and_present_stored_metadata() {
             args.push("--archived");
         }
         fixture.requests.lock().unwrap().clear();
-        let out = fixture.run(&args);
+        let out = fixture.run_in_timezone(&args, "Asia/Bangkok");
         assert!(out.status.success());
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(
@@ -572,7 +588,7 @@ fn shipped_sessions_explain_archive_emptiness_and_present_stored_metadata() {
                 "work, ไทย\\u{1b}[31m",
                 "preview 日本語",
                 "7",
-                "2026-11-01T12:34",
+                "2026-11-01 19:34 +07:00",
             ] {
                 assert!(text.contains(expected), "{text}");
             }
@@ -906,6 +922,192 @@ fn shipped_session_organization_uses_exact_mutations_and_returned_stored_state()
     ] {
         assert!(text.contains(expected), "{text}");
     }
+}
+
+fn timestamp_jobs() -> Value {
+    json!([
+        {"id":"clock","approved":true,"enabled":true,"cron":"0 9 * * *",
+         "next_run":"2026-11-01T09:00:00+07:00","last_status":"completed","prompt":"clock fixture"},
+        {"id":"legacy","next_run":"unparseable","prompt":"legacy fixture"},
+        {"id":"missing","next_run":null,"prompt":"missing fixture"}
+    ])
+}
+
+fn timestamp_job_runs(id: &str) -> Value {
+    let row = |id, started, finished| {
+        json!({
+            "id":id, "job_id":"clock", "session_id":null, "trigger":"schedule",
+            "status":"completed", "cost":null, "detail":"fixture",
+            "started_at":started, "finished_at":finished
+        })
+    };
+    if id == "fold" {
+        json!([
+            row("first", "2026-11-01T05:30:00Z", None),
+            row("second", "2026-11-01T06:30:00Z", None)
+        ])
+    } else {
+        assert_eq!(id, "clock");
+        json!([row(
+            "done",
+            "2026-11-01T02:00:00Z",
+            Some("2026-11-01T09:00:00.499+07:00")
+        )])
+    }
+}
+
+fn successful_text(output: std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn shipped_jobs_timestamps_share_local_time_and_keep_wire_values() {
+    let fixture = Fixture::new();
+    let timezone = "Asia/Bangkok";
+    for (args, expected_json) in [
+        (&["jobs", "list"][..], timestamp_jobs()),
+        (
+            &["jobs", "history", "clock"][..],
+            timestamp_job_runs("clock"),
+        ),
+    ] {
+        let text = successful_text(fixture.run_in_timezone(args, timezone));
+        assert!(text.contains("2026-11-01 09:00 +07:00"), "{text}");
+        let json_args = args.iter().copied().chain(["--json"]).collect::<Vec<_>>();
+        let text_json = successful_text(fixture.run_in_timezone(&json_args, timezone));
+        assert_eq!(
+            serde_json::from_str::<Value>(&text_json).unwrap(),
+            expected_json
+        );
+        if args[1] == "list" {
+            assert!(text.contains("unparseable") && text.contains("missing"));
+        } else {
+            assert!(text.contains("499ms"), "{text}");
+        }
+    }
+
+    let text =
+        successful_text(fixture.run_in_timezone(&["jobs", "history", "fold"], "America/New_York"));
+    assert!(text.contains("2026-11-01 01:30 -04:00"), "{text}");
+    assert!(text.contains("2026-11-01 01:30 -05:00"), "{text}");
+    let text = successful_text(fixture.run_in_timezone(&["jobs", "list"], "America/New_York"));
+    assert!(text.contains("2026-10-31 22:00 -04:00"), "{text}");
+}
+
+fn timestamp_search_hits() -> Value {
+    json!([{
+        "session_id":"session-clock","session_name":"Clock",
+        "message_id":"message-clock","seq":3,"role":"assistant",
+        "snippet":"matching synthetic result","created_at":"2026-10-31T22:30:00-03:30"
+    }])
+}
+
+fn timestamp_grants() -> Value {
+    json!([{
+        "tool_id":"fixture-tool","tool_name":"Fixture","capability":"net:example.test",
+        "scope":"hour","granted_by":"fixture","trusted":false,"session_id":null,
+        "granted_at":"2026-11-01T02:00:00Z",
+        "expires_at":"2026-11-01T10:00:00+07:00",
+        "last_used":"2026-10-31T23:15:00-03:30"
+    }])
+}
+
+fn timestamp_denials() -> Value {
+    json!([
+        {"capability":"net:example.test","tool_name":"Fixture","denied_by":"fixture",
+         "created_at":"2026-11-01T02:00:00Z"},
+        {"capability":"net:legacy.test","tool_name":"Legacy","denied_by":"",
+         "created_at":"2026-11-01T02:00 legacy"}
+    ])
+}
+
+fn timestamp_devices() -> Value {
+    json!([{
+        "cid":"device-clock","user_agent":"Synthetic Browser",
+        "first_seen":"2026-11-01T02:00:00Z","last_seen":"2026-11-01T10:00:00+07:00"
+    }])
+}
+
+#[test]
+fn shipped_session_run_and_approval_timestamps_use_numeric_local_offsets() {
+    let fixture = Fixture::new();
+    let session = json!({
+        "id":"session-clock","name":"Clock","created_at":"2026-11-01T01:00:00Z",
+        "updated_at":"2026-11-01T02:00:00Z"
+    });
+    *fixture.session_rows.lock().unwrap() = json!([session.clone()]);
+    let parsed: formless_protocol::SessionInfo = serde_json::from_value(session.clone()).unwrap();
+    let timezone = "Asia/Bangkok";
+    for (args, expected, wire) in [
+        (
+            &["sessions", "list"][..],
+            &["2026-11-01 09:00 +07:00"][..],
+            json!([parsed]),
+        ),
+        (
+            &["sessions", "show", "session-clock"][..],
+            &["updated 2026-11-01 09:00 +07:00"][..],
+            session_snapshot(session),
+        ),
+        (
+            &["sessions", "search", "synthetic"][..],
+            &["#3 2026-11-01 09:00 +07:00"][..],
+            timestamp_search_hits(),
+        ),
+        (
+            &["runs", "--limit", "4"][..],
+            &["2026-11-01 19:34:56 +07:00"][..],
+            run_report(),
+        ),
+        (
+            &["approvals", "list"][..],
+            &[
+                "2026-11-01 09:00 +07:00",
+                "2026-11-01 10:00 +07:00",
+                "2026-11-01 09:45 +07:00",
+            ][..],
+            timestamp_grants(),
+        ),
+        (
+            &["approvals", "denials"][..],
+            &["2026-11-01 09:00 +07:00", "Legacy", "2026-11-01 02:00"][..],
+            timestamp_denials(),
+        ),
+    ] {
+        let human = successful_text(fixture.run_in_timezone(args, timezone));
+        for part in expected {
+            assert!(human.contains(part), "{args:?}: {human}");
+        }
+        let args = args.iter().copied().chain(["--json"]).collect::<Vec<_>>();
+        let output = successful_text(fixture.run_in_timezone(&args, timezone));
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), wire);
+    }
+}
+
+#[test]
+fn shipped_relay_device_timestamps_preserve_offsets_in_json() {
+    let fixture = Fixture::new();
+    let run_status = |args: &[&str]| {
+        let mut command = fixture.command(args);
+        // Avoid reading the user's keyring even on a machine with stored relay credentials.
+        command
+            .env("FORMLESS_RELAY_SECRET", "synthetic-timestamp-fixture")
+            .env("TZ", "Asia/Bangkok");
+        successful_text(Fixture::capture(command))
+    };
+    let human = run_status(&["relay", "status"]);
+    assert!(human.contains(
+        "Synthetic Browser  (since 2026-11-01 09:00 +07:00, last seen 2026-11-01 10:00 +07:00)"
+    ));
+    let json = serde_json::from_str::<Value>(&run_status(&["relay", "status", "--json"])).unwrap();
+    assert_eq!(json["devices"], timestamp_devices());
+    assert_eq!(json["daemon_running"], true);
+    assert_eq!(json.as_object().unwrap().len(), 5);
 }
 
 fn schedule_preview_fixture(schedule: &str) -> anyhow::Result<Value> {
