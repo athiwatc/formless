@@ -21,7 +21,7 @@ function setup(actualRefresh = false) {
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
     request: async () => [], document: doc, focusVisible: button => box.contains(button), uiFormat: String, Date});
   installEventRenderFixture(c, fn);
-  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','renderRunning','onEvent'].map(fn).join('\n'),c);
+  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','recordedDuration','renderRunning','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};
 }
@@ -79,6 +79,7 @@ test('actual reconnect refresh restores distinct bars and diagnostic labels from
   assert.equal(c.S.liveTools[0].progress.fraction,0.2);
   assert.equal(c.S.liveTools[1].progress.label,'stuck-b');
   assert.ok(box.children.some(x => text(x).includes('last progress 50% (stuck-b)')));
+  assert.ok(box.children.some(x => text(x).includes('100ms') && text(x).includes('silent 30s')));
   await c.refreshRunning();
   assert.equal(c.S.liveTools.length,2);
   c.S.liveTools[0].status = 'ok';

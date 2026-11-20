@@ -162,6 +162,32 @@ fn format_live_elapsed(d: Duration) -> String {
     }
 }
 
+fn format_recorded_duration(ms: u64) -> String {
+    match ms {
+        0 => "0s".into(),
+        1..=999 => format!("{ms}ms"),
+        1000..=59_999 if ms / 100 % 10 != 0 => format!("{}.{}s", ms / 1000, ms / 100 % 10),
+        _ => format_live_elapsed(Duration::from_millis(ms)),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn recorded_invocation_durations_keep_short_and_long_times_readable() {
+    for (ms, expected) in [
+        (0, "0s"),
+        (499, "499ms"),
+        (1000, "1s"),
+        (1175, "1.1s"),
+        (59_999, "59.9s"),
+        (60_000, "1m00s"),
+        (3_600_000, "1h00m00s"),
+        (7_200_000, "2h00m00s"),
+    ] {
+        assert_eq!(format_recorded_duration(ms), expected);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum View {
     Chat,
@@ -3651,13 +3677,16 @@ impl App {
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| truncate_chars(&i.session_id, 8));
                                 self.notes.push(format!(
-                                    "{} {} · {}s · {}{}{}{} · /kill or /drop {}",
+                                    "{} {} · {} · {}{}{}{} · /kill or /drop {}",
                                     if i.stalled { "⚠" } else { "•" },
                                     i.tool_name,
-                                    i.elapsed_ms / 1000,
+                                    format_recorded_duration(i.elapsed_ms),
                                     session,
                                     if i.stalled {
-                                        format!(" · silent {}s", i.silent_ms / 1000)
+                                        format!(
+                                            " · silent {}",
+                                            format_recorded_duration(i.silent_ms)
+                                        )
                                     } else {
                                         String::new()
                                     },

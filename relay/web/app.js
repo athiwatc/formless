@@ -380,6 +380,17 @@
     }
     return s < 60 ? uiFormat(s) + "s" : uiFormat(Math.floor(s / 60)) + "m" + uiFormat(s % 60, { minimumIntegerDigits: 2, useGrouping: false }) + "s";
   }
+  /** Durations recorded in ms: keep short calls visible and long calls readable. */
+  function recordedDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "—";
+    if (ms === 0) return "0s";
+    if (ms < 1000) return uiFormat(Math.floor(ms)) + "ms";
+    if (ms < 60000) return uiFormat(Math.floor(ms / 100) / 10) + "s";
+    const seconds = Math.floor(ms / 1000);
+    const padded = { minimumIntegerDigits: 2, useGrouping: false };
+    if (seconds < 3600) return uiFormat(Math.floor(seconds / 60)) + "m" + uiFormat(seconds % 60, padded) + "s";
+    return uiFormat(Math.floor(seconds / 3600)) + "h" + uiFormat(Math.floor(seconds % 3600 / 60), padded) + "m" + uiFormat(seconds % 60, padded) + "s";
+  }
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
   const rateClass = (r) => (r == null ? "muted" : r >= 0.9 ? "rate-good" : r >= 0.7 ? "rate-mid" : "rate-bad");
@@ -1237,8 +1248,8 @@
       const s = S.sessions.find((x) => x.id === i.session_id);
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
         control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
+          h("strong", null, i.tool_name), " · " + recordedDuration(i.elapsed_ms) + (s ? " · " + s.name : "") +
+          (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
         control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
         i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
     }));
@@ -6973,7 +6984,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + uiFormat(Math.round(r.duration_ms / 1000)) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + recordedDuration(r.duration_ms) + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
       r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
@@ -7181,10 +7192,10 @@
     switch (ev.type) {
       case "run_started": runStarts.set(ev.session_id, Date.now()); return;
       case "run_finished": {
-        const took = (Date.now() - (runStarts.get(ev.session_id) || Date.now())) / 1000;
+        const took = Date.now() - (runStarts.get(ev.session_id) || Date.now());
         runStarts.delete(ev.session_id);
         const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
-        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + uiFormat(Math.round(took)) + "s");
+        if (took >= min * 1000 && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + recordedDuration(took));
         return;
       }
       case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
