@@ -56,6 +56,9 @@ pub use runfile_storage::{
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
 
+#[path = "attachment_expiry.rs"]
+mod attachment_expiry;
+
 #[path = "recap_storage.rs"]
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
@@ -6623,44 +6626,6 @@ impl Store {
     /// Mark the attachments with these artifact ids as expired in the
     /// messages that carry them, so every client and the model's history
     /// say so instead of pointing at a removed file (#858).
-    pub fn mark_attachments_expired(&self, ids: &[String]) -> Result<usize> {
-        let mut changed = 0;
-        for id in ids {
-            let rows: Vec<(String, String)> = {
-                let mut stmt =
-                    self.ps("SELECT id, meta FROM messages WHERE role='user' AND meta LIKE ?1")?;
-                let rows = stmt
-                    .query_map(params![format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                rows
-            };
-            for (msg_id, meta) in rows {
-                let Ok(mut v) = serde_json::from_str::<Value>(&meta) else {
-                    continue;
-                };
-                let mut hit = false;
-                for a in v["attachments"].as_array_mut().into_iter().flatten() {
-                    if a["id"].as_str() == Some(id.as_str()) && a["expired"] != true {
-                        a["expired"] = json!(true);
-                        hit = true;
-                    }
-                }
-                if hit {
-                    self.ex(
-                        "UPDATE messages SET meta=?1 WHERE id=?2",
-                        params![v.to_string(), msg_id],
-                    )?;
-                    changed += 1;
-                }
-            }
-        }
-        if changed > 0 {
-            self.rewrites
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(changed)
-    }
-
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
         self.ex(
             "DELETE FROM artifacts WHERE session_id=?1",
