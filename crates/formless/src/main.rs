@@ -2731,18 +2731,23 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     }
 }
 
-pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
-    let core = tag
-        .trim()
-        .trim_start_matches('v')
-        .split(['-', '+'])
-        .next()?;
-    let mut parts = core.split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-    ))
+pub fn parse_version(tag: &str) -> Option<semver::Version> {
+    let tag = tag.trim().trim_start_matches('v');
+    let (core, suffix) = tag.split_at(tag.find(['-', '+']).unwrap_or(tag.len()));
+    // Older tags may omit the minor or patch number.
+    let fill = match core.split('.').count() {
+        1 => ".0.0",
+        2 => ".0",
+        _ => "",
+    };
+    let mut version = if fill.is_empty() {
+        semver::Version::parse(tag).ok()?
+    } else {
+        semver::Version::parse(&format!("{core}{fill}{suffix}")).ok()?
+    };
+    // SemVer precedence ignores build metadata, including when sorting notes.
+    version.build = semver::BuildMetadata::EMPTY;
+    Some(version)
 }
 
 pub fn compare_versions(current: &str, latest_tag: &str) -> Option<std::cmp::Ordering> {
@@ -9896,6 +9901,16 @@ mod tests {
         assert_eq!(tags, ["v0.2.0", "v0.3.0"]);
         assert_eq!(newer[1].1, "New: run --timeout");
         assert!(newer_releases(&releases, "0.3.0").is_empty());
+
+        let final_release = serde_json::json!([
+            {"tag_name": "v0.2.0-rc.2", "prerelease": true, "body": "rc", "html_url": "rc"},
+            {"tag_name": "v0.2.0", "body": "Final release", "html_url": "final"},
+        ]);
+        assert_eq!(
+            newer_releases(&final_release, "0.2.0-rc.1"),
+            [("v0.2.0".into(), "Final release".into(), "final".into())]
+        );
+        assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
     }
 
     #[test]
@@ -10070,11 +10085,27 @@ mod tests {
 
     #[test]
     fn version_comparison_handles_tags() {
-        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("0.1"), Some((0, 1, 0)));
+        assert_eq!(parse_version("v1.2.3"), Some(semver::Version::new(1, 2, 3)));
+        assert_eq!(parse_version("0.1"), Some(semver::Version::new(0, 1, 0)));
         assert_eq!(compare_versions("0.1.0", "v0.2.0"), Some(Ordering::Less));
         assert_eq!(compare_versions("1.0.0", "v1.0.0"), Some(Ordering::Equal));
         assert_eq!(compare_versions("2.0.0", "v1.9.9"), Some(Ordering::Greater));
+        assert_eq!(
+            compare_versions("0.2.0-rc.1", "v0.2.0"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0", "v0.2.0-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.2.0-rc.2", "v0.2.0-rc.10"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0+build.5", "v0.2.0"),
+            Some(Ordering::Equal)
+        );
         assert_eq!(parse_version("nope"), None);
     }
 }
