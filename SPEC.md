@@ -5328,6 +5328,13 @@ list command and count. Static human `sessions show` includes stored archived,
 pinned, tags and last recorded Run status metadata; absent status is "not
 recorded". JSON and `--follow` retain their existing contracts.
 
+`formless sessions show ID --last N` displays the newest N stored messages
+in their original order, including blank entries in the selection before
+human formatting. N must be positive. When earlier messages are omitted,
+the human display reports the selected and total counts and `--json` adds
+`total_messages` next to the shortened `messages` array. The bound applies
+to display after fetching the full snapshot and conflicts with `--follow`.
+
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
 `tool_id` values; reports retain their own row order and are independent reads,

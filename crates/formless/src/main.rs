@@ -5837,6 +5837,9 @@ enum SessionsAction {
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
         follow: bool,
+        /// Show only the newest N stored messages from the fetched transcript
+        #[arg(long, conflicts_with = "follow")]
+        last: Option<std::num::NonZeroUsize>,
         /// Tagged Event lines, as with run --output jsonl-events
         #[arg(long, requires = "follow")]
         jsonl: bool,
@@ -5952,6 +5955,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             follow: true,
             json,
             jsonl,
+            ..
         } => {
             let code = cli_attach::follow(&paths, &id, json || jsonl)?;
             if code != 0 {
@@ -6041,10 +6045,23 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 cli_session_report::list_table(&shown).print();
             }
         }
-        SessionsAction::Show { id, json, .. } => {
+        SessionsAction::Show { id, last, json, .. } => {
             let s = find_session(&paths, &id)?;
-            let r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let mut r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let truncated = last.and_then(|last| {
+                let messages = r.get_mut("messages")?.as_array_mut()?;
+                let total = messages.len();
+                let count = last.get();
+                if total <= count {
+                    return None;
+                }
+                drop(messages.drain(..total - count));
+                Some((count, total))
+            });
             if json {
+                if let Some((_, total)) = truncated {
+                    r["total_messages"] = serde_json::json!(total);
+                }
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
             }
@@ -6065,6 +6082,9 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     .map(|c| format!(" · in {c}"))
                     .unwrap_or_default()
             );
+            if let Some((count, total)) = truncated {
+                println!("Showing last {count} of {total} stored messages.");
+            }
             print!("{}", cli_session_report::metadata(&s));
             let messages: Vec<formless_protocol::MessageInfo> =
                 serde_json::from_value(r["messages"].clone()).unwrap_or_default();
