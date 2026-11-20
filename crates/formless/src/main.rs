@@ -2748,10 +2748,14 @@ fn upgrade_command() -> &'static str {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    upgrade_command_for_exe(&exe)
+}
+
+fn upgrade_command_for_exe(exe: &str) -> &'static str {
     if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
         "brew upgrade formless"
     } else if exe.contains("/.cargo/bin/") {
-        "cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked --force"
+        "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
@@ -9521,6 +9525,26 @@ mod tests {
             !cmd.contains("| sh"),
             "a failed download must not be piped into sh: {cmd}"
         );
+    }
+
+    #[test]
+    fn cargo_upgrade_uses_git_package_not_a_checkout_path() {
+        let cmd = super::upgrade_command_for_exe("/home/user/.cargo/bin/formless");
+        let (install, force) = cmd.rsplit_once(' ').expect("Cargo upgrade flag");
+        assert_eq!(force, "--force");
+        assert_eq!(
+            install.split_whitespace().collect::<Vec<_>>(),
+            [
+                "cargo",
+                "install",
+                "--git",
+                "https://github.com/athiwatc/formless",
+                "--locked",
+                "formless-bin",
+            ]
+        );
+        let readme = include_str!("../../../README.md");
+        assert!(readme.contains(&format!("`{install}`")));
     }
 
     /// Root presentation order is deliberate (#1609), independently of inventory.
