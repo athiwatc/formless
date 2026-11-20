@@ -12566,29 +12566,12 @@ fn draft_row_hits(app: &App, row: &str, byte: usize, area: Rect, left: usize) {
     }
 }
 
-fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
-    if let Some(find) = app.find.as_ref().filter(|_| app.view == View::Chat) {
-        let n = find.rows.len();
-        let count = if find.query.is_empty() {
-            String::new()
-        } else if n == 0 {
-            "  no matches".into()
-        } else {
-            format!("  {}/{n}", find.current.min(n - 1) + 1)
-        };
-        let line = Line::from(vec![
-            Span::styled("find › ", bold_fg(app.color, Color::Magenta)),
-            Span::raw(format!("{}▏", find.query)),
-            Span::styled(count, bold_fg(app.color, Color::Yellow)),
-        ]);
-        let block = ui::panel(" Find in this Session ", app.color, Color::Magenta).title(ui::hint(
-            "Enter next · Shift+Enter previous · Esc close",
-            app.color,
-        ));
-        f.render_widget(Paragraph::new(line).block(block), area);
-        return;
-    }
-    let (prompt, color) = if let Some((action, ids)) = &app.bulk {
+fn composer_find(app: &App) -> Option<&FindBar> {
+    app.find.as_ref().filter(|_| app.view == View::Chat)
+}
+
+fn composer_prompt(app: &App) -> (&'static str, Color) {
+    if let Some((action, ids)) = &app.bulk {
         (
             match action {
                 BulkAction::Delete if ids.len() == 1 => "type delete to delete 1 Session › ",
@@ -12613,7 +12596,32 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         ("steer › ", Color::Yellow)
     } else {
         ("› ", Color::Cyan)
-    };
+    }
+}
+
+fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
+    if let Some(find) = composer_find(app) {
+        let n = find.rows.len();
+        let count = if find.query.is_empty() {
+            String::new()
+        } else if n == 0 {
+            "  no matches".into()
+        } else {
+            format!("  {}/{n}", find.current.min(n - 1) + 1)
+        };
+        let line = Line::from(vec![
+            Span::styled("find › ", bold_fg(app.color, Color::Magenta)),
+            Span::raw(format!("{}▏", find.query)),
+            Span::styled(count, bold_fg(app.color, Color::Yellow)),
+        ]);
+        let block = ui::panel(" Find in this Session ", app.color, Color::Magenta).title(ui::hint(
+            "Enter next · Shift+Enter previous · Esc close",
+            app.color,
+        ));
+        f.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
+    let (prompt, color) = composer_prompt(app);
     let prompt_w = Span::raw(prompt).width();
     let avail = input_text_width(area.width, prompt);
     app.composer_text_width.set(avail);
@@ -12780,11 +12788,11 @@ fn input_text_width(box_width: u16, prompt: &str) -> usize {
 
 /// The input box's height: its wrapped rows (up to 8) plus borders.
 fn input_height(app: &App, width: u16) -> u16 {
-    let rows = app
-        .input
-        .layout(input_text_width(width, "steer › "))
-        .0
-        .len();
+    if composer_find(app).is_some() || app.input.searching().is_some() {
+        return 3;
+    }
+    let (prompt, _) = composer_prompt(app);
+    let rows = app.input.layout(input_text_width(width, prompt)).0.len();
     rows.clamp(1, 8) as u16 + 2
 }
 
@@ -24442,6 +24450,60 @@ mod tests {
         app.key(key(KeyCode::Char('}')));
         app.key(key(KeyCode::Char('}')));
         assert_eq!(app.chat_scroll_top, None);
+    }
+
+    #[test]
+    fn composer_height_uses_the_drawn_prompt_and_keeps_exact_edge_rows() {
+        let mut app = test_app();
+        let width = 16;
+        app.input.set("ab界cd");
+        assert_eq!(composer_prompt(&app).0, "› ");
+        assert_eq!(input_height(&app, width), 3);
+
+        app.instructing = Some("fixture".into());
+        assert_eq!(composer_prompt(&app).0, "instructions › ");
+        let text_width = input_text_width(width, "instructions › ");
+        let rows = app.input.layout(text_width).0.len();
+        assert!(rows > 2);
+        assert_eq!(input_height(&app, width), rows as u16 + 2);
+
+        app.instructing = None;
+        let text_width = input_text_width(width, "› ");
+        app.input.set(&format!("{}界", "x".repeat(text_width - 2)));
+        assert_eq!(input_height(&app, width), 4);
+    }
+
+    #[test]
+    fn composer_height_ignores_hidden_drafts_in_visible_search_bars() {
+        let mut app = test_app();
+        let (width, height) = (40, 24);
+        // The content row sits just above the bottom border and status bar.
+        let search_row = (height - 3) as usize;
+        let draft = "draft\n".repeat(12);
+        app.input.set(&draft);
+        assert_eq!(input_height(&app, width), 10);
+
+        app.find = Some(FindBar::default());
+        assert_eq!(input_height(&app, width), 3);
+        let screen = render(&mut app, width, height);
+        assert!(screen.lines().nth(search_row).unwrap().contains("find ›"));
+        app.view = View::Sessions;
+        assert_eq!(input_height(&app, width), 10);
+        app.view = View::Chat;
+        app.find = None;
+
+        app.input.search_older(&["past message"]);
+        assert!(app.input.searching().is_some());
+        assert_eq!(input_height(&app, width), 3);
+        let screen = render(&mut app, width, height);
+        assert!(screen
+            .lines()
+            .nth(search_row)
+            .unwrap()
+            .contains("(history search)"));
+        app.input.search_cancel();
+        assert_eq!(input_height(&app, width), 10);
+        assert_eq!(app.input.expanded(), draft);
     }
 
     #[test]
