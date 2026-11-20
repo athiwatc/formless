@@ -17209,7 +17209,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.ends_with(".pem")
         || name.ends_with(".key")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
     secret_file.then_some("a key or secrets file")
 }
 

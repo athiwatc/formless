@@ -331,6 +331,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
         "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
+        || name.ends_with(".kdbx")
     {
         return Some("credential store file");
     }
@@ -378,6 +379,30 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn keepass_databases_are_sensitive_by_suffix() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for name in ["passwords.kdbx", "db.KDBX"] {
+            let path = root.join(name);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["db.kdbx.lock", "notes.txt"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);
