@@ -5276,7 +5276,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history ID [--limit N]`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
-| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
@@ -5482,7 +5482,7 @@ previous headless Run's Session.
   values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
   keys, long opaque tokens, and the home path (shown as `~`). The file says
   to read it before attaching it.
-- `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
+- `formless logs [-f | --jsonl] [--level warn] [--since 10m] [-n 200]` shows the
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
@@ -5496,6 +5496,13 @@ previous headless Run's Session.
   `info` and above by default (other commands only errors), `RUST_LOG`
   overrides it, and colour codes are only used on a terminal, never in the
   file.
+  `--jsonl` is snapshot-only and conflicts with `--follow`. It emits one JSON
+  object per selected entry with `timestamp` (RFC 3339 or null),
+  `filter_level` (the lowercase effective filter level, defaulting to
+  `info` for missing or unknown levels), and `text` (the same grouped,
+  normalized and possibly truncated entry as in raw output). `--since`
+  excludes undated entries. No matches leave stdout empty and print the
+  usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);

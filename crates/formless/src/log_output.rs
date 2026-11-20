@@ -6,6 +6,36 @@ use std::io::{self, Write};
 const CAP: usize = logs::MAX_LOG_LINE_BYTES;
 const MARKER: &str = " [log entry truncated]";
 
+#[derive(Clone, Copy)]
+pub(super) enum Format {
+    Text,
+    Jsonl,
+}
+
+impl Format {
+    fn write(self, entry: &LogEntry, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Text => writeln!(out, "{}", entry.text),
+            Self::Jsonl => {
+                let timestamp = entry
+                    .at
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+                let filter_level =
+                    ["error", "warn", "info", "debug", "trace"][usize::from(entry.level)];
+                serde_json::to_writer(
+                    &mut *out,
+                    &serde_json::json!({
+                        "timestamp": timestamp,
+                        "filter_level": filter_level,
+                        "text": entry.text,
+                    }),
+                )?;
+                writeln!(out)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct OutputSummary {
     pub entries: usize,
@@ -60,12 +90,13 @@ impl Builder {
 fn emit(
     builder: Builder,
     keep: &impl Fn(&LogEntry) -> bool,
+    format: Format,
     out: &mut impl Write,
     summary: &mut OutputSummary,
 ) -> io::Result<()> {
     summary.truncated_entries += usize::from(builder.cut);
     if keep(&builder.entry) {
-        writeln!(out, "{}", builder.entry.text)?;
+        format.write(&builder.entry, out)?;
         summary.entries += 1;
     }
     Ok(())
@@ -75,6 +106,7 @@ pub(super) fn history(
     paths: &Paths,
     lines: usize,
     keep: &impl Fn(&LogEntry) -> bool,
+    format: Format,
     out: &mut impl Write,
 ) -> io::Result<OutputSummary> {
     let mut summary = OutputSummary::default();
@@ -83,7 +115,7 @@ pub(super) fn history(
         let read = logs::visit_lines(paths, false, |line| {
             if let Some((at, level)) = log_start(&line) {
                 if let Some(previous) = current.take() {
-                    emit(previous, keep, out, &mut summary)?;
+                    emit(previous, keep, format, out, &mut summary)?;
                 }
                 current = Some(Builder::new(Some(at), level));
             }
@@ -93,7 +125,7 @@ pub(super) fn history(
             Ok(true)
         })?;
         if let Some(last) = current {
-            emit(last, keep, out, &mut summary)?;
+            emit(last, keep, format, out, &mut summary)?;
         }
         summary.read = read;
         return Ok(summary);
@@ -145,7 +177,7 @@ pub(super) fn history(
         }
     }
     for entry in selected.iter().rev() {
-        writeln!(out, "{}", entry.text)?;
+        format.write(entry, out)?;
     }
     summary.entries = selected.len();
     summary.read = read;
@@ -164,7 +196,7 @@ pub(super) fn appended(
     let read = logs::visit_appended_lines(path, start, end, |line| {
         if let Some((at, level)) = log_start(&line) {
             if let Some(previous) = current.take() {
-                emit(previous, keep, out, &mut summary)?;
+                emit(previous, keep, Format::Text, out, &mut summary)?;
             }
             current = Some(Builder::new(Some(at), level));
         }
@@ -174,7 +206,7 @@ pub(super) fn appended(
         Ok(true)
     })?;
     if let Some(last) = current {
-        emit(last, keep, out, &mut summary)?;
+        emit(last, keep, Format::Text, out, &mut summary)?;
     }
     summary.read = read;
     Ok(summary)
