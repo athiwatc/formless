@@ -2943,15 +2943,29 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
 }
 
+/// AppleScript source for a notification. Notification text stays on one
+/// source line and cannot end its quoted literal.
+#[cfg(any(target_os = "macos", test))]
+pub fn macos_notification_script(title: &str, body: &str) -> String {
+    let escape = |text: &str| {
+        let single_line: String = text
+            .replace("\r\n", "\n")
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        single_line.replace('\\', "\\\\").replace('"', "\\\"")
+    };
+    format!(
+        "display notification \"{}\" with title \"{}\"",
+        escape(body),
+        escape(title)
+    )
+}
+
 fn notify(title: &str, body: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            esc(body),
-            esc(title)
-        );
+        let script = macos_notification_script(title, body);
         run_capture("osascript", &["-e", &script], None).map(|_| ())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -3503,6 +3517,15 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_notifications_put_multiline_messages_on_one_source_line() {
+        let script = macos_notification_script("title\rline", "first\r\nsecond \"quoted\" \\");
+        assert_eq!(
+            script,
+            r#"display notification "first second \"quoted\" \\" with title "title line""#
+        );
+    }
 
     #[test]
     fn log_buffer_counts_empty_lines_and_retains_tool_text() {
