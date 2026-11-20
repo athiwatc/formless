@@ -115,6 +115,17 @@ fn canonical_identity(path: &Path) -> Result<PathBuf> {
     absolute_identity(&formless_runtime::caps::canonical_path(path).map_err(anyhow::Error::msg)?)
 }
 
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
@@ -128,7 +139,7 @@ impl Paths {
     pub fn resolve(profile: Option<&str>) -> Result<Self> {
         let paths = Self::resolve_read_only(profile)?;
         let _lease = crate::profile_lock::ProfileLock::hierarchy_shared(&paths)?;
-        std::fs::create_dir_all(&paths.data_dir)?;
+        create_private_directory(&paths.data_dir)?;
         std::fs::create_dir_all(&paths.config_dir)?;
         Ok(paths)
     }
@@ -377,7 +388,7 @@ impl Paths {
             profile: "default".into(),
         };
         let _lease = crate::profile_lock::ProfileLock::hierarchy_shared(&paths)?;
-        std::fs::create_dir_all(&paths.data_dir)?;
+        create_private_directory(&paths.data_dir)?;
         std::fs::create_dir_all(&paths.config_dir)?;
         Ok(paths)
     }
@@ -444,43 +455,114 @@ impl Paths {
         PathBuf::from(format!("/tmp/formless-{user}"))
     }
 
-    /// Make sure the socket's directory exists, belongs to this user and
-    /// is private (mode 0700): a shared `/tmp` folder someone else made
-    /// first must not receive the daemon's socket.
+    #[cfg(unix)]
+    fn socket_directories<'a>(
+        &'a self,
+        socket: &'a Path,
+    ) -> impl Iterator<Item = (&'a Path, bool)> {
+        // Configured data directories can be deliberate aliases. The shared
+        // runtime fallback must be a real directory owned by this user.
+        std::iter::once((self.data_dir.as_path(), true)).chain(
+            socket
+                .parent()
+                .filter(|parent| *parent != self.data_dir)
+                .map(|parent| (parent, false)),
+        )
+    }
+
+    /// Make the data and socket directories private before binding the daemon.
     #[cfg(unix)]
     pub fn prepare_socket_dir(&self) -> Result<()> {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-        let sock = self.socket_path();
-        let Some(dir) = sock.parent() else {
-            return Ok(());
-        };
-        if dir == self.data_dir {
-            return Ok(());
-        }
-        if !dir.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .with_context(|| format!("create {}", dir.display()))?;
-        }
-        let meta = std::fs::symlink_metadata(dir)?;
-        let mine = std::fs::metadata(&self.data_dir)
-            .map(|m| m.uid())
-            .unwrap_or_else(|_| meta.uid());
-        if !meta.is_dir() || meta.uid() != mine {
-            anyhow::bail!(
-                "{} is not a folder owned by you; the data dir path is too long for a unix \
-                 socket ({} bytes), so the socket goes there. Remove it, or use a shorter \
-                 FORMLESS_DATA_DIR",
-                dir.display(),
-                self.data_dir.join("daemon.sock").as_os_str().len()
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let socket = self.socket_path();
+        for (dir, configured) in self.socket_directories(&socket) {
+            create_private_directory(dir).with_context(|| format!("create {}", dir.display()))?;
+            let flags = libc::O_DIRECTORY | if configured { 0 } else { libc::O_NOFOLLOW };
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(dir)
+                .with_context(|| format!("open daemon directory {}", dir.display()))?;
+            let metadata = directory.metadata()?;
+            anyhow::ensure!(
+                metadata.uid() == unsafe { libc::getuid() },
+                "daemon directory {} must be owned by this user",
+                dir.display()
             );
-        }
-        if meta.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            if metadata.mode() & 0o7777 != 0o700 {
+                directory
+                    .set_permissions(std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("make daemon directory private: {}", dir.display()))?;
+            }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn daemon_socket_metadata(socket: &Path) -> Result<Option<std::fs::Metadata>> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(socket) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::getuid() },
+                    "daemon endpoint {} must be a socket owned by this user",
+                    socket.display()
+                );
+                Ok(Some(metadata))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("inspect daemon endpoint {}", socket.display()))
+            }
+        }
+    }
+
+    /// Set the Unix socket permissions after making its parent private.
+    #[cfg(unix)]
+    pub fn set_daemon_socket_permissions(&self) -> Result<bool> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let socket = self.socket_path();
+        let Some(metadata) = Self::daemon_socket_metadata(&socket)? else {
+            return Ok(false);
+        };
+        if metadata.mode() & 0o7777 != 0o600 {
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("make daemon socket private: {}", socket.display()))?;
+        }
+        Ok(true)
+    }
+
+    /// Existing directories and sockets with modes that need tightening.
+    #[cfg(unix)]
+    pub fn daemon_endpoint_permissions_need_repair(&self) -> Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let socket = self.socket_path();
+        let mut needs_repair = false;
+        for (dir, configured) in self.socket_directories(&socket) {
+            let metadata = if configured {
+                std::fs::metadata(dir)
+            } else {
+                std::fs::symlink_metadata(dir)
+            };
+            match metadata {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.is_dir() && metadata.uid() == unsafe { libc::getuid() },
+                        "daemon directory {} must be a folder owned by this user",
+                        dir.display()
+                    );
+                    needs_repair |= metadata.mode() & 0o7777 != 0o700;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect daemon directory {}", dir.display()))
+                }
+            }
+        }
+        needs_repair |= Self::daemon_socket_metadata(&socket)?
+            .is_some_and(|metadata| metadata.mode() & 0o7777 != 0o600);
+        Ok(needs_repair)
     }
     #[cfg(windows)]
     pub fn pipe_name(&self) -> String {
