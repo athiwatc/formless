@@ -133,8 +133,17 @@ fn the_renderer_fills_everything_or_fails() {
 #[test]
 fn the_image_and_packages_carry_what_they_need() {
     let docker = std::fs::read_to_string(root().join("Dockerfile")).unwrap();
-    for from in docker.lines().filter(|l| l.starts_with("FROM ")) {
-        assert!(from.contains("@sha256:"), "unpinned base: {from}");
+    let mut stages = std::collections::BTreeSet::new();
+    for from in docker.lines().filter_map(|line| line.strip_prefix("FROM ")) {
+        let mut parts = from.split_whitespace();
+        let image = parts.next().unwrap();
+        assert!(
+            image.contains("@sha256:") || stages.contains(image),
+            "unpinned base: {from}"
+        );
+        if parts.next() == Some("AS") {
+            stages.insert(parts.next().unwrap());
+        }
     }
     assert!(docker.contains("libdbus-1-dev") && docker.contains("libdbus-1-3"));
     assert!(docker.contains("HEALTHCHECK"));
