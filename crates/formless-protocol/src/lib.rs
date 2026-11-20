@@ -549,6 +549,10 @@ pub struct ToolInfo {
     pub needs_attention: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Start time of the latest retained Invocation, regardless of outcome.
+    /// Missing when the daemon has no retained history for this Tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
     /// Outcomes of the last 40 finished Invocations, oldest first: `s`
     /// success, `f` failure (SPEC §10.4 sparkline and trend).
     #[serde(default)]
@@ -3599,6 +3603,36 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_usage_timestamp_is_an_optional_additive_wire_field() {
+        let legacy = serde_json::json!({
+            "id": "tool", "name": "tool", "description": "", "retired": false,
+            "current_version": 1, "capabilities": [], "memory_mb": 64,
+            "invocations": 2, "success_rate": 0.5, "needs_attention": false,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-02-01T00:00:00+00:00"
+        });
+        let mut decoded: super::ToolInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.last_used_at, None);
+        let before = serde_json::to_value(&decoded).unwrap();
+        assert!(before.get("last_used_at").is_none());
+        decoded.last_used_at = Some("2026-01-10T00:00:00+00:00".into());
+        let mut after = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<super::ToolInfo>(after.clone()).unwrap(),
+            decoded
+        );
+        assert_eq!(
+            after
+                .as_object_mut()
+                .unwrap()
+                .remove("last_used_at")
+                .unwrap(),
+            "2026-01-10T00:00:00+00:00"
+        );
+        assert_eq!(after, before);
+    }
+
     #[test]
     fn unanswered_approval_close_is_global_and_has_no_decision_value() {
         let event: super::Event = serde_json::from_value(
