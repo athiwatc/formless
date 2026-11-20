@@ -14,9 +14,9 @@ function setup(){
   const elements=new Map();const h=(tag,props,...children)=>({tag,props,children:children.flat(Infinity).filter(x=>x!=null),replaceChildren(...kids){this.children=kids.flat(Infinity);},classList:{toggle(){}}});
   const $=id=>{if(!elements.has(id))elements.set(id,h('div',{}));return elements.get(id);};
   let renders=0;
-  const c=vm.createContext({S:{current:'s',view:'chat',sessions:[],messages:[],liveTools:[],running:new Set(),approvals:[],questions:[]},h,$,tr:x=>x,forecastRevision:0,scheduleForecast(){},branchSummaryEvent(){},notifyFor(){},note(){},invalidateBranchSummary(){},closeSidebar(){},renderHistory(){renders++;},renderRunTools(){},renderStatus(){},renderComposer(){},renderQueue(){},renderChips(){},renderStep(){},renderRunBanner(){},renderAll(){},renderLive(){},renderApproval(){},showQuestion(){},cancelAsk(){},setActivity(){},clearQuestions(){},addApproval(){},queueQuestion(){},rendered:new Map(),prefs:{set(){}},request:async()=>({}),act:async()=>snapshot('r1'),isRunning:()=>c.S.running.has(c.S.current)});
+  const c=vm.createContext({S:{current:'s',view:'chat',sessions:[],messages:[],liveTools:[],running:new Set(),approvals:[],questions:[]},h,$,tr:x=>x,uiLocale:()=>"en-US",forecastRevision:0,scheduleForecast(){},branchSummaryEvent(){},notifyFor(){},note(){},invalidateBranchSummary(){},closeSidebar(){},renderHistory(){renders++;},renderRunTools(){},renderStatus(){},renderComposer(){},renderQueue(){},renderChips(){},renderStep(){},renderRunBanner(){},renderAll(){},renderLive(){},renderApproval(){},showQuestion(){},cancelAsk(){},setActivity(){},clearQuestions(){},addApproval(){},queueQuestion(){},rendered:new Map(),prefs:{set(){}},request:async()=>({}),act:async()=>snapshot('r1'),isRunning:()=>c.S.running.has(c.S.current)});
   installEventRenderFixture(c, fn);
-  vm.runInContext(['planStateLabel','renderPlan','runFilesCaveat','recapBlock','restoreSessionRunState','applySessionLiveState','openSession','onEvent','clearLiveState'].map(fn).join('\n')+'\nlet sessionSeq=0;const CLIENT_LABEL="fixture";const attachmentDrafts={};',c);
+  vm.runInContext(['uiFormat','relTime','planStateLabel','renderPlan','runFilesCaveat','recapBlock','restoreSessionRunState','applySessionLiveState','openSession','onEvent','clearLiveState'].map(fn).join('\n')+'\nlet sessionSeq=0;const CLIENT_LABEL="fixture";const attachmentDrafts={};',c);
   return{c,elements,renders:()=>renders};
 }
 test('actual openSession restores exact terminal recap and lifecycle; clear and legacy remain honest',async()=>{
@@ -54,4 +54,43 @@ test('all unfinished calls are a subset of total and never labeled finished outc
   assert.match(text(block.children[0]),/5 calls.*5 unfinished calls/);
   assert.doesNotMatch(text(block),/5 finished calls|success/);
   assert.ok(!block.children.some(node=>text(node)==='Used'));
+});
+
+const completedItems = [{content:'finished item',status:'completed'}];
+test('current live and resumed successful plans collapse despite lifecycle timestamps',()=>{
+  for(const origin of ['live','resumed']) {
+    const {c,elements}=setup();c.S.plan=completedItems;c.S.planState={...metadata('r','completed'),origin};c.renderPlan();
+    const plan=elements.get('plan');assert.equal(plan.children.length,1);assert.equal(text(plan),'✓ Plan done (1/1)');
+    const title=plan.children[0].props.title;
+    const localDate = new Intl.DateTimeFormat("en-US", {year:"numeric", month:"long", day:"numeric"}).format(new Date(c.S.planState.updated_at));
+    assert.ok(title.includes(localDate));assert.match(title,/\d{2}:\d{2}:\d{2}/);assert.doesNotMatch(title,/2026-11-02T/);
+  }
+});
+test('metadata-free completed plans retain compact behavior but active and incomplete plans do not',()=>{
+  for(const state of [null,{}, {origin:"live", previous_task:false, run_status:null, updated_at:null}]) {
+    const {c,elements}=setup();c.S.plan=completedItems;c.S.planState=state;c.renderPlan();
+    assert.equal(text(elements.get('plan')),'✓ Plan done (1/1)');
+    c.S.running.add('s');c.renderPlan();assert.match(text(elements.get('plan')),/finished item/);
+    c.S.running.clear();c.S.plan=[{content:'pending item',status:'pending'}];c.renderPlan();assert.match(text(elements.get('plan')),/pending item/);
+  }
+});
+test('non-success and historical provenance retain lifecycle and item details',()=>{
+  const cases=[...['paused','failed','interrupted'].map(status=>metadata('r',status)),
+    ...['copied','imported','legacy'].map(origin=>({...metadata('r','completed'),origin})),
+    {...metadata('r','completed'),previous_task:true}];
+  for(const state of cases) {
+    const {c,elements}=setup();c.S.plan=completedItems;c.S.planState=state;c.renderPlan();
+    const plan=elements.get('plan');assert.equal(plan.children.length,2);assert.match(text(plan),/finished item/);
+    assert.ok(text(plan).includes(state.run_status));assert.ok(!text(plan).includes(state.updated_at));
+    if(state.previous_task)assert.match(text(plan),/previous task/);
+    if(state.origin!=='live')assert.ok(text(plan).includes(state.origin));
+  }
+});
+test('plan timestamps use relative display and localized full dates, never malformed raw values',()=>{
+  const {c,elements}=setup();c.S.plan=completedItems;c.S.planState=metadata('r','paused',new Date(Date.now()-120000).toISOString());
+  c.renderPlan();assert.match(text(elements.get('plan')),/updated 2m ago/);
+  c.uiLocale=()=> 'th-TH-u-ca-gregory-nu-latn';c.renderPlan();
+  assert.match(elements.get('plan').children[0].props.title,/[\u0E00-\u0E7F]/);
+  c.S.planState.updated_at='not-a-date';c.renderPlan();assert.doesNotMatch(text(elements.get('plan')),/not-a-date|updated/);
+  assert.equal(elements.get('plan').children[0].props.title,null);
 });
