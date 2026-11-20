@@ -15954,14 +15954,36 @@ impl App {
     }
 }
 
-fn tool_result_line(content: &str, color: bool) -> Line<'static> {
+fn tool_result_failed(result: &MessageInfo) -> bool {
+    if let Some(is_error) = result
+        .meta
+        .as_deref()
+        .and_then(|meta| serde_json::from_str::<serde_json::Value>(meta).ok())
+        .and_then(|meta| {
+            meta.get("is_error")
+                .map(|flag| flag.as_bool() == Some(true))
+        })
+    {
+        return is_error;
+    }
+    // Older rows without an outcome may hold a JSON reply or a plain error.
+    // Only a top-level boolean `ok` describes a legacy JSON reply's outcome.
+    let content = result.content.trim_start();
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(reply) => reply.get("ok").and_then(serde_json::Value::as_bool) == Some(false),
+        Err(_) => content
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error")),
+    }
+}
+
+fn tool_result_line(result: &MessageInfo, color: bool) -> Line<'static> {
+    let content = &result.content;
     let n = content.lines().count();
-    let failed = content.contains("\"ok\":false")
-        || content.trim_start().to_lowercase().starts_with("error");
     let mut spans = vec![
         Span::styled(
             "  ↳ ",
-            if failed {
+            if tool_result_failed(result) {
                 bold_fg(color, Color::Red)
             } else {
                 fg(color, Color::Yellow)
@@ -16161,13 +16183,12 @@ fn result_diff(result: &str) -> Option<String> {
 fn tool_call_block(
     app: &App,
     (id, name, args): &(String, String, String),
-    result: Option<&str>,
+    result: Option<&MessageInfo>,
 ) -> Vec<Line<'static>> {
     let focused = app.call_focus.as_deref() == Some(id.as_str());
     let expanded = app.expanded_calls.contains(id);
-    let failed = result.is_some_and(|r| {
-        r.contains("\"ok\":false") || r.trim_start().to_lowercase().starts_with("error")
-    });
+    let failed = result.is_some_and(tool_result_failed);
+    let result = result.map(|message| message.content.as_str());
     let (mark, mark_style) = match result {
         None => ("…".to_owned(), ui::dim(app.color)),
         Some(_) if failed => (
@@ -16287,11 +16308,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut call_lines: Vec<(usize, String)> = Vec::new();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
-    let results: HashMap<String, &str> = app
+    let results: HashMap<String, &MessageInfo> = app
         .messages
         .iter()
         .filter(|m| m.role == "tool")
-        .filter_map(|m| result_call_id(m).map(|id| (id, m.content.as_str())))
+        .filter_map(|m| result_call_id(m).map(|id| (id, m)))
         .collect();
     let called: HashSet<String> = app
         .messages
@@ -16388,7 +16409,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     continue;
                 }
                 open_group(&mut lines, &mut group, "assistant", when);
-                lines.push(tool_result_line(&m.content, app.color));
+                lines.push(tool_result_line(m, app.color));
             }
             "system-note" => {
                 open_group(&mut lines, &mut group, "system-note", when);
@@ -26265,7 +26286,7 @@ mod tests {
                 "t",
                 "tool",
                 serde_json::json!({"diff": diff, "ok": true}).to_string(),
-                serde_json::json!({"tool_call_id": "c1"}),
+                serde_json::json!({"tool_call_id": "c1", "is_error": false}),
             ),
         ];
         let screen = render(&mut app, 100, 20);
@@ -32385,7 +32406,15 @@ mod tests {
         app.color = true;
         let call = ("call".into(), "edit_file".into(), "{}".into());
         let diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
-        let result = serde_json::json!({"diff":diff}).to_string();
+        let result = MessageInfo {
+            id: "result".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "tool".into(),
+            content: serde_json::json!({"diff":diff}).to_string(),
+            created_at: String::new(),
+            meta: Some(serde_json::json!({"is_error":false}).to_string()),
+        };
         let rows = tool_call_block(&app, &call, Some(&result));
         let text = rows
             .iter()
@@ -32404,7 +32433,12 @@ mod tests {
                 .unwrap();
             assert!(span.style.add_modifier.contains(Modifier::BOLD));
         }
-        let failed = tool_call_block(&app, &call, Some("error: private fixture"));
+        let failed_result = MessageInfo {
+            content: "private fixture".into(),
+            meta: Some(serde_json::json!({"is_error":true}).to_string()),
+            ..result.clone()
+        };
+        let failed = tool_call_block(&app, &call, Some(&failed_result));
         assert!(failed[0].to_string().contains("fail ✗"));
         app.color = false;
         let plain = tool_call_block(&app, &call, Some(&result));
@@ -32417,6 +32451,90 @@ mod tests {
             text
         );
     }
+
+    #[test]
+    fn stored_tool_outcomes_drive_grouped_and_standalone_results() {
+        use serde_json::json;
+
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.color = true;
+        app.expanded_calls.insert("call".into());
+        let assistant = MessageInfo {
+            id: "assistant".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: String::new(),
+            created_at: String::new(),
+            meta: Some(
+                json!({"tool_calls":[
+                    {"id":"call","function":{"name":"fixture_tool","arguments":"{}"}}
+                ]})
+                .to_string(),
+            ),
+        };
+        for (content, flag, failed) in [
+            ("validation rejected", Some(json!(true)), true),
+            (
+                "Error is the title of the report",
+                Some(json!(false)),
+                false,
+            ),
+            (r#"{"body":{"ok":false}}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(null)), false),
+            (r#" { "ok" : false } "#, None, true),
+            (r#"{"body":{"ok":false}}"#, None, false),
+            ("  ERROR: legacy failure", None, true),
+        ] {
+            let mut meta = json!({"tool_call_id":"call"});
+            if let Some(flag) = flag {
+                meta["is_error"] = flag;
+            }
+            let grouped = MessageInfo {
+                id: "grouped".into(),
+                seq: 2,
+                role: "tool".into(),
+                content: content.into(),
+                meta: Some(meta.to_string()),
+                ..assistant.clone()
+            };
+            meta["tool_call_id"] = json!("orphan");
+            let orphan = MessageInfo {
+                id: "orphan".into(),
+                seq: 3,
+                meta: Some(meta.to_string()),
+                ..grouped.clone()
+            };
+            app.messages = vec![assistant.clone(), grouped, orphan];
+
+            let chat = chat_lines(&app, 100, 40);
+            let header = chat.lines[chat.call_lines[0].0].to_string();
+            assert!(
+                header.contains(if failed { "fail ✗" } else { "ok ✓" }),
+                "{content} {meta}: {header}"
+            );
+            let heading = if failed { "    error" } else { "    result" };
+            assert!(
+                chat.lines.iter().any(|line| line.to_string() == heading),
+                "{content} {meta}: missing expanded {heading} label"
+            );
+            let arrow = chat
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "  ↳ ")
+                .unwrap();
+            let style = if failed {
+                bold_fg(true, Color::Red)
+            } else {
+                fg(true, Color::Yellow)
+            };
+            assert_eq!(arrow.style, style, "{content} {meta}");
+        }
+    }
+
     #[test]
     fn colorblind_approval_broad_warning_keeps_identity_and_keys_without_color() {
         let _theme = theme::test_theme("colorblind");

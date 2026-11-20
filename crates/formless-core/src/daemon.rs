@@ -16976,14 +16976,36 @@ fn call_failed(text: String) -> String {
     text
 }
 
-/// A stored tool message's meta: which call it answers, and whether it
-/// reports a failure (Anthropic `tool_result.is_error`).
+/// A stored tool message's meta: call identity and explicit outcome.
 pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    let mut meta = json!({"tool_call_id": call_id, "name": name});
-    if is_error {
-        meta["is_error"] = json!(true);
+    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn stored_tool_result_outcome_preserves_provider_projection() {
+    let mut message = formless_protocol::MessageInfo {
+        id: "result".into(),
+        session_id: "session".into(),
+        seq: 1,
+        role: "tool".into(),
+        content: r#"{"ok":false}"#.into(),
+        created_at: String::new(),
+        meta: Some(json!({"tool_call_id": "call", "name": "tool_name"}).to_string()),
+    };
+    let legacy_projection = crate::storage::provider_message(&message);
+    for is_error in [false, true] {
+        let meta = tool_result_meta("call", "tool_name", is_error);
+        let parsed: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
+        message.meta = Some(meta);
+
+        let mut expected = legacy_projection.clone();
+        if is_error {
+            expected["_is_error"] = json!(true);
+        }
+        assert_eq!(crate::storage::provider_message(&message), expected);
     }
-    meta.to_string()
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):
