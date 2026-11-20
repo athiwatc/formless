@@ -22,6 +22,7 @@ mod markdown;
 mod mermaid;
 mod metrics_tools;
 mod notify;
+mod pager_view;
 mod palette_view;
 mod picker;
 pub mod plain;
@@ -1437,9 +1438,9 @@ struct Pager {
     top: usize,
     /// Columns scrolled to the right (←/→), for wide content.
     left: usize,
-    /// Highlighted lines, shown instead of `lines` while not scrolled
-    /// sideways.
+    /// Highlighted lines for entries that carry presentation styles.
     styled: Vec<Line<'static>>,
+    viewport: pager_view::View,
 }
 
 struct LiveToolCall {
@@ -3459,6 +3460,7 @@ impl App {
                                 lines: approval_lines(&grants, family.as_deref()),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3531,6 +3533,7 @@ impl App {
                                 lines: dry_run_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3545,6 +3548,7 @@ impl App {
                                 lines: body.lines().map(str::to_string).collect(),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3866,6 +3870,7 @@ impl App {
                                     .collect(),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3993,6 +3998,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4069,6 +4075,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             }
@@ -4103,6 +4110,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             } else if current {
@@ -4133,6 +4141,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             } else {
@@ -4257,6 +4266,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4409,6 +4419,7 @@ impl App {
                                 lines: status_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4424,6 +4435,7 @@ impl App {
                                 lines: storage_lines(&result, gc),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4454,6 +4466,7 @@ impl App {
                                 },
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4494,6 +4507,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4549,6 +4563,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4672,6 +4687,7 @@ impl App {
                                 lines: routing_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4769,6 +4785,7 @@ impl App {
                                         lines,
                                         top: 0,
                                         left: 0,
+                                        viewport: Default::default(),
                                         styled: Vec::new(),
                                     });
                                     self.branch_summary.review = Some(preview);
@@ -4811,6 +4828,7 @@ impl App {
                                         lines: session_ui::comparison_lines(&comparison),
                                         top: 0,
                                         left: 0,
+                                        viewport: Default::default(),
                                         styled: Vec::new(),
                                     })
                                 }
@@ -4846,6 +4864,7 @@ impl App {
                                 ),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -5689,6 +5708,7 @@ impl App {
                     lines: compare_lines(&results, width),
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 });
             }
@@ -7949,6 +7969,7 @@ impl App {
                     lines: self.notes.clone(),
                     top: self.notes.len().saturating_sub(20),
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 })
             }
@@ -7999,6 +8020,7 @@ impl App {
                         lines: raw.lines().map(str::to_string).collect(),
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                         styled: Vec::new(),
                     })
                 }
@@ -8178,7 +8200,7 @@ impl App {
                             self.pager = Some(Pager {
                                 title: format!("Guide · {} (bundled {})", if topic.is_empty() { "gallery" } else { &topic }, env!("CARGO_PKG_VERSION")),
                                 lines: body.lines().map(str::to_owned).collect(),
-                                top: 0, left: 0, styled: Vec::new(),
+                                top: 0, left: 0, styled: Vec::new(), viewport: Default::default(),
                             });
                             self.notes.push(format!("Current online copy (may differ from this build): {}", guide.url));
                         } else {
@@ -8450,6 +8472,7 @@ impl App {
                     lines,
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 })
             }
@@ -9402,22 +9425,11 @@ impl App {
             }
         }
         if let Some(p) = &mut self.pager {
-            let page = 20;
-            let last = p.lines.len().saturating_sub(1);
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.pager = None;
-                    self.branch_summary.clear();
-                }
-                KeyCode::Down | KeyCode::Char('j') => p.top = (p.top + 1).min(last),
-                KeyCode::Up | KeyCode::Char('k') => p.top = p.top.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => p.top = (p.top + page).min(last),
-                KeyCode::PageUp => p.top = p.top.saturating_sub(page),
-                KeyCode::Home | KeyCode::Char('g') => p.top = 0,
-                KeyCode::End | KeyCode::Char('G') => p.top = last,
-                KeyCode::Right | KeyCode::Char('l') => p.left += 8,
-                KeyCode::Left | KeyCode::Char('h') => p.left = p.left.saturating_sub(8),
-                _ => {}
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.pager = None;
+                self.branch_summary.clear();
+            } else {
+                p.viewport.key(key.code);
             }
             return;
         }
@@ -9540,6 +9552,7 @@ impl App {
                         lines,
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                         styled: Vec::new(),
                     });
                 }
@@ -10829,6 +10842,7 @@ impl App {
                     lines: wrap_rows(&text, 40),
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 });
             }
@@ -11733,30 +11747,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some((query, sel)) = &app.switcher {
         draw_switcher(f, app, query, *sel);
     }
-    if let Some(p) = &app.pager {
-        let area = f.area();
-        let height = area.height.saturating_sub(2) as usize;
-        let body: Vec<Line> = if p.left == 0 && !p.styled.is_empty() {
-            p.styled.iter().skip(p.top).take(height).cloned().collect()
-        } else {
-            p.lines
-                .iter()
-                .skip(p.top)
-                .take(height)
-                .map(|l| Line::raw(l.chars().skip(p.left).collect::<String>()))
-                .collect()
-        };
-        let title = format!(
-            " {} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
-            p.title,
-            (p.top + 1).min(p.lines.len().max(1)),
-            p.lines.len()
-        );
-        f.render_widget(ratatui::widgets::Clear, area);
-        f.render_widget(
-            Paragraph::new(body).block(ui::panel(title, app.color, Color::Cyan)),
-            area,
-        );
+    if let Some(p) = &mut app.pager {
+        pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
     if let Some(target) = rollback.filter(|target| target.is_visible(f.buffer_mut())) {
@@ -14327,6 +14319,7 @@ fn code_pager(title: &str, code: &str, color: bool) -> Pager {
             .collect(),
         top: 0,
         left: 0,
+        viewport: pager_view::View::with_gutter(w + 3),
         styled,
     }
 }
@@ -14847,6 +14840,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled,
         });
     }
@@ -15020,6 +15014,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled,
         });
     }
@@ -15077,6 +15072,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -15419,6 +15415,7 @@ impl App {
                 .collect(),
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -15466,6 +15463,7 @@ impl App {
                     lines: plain,
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: d.lines,
                 });
             }
@@ -15509,6 +15507,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -17110,6 +17109,7 @@ fn model_metrics_pager(stats: &[formless_protocol::ModelStatInfo], color: bool) 
         lines,
         top: 0,
         left: 0,
+        viewport: Default::default(),
         styled: Vec::new(),
     }
 }
@@ -23039,6 +23039,7 @@ mod tests {
             lines: vec!["first".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
         app.key(key(KeyCode::Tab));
@@ -23288,9 +23289,10 @@ mod tests {
         assert!(all.contains("Configuredvalue:matchesdefault"));
         assert!(all.contains("Everytextcolour"));
         app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        render(&mut app, 80, 10);
         assert_eq!(
             app.pager.as_ref().unwrap().top,
-            app.pager.as_ref().unwrap().lines.len() - 1
+            app.pager.as_ref().unwrap().lines.len().saturating_sub(8)
         );
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pager.is_none());
@@ -24994,6 +24996,108 @@ mod tests {
     }
 
     #[test]
+    fn pager_moves_by_visible_rows_and_clamps_the_bottom_after_resize() {
+        let mut app = test_app();
+        app.pager = Some(Pager {
+            title: "pager fixture".into(),
+            lines: (0..40).map(|n| format!("pager row {n:02}")).collect(),
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: vec![],
+        });
+        app.key(key(KeyCode::PageDown));
+        let screen = render(&mut app, 60, 10);
+        assert_eq!(app.pager.as_ref().unwrap().top, 8);
+        assert!(screen.contains("line 9/40") && screen.contains("pager row 08"));
+
+        app.key(key(KeyCode::Char(' ')));
+        assert!(render(&mut app, 60, 16).contains("pager row 22"));
+        assert_eq!(app.pager.as_ref().unwrap().top, 22);
+        app.key(key(KeyCode::PageUp));
+        render(&mut app, 60, 16);
+        assert_eq!(app.pager.as_ref().unwrap().top, 8);
+
+        app.key(key(KeyCode::End));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::PageDown));
+        let screen = render(&mut app, 60, 20);
+        assert_eq!(app.pager.as_ref().unwrap().top, 22);
+        assert!(screen.contains("line 23/40") && screen.contains("pager row 39"));
+        let screen = render(&mut app, 60, 26);
+        assert_eq!(app.pager.as_ref().unwrap().top, 16);
+        assert!(screen.contains("pager row 16") && screen.contains("pager row 39"));
+        app.key(key(KeyCode::Char('g')));
+        render(&mut app, 1, 1);
+        assert_eq!(app.pager.as_ref().unwrap().top, 0);
+    }
+
+    #[test]
+    fn pager_horizontal_scrolling_keeps_diff_styles_and_code_gutter() {
+        let mut app = test_app();
+        let lines = vec![
+            format!("+{} tail", "a".repeat(120)),
+            format!("-{} tail", "b".repeat(120)),
+        ];
+        app.pager = Some(Pager {
+            title: "proposal diff".into(),
+            styled: vec![
+                Line::styled(lines[0].clone(), Style::default().fg(Color::Green)),
+                Line::styled(lines[1].clone(), Style::default().fg(Color::Red)),
+            ],
+            lines,
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+        });
+        for _ in 0..30 {
+            app.key(key(KeyCode::Right));
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].fg, Color::Green);
+        assert_eq!(buffer[(1, 2)].fg, Color::Red);
+        assert_eq!(buffer[(58, 1)].symbol(), "l");
+        let left = app.pager.as_ref().unwrap().left;
+        app.key(key(KeyCode::Right));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.pager.as_ref().unwrap().left, left);
+
+        let code = code_pager(
+            "Tool source",
+            &format!("{}return 42;", " ".repeat(120)),
+            true,
+        );
+        let keyword_color = code.styled[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "return")
+            .and_then(|span| span.style.fg)
+            .unwrap();
+        app.pager = Some(code);
+        for _ in 0..30 {
+            app.key(key(KeyCode::Right));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "1");
+        assert_eq!(buffer[(3, 1)].symbol(), "│");
+        let keyword = (5..59).find(|&x| buffer[(x, 1)].symbol() == "r").unwrap();
+        assert_eq!(buffer[(keyword, 1)].fg, keyword_color);
+        assert_eq!(buffer[(58, 1)].symbol(), ";");
+
+        app.pager = Some(code_pager("Tool source", "界x", false));
+        let mut tiny = Terminal::new(ratatui::backend::TestBackend::new(7, 8)).unwrap();
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(tiny.backend().buffer()[(5, 1)].symbol(), " ");
+        app.key(key(KeyCode::Right));
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(tiny.backend().buffer()[(1, 1)].symbol(), "1");
+        assert_eq!(tiny.backend().buffer()[(5, 1)].symbol(), "x");
+    }
+
+    #[test]
     fn tables_open_full_width_in_the_pager() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -25016,8 +25120,8 @@ mod tests {
         assert_eq!(p.title, "table 1 of 2");
         assert!(p.lines.iter().any(|l| l.chars().count() > 200), "unshrunk");
         app.key(key(KeyCode::Right));
-        assert_eq!(app.pager.as_ref().unwrap().left, 8);
         assert!(render(&mut app, 60, 20).contains("←→"));
+        assert_eq!(app.pager.as_ref().unwrap().left, 8);
         app.key(key(KeyCode::Esc));
         app.slash("table 3");
         assert!(app.notes.last().unwrap().contains("2 table(s)"));
@@ -25981,6 +26085,7 @@ mod tests {
             lines: vec!["Different content".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: vec![],
         });
         app.key(key(KeyCode::Char('i')));
@@ -28678,21 +28783,18 @@ mod tests {
             assert!(lines[i * 3 + 1].contains("AVG 308ms"));
             assert!(lines[i * 3 + 1].contains(&cache_hit_text(model)));
         }
-        for i in 0..lines.len() {
-            let p = app.pager.as_ref().unwrap();
-            assert_eq!(p.top, i);
-            assert_eq!(p.lines[p.top], lines[i]);
-            app.key(key(KeyCode::Down));
-        }
         app.key(key(KeyCode::Right));
+        render(&mut app, 80, 24);
         assert_eq!(app.pager.as_ref().unwrap().left, 8);
         for size in [(80, 24), (40, 12), (120, 40)] {
             let _ = render(&mut app, size.0, size.1);
         }
         app.key(key(KeyCode::Home));
+        render(&mut app, 120, 40);
         assert_eq!(app.pager.as_ref().unwrap().top, 0);
         app.key(key(KeyCode::End));
-        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 1);
+        render(&mut app, 120, 40);
+        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 38);
         app.key(key(KeyCode::Esc));
         assert!(app.pager.is_none());
         assert_eq!(app.tool_idx, index);
@@ -29561,6 +29663,7 @@ mod tests {
                 lines: vec!["Different visible data".into()],
                 top: 0,
                 left: 0,
+                viewport: Default::default(),
                 styled: vec![],
             });
             app.key(key(KeyCode::Char('i')));
@@ -29722,6 +29825,7 @@ mod tests {
             lines: vec!["private data".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: vec![],
         });
         app.key(key(KeyCode::Esc));

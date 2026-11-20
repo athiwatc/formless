@@ -334,6 +334,7 @@ impl App {
                         styled: lines,
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                     });
                 }
             }
