@@ -31,6 +31,7 @@ mod profile_context_tests;
 pub mod qr;
 mod query;
 mod review_wrap;
+mod search_display;
 mod search_jump;
 mod session_rename;
 mod session_ui;
@@ -329,7 +330,12 @@ enum Pending {
     ReconnectSession,
     CreateSession,
     ForkSession,
-    SearchSessions,
+    SearchSessions {
+        context: search_display::Context,
+        serial: u64,
+        view: View,
+        session: Option<String>,
+    },
     ListTools,
     ListModules,
     ListModelStats,
@@ -1972,6 +1978,8 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_context: Option<search_display::Context>,
+    search_serial: u64,
     search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
@@ -2254,6 +2262,8 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -2859,6 +2869,11 @@ impl App {
         }
     }
 
+    fn stale_search(&self, pending: &Pending) -> bool {
+        matches!(pending, Pending::SearchSessions { serial, view, session, .. }
+            if *serial != self.search_serial || *view != self.view || *session != self.current)
+    }
+
     /// Give up on requests the daemon never answered.
     fn expire_pending(&mut self) {
         let late: Vec<u64> = self
@@ -2874,6 +2889,9 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if self.stale_search(&kind) {
+                continue;
+            }
             if matches!(kind, Pending::ProviderRetry { .. }) {
                 self.notes.push(
                     "Provider retry was not confirmed; the request may already have been re-sent."
@@ -3113,6 +3131,9 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if self.stale_search(&kind) {
+                        continue;
+                    }
                     if let Pending::SuggestName { target } = &kind {
                         self.finish_rename_suggestion(
                             target,
@@ -3387,10 +3408,11 @@ impl App {
                                 }
                             }
                         }
-                        Pending::SearchSessions => {
+                        Pending::SearchSessions { context, .. } => {
                             if let Ok(v) = serde_json::from_value::<Vec<SearchHit>>(result) {
                                 self.notes.push(format!("{} search hit(s)", v.len()));
                                 self.search_hits = v;
+                                self.search_context = Some(context);
                                 self.search_idx = 0;
                                 self.open_view(View::Search);
                             }
@@ -5512,6 +5534,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
@@ -6946,11 +6969,21 @@ impl App {
         }
         if self.search_mode {
             self.search_mode = false;
+            const LIMIT: usize = 50;
+            self.search_serial = self.search_serial.wrapping_add(1);
             self.request(
-                Pending::SearchSessions,
+                Pending::SearchSessions {
+                    context: search_display::Context {
+                        query: text.clone(),
+                        limit: LIMIT,
+                    },
+                    serial: self.search_serial,
+                    view: self.view,
+                    session: self.current.clone(),
+                },
                 Request::SearchSessions {
                     query: text,
-                    limit: Some(50),
+                    limit: Some(LIMIT),
                 },
             );
             return;
@@ -7478,6 +7511,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
             self.search_jump = None;
@@ -7552,6 +7586,7 @@ impl App {
             },
             cmd if cmd.starts_with("template ") => self.template_cmd(cmd[9..].trim()),
             "search" => {
+                self.search_serial = self.search_serial.wrapping_add(1);
                 self.search_mode = true;
                 self.notes
                     .push("Type a search query, then Enter (searches all sessions).".into());
@@ -17235,20 +17270,30 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
             .len()
             .min(area.height.saturating_sub(2) as usize),
     );
+    let context = app.search_context.as_ref();
     let items: Vec<ListItem> = if app.search_hits.is_empty() {
+        let budget = usize::from(area.width.saturating_sub(2));
         vec![ListItem::new(Line::styled(
-            "No hits. /search to try again.",
+            search_display::empty(context, budget),
             ui::dim(app.color),
         ))]
     } else {
+        let terms = search_display::Terms::new(context.map_or("", |context| &context.query));
         app.search_hits
             .iter()
             .map(|h| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(h.session_name.clone(), bold_fg(app.color, Color::Cyan)),
-                    Span::styled(format!("  #{} {}  ", h.seq, h.role), ui::dim(app.color)),
-                    Span::raw(h.snippet.clone()),
-                ]))
+                let mut spans = vec![
+                    Span::styled(
+                        search_display::label(&h.session_name),
+                        bold_fg(app.color, Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("  #{} {}  ", h.seq, search_display::label(&h.role)),
+                        ui::dim(app.color),
+                    ),
+                ];
+                spans.extend(terms.snippet_spans(&h.snippet, Style::default()));
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -17259,7 +17304,11 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(
         List::new(items)
             .block(ui::panel(
-                format!(" Search ({} hits) ", app.search_hits.len()),
+                search_display::title(
+                    app.search_hits.len(),
+                    context,
+                    usize::from(area.width.saturating_sub(2)),
+                ),
                 app.color,
                 Color::Magenta,
             ))
@@ -20079,6 +20128,8 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -27137,6 +27188,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn send_fixture_search(app: &mut App, sent: &mpsc::Receiver<String>, query: &str) -> u64 {
+        app.slash("search");
+        app.input.set(query);
+        app.submit_chat(false);
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            envelope.request,
+            Request::SearchSessions { query: text, limit: Some(50) } if text == query
+        ));
+        envelope.id
+    }
+
+    fn fixture_search_hit(seq: i64) -> SearchHit {
+        SearchHit {
+            session_id: "synthetic".into(),
+            session_name: "Fixture".into(),
+            message_id: format!("m{seq}"),
+            seq,
+            role: "user".into(),
+            snippet: "capped fixture text".into(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn search_results_follow_the_matching_reply_and_preserve_daemon_order() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let first = send_fixture_search(&mut app, &sent, "first query");
+        let second = send_fixture_search(&mut app, &sent, "second query");
+        branch_summary_reply(&tx, second, serde_json::json!([]));
+        branch_summary_reply(&tx, first, serde_json::json!([fixture_search_hit(93)]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Search);
+        assert!(app.search_hits.is_empty());
+        let screen = render(&mut app, 85, 18);
+        assert!(screen.contains("No hits for “second query”"), "{screen}");
+        assert!(!screen.contains("first query"), "{screen}");
+        assert!(!screen.contains("more may exist"), "{screen}");
+
+        for count in [2, 50] {
+            app.key(key(KeyCode::Esc));
+            let current = send_fixture_search(&mut app, &sent, "capped fixture");
+            assert_eq!(app.search_context.as_ref().unwrap().limit, 50);
+            let hits: Vec<_> = (0..count).rev().map(fixture_search_hit).collect();
+            branch_summary_reply(&tx, current, serde_json::to_value(&hits).unwrap());
+            app.drain_daemon();
+            assert_eq!(app.view, View::Search);
+            assert_eq!(app.search_hits, hits);
+            assert_eq!(app.search_idx, 0);
+            let screen = render(&mut app, 85, 18);
+            assert!(
+                screen.contains(&format!("Search ({count} hits)")),
+                "{screen}"
+            );
+            assert_eq!(screen.contains("more may exist"), count == 50, "{screen}");
+            assert!(screen.contains("capped fixture"), "{screen}");
+            render(&mut app, 14, 9);
+        }
+
+        app.key(key(KeyCode::Esc));
+        let malformed = send_fixture_search(&mut app, &sent, "malformed");
+        branch_summary_reply(&tx, malformed, serde_json::json!({"query":"wrong shape"}));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(app.search_context.as_ref().unwrap().query, "capped fixture");
+        assert_eq!(app.search_hits.len(), 50);
+    }
+
+    #[test]
+    fn search_replies_and_timeouts_do_not_interrupt_newer_views_or_sessions() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let requests: Vec<_> = ["before move", "stale error", "stale timeout"]
+            .into_iter()
+            .map(|query| send_fixture_search(&mut app, &sent, query))
+            .collect();
+        app.open_view(View::Sessions);
+        let list: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(list.request, Request::ListSessions));
+        branch_summary_reply(&tx, list.id, serde_json::json!([]));
+        app.open_view(View::Chat);
+        app.pending_since.insert(
+            requests[2],
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        let notes_before = app.notes.clone();
+        branch_summary_reply(&tx, requests[0], serde_json::json!([]));
+        tx.send(ServerMessage::Response {
+            id: requests[1],
+            ok: false,
+            result: None,
+            error: Some("obsolete fixture error".into()),
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.notes, notes_before);
+
+        let before_suggestion = send_fixture_search(&mut app, &sent, "before suggestion");
+        app.slash("rename auto");
+        let suggest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(suggest.request, Request::SuggestSessionName { id } if id == "s1"));
+        branch_summary_reply(&tx, before_suggestion, serde_json::json!([]));
+        branch_summary_reply(
+            &tx,
+            suggest.id,
+            serde_json::json!({"name":"Synthetic suggestion"}),
+        );
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(render(&mut app, 85, 18).contains("Synthetic suggestion"));
+        assert!(app.search_context.is_none());
+        app.key(key(KeyCode::Esc));
+
+        let before_switch = send_fixture_search(&mut app, &sent, "before switch");
+        app.switch_session("other".into());
+        app.switch_session("s1".into());
+        branch_summary_reply(&tx, before_switch, serde_json::json!([]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.current.as_deref(), Some("s1"));
     }
 
     fn branch_summary_test_app() -> (
