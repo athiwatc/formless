@@ -3928,7 +3928,7 @@
           h("tbody", null, result.runs.map((r) => h("tr", null,
             h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
             h("td", null, r.trigger),
-            h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+            h("td", { class: r.status === "failed" ? "error" : r.status === "skipped" ? "warn" : "" }, r.status),
             h("td", { class: "muted" }, secs(r)),
             h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
             h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
