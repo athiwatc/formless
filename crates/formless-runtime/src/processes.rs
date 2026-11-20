@@ -14,6 +14,86 @@ pub(super) const MAX_HANDLES: usize = 16;
 const QUEUED_PER_STREAM: usize = 256 * 1024;
 const PIPE_CHUNK: usize = 64 * 1024;
 
+pub(super) struct RunOutput {
+    cap: usize,
+    stdout_enc: Enc,
+    stdout: CapturedStream,
+    stderr: CapturedStream,
+}
+
+impl RunOutput {
+    pub(super) fn new(cap: usize, stdout_enc: Enc) -> Self {
+        Self {
+            cap,
+            stdout_enc,
+            stdout: CapturedStream::default(),
+            stderr: CapturedStream::default(),
+        }
+    }
+
+    pub(super) fn push(&mut self, stdout: bool, chunk: &[u8]) {
+        if stdout {
+            self.stdout.push(chunk, self.cap, self.stdout_enc);
+        } else {
+            self.stderr.push(chunk, self.cap, Enc::Text);
+        }
+    }
+
+    pub(super) fn finish(self, mut result: Value) -> Value {
+        result["stdout_cap_truncated"] = json!(self.stdout.truncated);
+        result["stderr_cap_truncated"] = json!(self.stderr.truncated);
+        result["truncated"] =
+            json!(self.stdout.truncated || self.stderr.truncated || result["truncated"] == true);
+        result["stdout"] = self.stdout.encode(self.stdout_enc);
+        result["stderr"] = self.stderr.encode(Enc::Text);
+        result
+    }
+}
+
+#[derive(Default)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+    lookahead: [u8; 3],
+    lookahead_len: usize,
+}
+
+impl CapturedStream {
+    fn push(&mut self, chunk: &[u8], cap: usize, enc: Enc) {
+        let retained = chunk.len().min(cap - self.bytes.len());
+        let (prefix, omitted) = chunk.split_at(retained);
+        self.bytes.extend_from_slice(prefix);
+        self.truncated |= !omitted.is_empty();
+        if enc == Enc::Text && !omitted.is_empty() {
+            let room = &mut self.lookahead[self.lookahead_len..];
+            let len = omitted.len().min(room.len());
+            room[..len].copy_from_slice(&omitted[..len]);
+            self.lookahead_len += len;
+        }
+    }
+
+    fn encode(mut self, enc: Enc) -> Value {
+        if enc == Enc::Text && self.truncated {
+            // Trim only a valid character split by the cap. The first omitted
+            // bytes distinguish that case from malformed or incomplete input.
+            let end = utf8_cut(&self.bytes);
+            let suffix = &self.bytes[end..];
+            if !suffix.is_empty() {
+                let mut boundary = [0; 4];
+                let len = suffix.len() + self.lookahead_len.min(4 - suffix.len());
+                boundary[..suffix.len()].copy_from_slice(suffix);
+                boundary[suffix.len()..len].copy_from_slice(&self.lookahead[..len - suffix.len()]);
+                let valid = std::str::from_utf8(&boundary[..len])
+                    .map_or_else(|error| error.valid_up_to(), str::len);
+                if valid > suffix.len() {
+                    self.bytes.truncate(end);
+                }
+            }
+        }
+        encode(&self.bytes, enc)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Channel {
     Stdout,
@@ -562,5 +642,121 @@ mod platform {
             }
             let _ = child.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod run_output_tests {
+    use super::*;
+
+    #[test]
+    fn text_cap_keeps_the_prefix_across_chunks() {
+        for character in ['¢', '€', '🙂'] {
+            let text = format!("a{character}");
+            for char_bytes_kept in 1..character.len_utf8() {
+                for split in 1..text.len() {
+                    let mut output = RunOutput::new(1 + char_bytes_kept, Enc::Text);
+                    let (first, rest) = text.as_bytes().split_at(split);
+                    output.push(true, first);
+                    output.push(false, b"ok");
+                    output.push(true, rest);
+                    output.push(true, b"x");
+
+                    let result = output.finish(json!({"truncated": false}));
+                    assert_eq!(
+                        result,
+                        json!({
+                            "stdout": "a",
+                            "stderr": "ok",
+                            "stdout_cap_truncated": true,
+                            "stderr_cap_truncated": false,
+                            "truncated": true
+                        }),
+                        "{character:?}, cap after {char_bytes_kept} character bytes, split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_stdout_keeps_the_exact_byte_prefix_and_stderr_stays_text() {
+        let mut output = RunOutput::new(2, Enc::Base64);
+        output.push(true, b"\xc2");
+        output.push(false, "a€".as_bytes());
+        output.push(true, b"\xa2\xff");
+        output.push(false, b"b");
+        let result = output.finish(json!({"truncated": false}));
+        assert_eq!(result["stdout"], "wqI=");
+        assert_eq!(result["stderr"], "a");
+        assert_eq!(result["stdout_cap_truncated"], true);
+        assert_eq!(result["stderr_cap_truncated"], true);
+        assert_eq!(result["truncated"], true);
+
+        let mut output = RunOutput::new(1, Enc::Base64);
+        output.push(true, b"\xc2");
+        output.push(false, "€".as_bytes());
+        let result = output.finish(json!({"truncated": false}));
+        assert_eq!(result["stdout"], "wg==");
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["stdout_cap_truncated"], false);
+        assert_eq!(result["stderr_cap_truncated"], true);
+        assert_eq!(result["truncated"], true);
+
+        let mut output = RunOutput::new(1, Enc::Base64);
+        output.push(true, "¢".as_bytes());
+        let result = output.finish(json!({"truncated": false}));
+        assert_eq!(result["stdout"], "wg==");
+        assert_eq!(result["stdout_cap_truncated"], true);
+        assert_eq!(result["stderr_cap_truncated"], false);
+    }
+
+    #[test]
+    fn malformed_and_incomplete_input_remains_lossy() {
+        let cases: &[(&[u8], usize, &str, bool)] = &[
+            (b"a\xffb", 2, "a�", true),
+            (b"a\xe2\x82x", 3, "a�", true),
+            (b"a\xed\xa0\x80", 3, "a��", true),
+            (b"a\xe2\x82", 2, "a�", true),
+            (b"a\xe2\x82", 3, "a�", false),
+            (b"\xff\xf0\x9f\x98\x80", 3, "�", true),
+        ];
+        for &(bytes, cap, expected, truncated) in cases {
+            let mut output = RunOutput::new(cap, Enc::Text);
+            for byte in bytes {
+                output.push(false, std::slice::from_ref(byte));
+            }
+            assert_eq!(output.stderr.bytes.len(), cap.min(bytes.len()));
+            let result = output.finish(json!({"truncated": false}));
+            assert_eq!(result["stderr"], expected, "{bytes:?} at cap {cap}");
+            assert_eq!(result["stderr_cap_truncated"], truncated);
+            assert_eq!(result["truncated"], truncated);
+        }
+    }
+
+    #[test]
+    fn empty_and_exact_cap_output_and_upstream_truncation() {
+        for (cap, bytes) in [(0, b"".as_slice()), (2, "é".as_bytes())] {
+            for upstream in [false, true] {
+                let mut output = RunOutput::new(cap, Enc::Text);
+                output.push(true, bytes);
+                output.push(false, b"");
+                let result = output.finish(json!({"code": 42, "truncated": upstream}));
+                assert_eq!(result["stdout"], std::str::from_utf8(bytes).unwrap());
+                assert_eq!(result["stderr"], "");
+                assert_eq!(result["stdout_cap_truncated"], false);
+                assert_eq!(result["stderr_cap_truncated"], false);
+                assert_eq!(result["truncated"], upstream);
+                assert_eq!(result["code"], 42);
+            }
+        }
+
+        let mut output = RunOutput::new(0, Enc::Text);
+        output.push(true, b"x");
+        let result = output.finish(json!({"truncated": false}));
+        assert_eq!(result["stdout"], "");
+        assert_eq!(result["stdout_cap_truncated"], true);
+        assert_eq!(result["stderr_cap_truncated"], false);
+        assert_eq!(result["truncated"], true);
     }
 }
