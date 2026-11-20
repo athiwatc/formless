@@ -13,6 +13,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("sk-", "API key"),
     ("sk_live_", "API key"),
     ("sk_test_", "API key"),
+    ("rk_test_", "API key"),
     ("rk_live_", "API key"),
     ("ghp_", "GitHub token"),
     ("gho_", "GitHub token"),
@@ -369,5 +370,12 @@ mod tests {
             ("ticket [REDACTED] done", Some("configured pattern"))
         );
         set_patterns(&[]);
+    }
+
+    #[test]
+    fn stripe_restricted_test_keys_are_redacted() {
+        let key = format!("rk_test_{}", "512345678901234567890123");
+        assert_eq!(redact(&key), (MARK.into(), Some("API key")));
+        assert_eq!(redact("rk_test_short"), ("rk_test_short".into(), None));
     }
 }
