@@ -10,13 +10,18 @@ const fn = name => {
   return source.slice(start, source.indexOf('\n  }', start) + 4);
 };
 function setup(actualRefresh = false) {
-  const notes = [], box = { classList: { toggle() {} }, children: [], replaceChildren(...children) { this.children = children; } };
-  const h = (tag, props, ...children) => ({ tag, props, children: children.flat(Infinity).filter(x => x != null) });
-  const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{},conn:1,channel:{}}, h, $:() => box,
+  const notes = [], box = { contains(node) { return !!node && this.children.some(row => row.children.includes(node)); }, classList: { toggle() {} }, children: [], replaceChildren(...children) { this.children = children; } };
+  const doc = { activeElement: null };
+  const h = (tag, props, ...children) => ({
+    tag, props, children: children.flat(Infinity).filter(x => x != null),
+    dataset: { runningAction: props?.['data-running-action'], runningHandle: props?.['data-running-handle'] },
+    focus(options) { assert.equal(options.preventScroll, true); doc.activeElement = this; },
+  });
+  const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{readyState:1},local:true,conn:1,channel:{}}, h, $:() => box,
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
-    request: async () => [], Date});
+    request: async () => [], document: doc, focusVisible: button => box.contains(button), uiFormat: String, Date});
   installEventRenderFixture(c, fn);
-  vm.runInContext(['runningTool','reconcileInvocationProgress','progressDiagnostic','refreshRunning','onEvent'].map(fn).join('\n'),c);
+  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','renderRunning','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};
 }
@@ -81,16 +86,29 @@ test('actual reconnect refresh restores distinct bars and diagnostic labels from
   assert.equal(c.S.liveTools.length,2);
   assert.equal(c.S.liveTools[0].status,'ok','older snapshot cannot revive a completed ID');
 });
-test('late refresh from replaced connection or older request never overwrites live identity', async () => {
+test('refresh keeps the focused action attached to its surviving handle', async () => {
+  const {c,box} = setup(true);
+  c.request = async () => [row('a'), row('b')];
+  await c.refreshRunning();
+  box.children[2].children.find(el => el.dataset?.runningAction === 'cancel').focus({ preventScroll: true });
+  c.request = async () => [row('b'), row('a')];
+  await c.refreshRunning();
+  assert.ok(box.contains(c.document.activeElement));
+  assert.equal(c.document.activeElement.dataset.runningHandle, 'h-b');
+  assert.equal(c.document.activeElement.dataset.runningAction, 'cancel');
+});
+test('a queued event prevents stale refresh and replaced connections cannot overwrite identity', async () => {
   const {c} = setup(true), resolvers = [];
   c.request = () => new Promise(resolve => resolvers.push(resolve));
-  const old = c.refreshRunning(), current = c.refreshRunning();
-  resolvers[1]([row('b')]); await current;
+  const old = c.refreshRunning();
+  await c.refreshRunning();
+  assert.equal(resolvers.length, 1);
   resolvers[0]([row('a')]); await old;
-  assert.equal(c.S.liveTools.length,1);
-  assert.equal(c.S.liveTools[0].invocationId,'b');
-  const replaced = c.refreshRunning(); c.S.channel = {};
-  resolvers[2]([row('a')]); await replaced;
+  assert.equal(c.S.liveTools.length, 0, 'snapshot superseded by queued event must not render');
+  c.S.channel = {};
+  const current = c.refreshRunning();
+  resolvers[2]([row('b')]); await current;
+  resolvers[1]([row('a')]); await Promise.resolve(); await Promise.resolve();
   assert.equal(c.S.liveTools.length,1);
   assert.equal(c.S.liveTools[0].invocationId,'b');
 });
