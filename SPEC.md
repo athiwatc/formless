@@ -5269,7 +5269,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless chat` | `--session ID` or `--new` | Line-mode chat with streamed answers and inline questions. |
 | `formless commands` | `list` | List local user-defined slash-command metadata without starting a daemon. |
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
-| `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
+| `formless config` | `path`, `list`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
@@ -5507,6 +5507,12 @@ previous headless Run's Session.
   usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
+  - `list [--filter TEXT] [--json]` reads documented settings from the local
+    profile and environment, with descriptions, defaults and settable status.
+    The optional filter matches dotted key names. The result marks changed
+    values and distinguishes null, empty and missing values from defaults
+    explained only in documentation. Credentials and other sensitive values
+    are excluded or masked. The command works before a daemon starts.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
     an unknown key exits 2.
   - `set KEY VALUE` goes through the settings API, so it's validated against

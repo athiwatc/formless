@@ -160,7 +160,7 @@ enum Cmd {
     },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
     #[command(
-        after_help = "Examples:\n  formless config path\n  formless config get provider.model\n  formless config get provider.model --json"
+        after_help = "Examples:\n  formless config path\n  formless config list --filter limits\n  formless config list --json\n  formless config get provider.model\n  formless config get provider.model --json"
     )]
     Config {
         #[command(subcommand)]
@@ -6223,6 +6223,15 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
 enum ConfigAction {
     /// Print where config.toml is
     Path,
+    /// List documented settings as loaded by this CLI, including defaults
+    List {
+        /// Match part of a dotted setting name, for example limits
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+        /// Print the local settings catalog as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a locally loaded setting (with FORMLESS_* overrides applied)
     Get {
         /// Dotted setting name, for example provider.model
@@ -6260,10 +6269,46 @@ fn config_get_output(value: &serde_json::Value, json: bool) -> serde_json::Resul
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
+        ConfigAction::List { filter, json } => {
+            let config = Config::load(&paths)?;
+            formless_core::secrets::set_patterns(&config.security.secret_patterns);
+            let report = config.local_settings(filter.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!("Local configuration (file and environment overrides)");
+            let mut table = Table::new(&["KEY", "EFFECTIVE", "DEFAULT", "SETTABLE", "DESCRIPTION"]);
+            for (key, row) in report["settings"].as_object().into_iter().flatten() {
+                let effective = match row["effective_kind"].as_str() {
+                    Some("redacted") => "[redacted]".to_owned(),
+                    Some("missing") => "(missing)".to_owned(),
+                    _ => serde_json::to_string(&row["effective"])?,
+                };
+                let default = if row["default_kind"] == "documentation" {
+                    format!("{} (documented)", row["default_documentation"].as_str().unwrap_or_default())
+                } else {
+                    serde_json::to_string(&row["default"])?
+                };
+                let effective = if row["changed"] == true {
+                    format!("{effective} (changed)")
+                } else {
+                    effective
+                };
+                table.row(vec![
+                    t(key, Tone::Strong),
+                    c(comparison_terminal_text(&effective)),
+                    c(comparison_terminal_text(&default)),
+                    c(if row["settable"] == true { "yes" } else { "no" }),
+                    c(row["description"].as_str().unwrap_or_default()),
+                ]);
+            }
+            table.print();
+        }
         ConfigAction::Get { key, json } => match Config::load(&paths)?.setting_value(&key)? {
             Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
-                eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                eprintln!("no setting '{key}' (see `formless config list` or SPEC §13)");
                 std::process::exit(2);
             }
         },
