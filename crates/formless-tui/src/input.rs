@@ -453,8 +453,9 @@ impl InputLine {
 
     fn insert_raw(&mut self, s: &str) -> usize {
         // Readline movement can enter a placeholder without expanding it.
-        // Preserve that payload before inserting at the position it denotes.
-        while let Some(index) = self
+        // Insert at the expanded payload's byte end before snapping the
+        // cursor, since expansion can join the next placeholder's cluster.
+        if let Some(index) = self
             .pastes
             .iter()
             .position(|paste| paste.range.start < self.cursor && self.cursor < paste.range.end)
@@ -462,7 +463,6 @@ impl InputLine {
             let paste = self.pastes.remove(index);
             self.cursor = paste.range.start + paste.payload.len();
             self.replace_raw(paste.range, &paste.payload);
-            self.snap_after_insert();
         }
         let start = self.cursor;
         self.replace_raw(start..start, s);
@@ -1541,6 +1541,24 @@ mod tests {
         assert!(line.ends_with("[pasted 10 lines #2]"));
         assert!(line.undo());
         assert_eq!(line.before_cursor(), "[");
+        assert_eq!(line.expanded(), format!("{first}{second}"));
+    }
+
+    #[test]
+    fn expanding_a_paste_keeps_insertion_before_the_next_placeholder() {
+        let first = format!("{}\u{0600}", "A\n".repeat(9));
+        let second = "B\n".repeat(10);
+        let mut line = InputLine::default();
+        line.paste(&first);
+        line.paste(&second);
+        line.home();
+        line.right();
+        line.insert_char('é');
+        assert_eq!(line.expanded(), format!("{first}é{second}"));
+        assert_eq!(line.before_cursor(), format!("{first}é"));
+        assert!(line.ends_with("[pasted 10 lines #2]"));
+        assert!(line.undo());
+        assert_eq!(&*line, "[pasted 10 lines #1][pasted 10 lines #2]");
         assert_eq!(line.expanded(), format!("{first}{second}"));
     }
 
