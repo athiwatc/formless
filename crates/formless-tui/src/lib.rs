@@ -12209,37 +12209,64 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
     );
 }
 
-/// The `@` completions, just above the input box.
+fn mention_path_label(path: &str, columns: usize) -> std::borrow::Cow<'_, str> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if columns == 0 {
+        return "".into();
+    }
+    // Ratatui paints one grapheme at a time, even for scripts whose combined
+    // string width can be narrower than the sum of their grapheme widths.
+    if path.graphemes(true).map(text::width).sum::<usize>() <= columns {
+        return path.into();
+    }
+    let mut remaining = columns - 1;
+    let mut start = path.len();
+    for (i, grapheme) in path.grapheme_indices(true).rev() {
+        let width = text::width(grapheme);
+        if width > remaining {
+            break;
+        }
+        remaining -= width;
+        start = i;
+    }
+    format!("…{}", &path[start..]).into()
+}
+
+/// The `@` completions, just above the input box and scrolled to the selection.
 fn draw_mention_popup(f: &mut Frame, input: Rect, m: &MentionPopup, color: bool) {
-    if m.files.is_empty() || input.y < 3 {
+    let area = f.area();
+    let x = input.x.max(area.x);
+    let y = input.y.min(area.bottom());
+    let width = input.right().min(area.right()).saturating_sub(x).min(72);
+    let height = y.saturating_sub(area.y);
+    if width < 3 || height < 3 || m.files.is_empty() {
         return;
     }
-    let lines: Vec<Line> = m
-        .files
+
+    let rows = usize::from(height - 2).min(m.files.len());
+    let sel = m.sel.min(m.files.len() - 1);
+    let start = sel.saturating_sub(rows - 1).min(m.files.len() - rows);
+    let columns = usize::from(width - 2);
+    let gap = if columns > 2 { " " } else { "" };
+    let path_columns = columns - 1 - gap.len();
+    let lines: Vec<Line> = m.files[start..start + rows]
         .iter()
         .enumerate()
         .map(|(i, file)| {
-            let text = format!(
-                "{} {}{}",
-                if i == m.sel { "›" } else { " " },
-                file.path,
-                if file.dir { "/" } else { "" }
-            );
-            if i == m.sel {
-                Line::styled(text, bold_fg(color, Color::Green))
+            let selected = start + i == sel;
+            let marker = if selected { '›' } else { ' ' };
+            let path = format!("{}{}", file.path, if file.dir { "/" } else { "" });
+            let label = format!("{marker}{gap}{}", mention_path_label(&path, path_columns));
+            if selected {
+                Line::styled(label, bold_fg(color, Color::Green))
             } else {
-                Line::raw(text)
+                Line::raw(label)
             }
         })
         .collect();
-    let h = (lines.len() as u16 + 2).min(input.y);
-    let w = 72.min(input.width).max(1);
-    let rect = Rect {
-        x: input.x,
-        y: input.y - h,
-        width: w,
-        height: h,
-    };
+    let height = rows as u16 + 2;
+    let rect = Rect::new(x, y - height, width, height);
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(ui::panel(
@@ -27671,6 +27698,126 @@ mod tests {
             "{requests:?}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mention_popup_keeps_every_selection_in_short_viewports() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let mut popup = MentionPopup {
+            query: "file".into(),
+            files: (0..8)
+                .map(|i| FileEntry {
+                    path: format!("file-{i:02}.rs"),
+                    dir: false,
+                    bytes: 0,
+                })
+                .collect(),
+            sel: 0,
+            dismissed: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        for y in [3, 4, 6, 10] {
+            for sel in (0..8).chain((0..7).rev()) {
+                popup.sel = sel;
+                terminal
+                    .draw(|frame| draw_mention_popup(frame, Rect::new(2, y, 36, 2), &popup, false))
+                    .unwrap();
+                let shown: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    shown.contains(&format!("› file-{sel:02}.rs")),
+                    "{y}: {shown}"
+                );
+                assert_eq!(shown.matches("file-").count(), usize::from(y - 2));
+            }
+        }
+    }
+
+    #[test]
+    fn mention_popup_ellipsizes_paths_at_grapheme_boundaries() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let mixed = "long parent path/資料/e\u{301}👩‍💻.rs";
+        for (path, dir, width, expected) in [
+            (mixed, true, 12, "│›…e\u{301}👩‍💻.rs/│"),
+            (mixed, true, 10, "│›….rs/│"),
+            ("لالالا", false, 8, "│›…الا│"),
+        ] {
+            let popup = MentionPopup {
+                query: "path".into(),
+                files: vec![FileEntry {
+                    path: path.into(),
+                    dir,
+                    bytes: 0,
+                }],
+                sel: 0,
+                dismissed: false,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+            terminal
+                .draw(|frame| draw_mention_popup(frame, Rect::new(0, 3, width, 1), &popup, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(row.replace(' ', ""), expected);
+            assert_eq!(popup.files[0].path, path);
+            assert_eq!(popup.files[0].dir, dir);
+        }
+    }
+
+    #[test]
+    fn mention_popup_handles_tiny_or_clipped_geometry() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let popup = MentionPopup {
+            query: "path".into(),
+            files: vec![FileEntry {
+                path: "document.txt".into(),
+                dir: false,
+                bytes: 0,
+            }],
+            sel: 0,
+            dismissed: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(8, 6)).unwrap();
+        for rect in [
+            Rect::new(0, 3, 0, 1),
+            Rect::new(0, 3, 1, 1),
+            Rect::new(0, 3, 2, 1),
+            Rect::new(0, 0, 8, 1),
+            Rect::new(0, 2, 8, 1),
+            Rect::new(6, 3, 5, 1),
+        ] {
+            terminal
+                .draw(|frame| draw_mention_popup(frame, rect, &popup, false))
+                .unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| cell.symbol() == " "),
+                "{rect}"
+            );
+        }
+        for (width, expected) in [(3, "│›│"), (4, "│›…│")] {
+            terminal
+                .draw(|frame| draw_mention_popup(frame, Rect::new(0, 3, width, 1), &popup, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(row, expected);
+        }
     }
 
     #[test]
