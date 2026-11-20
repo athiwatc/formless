@@ -390,12 +390,14 @@ enum Cmd {
         /// terminal, otherwise tell the agent nobody can answer)
         #[arg(long)]
         answer: Option<String>,
-        /// Emit one JSON event per line (same as --output jsonl-events)
+        /// Emit one JSON event per line (same as --output jsonl-events).
+        /// With --estimate, print one JSON forecast instead.
         #[arg(long, conflicts_with = "output")]
         json: bool,
         /// text: stream the answer and progress; final: only the final
         /// answer on stdout; json: one result object at the end;
-        /// jsonl-events: every event, one per line
+        /// jsonl-events: every event, one per line.
+        /// With --estimate, use text or json to print the forecast.
         #[arg(long, value_enum, default_value = "text")]
         output: RunOutput,
         /// No progress lines ([tool], [approval], …) on stderr; errors still show
@@ -2103,10 +2105,20 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         attach,
         cwd,
         json,
+        output,
         pipeline,
         ..
     }) = &cli.cmd
     {
+        let forecast_json = match output {
+            RunOutput::Text => *json,
+            RunOutput::Json => true,
+            RunOutput::Final | RunOutput::JsonlEvents => {
+                return Err(usage(
+                    "--estimate does not support --output final or jsonl-events. Use --output text or json.",
+                ));
+            }
+        };
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
@@ -2221,7 +2233,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         };
         // Only an owned DTO reaches output: private readers and maintenance
         // freezes have dropped, even if stdout is a backpressured pipe.
-        if *json {
+        if forecast_json {
             println!("{}", serde_json::to_string_pretty(&forecast)?);
         } else {
             println!("{}", formless_core::forecast::describe(&forecast));
