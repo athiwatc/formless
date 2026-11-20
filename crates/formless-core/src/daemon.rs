@@ -8518,6 +8518,7 @@ impl Daemon {
             }
         };
         if bootstrap {
+            builtin_progress.close();
             let elapsed_ms = started.elapsed().as_millis() as i64;
             let (ok, kind) = builtin_outcome(&tc.name, &text);
             let kind = if created_kind.is_empty() {
@@ -14443,6 +14444,7 @@ impl Daemon {
             let ops_dyn: Arc<dyn HostOps> = ops.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
+            progress.close();
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
                 this.broadcast(Event::ToolCallFinished {
@@ -16487,6 +16489,12 @@ impl NestedOps {
     }
 }
 
+impl Drop for NestedOps {
+    fn drop(&mut self) {
+        self.progress.close();
+    }
+}
+
 impl HostOps for NestedOps {
     fn path_policy(
         &self,
@@ -16576,6 +16584,36 @@ impl HostOps for NestedOps {
                 depth: self.depth.saturating_sub(1),
                 fraction: value.fraction,
                 label: value.label,
+            });
+        }
+        if let Some(mut deadline) = update.flush_at {
+            let progress = Arc::downgrade(&self.progress);
+            let daemon = Arc::downgrade(&self.daemon);
+            let session_id = self.session_id.clone();
+            let run_id = self.run_id.clone();
+            let tool_name = self.tool_name.clone();
+            let depth = self.depth.saturating_sub(1);
+            self.handle.spawn(async move {
+                loop {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    let (Some(progress), Some(daemon)) = (progress.upgrade(), daemon.upgrade())
+                    else {
+                        break;
+                    };
+                    let next = progress.flush_due(std::time::Instant::now(), |value| {
+                        daemon.broadcast(Event::ToolProgress {
+                            invocation_id: Some(progress.id.clone()),
+                            session_id: session_id.clone(),
+                            run_id: run_id.clone(),
+                            tool_name: tool_name.clone(),
+                            depth,
+                            fraction: value.fraction,
+                            label: value.label,
+                        });
+                    });
+                    let Some(next) = next else { break };
+                    deadline = next;
+                }
             });
         }
     }

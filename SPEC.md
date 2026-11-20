@@ -2248,8 +2248,9 @@ pattern (§4.4).
     state records the latest sanitized tuple independently of emission.
     `ToolProgress {invocation_id?, tool_name, depth, fraction, label}` is emitted
     at most once per 200 ms per execution, with no label-change or completion
-    exception; unchanged emitted tuples are suppressed. Only strict fractional
-    advancement counts as work for stall detection (§6.1).
+    exception. The daemon publishes the latest changed tuple when the interval
+    ends if the execution is still active. Unchanged tuples are suppressed.
+    Only strict fractional advancement counts as work for stall detection (§6.1).
     Tool start/progress/finish and pending/completed/stalled/activity events share
     one additive execution ID. Registry IDs are allocated before pending handoff
     and match the stored Invocation, even with a zero-second pending threshold.
