@@ -240,7 +240,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             .await
         }
     };
-    for bad in [".ssh/id_rsa", ".env", "../outside.txt"] {
+    for bad in [".ssh/id_rsa", ".env", ".env:4", "../outside.txt"] {
         let e = attach(bad).await.unwrap_err().to_string();
         assert!(
             e.contains("credential") || e.contains("outside"),
@@ -248,6 +248,21 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
         );
     }
     assert!(attach("notes.txt").await.is_ok());
+    for citation in ["notes.txt:42", "notes.txt:42:8"] {
+        let attached = attach(citation).await.unwrap();
+        assert_eq!(attached["name"], "notes.txt");
+        assert_eq!(attached["reference"], false);
+    }
+    assert!(attach("missing.txt:12")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("missing.txt:12"));
+    #[cfg(unix)]
+    for name in ["notes.txt:42", "notes:final"] {
+        std::fs::write(root.join(name), "literal filename").unwrap();
+        assert_eq!(attach(name).await.unwrap()["name"], name);
+    }
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
