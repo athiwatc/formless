@@ -25,10 +25,16 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls
-   to the user-configured provider endpoint, the user-enabled Relay, and
-   explicit user-run commands (e.g. `formless update check`). No automatic
-   update checker, no phone-home.
+5. **Local-first, zero telemetry.** Network activity can include requests to
+   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
+   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
+   Naming and auto-download are enabled by default. When both are enabled
+   in a build with embedded naming, an eligible Session can trigger a
+   download of its missing configured catalogue model and tokenizer from
+   Hugging Face. `naming.auto_download = false` disables
+   automatic naming downloads; `naming.enabled = false` disables automatic
+   naming. These settings do not block explicit `formless naming pull`.
+   There is no automatic update checker.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
