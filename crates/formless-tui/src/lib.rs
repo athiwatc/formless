@@ -152,6 +152,15 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
+fn format_live_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 3600 {
+        format_elapsed(d)
+    } else {
+        format!("{}h{:02}m{:02}s", s / 3600, s % 3600 / 60, s % 60)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum View {
     Chat,
@@ -5370,7 +5379,7 @@ impl App {
                 "{} {}… ({})",
                 self.spinner(),
                 i18n::tr_str(&a.label),
-                format_elapsed(a.since.elapsed())
+                format_live_elapsed(a.since.elapsed())
             )
         })
     }
@@ -16118,7 +16127,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             };
             let elapsed = match call.elapsed_ms {
                 Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
-                None => format_elapsed(call.started.elapsed()),
+                None => format_live_elapsed(call.started.elapsed()),
             };
             let mut spans = vec![Span::styled(
                 format!(
@@ -21375,6 +21384,35 @@ mod tests {
         assert!(!app.running());
         assert!(app.activity_text().is_none());
         assert!(app.thinking.is_empty(), "thinking is ephemeral per Run");
+    }
+
+    #[test]
+    fn elapsed_rolls_minutes_into_hours() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m00s"),
+            (65, "1m05s"),
+            (3599, "59m59s"),
+            (3600, "1h00m00s"),
+            (3601, "1h00m01s"),
+            (3661, "1h01m01s"),
+            (5400, "1h30m00s"),
+            (86399, "23h59m59s"),
+            (86400, "24h00m00s"),
+            (3_600_000, "1000h00m00s"),
+        ] {
+            assert_eq!(format_live_elapsed(Duration::from_secs(seconds)), expected);
+        }
+        assert_eq!(
+            format_live_elapsed(Duration::from_millis(3_599_999)),
+            "59m59s"
+        );
+        assert_eq!(
+            format_live_elapsed(Duration::from_millis(3_600_999)),
+            "1h00m00s"
+        );
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "60m00s");
     }
 
     #[test]

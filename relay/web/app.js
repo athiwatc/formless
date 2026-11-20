@@ -369,6 +369,10 @@
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
+    if (s >= 3600) {
+      const pad = { minimumIntegerDigits: 2, useGrouping: false };
+      return uiFormat(Math.floor(s / 3600)) + "h" + uiFormat(Math.floor(s % 3600 / 60), pad) + "m" + uiFormat(s % 60, pad) + "s";
+    }
     return s < 60 ? uiFormat(s) + "s" : uiFormat(Math.floor(s / 60)) + "m" + uiFormat(s % 60, { minimumIntegerDigits: 2, useGrouping: false }) + "s";
   }
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
