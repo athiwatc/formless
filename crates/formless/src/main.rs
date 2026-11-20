@@ -1442,7 +1442,7 @@ enum ApprovalsAction {
         #[arg(long)]
         forget: Option<String>,
         /// Forget every stored permanent denial
-        #[arg(long)]
+        #[arg(long, conflicts_with = "forget")]
         all: bool,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -1493,10 +1493,14 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
         ApprovalsAction::Denials { forget, all, json } => {
             if forget.is_some() || all {
                 let r = request_once(paths, Request::ForgetDenial { capability: forget })?;
-                println!(
-                    "forgot {} denial(s); the next use asks again",
-                    r["forgotten"]
-                );
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                } else {
+                    println!(
+                        "forgot {} denial(s); the next use asks again",
+                        r["forgotten"]
+                    );
+                }
                 return Ok(());
             }
             let list: Vec<formless_protocol::DenialInfo> =
