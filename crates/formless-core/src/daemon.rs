@@ -3152,7 +3152,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3195,17 +3195,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -7514,8 +7504,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));

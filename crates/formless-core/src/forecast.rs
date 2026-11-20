@@ -222,13 +222,10 @@ pub(crate) fn estimate_store_with_window(
             copy.edit_message(session, edit, &input.draft)?
                 .context("user message not found")?;
         } else if input.retry {
-            let user = copy
-                .list_messages(session)?
-                .into_iter()
-                .rev()
-                .find(|m| m.role == "user")
+            let (id, _, content) = copy
+                .last_user_message(session)?
                 .context("nothing to retry")?;
-            copy.edit_message(session, &user.id, &user.content)?
+            copy.edit_message(session, &id, &content)?
                 .context("user message not found")?;
         } else {
             let (id, status) = copy
