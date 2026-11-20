@@ -3,7 +3,7 @@
 use formless_core::{Config, Paths, Store};
 use std::{
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -19,26 +19,37 @@ struct Fixture {
     paths: Paths,
     provider: std::net::TcpListener,
 }
+
+fn create_fixture_root(parent: &Path, nonce: u128) -> PathBuf {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+
+    // Parallel fixtures can observe the same clock tick. Claim the directory
+    // exclusively so the daemon and its database belong to one fixture.
+    for attempt in 0..100 {
+        let root = parent.join(format!("f635-{}-{nonce:x}-{attempt}", std::process::id()));
+        match builder.create(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create private fixture directory: {error}"),
+        }
+    }
+    panic!("could not reserve a private fixture directory");
+}
+
 impl Fixture {
     fn new() -> Self {
         #[cfg(unix)]
         let temp = PathBuf::from("/tmp");
         #[cfg(not(unix))]
         let temp = std::env::temp_dir();
-        let root = temp.join(format!(
-            "f635-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = create_fixture_root(&temp, nonce);
         let paths = Paths {
             data_dir: root.join("d"),
             config_dir: root.join("c"),
@@ -161,6 +172,47 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+#[test]
+fn fixture_roots_with_the_same_timestamp_are_distinct() {
+    struct TestRoot(PathBuf);
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Test allocation directly without constructing the socket-bound fixture.
+    let parent = TestRoot(create_fixture_root(&std::env::temp_dir(), 0));
+    let start = std::sync::Barrier::new(2);
+    let allocate = || {
+        start.wait();
+        create_fixture_root(&parent.0, 0)
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(allocate);
+        let second = allocate();
+        (first.join().unwrap(), second)
+    });
+    assert_ne!(first, second);
+
+    let marker = first.join("owner");
+    std::fs::write(&marker, "first").unwrap();
+    let third = create_fixture_root(&parent.0, 0);
+    assert_ne!(third, first);
+    assert_ne!(third, second);
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "first");
+    assert!(!second.join("owner").exists());
+    assert!(!third.join("owner").exists());
+
+    #[cfg(unix)]
+    for directory in [&first, &second, &third] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(directory).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+}
+
 fn finish(child: Child) -> Output {
     let mut child = Owned(child);
     let mut stdout = child.0.stdout.take().unwrap();
