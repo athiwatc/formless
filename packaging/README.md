@@ -17,9 +17,8 @@ platform app-dirs (SPEC §9.4).
      (`scripts/release-notes.sh`);
    - builds macOS (arm64/x86_64) and Windows (x86_64) archives with
      SHA-256 files;
-   - builds the Linux archive, `.deb` and `.rpm` (`cargo-deb`,
-     `cargo-generate-rpm`, metadata in `crates/formless/Cargo.toml`) on
-     Debian bullseye, so they need **glibc 2.31 or newer** (Debian 11+,
+   - builds x86_64 and ARM64 Linux archives and x86_64 `.deb` and `.rpm`
+     packages on Debian bullseye. These need **glibc 2.31 or newer** (Debian 11+,
      Ubuntu 20.04+, RHEL/Rocky 9+); the packages record the shared
      libraries the binary links (libc, libdbus) and ship the license. The RPM
      output directory is created before `cargo generate-rpm --output`: the tool
@@ -149,7 +148,7 @@ Without a secret, that step is skipped and the release still completes.
 
 - macOS/Linux: `scripts/install.sh` (downloads the latest release and
   verifies its checksum, or builds from source with
-  `FORMLESS_FROM_SOURCE=1`).
+  `FORMLESS_FROM_SOURCE=1`). Linux prebuilt archives support x86_64 and ARM64.
 - Homebrew: `brew install athiwatc/tap/formless` (once the tap exists).
 - Winget: `winget install athiwatc.formless` (once submitted).
 - Windows manual ZIP: [verify and extract the matching release asset](../docs/windows-install.md); the PATH entry is the nested directory containing `formless.exe`.

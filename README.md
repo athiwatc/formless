@@ -247,7 +247,7 @@ cargo build --release          # binary at ./target/release/formless
 
 `cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`.
 
-**Linux packages.** Each release has a `.deb` (`sudo apt install ./formless_<version>_amd64.deb`) and an `.rpm` (`sudo dnf install ./formless-<version>.x86_64.rpm`); Arch users can install `formless-bin` from the AUR once it is published.
+**Linux packages.** The installer supports checksum-verified x86_64 and ARM64 archives. Each release also has a `.deb` (`sudo apt install ./formless_<version>_amd64.deb`) and an `.rpm` (`sudo dnf install ./formless-<version>.x86_64.rpm`); Arch users can install `formless-bin` from the AUR once it is published.
 
 **Docker.** `ghcr.io/athiwatc/formless` runs the daemon headless on a server, reachable through the relay; volumes, the API key as a secret and profiles are in [docs/docker.md](docs/docker.md).
 
@@ -1300,7 +1300,7 @@ formless/
 ├── relay/               Cloudflare Worker + web frontend for browser access
 ├── packaging/           release notes, Homebrew formula, winget templates
 ├── scripts/install.sh   prebuilt-binary installer (or FORMLESS_FROM_SOURCE=1)
-└── .github/workflows/   release.yml — macOS arm64/x86_64, Linux x86_64, Windows x86_64
+└── .github/workflows/   release.yml — macOS and Linux arm64/x86_64, Windows x86_64
 ```
 
 ---
