@@ -6755,6 +6755,10 @@ are addressed separately (#889).
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
 an active Run query exits 0, and cancel exits 0 when its request succeeds.
+The human Show report displays the stored timestamp span, recorded cache and
+reasoning token totals when available, and readable spend estimates. The
+timestamp span can include time outside active execution. `--json` retains
+the default Run lookup response.
 Existing `runs --limit N --json` remains a list (default limit 20).
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,

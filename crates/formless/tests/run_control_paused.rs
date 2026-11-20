@@ -196,7 +196,10 @@ fn serve_peer(
                     assert_eq!(id, session.id);
                     snapshot.clone()
                 }
-                Request::GetRun { run_id } => {
+                Request::GetRun {
+                    run_id,
+                    include_token_details: false,
+                } => {
                     assert_eq!(run_id, "paused-970");
                     snapshot["latest_run"].clone()
                 }

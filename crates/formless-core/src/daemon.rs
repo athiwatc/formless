@@ -4239,9 +4239,14 @@ impl Daemon {
                 });
                 Ok(json!({"retrying": retrying}))
             }
-            Request::GetRun { run_id } => {
+            Request::GetRun {
+                run_id,
+                include_token_details,
+            } => {
                 let mut run = self
-                    .with_reader(|st| st.inspect_run(&run_id))?
+                    .with_reader(|st| {
+                        st.inspect_run_with_token_details(&run_id, include_token_details)
+                    })?
                     .context(RequestFailure::not_found("Run not found"))?;
                 if let Ok(cfg) = Config::load(&self.paths) {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {

@@ -499,7 +499,10 @@ fn follow_resynchronizes_lost_finish_without_switching_to_replacement_run() {
                     json!({})
                 }
                 Request::ListSessions => json!([session]),
-                Request::GetRun { run_id } => {
+                Request::GetRun {
+                    run_id,
+                    include_token_details: false,
+                } => {
                     assert_eq!(run_id, "target633");
                     seen_exact = true;
                     json!({"run_id":"target633","status":"completed","end_message_seq":last.seq})
@@ -918,7 +921,10 @@ fn finished_event_with_failed_status_persistence_exits_with_diagnostic() {
                 json!({"messages":[],"pending_events":[],"latest_run":{"run_id":"status633","status":"running"}}),
             )
         }
-        Request::GetRun { run_id } => {
+        Request::GetRun {
+            run_id,
+            include_token_details: false,
+        } => {
             assert_eq!(run_id, "status633");
             (vec![], json!({"run_id":"status633","status":"running"}))
         }
@@ -1062,7 +1068,10 @@ fn new_user_message_before_replacement_run_started_stays_out_of_finished_target(
                 )
             }
         }
-        Request::GetRun { run_id } => {
+        Request::GetRun {
+            run_id,
+            include_token_details: false,
+        } => {
             assert_eq!(run_id, "target633");
             (
                 vec![],

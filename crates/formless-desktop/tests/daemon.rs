@@ -620,6 +620,7 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     let raw = daemon
         .handle(Request::GetRun {
             run_id: target.run_id.clone(),
+            include_token_details: false,
         })
         .await
         .unwrap();
@@ -641,7 +642,8 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     assert_eq!(
         daemon
             .handle(Request::GetRun {
-                run_id: target.run_id.clone()
+                run_id: target.run_id.clone(),
+                include_token_details: false,
             })
             .await
             .unwrap(),

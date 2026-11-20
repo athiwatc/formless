@@ -3300,6 +3300,14 @@ impl Store {
 
     /// Resolve literal prefixes, preferring an exact identity.
     pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
+        self.inspect_run_with_token_details(query, false)
+    }
+
+    pub(crate) fn inspect_run_with_token_details(
+        &self,
+        query: &str,
+        include_token_details: bool,
+    ) -> Result<Option<serde_json::Value>> {
         if query.is_empty() {
             let any_run: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM runs WHERE id IS NOT NULL)",
@@ -3310,7 +3318,7 @@ impl Store {
             return Ok(None);
         }
         self.read_transaction(|st| {
-            if let Some(exact) = st.inspect_exact_run(query)? {
+            if let Some(exact) = st.inspect_exact_run(query, include_token_details)? {
                 return Ok(Some(exact));
             }
             let encoding: String = st.ps("PRAGMA encoding")?.query_row([], |row| row.get(0))?;
@@ -3331,18 +3339,39 @@ impl Store {
             };
             let id: String = first.get(0)?;
             anyhow::ensure!(ids.next()?.is_none(), "ambiguous Run id");
-            st.inspect_exact_run(&id)
+            st.inspect_exact_run(&id, include_token_details)
         })
     }
 
-    fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+    fn inspect_exact_run(
+        &self,
+        id: &str,
+        include_token_details: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut run = self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
             "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
             "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-        }))).optional().map_err(Into::into)
+        }))).optional()?;
+        if let Some(run) = run.as_mut().filter(|_| include_token_details) {
+            // Use the resolved ID in the same snapshot as the Run lookup.
+            // SUM stays NULL when no usage rows were recorded.
+            run["token_details"] = self
+                .ps(
+                    "SELECT SUM(cached_tokens), SUM(cache_write_tokens), SUM(reasoning_tokens)
+                 FROM run_usage WHERE run_id=?1",
+                )?
+                .query_row(params![id], |row| {
+                    Ok(json!({
+                        "cached_tokens": row.get::<_, Option<i64>>(0)?,
+                        "cache_write_tokens": row.get::<_, Option<i64>>(1)?,
+                        "reasoning_tokens": row.get::<_, Option<i64>>(2)?,
+                    }))
+                })?;
+        }
+        Ok(run)
     }
 
     pub fn run_metrics_for(

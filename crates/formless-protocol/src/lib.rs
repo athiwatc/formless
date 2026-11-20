@@ -2368,6 +2368,9 @@ pub enum Request {
     /// Inspect a stored Run (full id or unambiguous prefix).
     GetRun {
         run_id: String,
+        /// Include details from the Run's recorded token usage when available.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_token_details: bool,
     },
     /// Interrupt only the matching active Run, never a replacement.
     CancelRunId {
@@ -3883,6 +3886,40 @@ mod tests {
         assert!(matches!(newer.request, Request::Ping));
         let round = serde_json::to_string(&newer).unwrap();
         assert!(serde_json::from_str::<RequestEnvelope>(&round).is_ok());
+    }
+
+    #[test]
+    fn get_run_token_details_are_a_backward_compatible_opt_in() {
+        let original = r#"{"type":"get_run","run_id":"run-1"}"#;
+        let request: Request = serde_json::from_str(original).unwrap();
+        assert!(matches!(
+            request,
+            Request::GetRun {
+                include_token_details: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&request).unwrap(), original);
+
+        let request = Request::GetRun {
+            run_id: "run-1".into(),
+            include_token_details: true,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_str(&wire).unwrap(),
+            Request::GetRun {
+                include_token_details: true,
+                ..
+            }
+        ));
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyRequest {
+            GetRun { run_id: String },
+        }
+        let LegacyRequest::GetRun { run_id } = serde_json::from_str(&wire).unwrap();
+        assert_eq!(run_id, "run-1");
     }
 
     #[test]

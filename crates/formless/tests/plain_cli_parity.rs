@@ -291,7 +291,16 @@ impl Fixture {
                             }
                         }
                         Request::Subscribe { .. } => json!({"conn":1}),
-                        Request::GetRun { run_id } => inspected_run(run_id),
+                        Request::GetRun {
+                            run_id,
+                            include_token_details,
+                        } => {
+                            let mut run = inspected_run(run_id);
+                            if *include_token_details && run_id == "paused" {
+                                run["token_details"] = json!({"cached_tokens":31,"cache_write_tokens":0,"reasoning_tokens":7});
+                            }
+                            run
+                        }
                         Request::CancelRunId { run_id } => cancellation_reply(run_id),
                         Request::UsageByDay { .. } => grouped_usage(),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
@@ -1970,7 +1979,9 @@ fn shipped_memory_used_preserves_exact_selectors_current_notes_and_qualified_emp
 fn inspected_run(status: &str) -> Value {
     let mut value = json!({"run_id":"full-run-日本語-id","session_id":"session-ไทย","status":status,"error":if status=="failed" {Some("failure\n\u{1b}[31mไทย")} else {None},"created_at":"stored-created","updated_at":"stored-updated","start_message_seq":0,"end_message_seq":null,"steps":2,"tool_calls":3,"prompt_tokens":0,"completion_tokens":0,"future":{"retained":true}});
     if status == "paused" {
-        value["spend"] = json!({"known_usd":0.25,"total_usd":null,"usage_complete":false,"spend_complete":false,"unpriced":["モデル"]});
+        value["created_at"] = json!("2026-11-20T08:00:00+07:00");
+        value["updated_at"] = json!("2026-11-20T02:02:05Z");
+        value["spend"] = json!({"known_usd":0.2500123,"total_usd":null,"usage_complete":false,"spend_complete":false,"unpriced":["モデル","local/foo\u{202e}"]});
     }
     value
 }
@@ -2021,15 +2032,27 @@ fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete
                     assert!(text.contains("failure\\u{a}\\u{1b}[31mไทย"));
                 }
                 if status == "paused" {
-                    assert!(
-                        text.contains("Known USD subtotal: 0.25")
-                            && text.contains("Total USD: -")
-                            && text.contains("Spend complete: false")
-                    );
+                    for expected in [
+                        "Duration (stored timestamp span): 1h2m5s",
+                        "Recorded cached tokens: 31",
+                        "Recorded cache write tokens: 0",
+                        "Recorded reasoning tokens: 7",
+                        "Known USD subtotal: $0.2500",
+                        "Total USD: -",
+                        "Spend complete: no",
+                        "Unpriced models: モデル, local/foo\\u{202e}",
+                    ] {
+                        assert!(text.contains(expected), "{text}");
+                    }
+                    assert!(!text.contains('\u{202e}'));
+                } else {
+                    // Old daemon replies can omit the token details despite the opt-in.
+                    assert!(text.contains("Recorded cached tokens: not reported"));
+                    assert!(text.contains("Duration (stored timestamp span): not reported"));
                 }
             }
             assert!(
-                matches!(&fixture.requests.lock().unwrap()[..],[Request::Subscribe{..},Request::GetRun{run_id}] if run_id==status)
+                matches!(&fixture.requests.lock().unwrap()[..], [Request::Subscribe { .. }, Request::GetRun { run_id, include_token_details }] if run_id == status && *include_token_details == (mode == 0))
             );
         }
     }

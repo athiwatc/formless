@@ -1684,6 +1684,7 @@ impl Engine {
                     self.request(
                         Request::GetRun {
                             run_id: target.run_id.clone(),
+                            include_token_details: false,
                         },
                         Pending::RunInspection { operation, target },
                     );
@@ -4397,7 +4398,10 @@ mod tests {
                             stopped = true;
                             json!({"interrupted":true})
                         }
-                        Request::GetRun { run_id } if reconnect => {
+                        Request::GetRun {
+                            run_id,
+                            include_token_details: false,
+                        } if reconnect => {
                             inspected = true;
                             crate::run_inspection::test_value(&crate::run_inspection::Target {
                                 run_id,
@@ -4470,7 +4474,9 @@ mod tests {
         assert!(engine.updates.iter().any(|update|matches!(update,Update::RunInspection{operation,result:Err(_),..} if *operation==operations[2])));
         let first = engine.outgoing.pop_front().unwrap();
         let second = engine.outgoing.pop_front().unwrap();
-        assert!(matches!(&first.request,Request::GetRun{run_id} if run_id=="run-a"));
+        assert!(
+            matches!(&first.request,Request::GetRun{run_id,include_token_details:false} if run_id=="run-a")
+        );
         engine.select(Some("unrelated".into()), 99);
         respond(&mut engine, second.id, test_value(&target));
         assert!(engine.updates.iter().any(|update|matches!(update,Update::RunInspection{connection:0,operation,target:actual,result:Ok(_)} if *operation==operations[1]&&actual==&target)));
@@ -5158,7 +5164,10 @@ mod tests {
                             }
                             json!({"subscribed":true})
                         }
-                        Request::GetRun { run_id } if reconnect => {
+                        Request::GetRun {
+                            run_id,
+                            include_token_details: false,
+                        } if reconnect => {
                             assert_eq!(run_id, "run-a");
                             crate::run_inspection::test_value(&crate::run_inspection::Target {
                                 run_id,

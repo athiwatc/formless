@@ -166,7 +166,13 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
     let running = matches!(&action, RunsAction::Running { .. });
     let (value, json) = match action {
         RunsAction::Running { json } => (conn.request(Request::ListInvocations)?, json),
-        RunsAction::Show { id, json } => (conn.request(Request::GetRun { run_id: id })?, json),
+        RunsAction::Show { id, json } => (
+            conn.request(Request::GetRun {
+                run_id: id,
+                include_token_details: !(json || outer_json),
+            })?,
+            json,
+        ),
         RunsAction::Cancel { id, json } => {
             (conn.request(Request::CancelRunId { run_id: id })?, json)
         }
@@ -583,6 +589,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
                 if let Some(target) = run["run_id"].as_str() {
                     let exact = conn.request(Request::GetRun {
                         run_id: target.into(),
+                        include_token_details: false,
                     })?;
                     if exact["status"].as_str().and_then(terminal).is_some() {
                         // MessageAppended has no Run id. A new user message
@@ -610,6 +617,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             if run.is_null() {
                 run = conn.request(Request::GetRun {
                     run_id: run_id.clone(),
+                    include_token_details: false,
                 })?;
             }
         }
@@ -619,6 +627,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
         if ending {
             run = conn.request(Request::GetRun {
                 run_id: run["run_id"].as_str().unwrap().into(),
+                include_token_details: false,
             })?;
             anyhow::ensure!(run["status"].as_str().and_then(terminal).is_some(),
                 "daemon reported that the Run ended but its stored status is still nonterminal; cannot confirm the durable outcome");
@@ -627,6 +636,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             if let Some(run_id) = run["run_id"].as_str() {
                 run = conn.request(Request::GetRun {
                     run_id: run_id.into(),
+                    include_token_details: false,
                 })?;
             }
             let snap = conn.request(Request::GetSession {

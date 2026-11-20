@@ -100,3 +100,78 @@ fn foreign_database_encoding_keeps_literal_run_lookup() {
     drop(store);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn opt_in_token_details_follow_the_exact_resolved_run_and_preserve_missing_data() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    for id in ["run-a", "run-ab-long", "run-b"] {
+        store.conn.execute(
+            "INSERT INTO runs(id,session_id,status,created_at,updated_at) VALUES(?1,?2,'running','','')",
+            params![id, session.id],
+        ).unwrap();
+    }
+    for (id, cached, cache_write, reasoning) in [
+        ("run-a", 5, 0, 1),
+        ("run-a", 2, 0, 3),
+        ("run-ab-long", 90, 90, 90),
+    ] {
+        store
+            .record_usage(
+                &session.id,
+                id,
+                "fixture",
+                &crate::provider::Usage {
+                    cached_tokens: cached,
+                    cache_write_tokens: cache_write,
+                    reasoning_tokens: reasoning,
+                    reported: 3,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    let original = store.inspect_run("run-a").unwrap().unwrap();
+    assert!(original.get("token_details").is_none());
+    let mut detailed = store
+        .inspect_run_with_token_details("run-a", true)
+        .unwrap()
+        .unwrap();
+    let details = detailed
+        .as_object_mut()
+        .unwrap()
+        .remove("token_details")
+        .unwrap();
+    assert_eq!(
+        details,
+        json!({"cached_tokens":7,"cache_write_tokens":0,"reasoning_tokens":4})
+    );
+    assert_eq!(detailed, original);
+    let prefix = store
+        .inspect_run_with_token_details("run-ab", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prefix["run_id"], "run-ab-long");
+    assert_eq!(
+        prefix["token_details"],
+        json!({"cached_tokens":90,"cache_write_tokens":90,"reasoning_tokens":90})
+    );
+    assert!(store
+        .inspect_run_with_token_details("run-", true)
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous Run id"));
+    assert!(store
+        .inspect_run_with_token_details("missing", true)
+        .unwrap()
+        .is_none());
+    let missing_usage = store
+        .inspect_run_with_token_details("run-b", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        missing_usage["token_details"],
+        json!({"cached_tokens":null,"cache_write_tokens":null,"reasoning_tokens":null})
+    );
+}

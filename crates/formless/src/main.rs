@@ -4999,6 +4999,7 @@ fn run_headless(
                     &paths,
                     Request::GetRun {
                         run_id: run_id.clone(),
+                        include_token_details: false,
                     },
                 )
                 .ok()
