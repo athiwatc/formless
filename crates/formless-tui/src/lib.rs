@@ -548,6 +548,15 @@ enum Click {
     Call(String),
 }
 
+/// Pasted search queries stay on one line without joining separate words.
+fn single_line_query_paste(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 /// The Ctrl+F find bar: the query, the current match and, from the last
 /// draw, the wrapped row of every matching line.
 #[derive(Default)]
@@ -11579,6 +11588,20 @@ impl App {
 
     /// A bracketed paste: one block, wherever text is being typed.
     fn paste(&mut self, text: &str) {
+        // These full-screen views return before drawing the ordinary overlays.
+        if let Some(wizard) = &self.wizard {
+            if !wizard.confirm_key_change
+                && matches!(
+                    wizard.step,
+                    WizardStep::BaseUrl | WizardStep::ApiKey | WizardStep::PickModel
+                )
+            {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.wizard_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+            }
+            return;
+        }
         if self.hunk_review_is_visible() {
             if !self.hunk_review.busy {
                 if let Some(comment) = &mut self.hunk_review.comment {
@@ -11587,13 +11610,13 @@ impl App {
             }
             return;
         }
-        if self.wizard.is_some() || self.model_overlay.is_some() {
-            for c in text.chars().filter(|c| !c.is_control()) {
-                self.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-            }
+        if self.external_edit.awaiting_confirmation() {
             return;
         }
         if let Some(ed) = &mut self.editor {
+            if ed.confirm_exit || self.editor_review.is_some() || self.vim_help {
+                return;
+            }
             self.editor_generation = self.editor_generation.wrapping_add(1);
             if ed.original.is_none() {
                 ed.original = Some(ed.text());
@@ -11604,27 +11627,88 @@ impl App {
                 ed.apply_modal_line(line);
                 return;
             }
-            if ed.original.is_none() {
-                ed.original = Some(ed.text());
-            }
             let mut line = ed.take_modal_line();
             line.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
             ed.apply_modal_line(line);
             return;
         }
-        if let Some(f) = &mut self.settings_form {
-            f.fields[f.idx].input.paste(text.trim());
+        // Neither a pager nor a confirmation should interpret pasted text
+        // as typed commands, or let it reach a covered surface.
+        if self.pager.is_some() {
             return;
         }
-        if let Some((_, edit)) = &mut self.settings_edit {
-            edit.paste(text.trim());
+        if let Some((query, selected)) = &mut self.switcher {
+            query.push_str(&single_line_query_paste(text));
+            *selected = 0;
+            return;
+        }
+        if self.rollback_pick.is_some() || self.forecast.modal.is_some() || self.quit_confirm {
+            return;
+        }
+        let approval_open = !self.approvals.is_empty() || !self.promotions.is_empty();
+        if approval_open && !self.input_focus {
+            return;
+        }
+        // An approval covers the model picker, even when the composer has focus.
+        if let Some(model) = self.model_overlay.as_mut().filter(|_| !approval_open) {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                model.picker.type_char(c);
+            }
+            return;
+        }
+        if self.view == View::Settings {
+            if let Some(f) = &mut self.settings_form {
+                f.fields[f.idx].input.paste(text.trim());
+            } else if let Some((_, edit)) = &mut self.settings_edit {
+                edit.paste(text.trim());
+            }
             return;
         }
         if self.view == View::Chat {
-            // A file dragged into the terminal arrives as its path.
-            if let Some(path) = clipimg::dropped_file(text) {
-                self.attach_path_file(&path);
+            if let Some(find) = &mut self.find {
+                find.query.push_str(&single_line_query_paste(text));
+                find.current = usize::MAX;
+                find.scroll = true;
                 return;
+            }
+            if self.input.searching().is_some() {
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
+                self.input
+                    .search_paste(&single_line_query_paste(text), &history);
+                return;
+            }
+        }
+        let filter = match self.view {
+            View::Sessions => Some((&mut self.session_filter, &mut self.session_idx)),
+            View::Tools => Some((&mut self.tool_filter, &mut self.tool_idx)),
+            View::Proposals => Some((&mut self.proposal_filter, &mut self.proposal_idx)),
+            _ => None,
+        };
+        if let Some((filter, selected)) = filter {
+            if filter.editing {
+                filter.query.push_str(&single_line_query_paste(text));
+                *selected = 0;
+            }
+            return;
+        }
+        if self.view == View::Chat {
+            // A dragged file arrives as a pasted path. Only the message
+            // composer uses that path as an attachment.
+            if self.bulk.is_none()
+                && self.renaming.is_none()
+                && self.instructing.is_none()
+                && !self.search_mode
+                && self.import_mode.is_none()
+                && self.editing_id.is_none()
+                && self.editing_queued.is_none()
+                && !self.editing_step
+                && self.current_question().is_none()
+            {
+                if let Some(path) = clipimg::dropped_file(text) {
+                    self.attach_path_file(&path);
+                    return;
+                }
             }
             if self.vim_mode {
                 self.vim_input.paste(&mut self.input, text);
@@ -24560,6 +24644,328 @@ mod tests {
         let text_width = input_text_width(width, "› ");
         app.input.set(&format!("{}界", "x".repeat(text_width - 2)));
         assert_eq!(input_height(&app, width), 4);
+    }
+
+    #[test]
+    fn paste_routes_to_find_and_switcher_without_editing_the_draft() {
+        let payload = "กิ中\r\nnext\rline\nlast\t\u{1b}";
+        let normalized = "กิ中 next line last";
+        let mut app = test_app();
+        app.input.set("private draft");
+        app.messages.push(msg("user", normalized));
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.paste(payload);
+        let find = app.find.as_ref().unwrap();
+        assert_eq!(find.query, normalized);
+        assert_eq!(find.current, usize::MAX);
+        assert!(find.scroll);
+        render(&mut app, 100, 24);
+        assert!(!app.find.as_ref().unwrap().rows.is_empty());
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(app.attachments.is_empty());
+        app.sessions = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "first",
+                "name": format!("prefix {normalized}"),
+                "created_at": "",
+                "updated_at": ""
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": "second",
+                "name": "prefix unrelated",
+                "created_at": "",
+                "updated_at": ""
+            }))
+            .unwrap(),
+        ];
+        for view in [View::Chat, View::Sessions] {
+            app.view = view;
+            app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            app.paste("prefix ");
+            app.switcher.as_mut().unwrap().1 = 1;
+            app.paste(payload);
+            let query = format!("prefix {normalized}");
+            assert_eq!(app.switcher, Some((query.clone(), 0)));
+            assert_eq!(app.switcher_matches(&query), vec![0]);
+            assert_eq!(app.find.as_ref().unwrap().query, normalized);
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn paste_routes_to_each_editing_list_filter_only() {
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            let mut app = test_app();
+            app.view = view;
+            app.input.set("private draft");
+            app.session_filter.editing = true;
+            app.tool_filter.editing = true;
+            app.proposal_filter.editing = true;
+            app.session_idx = 7;
+            app.tool_idx = 7;
+            app.proposal_idx = 7;
+            app.paste("ไทย\r\n中文");
+            let (query, selected) = match view {
+                View::Sessions => (&app.session_filter.query, app.session_idx),
+                View::Tools => (&app.tool_filter.query, app.tool_idx),
+                View::Proposals => (&app.proposal_filter.query, app.proposal_idx),
+                _ => unreachable!(),
+            };
+            assert_eq!(query, "ไทย 中文");
+            assert_eq!(selected, 0);
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.attachments.is_empty());
+            assert_eq!(
+                [&app.session_filter, &app.tool_filter, &app.proposal_filter]
+                    .iter()
+                    .filter(|filter| !filter.query.is_empty())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn paste_is_consumed_by_read_only_overlays_before_hidden_inputs() {
+        for overlay in ["pager", "quit", "rollback", "forecast", "approval"] {
+            let mut app = test_app();
+            app.input.set("private draft");
+            app.find = Some(FindBar::default());
+            match overlay {
+                "pager" => {
+                    app.pager = Some(code_pager("Read only", "text", app.color));
+                    app.switcher = Some(("hidden query".into(), 3));
+                }
+                "quit" => app.quit_confirm = true,
+                "rollback" => {
+                    app.rollback_pick = Some(RollbackPick {
+                        tool_id: "tool".into(),
+                        idx: 0,
+                        armed_version: None,
+                    });
+                }
+                "forecast" => {
+                    app.forecast.modal = Some((
+                        app.forecast_generation(),
+                        forecast_reply("preview", true),
+                        ForecastAction::Send { queued: false },
+                    ));
+                }
+                "approval" => app.on_event(reconnect_approval("fixture", "s1")),
+                _ => unreachable!(),
+            }
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            let file = app.paths.data_dir.join("paste-routing.txt");
+            std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+            std::fs::write(&file, "attachment fixture").unwrap();
+            let path = format!("'{}'", file.display());
+            assert!(clipimg::dropped_file(&path).is_some());
+            app.paste(&path);
+            app.paste("ynq");
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.find.as_ref().unwrap().query.is_empty());
+            assert!(app.attachments.is_empty());
+            assert!(sent.try_recv().is_err());
+            assert!(!app.should_quit);
+            match overlay {
+                "pager" => {
+                    assert!(app.pager.is_some());
+                    assert_eq!(app.switcher, Some(("hidden query".into(), 3)));
+                }
+                "quit" => assert!(app.quit_confirm),
+                "rollback" => assert!(app.rollback_pick.is_some()),
+                "forecast" => assert!(app.forecast.modal.is_some()),
+                "approval" => assert_eq!(app.approvals.len(), 1),
+                _ => unreachable!(),
+            }
+            std::fs::remove_file(file).unwrap();
+        }
+        let mut app = test_app();
+        app.input.set("visible ");
+        app.paste("ordinary text");
+        assert_eq!(app.input.expanded(), "visible ordinary text");
+    }
+
+    #[test]
+    fn paste_respects_settings_visibility_and_history_search() {
+        let mut app = test_app();
+        app.input.set("draft");
+        let mut form = settings::Form::provider(None);
+        form.fields[0].input.set("provider");
+        app.settings_form = Some(form);
+        app.view = View::Chat;
+        app.paste(" edit");
+        assert_eq!(app.input.expanded(), "draft edit");
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().fields[0]
+                .input
+                .expanded(),
+            "provider"
+        );
+        app.view = View::Settings;
+        app.paste(" name");
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().fields[0]
+                .input
+                .expanded(),
+            "providername"
+        );
+        assert_eq!(app.input.expanded(), "draft edit");
+
+        app.view = View::Chat;
+        app.messages = vec![msg("user", "some ไทย 中 text")];
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.paste("ไทย\r\n中");
+        assert_eq!(app.input.searching(), Some(("ไทย 中", Some(0))));
+        assert_eq!(app.input.expanded(), "draft edit");
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn paste_treats_a_path_as_text_in_non_message_chat_prompts() {
+        let mut app = test_app();
+        let file = app.paths.data_dir.join("query-fixture.txt");
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        std::fs::write(&file, "search fixture").unwrap();
+        let path = format!("'{}'", file.display());
+        assert!(clipimg::dropped_file(&path).is_some());
+        app.search_mode = true;
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        app.search_mode = false;
+
+        app.input.clear();
+        app.editing_step = true;
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        app.editing_step = false;
+
+        app.input.clear();
+        app.on_event(Event::UserQuestion {
+            question_id: "question-fixture".into(),
+            session_id: "s1".into(),
+            question: "Which path?".into(),
+            options: vec![],
+            questions: vec![],
+        });
+        assert!(app.current_question().is_some());
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn paste_reaches_model_and_wizard_text_without_using_picker_shortcuts() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("draft");
+        app.model_overlay = Some(ModelOverlay {
+            picker: picker::ModelPicker::new(Vec::new()),
+            meta: serde_json::Value::Null,
+            effort_idx: 0,
+            default_only: false,
+        });
+        app.paste("literal\nmodel");
+        assert_eq!(
+            app.model_overlay.as_ref().unwrap().picker.query,
+            "literalmodel"
+        );
+
+        app.quit_confirm = true;
+        app.paste("hidden");
+        assert!(app.quit_confirm);
+        assert_eq!(
+            app.model_overlay.as_ref().unwrap().picker.query,
+            "literalmodel"
+        );
+        app.quit_confirm = false;
+        app.model_overlay = None;
+
+        let mut wizard = Wizard::new(&Config::default());
+        wizard.step = WizardStep::PickPreset;
+        app.wizard = Some(wizard);
+        app.paste("1");
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickPreset);
+        let wizard = app.wizard.as_mut().unwrap();
+        wizard.step = WizardStep::BaseUrl;
+        wizard.base_url.clear();
+        app.paste("synthetic\nendpoint");
+        assert_eq!(app.wizard.as_ref().unwrap().base_url, "syntheticendpoint");
+        assert_eq!(app.input.expanded(), "draft");
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_reaches_focused_composer_when_approval_covers_model_picker() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.model_overlay = Some(ModelOverlay {
+            picker: picker::ModelPicker::new(Vec::new()),
+            meta: serde_json::Value::Null,
+            effort_idx: 0,
+            default_only: false,
+        });
+        app.on_event(reconnect_approval("fixture", "s1"));
+        app.input.set("draft");
+        app.input_focus = true;
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("draft"));
+        app.paste(" y");
+        assert_eq!(app.input.expanded(), "draft y");
+        assert!(app.model_overlay.as_ref().unwrap().picker.query.is_empty());
+        assert_eq!(app.approvals.len(), 1);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_consumes_editor_review_and_confirmations_before_editing_code() {
+        let mut app = test_app();
+        app.input.set("draft");
+        app.editor = Some(EditorState {
+            viewport: Default::default(),
+            draft: None,
+            original: None,
+            confirm_exit: true,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "test-tool".into(),
+            name: "fixture".into(),
+            chars: "code".chars().collect(),
+            cursor: 4,
+            mode: EditMode::Code,
+        });
+        app.paste("ynq");
+        assert!(app.editor.as_ref().unwrap().confirm_exit);
+        app.editor.as_mut().unwrap().confirm_exit = false;
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff: "fixture review".into(),
+            verdict: "checked".into(),
+            ok: true,
+        });
+        app.paste("hidden");
+        assert!(app.editor_review.is_some());
+        app.editor_review = None;
+        app.vim_help = true;
+        app.paste("hidden");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "code");
+        assert_eq!(app.editor_generation, 0);
+        app.vim_help = false;
+        app.switcher = Some(("covered".into(), 2));
+        app.pager = Some(code_pager("Hidden pager", "text", app.color));
+        assert!(render(&mut app, 100, 24).contains("Edit fixture"));
+        app.paste(" edit\r\nline");
+        assert_eq!(app.switcher, Some(("covered".into(), 2)));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "code edit\nline");
+        assert_eq!(app.input.expanded(), "draft");
     }
 
     #[test]
