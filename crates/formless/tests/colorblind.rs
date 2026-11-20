@@ -401,6 +401,39 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
 }
 
 #[test]
+fn static_session_preview_marks_clipped_tool_output_while_json_keeps_it() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("preview fixture".into()))
+        .unwrap();
+    let prefix = "x".repeat(119);
+    let tool = format!("{prefix}👍🏽\r\nsecond tool line");
+    let assistant = "first answer line\nsecond answer line";
+    store.append_message(&session.id, "tool", &tool).unwrap();
+    store
+        .append_message(&session.id, "assistant", assistant)
+        .unwrap();
+    let _daemon = fixture.daemon();
+
+    let human = fixture.run(&["sessions", "show", &session.id], Some("1"));
+    assert!(human.status.success(), "{human:?}");
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text
+        .lines()
+        .any(|line| line == format!("  tool result: {prefix}…")));
+    assert!(!text.contains("second tool line"));
+    assert!(text.contains(assistant));
+
+    let json = fixture.run(&["sessions", "show", &session.id, "--json"], Some("1"));
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["messages"][0]["content"], tool);
+    assert_eq!(value["messages"][1]["content"], assistant);
+    fixture.no_provider_contact();
+}
+
+#[test]
 fn jobs_history_distinguishes_missing_empty_and_populated_jobs_in_both_formats() {
     let fixture = Fixture::new();
     let store = Store::open(&fixture.paths.db_file()).unwrap();
