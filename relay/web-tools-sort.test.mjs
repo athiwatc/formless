@@ -89,6 +89,7 @@ function fixture() {
     S: { tools, modules: [], toolSort: { key: 'name', reverse: false }, selectedTool: null },
     $: (id) => controls[id],
     uiFormat: (value) => String(value),
+    tr: text => text,
     rateCell: (rate) => rate == null ? DASH : String(rate),
     relTime: (ts) => String(ts || ''),
     bar: (rate) => 'bar:' + String(rate),
@@ -97,7 +98,7 @@ function fixture() {
   });
   vm.runInContext([
     constStatement('TOOL_COLS'),
-    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'toolsTable', 'visibleTools', 'renderTools'].map(fn),
+    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'recentCalls', 'toolRecent', 'toolsTable', 'visibleTools', 'renderTools'].map(fn),
   ].join('\n'), context);
   return { context, controls };
 }
@@ -401,4 +402,21 @@ test('row selection follows the rendered tool', () => {
   assert.deepEqual(picks, ['ecl', 'zebra']);
   assert.equal(row('alpha').className, 'selected');
   assert.deepEqual(idsOf(table), rows.map((tool) => tool.id));
+});
+
+
+test('Tools and Metrics rows show the same retained sample without changing lifetime success', () => {
+  for (const bars of [false, true]) {
+    const setup = fixture();
+    const table = new Node('table');
+    const tool = { ...tools[0], recent: 's'.repeat(20) + 'sfff'.repeat(5) };
+    setup.context.toolsTable(table, [tool], { bars, onselect: () => {} });
+    const cell = table.children[1].children[0].children[3];
+    assert.equal(cell.children[0], '0.5');
+    const recent = cell.children[1];
+    assert.equal(recent.attrs.role, 'img');
+    assert.match(recent.attrs['aria-label'], /Succeeded: 5; Failed: 15; Recent sample trend: down/);
+    assert.equal(recent.children[0].children.length, 20);
+    assert.equal(recent.children[1].textContent, '5/20 ✓ ↓');
+  }
 });
