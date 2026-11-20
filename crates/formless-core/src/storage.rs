@@ -106,6 +106,111 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+#[cfg(test)]
+#[test]
+fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = Capabilities::parse(&[]).unwrap();
+    let (tool, version) = store
+        .create_tool_version(
+            "usage_fixture",
+            "usage fixture",
+            "{}",
+            "{}",
+            "",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    let (unused, _) = store
+        .create_tool_version("unused_fixture", "", "{}", "{}", "", &caps, 64, "user")
+        .unwrap();
+    let running = store
+        .start_invocation(&tool.id, version, None, None, None, "{}")
+        .unwrap();
+    let older = store
+        .record_invocation(
+            &tool.id, version, None, None, None, "denied", "", "{}", "", "", 0, 20,
+        )
+        .unwrap();
+    let latest = "2026-01-02T03:04:05+00:00";
+    for (id, stamp) in [(&running, latest), (&older, "2026-01-01T03:04:05+00:00")] {
+        store
+            .conn
+            .execute(
+                "UPDATE invocations SET created_at=?2 WHERE id=?1",
+                params![id, stamp],
+            )
+            .unwrap();
+    }
+    let rows = store.list_tools(true).unwrap();
+    let used = rows.iter().find(|row| row.id == tool.id).unwrap();
+    assert_eq!(used.updated_at, tool.updated_at);
+    assert_eq!(used.invocations, 2);
+    assert_eq!(used.last_used_at.as_deref(), Some(latest));
+    assert_eq!(
+        store
+            .tool_last_used()
+            .unwrap()
+            .get(&tool.id)
+            .map(String::as_str),
+        Some(latest)
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.id == unused.id)
+            .unwrap()
+            .last_used_at,
+        None
+    );
+
+    let (revised, revised_version) = store
+        .create_tool_version(
+            "usage_fixture",
+            "updated usage fixture",
+            "{}",
+            "{}",
+            "function run() { return {}; }",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    assert_eq!(revised.id, tool.id);
+    assert!(revised_version > version);
+    assert_eq!(revised.last_used_at.as_deref(), Some(latest));
+    let rolled_back = store.rollback_tool(&tool.id, version).unwrap().unwrap();
+    assert_eq!(rolled_back.current_version, version);
+    assert_eq!(rolled_back.last_used_at.as_deref(), Some(latest));
+
+    store.set_needs_attention(&tool.id, true).unwrap();
+    let retired = store.set_tool_retired(&tool.id, true).unwrap().unwrap();
+    assert!(retired.retired && retired.needs_attention);
+    assert_eq!(retired.last_used_at.as_deref(), Some(latest));
+    assert_eq!(
+        store
+            .get_tool_current(&tool.id)
+            .unwrap()
+            .unwrap()
+            .0
+            .last_used_at
+            .as_deref(),
+        Some(latest)
+    );
+    store
+        .finish_invocation(&running, &tool.id, "success", "", "", "", 1, 0)
+        .unwrap();
+    let pruned = store
+        .list_tools(true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == tool.id)
+        .unwrap();
+    assert_eq!(pruned.invocations, 0);
+    assert_eq!(pruned.last_used_at, None);
+}
+
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
     (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
@@ -3812,7 +3917,7 @@ impl Store {
                 )
             })
             .unwrap_or_default();
-        let metrics = self.tool_metrics(&id, None)?;
+        let (metrics, last_used_at) = self.tool_metrics_with_last_use(&id, None)?;
         let mut recent: Vec<char> = {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT status FROM invocations WHERE tool_id=?1 AND status IN ('success','failure')
@@ -3842,6 +3947,7 @@ impl Store {
             needs_attention: needs_attention != 0,
             created_at,
             updated_at,
+            last_used_at,
             recent: recent.into_iter().collect(),
             author,
         }))
@@ -5330,10 +5436,24 @@ impl Store {
     }
 
     pub fn tool_metrics(&self, tool_id: &str, version: Option<i64>) -> Result<ToolMetricsInfo> {
-        let (total, success, failure, denied, cancelled, validation, retried): (i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(status='success'),0), COALESCE(SUM(status='failure'),0), COALESCE(SUM(status='denied'),0), COALESCE(SUM(status='cancelled'),0), COALESCE(SUM(tag='validation'),0), COALESCE(SUM(retried),0) FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
+        self.tool_metrics_with_last_use(tool_id, version)
+            .map(|(metrics, _)| metrics)
+    }
+
+    fn tool_metrics_with_last_use(
+        &self,
+        tool_id: &str,
+        version: Option<i64>,
+    ) -> Result<(ToolMetricsInfo, Option<String>)> {
+        // Reuse the existing per-Tool counts scan instead of making an extra
+        // query for every Tool in a list. Match tool_last_used's retained MAX.
+        let (total, success, failure, denied, cancelled, validation, retried, last_used_at) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(status='success'),0), COALESCE(SUM(status='failure'),0),
+                    COALESCE(SUM(status='denied'),0), COALESCE(SUM(status='cancelled'),0),
+                    COALESCE(SUM(tag='validation'),0), COALESCE(SUM(retried),0), MAX(created_at)
+             FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
             params![tool_id, version],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)?, r.get::<_, Option<String>>(7)?)),
         )?;
         // Cost per Success (§8.1 metric 3): everything spent, failures
         // included, over the successes it bought.
@@ -5373,7 +5493,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let denom = success + failure;
-        Ok(ToolMetricsInfo {
+        let metrics = ToolMetricsInfo {
             total,
             success,
             failure,
@@ -5397,7 +5517,8 @@ impl Store {
             tokens_per_success: per_success(all_tokens),
             model_tokens_per_call: model_used.then(|| model_tokens as f64 / total as f64),
             model_cost_per_call: (model_used && unpriced == 0).then(|| model_cost / total as f64),
-        })
+        };
+        Ok((metrics, last_used_at))
     }
 
     /// Remove one Capability spec from a Tool's grant (or the whole grant

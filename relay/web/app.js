@@ -4517,7 +4517,7 @@
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
       h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
-      h("td", { class: "muted" }, t.invocations ? relTime(t.updated_at) : "—"),
+      h("td", { class: "muted" }, t.last_used_at ? relTime(t.last_used_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
     table.append(body);
@@ -4543,10 +4543,20 @@
       name: (a, b) => a.name.localeCompare(b.name),
       version: (a, b) => a.current_version - b.current_version,
       rate: (a, b) => (b.success_rate ?? -1) - (a.success_rate ?? -1),
-      used: (a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""),
       calls: (a, b) => b.invocations - a.invocations,
     };
     const sort = S.toolSort || { key: $("tools-sort").value, reverse: false };
+    if (sort.key === "used") {
+      return rows.sort((a, b) => {
+        const left = a.last_used_at || "", right = b.last_used_at || "";
+        // Binary order matches the retained UTC timestamps in SQLite,
+        // including whole seconds next to fractional ones.
+        const order = left < right ? -1 : left > right ? 1 : 0;
+        return Number(!left) - Number(!right) ||
+          (sort.reverse ? order : -order) ||
+          a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+      });
+    }
     const cmp = by[sort.key];
     if (!cmp) return rows;
     rows.sort(cmp);

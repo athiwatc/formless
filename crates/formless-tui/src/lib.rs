@@ -17590,6 +17590,12 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                         ]),
                         Line::from(versions),
                         Line::from(vec![
+                            label("Last used"),
+                            Span::raw(d.tool.last_used_at.as_deref()
+                                .map(|ts| ui::relative_time(ts, now))
+                                .unwrap_or_else(|| "—".into())),
+                        ]),
+                        Line::from(vec![
                             label("uses"),
                             Span::raw(dependency_text(&d.uses, &d.modules)),
                             Span::styled("  · used by ", ui::dim(app.color)),
@@ -21991,6 +21997,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             },
@@ -22011,6 +22018,7 @@ mod tests {
                 needs_attention: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             },
@@ -23575,6 +23583,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -24324,6 +24333,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -25615,6 +25625,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -25794,6 +25805,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -26907,6 +26919,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: falling,
             author: "agent".into(),
         }];
@@ -26937,6 +26950,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -27258,6 +27272,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         }];
@@ -27417,6 +27432,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -27464,6 +27480,7 @@ mod tests {
             needs_attention: true,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: "sf".into(),
             author: "agent".into(),
         };
@@ -28816,6 +28833,29 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("forecast vs actual (f"), "{screen}");
     }
+    #[test]
+    fn tool_detail_shows_retained_use_or_a_dash_for_missing_history() {
+        let mut app = test_app();
+        let stamp = "2020-06-15T12:00:00+00:00";
+        let mut detail = description_fixture_detail();
+        detail.tool.updated_at = "2025-07-01T12:00:00+00:00".into();
+        detail.tool.last_used_at = Some(stamp.into());
+        app.tool_detail = Some(detail);
+        let last_use_line = |app: &App| {
+            tool_detail_lines(app)
+                .iter()
+                .map(ToString::to_string)
+                .find(|line| line.starts_with("Last used "))
+                .unwrap()
+        };
+        assert_eq!(
+            last_use_line(&app),
+            format!("Last used {}", ui::relative_time(stamp, chrono::Utc::now()))
+        );
+        app.tool_detail.as_mut().unwrap().tool.last_used_at = None;
+        assert_eq!(last_use_line(&app), "Last used —");
+    }
+
     pub(super) fn description_fixture_detail() -> ToolDetail {
         ToolDetail {
             description_review: formless_core::descriptions::screen("Plain inventory reader"),
@@ -28837,6 +28877,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "user".into(),
             },

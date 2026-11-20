@@ -4625,6 +4625,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   sort by that column on click or Enter; a second click reverses it. Each
   column's natural order is names A→Z and numbers or dates biggest first.
   The headers carry `aria-sort`, and the Sort menu follows.
+  Tool usage time is the start of the latest retained Invocation, regardless
+  of outcome. Web Tools and Metrics show that time as of the latest Tool
+  refresh, and the TUI shows it in Tool details. An absent time is unknown,
+  including when all call history was pruned or the daemon predates the field.
+  The last-used sort puts unknown times after known ones and breaks ties by
+  name and Tool ID.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset

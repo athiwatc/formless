@@ -23,12 +23,12 @@ function constStatement(name) {
 }
 
 const tools = [
-  { id: 'beta', name: 'ベータ', current_version: 2, invocations: 10, success_rate: 0.5, updated_at: '2024-01-02T00:00:00Z', tags: ['計測'], description: '測定器', capabilities: ['fs:read', '計測'] },
+  { id: 'beta', name: 'ベータ', current_version: 2, invocations: 10, success_rate: 0.5, updated_at: '2024-01-02T00:00:00Z', last_used_at: '2024-03-01T00:00:00.123+00:00', tags: ['計測'], description: '測定器', capabilities: ['fs:read', '計測'] },
   { id: 'ecl', name: 'éclair', current_version: 10, invocations: 3, success_rate: null, updated_at: '2024-03-01T00:00:00Z', tags: ['pastry'], description: 'dessert' },
-  { id: 'zebra', name: 'ゼブラ', current_version: 1, invocations: 10, success_rate: 0.95, updated_at: '2023-12-01T00:00:00Z', tags: ['計測'], description: 'しまうま', needs_attention: true },
-  { id: 'retired', name: '引退', current_version: 4, invocations: 1, success_rate: 0.2, updated_at: '2024-06-01T00:00:00Z', tags: ['旧'], description: '終了', retired: true },
-  { id: 'zero', name: 'fennel', current_version: 3, invocations: 0, success_rate: 0, updated_at: '2022-05-05T00:00:00Z', tags: ['herb'], description: 'zero successes' },
-  { id: 'alpha', name: 'alpha', current_version: 8, invocations: 7, success_rate: 0.8, updated_at: '2024-02-02T00:00:00Z', tags: ['latin'], description: 'first' },
+  { id: 'zebra', name: 'ゼブラ', current_version: 1, invocations: 10, success_rate: 0.95, updated_at: '2023-12-01T00:00:00Z', last_used_at: '2024-03-01T00:00:00+00:00', tags: ['計測'], description: 'しまうま', needs_attention: true },
+  { id: 'retired', name: '引退', current_version: 4, invocations: 1, success_rate: 0.2, updated_at: '2024-06-01T00:00:00Z', last_used_at: '2024-01-01T00:00:00+00:00', tags: ['旧'], description: '終了', retired: true },
+  { id: 'zero', name: 'fennel', current_version: 3, invocations: 0, success_rate: 0, updated_at: '2022-05-05T00:00:00Z', last_used_at: null, tags: ['herb'], description: 'zero successes' },
+  { id: 'alpha', name: 'alpha', current_version: 8, invocations: 7, success_rate: 0.8, updated_at: '2024-02-02T00:00:00Z', last_used_at: '2024-03-01T00:00:00+00:00', tags: ['latin'], description: 'first' },
 ];
 const byId = new Map(tools.map((tool) => [tool.id, tool]));
 const COLUMNS = [
@@ -41,12 +41,12 @@ const COLUMNS = [
 const VERSION_NATURAL = ['zebra', 'beta', 'zero', 'retired', 'alpha', 'ecl'];
 const CALLS_NATURAL = ['beta', 'zebra', 'alpha', 'ecl', 'retired', 'zero'];
 const RATE_NATURAL = ['zebra', 'alpha', 'beta', 'retired', 'zero', 'ecl'];
-const USED_NATURAL = ['retired', 'ecl', 'alpha', 'beta', 'zebra', 'zero'];
+const USED_NATURAL = ['beta', 'alpha', 'zebra', 'retired', 'ecl', 'zero'];
+const USED_REVERSE = ['retired', 'alpha', 'zebra', 'beta', 'ecl', 'zero'];
 const ORDER = {
   version: VERSION_NATURAL,
   calls: CALLS_NATURAL,
   rate: RATE_NATURAL,
-  used: USED_NATURAL,
 };
 
 class Node {
@@ -172,6 +172,7 @@ function idsByName(list, reverse) {
   return reverse ? ids.slice().reverse() : ids;
 }
 function expectedIds(key, reverse) {
+  if (key === 'used') return reverse ? USED_REVERSE : USED_NATURAL;
   const natural = key === 'name' ? idsByName(tools, false) : ORDER[key];
   return reverse ? natural.slice().reverse() : natural.slice();
 }
@@ -184,8 +185,8 @@ function proveOrders() {
   assert.deepEqual(CALLS_NATURAL.map((id) => byId.get(id).invocations), [10, 10, 7, 3, 1, 0]);
   assert.deepEqual(tools.filter((tool) => tool.invocations === 10).map((tool) => tool.id), ['beta', 'zebra']);
   assert.deepEqual(RATE_NATURAL.map((id) => byId.get(id).success_rate ?? -1), [0.95, 0.8, 0.5, 0.2, 0, -1]);
-  const stamps = USED_NATURAL.map((id) => byId.get(id).updated_at);
-  assert.deepEqual(stamps, stamps.slice().sort((a, b) => b.localeCompare(a)));
+  const stamps = USED_NATURAL.map((id) => byId.get(id).last_used_at).filter(Boolean);
+  assert.deepEqual(stamps, stamps.slice().sort().reverse());
   const collated = tools.map((tool) => tool.name).sort((a, b) => a.localeCompare(b));
   assert.notDeepEqual(collated, tools.map((tool) => tool.name).sort());
   assert.ok(collated.indexOf('alpha') < collated.indexOf('éclair') && collated.indexOf('éclair') < collated.indexOf('fennel'));
@@ -269,7 +270,7 @@ test('a header click sorts naturally and the next click on that header reverses'
     [3, 'rate', false, 'rate', RATE_NATURAL],
     [3, 'rate', true, 'rate', RATE_NATURAL.slice().reverse()],
     [4, 'used', false, 'used', USED_NATURAL],
-    [4, 'used', true, 'used', USED_NATURAL.slice().reverse()],
+    [4, 'used', true, 'used', USED_REVERSE],
   ];
   for (const [index, key, reverse, select, ids] of steps) {
     activate(table, index);
@@ -298,12 +299,12 @@ test('filters and non-ASCII fields keep production order in the rendered table',
   assert.deepEqual(version.table.children[1].children[0].children.map((cell) => cell.className), ['', '', 'num', 'num', 'muted', 'caps']);
   assert.deepEqual(version.table.children[1].children.map((row) => row.children.map((cell, index) => index === 0
     ? nameOf(row) : cell.textContent)), [
-    ['ゼブラ', 'v1', '10', '0.95', '2023-12-01T00:00:00Z', DASH],
-    ['ベータ', 'v2', '10', '0.5', '2024-01-02T00:00:00Z', 'fs:read, 計測'],
+    ['ゼブラ', 'v1', '10', '0.95', '2024-03-01T00:00:00+00:00', DASH],
+    ['ベータ', 'v2', '10', '0.5', '2024-03-01T00:00:00.123+00:00', 'fs:read, 計測'],
     ['fennel', 'v3', '0', '0', DASH, DASH],
-    ['引退', 'v4', '1', '0.2', '2024-06-01T00:00:00Z', DASH],
-    ['alpha', 'v8', '7', '0.8', '2024-02-02T00:00:00Z', DASH],
-    ['éclair', 'v10', '3', DASH, '2024-03-01T00:00:00Z', DASH],
+    ['引退', 'v4', '1', '0.2', '2024-01-01T00:00:00+00:00', DASH],
+    ['alpha', 'v8', '7', '0.8', '2024-03-01T00:00:00+00:00', DASH],
+    ['éclair', 'v10', '3', DASH, DASH, DASH],
   ]);
   assert.ok(version.table.children[1].children[3].children[0].textContent.includes('(retired)'));
 
@@ -311,7 +312,7 @@ test('filters and non-ASCII fields keep production order in the rendered table',
   setup.context.S.selectedTool = null;
   setup.controls['tools-quick'].value = 'active';
   setup.context.S.toolSort = { key: 'used', reverse: false };
-  assert.deepEqual(renderFiltered(setup).filteredTools.map((tool) => tool.id), ['ecl', 'alpha', 'beta', 'zebra', 'zero']);
+  assert.deepEqual(renderFiltered(setup).filteredTools.map((tool) => tool.id), ['beta', 'alpha', 'zebra', 'ecl', 'zero']);
   setup.context.S.toolSort = { key: 'name', reverse: false };
   const activeNames = renderFiltered(setup).filteredTools.map((tool) => tool.name);
   assert.deepEqual(activeNames, activeNames.slice().sort((a, b) => a.localeCompare(b)));
@@ -404,6 +405,21 @@ test('row selection follows the rendered tool', () => {
   assert.deepEqual(idsOf(table), rows.map((tool) => tool.id));
 });
 
+
+test('Tools and Metrics rows display retained use and treat old or empty history as unknown', () => {
+  for (const bars of [false, true]) {
+    const setup = fixture();
+    const table = new Node('table');
+    const retained = byId.get('beta');
+    const legacy = byId.get('ecl');
+    const pruned = byId.get('zero');
+    setup.context.toolsTable(table, [retained, legacy, pruned], { bars, onselect: () => {} });
+    const stamps = table.children[1].children.map((row) => row.children[4].textContent);
+    assert.deepEqual(stamps, [retained.last_used_at, DASH, DASH]);
+    assert.notEqual(retained.last_used_at, retained.updated_at);
+    assert.ok(legacy.invocations > 0 && !Object.hasOwn(legacy, 'last_used_at'));
+  }
+});
 
 test('Tools and Metrics rows show the same retained sample without changing lifetime success', () => {
   for (const bars of [false, true]) {
