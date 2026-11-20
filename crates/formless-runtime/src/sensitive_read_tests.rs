@@ -104,6 +104,32 @@ fn profile_denial_precedes_consent_and_broad_grants() {
     assert_eq!(std::fs::read_to_string(key).unwrap(), "fixture-secret");
 }
 #[test]
+fn p8_private_key_tool_reads_use_the_credential_gate() {
+    let f = Fixture::new();
+    let key = f.0.join("SigningKey.P8");
+    let notes = f.0.join("key.p8.txt");
+    std::fs::write(&key, "private test placeholder").unwrap();
+    std::fs::write(&notes, "ordinary test placeholder").unwrap();
+    let code = "function run(input) { return fs.read(input.path); }";
+    let request = f.request(code, &key);
+    let declining = host(PathPolicy::default(), false);
+    assert!(execute(&request, declining.clone()).is_err());
+    assert_eq!(*declining.paths.locked(), vec![key.canonicalize().unwrap()]);
+    assert_eq!(
+        execute(&f.request(code, &notes), declining.clone())
+            .unwrap()
+            .output,
+        json!("ordinary test placeholder")
+    );
+    assert_eq!(declining.paths.locked().len(), 1);
+    let mut smoke = request;
+    smoke.mode = HostMode::Smoke;
+    let approving = host(PathPolicy::default(), true);
+    assert!(execute(&smoke, approving.clone()).is_err());
+    assert!(approving.paths.locked().is_empty());
+}
+
+#[test]
 fn rename_cannot_launder_a_credential_when_snapshot_callback_is_noop() {
     let f = Fixture::new();
     let key = f.0.join("private.key");
