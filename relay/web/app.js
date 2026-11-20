@@ -2343,12 +2343,14 @@
   }
 
   // ------------------------------------------------------- @ mentions
-  /** `@path` mentions: an `@` at the start or after whitespace (same rule
-   * as the daemon's `files::mentions`). */
+  /** Match ordinary and Markdown-wrapped `@path` mentions. */
+  function mentionMatches(text) {
+    return text.matchAll(/(^|[\s`(\[{])(@\S+)/g);
+  }
   function mentionsIn(text) {
     const out = [];
-    for (const m of text.matchAll(/(^|\s)@(\S+)/g)) {
-      const p = m[2].replace(/[,.;:!?)"']+$/, "");
+    for (const m of mentionMatches(text)) {
+      const p = m[2].slice(1).replace(/[,.;:!?)"'`\]}>]+$/, "");
       if (p && !out.includes(p)) out.push(p);
     }
     return out;
@@ -2357,7 +2359,7 @@
   function withMentions(text) {
     const parts = [];
     let last = 0;
-    for (const m of text.matchAll(/(^|\s)(@\S+)/g)) {
+    for (const m of mentionMatches(text)) {
       const at = m.index + m[1].length;
       parts.push(text.slice(last, at), h("span", { class: "mention" }, m[2]));
       last = at + m[2].length;
@@ -2376,7 +2378,7 @@
   function mentionAtCaret() {
     const t = $("input");
     const before = t.value.slice(0, t.selectionStart);
-    const m = before.match(/(^|\s)@(\S*)$/);
+    const m = before.match(/(^|[\s`(\[{])@(\S*)$/);
     return m && !t.value.startsWith("/") ? { query: m[2], start: before.length - m[2].length - 1 } : null;
   }
   async function updateMentions() {

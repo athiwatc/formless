@@ -34,6 +34,21 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('wrapped file mentions attach and highlight the same paths without matching email addresses', () => {
+  const c = setup(['mentionMatches', 'mentionsIn', 'withMentions', 'mentionAtCaret'], {
+    h: (tag, attrs, text) => ({ tag, attrs, text }),
+  });
+  const message = 'mail a@b.c, then `@src/main.rs` ([@README.md]) {@Cargo.toml} and @src/main.rs]}>';
+  assert.deepEqual([...c.mentionsIn(message)], ['src/main.rs', 'README.md', 'Cargo.toml']);
+  const parts = c.withMentions(message);
+  assert.equal(parts.map(part => typeof part === 'string' ? part : part.text).join(''), message);
+  assert.equal(parts.filter(part => typeof part === 'object').length, 4);
+  const input = c.$('input');
+  input.value = 'see [@src/';
+  input.selectionStart = input.value.length;
+  assert.equal(c.mentionAtCaret().query, 'src/');
+  assert.equal(c.mentionAtCaret().start, 5);
+});
 test('malformed fragment pairs preserve independently valid pairs and plus signs', () => {
   const c = setup(['hashParams'], { location: { hash: '' } });
   for (const hash of ['#k=%E0%A4%A', '#s=%', '#local=%zz', '#k=abc%&s=valid']) {
