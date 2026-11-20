@@ -192,6 +192,19 @@ fn http_target(mut url: String) -> String {
     url
 }
 
+/// Parsed Markdown destinations retain their path punctuation. Reject
+/// controls before placing a target in an OSC string.
+pub(crate) fn explicit_http_target(text: &str) -> Option<String> {
+    let (scheme, _) = text.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        || text.chars().any(|c| c.is_control() || c.is_whitespace())
+        || url::Url::parse(text).ok()?.host().is_none()
+    {
+        return None;
+    }
+    Some(http_target(text.to_owned()))
+}
+
 /// Path-looking words in a line, as (start char, end char exclusive,
 /// path, line): `src/main.rs`, `./a/b.txt:42`, `Cargo.toml`. Whether they
 /// exist is checked by the caller.
@@ -280,9 +293,19 @@ fn byte_of(chars: &[char], idx: usize) -> usize {
 
 /// The links visible in `area` of a drawn buffer: URLs, and paths that
 /// `resolve` turns into a `file://` target (it says whether one exists).
+#[cfg(test)]
 pub fn scan(
     buf: &Buffer,
     area: Rect,
+    resolve: &mut dyn FnMut(&str) -> Option<String>,
+) -> Vec<Painted> {
+    scan_with_explicit(buf, area, &[], resolve)
+}
+
+pub fn scan_with_explicit(
+    buf: &Buffer,
+    area: Rect,
+    explicit: &[Painted],
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Vec<Painted> {
     let rows: Vec<(u16, Vec<u16>, Vec<char>)> = (area.top()..area.bottom())
@@ -317,6 +340,24 @@ pub fn scan(
     // wrapped from the row above included).
     let mut covered: Vec<Vec<(usize, usize)>> = vec![Vec::new(); rows.len()];
     let mut out = Vec::new();
+    for link in explicit {
+        let Some(i) = link.y.checked_sub(area.top()).map(usize::from) else {
+            continue;
+        };
+        let Some((_, xs, _)) = rows.get(i) else {
+            continue;
+        };
+        let a = xs.partition_point(|x| *x < link.x0);
+        let b = xs.partition_point(|x| *x <= link.x1);
+        if a < b {
+            covered[i].push((a, b));
+            out.push(Painted {
+                x0: xs[a],
+                x1: xs[b - 1],
+                ..link.clone()
+            });
+        }
+    }
     for (i, (y, xs, chars)) in rows.iter().enumerate() {
         let text: String = chars.iter().collect();
         for (a, b, url) in find_urls(&text) {
@@ -346,7 +387,14 @@ pub fn scan(
                 if width < 16 || next_xs[next_start] != xs[a] {
                     break;
                 }
-                pieces.push((r + 1, next_start, run_end(next, next_start)));
+                let next_end = run_end(next, next_start);
+                if covered[r + 1]
+                    .iter()
+                    .any(|&(a, b)| next_start < b && next_end > a)
+                {
+                    break;
+                }
+                pieces.push((r + 1, next_start, next_end));
             }
             let target = if pieces.len() == 1 {
                 url
@@ -509,6 +557,23 @@ pub fn open_external(target: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_targets_keep_punctuation_and_reject_controls_and_other_schemes() {
+        assert_eq!(
+            super::explicit_http_target("HTTPS://Example.com/path_(x).?!").as_deref(),
+            Some("https://Example.com/path_(x).?!")
+        );
+        for url in [
+            "file:///tmp/fixture",
+            "mailto:sample@example.com",
+            "https://example.com/with space",
+            "https://example.com/\u{1b}suffix",
+            "https://example.com/\u{9c}suffix",
+        ] {
+            assert!(super::explicit_http_target(url).is_none(), "{url:?}");
+        }
+    }
+
     #[test]
     fn native_file_links_round_trip_reserved_and_unicode_path_names() {
         let dir = std::env::temp_dir().join(format!("fl link {}", uuid::Uuid::new_v4()));
