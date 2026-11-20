@@ -706,7 +706,17 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "doas"
         ) || matches!(
             stem,
-            "python" | "node" | "deno" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
+            "python"
+                | "node"
+                | "deno"
+                | "bun"
+                | "perl"
+                | "ruby"
+                | "elixir"
+                | "iex"
+                | "php"
+                | "lua"
+                | "tclsh"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -3829,6 +3839,23 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn elixir_and_iex_require_broad_process_confirmation() {
+        for spec in [
+            "process:elixir",
+            "process:elixir1.16",
+            "process:/usr/bin/elixir",
+            "process:elixir.exe",
+            "process:iex",
+            "process:iex.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:elixirc", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
