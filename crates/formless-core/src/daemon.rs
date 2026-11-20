@@ -4247,6 +4247,8 @@ impl Daemon {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
                         run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
                     }
+                } else {
+                    run["spend_error"] = json!("configuration could not be loaded");
                 }
                 Ok(run)
             }
