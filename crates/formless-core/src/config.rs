@@ -1411,15 +1411,21 @@ impl ProviderCfg {
     /// aggregator prefixes are dropped on either side (#809). Deterministic:
     /// the first such key in name order.
     pub fn price_for(&self, model: &str) -> Option<&ModelPrice> {
-        if let Some(p) = self.prices.get(model) {
-            return Some(p);
-        }
-        let want = bare_model(model);
-        let mut keys: Vec<&String> = self.prices.keys().collect();
-        keys.sort();
-        keys.into_iter()
-            .find(|k| bare_model(k) == want)
-            .and_then(|k| self.prices.get(k))
+        self.price_entry_for(model).map(|(_, price)| price)
+    }
+
+    /// The stored key and price selected by the same fallback lookup.
+    pub fn price_entry_for(&self, model: &str) -> Option<(&str, &ModelPrice)> {
+        self.prices
+            .get_key_value(model)
+            .or_else(|| {
+                let want = bare_model(model);
+                self.prices
+                    .iter()
+                    .filter(|(key, _)| bare_model(key) == want)
+                    .min_by_key(|(key, _)| *key)
+            })
+            .map(|(key, price)| (key.as_str(), price))
     }
     pub fn context_for(&self, model: &str) -> u32 {
         self.model_context_tokens

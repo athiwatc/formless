@@ -5285,7 +5285,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
-| `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
+| `formless prices` | `import`, `list` | Import a model-price catalog or inspect prices and configured model references offline. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
 | `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
@@ -5306,6 +5306,14 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless prices list [--provider NAME] [--json]` reads the configuration file
+and defaults. Rates are USD per million tokens. It shows stored entries and
+the effective stored-price match for each configured provider model, fallback
+model, and explicit Role model. It skips automatic routing and leaves model
+references as configured. Environment overrides and historical usage are
+outside this view. A provider's reported cost takes precedence over the
+stored fallback estimate. Use `--provider default` to select `[provider]`.
 
 `mcp test NAME [--json]` restarts the server and prints the full report before
 returning its verdict: exit 0 for a successful reply (including zero tools),

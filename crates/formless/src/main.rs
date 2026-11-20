@@ -10,6 +10,7 @@ mod cli_models;
 mod cli_modules;
 mod cli_pipeline;
 mod cli_price_import;
+mod cli_prices;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
@@ -307,7 +308,7 @@ enum Cmd {
     },
     /// Model prices for spending limits and cost (provider.prices)
     #[command(
-        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run\n  formless prices list --provider default --json"
     )]
     Prices {
         #[command(subcommand)]
@@ -969,6 +970,15 @@ enum PricesAction {
         /// Show what would change; write nothing
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Show stored prices and configured model references without contacting the provider
+    List {
+        /// Show only this provider (use "default" for the default provider)
+        #[arg(long)]
+        provider: Option<String>,
+        /// One JSON value instead of tables
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2313,15 +2323,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 }
         )
     );
+    let read_only = matches!(
+        cli.cmd,
+        Some(Cmd::Prices {
+            action: PricesAction::List { .. }
+        })
+    );
     let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
-    let _operation = if destructive || serving {
+    let _operation = if destructive || serving || read_only {
         None
     } else {
         Some(formless_core::profile_lock::ProfileLock::hierarchy_shared(
             &paths,
         )?)
     };
-    let paths = if destructive {
+    let paths = if destructive || read_only {
         paths
     } else {
         Paths::resolve(cli.profile.as_deref())?
@@ -2419,7 +2435,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
-        Some(Cmd::Prices { action }) => prices_cmd(paths, action),
+        Some(Cmd::Prices { action }) => match action {
+            PricesAction::Import {
+                provider,
+                all,
+                dry_run,
+            } => prices_import_cmd(paths, provider, all, dry_run),
+            PricesAction::List { provider, json } => {
+                cli_prices::list(&paths, provider.as_deref(), json)
+            }
+        },
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
         Some(Cmd::Logs {
@@ -6630,12 +6655,12 @@ fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
 
 /// `formless prices import` (#809): the endpoint's own prices, dated, so
 /// dollar limits can count the models in use.
-fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
-    let PricesAction::Import {
-        provider,
-        all,
-        dry_run,
-    } = action;
+fn prices_import_cmd(
+    paths: Paths,
+    provider: Option<String>,
+    all: bool,
+    dry_run: bool,
+) -> Result<()> {
     let live = Config::load(&paths)?;
     let pcfg = live.provider_cfg(provider.as_deref())?;
     let name = provider.clone().unwrap_or_else(|| "default".into());
