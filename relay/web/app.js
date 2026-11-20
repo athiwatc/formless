@@ -4792,8 +4792,7 @@
       const pre = h("pre", { class: "diff" }, "loading…");
       box.append(h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + t.current_version), pre));
       request({ type: "diff_tool_versions", id: t.id, from, to: t.current_version }).then((r) => {
-        pre.replaceChildren(...String(r.diff).split("\n").map((l) =>
-          h("div", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : l[0] === "@" ? "muted" : null }, l)));
+        pre.replaceChildren(...renderDiffLines(r.diff, "div"));
       }).catch((e) => { pre.textContent = String(e.message || e); });
     }
     const editing = S.editingCode && S.editingCode.toolId === t.id;
@@ -6763,6 +6762,30 @@
     let text = changed.length ? changed.length + " tracked path(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + (changed.length > 5 ? ", +" + (changed.length - 5) + " more" : "") + " · /files shows tracked changes; /rewind attempts safe restoration." : files.length ? "No current changes among tracked paths." : "No tracked path changes.";
     return text + (untracked ? " " + runFilesCaveat() : "");
   }
+  // Hunk counts distinguish real +/- content from unified-diff file headers.
+  function renderDiffLines(diff, tag) {
+    let oldLeft = 0, newLeft = 0;
+    return String(diff).split("\n").map((line) => {
+      let cls = null;
+      const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk) {
+        oldLeft = Number(hunk[2] ?? 1);
+        newLeft = Number(hunk[4] ?? 1);
+        cls = "muted";
+      } else if (oldLeft > 0 || newLeft > 0) {
+        if (line[0] === "+") { newLeft = Math.max(0, newLeft - 1); cls = "add"; }
+        else if (line[0] === "-") { oldLeft = Math.max(0, oldLeft - 1); cls = "del"; }
+        else if (line[0] === " ") {
+          oldLeft = Math.max(0, oldLeft - 1);
+          newLeft = Math.max(0, newLeft - 1);
+        }
+      } else if (/^(?:\+\+\+|---)(?:\s|$)/.test(line) || line.startsWith("@@")) {
+        cls = "muted";
+      } else if (line[0] === "+") cls = "add";
+      else if (line[0] === "-") cls = "del";
+      return h(tag, { class: cls }, line + (tag === "span" ? "\n" : ""));
+    });
+  }
   // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
   async function showRunFiles() {
     const trigger = document.activeElement;
@@ -6783,7 +6806,7 @@
       h("div", { class: "run-file-head" }, h("code", null, (mark[f.status] || "M") + " " + f.path),
         h("span", { class: "spacer" }),
         f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
-      f.diff ? h("pre", { class: "diff" }, f.diff.split("\n").map((l) => h("span", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : "" }, l + "\n"))) : null)));
+      f.diff ? h("pre", { class: "diff" }, renderDiffLines(f.diff, "span")) : null)));
     const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
