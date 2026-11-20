@@ -548,6 +548,8 @@ const SESSION_SUMMARY: &str = "s.*";
 const DERIVED_INDEXES: &str = "
     CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
     CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);
+    CREATE INDEX IF NOT EXISTS idx_inv_replay_recent ON invocations(tool_id)
+        WHERE status IN ('success','failure');
 ";
 
 const LATEST_CHECKPOINT_SQL: &str = "SELECT id, summary, up_to_seq FROM checkpoints

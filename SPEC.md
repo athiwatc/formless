@@ -3028,10 +3028,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Before contacting the candidate-generation provider, freeze a **server-owned
   replay manifest** from recent terminal success/failure Invocations. Selection
   is independent of outcome: there is no balancing or oversampling of failures.
-  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan at
-  most four times that many recent records, at most 2,048, with at most 256 KiB
-  per raw input and an 8 MiB manifest. Invalid/oversized inputs and samples
-  outside the bounded pool are counted as exclusions, never silently claimed
+  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan
+  four times that many recent records, then continue if the pool is short of
+  distinct inputs. Stop at 8,192 terminal records or 32 MiB of additional input,
+  with at most 256 KiB per raw input and an 8 MiB manifest. Invalid or oversized
+  inputs and samples outside the bounded pool are counted as exclusions and never claimed
   as tested. The snapshot records source Invocation IDs, canonical input
   digests, selection bounds and partitions.
 - Group semantically identical JSON inputs before splitting, ignoring object
