@@ -1673,10 +1673,11 @@
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
-    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
@@ -1684,6 +1685,15 @@
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
+  function powershellQuoteEnd(code, from, quote) {
+    for (let i = from; i < code.length; i++) {
+      const c = code[i];
+      if ((quote === '"' && c === "`") || (c === quote && code[i + 1] === quote)) i++;
+      else if (c === quote) return i + 1;
+    }
+    return code.length;
+  }
+
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1697,6 +1707,7 @@
     const php = L === HL.php;
     const out = [];
     let plain = "";
+    const powershell = L === HL.powershell;
     const tok = (cls, s) => {
       if (plain) { out.push(plain); plain = ""; }
       out.push(h("span", { class: cls }, s));
@@ -1742,6 +1753,23 @@
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
         tok("tok-com", code.slice(i, stop));
+        i = stop;
+        continue;
+      }
+      if (powershell && c === "@" && (code[i + 1] === '"' || code[i + 1] === "'")) {
+        const newline = code.indexOf("\n", i + 2);
+        const lineEnd = newline === -1 ? code.length : newline;
+        if (!code.slice(i + 2, lineEnd).trim()) {
+          const end = code.indexOf("\n" + code[i + 1] + "@", lineEnd);
+          const stop = end === -1 ? code.length : end + 3;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
+      if (powershell && L.q.includes(c)) {
+        const stop = powershellQuoteEnd(code, i + 1, c);
+        tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
       }
