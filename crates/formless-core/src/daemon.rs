@@ -198,6 +198,11 @@ fn is_model_failure(error: &anyhow::Error) -> bool {
             .is_none()
 }
 
+fn run_cancelled(cancel: &CancellationToken, cancel_flag: &AtomicBool) -> bool {
+    // The Run controller sets the sandbox flag before waking token waiters.
+    cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst)
+}
+
 /// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     match e.downcast_ref::<RequestFailure>() {
@@ -5936,8 +5941,11 @@ impl Daemon {
                     }
                     // Steered messages continue the same Run (next step boundary).
                     while steer_rx.try_recv().is_ok() {}
-                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
-                    {
+                    match self.extend_or_close_steering(
+                        &session_id,
+                        &run_id,
+                        run_cancelled(&cancel, &cancel_flag),
+                    ) {
                         steering_daemon::SteeringOutcome::Extend => continue,
                         steering_daemon::SteeringOutcome::Completed => {}
                         steering_daemon::SteeringOutcome::Interrupted => {
@@ -5948,7 +5956,7 @@ impl Daemon {
                     }
                     break;
                 }
-                Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
+                Err(_) if run_cancelled(&cancel, &cancel_flag) => {
                     final_status = "interrupted";
                     self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
@@ -10221,7 +10229,7 @@ impl Daemon {
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
-            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            let interrupted = outcome.is_err() && run_cancelled(cancel, cancel_flag);
             if let Some((r, task, identity)) =
                 role.as_ref().filter(|_| !interrupted).and_then(|r| {
                     let task = routing_task.as_ref()?;
