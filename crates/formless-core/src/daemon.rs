@@ -11547,14 +11547,20 @@ impl Daemon {
         )
         .map_err(|error| anyhow!(error))?;
         let root = mention_root(root_hint)?;
-        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
-        let input_path = if let Some(rest) = path.strip_prefix("~/") {
-            home.as_ref()
-                .filter(|home| home.is_absolute())
-                .context("native home is unavailable for this mention")?
-                .join(rest)
+        let (input_path, home_root) = if let Some(rest) = crate::files::home_path_suffix(path) {
+            let base = directories::BaseDirs::new()
+                .filter(|base| base.home_dir().is_absolute())
+                .context("native home is unavailable for this mention")?;
+            let home = base.home_dir();
+            (
+                home.join(rest),
+                Some(
+                    home.canonicalize()
+                        .context("native home cannot be resolved")?,
+                ),
+            )
         } else {
-            std::path::PathBuf::from(path)
+            (std::path::PathBuf::from(path), None)
         };
         // Preserve the configured root spelling as well as its resolved
         // destination: a credential/profile namespace can itself be an alias.
@@ -11563,16 +11569,19 @@ impl Daemon {
             .join(input_path)
             .canonicalize()
             .with_context(|| format!("no file '{path}'"))?;
-        // A mention reaches only the working folder (or ~/ when written so),
+        // A mention reaches only the working folder (or an explicit home path),
         // and never a credential, whoever pasted it (#863).
-        let inside = full.starts_with(&root)
-            || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
-        if !inside {
+        let authority_root = if full.starts_with(&root) {
+            Some(&root)
+        } else {
+            home_root.as_ref().filter(|home| full.starts_with(home))
+        };
+        let Some(authority_root) = authority_root else {
             return Err(anyhow!(
                 "@{path} is outside the working folder {}; attach it with /attach instead",
                 root.display()
             ));
-        }
+        };
         if let Some(why) = credential_path(&full) {
             return Err(anyhow!(
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
@@ -11602,14 +11611,7 @@ impl Daemon {
             };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let authority_root = if full.starts_with(&root) {
-                root.clone()
-            } else {
-                home.as_ref()
-                    .context("authorized home is unavailable")?
-                    .canonicalize()?
-            };
-            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+            let bytes=crate::attachment_access::read_rooted_file(authority_root,&full,inline_limit)
                 .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
