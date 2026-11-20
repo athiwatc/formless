@@ -2177,21 +2177,20 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
                 "Invocation ID: invocation-full-id",
                 "Elapsed: 1.234s",
                 "Silent: 0.000s",
-                "Elapsed: 86400.001s",
-                "Silent: 60.001s",
+                "Elapsed: 24h",
+                "Silent: 1m",
                 "Stalled: yes",
                 "Stalled: no",
                 "Abandoned: no",
                 "Abandoned: yes — no longer awaited; may still finish",
-                "Progress fraction: 0",
-                "Progress label: label only\\u{9}ไทย",
+                "Progress: 0%",
+                "Progress: label only\\u{9}ไทย",
                 "日本語\\u{1b}[31m",
                 "Session: session\\u{a}full",
             ] {
                 assert!(text.contains(expected), "missing {expected:?}: {text}");
             }
-            assert_eq!(text.matches("Progress fraction:").count(), 1);
-            assert_eq!(text.matches("Progress label:").count(), 1);
+            assert_eq!(text.matches("Progress:").count(), 2);
             assert!(!text.contains('\u{1b}'));
         }
         let requests = fixture.requests.lock().unwrap();
