@@ -45,27 +45,24 @@ impl Inventory {
                 .filter(|token| !self.records.contains_key(*token))
                 .count()
     }
+    fn has_marker_capacity(&self) -> Result<bool> {
+        Ok(self.len() < MAX_RECORDS
+            && self
+                .charge()?
+                .checked_add(MAX_MARKER_BYTES as u64)
+                .context("Missing marker quota overflow")?
+                <= MAX_STORE_BYTES - PROBE_RESERVE)
+    }
+
     fn charge(&self) -> Result<u64> {
-        let excess = |token: &RetainedToken| {
-            self.actual_bytes
-                .get(token)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub((2 * 1024 * 1024u64))
-        };
-        let missing = self.missing.values().try_fold(0u64, |sum, marker| {
-            sum.checked_add(marker.charge())
-                .and_then(|sum| sum.checked_add(excess(&marker.token)))
-                .context("Missing marker quota overflow")
-        })?;
-        self.records
-            .values()
-            .filter(|record| !self.missing.contains_key(&record.token))
-            .try_fold(missing, |sum, record| {
-                sum.checked_add(record.charge()?)
-                    .and_then(|sum| sum.checked_add(excess(&record.token)))
-                    .context("Retained quota overflow")
-            })
+        // An initial missing capture reserves a receipt and one logical slot.
+        // A linked or moved object adds its own byte charge to those receipts.
+        let markers = (self.missing.len() * MAX_MARKER_BYTES) as u64;
+        self.records.values().try_fold(markers, |sum, record| {
+            let actual_bytes = self.actual_bytes.get(&record.token).copied().unwrap_or(0);
+            sum.checked_add(record.charge(actual_bytes)?)
+                .context("Retained quota overflow")
+        })
     }
 }
 struct Inner {
@@ -441,7 +438,9 @@ impl RetainedStore {
         regular(&file)?;
         review_journal::windows_private(&file)?;
         let mut bytes = Vec::new();
-        (&file).take(4097).read_to_end(&mut bytes)?;
+        (&file)
+            .take(MAX_MARKER_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
         MissingMarker::decode(&bytes, token, owner)
     }
     fn validate_binding(&self, record: &Manifest) -> Result<()> {
@@ -488,14 +487,8 @@ impl RetainedStore {
             bail!("A first existing snapshot cannot be replaced by missing capture");
         }
         let marker = MissingMarker::new(RetainedToken::fresh(), owner.clone(), before, now()?)?;
-        if inventory.len() >= MAX_RECORDS
-            || inventory
-                .charge()?
-                .checked_add(marker.charge())
-                .context("Missing marker quota overflow")?
-                > MAX_STORE_BYTES - PROBE_RESERVE
-        {
-            bail!("No reserved slot for a future created-file inverse; missing capture remains read-only");
+        if !inventory.has_marker_capacity()? {
+            bail!("Retained review history is full");
         }
         let mut file =
             namespace::create_private(&self.0.directory, OsStr::new(&missing_name(&marker.token)))?;
@@ -522,6 +515,9 @@ impl RetainedStore {
             Self::eligible(&live, &marker.token, marker.expires_at)?;
             let pin = Self::pin(&mut live, &marker.token);
             return Ok(Some(marker.token.with_lease(pin, self.0.clone())));
+        }
+        if !inventory.has_marker_capacity()? {
+            bail!("Retained review history is full");
         }
         Ok(None)
     }
@@ -715,7 +711,7 @@ impl RetainedStore {
             .missing
             .values()
             .find(|marker| &marker.owner == owner);
-        let (mut manifest, extra, extra_slot) = match kind {
+        let (mut manifest, extra_slot) = match kind {
             RetentionKind::Move => {
                 let marker = marker.context("Created-file inverse requires a private missing capture from before the Tool; SQLite rows alone provide no authority")?;
                 Self::eligible(&live, &marker.token, marker.expires_at)?;
@@ -727,8 +723,7 @@ impl RetainedStore {
                     marker.created_at,
                 )?;
                 manifest.missing_capture = Some(marker.checksum.clone());
-                manifest.checksum = manifest.checksum()?;
-                (manifest, 0, 0)
+                (manifest, 0)
             }
             RetentionKind::Link => {
                 if marker.is_some() {
@@ -736,14 +731,13 @@ impl RetainedStore {
                 }
                 let manifest =
                     Manifest::new(RetainedToken::fresh(), owner.clone(), before, kind, now()?)?;
-                let charge = manifest.charge()?;
-                (manifest, charge, 1)
+                (manifest, 1)
             }
         };
         manifest.checksum = manifest.checksum()?;
         let total = records
             .charge()?
-            .checked_add(extra)
+            .checked_add(manifest.charge(source.metadata()?.len())?)
             .context("Retained quota overflow")?;
         if records.len() + extra_slot > MAX_RECORDS || total > MAX_STORE_BYTES - PROBE_RESERVE {
             bail!("Retained store capacity reached; no namespace was changed");
@@ -817,6 +811,16 @@ impl RetainedStore {
             bail!("Prepared retention belongs to another store or operation");
         }
         let _serial = self.lock()?;
+        let needed = prepared.manifest.charge(source.metadata()?.len())?;
+        let already_reserved = prepared.manifest.charge(0)?;
+        let total = self
+            .inventory()?
+            .charge()?
+            .checked_add(needed.saturating_sub(already_reserved))
+            .context("Retained quota overflow")?;
+        if total > MAX_STORE_BYTES - PROBE_RESERVE {
+            bail!("Retained store capacity reached; no namespace was changed");
+        }
         let expected_before = self
             .internal_links(&prepared.manifest.identity)?
             .checked_add(1)
@@ -929,7 +933,9 @@ impl RetainedStore {
                 regular(&file)?;
                 review_journal::windows_private(&file)?;
                 let mut bytes = Vec::new();
-                (&file).take(4097).read_to_end(&mut bytes)?;
+                (&file)
+                    .take(MAX_MARKER_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
                 let current = MissingMarker::decode(&bytes, &token, Some(&marker.owner))?;
                 if current.checksum != marker.checksum {
                     bail!("Missing marker changed during expiry");
@@ -1325,7 +1331,7 @@ mod tests {
             .is_empty());
     }
     #[test]
-    fn reserved_missing_slot_can_upgrade_when_no_new_slot_can_be_admitted() {
+    fn all_missing_slots_fit_and_more_than_thirty_one_small_creations_can_be_retained() {
         let f = Fixture::new();
         let store = f.store();
         let first_owner = owner("reserved-0");
@@ -1347,19 +1353,30 @@ mod tests {
             }
         }
         assert!(full);
-        assert!(owners.len() > 1);
-        let before_slots = store.inventory().unwrap().len();
-        let (path, source, image) = f.source("reserved-created.txt", b"created");
-        let prepared = store.prepare_move(&first_owner, &source, &image).unwrap();
-        assert_eq!(prepared.token(), &first);
-        let token = store.commit_move(prepared, &source).unwrap();
-        drop(source);
-        assert!(!path.exists());
-        assert_eq!(store.inventory().unwrap().len(), before_slots);
-        let object = store.open_verified(&token, &first_owner).unwrap();
-        assert_eq!(object.before().bytes.as_deref(), Some(&b"created"[..]));
-        object.require_retained_only().unwrap();
+        assert_eq!(
+            owners.len(),
+            MAX_RECORDS,
+            "all 64 markers fit before the Tools run"
+        );
+        let full = store
+            .lookup_missing(&owner("new"), &ReviewImage::missing())
+            .unwrap_err();
+        assert!(full.to_string().contains("review history is full"));
+        for (index, marker) in owners.iter().enumerate().take(40) {
+            let owner = owner(&format!("reserved-{index}"));
+            let (path, source, image) = f.source(&format!("created-{index}.txt"), b"created");
+            let prepared = store.prepare_move(&owner, &source, &image).unwrap();
+            assert_eq!(prepared.token(), marker);
+            let token = store.commit_move(prepared, &source).unwrap();
+            drop(source);
+            assert!(!path.exists());
+            let object = store.open_verified(&token, &owner).unwrap();
+            assert_eq!(object.before().bytes.as_deref(), Some(&b"created"[..]));
+            object.require_retained_only().unwrap();
+        }
+        assert_eq!(store.inventory().unwrap().len(), MAX_RECORDS);
     }
+
     #[test]
     fn expired_receipts_cannot_mint_new_pins_but_existing_owner_keeps_its_window() {
         let f = Fixture::new();
