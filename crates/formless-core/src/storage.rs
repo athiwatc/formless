@@ -60,6 +60,20 @@ mod run_state_storage;
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
 
+#[path = "forecast_report_storage.rs"]
+mod forecast_report_storage;
+pub(crate) use forecast_report_storage::ForecastMetricInput;
+
+fn run_duration_ms(created: &str, updated: &str) -> i64 {
+    match (
+        chrono::DateTime::parse_from_rfc3339(created),
+        chrono::DateTime::parse_from_rfc3339(updated),
+    ) {
+        (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
+        _ => 0,
+    }
+}
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -3255,10 +3269,10 @@ impl Store {
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(expected > 0
-            && expected == rows
-            && expected == known
-            && main >= self.run_steps(run_id)?)
+        Ok(
+            forecast_report_storage::covered_requests(expected, rows, known)
+                && main >= self.run_steps(run_id)?,
+        )
     }
 
     /// Check coverage for a branch's allocated Runs in one statement.
@@ -3306,35 +3320,14 @@ impl Store {
         cfg: &crate::Config,
     ) -> Result<(Option<f64>, u64, u64)> {
         let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source,cost_unknown FROM run_usage WHERE run_id=?1")?;
-        let rows = stmt.query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<f64>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, bool>(8)?,
-            ))
+        let rows = stmt.query_map(params![run_id], |row| {
+            forecast_report_storage::UsageRow::read(row, 0)
         })?;
-        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
-        let mut any = false;
+        let mut usage = forecast_report_storage::UsageTotals::default();
         for row in rows {
-            let (p, m, input, output, cache, write, reported, source, unknown) = row?;
-            any = true;
-            // Only the main Session request drives its compaction threshold;
-            // nested llm/sub-agent/summarizer contexts have separate windows.
-            if source == "run" {
-                peak = peak.max(input.max(0) as u64);
-            }
-            cached += cache.max(0) as u64;
-            cost = cost
-                .zip(cfg.cost_of_known(&p, &m, input, output, cache, write, reported, unknown))
-                .map(|(a, b)| a + b);
+            usage.add(&row?, cfg);
         }
-        Ok((cost.filter(|_| any), peak, cached))
+        Ok((usage.cost(), usage.peak, usage.cached))
     }
 
     pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
@@ -3435,13 +3428,7 @@ impl Store {
         let rows = stmt
             .query_map(params![limit as i64, session_id, since, run_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
-                let duration_ms = match (
-                    chrono::DateTime::parse_from_rfc3339(&created),
-                    chrono::DateTime::parse_from_rfc3339(&updated),
-                ) {
-                    (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
-                    _ => 0,
-                };
+                let duration_ms = run_duration_ms(&created, &updated);
                 let status: String = r.get(2)?;
                 let followup: String = r.get(3)?;
                 let rating: String = r.get(10)?;
