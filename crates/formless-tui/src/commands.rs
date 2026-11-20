@@ -737,6 +737,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
     ("PgUp / PgDn", "scroll the chat"),
+    ("PgUp / PgDn in a Settings form", "scroll the form without changing the active field"),
     ("↑ / ↓ (non-Vim composer)", "move within wrapped draft rows; browse Session history at the first/last row, including empty/one-line input"),
     (
         "j / k, g / G, Ctrl+D / Ctrl+U",

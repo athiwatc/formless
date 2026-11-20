@@ -10945,6 +10945,25 @@ impl App {
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
         if let Some(form) = &mut self.settings_form {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
+                form.viewport.get_mut().page(key.code == KeyCode::PageDown);
+                return;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Down
+                    | KeyCode::Up
+                    | KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Left
+                    | KeyCode::Right
+            ) || matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                form.viewport.get_mut().inspecting = false;
+            }
             let n = form.fields.len();
             match key.code {
                 KeyCode::Esc => self.settings_form = None,
@@ -11798,6 +11817,7 @@ impl App {
         if self.view == View::Settings {
             if let Some(f) = &mut self.settings_form {
                 f.fields[f.idx].input.paste(text.trim());
+                f.viewport.get_mut().inspecting = false;
             } else if let Some((_, edit)) = &mut self.settings_edit {
                 edit.paste(text.trim());
             }
@@ -11920,6 +11940,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         typing && (modal.is_none() || app.input_focus),
     );
     draw_status(f, chunks[3], app);
+    // Give the form the full frame after drawing its background. Approval
+    // and other modal overlays below keep their existing priority.
+    if app.view == View::Settings {
+        if let Some(form) = &app.settings_form {
+            draw_settings_form(f, form, app.color);
+        }
+    }
     if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
@@ -17046,73 +17073,159 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         )),
         area,
     );
-    if let Some(form) = &app.settings_form {
-        draw_settings_form(f, form, app.color);
+}
+
+/// The normal word wrapper can overhang the last column with a wide
+/// grapheme. Split those rows before painting them inside the form border.
+fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
+    let columns = usize::from(width);
+    let mut rows = Vec::new();
+    for row in review_wrap::window(&line, width, 0, usize::MAX) {
+        if row.width() <= columns {
+            rows.push(row);
+            continue;
+        }
+        let mut chunk = Vec::new();
+        let mut used = 0;
+        // The wrapper emits one complete grapheme per span.
+        for span in row.spans {
+            let span_width = span.width();
+            if used + span_width > columns && !chunk.is_empty() {
+                rows.push(Line::from(std::mem::take(&mut chunk)));
+                used = 0;
+            }
+            used += span_width;
+            chunk.push(span);
+        }
+        if !chunk.is_empty() {
+            rows.push(Line::from(chunk));
+        }
     }
+    rows
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
-    let mut lines = vec![Line::raw("")];
-    let width = f.area().width.saturating_sub(6).min(66).max(1) as usize;
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        form.viewport.set(Default::default());
+        return;
+    }
+    // In very narrow terminals use all columns so a two-column grapheme
+    // still fits. A one-column frame can only paint one-column graphemes.
+    let bordered = area.width >= 6 && area.height >= 3;
+    let border = if bordered { 2 } else { 0 };
+    let width = area.width.saturating_sub(border).min(72);
+    let inner_width = width - border;
+    let wrap = |line: Line<'_>| settings_form_rows(line, inner_width);
+    let mut body = vec![Line::raw("")];
     for text in &form.review {
-        let chars: Vec<char> = text.chars().collect();
-        for part in chars.chunks(width) {
-            lines.push(Line::raw(part.iter().collect::<String>()));
+        for line in text.split('\n') {
+            body.extend(wrap(Line::raw(line)));
         }
     }
+    let mut active_rows = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
-        let text = if field.masked {
+        let mut text = if field.masked {
             "•".repeat(field.input.chars().count())
         } else {
             field.input.to_string()
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} {:<12}", if active { "›" } else { " " }, field.label),
-                if active {
-                    bold_fg(color, Color::Green)
-                } else {
-                    ui::dim(color)
-                },
-            ),
-            Span::raw(if active { format!("{text}▏") } else { text }),
-        ]));
         if active {
-            lines.push(Line::styled(
+            text.push('▏');
+        }
+        let start = body.len();
+        for (row, line) in text.split('\n').enumerate() {
+            if row == 0 {
+                body.extend(wrap(Line::from(vec![
+                    Span::styled(
+                        format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                        if active {
+                            bold_fg(color, Color::Green)
+                        } else {
+                            ui::dim(color)
+                        },
+                    ),
+                    Span::raw(line),
+                ])));
+            } else {
+                body.extend(wrap(Line::raw(line)));
+            }
+        }
+        if active {
+            active_rows = Some(start..body.len());
+            body.extend(wrap(Line::styled(
                 format!("               {}", field.hint),
                 ui::dim(color),
-            ));
+            )));
         }
     }
-    if let Some(e) = &form.error {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}")),
-            fg(color, Color::Red),
-        ));
+    if let Some(error) = &form.error {
+        body.push(Line::raw(""));
+        let title = ui::status_text(color, SemanticTone::Bad, format!("  ✗ {error}"));
+        for line in title.split('\n') {
+            body.extend(wrap(Line::styled(line, fg(color, Color::Red))));
+        }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
+
+    let capacity = usize::from(area.height - border);
+    let mut footer = wrap(Line::styled(
         "  Tab/↑↓ field · Enter next, then save · Esc cancel",
         ui::dim(color),
     ));
-    let area = f.area();
-    let w = 72.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 3,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(format!(" {} ", form.title), color, Color::Cyan))
-            .wrap(Wrap { trim: false }),
-        rect,
+    if footer.len() >= capacity {
+        // Leave room to follow the active field even at one terminal row.
+        // The full footer remains reachable by paging through the body.
+        body.push(Line::raw(""));
+        body.append(&mut footer);
+    } else if body.len() + footer.len() < capacity {
+        footer.insert(0, Line::raw(""));
+    } else {
+        let hint = wrap(Line::styled("  PgUp/PgDn scroll form", ui::dim(color)));
+        if footer.len() + hint.len() + 1 < capacity {
+            footer.extend(hint);
+        }
+    }
+
+    let mut viewport = form.viewport.get();
+    viewport.page = body.len().min(capacity - footer.len());
+    viewport.max_top = body.len() - viewport.page;
+    if !viewport.inspecting {
+        if let Some(active) = active_rows {
+            let first_with_end = active.end.saturating_sub(viewport.page);
+            // Keep the entire active field visible when it fits. Otherwise
+            // keep its trailing editing marker in view.
+            viewport.top = viewport
+                .top
+                .clamp(first_with_end, active.start.max(first_with_end));
+        }
+    }
+    viewport.top = viewport.top.min(viewport.max_top);
+    form.viewport.set(viewport);
+
+    let height = (viewport.page + footer.len()) as u16 + border;
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 3,
+        width,
+        height,
     );
+    f.render_widget(Clear, rect);
+    let inner = if bordered {
+        let panel = ui::panel(format!(" {} ", form.title), color, Color::Cyan);
+        let inner = panel.inner(rect);
+        f.render_widget(panel, rect);
+        inner
+    } else {
+        rect
+    };
+    let rows = body
+        .into_iter()
+        .skip(viewport.top)
+        .take(viewport.page)
+        .chain(footer)
+        .collect();
+    f.render_widget(review_wrap::Rows(rows), inner);
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -23302,6 +23415,144 @@ mod tests {
     }
 
     #[test]
+    fn settings_form_paging_reads_the_body_without_submitting_or_revealing_masked_text() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.view = View::Settings;
+        let mut form = settings::Form::provider(None);
+        form.review = (0..16).map(|i| format!("review row {i:02}")).collect();
+        form.error = Some("fixture error at end".into());
+        form.fields[0].masked = true;
+        let masked = "ab界e\u{301}";
+        form.fields[0].input.set(masked);
+        app.settings_form = Some(form);
+
+        let first = render(&mut app, 65, 9);
+        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("Enter next, then save"), "{first}");
+        assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
+        assert!(!first.contains("ab界"), "{first}");
+        let form = app.settings_form.as_ref().unwrap();
+        let original_index = form.idx;
+        let original_cursor = form.fields[original_index].input.cursor_byte();
+        let original_top = form.viewport.get().top;
+
+        app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            original_top
+        );
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageUp));
+        }
+        let intro = render(&mut app, 65, 9);
+        assert!(intro.contains("review row 00"), "{intro}");
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageDown));
+        }
+        let tail = render(&mut app, 65, 9);
+        assert!(tail.contains("fixture error at end"), "{tail}");
+        assert!(tail.contains("Enter next, then save"), "{tail}");
+        let form = app.settings_form.as_ref().unwrap();
+        assert_eq!(form.idx, original_index);
+        assert_eq!(
+            form.fields[original_index].input.cursor_byte(),
+            original_cursor
+        );
+        assert_eq!(form.fields[original_index].input, masked);
+        assert_eq!(form.error.as_deref(), Some("fixture error at end"));
+        assert!(sent.try_recv().is_err());
+
+        app.key(key(KeyCode::Left));
+        let followed = render(&mut app, 65, 9);
+        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(!followed.contains("ab界"), "{followed}");
+        app.paste("X");
+        let edited = render(&mut app, 65, 9);
+        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(!edited.contains("ab界"), "{edited}");
+        app.key(key(KeyCode::Tab));
+        let next_field = render(&mut app, 65, 9);
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, original_index + 1);
+        assert!(next_field.contains("› base_url"), "{next_field}");
+        assert!(sent.try_recv().is_err());
+    }
+
+    fn render_only_settings_form(form: &settings::Form, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings_form(frame, form, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn settings_form_reflows_wide_graphemes_and_keeps_the_tiny_footer_reachable() {
+        let mut form = settings::Form::provider(None);
+        let value = format!("{} end", "界e\u{301}".repeat(65));
+        form.fields[0].input.set(&value);
+        for (width, height) in [(60, 18), (27, 8), (1, 1), (15, 2), (60, 20)] {
+            let screen = render_only_settings_form(&form, width, height);
+            let viewport = form.viewport.get();
+            assert!(viewport.top <= viewport.max_top);
+            assert!(viewport.page > 0 && viewport.page <= usize::from(height));
+            assert!(screen.contains('▏'), "{width}x{height}: {screen}");
+        }
+        let screen = render_only_settings_form(&form, 60, 20);
+        assert!(
+            screen.contains("e\u{301}") && screen.contains("end▏"),
+            "{screen}"
+        );
+        assert!(screen.contains("Enter next, then save"), "{screen}");
+        render_only_settings_form(&form, 15, 2);
+        let mut viewport = form.viewport.get();
+        for _ in 0..viewport.max_top {
+            viewport.page(true);
+        }
+        form.viewport.set(viewport);
+        let tail = render_only_settings_form(&form, 15, 2);
+        assert!(
+            tail.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("Esc cancel"),
+            "{tail}"
+        );
+        assert_eq!(form.fields[0].input, value.as_str());
+        assert_eq!(form.idx, 0);
+    }
+
+    #[test]
+    fn settings_form_preserves_wide_text_at_narrow_and_right_edges() {
+        for width in 2..=5 {
+            let mut form = settings::Form::provider(None);
+            form.fields[0].input.set("a界");
+            let screen = render_only_settings_form(&form, width, 16);
+            assert!(screen.contains('界'), "{width} columns: {screen}");
+        }
+        for width in 2..=8 {
+            let value = format!("{}界", "a".repeat(usize::from(width - 1)));
+            let rows = settings_form_rows(Line::raw(&value), width);
+            assert_eq!(
+                rows.iter().map(ToString::to_string).collect::<String>(),
+                value,
+                "{width} columns"
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
+
+    #[test]
     fn active_settings_form_owns_tabs_after_overlays_without_hidden_form_capture() {
         let mut app = test_app();
         let (client, sent) = DaemonClient::recording();
@@ -23351,6 +23602,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             cursors
         );
+        render(&mut app, 65, 9);
+        let form_top = app.settings_form.as_ref().unwrap().viewport.get().top;
         app.pager = Some(Pager {
             title: "overlay".into(),
             lines: vec!["first".into()],
@@ -23361,7 +23614,12 @@ mod tests {
         });
         app.key(key(KeyCode::Tab));
         app.key(key(KeyCode::BackTab));
+        app.key(key(KeyCode::PageDown));
         assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            form_top
+        );
         assert!(app.pager.is_some());
         assert_eq!(app.view, View::Settings);
         assert!(
