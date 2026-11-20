@@ -13214,7 +13214,7 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
     }
     let when = |t: &Option<String>| {
         t.as_deref()
-            .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+            .map(|s| ui::local_timestamp(s).replace('T', " "))
             .unwrap_or_else(|| "-".into())
     };
     let w = rows
@@ -13229,8 +13229,10 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
         .max()
         .unwrap_or(10)
         .max(10);
+    // The minute stamp includes a space and a six-column numeric offset.
+    const TIME_WIDTH: usize = 23;
     let mut out = vec![format!(
-        "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  LAST USED",
+        "{:w$}  {:cw$}  {:7}  {:TIME_WIDTH$}  {:6}  {:TIME_WIDTH$}  LAST USED",
         "TOOL", "CAPABILITY", "SCOPE", "GRANTED", "BY", "ENDS"
     )];
     for g in rows {
@@ -13240,7 +13242,7 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
             _ => "always",
         };
         out.push(format!(
-            "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  {}",
+            "{:w$}  {:cw$}  {:7}  {:TIME_WIDTH$}  {:6}  {:TIME_WIDTH$}  {}",
             g.tool_name,
             g.capability,
             scope,
@@ -19422,6 +19424,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
 }
 
 pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
 /// Subcommands reserve their leading root rather than a separate namespace.
@@ -24450,6 +24453,17 @@ mod tests {
                 && all[1].contains("web")
         );
         assert!(all[2].contains("env:HOME") && all[2].contains("hour"));
+        let when = chrono::DateTime::parse_from_rfc3339("2026-10-24T13:43:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string();
+        let by = all[0].find("BY").unwrap();
+        let granted = all[0].find("GRANTED").unwrap();
+        let ends = all[0].find("ENDS").unwrap();
+        assert_eq!(all[1][granted..by].trim_end(), when);
+        assert_eq!(&all[1][by..by + 3], "web");
+        assert_eq!(&all[1][ends..ends + 1], "-");
         let env = approval_lines(&grants, Some("env"));
         assert_eq!(env.iter().filter(|l| l.contains("netty")).count(), 1);
         assert_eq!(

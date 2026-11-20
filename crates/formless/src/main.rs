@@ -45,6 +45,7 @@ use formless_core::{Config, Paths};
 use formless_protocol::{
     ApprovalScope, Event, Question, QuestionAnswer, Request, SendMode, ServerMessage, SessionInfo,
 };
+use formless_tui::local_timestamp;
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -1510,10 +1511,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                 tbl.row(vec![
                     t(d.capability.clone(), Tone::Warn),
                     c(d.tool_name.clone()),
-                    c(d.created_at
-                        .get(..16)
-                        .unwrap_or(&d.created_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&d.created_at).replace('T', " ")),
                     c(if d.denied_by.is_empty() {
                         "-".to_string()
                     } else {
@@ -1536,7 +1534,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
             }
             let when = |t: &Option<String>| {
                 t.as_deref()
-                    .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+                    .map(|s| local_timestamp(s).replace('T', " "))
                     .unwrap_or_else(|| "-".into())
             };
             let mut tbl = Table::new(&[
@@ -3001,8 +2999,8 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                         } else {
                             &c.user_agent
                         },
-                        c.first_seen.get(..16).unwrap_or(&c.first_seen),
-                        c.last_seen.get(..16).unwrap_or(&c.last_seen)
+                        local_timestamp(&c.first_seen),
+                        local_timestamp(&c.last_seen)
                     );
                 }
             }
@@ -6083,7 +6081,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             println!(
                 "{} messages · updated {}{}{}",
                 s.message_count,
-                s.updated_at.get(..16).unwrap_or(&s.updated_at),
+                local_timestamp(&s.updated_at),
                 s.model
                     .as_deref()
                     .map(|m| format!(" · {m}"))
@@ -6425,12 +6423,7 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
         return out;
     }
     for hit in hits {
-        // Same boundary-safe stored date/time presentation as other CLI rows.
-        let time = hit
-            .created_at
-            .get(..16)
-            .unwrap_or(&hit.created_at)
-            .replace('T', " ");
+        let time = local_timestamp(&hit.created_at).replace('T', " ");
         let short_id: String = hit.session_id.chars().take(8).collect();
         let _ = writeln!(
             out,
@@ -6986,8 +6979,8 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                     c(j["cron"].as_str().unwrap_or("once")),
                     c(j["next_run"]
                         .as_str()
-                        .map(|n| n.get(..16).unwrap_or(n))
-                        .unwrap_or("-")),
+                        .map(local_timestamp)
+                        .unwrap_or_else(|| "-".into())),
                     t(
                         last,
                         if last == "completed" {
@@ -7104,10 +7097,7 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             for r in runs {
                 let took = format_job_history_duration(&r.started_at, r.finished_at.as_deref());
                 tbl.row(vec![
-                    c(r.started_at
-                        .get(..16)
-                        .unwrap_or(&r.started_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&r.started_at).replace('T', " ")),
                     c(r.trigger),
                     t(
                         r.status.clone(),
