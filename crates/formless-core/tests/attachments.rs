@@ -217,6 +217,15 @@ async fn retention_marks_sent_attachments_expired() {
     );
 }
 
+#[test]
+fn composer_auth_mentions_use_the_credential_classifier() {
+    let home = std::env::temp_dir().join("formless-home");
+    assert!(credential_path(&home.join(".composer/auth.json")).is_some());
+    assert!(credential_path(&home.join(".config/Composer/AUTH.JSON")).is_some());
+    assert!(credential_path(&home.join("auth.json")).is_none());
+    assert!(credential_path(&home.join(".composer/cache/auth.json")).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mentions_never_take_credentials_or_leave_the_folder() {
     let (paths, sid) = setup("mention");
