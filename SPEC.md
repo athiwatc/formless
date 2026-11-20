@@ -6762,8 +6762,9 @@ Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
 returned stalled/abandoned flags and optional progress fraction/label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
-Outer `runs --json running` is also supported. An explicitly supplied
-`--limit` conflicts with this unbounded snapshot and fails before connection.
+Outer `runs --json running` is also supported. `--limit` applies only to the
+Runs list. With `running`, `show`, or `cancel`, an explicit `--limit` is a
+usage error before connection.
 There is no polling or Invocation control action.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;

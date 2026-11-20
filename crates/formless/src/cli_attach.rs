@@ -201,13 +201,13 @@ pub(super) fn validate_runs_limit(cli: &Cli) -> Result<()> {
     if matches!(
         &cli.cmd,
         Some(Cmd::Runs {
-            action: Some(RunsAction::Running { .. }),
+            action: Some(_),
             limit: Some(_),
             ..
         })
     ) {
         return Err(super::usage(
-            "--limit applies to the stored Run list, not the live Invocation snapshot",
+            "--limit applies only to the Runs list, not its subcommands",
         ));
     }
     Ok(())
@@ -644,6 +644,37 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_runs_limit_is_rejected_for_show_and_cancel_only_when_supplied() {
+        for action in ["show", "cancel"] {
+            for limit in ["0", "5", "20"] {
+                let cli = Cli::try_parse_from([
+                    "formless",
+                    "runs",
+                    "--limit",
+                    limit,
+                    action,
+                    "fixture-id",
+                ])
+                .unwrap();
+                let error = validate_runs_limit(&cli).unwrap_err();
+                assert_eq!(super::super::exit_code(&error), 2);
+                assert!(error
+                    .to_string()
+                    .contains("--limit applies only to the Runs list"));
+            }
+            for args in [
+                vec!["formless", "runs", action, "fixture-id"],
+                vec!["formless", "runs", action, "fixture-id", "--json"],
+                vec!["formless", "runs", "--json", action, "fixture-id"],
+            ] {
+                validate_runs_limit(&Cli::try_parse_from(args).unwrap()).unwrap();
+            }
+        }
+        validate_runs_limit(&Cli::try_parse_from(["formless", "runs"]).unwrap()).unwrap();
+    }
+
     #[test]
     fn live_snapshot_json_placements_and_explicit_limit_validation() {
         for args in [

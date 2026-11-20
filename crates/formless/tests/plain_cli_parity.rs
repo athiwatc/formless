@@ -1979,6 +1979,30 @@ fn cancellation_reply(id: &str) -> Value {
 }
 
 #[test]
+fn shipped_run_subcommands_reject_list_limit_before_contact() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["runs", "--limit", "5", "show", "completed"],
+        vec!["runs", "--limit", "0", "show", "completed", "--json"],
+        vec!["runs", "--json", "--limit", "20", "show", "completed"],
+        vec!["runs", "--limit", "5", "cancel", "fixture-id"],
+        vec!["runs", "--limit", "20", "cancel", "fixture-id", "--json"],
+        vec!["runs", "--json", "--limit", "0", "cancel", "fixture-id"],
+    ] {
+        let out = fixture.run(&args);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            stderr.contains("--limit applies only to the Runs list"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete() {
     let fixture = Fixture::new();
     for (status, exit) in [
