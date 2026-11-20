@@ -249,6 +249,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn rename_error(from: &Path, to: &Path, error: std::io::Error) -> String {
+    let mut message = format!("rename {} -> {}: {error}", from.display(), to.display());
+    if error.kind() == std::io::ErrorKind::CrossesDevices {
+        message.push_str(" (fs.rename cannot move directly across file systems)");
+    }
+    message
+}
+
 /// Set how many `tools.call` Invocations one sandbox may have in
 /// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
 pub fn set_max_parallel_calls(n: u64) {
@@ -1721,7 +1729,7 @@ impl State {
                         "readonly": m.permissions().readonly(),
                     })),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(format!("{}: {e}", p.display())),
                 }
             }
             "fs_list" => self.fs_list(a),
@@ -1812,7 +1820,7 @@ impl State {
                 if let Some(parent) = to.parent() {
                     self.create_tracked_directories(parent)?;
                 }
-                std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+                std::fs::rename(&from, &to).map_err(|e| rename_error(&from, &to, e))?;
                 self.changed(a["from"].as_str().unwrap_or_default(), &from, "rename");
                 self.changed(a["to"].as_str().unwrap_or_default(), &to, "rename");
                 Ok(Value::Null)
@@ -1831,14 +1839,14 @@ impl State {
                     }
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
-                        let mut f =
-                            std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-                        let total = f.metadata().map_err(|e| e.to_string())?.len();
-                        f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                        let path_error = |e| format!("{}: {e}", p.display());
+                        let mut f = std::fs::File::open(&p).map_err(path_error)?;
+                        let total = f.metadata().map_err(path_error)?.len();
+                        f.seek(SeekFrom::Start(offset)).map_err(path_error)?;
                         let mut buf = Vec::with_capacity(size);
                         f.take(size as u64)
                             .read_to_end(&mut buf)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(path_error)?;
                         (buf, total)
                     }
                 };
@@ -1886,7 +1894,7 @@ impl State {
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
                 for e in rd {
-                    let e = e.map_err(|e| e.to_string())?;
+                    let e = e.map_err(|e| format!("{}: {e}", p.display()))?;
                     let name = e.file_name().to_string_lossy().to_string();
                     let entry_path = e.path();
                     let raw_entry = entry_path
@@ -3546,6 +3554,58 @@ mod tests {
                 && error.contains("fs.readChunks")
                 && error.contains("fs.readLines")
         );
+    }
+
+    #[test]
+    fn fs_error_messages_name_the_paths_and_explain_cross_filesystem_renames() {
+        let fixture = std::env::temp_dir().join(format!("fl-io-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&fixture).unwrap();
+        struct RemoveDirectory(PathBuf);
+        impl Drop for RemoveDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectory(fixture.clone());
+        let root = fixture.canonicalize().unwrap();
+        let from = root.join("missing.txt");
+        let to = root.join("destination.txt");
+        let run = |code: &str| {
+            let mut request = live(code);
+            request.caps = Capabilities::parse(&[
+                format!("fs:read:{}", root.display()),
+                format!("fs:write:{}", root.display()),
+            ])
+            .unwrap();
+            request.input = json!({"root": root, "from": from, "to": to});
+            execute(&request, Arc::new(NoHostOps))
+        };
+        let error = run("function run(i) { fs.rename(i.from, i.to); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error
+                .message
+                .contains(&format!("rename {} -> {}", from.display(), to.display())),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            run("function run(i) { return fs.stat(i.from); }")
+                .unwrap()
+                .output,
+            Value::Null
+        );
+
+        let error = run("function run(i) { fs.readChunks(i.root, 16, () => {}); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error.message.contains(&root.display().to_string()),
+            "{}",
+            error.message
+        );
+
+        let error = rename_error(&from, &to, std::io::ErrorKind::CrossesDevices.into());
+        assert!(error.contains("fs.rename cannot move directly across file systems"));
     }
 
     #[test]
