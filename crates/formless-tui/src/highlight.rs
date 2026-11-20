@@ -9,6 +9,83 @@ use ratatui::prelude::*;
 
 use super::fg;
 
+struct YamlScalar {
+    header_indent: usize,
+    content_indent: Option<usize>,
+}
+
+fn yaml_mapping_value(key: &str) -> Option<&str> {
+    let mut bytes = key.bytes().enumerate().peekable();
+    let mut quote = bytes
+        .peek()
+        .map(|&(_, byte)| byte)
+        .filter(|byte| matches!(byte, b'\'' | b'"'));
+    if quote.is_some() {
+        bytes.next();
+    }
+    while let Some((i, byte)) = bytes.next() {
+        if let Some(q) = quote {
+            if q == b'"' && byte == b'\\' {
+                bytes.next();
+            } else if byte == q {
+                if q == b'\'' && bytes.peek().is_some_and(|&(_, next)| next == q) {
+                    bytes.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if byte == b'#' && (i == 0 || key.as_bytes()[i - 1].is_ascii_whitespace()) {
+            break;
+        } else if i > 0
+            && byte == b':'
+            && bytes
+                .peek()
+                .is_some_and(|&(_, next)| matches!(next, b' ' | b'\t'))
+        {
+            return Some(key[i + 1..].trim_start_matches([' ', '\t']));
+        }
+    }
+    None
+}
+
+fn yaml_scalar_header(line: &str) -> Option<YamlScalar> {
+    let line = line.trim_end_matches('\r');
+    let mut rest = line.trim_start_matches(' ');
+    let mut header_indent = line.len() - rest.len();
+    while let Some(after_dash) = rest
+        .strip_prefix('-')
+        .filter(|value| value.starts_with([' ', '\t']))
+    {
+        header_indent = line.len() - rest.len();
+        rest = after_dash.trim_start_matches([' ', '\t']);
+    }
+    if !rest.starts_with(['|', '>']) {
+        header_indent = line.len() - rest.len();
+        rest = yaml_mapping_value(rest)?;
+    }
+    let suffix = rest.strip_prefix(['|', '>'])?;
+    let (modifiers, tail) = suffix.split_at(suffix.find([' ', '\t']).unwrap_or(suffix.len()));
+    let tail = tail.trim_start_matches([' ', '\t']);
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return None;
+    }
+    let mut content_indent = None;
+    let mut chomp = false;
+    for byte in modifiers.bytes() {
+        match byte {
+            b'1'..=b'9' if content_indent.is_none() => {
+                content_indent = Some(header_indent + usize::from(byte - b'0'))
+            }
+            b'+' | b'-' if !chomp => chomp = true,
+            _ => return None,
+        }
+    }
+    Some(YamlScalar {
+        header_indent,
+        content_indent,
+    })
+}
+
 struct Lang {
     line_comments: &'static [&'static str],
     block_comment: Option<(&'static str, &'static str)>,
@@ -509,6 +586,8 @@ pub(crate) struct Highlighter {
     in_block: usize,
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
+    yaml: bool,
+    yaml_scalar: Option<YamlScalar>,
     js_typescript: bool,
 }
 
@@ -628,6 +707,8 @@ impl Highlighter {
             json5_strings: name == "json5",
             color,
             in_block: 0,
+            yaml: matches!(name.as_str(), "yaml" | "yml"),
+            yaml_scalar: None,
             in_str: None,
             js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
         })
@@ -650,6 +731,19 @@ impl Highlighter {
     /// Highlight one line; open block comments and multi-line strings
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
+        if self.yaml {
+            if let Some(scalar) = &mut self.yaml_scalar {
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                let blank = line.trim().is_empty();
+                if blank || indent >= scalar.content_indent.unwrap_or(scalar.header_indent + 1) {
+                    if !blank {
+                        scalar.content_indent.get_or_insert(indent);
+                    }
+                    return vec![Span::styled(line.to_owned(), self.style(Tok::Str))];
+                }
+            }
+            self.yaml_scalar = yaml_scalar_header(line);
+        }
         let l = self.lang;
         let mysql = self.mysql_comments;
         let php = self.php_comments;
@@ -1520,6 +1614,56 @@ mod tests {
         let t = toks("rust", "fn f<'a>(x: &'a str) -> Vec<u8>");
         assert!(t.contains(&("Vec".into(), Some(Color::Cyan))));
         assert!(Highlighter::new("brainfuck", true).is_none());
+    }
+
+    #[test]
+    fn yaml_block_scalars_keep_indented_punctuation_in_string_spans() {
+        for alias in ["YAML", "yml"] {
+            let mut highlighter = Highlighter::new(alias, true).unwrap();
+            let header = highlighter.line("msg: | # header");
+            assert_eq!(header.last().unwrap().content, "# header");
+            assert!(header
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC));
+            for line in [
+                "",
+                "  keep # literal",
+                "    nested: text",
+                "  # still literal",
+            ] {
+                let spans = highlighter.line(line);
+                assert_eq!(
+                    (spans[0].content.as_ref(), spans[0].style.fg),
+                    (line, Some(Color::Green))
+                );
+                assert_eq!(spans.len(), 1);
+            }
+            assert!(highlighter
+                .line("next: after")
+                .iter()
+                .any(|span| { span.content == "next" && span.style.fg == Some(Color::Blue) }));
+        }
+
+        let mut highlighter = Highlighter::new("yaml", true).unwrap();
+        highlighter.line("- 'with: colon': >+2");
+        assert_eq!(
+            highlighter.line("    body # still text")[0].style.fg,
+            Some(Color::Green)
+        );
+        let next = highlighter.line("  next: \"quoted # value\" # tail");
+        assert!(next
+            .iter()
+            .any(|span| span.content == "next" && span.style.fg == Some(Color::Blue)));
+        assert_eq!(next.last().unwrap().content, "# tail");
+
+        assert!(yaml_scalar_header("bad: |22").is_none());
+        assert!(yaml_scalar_header("quoted: '|'").is_none());
+        assert!(yaml_scalar_header("# fake: >").is_none());
+        assert!(yaml_scalar_header("flow: {key: >}").is_none());
+        assert!(yaml_scalar_header("- |- ").is_some());
     }
 
     #[test]

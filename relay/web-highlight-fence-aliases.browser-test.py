@@ -11,6 +11,12 @@ from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent
 FAMILIES = [
+    (('yaml', 'YML'), 'msg: | # header\n\n  keep # literal\n  name: text\nnext: "quoted # value" # tail',
+     [('tok-key', 'msg'), ('tok-com', '# header'), ('tok-str', '  keep # literal'),
+      ('tok-str', '  name: text'), ('tok-key', 'next'), ('tok-str', '"quoted # value"'), ('tok-com', '# tail')]),
+    (('yaml',), 'parent:\n  folded: >+2\n    # string\n  after: true',
+     [('tok-key', 'parent'), ('tok-key', 'folded'), ('tok-num', '2'), ('tok-str', '    # string'),
+      ('tok-key', 'after'), ('tok-lit', 'true')]),
     (('c#', 'C#', 'cs', 'csharp', 'f#', 'fsharp', 'objc'),
      'class Item {} // comment', [('tok-kw', 'class'), ('tok-type', 'Item'), ('tok-com', '// comment')]),
     (('dockerfile', 'docker', 'make', 'makefile', 'mk', 'ruby', 'rb', 'perl', 'pl', 'elixir', 'ex', 'exs', 'r'),
