@@ -362,8 +362,11 @@
     const s = (Date.parse(ts) - Date.now()) / 1000;
     if (isNaN(s)) return ts || "";
     if (s <= 0) return "ended";
-    if (s < 3600) return "in " + uiFormat(Math.max(1, Math.ceil(s / 60))) + "m";
-    return "in " + uiFormat(Math.round(s / 3600)) + "h";
+    if (s < 60) return "in less than 1m";
+    const minutes = Math.floor(s / 60);
+    const hours = Math.floor(minutes / 60), remainder = minutes % 60;
+    return "in " + (hours ? uiFormat(hours) + "h" + (remainder ? " " : "") : "")
+      + (!hours || remainder ? uiFormat(remainder) + "m" : "");
   }
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
@@ -2243,8 +2246,11 @@
       h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
-  function toolResultChip(content) {
-    const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
+  function toolResultChip(content, meta) {
+    // The daemon stores the error outcome separately from arbitrary output.
+    // Older or incomplete transcripts may not carry a recorded failure.
+    let failed = false;
+    try { failed = JSON.parse(meta || "{}")?.is_error === true; } catch (_) {}
     const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
@@ -2910,7 +2916,7 @@
             ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
             ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
         } else if (m.role === "tool") {
-          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
+          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || "", m.meta))));
         } else if (m.role === "system-note") {
           open("system-note", m.created_at).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
         } else {
