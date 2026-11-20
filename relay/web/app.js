@@ -292,6 +292,8 @@
       "Send": "ส่ง", "Steer": "ปรับทิศ", "Re-run": "ส่งใหม่", "Stop": "หยุด",
       "Message Formless…": "พิมพ์ข้อความถึง Formless…",
       "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
+      "Recent retained calls": "การเรียกใช้ล่าสุดที่เก็บไว้", "Succeeded": "สำเร็จ", "Failed": "ล้มเหลว",
+      "Recent sample trend": "แนวโน้มตัวอย่างล่าสุด", "up": "เพิ่มขึ้น", "down": "ลดลง", "no arrow": "ไม่มีลูกศร",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
@@ -408,6 +410,28 @@
   }
   function bar(r) {
     return h("span", { class: "bar " + rateClass(r) }, h("i", { style: "width:" + Math.round((r || 0) * 100) + "%" }));
+  }
+  // Same two-window descriptive rule as the TUI; retained outcomes, not a forecast.
+  function recentCalls(recent) {
+    if (typeof recent !== "string" || !recent.length || /[^sf]/.test(recent)) return null;
+    const outcomes = recent.slice(-40), now = outcomes.slice(-20), before = outcomes.slice(0, -20);
+    const successes = text => [...text].filter(c => c === "s").length;
+    const succeeded = successes(now), failed = now.length - succeeded;
+    const delta = before.length >= 5 && now.length >= 5 ? succeeded / now.length - successes(before) / before.length : 0;
+    return { now, succeeded, failed, trend: delta >= 0.1 ? "up" : delta <= -0.1 ? "down" : "none" };
+  }
+  function toolRecent(recent) {
+    const sample = recentCalls(recent);
+    if (!sample) return null;
+    const { now, succeeded, failed, trend } = sample;
+    const arrow = trend === "up" ? " ↑" : trend === "down" ? " ↓" : "";
+    const label = tr("Recent retained calls") + ": " + uiFormat(now.length) + "; " +
+      tr("Succeeded") + ": " + uiFormat(succeeded) + "; " + tr("Failed") + ": " + uiFormat(failed) +
+      "; " + tr("Recent sample trend") + ": " + tr(trend === "up" ? "up" : trend === "down" ? "down" : "no arrow");
+    return h("span", { class: "tool-recent", role: "img", "aria-label": label },
+      h("span", { class: "tool-recent-bars", "aria-hidden": "true" }, [...now].map(c =>
+        h("span", { class: c === "s" ? "rate-good success" : "rate-bad failure" }))),
+      h("span", { class: "tool-recent-counts", "aria-hidden": "true" }, uiFormat(succeeded) + "/" + uiFormat(now.length) + " ✓" + arrow));
   }
   function summarizeArgs(args) {
     let obj;
@@ -4420,7 +4444,7 @@
       h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
-      h("td", { class: "num" }, rateCell(t.success_rate)),
+      h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
       h("td", { class: "muted" }, t.invocations ? relTime(t.updated_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
