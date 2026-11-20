@@ -36,6 +36,19 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn pulumi_mentions_warn_for_credentials_in_the_pulumi_directory() {
+    for path in [
+        ".pulumi/credentials.json",
+        "project/.PULUMI/CREDENTIALS.JSON",
+    ] {
+        assert!(credential_path(path.as_ref()).is_some(), "{path}");
+    }
+    for path in ["project/credentials.json", ".pulumi/stacks/dev.json"] {
+        assert!(credential_path(path.as_ref()).is_none(), "{path}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");

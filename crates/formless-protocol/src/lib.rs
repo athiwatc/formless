@@ -817,6 +817,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     {
         return Some((true, "holds account credentials".into()));
     }
+    if is_pulumi_credentials_path(std::path::Path::new(path)) {
+        return Some((true, "holds Pulumi credentials".into()));
+    }
     if segments.first() == Some(&"etc") {
         return Some((true, "system configuration".into()));
     }
@@ -827,6 +830,21 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     } else {
         (true, format!("outside the working folder {cwd}"))
     })
+}
+
+/// Pulumi stores access tokens in this file under its conventional home.
+pub fn is_pulumi_credentials_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter().rev();
+    let name_matches = |part: &std::ffi::OsStr, expected: &str| {
+        let name = part.to_string_lossy();
+        #[cfg(windows)]
+        let name = name.split(':').next().unwrap_or_default();
+        name.eq_ignore_ascii_case(expected)
+    };
+    parts
+        .next()
+        .is_some_and(|name| name_matches(name, "credentials.json"))
+        && parts.any(|part| name_matches(part, ".pulumi"))
 }
 
 /// One granted Capability, for the central approvals list (SPEC §10.3).
@@ -4031,6 +4049,21 @@ mod tests {
             "HOME",
         ] {
             assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn pulumi_approval_warning_matches_only_credentials_inside_the_namespace() {
+        let credential = "fs:read:/work/.Pulumi/nested/Credentials.json";
+        assert_eq!(
+            path_note(credential, Some("/work")),
+            Some((true, "holds Pulumi credentials".into()))
+        );
+        for path in ["/work/credentials.json", "/work/.pulumi/stacks/dev.json"] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((false, "inside the working folder".into()))
+            );
         }
     }
 
