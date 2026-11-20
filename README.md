@@ -556,6 +556,8 @@ formless tools list       # registry inspection (also export / import)
 formless tools show fetch_page                       # description, schemas, versions, stats
 formless tools reviews                               # retained description warnings and diffs
 formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
+formless tools run fetch_page --input-file request.json
+printf '%s' '{"url":"https://example.com"}' | formless tools run fetch_page --input-file -
 formless reset --force    # destructive: config, key, whole data dir
 ```
 

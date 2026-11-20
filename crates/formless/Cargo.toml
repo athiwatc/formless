@@ -70,7 +70,7 @@ assets = [
     { source = "../../README.md", dest = "/usr/share/doc/formless/README.md", mode = "644", doc = true },
 ]
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

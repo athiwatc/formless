@@ -29,6 +29,7 @@ mod cli_tool_filters;
 
 mod cli_runs_list;
 mod cli_tool_lookup;
+mod cli_tool_run_input;
 mod cli_tool_success;
 mod cli_update;
 mod cli_usage;
@@ -850,9 +851,12 @@ enum ToolsAction {
     Run {
         /// Tool name or id
         name: String,
-        /// The input, a JSON object
-        #[arg(long, default_value = "{}")]
-        input: String,
+        /// Inline JSON object (the default is {} when neither input flag is used)
+        #[arg(long, value_name = "JSON", conflicts_with = "input_file")]
+        input: Option<String>,
+        /// Read a UTF-8 JSON object from FILE or '-' (stdin), at most 1 MiB
+        #[arg(long, value_name = "FILE|-")]
+        input_file: Option<std::path::PathBuf>,
         /// Approve this run's Capabilities once (nothing is remembered)
         #[arg(long)]
         yes: bool,
@@ -2040,6 +2044,19 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     // daemon connection. sessions_cmd validates again for direct callers.
     validate_cli_export_format(&cli)?;
     validate_mcp_prompt_args(&cli)?;
+    // Reject invalid Tool input before resolving a profile or connecting.
+    let tool_run_input = match &cli.cmd {
+        Some(Cmd::Tools {
+            action: ToolsAction::Run {
+                input, input_file, ..
+            },
+        }) => Some(cli_tool_run_input::prepare(
+            input.as_deref(),
+            input_file.as_deref(),
+            std::io::stdin(),
+        )?),
+        _ => None,
+    };
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -2446,7 +2463,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             check,
             json,
         }) => update_cmd(check || matches!(action, Some(UpdateAction::Check)), json),
-        Some(Cmd::Tools { action }) => tools_cmd(paths, action),
+        Some(Cmd::Tools { action }) => tools_cmd(paths, action, tool_run_input),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
         Some(Cmd::Uninstall {
@@ -7839,19 +7856,8 @@ fn set_tool_pinned(paths: &Paths, name: &str, pinned: bool) -> Result<()> {
     Ok(())
 }
 
-fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
+fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -> Result<()> {
     use formless_tui::client::request_once;
-    // Checked here, before a daemon (and a database) is started (#896).
-    if let ToolsAction::Run { input, .. } = &action {
-        if !matches!(
-            serde_json::from_str(input),
-            Ok(serde_json::Value::Object(_))
-        ) {
-            return Err(usage(
-                "--input must be a JSON object, like '{\"url\": \"https://…\"}'",
-            ));
-        }
-    }
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
         ToolsAction::Diff {
@@ -7973,18 +7979,12 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         }
         ToolsAction::Run {
             name,
-            input,
             yes,
             session,
             dry_run,
+            ..
         } => {
-            let input: serde_json::Value = match serde_json::from_str(&input) {
-                Ok(v @ serde_json::Value::Object(_)) => v,
-                _ => {
-                    eprintln!("--input must be a JSON object, like '{{\"url\": \"https://…\"}}'");
-                    std::process::exit(2);
-                }
-            };
+            let input = prepared_input.context("Tool Run input was not prepared")?;
             let tool = find_tool(&paths, &name)?;
             if let Err(e) = formless_tui::client::require_secure_daemon(&paths) {
                 eprintln!("error: {e:#}");

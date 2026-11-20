@@ -115,6 +115,7 @@ impl Fixture {
                 .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut line = String::new();
+                let mut awaiting_tool_approval = None;
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     if fail_organization.load(Ordering::SeqCst)
@@ -166,7 +167,47 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    if let Request::RunTool { session_id, .. } = &envelope.request {
+                        assert!(awaiting_tool_approval.replace(envelope.id).is_none());
+                        let event = json!({
+                            "kind": "event", "type": "approval_requested",
+                            "approval_id": "fixture-approval", "session_id": session_id,
+                            "tool_name": "FetchPage", "version": 1,
+                            "capabilities": ["fixture-capability"], "memory_mb": 16
+                        });
+                        seen.lock().unwrap().push(envelope.request);
+                        if writeln!(socket, "{event}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
+                    if let Request::ApprovalDecision { approved, .. } = &envelope.request {
+                        let run = awaiting_tool_approval
+                            .take()
+                            .expect("private mock Tool Run");
+                        let reply = if *approved {
+                            json!({"kind":"response","id":run,"ok":true,"result":{"ok":true,"result":"synthetic result"}})
+                        } else {
+                            json!({"kind":"response","id":run,"ok":false,"error":"fixture call denied"})
+                        };
+                        seen.lock().unwrap().push(envelope.request);
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::CreateSession { .. } => json!({"id":"owned-tool-session"}),
+                        Request::SetSessionArchived { id, archived } => {
+                            assert_eq!(id, "owned-tool-session");
+                            assert!(*archived);
+                            json!({})
+                        }
+                        Request::DryRunTool { .. } => {
+                            json!({"ok":true,"result":"synthetic preview","effects":[]})
+                        }
                         Request::SetSessionPinned { id, pinned } => {
                             organization_reply(id, Some(!pinned), false)
                         }
@@ -405,8 +446,18 @@ impl Fixture {
         Self::capture(command)
     }
 
-    fn capture(mut command: Command) -> std::process::Output {
+    fn capture(command: Command) -> std::process::Output {
+        Self::capture_with_input(command, None)
+    }
+
+    fn capture_with_input(mut command: Command, input: Option<&[u8]>) -> std::process::Output {
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let out = std::thread::spawn(move || {
@@ -2707,4 +2758,118 @@ fn shipped_run_list_retains_report_json_summary_order_and_numeric_units() {
             since: None
         }
     )));
+}
+
+#[test]
+fn shipped_tool_run_input_sources_keep_dispatch_and_once_approval() {
+    let fixture = Fixture::new();
+    let file = fixture.root.join("input.json");
+    let text = "{\n  \"argument\": \"ไทย 日本語\"\n}";
+    let input: Value = serde_json::from_str(text).unwrap();
+    std::fs::write(&file, text).unwrap();
+    let file = file.to_str().unwrap();
+    for (args, stdin, expected, approved) in [
+        (vec!["--input", text, "--yes"], None, input.clone(), true),
+        (
+            vec!["--input-file", file, "--yes"],
+            None,
+            input.clone(),
+            true,
+        ),
+        (
+            vec!["--input-file", "-", "--yes"],
+            Some(text.as_bytes()),
+            input.clone(),
+            true,
+        ),
+        (vec!["--yes"], None, json!({}), true),
+        (vec!["--input-file", file], None, input.clone(), false),
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let args = ["tools", "run", "FetchPage"]
+            .into_iter()
+            .chain(args)
+            .collect::<Vec<_>>();
+        let out = Fixture::capture_with_input(fixture.command(&args), stdin);
+        assert_eq!(out.status.code(), Some(i32::from(!approved)), "{out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        if approved {
+            assert_eq!(out.stdout, b"synthetic result\n");
+            assert!(stderr.contains("sending approval for this call"));
+        } else {
+            assert!(out.stdout.is_empty());
+            assert!(stderr.contains("sending denial") && stderr.contains("fixture call denied"));
+        }
+        use formless_protocol::ApprovalScope;
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [
+                Request::ListTools,
+                Request::CreateSession { .. },
+                Request::RunTool { id, input, session_id },
+                Request::ApprovalDecision { approval_id, approved: actual, scope: ApprovalScope::Once, remember_denial: false, .. },
+                Request::SetSessionArchived { id: archived_id, archived: true }
+            ] if id == "full-tool-id" && *input == expected
+                && session_id == "owned-tool-session"
+                && archived_id == session_id && approval_id == "fixture-approval"
+                && *actual == approved
+        ));
+    }
+    fixture.requests.lock().unwrap().clear();
+    let preview = fixture.run(&[
+        "tools",
+        "run",
+        "FetchPage",
+        "--input-file",
+        file,
+        "--dry-run",
+    ]);
+    assert!(preview.status.success(), "{preview:?}");
+    assert!(matches!(&fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::CreateSession{..}, Request::DryRunTool{input:actual,..}, Request::SetSessionArchived{..}]
+        if *actual == input));
+}
+
+#[test]
+fn shipped_tool_run_rejects_bad_input_without_opening_a_profile_or_contacting_daemon() {
+    let fixture = Fixture::new();
+    let input = fixture.root.join("invalid.json");
+    let missing = fixture.root.join("missing.json");
+    let absent = fixture.root.join("absent");
+    let connected = fixture.connections.load(Ordering::SeqCst);
+    let check = |file: &str, data: Option<&[u8]>, hint: &str| {
+        for existing in [false, true] {
+            let mut command = fixture.command(&["tools", "run", "FetchPage", "--input-file", file]);
+            if !existing {
+                command
+                    .env("FORMLESS_DATA_DIR", absent.join("data"))
+                    .env("FORMLESS_CONFIG_DIR", absent.join("config"));
+            }
+            let result = Fixture::capture_with_input(command, data);
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            assert!(result.stdout.is_empty());
+            let error = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                error.contains(if file == "-" { "stdin" } else { file }),
+                "{error}"
+            );
+            assert!(error.contains(hint), "{error}");
+        }
+    };
+    check(missing.to_str().unwrap(), None, "cannot read");
+    check(fixture.root.to_str().unwrap(), None, "regular file");
+    for (data, hint) in [
+        (&[0xff][..], "UTF-8"),
+        (&b"invalid fixture payload"[..], "JSON object"),
+        (&b"[]"[..], "JSON object"),
+    ] {
+        std::fs::write(&input, data).unwrap();
+        check(input.to_str().unwrap(), None, hint);
+        check("-", Some(data), hint);
+    }
+    std::fs::write(&input, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    check(input.to_str().unwrap(), None, "1 MiB");
+    assert!(!absent.exists());
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), connected);
 }
