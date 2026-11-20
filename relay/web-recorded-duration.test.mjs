@@ -46,7 +46,7 @@ test('notifications preserve the threshold and describe long finished runs', () 
   start(); advance(1000); finish('completed');
   start(); advance(7200000); finish('completed');
   assert.deepEqual(notices, [
-    ['Run completed', 'Synthetic · 1s'],
-    ['Run completed', 'Synthetic · 2h00m00s'],
+    ['Run completed', 'Synthetic · 1s', 'run_finished', 's'],
+    ['Run completed', 'Synthetic · 2h00m00s', 'run_finished', 's'],
   ]);
 });
