@@ -245,7 +245,7 @@ git clone https://github.com/athiwatc/formless && cd formless
 cargo build --release          # binary at ./target/release/formless
 ```
 
-`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked`.
+`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`.
 
 **Linux packages.** Each release has a `.deb` (`sudo apt install ./formless_<version>_amd64.deb`) and an `.rpm` (`sudo dnf install ./formless-<version>.x86_64.rpm`); Arch users can install `formless-bin` from the AUR once it is published.
 
