@@ -694,6 +694,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             base.as_str(),
             "sh" | "bash"
                 | "zsh"
+                | "csh"
+                | "tcsh"
                 | "fish"
                 | "dash"
                 | "cmd"
@@ -3829,6 +3831,22 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_csh_and_tcsh() {
+        for spec in [
+            "process:csh",
+            "process:tcsh",
+            "process:/bin/tcsh",
+            "process:csh.exe",
+            "process:tcsh:--version",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:csharp", "process:tcsh-helper", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
