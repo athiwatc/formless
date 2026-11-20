@@ -9021,12 +9021,12 @@ impl App {
         use crossterm::event::{MouseButton, MouseEventKind};
         if self.hunk_review_is_visible() {
             match m.kind {
-                MouseEventKind::ScrollUp => {
-                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_sub(3)
-                }
-                MouseEventKind::ScrollDown => {
-                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_add(3)
-                }
+                MouseEventKind::ScrollUp => self
+                    .hunk_review
+                    .move_viewport(hunk_ui::ViewportMove::Rows(-3)),
+                MouseEventKind::ScrollDown => self
+                    .hunk_review
+                    .move_viewport(hunk_ui::ViewportMove::Rows(3)),
                 _ => {}
             }
             return;

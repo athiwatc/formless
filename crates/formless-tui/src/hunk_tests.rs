@@ -75,6 +75,85 @@ fn hunk_open(
 }
 
 #[test]
+fn hunk_review_scroll_stops_at_rendered_edges_and_recovers_immediately() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+
+    let (mut app, tx, sent) = hunk_test_app();
+    let mut review = hunk_fixture();
+    let hunk = &mut review.files[0].hunks[0];
+    hunk.new_lines = 40;
+    hunk.lines = (1..=40)
+        .map(|n| formless_protocol::ReviewLine {
+            kind: "added".into(),
+            old_line: None,
+            new_line: Some(n),
+            text: vec![formless_protocol::ReviewTextSpan {
+                text: format!("diff-row-{n:02} {}\u{1b} tail", "界".repeat(45)),
+                changed: false,
+            }],
+            ending: "\n".into(),
+        })
+        .collect();
+    let second_lines = hunk.lines.clone();
+    review.files[2].hunks[0].lines = second_lines;
+    review.files[2].hunks[0].new_lines = 40;
+    hunk_open(&mut app, &tx, &sent, &review);
+    let (width, height) = (60, 23);
+    let first = render(&mut app, width, height);
+    assert!(first.contains("diff-row-01") && !first.contains("diff-row-40"));
+    for _ in 0..50 {
+        app.key(key(KeyCode::PageDown));
+        app.key(key(KeyCode::Down));
+        app.mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 4,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    let bottom = render(&mut app, width, height);
+    assert!(bottom.contains("diff-row-40"));
+    let offset = app.hunk_review.scroll;
+    app.key(key(KeyCode::Up));
+    let up = render(&mut app, width, height);
+    assert_eq!(app.hunk_review.scroll, offset - 1);
+    let first_diff = |screen: &str| {
+        screen.lines().find(|line| line.contains("diff-row-")).unwrap().to_owned()
+    };
+    assert_ne!(first_diff(&bottom), first_diff(&up));
+
+    app.key(key(KeyCode::End));
+    assert_eq!(render(&mut app, width, height), bottom);
+    app.key(key(KeyCode::PageUp));
+    render(&mut app, width, height);
+    assert!(app.hunk_review.scroll < offset);
+    app.key(key(KeyCode::Home));
+    assert_eq!(render(&mut app, width, height), first);
+
+    for _ in 0..50 {
+        app.key(key(KeyCode::Right));
+    }
+    let right = render(&mut app, width, height);
+    assert!(right.contains("⟨U+001B⟩ tail  ⟨LF⟩"), "{right}");
+    let offset = app.hunk_review.left;
+    assert!(offset > 0);
+    app.key(key(KeyCode::Left));
+    assert_ne!(render(&mut app, width, height), right);
+    assert_eq!(app.hunk_review.left, offset - 8);
+
+    app.key(key(KeyCode::End));
+    render(&mut app, 250, 60);
+    assert_eq!((app.hunk_review.scroll, app.hunk_review.left), (0, 0));
+    // Focus and resize can both change before the next frame.
+    app.key(key(KeyCode::Char('n')));
+    app.key(key(KeyCode::End));
+    let second = render(&mut app, width, height);
+    assert_eq!(app.hunk_review.focus, 1);
+    assert!(second.contains("diff-row-40") && !second.contains("diff-row-01"));
+    assert!(sent.try_recv().is_err(), "viewport navigation sends no requests");
+}
+
+#[test]
 fn hunk_review_reachable_keys_use_opaque_ids_hashes_and_preserve_composer() {
     let _env = credential_env::EnvGuard::isolated();
     let (mut app, tx, sent) = hunk_test_app();
