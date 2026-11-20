@@ -2592,7 +2592,8 @@ impl Provider {
     ) {
         if matches!(
             error,
-            StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
+            StructuredOutputError::InvalidJson { .. }
+                | StructuredOutputError::SchemaViolation { .. }
         ) {
             if let Some(routing) = routing {
                 routing.claim_contract(crate::routing_observation::Identity::new(
@@ -3183,7 +3184,7 @@ impl Provider {
                 return Err(StructuredOutputError::RefusedResponse.into());
             }
             if !result.tool_calls.is_empty() {
-                let error = StructuredOutputError::SchemaViolation;
+                let error = StructuredOutputError::SchemaViolation { summary: None };
                 self.note_output_contract(routing.as_ref(), &result.model_used, &error);
                 return Err(error.into());
             }
