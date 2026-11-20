@@ -919,6 +919,13 @@ impl InputLine {
         }
     }
 
+    pub(super) fn search_paste(&mut self, query: &str, history: &[impl AsRef<str>]) {
+        if let Some((q, m)) = &mut self.search {
+            q.push_str(query);
+            *m = find_back(history, q, history.len());
+        }
+    }
+
     /// Enter: take the match into the input.
     pub fn search_accept(&mut self, history: &[impl AsRef<str>]) {
         if let Some((_, Some(i))) = self.search.take() {

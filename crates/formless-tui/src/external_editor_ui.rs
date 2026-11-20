@@ -15,6 +15,11 @@ pub(super) struct State {
     #[cfg(test)]
     runner: Option<TestRunner>,
 }
+impl State {
+    pub(super) fn awaiting_confirmation(&self) -> bool {
+        self.pending.is_some()
+    }
+}
 struct PendingClear {
     origin: Origin,
     replacement: String,
@@ -378,7 +383,7 @@ impl Drop for TerminalHandoff {
 }
 
 pub(super) fn draw_confirmation(f: &mut Frame, app: &App) {
-    if app.external_edit.pending.is_none() {
+    if !app.external_edit.awaiting_confirmation() {
         return;
     }
     let area = f.area();
@@ -762,6 +767,19 @@ mod tests {
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
     }
+    #[test]
+    fn paste_does_not_confirm_or_edit_behind_external_clear_prompt() {
+        let mut app = crate::tests::test_app();
+        app.input.set("original draft");
+        app.external_edit.pending = Some(PendingClear {
+            origin: Origin::capture(&app).unwrap(),
+            replacement: String::new(),
+        });
+        app.paste("ynq");
+        assert_eq!(app.input.expanded(), "original draft");
+        assert!(app.external_edit.awaiting_confirmation());
+    }
+
     #[test]
     fn ctrl_g_failure_preserves_collapsed_pastes_cursor_vim_attachments_and_scroll() {
         let env = credential_env::EnvGuard::isolated();
