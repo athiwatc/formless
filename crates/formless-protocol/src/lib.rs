@@ -770,6 +770,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         .iter()
         .any(|w| k.contains(w))
             || credential_key
+            || matches!(k.as_str(), "DATABASE_URL" | "REDIS_URL" | "MONGODB_URI")
             || k.ends_with("_PAT");
         if secret {
             return Some("a secret from your environment");
@@ -3976,6 +3977,9 @@ mod tests {
             "env:GITHUB_TOKEN",
             "env:OPENAI_API_KEY",
             "env:DB_PASSWORD",
+            "env:DATABASE_URL",
+            "env:redis_url",
+            "env:MONGODB_URI",
         ] {
             assert!(broad_capability(broad).is_some(), "{broad}");
         }
@@ -3987,6 +3991,8 @@ mod tests {
             "fs:read:/",
             "env:HOME",
             "env:LANG",
+            "env:PUBLIC_URL",
+            "env:DATABASE_URL_SAMPLE",
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
         }

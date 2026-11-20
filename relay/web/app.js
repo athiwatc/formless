@@ -489,6 +489,7 @@
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
       if (credentialKey || k.endsWith("_PAT") ||
+          ["DATABASE_URL", "REDIS_URL", "MONGODB_URI"].includes(k) ||
           ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
         return "a secret from your environment";
       }
