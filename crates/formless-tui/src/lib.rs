@@ -9127,8 +9127,14 @@ impl App {
         if self.wizard.is_some() {
             return;
         }
-        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+        let left_released = matches!(m.kind, MouseEventKind::Up(MouseButton::Left));
+        if left_released {
             self.selecting_draft = false;
+        }
+        // A fullscreen pager covers all hit targets. Keep release cleanup
+        // for both draft editors if a pager appeared during a drag.
+        if self.pager.is_some() && !left_released {
+            return;
         }
         if self.editor.is_none() && self.renaming.is_some() {
             if self.rename_mouse(m) {
@@ -9958,6 +9964,34 @@ impl App {
         }
         if self.list_filter_key(&key) || self.list_nav_key(&key) {
             return;
+        }
+        // Keep filter, overlay and delete-confirmation ownership ahead of list help.
+        if !modal_open
+            && !(self.view == View::Sessions && self.delete_arm.is_some())
+            && !self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::ProposalDiff))
+            && self.branch_summary.intent.is_none()
+            && self.branch_summary.review.is_none()
+            && !self.branch_summary.committing
+            && key.code == KeyCode::Char('?')
+            && query::plain(&key)
+        {
+            if let Some((title, lines)) = keys::contextual_help(self.view) {
+                // A failed diff may leave its owner behind without a pager
+                // or request. Never carry its decision keys into list help.
+                self.reviewing = None;
+                self.pager = Some(Pager {
+                    title: title.into(),
+                    lines,
+                    top: 0,
+                    left: 0,
+                    viewport: Default::default(),
+                    styled: Vec::new(),
+                });
+                return;
+            }
         }
         match self.view {
             View::Settings => self.settings_key(key),
@@ -13245,7 +13279,19 @@ fn compact_status(
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let mut spans = status_left(app, width);
-    let used: usize = spans.iter().map(status_width).sum();
+    let mut used: usize = spans.iter().map(status_width).sum();
+    // Make room for the omission marker without displacing the existing
+    // high-ranked shortcuts or the pending-approval indicator.
+    let reserve = text::width(keys::LIST_MORE) + 3;
+    if width >= reserve
+        && keys::list_footer_truncated(app.view, width.saturating_sub(used + 3))
+        && app.approvals.is_empty()
+        && app.promotions.is_empty()
+    {
+        let status_budget = used.min(width - 3).saturating_sub(reserve);
+        spans = status_left(app, status_budget);
+        used = spans.iter().map(status_width).sum();
+    }
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
     let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
@@ -26664,6 +26710,175 @@ mod tests {
         assert_eq!(short_dir("/a/b"), "/a/b");
         #[cfg(unix)]
         assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
+    }
+
+    #[test]
+    fn list_help_lists_real_bindings_and_preserves_the_view_and_draft() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("synthetic draft");
+        app.input.prepare_selection(true);
+        app.input.left();
+        let cursor = app.input.cursor_byte();
+        let selection = app.input.selection();
+        app.session_idx = 2;
+        app.tool_idx = 3;
+        app.search_idx = 4;
+        app.proposal_idx = 5;
+        app.click_targets
+            .borrow_mut()
+            .push((Rect::new(0, 0, 8, 1), Click::View(View::Chat)));
+        for (view, title, expected) in [
+            (View::Sessions, "Sessions keys", "T  session tree"),
+            (
+                View::Tools,
+                "Tools keys",
+                "z/Z  fold selected group / unfold all",
+            ),
+            (View::Metrics, "Metrics keys", "f  forecast versus actual"),
+            (View::Proposals, "Proposals keys", "Enter  review"),
+            (View::Search, "Search keys", "Enter  open"),
+        ] {
+            app.view = view;
+            app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+            let pager = app.pager.as_ref().unwrap();
+            assert_eq!(pager.title, title);
+            assert!(pager.lines.iter().any(|line| line == expected));
+            for hint in keys::table(view) {
+                assert!(pager
+                    .lines
+                    .contains(&format!("{}  {}", hint.keys, hint.action)));
+            }
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.selecting_draft = true;
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(!app.selecting_draft);
+            assert_eq!(app.view, view);
+            app.key(key(KeyCode::Char('?')));
+            assert_eq!(app.pager.as_ref().unwrap().title, title);
+            app.key(key(if view == View::Sessions {
+                KeyCode::Char('q')
+            } else {
+                KeyCode::Esc
+            }));
+            assert!(app.pager.is_none());
+            assert_eq!(app.view, view);
+            assert_eq!(
+                (
+                    app.session_idx,
+                    app.tool_idx,
+                    app.search_idx,
+                    app.proposal_idx
+                ),
+                (2, 3, 4, 5)
+            );
+            assert_eq!(app.current.as_deref(), Some("s1"));
+            assert_eq!(app.input, "synthetic draft");
+            assert_eq!(app.input.cursor_byte(), cursor);
+            assert_eq!(app.input.selection(), selection);
+        }
+        assert!(sent.try_recv().is_err(), "context help sends no requests");
+    }
+
+    #[test]
+    fn list_help_respects_filters_and_existing_overlay_keys() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            app.key(key(KeyCode::Char('/')));
+            app.key(key(KeyCode::Char('?')));
+            let filter = match view {
+                View::Sessions => &app.session_filter,
+                View::Tools => &app.tool_filter,
+                _ => &app.proposal_filter,
+            };
+            assert_eq!(filter.query, "?");
+            assert!(filter.editing && app.pager.is_none());
+            app.key(key(KeyCode::Esc));
+        }
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.reviewing = Some("awaiting-proposal".into());
+        app.request(
+            Pending::ProposalDiff,
+            Request::ProposalDiff {
+                id: "awaiting-proposal".into(),
+            },
+        );
+        let diff: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_none());
+        assert_eq!(app.reviewing.as_deref(), Some("awaiting-proposal"));
+
+        tx.send(ServerMessage::err(diff.id, "synthetic diff failure".into()))
+            .unwrap();
+        app.drain_daemon();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_some() && app.reviewing.is_none());
+        app.key(key(KeyCode::Char('a')));
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_some());
+        app.key(key(KeyCode::Esc));
+
+        app.view = View::Sessions;
+        app.delete_arm = Some("s1".into());
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.delete_arm.is_none() && app.pager.is_none());
+        assert_eq!(app.notes.last().unwrap(), "delete cancelled");
+
+        app.on_event(reconnect_approval("fixture", "s1"));
+        let explanation = app.approval_explain;
+        app.key(key(KeyCode::Char('?')));
+        assert_ne!(app.approval_explain, explanation);
+        assert!(app.pager.is_none());
+        assert_eq!(app.approvals.len(), 1);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn list_help_marker_survives_a_busy_narrow_status_row() {
+        let mut app = test_app();
+        app.view = View::Tools;
+        app.model_label.clear();
+        let screen = render(&mut app, 40, 16);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("Enter detail") && footer.contains("? more"),
+            "{footer}"
+        );
+
+        app.model_label = "synthetic-model-label".repeat(5);
+        app.context_fill.insert("s1".into(), (70, 100));
+        for view in [
+            View::Sessions,
+            View::Tools,
+            View::Metrics,
+            View::Proposals,
+            View::Search,
+        ] {
+            app.view = view;
+            for width in [40, 60, 80] {
+                let screen = render(&mut app, width, 16);
+                let footer = screen.lines().last().unwrap();
+                assert!(
+                    footer.contains("? more") && footer.contains("ctx 70%"),
+                    "{view:?} {width}: {footer}"
+                );
+            }
+        }
     }
 
     fn branch_summary_test_app() -> (
