@@ -706,7 +706,17 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "doas"
         ) || matches!(
             stem,
-            "python" | "node" | "deno" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
+            "python"
+                | "node"
+                | "deno"
+                | "bun"
+                | "perl"
+                | "ruby"
+                | "php"
+                | "lua"
+                | "luajit"
+                | "pypy"
+                | "tclsh"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -3829,6 +3839,23 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_luajit_and_pypy() {
+        for spec in [
+            "process:luajit",
+            "process:luajit2.1",
+            "process:/usr/bin/luajit",
+            "process:pypy",
+            "process:pypy3",
+            "process:pypy3.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:luajit-helper", "process:pypy-config", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
