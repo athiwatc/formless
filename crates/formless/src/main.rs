@@ -6867,6 +6867,19 @@ fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
     Ok(())
 }
 
+fn format_job_history_duration(started_at: &str, finished_at: Option<&str>) -> String {
+    let duration = finished_at.and_then(|finished_at| {
+        let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+        let finished = chrono::DateTime::parse_from_rfc3339(finished_at).ok()?;
+        (finished - started).to_std().ok()
+    });
+    match duration {
+        Some(duration) if duration.as_secs() == 0 => format!("{}ms", duration.as_millis()),
+        Some(duration) => format_duration(duration),
+        None => "-".into(),
+    }
+}
+
 fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
@@ -6989,15 +7002,7 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                 "STARTED", "TRIGGER", "OUTCOME", "TOOK", "COST", "SESSION", "DETAIL",
             ]);
             for r in runs {
-                let took = r
-                    .finished_at
-                    .as_deref()
-                    .and_then(|f| {
-                        let a = chrono::DateTime::parse_from_rfc3339(&r.started_at).ok()?;
-                        let b = chrono::DateTime::parse_from_rfc3339(f).ok()?;
-                        Some(format!("{}s", (b - a).num_seconds()))
-                    })
-                    .unwrap_or_else(|| "-".into());
+                let took = format_job_history_duration(&r.started_at, r.finished_at.as_deref());
                 tbl.row(vec![
                     c(r.started_at
                         .get(..16)
@@ -9784,6 +9789,33 @@ mod tests {
             "1h30m"
         );
         assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn jobs_history_formats_elapsed_time_and_missing_values() {
+        let started_at = "2026-11-18T10:00:00.123Z";
+        for (finished_at, expected) in [
+            (Some("2026-11-18T10:00:00.579Z"), "456ms"),
+            (Some("2026-11-18T10:00:01.122999999Z"), "999ms"),
+            (Some("2026-11-18T10:00:01.123Z"), "1s"),
+            (Some("2026-11-18T10:00:45.123Z"), "45s"),
+            (Some("2026-11-18T12:30:00.123+01:00"), "1h30m"),
+            (Some(started_at), "0ms"),
+            (Some("2026-11-18T10:00:00.122999999Z"), "-"),
+            (Some("2026-11-18T09:59:57.123Z"), "-"),
+            (Some("not a timestamp"), "-"),
+            (None, "-"),
+        ] {
+            assert_eq!(
+                format_job_history_duration(started_at, finished_at),
+                expected,
+                "{finished_at:?}"
+            );
+        }
+        assert_eq!(
+            format_job_history_duration("not a timestamp", Some(started_at)),
+            "-"
+        );
     }
 
     #[test]
