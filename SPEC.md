@@ -2491,7 +2491,10 @@ None ship by default (principle 1).
   group with a minimal environment (as `process.run`, §7.4), speaks
   newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`),
   answers the server's `ping`, and writes its stderr to
-  `<data>/mcp/<name>.log`. Servers start on first use, stop after
+  `<data>/mcp/<name>.log`. Before a write would exceed 2 MB, the daemon
+  keeps up to the last 1 MB from a line boundary. Hourly maintenance compacts
+  older oversized logs, which `formless storage` also reports. Log views read up
+  to the final 1 MB. Servers start on first use, stop after
   `idle_secs` without calls, and a crashed server is simply started again
   on the next call (the failed call is a failed Invocation, never a hung
   Run). Cancelling an Invocation sends `notifications/cancelled`.

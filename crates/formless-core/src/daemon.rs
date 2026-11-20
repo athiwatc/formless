@@ -3956,14 +3956,15 @@ impl Daemon {
                         "no MCP server '{name}'"
                     ))));
                 }
-                let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
-                let text = std::fs::read(&file)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let all: Vec<&str> = text.lines().collect();
-                let n = lines.unwrap_or(50).clamp(1, 1000);
+                let file = crate::mcp_log::path(&self.paths, &name);
+                let log = file.clone();
+                let lines = lines.unwrap_or(50).clamp(1, 1000);
+                let recent =
+                    tokio::task::spawn_blocking(move || crate::mcp_log::read_lines(&log, lines))
+                        .await?
+                        .unwrap_or_default();
                 let server = &cfg.mcp.servers[&name];
-                let tail = all[all.len().saturating_sub(n)..]
+                let tail = recent
                     .iter()
                     .map(|line| crate::mcp_catalog::redact_server_text(server, line))
                     .collect::<Vec<_>>();
@@ -15566,6 +15567,16 @@ impl Daemon {
     /// keeping `daemon.backups_keep` (SPEC §9.6).
     async fn backup_loop(self: Arc<Self>) {
         loop {
+            let paths = self.paths.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::mcp_log::compact_logs(&paths, crate::mcp_log::MAX_BYTES, false)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "compact MCP logs"),
+                Err(error) => tracing::warn!(%error, "MCP log maintenance worker failed"),
+            }
             if let Ok(cfg) = self.config() {
                 let keep = cfg.daemon.backups_keep;
                 let due = crate::housekeeping::last_backup(&self.paths).is_none_or(|(_, at)| {
