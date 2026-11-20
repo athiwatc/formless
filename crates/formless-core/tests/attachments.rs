@@ -36,6 +36,16 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn yarn_credentials_are_detected_for_attachment_warnings() {
+    for name in [".yarnrc", "project/.YARNRC.YML"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");

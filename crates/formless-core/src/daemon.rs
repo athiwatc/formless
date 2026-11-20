@@ -17198,6 +17198,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".netrc",
         ".npmrc",
         ".pypirc",
+        ".yarnrc",
+        ".yarnrc.yml",
         "credentials",
         ".git-credentials",
     ]

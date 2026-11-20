@@ -328,7 +328,14 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
+        "api_key"
+            | "oauth_tokens.json"
+            | "relay_secret"
+            | ".netrc"
+            | "_netrc"
+            | ".git-credentials"
+            | ".yarnrc"
+            | ".yarnrc.yml"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
@@ -349,6 +356,14 @@ mod tests {
             policy.classify(&project, &project).unwrap(),
             PathDecision::Ordinary
         );
+        for relative in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
         for relative in [
             ".ssh/config",
             ".aws/credentials",
@@ -361,6 +376,8 @@ mod tests {
             "Microsoft/Credentials/store",
             ".env",
             ".env.local",
+            ".yarnrc",
+            "project/.YARNRC.YML",
             "server.pem",
             "server.key",
             ".bash_history",
