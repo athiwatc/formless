@@ -6061,8 +6061,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     _ => "  note",
                 };
                 if m.role == "tool" {
-                    let first = m.content.lines().next().unwrap_or_default();
-                    println!("{who}: {}", first.chars().take(120).collect::<String>());
+                    println!("{who}: {}", tool_result_preview(&m.content));
                 } else if !m.content.trim().is_empty() {
                     println!("\n{who}:\n{}", m.content.trim_end());
                 }
@@ -6327,7 +6326,35 @@ fn config_edit(paths: &Paths) -> Result<()> {
     }
 }
 
-/// The Session with this id or id prefix.
+/// First-line tool output for the static human Session transcript.
+fn tool_result_preview(content: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    // An initial LF or CRLF ends the displayed line. Anything after that
+    // terminator, including additional blank lines, is omitted content.
+    let (first, omitted_lines) = match content.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), !rest.is_empty()),
+        None => (content, false),
+    };
+    // The visible marker is outside the 120-scalar content budget.
+    let mut remaining = 120;
+    let mut end = 0;
+    for (offset, grapheme) in first.grapheme_indices(true) {
+        let scalars = grapheme.chars().take(remaining + 1).count();
+        if scalars > remaining {
+            break;
+        }
+        remaining -= scalars;
+        end = offset + grapheme.len();
+    }
+    if omitted_lines || end < first.len() {
+        Cow::Owned(format!("{}…", &first[..end]))
+    } else {
+        Cow::Borrowed(first)
+    }
+}
+
 fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String> {
     value
         .parse::<usize>()
@@ -8911,6 +8938,39 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_result_preview_marks_omission_at_complete_grapheme_boundaries() {
+        use super::tool_result_preview;
+
+        for (content, expected) in [
+            ("", ""),
+            ("value", "value"),
+            ("value\n", "value"),
+            ("value\r\n", "value"),
+            ("value\n\n", "value…"),
+            ("value\r\n\r\n", "value…"),
+            ("value\r\nmore", "value…"),
+            ("\nmore", "…"),
+        ] {
+            assert_eq!(tool_result_preview(content), expected);
+        }
+        let exact = "界".repeat(120);
+        assert_eq!(tool_result_preview(&exact), exact);
+        assert_eq!(
+            tool_result_preview(&format!("{exact}x")),
+            format!("{exact}…")
+        );
+        let prefix = "x".repeat(119);
+        for grapheme in ["e\u{301}", "👍🏽", "👩‍💻"] {
+            assert_eq!(
+                tool_result_preview(&format!("{prefix}{grapheme}")),
+                format!("{prefix}…")
+            );
+        }
+        let oversized = format!("e{}", "\u{301}".repeat(120));
+        assert_eq!(tool_result_preview(&oversized), "…");
+    }
+
     #[test]
     fn profile_namespace_parser_refuses_reserved_names_before_running_cli_actions() {
         use clap::Parser;
