@@ -2106,6 +2106,14 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 let text = String::from_utf8(out.stdout).unwrap();
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
                 assert!(text.contains('-') && text.contains("0.125"));
+                assert_eq!(
+                    text.lines()
+                        .last()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    ["TOTAL", "10", "12", "3", "-", "22", "-"]
+                );
                 assert!(
                     !text.contains('\x1b'),
                     "redirected usage must be plain: {text:?}"
