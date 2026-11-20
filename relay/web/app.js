@@ -2317,19 +2317,23 @@
       pre.textContent = text;
       sync();
     };
-    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
-      while (end < first.total_chars) {
-        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
-        if (!r) return;
-        text += r.text;
-        end = r.end;
+    const download = h("button", { class: "btn small", type: "button" }, "Download");
+    download.onclick = async () => {
+      download.disabled = true;
+      try {
+        const chunks = [text];
+        let offset = end;
+        while (offset < first.total_chars) {
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          if (!r) return;
+          chunks.push(r.text);
+          offset = r.end;
+        }
+        downloadBlob("artifact-" + id.slice(0, 8) + ".txt", new Blob(chunks, { type: "text/plain" }));
+      } finally {
+        download.disabled = false;
       }
-      pre.textContent = text;
-      sync();
-      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    } }, "Download");
+    };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
