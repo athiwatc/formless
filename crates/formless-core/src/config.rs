@@ -2006,13 +2006,20 @@ impl Config {
         Self::load_from(&paths.config_file())
     }
     pub fn load_from(file: &Path) -> Result<Self> {
-        let mut cfg = if file.exists() {
+        if file.exists() {
             let text = std::fs::read_to_string(file)
                 .with_context(|| format!("read {}", file.display()))?;
-            toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?
-        } else {
-            Self::default()
-        };
+            return Self::load_from_text(&text, file);
+        }
+        let mut cfg = Self::default();
+        cfg.apply_env()?;
+        Ok(cfg)
+    }
+
+    /// Validate an in-memory copy so callers can commit the exact text read.
+    pub fn load_from_text(text: &str, file: &Path) -> Result<Self> {
+        let mut cfg: Self =
+            toml::from_str(text).with_context(|| format!("parse {}", file.display()))?;
         cfg.apply_env()?;
         Ok(cfg)
     }
