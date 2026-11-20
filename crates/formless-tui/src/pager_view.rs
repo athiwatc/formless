@@ -129,22 +129,28 @@ pub(super) fn search_key(pager: &mut Pager, key: &KeyEvent) -> bool {
         search.draft = Some(search.query.clone());
         return true;
     }
-    if matches!(key.code, KeyCode::Char('n' | 'N')) && query::plain(key) {
-        let count = search.hits.len();
-        if count > 0 {
-            search.current = if key.code == KeyCode::Char('n') {
-                (search.current + 1) % count
-            } else {
-                (search.current + count - 1) % count
-            };
-            pager
-                .viewport
-                .moves
-                .push(Move::Find(Some(search.hits[search.current])));
-        }
-        return true;
+    if !query::plain(key) {
+        return false;
     }
-    false
+    let forward = match key.code {
+        KeyCode::Char('n') => true,
+        KeyCode::Char('N') => false,
+        KeyCode::Enter if !search.query.is_empty() => key.modifiers != KeyModifiers::SHIFT,
+        _ => return false,
+    };
+    let count = search.hits.len();
+    if count > 0 {
+        search.current = if forward {
+            (search.current + 1) % count
+        } else {
+            (search.current + count - 1) % count
+        };
+        pager
+            .viewport
+            .moves
+            .push(Move::Find(Some(search.hits[search.current])));
+    }
+    true
 }
 
 fn find_lines(pager: &Pager, query: &str) -> Vec<Hit> {
@@ -408,6 +414,21 @@ pub(super) fn draw(f: &mut Frame, pager: &mut Pager, color: bool) {
                 usize::from(inner.width).saturating_sub(5)
             )
         ),
+        None if !search.query.is_empty() => {
+            let width = usize::from(inner.width);
+            let keys = if width >= 40 {
+                "Enter/Shift+Enter · n/N"
+            } else {
+                "↵/⇧↵ n/N"
+            };
+            let budget = width.saturating_sub(text::width(keys) + 7);
+            let query = if budget > 0 {
+                text::truncate(&text::escape_bidi(&search.query), budget)
+            } else {
+                String::new()
+            };
+            format!(" / {query} · {keys} ")
+        }
         None => " / find · n/N next/previous ".into(),
     };
     f.render_widget(Clear, area);

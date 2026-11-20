@@ -25641,70 +25641,100 @@ mod tests {
         app.key(key(KeyCode::Char('/')));
         app.paste("needle");
         app.key(key(KeyCode::Enter));
+        let enter = key(KeyCode::Enter);
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
         for (movement, index, row) in [
             (None, 1, 3),
-            (Some('n'), 2, 11),
-            (Some('n'), 3, 21),
-            (Some('n'), 1, 3),
-            (Some('N'), 3, 21),
+            (Some(enter), 2, 11),
+            (Some(shift_enter), 1, 3),
+            (Some(shift_enter), 3, 21),
+            (Some(key(KeyCode::Char('n'))), 1, 3),
+            (Some(key(KeyCode::Char('n'))), 2, 11),
+            (Some(key(KeyCode::Char('N'))), 1, 3),
+            (Some(key(KeyCode::Char('N'))), 3, 21),
         ] {
-            if let Some(ch) = movement {
-                app.key(key(KeyCode::Char(ch)));
+            if let Some(movement) = movement {
+                app.key(movement);
             }
             let screen = render(&mut app, 52, 6);
             assert!(screen.contains(&format!("match {index}/3")), "{screen}");
             assert!(screen.contains(&format!("needle {row:02}")), "{screen}");
+            let footer = screen.lines().last().unwrap();
+            assert!(footer.contains("needle") && footer.contains("Enter/Shift+Enter"));
         }
     }
 
     #[test]
-    fn pager_search_owns_literal_keys_and_paste_until_escape() {
-        let mut app = test_app();
-        let (client, sent) = DaemonClient::recording();
-        app.client = Some(client);
-        app.input.set("unsent fixture");
-        app.pager = Some(Pager {
-            title: "proposal review".into(),
-            lines: vec!["retained matching text".into(), "another line".into()],
-            top: 0,
-            left: 0,
-            viewport: Default::default(),
-            styled: vec![],
-        });
-        app.reviewing = Some("proposal-fixture".into());
-        app.branch_summary.intent = Some(("source".into(), "target".into()));
-        app.branch_summary.review = Some(branch_summary::fixture().1);
-        app.key(key(KeyCode::Char('/')));
-        app.paste("retained");
-        app.key(key(KeyCode::Enter));
-        assert!(render(&mut app, 62, 8).contains("match 1/1"));
-        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for letter in "qgjarin".chars() {
-            app.key(key(KeyCode::Char(letter)));
+    fn pager_search_owns_literal_keys_and_paste_in_each_review() {
+        for branch in [false, true] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set("unsent fixture");
+            let (title, lines, needle) = if branch {
+                let (basis, preview) = branch_summary::fixture();
+                let lines = branch_summary::review_lines(&basis, &preview);
+                app.current = Some(preview.target_id.clone());
+                app.branch_summary.intent =
+                    Some((basis.source_id.clone(), basis.target_id.clone()));
+                app.branch_summary.basis = Some(basis);
+                app.branch_summary.review = Some(preview);
+                (
+                    "Branch summary · review exact note",
+                    lines,
+                    "Exact candidate note",
+                )
+            } else {
+                app.reviewing = Some("proposal-fixture".into());
+                (
+                    "proposal review",
+                    vec!["fixture match".into()],
+                    "fixture match",
+                )
+            };
+            app.pager = Some(Pager {
+                title: title.into(),
+                lines,
+                top: 0,
+                left: 0,
+                viewport: Default::default(),
+                styled: vec![],
+            });
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            app.key(key(KeyCode::Char('/')));
+            app.paste(needle);
+            app.key(key(KeyCode::Enter));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            let top = app.pager.as_ref().unwrap().top;
+
+            app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            for letter in "qgjarin".chars() {
+                app.key(key(KeyCode::Char(letter)));
+            }
+            app.paste("arqi\r\nไทย");
+            app.paste("e\u{301}");
+            app.key(key(KeyCode::Backspace));
+            let screen = render(&mut app, 62, 8);
+            assert!(screen.contains("Enter find · Esc cancel"), "{screen}");
+            assert!(screen.contains("qgjarinarqi ไทย▏"), "{screen}");
+            assert_eq!(app.pager.as_ref().unwrap().top, top);
+            assert!(
+                sent.try_recv().is_err(),
+                "query keys and paste must emit no requests"
+            );
+
+            app.key(key(KeyCode::Esc));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            assert_eq!(app.reviewing.is_some(), !branch);
+            app.paste("arqi");
+            assert!(sent.try_recv().is_err());
+            app.key(key(KeyCode::Esc));
+            assert!(app.pager.is_none() && app.reviewing.is_none());
+            assert!(app.branch_summary.review.is_none() && app.branch_summary.intent.is_none());
+            assert_eq!(app.input, "unsent fixture");
         }
-        app.paste("\r\nไทย");
-        app.paste("e\u{301}");
-        app.key(key(KeyCode::Backspace));
-        let screen = render(&mut app, 62, 8);
-        assert!(screen.contains("Enter find · Esc cancel"), "{screen}");
-        assert!(screen.contains("qgjarin ไทย▏"), "{screen}");
-        assert_eq!(app.pager.as_ref().unwrap().top, 0);
-        assert!(
-            sent.try_recv().is_err(),
-            "query keys never submit a decision"
-        );
-        app.key(key(KeyCode::Esc));
-        assert!(render(&mut app, 62, 8).contains("match 1/1"));
-        assert!(app.reviewing.is_some() && app.branch_summary.intent.is_some());
-        assert!(app.branch_summary.review.is_some());
-        assert_eq!(app.input, "unsent fixture");
-        app.paste("ar");
-        assert!(sent.try_recv().is_err());
-        app.branch_summary.intent = None;
-        app.key(key(KeyCode::Esc));
-        assert!(app.pager.is_none() && app.reviewing.is_none());
-        assert_eq!(app.input, "unsent fixture");
     }
 
     #[test]
@@ -25769,6 +25799,53 @@ mod tests {
         assert!(render(&mut app, 24, 8).contains("no match"));
         app.key(key(KeyCode::Char('n')));
         assert!(render(&mut app, 24, 8).contains("no match"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run only by the owned synthetic PTY driver"]
+    fn pager_search_owned_pty_fixture() {
+        use std::io::IsTerminal;
+
+        assert_eq!(std::env::var("FORMLESS_TEST_PAGER_PTY").as_deref(), Ok("1"));
+        assert!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+        struct RawMode;
+        impl Drop for RawMode {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode().unwrap();
+        let _raw = RawMode;
+        let mut app = test_app();
+        let prefix = "x".repeat(45);
+        let content = format!(
+            "{prefix}ไทย first\n{}{prefix}ไทย second",
+            "fixture row\n".repeat(12)
+        );
+        app.pager = Some(code_pager("PTY search fixture", &content, false));
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        for phase in 0..=9 {
+            terminal.clear().unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            print!("\r\nPAGER-FRAME-{phase}\r\n");
+            std::io::stdout().flush().unwrap();
+            if app.pager.is_none() {
+                assert_eq!(phase, 9);
+                return;
+            }
+            assert!(
+                event::poll(Duration::from_secs(5)).unwrap(),
+                "phase {phase}"
+            );
+            match event::read().unwrap() {
+                CtEvent::Key(key) => app.key(key),
+                CtEvent::Paste(text) => app.paste(&text),
+                CtEvent::Resize(_, _) => app.resized(),
+                event => panic!("unexpected event in phase {phase}: {event:?}"),
+            }
+        }
+        panic!("pager did not close");
     }
 
     #[test]

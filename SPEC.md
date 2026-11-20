@@ -3675,7 +3675,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
     and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
     pager (↑↓, PgUp/PgDn, g/G, Esc). In text pagers, `/` or Ctrl+F edits a
     search query and Enter jumps to the first matching line. `n` and `N`
-    cycle through matching lines. Esc while editing restores the previous
+    cycle through matching lines. Enter and Shift+Enter also cycle while
+    the submitted query is shown. Esc while editing restores the previous
     query. Esc after editing closes the pager.
   - Web: the result gets an "Open full output" button that opens a viewer
     with "Load more" and Download, which fetches the rest and saves it as
