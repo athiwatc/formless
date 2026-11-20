@@ -6846,9 +6846,12 @@ Already-deleted legacy files without a captured original object remain read-only
 ### Colour-independent meaning (§10.6, #635)
 
 `tui.theme = "colorblind"` is available through Settings and `config set`.
-Its shared TUI/CLI status palette uses sky blue `#56B4E9` for good, yellow
-`#F0E442` for warning, and orange `#E69F00` for bad. Diff additions use blue
-and removals orange. Every added/removed diff retains a bold `+`/`-` gutter
+The TUI and CLI select a shared status palette for the detected terminal
+background. On dark backgrounds it uses sky blue `#56B4E9`, yellow
+`#F0E442`, and orange `#E69F00` for good, warning, and bad. On light
+backgrounds it uses blue `#0064A0`, amber `#7B5300`, and vermilion
+`#AA370A`. Diff additions use blue and removals orange.
+Every added/removed diff retains a bold `+`/`-` gutter
 by default, including when colour is disabled. Hunk line numbers, changed-word
 underlining and newline labels remain intact.
 
