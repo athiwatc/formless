@@ -3,6 +3,7 @@ pub mod client;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;

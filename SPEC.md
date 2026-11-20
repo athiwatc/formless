@@ -5517,8 +5517,9 @@ previous headless Run's Session.
     supplied entries replace their whole value, null entries are removed,
     and siblings survive. `--replace` uses `SetSetting` for whole-map
     replacement; `--replace '{}'` clears. Lists remain replace-only.
-  - `edit` opens a copy in `$VISUAL`/`$EDITOR` (run through `sh -c`, so
-    arguments and quotes work) and replaces config.toml only when the copy
+  - `edit` opens a copy in `VISUAL` or `EDITOR`. On Unix the shell parses
+    the command. On Windows the same argument parser as the TUI handles
+    double-quoted executable paths and arguments. It replaces config.toml only when the copy
     parses. Otherwise it shows the error and, on a terminal, offers to edit
     again; the file is never left half-written.
 - `formless sessions` manages Sessions with the same protocol requests as
