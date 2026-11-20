@@ -36,6 +36,16 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn detects_s3_client_config_in_attachment_paths() {
+    for name in [".s3cfg", ".boto", "project/.BOTO"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/s3cfg/notes.txt", ".s3cfg.example", "boto"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");
