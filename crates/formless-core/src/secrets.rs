@@ -20,6 +20,8 @@ const PREFIXES: &[(&str, &str)] = &[
     ("ghs_", "GitHub token"),
     ("github_pat_", "GitHub token"),
     ("glpat-", "GitLab token"),
+    ("gldt-", "GitLab token"),
+    ("glrt-", "GitLab token"),
     ("xoxb-", "Slack token"),
     ("xoxp-", "Slack token"),
     ("AIza", "Google API key"),
@@ -263,6 +265,13 @@ mod tests {
 
     #[test]
     fn finds_and_blanks_secret_shapes_not_key_names() {
+        for prefix in ["gldt-", "glrt-"] {
+            let token = format!("{prefix}0123456789abcdefghij");
+            assert_eq!(redact(&token), (MARK.into(), Some("GitLab token")));
+        }
+        let note = "GitLab documentation includes gldt-short and glpat-";
+        assert_eq!(redact(note), (note.into(), None));
+
         let cases = [
             ("key sk-proj-abcdefghijklmnopqrstuvwxyz0123 here", "API key"),
             ("Authorization: Bearer abcdefghijklmnop1234", "bearer token"),
