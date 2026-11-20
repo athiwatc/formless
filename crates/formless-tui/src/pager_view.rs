@@ -1,6 +1,6 @@
 //! Paging and horizontal clipping use the geometry of the frame being drawn.
-use super::{text, ui, Pager};
-use crossterm::event::KeyCode;
+use super::{highlight_matches, query, single_line_query_paste, text, ui, Pager};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Clear, Paragraph};
 use std::borrow::Cow;
@@ -13,6 +13,44 @@ enum Move {
     Columns(isize),
     Home,
     End,
+    Find(Option<Hit>),
+}
+
+#[derive(Clone, Copy)]
+struct Hit {
+    row: usize,
+    column: usize,
+    first_grapheme_end: usize,
+}
+
+impl Hit {
+    fn reveal_left(self, left: usize, width: usize, right: usize) -> usize {
+        if self.column < left || self.first_grapheme_end > left.saturating_add(width) {
+            self.column.min(right)
+        } else {
+            left
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct Search {
+    draft: Option<String>,
+    query: String,
+    hits: Vec<Hit>,
+    current: usize,
+}
+
+impl Search {
+    fn status(&self) -> String {
+        if self.query.is_empty() {
+            String::new()
+        } else if self.hits.is_empty() {
+            "no match · ".into()
+        } else {
+            format!("match {}/{} · ", self.current + 1, self.hits.len())
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -22,6 +60,8 @@ pub(super) struct View {
     // Pager contents belong to this instance and stay fixed; bounds are
     // recomputed from this width and the actual viewport on each draw.
     content_width: Option<usize>,
+    search: Search,
+    follow_hit: Option<Hit>,
 }
 
 impl View {
@@ -29,6 +69,12 @@ impl View {
         Self {
             gutter: width,
             ..Self::default()
+        }
+    }
+
+    pub(super) fn search_paste(&mut self, text: &str) {
+        if let Some(draft) = &mut self.search.draft {
+            draft.push_str(&single_line_query_paste(text));
         }
     }
 
@@ -45,6 +91,101 @@ impl View {
             _ => return,
         });
     }
+}
+
+/// Only the pager owns these keys. The application keeps its existing
+/// special pager actions and dismissal keys when no query is being edited.
+pub(super) fn search_key(pager: &mut Pager, key: &KeyEvent) -> bool {
+    if let Some(draft) = &mut pager.viewport.search.draft {
+        match key.code {
+            KeyCode::Esc => pager.viewport.search.draft = None,
+            KeyCode::Enter if query::plain(key) => {
+                let text = std::mem::take(draft);
+                pager.viewport.search.draft = None;
+                let hits = find_lines(pager, &text);
+                pager.viewport.moves.push(Move::Find(hits.first().copied()));
+                let search = &mut pager.viewport.search;
+                search.query = text;
+                search.hits = hits;
+                search.current = 0;
+            }
+            KeyCode::Backspace if query::plain(key) => {
+                if let Some((start, _)) = draft.grapheme_indices(true).next_back() {
+                    draft.truncate(start);
+                }
+            }
+            KeyCode::Char(ch) if ch.is_control() => {}
+            _ => {
+                let _ = query::edit(draft, key);
+            }
+        }
+        return true;
+    }
+
+    let search = &mut pager.viewport.search;
+    if (key.code == KeyCode::Char('/') && query::plain(key))
+        || (key.code == KeyCode::Char('f') && key.modifiers == KeyModifiers::CONTROL)
+    {
+        search.draft = Some(search.query.clone());
+        return true;
+    }
+    if matches!(key.code, KeyCode::Char('n' | 'N')) && query::plain(key) {
+        let count = search.hits.len();
+        if count > 0 {
+            search.current = if key.code == KeyCode::Char('n') {
+                (search.current + 1) % count
+            } else {
+                (search.current + count - 1) % count
+            };
+            pager
+                .viewport
+                .moves
+                .push(Move::Find(Some(search.hits[search.current])));
+        }
+        return true;
+    }
+    false
+}
+
+fn find_lines(pager: &Pager, query: &str) -> Vec<Hit> {
+    if formless_core::fuzzy::fold_chars(query).next().is_none() {
+        return Vec::new();
+    }
+    pager
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(row, raw)| {
+            let raw_line;
+            let line = match pager.styled.get(row) {
+                Some(line) => line,
+                None => {
+                    raw_line = Line::raw(raw.as_str());
+                    &raw_line
+                }
+            };
+            let gutter = usize::from(pager.viewport.gutter > 0 && pager.styled.get(row).is_some())
+                .min(line.spans.len());
+            let content = joined(&line.spans[gutter..]);
+            let first = formless_core::fuzzy::find_folded(&content, query)?;
+            let mut remaining = first.start;
+            let mut column = 0;
+            for grapheme in content.graphemes(true) {
+                let count = grapheme.chars().count();
+                let width = text::width(grapheme);
+                if remaining < count {
+                    return Some(Hit {
+                        row,
+                        column,
+                        first_grapheme_end: column + width,
+                    });
+                }
+                remaining -= count;
+                column += width;
+            }
+            None
+        })
+        .collect()
 }
 
 fn joined<'a>(spans: &'a [Span<'_>]) -> Cow<'a, str> {
@@ -187,6 +328,10 @@ pub(super) fn draw(f: &mut Frame, pager: &mut Pager, color: bool) {
     pager.top = pager.top.min(last);
     pager.left = pager.left.min(right);
     for movement in pager.viewport.moves.drain(..) {
+        // Explicit scrolling resumes the normal viewport behavior.
+        if !matches!(movement, Move::Find(_)) {
+            pager.viewport.follow_hit = None;
+        }
         match movement {
             Move::Rows(rows) => pager.top = pager.top.saturating_add_signed(rows).min(last),
             Move::Page(true) => pager.top = pager.top.saturating_add(page).min(last),
@@ -196,29 +341,76 @@ pub(super) fn draw(f: &mut Frame, pager: &mut Pager, color: bool) {
             }
             Move::Home => pager.top = 0,
             Move::End => pager.top = last,
+            Move::Find(hit) => {
+                pager.viewport.follow_hit = hit;
+                if let Some(hit) = hit {
+                    pager.top = hit.row.min(last);
+                    pager.left = hit.reveal_left(pager.left, width, right);
+                }
+            }
         }
     }
+    if let Some(hit) = pager.viewport.follow_hit {
+        pager.top = hit.row.min(last);
+        pager.left = hit.reveal_left(pager.left, width, right);
+    }
 
+    let search = &pager.viewport.search;
+    let selected = search.hits.get(search.current).map(|hit| hit.row);
     let body: Vec<_> = (pager.top..pager.lines.len())
         .take(height)
         .map(|index| {
-            let line = pager
+            let mut line = pager
                 .styled
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| Line::raw(pager.lines[index].clone()));
-            clipped_line(line, pager.viewport.gutter > 0, pager.left, width)
+            let gutter = pager.viewport.gutter > 0 && pager.styled.get(index).is_some();
+            if search
+                .hits
+                .binary_search_by_key(&index, |hit| hit.row)
+                .is_ok()
+            {
+                // Line numbering stays fixed and outside search. Patching only
+                // modifiers retains foreground and background syntax colors.
+                let prefix = (gutter && !line.spans.is_empty()).then(|| line.spans.remove(0));
+                (line, _) = highlight_matches(line, &search.query, |_| {
+                    let emphasis = if selected == Some(index) {
+                        Modifier::UNDERLINED | Modifier::REVERSED
+                    } else {
+                        Modifier::UNDERLINED
+                    };
+                    Style::default().add_modifier(emphasis)
+                });
+                if let Some(prefix) = prefix {
+                    line.spans.insert(0, prefix);
+                }
+            }
+            clipped_line(line, gutter, pager.left, width)
         })
         .collect();
-    let title = format!(
-        " {} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
-        pager.title,
-        (pager.top + 1).min(pager.lines.len()),
-        pager.lines.len()
-    );
+    let title = if search.draft.is_some() {
+        format!(" Enter find · Esc cancel · {} ", pager.title)
+    } else {
+        format!(
+            " {}{} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
+            search.status(),
+            pager.title,
+            (pager.top + 1).min(pager.lines.len()),
+            pager.lines.len()
+        )
+    };
+    let footer = match &search.draft {
+        Some(draft) => format!(
+            " / {}▏ ",
+            text::truncate(
+                &text::escape_bidi(draft),
+                usize::from(inner.width).saturating_sub(5)
+            )
+        ),
+        None => " / find · n/N next/previous ".into(),
+    };
     f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(body).block(ui::panel(title, color, Color::Cyan)),
-        area,
-    );
+    let panel = ui::panel(title, color, Color::Cyan).title_bottom(ui::hint(&footer, color));
+    f.render_widget(Paragraph::new(body).block(panel), area);
 }
