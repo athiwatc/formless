@@ -5,6 +5,10 @@ use formless_protocol::Request;
 use formless_runtime::Capabilities;
 use std::sync::Arc;
 
+#[cfg(unix)]
+#[path = "support/sqlite_encoding.rs"]
+mod sqlite_encoding;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_newest_registry_change_can_be_undone() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
@@ -113,6 +117,13 @@ async fn the_newest_registry_change_can_be_undone() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_guarded_undo_cannot_revert_another_clients_change_or_be_repeated() {
+    for encoding in sqlite_encoding::ENCODINGS {
+        check_guarded_undo(encoding).await;
+    }
+}
+
+#[cfg(unix)]
+async fn check_guarded_undo(encoding: &str) {
     use formless_protocol::{
         Event, RegistryChange, RequestEnvelope, ServerMessage, PROTOCOL_VERSION,
     };
@@ -175,6 +186,7 @@ async fn a_guarded_undo_cannot_revert_another_clients_change_or_be_repeated() {
     cfg.provider.base_url = "http://127.0.0.1:9".into();
     cfg.provider.model = "fixture".into();
     cfg.save(&paths).unwrap();
+    sqlite_encoding::create_database(&paths.db_file(), encoding);
     let store = Store::open(&paths.db_file()).unwrap();
     let seed = |name| {
         store

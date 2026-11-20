@@ -85,7 +85,7 @@ fn genuine_schema66_upgrade_preserves_unknown_plan_and_recovery_and_replay_evide
                 .conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            67
+            super::super::SCHEMA_VERSION
         );
         assert_eq!(store.session_plan("s").unwrap(), vec![item("legacy task")]);
         let state = store.session_plan_state("s").unwrap().unwrap();
@@ -140,10 +140,10 @@ fn genuine_schema66_upgrade_preserves_unknown_plan_and_recovery_and_replay_evide
                 .schema_version,
             66
         );
-        let backup = fixture.0.join("upgraded67.db");
+        let backup = fixture.0.join("upgraded-current.db");
         store.backup_into(&backup).unwrap();
         let report = crate::backup_verification::inspect(&backup).unwrap();
-        assert_eq!(report.schema_version, 67);
+        assert_eq!(report.schema_version, super::super::SCHEMA_VERSION);
         assert_eq!(report.tables["run_files"], 1);
         assert_eq!(report.tables["optimiser_replay_snapshots"], 1);
     }

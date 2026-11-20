@@ -4,7 +4,7 @@ use formless_protocol::{
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{functions::FunctionFlags, params, types::ValueRef, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -447,6 +447,38 @@ CREATE TABLE IF NOT EXISTS tool_kv (
   updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
 ";
 
+// Count existing data once and keep the profile admission check independent
+// of the number of keys. A rollback reverts both the payload and its charge.
+const SCHEMA_V68_TOOL_STORE_USAGE: &str = "
+CREATE TABLE IF NOT EXISTS tool_store_profile_usage (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  bytes INTEGER NOT NULL CHECK(bytes>=0));
+INSERT OR IGNORE INTO tool_store_profile_usage
+  SELECT 1, COALESCE(SUM(formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value)),0)
+  FROM tool_kv WHERE namespace NOT GLOB 'harness:*';
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_insert AFTER INSERT ON tool_kv
+WHEN new.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage
+    SET bytes=bytes+formless_utf8_bytes(new.namespace)+formless_utf8_bytes(new.key)+formless_utf8_bytes(new.value);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_delete AFTER DELETE ON tool_kv
+WHEN old.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage
+    SET bytes=bytes-formless_utf8_bytes(old.namespace)-formless_utf8_bytes(old.key)-formless_utf8_bytes(old.value);
+END;
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_update AFTER UPDATE OF namespace, key, value ON tool_kv
+WHEN old.namespace NOT GLOB 'harness:*' OR new.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage SET bytes=bytes
+    - CASE WHEN old.namespace NOT GLOB 'harness:*'
+           THEN formless_utf8_bytes(old.namespace)+formless_utf8_bytes(old.key)+formless_utf8_bytes(old.value) ELSE 0 END
+    + CASE WHEN new.namespace NOT GLOB 'harness:*'
+           THEN formless_utf8_bytes(new.namespace)+formless_utf8_bytes(new.key)+formless_utf8_bytes(new.value) ELSE 0 END;
+END;
+";
+
 /// Full-text index over message content (SPEC §5.1 search), kept in step
 /// with `messages` by triggers and backfilled once.
 /// Orchestration scripts (SPEC §7.12). Nested Invocations link to theirs
@@ -480,6 +512,7 @@ INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
 /// Largest stored value (JSON bytes) and namespace total.
 pub const KV_MAX_VALUE: usize = 64 * 1024;
 pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
+const KV_MAX_PROFILE: i64 = 50 * 1024 * 1024;
 
 /// Token use of one model: (model, prompt, completion, cached,
 /// provider-reported USD when every request reported one).
@@ -544,7 +577,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 67;
+pub const SCHEMA_VERSION: i64 = 68;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -629,7 +662,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 67] = [
+const MIGRATIONS: [(i64, MigrationStep); SCHEMA_VERSION as usize] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -955,6 +988,7 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
         add_column(c, "sessions", "plan_state TEXT")?;
         Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
+    (68, |c| Ok(c.execute_batch(SCHEMA_V68_TOOL_STORE_USAGE)?)),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -964,6 +998,7 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
         return Err(anyhow!("unsupported backup schema v{version}"));
     }
     let conn = Connection::open_in_memory()?;
+    register_utf8_bytes(&conn)?;
     for (target, step) in MIGRATIONS {
         if target <= version {
             step(&conn)?;
@@ -972,11 +1007,34 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
     Ok(conn)
 }
 
+fn register_utf8_bytes(conn: &Connection) -> Result<()> {
+    // SQLite's octet_length counts bytes in the database encoding. Rusqlite
+    // exposes TEXT as UTF-8, so this uses the same units as Rust's str::len
+    // even for restored UTF-16 profiles, including embedded NULs.
+    conn.create_scalar_function(
+        "formless_utf8_bytes",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| match ctx.get_raw(0) {
+            ValueRef::Null => Ok(None),
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(Some(bytes.len() as i64)),
+            value => Err(rusqlite::Error::InvalidFunctionParameterType(
+                0,
+                value.data_type(),
+            )),
+        },
+    )?;
+    Ok(())
+}
+
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
 /// database is backed up first; each step runs in its own transaction
 /// together with its version bump, so a failure leaves the database at
 /// the last completed version.
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
+    register_utf8_bytes(conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(anyhow!(
@@ -1366,6 +1424,7 @@ impl Store {
     pub fn open_reader(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
         conn.execute_batch(READER_PRAGMAS)?;
+        register_utf8_bytes(&conn)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE);
         Ok(Self {
             conn,
@@ -3059,9 +3118,9 @@ impl Store {
                 .unwrap_or(0))
         };
         Ok(serde_json::json!({
-            "messages": sum("SELECT SUM(length(content) + COALESCE(length(meta),0)) FROM messages")?,
-            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error)) FROM invocations")?,
-            "tool_versions": sum("SELECT SUM(length(code) + length(input_schema) + length(output_schema)) FROM tool_versions")?,
+            "messages": sum("SELECT SUM(formless_utf8_bytes(content) + COALESCE(formless_utf8_bytes(meta),0)) FROM messages")?,
+            "invocations": sum("SELECT SUM(formless_utf8_bytes(input) + formless_utf8_bytes(output) + formless_utf8_bytes(error)) FROM invocations")?,
+            "tool_versions": sum("SELECT SUM(formless_utf8_bytes(code) + formless_utf8_bytes(input_schema) + formless_utf8_bytes(output_schema)) FROM tool_versions")?,
             "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
         }))
     }
@@ -5222,29 +5281,87 @@ impl Store {
     /// Store a JSON value, within the size caps.
     pub fn kv_set(&self, namespace: &str, key: &str, value: &Value) -> Result<()> {
         if key.is_empty() || key.len() > 256 {
-            anyhow::bail!("store keys must be 1-256 characters");
+            anyhow::bail!("store keys must be 1-256 UTF-8 bytes");
         }
         let text = value.to_string();
         if text.len() > KV_MAX_VALUE {
-            anyhow::bail!("store value is larger than {} KB", KV_MAX_VALUE / 1024);
+            anyhow::bail!("store value is larger than {} KiB", KV_MAX_VALUE / 1024);
         }
-        let used: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(length(value)+length(key)),0) FROM tool_kv WHERE namespace=?1 AND key!=?2",
-            params![namespace, key],
-            |r| r.get(0),
-        )?;
-        if used + (text.len() + key.len()) as i64 > KV_MAX_NAMESPACE {
-            anyhow::bail!(
-                "store namespace is full ({} MB); delete keys first",
-                KV_MAX_NAMESPACE / 1024 / 1024
-            );
-        }
-        self.ex(
-            "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            params![namespace, key, text, now()],
-        )?;
-        Ok(())
+        let new_bytes = (text.len() + key.len()) as i64;
+        // Keep admission and the write under the same SQLite writer lock.
+        self.transaction(|st| {
+            let used: i64 = st.ps(
+                "SELECT COALESCE(SUM(formless_utf8_bytes(value)+formless_utf8_bytes(key)),0)
+                 FROM tool_kv WHERE namespace=?1 AND key!=?2",
+            )?.query_row(params![namespace, key], |r| r.get(0))?;
+            if used + new_bytes > KV_MAX_NAMESPACE {
+                anyhow::bail!(
+                    "store namespace is full ({} MiB); delete keys first",
+                    KV_MAX_NAMESPACE / 1024 / 1024
+                );
+            }
+            // Tool data has its own budget so filling it cannot block harness
+            // bookkeeping such as saving a registry Undo receipt.
+            if !namespace.starts_with("harness:") {
+                let used: i64 = st.ps(
+                    "SELECT bytes - COALESCE((
+                       SELECT formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value)
+                       FROM tool_kv WHERE namespace=?1 AND key=?2
+                     ),0) FROM tool_store_profile_usage WHERE singleton=1",
+                )?.query_row(params![namespace, key], |r| r.get(0))?;
+                if used + new_bytes + namespace.len() as i64 > KV_MAX_PROFILE {
+                    anyhow::bail!(
+                        "profile Tool store is full ({} MiB); delete keys first",
+                        KV_MAX_PROFILE / 1024 / 1024
+                    );
+                }
+            }
+            st.ex(
+                "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                params![namespace, key, text, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Logical Tool payload bytes, orphaned shared namespace count and bytes.
+    pub(crate) fn tool_store_usage(&self) -> Result<(i64, usize, i64)> {
+        self.read_transaction(|st| {
+            let mut specs = st.ps(
+                "SELECT DISTINCT cap.value FROM tool_versions v,
+                 json_each(CASE WHEN json_valid(v.capabilities) THEN v.capabilities ELSE '[]' END) cap
+                 WHERE cap.type='text'",
+            )?;
+            let declared: std::collections::HashSet<String> = specs
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|row| match row {
+                    Ok(spec) => spec.trim().strip_prefix("store:").map(|ns| Ok(ns.to_owned())),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<rusqlite::Result<_>>()?;
+
+            let mut usage = st.ps(
+                "SELECT namespace, SUM(formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value))
+                 FROM tool_kv WHERE namespace NOT GLOB 'harness:*'
+                 GROUP BY namespace",
+            )?;
+            let mut rows = usage.query([])?;
+            let (mut total_bytes, mut orphaned_count, mut orphaned_bytes) = (0, 0, 0);
+            while let Some(row) = rows.next()? {
+                let namespace: String = row.get(0)?;
+                let bytes: i64 = row.get(1)?;
+                total_bytes += bytes;
+                if namespace
+                    .strip_prefix("shared:")
+                    .is_some_and(|shared| !declared.contains(shared))
+                {
+                    orphaned_count += 1;
+                    orphaned_bytes += bytes;
+                }
+            }
+            Ok((total_bytes, orphaned_count, orphaned_bytes))
+        })
     }
 
     pub fn kv_delete(&self, namespace: &str, key: &str) -> Result<bool> {

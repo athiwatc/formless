@@ -40,7 +40,7 @@ jsonschema.workspace = true
 futures-util.workspace = true
 keyring.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["functions"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
