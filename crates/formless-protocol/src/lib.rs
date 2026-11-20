@@ -725,7 +725,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             }
             "find" => return Some("find can run any program (-exec)"),
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
-            "make" | "cmake" | "ninja" => {
+            "make" | "cmake" | "ninja" | "composer" | "composer.phar" => {
                 return Some("a build tool runs whatever the build files say")
             }
             _ => {}
@@ -3829,6 +3829,23 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn composer_build_tools_require_broad_confirmation() {
+        let build_tool = broad_capability("process:make").unwrap();
+        for spec in [
+            "process:composer",
+            "process:composer.phar",
+            "process:/usr/bin/composer",
+            "process:composer.exe",
+            "process:composer:install",
+        ] {
+            assert_eq!(broad_capability(spec), Some(build_tool), "{spec}");
+        }
+        for spec in ["process:composer-helper", "process:composer2", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
