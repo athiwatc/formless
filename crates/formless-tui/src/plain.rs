@@ -46,7 +46,7 @@ fn docs_lines(input: &str) -> Vec<String> {
     lines
 }
 
-fn display_text(text: &str) -> String {
+pub(super) fn display_text(text: &str) -> String {
     text.chars().flat_map(|c| {
         if c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
             c.escape_default().collect::<Vec<_>>()
