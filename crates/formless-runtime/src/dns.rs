@@ -91,12 +91,22 @@ impl ResolverPool {
         deadline: Instant,
         timeouts: FetchTimeouts,
     ) -> LookupResult {
+        self.resolve_until(host, port, deadline, || timed_out(host, timeouts))
+    }
+
+    fn resolve_until(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+        timeout_error: impl Fn() -> String,
+    ) -> LookupResult {
         let (reply, result) = mpsc::sync_channel(1);
         let mut queue = self.shared.queue.locked();
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(timed_out(host, timeouts));
+                return Err(timeout_error());
             }
             if queue.closed {
                 return Err("fetch DNS resolver is unavailable".into());
@@ -121,11 +131,11 @@ impl ResolverPool {
         }
         drop(queue);
         match result.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(_) if Instant::now() >= deadline => Err(timed_out(host, timeouts)),
+            Ok(_) if Instant::now() >= deadline => Err(timeout_error()),
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out(host, timeouts)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(timeout_error()),
             Err(mpsc::RecvTimeoutError::Disconnected) if Instant::now() >= deadline => {
-                Err(timed_out(host, timeouts))
+                Err(timeout_error())
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("fetch DNS resolver worker failed".into())
@@ -151,6 +161,16 @@ pub(super) fn resolve(
     deadline: Instant,
     timeouts: FetchTimeouts,
 ) -> LookupResult {
+    shared_pool()?.resolve(host, port, deadline, timeouts)
+}
+
+pub(super) fn resolve_host_until(host: &str, port: u16, deadline: Instant) -> LookupResult {
+    shared_pool()?.resolve_until(host, port, deadline, || {
+        format!("timed out resolving {host}")
+    })
+}
+
+fn shared_pool() -> Result<&'static ResolverPool, String> {
     static POOL: OnceLock<Result<ResolverPool, String>> = OnceLock::new();
     POOL.get_or_init(|| {
         ResolverPool::new(
@@ -165,8 +185,7 @@ pub(super) fn resolve(
         )
     })
     .as_ref()
-    .map_err(Clone::clone)?
-    .resolve(host, port, deadline, timeouts)
+    .map_err(Clone::clone)
 }
 
 #[cfg(test)]

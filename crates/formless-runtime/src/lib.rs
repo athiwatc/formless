@@ -178,6 +178,16 @@ pub fn set_fetch_timeouts(connect_ms: u64, total_ms: u64) {
     FETCH_TIMEOUT_MS.store(total_ms.clamp(1, DAY_MS), Ordering::Relaxed);
 }
 
+/// Look up a host in the bounded native resolver pool. Callers on an async
+/// executor must run this wait on a blocking worker.
+pub fn resolve_host_until(
+    host: &str,
+    port: u16,
+    deadline: std::time::Instant,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    dns::resolve_host_until(host, port, deadline)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FetchTimeouts {
     connect_ms: u64,
