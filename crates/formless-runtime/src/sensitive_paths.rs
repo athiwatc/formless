@@ -328,7 +328,13 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
+        "api_key"
+            | "oauth_tokens.json"
+            | "relay_secret"
+            | ".netrc"
+            | "_netrc"
+            | ".htpasswd"
+            | ".git-credentials"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
@@ -364,6 +370,8 @@ mod tests {
             "server.pem",
             "server.key",
             ".bash_history",
+            "www/.htpasswd",
+            "site/.HTPASSWD",
             "fish_history",
             "Profiles/default/logins.json",
             "Chrome/Profile/Login Data",
@@ -375,6 +383,27 @@ mod tests {
                     PathDecision::Sensitive(_)
                 ),
                 "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn apache_password_file_checks_both_path_spellings_and_requires_exact_name() {
+        let root = std::env::temp_dir().join("project");
+        let policy = PathPolicy::default();
+        let secret = root.join(".HTPASSWD");
+        let alias = root.join("alias.txt");
+        for (requested, resolved) in [(&alias, &secret), (&secret, &alias)] {
+            assert!(matches!(
+                policy.classify(requested, resolved).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for name in ["htpasswd", "htpasswd.txt", ".htpasswd.bak"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
             );
         }
     }

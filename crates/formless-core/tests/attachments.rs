@@ -224,6 +224,8 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     std::fs::create_dir_all(root.join(".ssh")).unwrap();
     std::fs::write(root.join(".ssh/id_rsa"), "PRIVATE").unwrap();
     std::fs::write(root.join(".env"), "TOKEN=1").unwrap();
+    std::fs::write(root.join(".HTPASSWD"), "private test placeholder").unwrap();
+    std::fs::write(root.join("htpasswd.txt"), "ordinary test placeholder").unwrap();
     std::fs::write(root.join("notes.txt"), "fine").unwrap();
     let outside = paths.data_dir.parent().unwrap().join("outside.txt");
     std::fs::write(&outside, "elsewhere").unwrap();
@@ -248,6 +250,12 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
         );
     }
     assert!(attach("notes.txt").await.is_ok());
+    assert!(attach(".HTPASSWD")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("credential"));
+    assert!(attach("htpasswd.txt").await.is_ok());
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }

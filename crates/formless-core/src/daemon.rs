@@ -17196,6 +17196,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         );
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
         "credentials",
