@@ -8384,6 +8384,22 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
     cli_tool_lookup::resolve(&tools, name).cloned()
 }
 
+fn tool_detail_calls_line(m: &formless_protocol::ToolMetricsInfo) -> String {
+    format!(
+        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
+        m.total,
+        m.success,
+        m.failure,
+        m.denied,
+        m.success_rate
+            .map(formless_core::success_rate::label)
+            .unwrap_or_else(|| "-".into()),
+        m.p50_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into())
+    )
+}
+
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     let t = &d.tool;
     let status = if t.retired {
@@ -8430,19 +8446,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     );
     println!("memory:       {} MB", t.memory_mb);
     let m = &d.metrics;
-    println!(
-        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
-        m.total,
-        m.success,
-        m.failure,
-        m.denied,
-        m.success_rate
-            .map(|r| format!("{:.0}%", r * 100.0))
-            .unwrap_or_else(|| "-".into()),
-        m.p50_ms
-            .map(|v| format!("{v:.0}ms"))
-            .unwrap_or_else(|| "-".into())
-    );
+    println!("{}", tool_detail_calls_line(m));
     println!(
         "latency:      p50 {} · p95 {}",
         m.p50_ms
@@ -9018,6 +9022,34 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_detail_calls_use_shared_success_rate_labels() {
+        use super::tool_detail_calls_line;
+
+        for (rate, label) in [
+            (None, "-"),
+            (Some(0.0), "0%"),
+            (Some(2.0 / 3.0), "67%"),
+            (Some(0.995), ">99%"),
+            (Some(0.9999), ">99%"),
+            (Some(1.0), "100%"),
+        ] {
+            let metrics = formless_protocol::ToolMetricsInfo {
+                total: 5,
+                success: 2,
+                failure: 2,
+                denied: 1,
+                success_rate: rate,
+                p50_ms: Some(12.0),
+                ..Default::default()
+            };
+            assert_eq!(
+                tool_detail_calls_line(&metrics),
+                format!("calls:        5 (2 ok, 2 failed, 1 denied) · success {label} · p50 12ms")
+            );
+        }
+    }
+
     #[test]
     fn tool_result_preview_marks_omission_at_complete_grapheme_boundaries() {
         use super::tool_result_preview;
