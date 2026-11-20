@@ -45,6 +45,19 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   c.location.hash = '#k=a+b%3D&s=session';
   assert.equal(c.hashParams().k, 'a+b=');
 });
+
+test('Windows drive roots, home folders and credential paths use native separators', () => {
+  const c = setup(['broadWhy', 'pathNote', 'normalizeApprovalPath']);
+  for (const path of ['C:\\', 'c:/', 'D:\\Users', 'C:\\Users\\Ada', '\\\\?\\C:\\USERS\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), 'writing anywhere in your files', path);
+  }
+  for (const path of ['C:', 'C:Users\\Ada', 'C:\\Users\\Ada\\project', '/work\\Users\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), null, path);
+  }
+  assert.deepEqual(Array.from(c.pathNote('fs:read:C:\\Users\\Ada\\.SSH\\id_rsa', 'C:\\Users\\Ada')), [true, 'holds SSH keys']);
+  assert.deepEqual(Array.from(c.pathNote('fs:read:c:/Users/Ada/project/file', 'C:\\USERS\\Ada\\project\\')), [false, 'inside the working folder']);
+  assert.equal(c.pathNote('fs:read:c:/Users/Ada/project-other/file', 'C:\\Users\\Ada\\project')[0], true);
+});
 test('init and hashchange recover malformed links through pairing guidance', () => {
   for (const kind of ['init', 'hashchange']) {
     let shown = 0, handler;
