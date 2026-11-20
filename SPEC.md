@@ -5273,7 +5273,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
-| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE`, `--overwrite` | Write a portable setup bundle, optionally including Session transcripts. To replace a file, pass `--overwrite` with `--output`. |
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
@@ -6242,7 +6242,9 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   command instead) or on Windows (a running program can't delete itself:
   it says to). `formless reset` deletes the same secrets.
 - **Moving to a new machine.** `formless export-all [--sessions] [-o
-  FILE]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600):
+  FILE [--overwrite]]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600).
+  The default name includes local hours, minutes, and seconds. Existing
+  destinations require `--overwrite` with an explicit output path. The bundle includes
   every active registry Tool (MCP tools come back with their server), the
   shared modules, Skills, memories, recurring jobs and the config
   (providers, Roles, MCP servers, settings) with every value that can

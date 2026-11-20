@@ -210,6 +210,9 @@ enum Cmd {
         /// Where to write it (default: ./formless-export-<date>.json)
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
+        /// Replace an existing file at the explicit output path
+        #[arg(long, requires = "output")]
+        overwrite: bool,
     },
     /// Free disk space: old artifacts and snapshots, long MCP logs, old
     /// migration copies, database free space
@@ -2491,20 +2494,26 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Some(BackupAction::Restore { file, .. }) => restore_cmd(&paths, &file),
             Some(BackupAction::Drill { file }) => run_restore_drill(&paths, file),
         },
-        Some(Cmd::ExportAll { sessions, output }) => {
+        Some(Cmd::ExportAll {
+            sessions,
+            output,
+            overwrite,
+        }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
             let bundle =
                 formless_tui::client::request_once(&paths, Request::ExportAll { sessions })?;
             let file = output.unwrap_or_else(|| {
                 std::path::PathBuf::from(format!(
                     "formless-export-{}.json",
-                    chrono::Local::now().format("%Y%m%d-%H%M")
+                    chrono::Local::now().format("%Y%m%d-%H%M%S")
                 ))
             });
-            formless_core::config::write_secret_file(
-                &file,
-                &serde_json::to_string_pretty(&bundle)?,
-            )?;
+            let contents = serde_json::to_string_pretty(&bundle)?;
+            if overwrite {
+                formless_core::config::write_secret_file(&file, &contents)?;
+            } else {
+                write_new_bundle(&file, &contents)?;
+            }
             let n = |k: &str| bundle[k].as_array().map_or(0, Vec::len);
             println!("exported:  {}", file.display());
             println!(
@@ -5248,6 +5257,30 @@ fn description_reviews_cmd(
         }
     }
     Ok(())
+}
+
+fn write_new_bundle(path: &std::path::Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("stage export in {}", parent.display()))?;
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists. Choose a new output path or pass --overwrite with --output.",
+                path.display()
+            );
+        }
+        Err(error) => {
+            Err(error.error).with_context(|| format!("publish export {}", path.display()))
+        }
+    }
 }
 
 fn print_bundle_description_preview(paths: &Paths, bundle: &Value) -> Result<()> {
