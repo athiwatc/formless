@@ -700,6 +700,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "powershell"
                 | "pwsh"
                 | "osascript"
+                | "r"
+                | "rscript"
                 | "env"
                 | "xargs"
                 | "sudo"
@@ -3829,6 +3831,28 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn r_interpreters_require_broad_process_confirmation() {
+        for spec in [
+            "process:R",
+            "process:Rscript",
+            "process:RSCRIPT",
+            "process:/usr/bin/Rscript",
+            "process:Rscript.exe",
+            "process:Rscript:--version",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:RStudio",
+            "process:Rscript2",
+            "process:rclone",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
