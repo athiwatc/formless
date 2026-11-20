@@ -1143,26 +1143,82 @@
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
-  async function refreshRunning() {
-    const revision = S.invocationRefresh = (S.invocationRefresh || 0) + 1;
-    const connection = [S.ws, S.conn, S.channel];
+  let runningRefresh = null, runningExposed = false, runningExposureQueued = false;
+  function runningPanelExposed() {
+    const sidebar = $("sidebar");
+    // Read the actual layout; both viewport and container queries can hide
+    // this drawer. The Running box itself is hidden when its list is empty.
+    return !document.hidden && S.view === "chat" && !!sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden";
+  }
+  function syncRunningExposure() {
+    const exposed = runningPanelExposed();
+    if (exposed && !runningExposed && !runningExposureQueued) {
+      runningExposureQueued = true;
+      queueMicrotask(() => {
+        runningExposureQueued = false;
+        if (runningPanelExposed()) refreshRunning("exposure");
+      });
+    }
+    runningExposed = exposed;
+  }
+  function sameRunningConnection(query) {
+    return query.ws === S.ws && query.conn === S.conn && query.channel === S.channel;
+  }
+  async function refreshRunning(reason = "event") {
+    if (!S.channel || S.ws?.readyState !== 1 || (!S.local && !S.relayReady)) return;
+    if (runningRefresh && sameRunningConnection(runningRefresh)) {
+      // A change may have happened after the read began; keep one follow-up.
+      // A periodic tick or a visibility change can reuse the current read.
+      if (reason === "event") runningRefresh.followUp = true;
+      return;
+    }
+    const query = runningRefresh = { ws: S.ws, conn: S.conn, channel: S.channel, followUp: false };
     const list = await request({ type: "list_invocations" }).catch(() => null);
-    if (!list || revision !== S.invocationRefresh || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+    if (runningRefresh !== query) return;
+    runningRefresh = null;
+    if (!sameRunningConnection(query)) {
+      // A Session subscription may change its client identifier without
+      // reconnecting. Retry on this socket, but never paint that old reply.
+      if (query.ws === S.ws && query.channel === S.channel) refreshRunning();
+      return;
+    }
+    if (query.followUp) {
+      refreshRunning();
+      return;
+    }
+    if (!list) return;
     S.invocations = list;
     reconcileInvocationProgress(list);
+    renderRunning(list);
+  }
+  function pollRunning() {
+    if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
+  }
+  function renderRunning(list) {
     const box = $("running");
+    const focused = document.activeElement;
+    const previous = box.contains(focused) ? focused.dataset : null;
+    const controls = [];
+    const control = (action, i, attrs, ...children) => {
+      const button = h("button", { type: "button", "data-running-action": action, "data-running-handle": i.handle, ...attrs }, ...children);
+      if (previous?.runningAction === action && previous.runningHandle === String(i.handle)) controls.push(button);
+      return button;
+    };
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
       const s = S.sessions.find((x) => x.id === i.session_id);
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
+        control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
           h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
           (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
-        i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
+        control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
+        i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
     }));
+    if (focusVisible(controls[0])) controls[0].focus({ preventScroll: true });
   }
-  setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
+  setInterval(pollRunning, 2000);
+  document.addEventListener("visibilitychange", syncRunningExposure);
 
   function sessionRows(sessions, visible, tree) {
     if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));
@@ -6976,6 +7032,7 @@
     const visible = !!(sidebar.getClientRects().length
       && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
     menu.setAttribute("aria-expanded", String(visible));
+    syncRunningExposure();
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
@@ -7418,6 +7475,7 @@
         break;
       }
       case "invocation_completed": {
+        refreshRunning();
         const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
         if (t) { t.status = ev.ok ? "ok" : "failed"; t.stalledSecs = null; }
         note(ev.tool_name + " background invocation " + (ev.ok ? "finished" : "failed"), !ev.ok);
@@ -7436,6 +7494,7 @@
 
   // =========================================================== connection
   async function loadAll() {
+    if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
     const saved = prefs.get("session", null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
