@@ -543,6 +543,13 @@ impl ModelStat {
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
 
+// These indexes are rebuilt from existing rows and change no record layout.
+// Install them on writable opens without accepting a new schema stamp.
+const DERIVED_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
+    CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);
+";
+
 const LATEST_CHECKPOINT_SQL: &str = "SELECT id, summary, up_to_seq FROM checkpoints
      WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1";
 
@@ -569,34 +576,26 @@ fn grouped_usage_sql(by: &str, bounded: bool) -> String {
         }
         _ => "substr(u.created_at, 1, 10)",
     };
-    let (label, join, order) = if by == "session" {
+    let (label, order) = if by == "session" {
         (
-            "COALESCE(s.name, u.session_id)",
-            "LEFT JOIN sessions s ON s.id=u.session_id",
+            "COALESCE((SELECT s.name FROM sessions s WHERE s.id=u.session_id), u.session_id)",
             // Keep alphabetical labels on token-count ties. The ID
             // makes buckets with an identical label stay contiguous.
             "10, 1",
         )
     } else {
-        ("NULL", "", "1")
+        ("NULL", "1")
     };
     let filter = if bounded {
         "WHERE u.created_at >= ?1"
     } else {
         ""
     };
-    // The Session join can otherwise prefer a full scan of the Session
-    // index for grouping, even though its leading column is unconstrained.
-    let source = if bounded && by == "session" {
-        "run_usage u INDEXED BY idx_run_usage_created"
-    } else {
-        "run_usage u"
-    };
     format!(
         "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
            SUM(u.cached_tokens), SUM(u.cache_write_tokens),
            CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
-         FROM {source} {join}
+         FROM run_usage u
          {filter}
          GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
     )
@@ -694,7 +693,7 @@ fn checkpoint_and_usage_range_queries_use_their_indexes() {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 68;
+pub const SCHEMA_VERSION: i64 = 67;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -779,7 +778,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 68] = [
+const MIGRATIONS: [(i64, MigrationStep); 67] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1105,12 +1104,6 @@ const MIGRATIONS: [(i64, MigrationStep); 68] = [
         add_column(c, "sessions", "plan_state TEXT")?;
         Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
-    (68, |c| {
-        Ok(c.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
-             CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);",
-        )?)
-    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -1145,7 +1138,7 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     } else {
         None
     };
-    let result = (|| {
+    let result: Result<()> = (|| {
         for (target, step) in MIGRATIONS {
             if version < target {
                 let tx = conn.unchecked_transaction()?;
@@ -1167,7 +1160,9 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
             let _ = std::fs::remove_file(migration_receipt_path(file));
         }
     }
-    result
+    result?;
+    conn.execute_batch(DERIVED_INDEXES)
+        .context("create derived database indexes")
 }
 
 /// Whether `e` says the database file itself is damaged (corrupt, or not a
