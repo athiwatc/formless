@@ -1990,7 +1990,9 @@ fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run_cli(cli) {
-        eprintln!("error: {e:#}");
+        if !e.is::<DoctorProblems>() {
+            eprintln!("error: {e:#}");
+        }
         std::process::exit(exit_code(&e));
     }
 }
@@ -2368,7 +2370,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 doctor(paths, fix)?
             };
             if !healthy {
-                std::process::exit(1);
+                return Err(DoctorProblems.into());
             }
             Ok(())
         }
@@ -3555,6 +3557,18 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
         }
     }
 }
+
+/// Doctor already wrote the full diagnostic report before returning this verdict.
+#[derive(Debug)]
+struct DoctorProblems;
+
+impl std::fmt::Display for DoctorProblems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor found unresolved diagnostic problems")
+    }
+}
+
+impl std::error::Error for DoctorProblems {}
 
 fn doctor(paths: Paths, fix: bool) -> Result<bool> {
     let problems = doctor_report(&paths, false)?;
