@@ -4054,7 +4054,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   folded in. `[`/`]` on an empty input focus the previous/next call and
   scroll it into view. `[`/`]` also stop on messages with text (yours
   and the answers). While a call is focused, Enter expands or collapses
-  it, and `z`/`Z` expand or collapse all calls. On a focused message or
+  its preview, F6 opens its full stored input and available result, and
+  `z`/`Z` expand or collapse all calls. Esc closes the pager and returns
+  to the same call. On a focused message or
   call, `c` copies its text and `C` copies it as Markdown (a call as its
   name, input and result in fences). Esc or typing leaves the focus.
   `/copy N` copies the Nth message from the bottom.
@@ -4063,8 +4065,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   discarded, the first Enter asks and a second confirms, and Esc cancels
   the edit. `f` forks a new Session with everything before that message
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
-  pretty-printed and highlighted when JSON (capped at a few hundred lines;
-  `/open` shows stored outputs in full).
+  pretty-printed and highlighted when JSON (input and ordinary result
+  previews are capped). The full call pager preserves the stored text and
+  shows control characters as visible escapes.
 - **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
   `/vim [on|off]`, enables modal editing in the composer and internal Tool,
   module, schema, description and run-input editors. The setting persists;

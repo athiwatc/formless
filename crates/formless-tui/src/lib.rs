@@ -9902,6 +9902,13 @@ impl App {
             self.begin_external_edit();
             return;
         }
+        if key.code == KeyCode::F(6)
+            && key.modifiers.is_empty()
+            && self.chat_focus_actions_available()
+            && self.open_focused_call()
+        {
+            return;
+        }
         if self.vim_mode
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
@@ -11267,6 +11274,99 @@ impl App {
         Some((text, format!("the {name} call")))
     }
 
+    fn chat_focus_input_available(&self) -> bool {
+        self.input.is_empty() && (!self.vim_mode || self.vim_input.mode == vim::Mode::Normal)
+    }
+
+    fn chat_focus_actions_available(&self) -> bool {
+        self.view == View::Chat
+            && self.chat_focus_input_available()
+            && self.input.searching().is_none()
+            && (!self.vim_mode || !self.vim_input.waiting_for_argument())
+            && self.current_question().is_none()
+            && self.find.is_none()
+            && self.renaming.is_none()
+            && self.instructing.is_none()
+            && !self.search_mode
+            && self.import_mode.is_none()
+            && self.bulk.is_none()
+            && self.editing_id.is_none()
+            && self.editing_queued.is_none()
+            && self.step.is_none()
+            && !self.editing_step
+            && self.approvals.is_empty()
+            && self.promotions.is_empty()
+            // These reviews can claim generic pager keys even before their
+            // asynchronous content arrives.
+            && !self.pending.values().any(|p| matches!(p, Pending::ProposalDiff))
+            && self.branch_summary.intent.is_none()
+            && self.branch_summary.review.is_none()
+            && !self.branch_summary.committing
+            && self.pager.is_none()
+            && self.wizard.is_none()
+            && self.editor.is_none()
+            && self.switcher.is_none()
+            && self.rollback_pick.is_none()
+            && self.model_overlay.is_none()
+            && self.forecast.modal.is_none()
+            && !self.quit_confirm
+            && !self.hunk_review_is_visible()
+            && !self.external_edit.awaiting_confirmation()
+    }
+
+    fn open_focused_call(&mut self) -> bool {
+        let Some(id) = self
+            .call_focus
+            .as_deref()
+            .filter(|id| !id.is_empty() && !id.starts_with("msg:"))
+        else {
+            return false;
+        };
+        // Chat's focus anchor is the last matching call in the transcript.
+        // Pair it only with a result after that occurrence.
+        let Some((index, (_, name, arguments))) = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, m)| !matches!(m.role.as_str(), "user" | "tool" | "system-note"))
+            .find_map(|(index, m)| {
+                persisted_calls(m.meta.as_deref()?)
+                    .into_iter()
+                    .rev()
+                    .find(|(call_id, _, _)| call_id == id)
+                    .map(|call| (index, call))
+            })
+        else {
+            return false;
+        };
+        let result = self.messages[index + 1..]
+            .iter()
+            .rev()
+            .find(|m| m.role == "tool" && result_call_id(m).as_deref() == Some(id));
+        let mut lines = vec!["Input:".into()];
+        lines.extend(arguments.split('\n').map(text::escape_terminal_line));
+        lines.push(String::new());
+        if let Some(result) = result {
+            lines.push("Result:".into());
+            lines.extend(result.content.split('\n').map(text::escape_terminal_line));
+        } else {
+            lines.push("Result unavailable.".into());
+        }
+        // A failed or offline Proposal diff can leave an owner without a
+        // pending request or a pager. Do not carry its keys into this viewer.
+        self.reviewing = None;
+        self.pager = Some(Pager {
+            title: format!("{} call", text::escape_terminal_line(&name)),
+            lines,
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        true
+    }
+
     /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
     /// while a call is focused Enter toggles it, `z`/`Z` expand or
     /// collapse all, and Esc or any other key leaves the focus.
@@ -11863,9 +11963,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(f.area());
     draw_tab_bar(f, chunks[0], app);
     let toast_area = chunks[1];
+    let mut chat_focus = None;
     match app.view {
-        View::Chat if pane_layout(app.multi_pane, chunks[1].width) => draw_panes(f, chunks[1], app),
-        View::Chat => draw_chat(f, chunks[1], app),
+        View::Chat if pane_layout(app.multi_pane, chunks[1].width) => {
+            chat_focus = draw_panes(f, chunks[1], app);
+        }
+        View::Chat => chat_focus = draw_chat(f, chunks[1], app),
         View::Sessions => draw_sessions(f, chunks[1], app),
         View::Settings => draw_settings(f, chunks[1], app),
         View::Tools => draw_tools(f, chunks[1], app),
@@ -11884,8 +11987,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         chunks[2],
         app,
         typing && (modal.is_none() || app.input_focus),
+        chat_focus,
     );
-    draw_status(f, chunks[3], app);
+    draw_status(f, chunks[3], app, chat_focus);
     if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
@@ -12827,7 +12931,13 @@ fn composer_prompt(app: &App) -> (&'static str, Color) {
     }
 }
 
-fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
+fn draw_input(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    show_cursor: bool,
+    focus: Option<keys::ChatFocus>,
+) {
     if let Some(find) = composer_find(app) {
         let n = find.rows.len();
         let count = if find.query.is_empty() {
@@ -12937,7 +13047,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if flashing {
         block = block.border_style(bold_fg(app.color, Color::Yellow));
     }
-    if area.width > 64 {
+    if area.width > 64 && focus.is_none() {
         block = block.title(ui::hint(
             &if app.running() {
                 format!("Enter steer · {} queue · Esc stop", app.queue_label())
@@ -13242,13 +13352,19 @@ fn compact_status(
     spans
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+fn draw_status(f: &mut Frame, area: Rect, app: &App, focus: Option<keys::ChatFocus>) {
     let width = area.width as usize;
     let mut spans = status_left(app, width);
     let used: usize = spans.iter().map(status_width).sum();
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
-    let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
+    let hint_width = width.saturating_sub(used + 3);
+    let hints = if focus.is_some() {
+        keys::line_with_chat_focus(app.view, hint_width, focus)
+    } else {
+        keys::line(app.view, hint_width)
+    };
+    let tip = format!("{hints} ");
     if tip.len() > 1 {
         spans.push(Span::raw(
             " ".repeat(width.saturating_sub(used + text::width(&tip))),
@@ -16177,6 +16293,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
     let mut call_lines: Vec<(usize, String)> = Vec::new();
+    let focus_actions = app.chat_focus_actions_available();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
     let results: HashMap<String, &str> = app
@@ -16313,12 +16430,25 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
                 if let Some(meta) = &m.meta {
                     for call in persisted_calls(meta) {
-                        if app.call_focus.as_deref() == Some(call.0.as_str()) {
+                        let focused = !call.0.is_empty()
+                            && !call.0.starts_with("msg:")
+                            && app.call_focus.as_deref() == Some(call.0.as_str());
+                        if focused {
                             focus_line = Some(lines.len());
                         }
                         call_lines.push((lines.len(), call.0.clone()));
                         let result = results.get(&call.0).copied();
-                        lines.extend(tool_call_block(app, &call, result));
+                        let mut block = tool_call_block(app, &call, result);
+                        if focused && focus_actions {
+                            block.insert(
+                                1,
+                                Line::styled(
+                                    "  ▲ Enter toggle · F6 full call · c copy · C Markdown · [ ] move · Esc",
+                                    bold_fg(app.color, Color::Yellow),
+                                ),
+                            );
+                        }
+                        lines.extend(block);
                     }
                 }
             }
@@ -16551,7 +16681,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     }
 }
 
-fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus> {
     app.chat_area = Some(area.inner(Margin {
         vertical: 1,
         horizontal: 1,
@@ -16567,6 +16697,21 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         image_lines,
         call_lines,
     } = chat_lines(app, width as usize, height);
+    let focus = app
+        .call_focus
+        .as_deref()
+        .filter(|_| app.chat_focus_input_available())
+        .map(|id| {
+            if focus_line.is_none() || !app.chat_focus_actions_available() {
+                // Focus may still receive Enter through the existing key
+                // path beneath a prompt. Suppress the generic send hint.
+                keys::ChatFocus::Unavailable
+            } else if id.starts_with("msg:") {
+                keys::ChatFocus::Message
+            } else {
+                keys::ChatFocus::Call
+            }
+        });
     // Find (Ctrl+F): highlight matches; the current one stands out.
     let mut match_lines = Vec::new();
     if let Some(find) = app.find.as_ref().filter(|f| !f.query.is_empty()) {
@@ -16791,6 +16936,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             &mut state,
         );
     }
+    focus
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
@@ -19151,7 +19297,7 @@ fn draw_editor_review(
     );
 }
 
-fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus> {
     // Side panes at their set widths (0 hides one; zero-size areas draw
     // nothing); the chat takes the rest.
     let (l, r) = app.pane_widths;
@@ -19232,7 +19378,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             left[1],
         );
     }
-    draw_chat(f, cols[1], app);
+    let focus = draw_chat(f, cols[1], app);
     let right = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(cols[2]);
     let total: i64 = app.tools.iter().map(|t| t.invocations).sum();
     let attention = app.tools.iter().filter(|t| t.needs_attention).count();
@@ -19314,6 +19460,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             .scroll((offset.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+    focus
 }
 
 mod wizard_layout;
@@ -21796,6 +21943,260 @@ mod tests {
         app.key(key(KeyCode::Char('h')));
         assert!(app.call_focus.is_none());
         assert_eq!(app.input, "h");
+    }
+
+    fn stored_call_fixture(name: &str, input: &str, result: &str) -> App {
+        let mut app = test_app();
+        let mut assistant = msg("assistant", "starting");
+        assistant.meta = Some(
+            serde_json::json!({"tool_calls":[
+                {"id":"focused-fixture", "function":{"name":name, "arguments":input}}
+            ]})
+            .to_string(),
+        );
+        let mut output = msg("tool", result);
+        output.meta = Some(serde_json::json!({"tool_call_id":"focused-fixture"}).to_string());
+        app.messages = vec![assistant, output];
+        app.call_focus = Some("focused-fixture".into());
+        app.scroll_to_focus = true;
+        app
+    }
+
+    #[test]
+    fn focused_call_opens_stored_pager_and_returns_to_focus() {
+        let mut app = stored_call_fixture("fixture", "private input", "private result");
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("F6 full call"), "{screen}");
+        assert!(screen.contains("Enter toggle call"), "{screen}");
+        assert!(!screen.contains("Enter send"), "{screen}");
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().expect("F6 opens focused stored call");
+        assert_eq!(
+            pager.lines,
+            ["Input:", "private input", "", "Result:", "private result"]
+        );
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.call_focus.as_deref(), Some("focused-fixture"));
+        app.key(key(KeyCode::Enter));
+        assert!(app.expanded_calls.contains("focused-fixture"));
+    }
+
+    #[test]
+    fn focused_call_keeps_chat_caps_and_pages_through_the_full_text() {
+        let input = (0..240)
+            .map(|i| format!("input row {i}\n"))
+            .collect::<String>();
+        let result = (0..340)
+            .map(|i| format!("output row {i}\n"))
+            .collect::<String>();
+        let mut app = stored_call_fixture("fixture", &input, &result);
+        app.expanded_calls.insert("focused-fixture".into());
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("F6 full call"), "{screen}");
+        let chat = chat_lines(&app, 120, 20);
+        let preview: Vec<_> = chat.lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            preview
+                .iter()
+                .filter(|line| line.contains("40 more lines"))
+                .count(),
+            2
+        );
+        assert!(preview
+            .iter()
+            .all(|line| !line.contains("input row 239") && !line.contains("output row 339")));
+
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().unwrap();
+        let result_header = pager
+            .lines
+            .iter()
+            .position(|line| line == "Result:")
+            .unwrap();
+        assert_eq!(pager.lines[1..result_header - 1].join("\n"), input);
+        assert_eq!(pager.lines[result_header + 1..].join("\n"), result);
+        app.key(key(KeyCode::End));
+        assert!(render(&mut app, 100, 12).contains("output row 339"));
+    }
+
+    #[test]
+    fn focused_call_displays_controls_safely_and_retains_all_json_fields() {
+        let mut app = stored_call_fixture(
+            "fixture\u{1b}\u{202e}",
+            "input\t\u{009b}\r\nnext line",
+            "result\u{1b}\u{0007}\u{2066}",
+        );
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().unwrap();
+        assert_eq!(pager.title, r"fixture\u{1b}⟨U+202E⟩ call");
+        assert_eq!(pager.lines[1], r"input\t\u{9b}\r");
+        assert_eq!(pager.lines[2], "next line");
+        assert_eq!(pager.lines.last().unwrap(), r"result\u{1b}\u{7}⟨U+2066⟩");
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains(r"result\u{1b}\u{7}⟨U+2066⟩"), "{screen}");
+        assert!(!screen
+            .chars()
+            .any(|c| c == '\u{1b}' || text::is_bidi_control(c)));
+        app.key(key(KeyCode::Esc));
+
+        let json = serde_json::json!({
+            "diff": "diff --git a/fixture b/fixture\n--- a/fixture\n+++ b/fixture\n@@ -1 +1 @@\n-old\n+new\n",
+            "other": "retained field",
+        })
+        .to_string();
+        assert!(result_diff(&json).is_some());
+        app.messages[1].content = json.clone();
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(app.pager.as_ref().unwrap().lines.last().unwrap(), &json);
+        render(&mut app, 44, 12);
+        for _ in 0..=json.len() / 8 {
+            app.key(key(KeyCode::Right));
+        }
+        assert!(render(&mut app, 44, 12).contains("retained field"));
+        app.key(key(KeyCode::Esc));
+        app.messages.pop();
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines.last().unwrap(),
+            "Result unavailable."
+        );
+    }
+
+    #[test]
+    fn focused_call_hints_and_f6_follow_current_chat_ownership() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        app.call_focus = Some(format!("msg:{}", app.messages[0].id));
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("Enter show focus"), "{screen}");
+        assert!(
+            !screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        app.call_focus = Some("stale-call".into());
+        let screen = render(&mut app, 140, 24);
+        assert!(
+            !screen.contains("Enter toggle call")
+                && !screen.contains("Enter send")
+                && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+
+        app.call_focus = Some("focused-fixture".into());
+        app.input.set("draft");
+        let screen = render(&mut app, 140, 24);
+        assert!(
+            screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.input, "draft");
+        app.input.clear();
+        app.input.search_older(&[] as &[&str]);
+        assert!(app.input.searching().is_some());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+
+        app.call_focus = Some("focused-fixture".into());
+        app.quit_confirm = true;
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert!(app.quit_confirm);
+        app.quit_confirm = false;
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Insert;
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+    }
+
+    #[test]
+    fn focused_call_does_not_advertise_send_when_approval_remains_open() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.on_event(Event::PromotionApprovalRequested {
+            promotion_id: "synthetic-choice".into(),
+            tool_name: "fixture".into(),
+            reason: "Pending promotion".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        app.key(key(KeyCode::Tab));
+        assert!(app.input_focus);
+        let screen = render(&mut app, 140, 36);
+        assert!(
+            !screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::Enter));
+        assert!(app.expanded_calls.contains("focused-fixture"));
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.promotions.len(), 1);
+    }
+
+    #[test]
+    fn focused_call_waits_for_existing_proposal_or_branch_summary_review() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.pending.insert(9, Pending::ProposalDiff);
+        app.reviewing = Some("synthetic-proposal".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.reviewing.as_deref(), Some("synthetic-proposal"));
+        tx.send(ServerMessage::err(9, "synthetic unavailable diff".into()))
+            .unwrap();
+        app.drain_daemon();
+        assert!(!app.pending.contains_key(&9));
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+        assert!(app.reviewing.is_none());
+        app.key(key(KeyCode::Char('a')));
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_some());
+        assert!(app.pending.is_empty());
+        app.key(key(KeyCode::Esc));
+
+        app.call_focus = Some("focused-fixture".into());
+        app.branch_summary.intent = Some(("source".into(), "target".into()));
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        app.key(key(KeyCode::Esc));
+        assert!(app.branch_summary.intent.is_none());
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+    }
+
+    #[test]
+    fn focused_call_pairs_the_latest_occurrence_with_its_later_result() {
+        let mut app = stored_call_fixture("fixture", "earlier input", "earlier result");
+        let later = stored_call_fixture("fixture", "later input", "later result");
+        app.messages.push(later.messages[0].clone());
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["Input:", "later input", "", "Result unavailable."]
+        );
+        app.messages.push(later.messages[1].clone());
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["Input:", "later input", "", "Result:", "later result"]
+        );
     }
 
     /// A rejected key goes back to the key step with the reason; an
@@ -26049,7 +26450,9 @@ mod tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw_panes(frame, frame.area(), app))
+            .draw(|frame| {
+                draw_panes(frame, frame.area(), app);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows = |start, end| {
@@ -28158,7 +28561,7 @@ mod tests {
         app.run_usage.insert("s1".into(), usage.clone());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(300, 1)).unwrap();
         terminal
-            .draw(|frame| draw_status(frame, frame.area(), &app))
+            .draw(|frame| draw_status(frame, frame.area(), &app, None))
             .unwrap();
         let status = terminal
             .backend()
