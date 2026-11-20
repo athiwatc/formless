@@ -5307,6 +5307,13 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
+`providers test NAME [--model MODEL] [--json]` lists the available model IDs
+or reports a model probe. JSON emits one object with the known listing or
+probe fields, including recorded usage when present. A completed model probe
+prints its report before returning exit 0 for success or 1 for a negative
+verdict. An empty model list still exits 0. Usage errors exit 2 and other
+request failures exit 1.
+
 `mcp test NAME [--json]` restarts the server and prints the full report before
 returning its verdict: exit 0 for a successful reply (including zero tools),
 exit 1 for an embedded restart error. JSON preserves the reply as one value
