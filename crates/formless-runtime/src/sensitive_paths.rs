@@ -287,6 +287,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
             || name.ends_with(".pem")
             || name.ends_with(".key")
+            || name.ends_with(".jks")
+            || name.ends_with(".keystore")
         {
             return Some("credential-shaped filename");
         }

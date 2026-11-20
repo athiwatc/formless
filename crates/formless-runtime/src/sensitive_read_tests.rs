@@ -63,6 +63,35 @@ fn host(policy: PathPolicy, allow: bool) -> Arc<ConsentHost> {
         paths: Mutex::new(Vec::new()),
     })
 }
+
+#[test]
+fn java_keystores_need_exact_consent_for_tool_reads() {
+    let f = Fixture::new();
+    let ops = host(PathPolicy::default(), false);
+    let code = "function run(input) { return fs.read(input.path); }";
+    let mut expected_paths = Vec::new();
+    for name in ["release.jks", "debug.KEYSTORE"] {
+        let path = f.0.join(name);
+        std::fs::write(&path, "private test placeholder").unwrap();
+        assert!(
+            execute(&f.request(code, &path), ops.clone()).is_err(),
+            "{name}"
+        );
+        expected_paths.push(path.canonicalize().unwrap());
+    }
+    for name in ["notes.txt", "keys.jks.txt", "debug.keystore.bak"] {
+        let path = f.0.join(name);
+        std::fs::write(&path, "ordinary test placeholder").unwrap();
+        assert_eq!(
+            execute(&f.request(code, &path), ops.clone())
+                .unwrap()
+                .output,
+            json!("ordinary test placeholder")
+        );
+    }
+    assert_eq!(*ops.paths.locked(), expected_paths);
+}
+
 #[test]
 fn input_bound_project_read_is_quiet_but_credentials_need_exact_consent() {
     let f = Fixture::new();
