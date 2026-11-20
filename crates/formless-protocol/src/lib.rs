@@ -725,7 +725,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             }
             "find" => return Some("find can run any program (-exec)"),
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
-            "make" | "cmake" | "ninja" => {
+            "make" | "cmake" | "ninja" | "npm" | "yarn" | "pnpm" | "cargo" => {
                 return Some("a build tool runs whatever the build files say")
             }
             _ => {}
@@ -3829,6 +3829,27 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_package_build_tools() {
+        for spec in [
+            "process:npm",
+            "process:/usr/bin/yarn",
+            "process:pnpm",
+            "process:cargo.exe",
+            "process:cargo:build",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:npmlint",
+            "process:yarnpkg-info",
+            "process:cargo-watch",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
