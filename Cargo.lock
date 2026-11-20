@@ -1418,6 +1418,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
  "windows-sys 0.59.0",
 ]

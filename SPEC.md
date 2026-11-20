@@ -3802,6 +3802,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   Tool's Capabilities, Session and Run. post_tool adds the result
   (clipped to 4000 characters) and `ok`; run_end has the Run's `status`.
   A Tool hook gets it as input, and a command gets it on stdin.
+  After a command exits, Formless gives its output pipes a short grace
+  period to drain and then stops any remaining processes in the hook's
+  process group. A hook that reaches its timeout also stops the group.
 - **pre_tool:**
   - Runs before every matching call, built-ins included.
   - A Tool hook returning `{deny: true, reason}`, or a command exiting
