@@ -706,7 +706,17 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "doas"
         ) || matches!(
             stem,
-            "python" | "node" | "deno" | "bun" | "perl" | "ruby" | "php" | "lua" | "tclsh"
+            "python"
+                | "node"
+                | "deno"
+                | "bun"
+                | "perl"
+                | "ruby"
+                | "php"
+                | "lua"
+                | "tclsh"
+                | "wish"
+                | "expect"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -3816,8 +3826,15 @@ mod tests {
 
     #[test]
     fn programs_that_run_others_are_flagged_broad() {
+        assert!(broad_capability("process:autoexpect").is_none());
+        assert!(broad_capability("process:unexpect").is_none());
         for spec in [
             "process:python3.11",
+            "process:wish",
+            "process:wish8.6",
+            "process:wish.exe",
+            "process:expect",
+            "process:expect5.45",
             "process:ruby3.2",
             "process:node20",
             "process:git",
