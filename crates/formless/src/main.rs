@@ -5459,19 +5459,8 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
     let url = r["url"].as_str().unwrap_or_default().to_string();
     println!("Web UI on 127.0.0.1:{} (this link works once):", r["port"]);
     println!("{url}");
-    if !no_open {
-        let opener = if cfg!(target_os = "macos") {
-            std::process::Command::new("open").arg(&url).status()
-        } else if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .status()
-        } else {
-            std::process::Command::new("xdg-open").arg(&url).status()
-        };
-        if opener.map(|s| !s.success()).unwrap_or(true) {
-            println!("(could not open a browser; open the link above)");
-        }
+    if !no_open && !formless_core::docs::open_url(&url) {
+        println!("(could not open a browser; open the link above)");
     }
     Ok(())
 }
