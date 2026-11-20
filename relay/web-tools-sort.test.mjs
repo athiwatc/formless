@@ -98,7 +98,7 @@ function fixture() {
   });
   vm.runInContext([
     constStatement('TOOL_COLS'),
-    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'recentCalls', 'toolRecent', 'toolsTable', 'visibleTools', 'renderTools'].map(fn),
+    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'recentCalls', 'toolRecent', 'toolsTable', 'visibleTools', 'renderToolsTable', 'renderTools'].map(fn),
   ].join('\n'), context);
   return { context, controls };
 }
@@ -195,7 +195,7 @@ function paint(setup) {
   const draw = () => setup.context.toolsTable(table, setup.context.visibleTools(), {
     selected: setup.context.S.selectedTool, onselect(id) { setup.context.S.selectedTool = id; }, sortable: true,
   });
-  setup.context.renderTools = draw;
+  setup.context.renderToolsTable = draw;
   draw();
   return table;
 }
@@ -419,4 +419,51 @@ test('Tools and Metrics rows show the same retained sample without changing life
     assert.equal(recent.children[0].children.length, 20);
     assert.equal(recent.children[1].textContent, '5/20 ✓ ↓');
   }
+});
+
+
+test('filter, quick filter and menu sort leave the selected detail and editor untouched', () => {
+  const { context, controls } = fixture();
+  for (const id of ['tools-filter', 'tools-quick', 'tools-sort']) {
+    controls[id].listeners = {};
+    controls[id].addEventListener = Node.prototype.addEventListener;
+  }
+  const detail = controls['tool-detail'];
+  const editor = new Node('textarea');
+  editor.value = 'unsaved code';
+  editor.selectionStart = 3;
+  const tags = new Node('input');
+  tags.value = 'unsaved tags';
+  const changes = new Node('details');
+  changes.open = true;
+  detail.append(editor, tags, changes);
+  context.S.selectedTool = 'alpha';
+  context.S.toolDetail = { tool: { id: 'alpha' } };
+  context.renderToolDetail = () => { throw new Error('detail rebuilt: would request diff and focus editor'); };
+  context.document.activeElement = controls['tools-filter'];
+  let paints = 0;
+  const paintTable = context.toolsTable;
+  context.toolsTable = (...args) => { paints++; return paintTable(...args); };
+  const start = source.indexOf('  for (const id of ["tools-filter"');
+  const end = source.indexOf('  for (const id of ["proposals-filter"', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(source.slice(start, end), context);
+  for (const text of ['a', 'al', 'alp']) {
+    controls['tools-filter'].value = text;
+    for (const listener of controls['tools-filter'].listeners.input) listener();
+  }
+  controls['tools-quick'].value = '';
+  for (const listener of controls['tools-quick'].listeners.input) listener();
+  controls['tools-sort'].value = 'calls';
+  assert.equal(controls['tools-sort'].listeners.input.length, 1);
+  for (const listener of controls['tools-sort'].listeners.input) listener();
+  assert.equal(paints, 5);
+  assert.equal(context.S.toolSort.key, 'calls');
+  assert.deepEqual(detail.children, [editor, tags, changes]);
+  assert.equal(editor.value, 'unsaved code');
+  assert.equal(editor.selectionStart, 3);
+  assert.equal(tags.value, 'unsaved tags');
+  assert.equal(changes.open, true);
+  assert.equal(context.document.activeElement, controls['tools-filter']);
+  expectHeaders(controls['tools-table'], 'calls', false);
 });

@@ -42,7 +42,7 @@ for (const tag of ['div', 'span']) {
   });
 }
 test('both shipped diff viewers use the renderer without changing fenced highlights', () => {
-  assert.match(source, /pre\.replaceChildren\(\.\.\.renderDiffLines\(r\.diff, "div"\)\)/);
+  assert.match(source, /pre\.replaceChildren\(\.\.\.renderDiffLines\(result\.value\.diff, "div"\)\)/);
   assert.match(source, /h\("pre", \{ class: "diff" \}, renderDiffLines\(f\.diff, "span"\)\)/);
 });
 test('run-file dialog uses metadata styling while preserving literal diff text', async () => {

@@ -4458,9 +4458,9 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
-  for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
+  for (const id of ["tools-filter", "tools-quick"]) $(id).addEventListener("input", () => renderToolsTable());
   // The Sort menu picks a column in its natural order.
-  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderTools(); });
+  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderToolsTable(); });
   for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
@@ -4500,7 +4500,7 @@
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
-          renderTools();
+          renderToolsTable();
         } }, label, glyph) : label);
       return th;
     }))));
@@ -4552,11 +4552,14 @@
     rows.sort(cmp);
     return sort.reverse ? rows.reverse() : rows;
   }
-  function renderTools() {
+  function renderToolsTable() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
     toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true,
       emptyMessage: S.tools.length ? "No Tools match the current filters." : null });
+  }
+  function renderTools() {
+    renderToolsTable();
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -4849,6 +4852,48 @@
     const approved = await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" });
     return approved && current() ? metadata : null;
   }
+  // One selected version pair only; never persisted or shared across connections.
+  function toolVersionChanges(id, from, to) {
+    const channel = S.channel, ws = S.ws, conn = S.conn;
+    const valid = () => {
+      const d = S.toolDetail;
+      const idx = d && d.versions.findIndex((v) => v.version === to);
+      return S.channel === channel && S.ws === ws && S.conn === conn &&
+        S.selectedTool === id && d && d.tool.id === id && d.tool.current_version === to &&
+        idx > 0 && d.versions[idx - 1].version === from;
+    };
+    const pre = h("pre", { class: "diff" }, "Open to load changes.");
+    const details = h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + to), pre);
+    details.addEventListener("toggle", async () => {
+      if (!details.open || !details.isConnected || !valid()) return;
+      let cached = S.toolVersionDiff;
+      if (!cached || cached.channel !== channel || cached.ws !== ws || cached.conn !== conn ||
+          cached.id !== id || cached.from !== from || cached.to !== to) {
+        cached = { channel, ws, conn, id, from, to };
+        S.toolVersionDiff = cached;
+        // Keep the settled result (including errors) to avoid repeated requests
+        // on toggles. A new selection/connection permits a new attempt.
+        cached.result = request({ type: "diff_tool_versions", id, from, to })
+          .then((value) => ({ value }), (error) => ({ error }));
+      }
+      pre.textContent = "loading…";
+      const result = await cached.result;
+      if (!valid() || S.toolVersionDiff !== cached || !details.isConnected) return;
+      if (result.error) pre.textContent = String(result.error.message || result.error);
+      else if (typeof result.value?.diff === "string") pre.replaceChildren(...renderDiffLines(result.value.diff, "div"));
+      else pre.textContent = "No version diff returned.";
+    });
+    return details;
+  }
+  function focusToolEditor(area) {
+    const editing = S.editingCode;
+    if (!editing || !editing.focusPending) return;
+    editing.focusPending = false;
+    const active = document.activeElement;
+    setTimeout(() => {
+      if (S.editingCode === editing && area.isConnected && document.activeElement === active) area.focus();
+    }, 0);
+  }
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
@@ -4889,15 +4934,11 @@
     if (idx > 0) {
       // What the current version changed (optimiser promotion or agent edit).
       const from = d.versions[idx - 1].version;
-      const pre = h("pre", { class: "diff" }, "loading…");
-      box.append(h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + t.current_version), pre));
-      request({ type: "diff_tool_versions", id: t.id, from, to: t.current_version }).then((r) => {
-        pre.replaceChildren(...renderDiffLines(r.diff, "div"));
-      }).catch((e) => { pre.textContent = String(e.message || e); });
+      box.append(toolVersionChanges(t.id, from, t.current_version));
     }
     const editing = S.editingCode && S.editingCode.toolId === t.id;
     box.append(h("div", { class: "detail-actions" },
-      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),
+      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "", focusPending: true }; renderTools(); } }, "Edit code"),
       t.retired ? null : h("button", { class: "btn small", type: "button", onclick: () => tryTool(t, current) }, "Try it"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => retireTool(t, d) }, t.retired ? "Restore" : "Retire"),
@@ -4942,7 +4983,7 @@
         h("button", { class: "btn primary small", type: "button", onclick: () => saveCode(t) }, "Save new version"),
         h("button", { class: "btn ghost small", type: "button", onclick: () => { S.editingCode = null; renderTools(); } }, "Cancel"),
         h("span", { class: "muted", style: "font-size:0.75rem" }, "Ctrl/⌘+S save · Esc cancel")));
-      setTimeout(() => area.focus(), 0);
+      focusToolEditor(area);
     } else if (current) {
       box.append(h("h3", null, "Code v" + current.version));
       const rows = current.code.split("\n").map((l, i) => h("tr", null, h("td", { class: "ln" }, i + 1), h("td", { class: "src" }, l)));
@@ -6176,6 +6217,7 @@
   let toolSeq = 0;
   async function selectTool(id, quiet) {
     const seq = ++toolSeq;
+    if (S.selectedTool !== id) S.toolVersionDiff = null;
     S.selectedTool = id;
     S.toolDetailError = null;
     renderView();
@@ -6206,6 +6248,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    S.toolVersionDiff = null;
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
@@ -7563,6 +7606,7 @@
     S.stableTimer = setTimeout(() => { S.backoff = 1000; }, 30000);
   }
   async function connect(secret) {
+    S.toolVersionDiff = null;
     $("pair-error").textContent = "";
     if (!secureOrigin()) {
       $("pair-error").textContent = "This page was not loaded over HTTPS, so it will not take a pairing secret. Open the relay's https:// address.";
@@ -7771,6 +7815,7 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    S.toolVersionDiff = null;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;
     S.local = true;
