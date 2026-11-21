@@ -1060,6 +1060,7 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::Pi => executable("FORMLESS_TOPIC_PI_EXE")?,
                 _ => None,
             },
             environment: BTreeMap::from([
@@ -1145,7 +1146,23 @@ impl Daemon {
                 self.run_topic_cli(attempt, token, request, handler, cancel)
                     .await
             }
-            HarnessKind::Pi => bail!("Pi adapter not integrated yet; choose Claude or Codex"),
+            HarnessKind::Pi => {
+                let private = self
+                    .paths
+                    .data_dir
+                    .canonicalize()?
+                    .join("topic-attempts")
+                    .join(&attempt.id);
+                let staged = local_harness::pi::stage_extension(&private)?;
+                {
+                    let _launch = self.topic_launch.locked();
+                    self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+                    if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                        bail!("step cancelled before launch");
+                    }
+                }
+                local_harness::pi::run(request, &staged, handler, cancel).await
+            }
             HarnessKind::OpenCode => {
                 bail!("OpenCode adapter not integrated yet; choose Claude or Codex")
             }
