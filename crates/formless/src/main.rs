@@ -3508,9 +3508,19 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     {
         use std::os::unix::fs::PermissionsExt;
         // Every secret file, named secrets included (#849).
+        let config_backups = std::fs::read_dir(&paths.config_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry.file_name().to_string_lossy().ends_with(".toml.bak")
+            })
+            .map(|entry| entry.path());
         let open: Vec<std::path::PathBuf> = formless_core::config::secret_files(paths)
             .into_iter()
             .chain([paths.config_file()])
+            .chain(config_backups)
             .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
             .collect();
         if !open.is_empty() {

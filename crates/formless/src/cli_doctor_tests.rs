@@ -196,6 +196,23 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fixes_open_config_backup_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let backup = fixture.paths.config_file().with_extension("toml.bak");
+    std::fs::write(&backup, "fixture backup").unwrap();
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let problem = super::doctor_local_problems(&fixture.paths)
+        .into_iter()
+        .find(|problem| matches!(&problem.fix, Some(super::Fix::Chmod600(files)) if files.contains(&backup)))
+        .expect("doctor should report an open config backup");
+    super::apply_fix(&fixture.paths, &problem.fix.unwrap()).unwrap();
+    let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 #[ignore = "owned subprocess fixture; invoked by doctor dispatch/output tests"]
 fn doctor_child_fixture() {
