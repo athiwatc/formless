@@ -46,11 +46,10 @@ impl App {
             },
             Request::ListTopics,
         );
-        if self.topic.main().is_none()
-            && !self
-                .pending
-                .values()
-                .any(|pending| matches!(pending, Pending::TopicMain { .. }))
+        if !self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::TopicMain { .. }))
         {
             self.request_main_chat(false);
         }
@@ -135,11 +134,10 @@ impl App {
         self.topic.open_proposal(&source, &messages, &repo, &name);
     }
 
+    /// Always asks the daemon: a purged Main Chat is replaced there, so a
+    /// cached id may no longer exist.
     fn open_main_chat(&mut self) {
-        match self.topic.main().map(|main| main.id.clone()) {
-            Some(id) => self.open_topic_session(id),
-            None => self.request_main_chat(true),
-        }
+        self.request_main_chat(true);
     }
 
     fn open_topic_session(&mut self, id: String) {
@@ -906,6 +904,11 @@ mod tests {
         app.topic.update_topics(vec![running]);
         assert_eq!(app.topic.selected(), &Node::Topic("t1".into()));
         app.open_main_chat();
+        assert!(app
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::TopicMain { open: true, .. })));
+        app.open_topic_session("main".into());
         assert_eq!(app.current.as_deref(), Some("main"));
         assert_eq!(app.input.expanded(), "half-written");
     }

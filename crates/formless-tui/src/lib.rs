@@ -7155,7 +7155,7 @@ impl App {
             self.submit_queued_edit(edit);
             return;
         }
-        if !self.expand_user_command() {
+        if !self.expand_user_command() || self.topic_blocks_submit() {
             return;
         }
         let text = self.input.expanded();
@@ -12188,6 +12188,10 @@ impl App {
             let mut line = ed.take_modal_line();
             line.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
             ed.apply_modal_line(line);
+            return;
+        }
+        if self.topic.overlay_open() && self.approvals.is_empty() && self.promotions.is_empty() {
+            self.topic.paste(text);
             return;
         }
         // Paste is literal query text while searching the pager. Otherwise

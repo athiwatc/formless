@@ -353,6 +353,29 @@ impl State {
         self.enabled = None;
     }
 
+    /// Pasted text goes to the overlay's focused text field, never the
+    /// composer it covers.
+    pub fn paste(&mut self, text: &str) {
+        let text: String = text
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        match self.overlay.as_mut() {
+            Some(Overlay::Proposal) => {
+                if let Some(proposal) = self.proposal.as_mut() {
+                    if matches!(proposal.step, ProposalStep::Fields) {
+                        if let Some(field) = proposal.text_field_mut() {
+                            field.insert_str(&text);
+                        }
+                    }
+                }
+            }
+            Some(Overlay::Reject { reason, .. }) => reason.insert_str(&text),
+            _ => {}
+        }
+    }
+
     pub fn overlay_open(&self) -> bool {
         self.overlay.is_some()
     }
@@ -394,9 +417,11 @@ impl State {
         }
         self.topics
             .iter()
-            .find(|topic| topic.status == TopicStatus::PendingApproval)
+            .find(|topic| {
+                topic.status == TopicStatus::PendingApproval
+                    && !self.pending_reviewed.contains(&topic.id)
+            })
             .map(|topic| topic.id.clone())
-            .filter(|id| !self.pending_reviewed.contains(id))
     }
 
     pub fn mark_pending_reviewed(&mut self, topic_id: &str) {
@@ -1152,6 +1177,10 @@ impl State {
 
     fn draw_picker_rows(&self, frame: &mut Frame, area: Rect, color: bool) {
         let rows = self.rows();
+        let mut state = ListState::default().with_selected(
+            rows.iter()
+                .position(|row| row.node.as_ref() == Some(&self.selected)),
+        );
         let items = rows
             .into_iter()
             .map(|row| {
@@ -1174,9 +1203,10 @@ impl State {
                 ]))
             })
             .collect::<Vec<_>>();
-        frame.render_widget(
+        frame.render_stateful_widget(
             List::new(items).block(crate::ui::panel(" Conversations ", color, Color::Cyan)),
             area,
+            &mut state,
         );
     }
 
@@ -1222,10 +1252,11 @@ impl State {
                     ]));
                     lines.push(Line::from(format!("    {}", message.content.replace('\n', " "))));
                 }
+                // One header line, then two unwrapped lines per message.
+                let selected_end = 3 + 2 * proposal.message_index;
+                let scroll = selected_end.saturating_sub(inner.height as usize);
                 frame.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: false })
-                        .scroll((proposal.scroll, 0)),
+                    Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
                     inner,
                 );
             }
@@ -1740,6 +1771,29 @@ mod tests {
         state.mark_pending_reviewed("t1");
         assert_eq!(state.update_topics(vec![pending]), None);
         assert!(matches!(state.overlay, Some(Overlay::Review { .. })));
+    }
+
+    #[test]
+    fn a_reviewed_pending_topic_does_not_hide_later_ones() {
+        let mut state = State::default();
+        state.mark_pending_reviewed("t1");
+        let topics = vec![
+            topic("t1", TopicStatus::PendingApproval),
+            topic("t2", TopicStatus::PendingApproval),
+        ];
+        assert_eq!(state.update_topics(topics), Some("t2".into()));
+    }
+
+    #[test]
+    fn paste_edits_the_focused_proposal_field_only() {
+        let mut state = State::default();
+        let messages = vec![message("m1", 1, "user", "add X")];
+        state.open_proposal(&session("main"), &messages, "/repo", "");
+        state.paste("ignored on the message step");
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.paste("formless\n");
+        let proposal = state.proposal.as_ref().unwrap();
+        assert_eq!(proposal.fields[0].expanded(), "formless ");
     }
 
     #[test]
