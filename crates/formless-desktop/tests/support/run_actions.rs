@@ -125,7 +125,19 @@ fn every_run_action_control_reviews_exact_target_and_requires_explicit_confirmat
                 .iter()
                 .any(|c| matches!(c,Wire::CommitRunAction(op) if *op == operation)));
             assert!(d.before_write());
-            d.finish(Err("Fixture rejected; nothing applied".into()), false);
+            let receipt = match kind {
+                Kind::Edit => {
+                    json!({"session_id":d.action.owner.session,"id":"last-user","content":d.action.text})
+                }
+                Kind::Retry => json!({"model":null,"original_session":null}),
+                Kind::Good => json!({"run_id":"run-actions-r","rating":"good"}),
+                Kind::Bad => json!({"run_id":"run-actions-r","rating":"bad"}),
+                Kind::ProviderRetry => json!({"retrying":true}),
+                Kind::Compact => json!({"started":true,"up_to":1}),
+                Kind::Delete => json!({"deleted":true,"undo_secs":30}),
+                Kind::Cwd => json!({"id":d.action.owner.session,"cwd":null}),
+            };
+            d.finish(Ok(receipt), true);
             window.render_frame(cx);
             window.click("run-action-close", cx);
             window.render_frame(cx);
@@ -251,23 +263,38 @@ fn delete_undo_is_explicit_expires_and_is_cleared_on_disconnect(cx: &mut TestApp
         window.render_frame(cx);
         window.click("run-action-close", cx);
         let ticket = formless_desktop::run_actions::DeleteUndo {
-            owner, operation: uuid::Uuid::new_v4(),
+            owner,
+            operation: uuid::Uuid::new_v4(),
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
         };
-        shell.update(cx, |s, cx| s.apply_client_update(Update::DeleteUndo(ticket.clone()), window, cx));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::DeleteUndo(ticket.clone()), window, cx)
+        });
         window.render_frame(cx);
         window.click("session-delete-undo", cx);
-        assert!(shell.update(cx, |s, _| s.take_client_commands()).iter().any(|c| matches!(c, Wire::UndoDelete(op) if *op == ticket.operation)));
+        assert!(shell
+            .update(cx, |s, _| s.take_client_commands())
+            .iter()
+            .any(|c| matches!(c, Wire::UndoDelete(op) if *op == ticket.operation)));
         window.render_frame(cx);
         assert!(window.try_find("session-delete-undo").is_none());
         let mut expired = ticket.clone();
         expired.deadline = std::time::Instant::now();
-        shell.update(cx, |s, cx| s.apply_client_update(Update::DeleteUndo(expired), window, cx));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::DeleteUndo(expired), window, cx)
+        });
         window.render_frame(cx);
         assert!(window.try_find("session-delete-undo").is_none());
         shell.update(cx, |s, cx| {
             s.apply_client_update(Update::DeleteUndo(ticket), window, cx);
-            s.apply_client_update(Update::Connection { ready: false, notice: "Disconnected".into() }, window, cx);
+            s.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            );
         });
         window.render_frame(cx);
         assert!(window.try_find("session-delete-undo").is_none());
@@ -282,20 +309,70 @@ fn measured_run_context_survives_estimates_errors_and_resets_for_next_run(cx: &m
         let (owner, _) = open_action(&shell, Kind::Cwd, window, cx);
         window.render_frame(cx);
         window.click("run-action-close", cx);
-        shell.update(cx, |s, cx| s.apply_client_update(Update::RunActivity {
-            owner: owner.clone(),
-            event: formless_protocol::Event::RunUsage { session_id: owner.session.clone(), run_id: "r".into(),
-                usage: formless_protocol::UsageInfo { context_used: 75, context_tokens: 100, ..Default::default() } },
-        }, window, cx));
-        for result in [Ok(ContextUsage { used: 12, limit: 100, measured: false }), Err("unavailable".into())] {
-            shell.update(cx, |s, cx| s.apply_client_update(Update::LiveContext { owner: owner.clone(), result }, window, cx));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::RunActivity {
+                    owner: owner.clone(),
+                    event: formless_protocol::Event::RunUsage {
+                        session_id: owner.session.clone(),
+                        run_id: "r".into(),
+                        usage: formless_protocol::UsageInfo {
+                            context_used: 75,
+                            context_tokens: 100,
+                            ..Default::default()
+                        },
+                    },
+                },
+                window,
+                cx,
+            )
+        });
+        for result in [
+            Ok(ContextUsage {
+                used: 12,
+                limit: 100,
+                measured: false,
+            }),
+            Err("unavailable".into()),
+        ] {
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::LiveContext {
+                        owner: owner.clone(),
+                        result,
+                    },
+                    window,
+                    cx,
+                )
+            });
             window.render_frame(cx);
             let label = window.find("status-context").value().unwrap().to_string();
             assert!(label.contains("75%") && label.contains("measured"));
         }
         shell.update(cx, |s, cx| {
-            s.apply_client_update(Update::RunActivity { owner: owner.clone(), event: formless_protocol::Event::RunStarted { session_id: owner.session.clone(), run_id: "next".into() } }, window, cx);
-            s.apply_client_update(Update::LiveContext { owner, result: Ok(ContextUsage { used: 12, limit: 100, measured: false }) }, window, cx);
+            s.apply_client_update(
+                Update::RunActivity {
+                    owner: owner.clone(),
+                    event: formless_protocol::Event::RunStarted {
+                        session_id: owner.session.clone(),
+                        run_id: "next".into(),
+                    },
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::LiveContext {
+                    owner,
+                    result: Ok(ContextUsage {
+                        used: 12,
+                        limit: 100,
+                        measured: false,
+                    }),
+                },
+                window,
+                cx,
+            );
         });
         window.render_frame(cx);
         let label = window.find("status-context").value().unwrap().to_string();

@@ -1415,9 +1415,12 @@ impl Engine {
             match &pending {
                 Pending::RunWrite(w) => w.dispatch.reject(error),
                 Pending::Action(a) | Pending::ReviewedAction { action: a, .. } => {
-                    self.updates.push(Update::Action { session_id: a.session_id.clone(), result: Err(error.into()) });
+                    self.updates.push(Update::Action {
+                        session_id: a.session_id.clone(),
+                        result: Err(error.into()),
+                    });
                 }
-                _ => {},
+                _ => {}
             }
             self.updates.push(Update::Notice(error.into()));
             return;
@@ -1442,9 +1445,23 @@ impl Engine {
         if self.stream_subscribe() {
             return;
         }
+        let sessions = self
+            .active
+            .iter()
+            .cloned()
+            .chain(
+                self.compacting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         self.request(
             Request::Subscribe {
-                sessions: Some(self.active.iter().cloned().collect()),
+                sessions: Some(sessions),
                 deltas: self.live_available && !self.reader.requested,
                 client: Some("Desktop".into()),
             },
@@ -1531,8 +1548,17 @@ impl Engine {
     fn command(&mut self, command: Command) {
         match command {
             Command::UndoDelete(operation) => {
-                if let Some(ticket) = self.delete_undo.take().filter(|t| t.operation == operation && t.available() && self.ready) {
-                    self.request(Request::RestoreSession { id: ticket.owner.session.clone() }, Pending::RestoreSession(ticket));
+                if let Some(ticket) = self
+                    .delete_undo
+                    .take()
+                    .filter(|t| t.operation == operation && t.available() && self.ready)
+                {
+                    self.request(
+                        Request::RestoreSession {
+                            id: ticket.owner.session.clone(),
+                        },
+                        Pending::RestoreSession(ticket),
+                    );
                 }
             }
             Command::ReadRunAction { owner, operation } => {
@@ -2365,7 +2391,10 @@ impl Engine {
                     || matches!(&event, Event::Note { text, .. } if text.starts_with("compaction failed:"))
                 {
                     if let Some(session) = event.session_id() {
-                        self.compacting.lock().unwrap_or_else(|e| e.into_inner()).remove(session);
+                        self.compacting
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(session);
                     }
                 }
                 if matches!(
@@ -2553,19 +2582,22 @@ impl Engine {
         };
         match pending {
             Pending::RestoreSession(ticket) => {
-                let acknowledged = response_ok && result.as_ref().is_ok_and(|v| v["id"] == ticket.owner.session);
+                let acknowledged = response_ok
+                    && result
+                        .as_ref()
+                        .is_ok_and(|v| v["id"] == ticket.owner.session);
                 self.updates.push(Update::Notice(if acknowledged {
                     "Session restored.".into()
                 } else {
-                    "Restore outcome unknown or rejected. Reload Sessions; nothing was replayed.".into()
+                    "Restore outcome unknown or rejected. Reload Sessions; nothing was replayed."
+                        .into()
                 }));
                 self.dirty_list = true;
                 self.dirty_session = true;
             }
             Pending::RunTarget { owner, operation } => {
                 if self.action_owner().as_ref() == Some(&owner) {
-                    let result =
-                        result.and_then(|v| self.action_target(&owner.session, &v));
+                    let result = result.and_then(|v| self.action_target(&owner.session, &v));
                     self.updates.push(Update::RunActionTarget {
                         owner,
                         operation,
@@ -2578,10 +2610,23 @@ impl Engine {
             Pending::RunForecast(w) => self.action_forecast(w, result),
             Pending::RunConsent(w) => self.action_consented(w, result),
             Pending::RunWrite(w) => {
-                let acknowledged = response_ok && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v));
-                if response_ok && w.dispatch.action.kind == crate::run_actions::Kind::Delete && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v)) {
-                    if let Some(deadline) = result.as_ref().ok().and_then(|v| v["undo_secs"].as_u64()).and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs))) {
-                        let ticket = crate::run_actions::DeleteUndo { owner: w.dispatch.action.owner.clone(), operation: uuid::Uuid::new_v4(), deadline };
+                let acknowledged =
+                    response_ok && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v));
+                if response_ok
+                    && w.dispatch.action.kind == crate::run_actions::Kind::Delete
+                    && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v))
+                {
+                    if let Some(deadline) = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v["undo_secs"].as_u64())
+                        .and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs)))
+                    {
+                        let ticket = crate::run_actions::DeleteUndo {
+                            owner: w.dispatch.action.owner.clone(),
+                            operation: uuid::Uuid::new_v4(),
+                            deadline,
+                        };
                         if ticket.available() {
                             self.delete_undo = Some(ticket.clone());
                             self.updates.push(Update::DeleteUndo(ticket));
@@ -3226,7 +3271,11 @@ async fn write_requests(
             });
         }
         if let Some(Pending::RestoreSession(ticket)) = engine.pending.get(&request.id) {
-            uncertain.insert(Action { id: ticket.operation, session_id: ticket.owner.session.clone(), question_id: None });
+            uncertain.insert(Action {
+                id: ticket.operation,
+                session_id: ticket.owner.session.clone(),
+                question_id: None,
+            });
         }
         let mut line = serde_json::to_vec(&request)?;
         if line.len() >= formless_protocol::MAX_FRAME_BYTES {

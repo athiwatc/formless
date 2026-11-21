@@ -17,10 +17,13 @@ impl Drop for Work {
     }
 }
 impl Engine {
-    fn compaction_pending(&self, session: &str) -> bool {
-        self.compacting.lock().unwrap_or_else(|e| e.into_inner()).contains(session)
+    pub(super) fn compaction_pending(&self, session: &str) -> bool {
+        self.compacting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(session)
     }
-    fn action_target(&self, session: &str, value: &Value) -> Result<Target, String> {
+    pub(super) fn action_target(&self, session: &str, value: &Value) -> Result<Target, String> {
         let mut target = Target::decode(session, value)?;
         target.compacting = self.compaction_pending(session);
         Ok(target)
@@ -36,8 +39,12 @@ impl Engine {
     }
     fn action_current(&self, work: &Work) -> bool {
         self.ready
-            && !(matches!(work.dispatch.action.kind, crate::run_actions::Kind::Edit | crate::run_actions::Kind::Retry | crate::run_actions::Kind::Compact)
-                && self.compaction_pending(&work.dispatch.action.owner.session))
+            && !(matches!(
+                work.dispatch.action.kind,
+                crate::run_actions::Kind::Edit
+                    | crate::run_actions::Kind::Retry
+                    | crate::run_actions::Kind::Compact
+            ) && self.compaction_pending(&work.dispatch.action.owner.session))
             && self.action_owner().as_ref() == Some(&work.dispatch.action.owner)
             && self.status_revision == work.revision
             && work.dispatch.reserved()
@@ -73,8 +80,12 @@ impl Engine {
             return;
         }
         if !self.ready
-            || (matches!(dispatch.action.kind, crate::run_actions::Kind::Edit | crate::run_actions::Kind::Retry | crate::run_actions::Kind::Compact)
-                && self.compaction_pending(&dispatch.action.owner.session))
+            || (matches!(
+                dispatch.action.kind,
+                crate::run_actions::Kind::Edit
+                    | crate::run_actions::Kind::Retry
+                    | crate::run_actions::Kind::Compact
+            ) && self.compaction_pending(&dispatch.action.owner.session))
             || self.action_owner().as_ref() != Some(&dispatch.action.owner)
             || !dispatch.action.valid()
             || !dispatch.reserved()
@@ -253,7 +264,9 @@ impl Engine {
     pub(super) fn action_before_write(&mut self, id: u64) -> bool {
         if matches!(self.pending.get(&id), Some(Pending::RestoreSession(t)) if !t.available()) {
             self.pending.remove(&id);
-            self.updates.push(Update::Notice("The delete Undo window has expired. Nothing was sent.".into()));
+            self.updates.push(Update::Notice(
+                "The delete Undo window has expired. Nothing was sent.".into(),
+            ));
             return false;
         }
         let valid = match self.pending.get(&id) {
@@ -274,7 +287,10 @@ impl Engine {
         w.sent = true;
         w.sent_at = Some(std::time::Instant::now());
         if w.dispatch.action.kind == crate::run_actions::Kind::Compact {
-            self.compacting.lock().unwrap_or_else(|e| e.into_inner()).insert(w.dispatch.action.owner.session.clone());
+            self.compacting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(w.dispatch.action.owner.session.clone());
         }
         true
     }
@@ -549,7 +565,11 @@ mod tests {
         reply(&mut e, snapshot());
         let request = e.outgoing.pop_front().unwrap();
         assert!(e.action_before_write(request.id));
-        e.receive(ServerMessage::ok(request.id, json!({"started":true,"up_to":1}))).unwrap();
+        e.receive(ServerMessage::ok(
+            request.id,
+            json!({"started":true,"up_to":1}),
+        ))
+        .unwrap();
         assert!(e.compaction_pending("s"));
         let target = e.action_target("s", &snapshot()).unwrap();
         assert!(!target.allowed(Kind::Edit));
@@ -562,11 +582,22 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         e.action_prepare(ledger.reserve(next).unwrap());
         assert!(e.outgoing.is_empty());
-        e.receive(ServerMessage::Event(Event::Note { session_id: Some("other".into()), text: "compaction failed: test".into() })).unwrap();
+        e.receive(ServerMessage::Event(Event::Note {
+            session_id: Some("other".into()),
+            text: "compaction failed: test".into(),
+        }))
+        .unwrap();
         assert!(e.compaction_pending("s"));
-        e.receive(ServerMessage::Event(Event::Note { session_id: Some("s".into()), text: "compaction failed: test".into() })).unwrap();
+        e.receive(ServerMessage::Event(Event::Note {
+            session_id: Some("s".into()),
+            text: "compaction failed: test".into(),
+        }))
+        .unwrap();
         assert!(!e.compaction_pending("s"));
-        assert!(e.action_target("s", &snapshot()).unwrap().allowed(Kind::Retry));
+        assert!(e
+            .action_target("s", &snapshot())
+            .unwrap()
+            .allowed(Kind::Retry));
     }
     #[test]
     fn delete_undo_uses_the_receipt_window_exact_session_and_never_replays() {
@@ -577,13 +608,19 @@ mod tests {
         reply(&mut e, snapshot());
         let request = e.outgoing.pop_front().unwrap();
         assert!(e.action_before_write(request.id));
-        e.receive(ServerMessage::ok(request.id, json!({"deleted":true,"undo_secs":30}))).unwrap();
+        e.receive(ServerMessage::ok(
+            request.id,
+            json!({"deleted":true,"undo_secs":30}),
+        ))
+        .unwrap();
         let ticket = e.delete_undo.clone().unwrap();
         assert!(ticket.available());
         assert!(ticket.deadline <= std::time::Instant::now() + Duration::from_secs(30));
         e.active = Some("other".into());
         e.command(Command::UndoDelete(ticket.operation));
-        assert!(matches!(reply(&mut e, json!({"id":"s"})), Request::RestoreSession { id } if id == "s"));
+        assert!(
+            matches!(reply(&mut e, json!({"id":"s"})), Request::RestoreSession { id } if id == "s")
+        );
         e.command(Command::UndoDelete(ticket.operation));
         assert!(e.outgoing.is_empty());
         let mut expired = ticket;
@@ -601,11 +638,26 @@ mod tests {
         reply(&mut e, snapshot());
         let request = e.outgoing.pop_front().unwrap();
         assert!(e.action_before_write(request.id));
-        e.receive(ServerMessage::Response { id: request.id, ok: false, result: None, error: Some("persisted CWD, prompt refresh failed".into()) }).unwrap();
+        e.receive(ServerMessage::Response {
+            id: request.id,
+            ok: false,
+            result: None,
+            error: Some("persisted CWD, prompt refresh failed".into()),
+        })
+        .unwrap();
         assert_eq!(ledger.status(), Status::Unknown);
-        assert!(ledger.status().notice().contains("may already have applied"));
-        assert!(e.outgoing.iter().any(|r| matches!(&r.request, Request::GetSession { id } if id == "s")));
-        assert!(!e.outgoing.iter().any(|r| matches!(r.request, Request::SetSessionCwd { .. })));
+        assert!(ledger
+            .status()
+            .notice()
+            .contains("may already have applied"));
+        assert!(e
+            .outgoing
+            .iter()
+            .any(|r| matches!(&r.request, Request::GetSession { id } if id == "s")));
+        assert!(!e
+            .outgoing
+            .iter()
+            .any(|r| matches!(r.request, Request::SetSessionCwd { .. })));
         assert!(ledger.reserve(d.action).is_err());
     }
     #[test]

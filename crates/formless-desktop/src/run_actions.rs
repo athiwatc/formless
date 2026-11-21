@@ -113,7 +113,14 @@ impl Target {
                 if m["session_id"].as_str() != Some(session) {
                     return Err(bad);
                 }
-                Ok((id.to_string(), if user_oversized { String::new() } else { text.to_string() }))
+                Ok((
+                    id.to_string(),
+                    if user_oversized {
+                        String::new()
+                    } else {
+                        text.to_string()
+                    },
+                ))
             })
             .transpose()
             .map_err(str::to_string)?;
@@ -139,8 +146,12 @@ impl Target {
     pub fn allowed(&self, kind: Kind) -> bool {
         match kind {
             Kind::ProviderRetry => self.running && self.run.is_some(),
-            Kind::Edit => !self.user_oversized && !self.compacting && !self.running && self.user.is_some(),
-            Kind::Retry => !self.compacting && !self.running && self.user.is_some() && self.run.is_some(),
+            Kind::Edit => {
+                !self.user_oversized && !self.compacting && !self.running && self.user.is_some()
+            }
+            Kind::Retry => {
+                !self.compacting && !self.running && self.user.is_some() && self.run.is_some()
+            }
             Kind::Good | Kind::Bad => {
                 !self.running
                     && self.run.is_some()
@@ -433,7 +444,14 @@ mod tests {
             let target = Target::decode("s", &value).unwrap();
             assert_eq!(target.allowed(Kind::Edit), size <= MAX_TEXT);
             assert!(target.user.as_ref().unwrap().1.len() <= MAX_TEXT);
-            for kind in [Kind::Retry, Kind::Good, Kind::Bad, Kind::Compact, Kind::Delete, Kind::Cwd] {
+            for kind in [
+                Kind::Retry,
+                Kind::Good,
+                Kind::Bad,
+                Kind::Compact,
+                Kind::Delete,
+                Kind::Cwd,
+            ] {
                 assert!(target.allowed(kind));
             }
             if size > MAX_TEXT {
@@ -481,7 +499,9 @@ mod tests {
         }
         let mut v = snapshot();
         v["messages"][0]["content"] = json!("x".repeat(MAX_TEXT + 1));
-        assert!(Target::decode("s", &v).is_err());
+        let target = Target::decode("s", &v).unwrap();
+        assert!(!target.allowed(Kind::Edit));
+        assert!(target.allowed(Kind::Delete));
         let t = Target::decode(
             "s",
             &json!({"session":{"id":"s"},"running":false,"messages":[]}),
@@ -596,7 +616,9 @@ mod tests {
         assert!(new.reserved());
         assert!(new.before_write());
         new.finish(Err("daemon refused".into()), false);
-        assert_eq!(ledger.status(), Status::Rejected("daemon refused".into()));
+        assert_eq!(ledger.status(), Status::Unknown);
+        assert!(ledger.reserve(action(Kind::Compact)).is_err());
+        let ledger = Arc::new(Ledger::default());
         let d = ledger.reserve(action(Kind::Compact)).unwrap();
         assert!(d.before_write());
         ledger.cancel();

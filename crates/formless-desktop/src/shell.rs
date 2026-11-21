@@ -2324,7 +2324,10 @@ impl Shell {
     ) {
         match update {
             ClientUpdate::DeleteUndo(ticket) => {
-                if self.client_identity() == Some((ticket.owner.client, ticket.owner.connection)) && self.client_connected && ticket.available() {
+                if self.client_identity() == Some((ticket.owner.client, ticket.owner.connection))
+                    && self.client_connected
+                    && ticket.available()
+                {
                     self.run_actions.delete_undo = Some(ticket);
                 }
             }
@@ -2344,7 +2347,13 @@ impl Shell {
             ClientUpdate::LiveContext { owner, result } => {
                 if self.run_action_owner().as_ref() == Some(&owner) {
                     if let Ok(context) = result {
-                        let keep_measured = self.run_actions.context.as_ref().is_some_and(|(current, c)| *current == owner && c.measured && !context.measured);
+                        let keep_measured =
+                            self.run_actions
+                                .context
+                                .as_ref()
+                                .is_some_and(|(current, c)| {
+                                    *current == owner && c.measured && !context.measured
+                                });
                         if !keep_measured {
                             self.run_actions.context = Some((owner, context));
                         }
