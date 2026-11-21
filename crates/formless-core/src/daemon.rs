@@ -17351,6 +17351,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.ends_with(".p12")
         || name.ends_with(".pfx")
         || name.ends_with(".kdbx");
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("a Pulumi credentials file");
+    }
     secret_file.then_some("a key or secrets file")
 }
 

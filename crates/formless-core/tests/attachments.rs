@@ -44,6 +44,19 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn pulumi_mentions_warn_for_credentials_in_the_pulumi_directory() {
+    for path in [
+        ".pulumi/credentials.json",
+        "project/.PULUMI/CREDENTIALS.JSON",
+    ] {
+        assert!(credential_path(path.as_ref()).is_some(), "{path}");
+    }
+    for path in ["project/credentials.json", ".pulumi/stacks/dev.json"] {
+        assert!(credential_path(path.as_ref()).is_none(), "{path}");
+    }
+}
+
+#[test]
 fn yarn_credentials_are_detected_for_attachment_warnings() {
     for name in [".yarnrc", "project/.YARNRC.YML"] {
         assert!(credential_path(name.as_ref()).is_some(), "{name}");

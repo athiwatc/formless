@@ -84,7 +84,9 @@ impl PathPolicy {
         if from.is_dir()
             && (self.classify(raw_from, from)? != PathDecision::Ordinary
                 || directory_namespace_prefix(raw_from)
-                || directory_namespace_prefix(from))
+                || directory_namespace_prefix(from)
+                || ((in_pulumi_directory(raw_from) || in_pulumi_directory(from))
+                    && !in_pulumi_directory(to)))
         {
             // A directory consent covers only that directory's listing or
             // metadata. It cannot authorize declassifying its descendants.
@@ -218,6 +220,11 @@ const DIRECTORY_SEQUENCES: &[&[&str]] = &[
     &["etc", "ssl", "private"],
 ];
 
+fn in_pulumi_directory(path: &Path) -> bool {
+    path.components()
+        .any(|part| matches!(part, Component::Normal(name) if credential_name(name) == ".pulumi"))
+}
+
 /// Removing a prefix of a recognized sequence also removes the descendants'
 /// classification: Library -> Ordinary would wash Library/Keychains/files.
 /// This deliberately rejects such directory names even if currently empty;
@@ -267,6 +274,9 @@ pub fn is_env_template_file(path: &Path) -> bool {
 }
 
 fn builtin(path: &Path) -> Option<&'static str> {
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("Pulumi credentials file");
+    }
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
     }
@@ -453,6 +463,37 @@ mod tests {
                 "{relative}"
             );
         }
+    }
+
+    #[test]
+    fn pulumi_credential_reads_require_consent_without_covering_the_whole_directory() {
+        let root = std::env::temp_dir().join(format!("fl-pulumi-{}", uuid::Uuid::new_v4()));
+        let directory = root.join(".PuLuMi");
+        std::fs::create_dir_all(&directory).unwrap();
+        let policy = PathPolicy::default();
+        let credential = directory.join("credentials.json");
+        for (raw, resolved) in [
+            (&credential, &credential),
+            (&root.join("alias"), &credential),
+        ] {
+            assert_eq!(
+                policy.classify(raw, resolved).unwrap(),
+                PathDecision::Sensitive("Pulumi credentials file".into())
+            );
+        }
+        for ordinary in [
+            &directory,
+            &directory.join("stacks/dev.json"),
+            &root.join("credentials.json"),
+        ] {
+            assert_eq!(
+                policy.classify(ordinary, ordinary).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+        let relocation = policy.relocation_allowed(&directory, &directory, &root.join("ordinary"));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!relocation.unwrap());
     }
 
     #[test]
