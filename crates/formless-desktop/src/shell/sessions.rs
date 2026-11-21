@@ -196,7 +196,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.session_editor.is_some() || !self.client_connected {
+        if self.session_editor.is_some()
+            || !self.client_connected
+            || !self.topic_session_edit_allowed()
+        {
             return;
         }
         if self.destination == Destination::Sessions

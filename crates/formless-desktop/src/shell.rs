@@ -54,6 +54,7 @@ mod sessions;
 mod slash;
 mod step_mode;
 mod step_review;
+mod topics;
 mod usage;
 use self::sessions::SessionEditorStart;
 use crate::full_view;
@@ -775,6 +776,7 @@ impl PageMetrics {
 }
 
 pub struct Shell {
+    topic_ui: topics::Ui,
     attachments: attachments::State,
     pasted_image_number: u64,
     slash: slash::Popup,
@@ -1053,6 +1055,7 @@ impl Shell {
         let directory_anchor = gpui_kit::ScrollAnchor::for_handle(page_scroll.clone());
         let inspector_scroll = ScrollHandle::new();
         Self {
+            topic_ui: topics::Ui::new(window, cx),
             client: None,
             run_actions: run_actions::State::default(),
             client_connected: false,
@@ -2024,6 +2027,7 @@ impl Shell {
         self.include_archived = false;
         self.directory.rebuild(&self.directory_rows, "");
         self.client_sessions.clear();
+        self.topic_ui.reset_connection();
         self.resource_pages.clear();
         self.resource_confirm = None;
         self.resource_error = None;
@@ -2463,6 +2467,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.topic_ui.state.disconnect();
                     self.attachments = Default::default();
                     self.live_overlay = Default::default();
                     self.run_actions.delete_undo = None;
@@ -2643,6 +2648,7 @@ impl Shell {
                 }
                 self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), self.text_scale);
                 self.rebuild_directory(cx);
+                self.topic_sessions_loaded(window, cx);
                 if vanished {
                     self.reading_restore = None;
                     self.reading_notice = None;
@@ -2654,6 +2660,33 @@ impl Shell {
                         .update(cx, |timeline, cx| timeline.reset(0, cx));
                     self.client_select(cx);
                     self.invalidate_search(cx);
+                }
+            }
+            ClientUpdate::TopicSupport(supported) => {
+                self.topic_ui.state.supported = supported;
+            }
+            ClientUpdate::Topics {
+                connection,
+                operation,
+                result,
+            } => {
+                self.topic_result(connection, operation, result, window, cx);
+            }
+            ClientUpdate::TopicCandidates {
+                generation,
+                session_id,
+                messages,
+            } => {
+                if generation == self.client_generation
+                    && self.sidebar.active_id() == Some(session_id.as_str())
+                {
+                    let available = messages
+                        .iter()
+                        .map(|m| m.id.as_str())
+                        .collect::<HashSet<_>>();
+                    self.topic_ui.retain_candidates(&available);
+                    self.topic_ui.state.candidates = messages;
+                    self.topic_ui.state.candidate_session = Some(session_id);
                 }
             }
             ClientUpdate::SessionStatusInvalidated {
@@ -3370,6 +3403,11 @@ impl Shell {
         if self.attachments.busy() {
             actions.disabled_reason = Some("Wait for pending attachments to finish loading");
         }
+        if let Some(notice) = self.topic_write_notice() {
+            actions.disabled_reason = Some(notice);
+            actions.secondary = None;
+            actions.stop_enabled = false;
+        }
         if self.client.is_some() && self.client_connected && !self.client_snapshot_ready {
             actions.disabled_reason = Some("Waiting for a current Session snapshot");
         }
@@ -3454,7 +3492,8 @@ impl Shell {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
             has_history: self.timeline.read(cx).item_count() > 0,
-            can_recover: self.client_connected
+            can_recover: self.topic_write_notice().is_none()
+                && self.client_connected
                 && self.client_snapshot_ready
                 && self
                     .client_recovery
@@ -3470,7 +3509,7 @@ impl Shell {
                 && self.mode_disable_action().is_none())
             .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
-            can_edit_session: self.client_connected && self.session_edit_target().is_some(),
+            can_edit_session: self.client_connected && self.topic_session_edit_allowed(),
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
             composing,
@@ -3928,6 +3967,7 @@ impl Shell {
         let previous = self.sidebar.active_id().map(str::to_string);
         let changed = self.sidebar.activate_selected();
         if changed {
+            self.topic_ui.session_changed(self.sidebar.active_id());
             if let Some(id) = previous.as_deref() {
                 self.park_reading_position(id, cx);
             }
@@ -4452,9 +4492,10 @@ impl Shell {
     /// inside it until it is dismissed.
     fn render_sidebar(&self, modal: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.sidebar_focus.is_focused(window);
-        let navigation = Destination::NAVIGATION.into_iter().map(|destination| {
-            let button =
-                Button::new(SharedString::from(format!(
+        let navigation = Destination::NAVIGATION
+            .into_iter()
+            .map(|destination| {
+                let button = Button::new(SharedString::from(format!(
                     "destination-{}",
                     destination.label()
                 )))
@@ -4465,14 +4506,15 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_destination(destination, window, cx)
                 }));
-            if self.client.is_some()
-                || matches!(destination, Destination::Chat | Destination::Sessions)
-            {
-                button
-            } else {
-                button.tooltip("Scaffold: this destination has no view yet")
-            }
-        });
+                if self.client.is_some()
+                    || matches!(destination, Destination::Chat | Destination::Sessions)
+                {
+                    button
+                } else {
+                    button.tooltip("Scaffold: this destination has no view yet")
+                }
+            })
+            .collect::<Vec<_>>();
         let panel = v_flex()
             .id("region-sidebar")
             .test_support()
@@ -4489,14 +4531,16 @@ impl Shell {
             .when(!modal, |panel| {
                 inert_while(panel, self.background_inert(window))
             })
-            .key_context(SESSION_LIST_CONTEXT)
+            // Topic buttons use their own native focus/activation. Legacy
+            // session-list arrows must not walk rows that are no longer shown.
+            .when(!self.topic_ui.state.supported, |panel| panel.key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
             .on_action(
                 cx.listener(|this, _: &SelectPreviousSession, _, cx| this.move_selection(-1, cx)),
             )
             .on_action(cx.listener(|this, _: &ActivateSession, window, cx| {
                 this.activate_selected(window, cx)
-            }))
+            })))
             .w(self.panel_width(tokens::SIDEBAR_DEFAULT, window))
             .flex_shrink_0()
             .h_full()
@@ -4504,7 +4548,7 @@ impl Shell {
             .text_color(cx.theme().sidebar_foreground)
             .border_r_1()
             .border_color(region_border(focused, cx.theme().sidebar_border, cx))
-            .child(
+            .when(!self.topic_ui.state.supported, |panel| panel.child(
                 h_flex().p_2().gap_2().flex_wrap()
                     .child(readable("session-count", format!("Sessions ({})", self.sidebar.rows().len())).text_xs().flex_1().text_color(cx.theme().muted_foreground))
                     .child(
@@ -4522,13 +4566,14 @@ impl Shell {
                             }
                         })),
                 ),
-            )
-            .when(self.sidebar.rows().is_empty(), |panel| panel.child(
+            ))
+            .when(self.topic_ui.state.supported, |panel| panel.child(self.render_topic_tree(window, cx)))
+            .when(!self.topic_ui.state.supported && self.sidebar.rows().is_empty(), |panel| panel.child(
                 v_flex().p_3().gap_2()
                     .child(readable("sessions-empty-title", "A fresh start").font_semibold())
                     .child(readable("sessions-empty-help", if self.client.is_some() { "Create a Session above to start a conversation." } else { "No fixture Sessions. Connect to a daemon to start a conversation." }).text_sm().text_color(cx.theme().muted_foreground)),
             ))
-            .child(
+            .when(!self.topic_ui.state.supported, |panel| panel.child(
                 div()
                     .id("session-list")
                     .test_support()
@@ -4550,7 +4595,7 @@ impl Shell {
                         )
                         .track_scroll(&self.session_scroll),
                     ),
-            )
+            ))
             .child(
                 h_flex()
                     .id("destination-list")
@@ -4803,6 +4848,7 @@ impl Shell {
             .border_color(region_border(focused, cx.theme().background, cx))
             .drag_over::<gpui_kit::ExternalPaths>(|style, _, _, cx| style.border_color(cx.theme().primary).bg(cx.theme().accent))
             .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| this.stage_composer_attachments(client::attachments::Intake::Paths(paths.paths().to_vec()), cx)))
+            .when(self.topic_ui.state.supported, |region| region.child(self.render_topic_workbench(window, cx)))
             .child(
                 h_flex()
                     .map(|row| if reflowed { row.px_2() } else { row.px_4() })
@@ -6126,7 +6172,12 @@ impl Shell {
             .icon(attachments::icon(gpui_kit::assets::IconName::Paperclip))
             .accessibility_label("Attach files")
             .tooltip("Attach files (up to 20 MiB each)")
-            .disabled(inert || !self.client_connected || self.sidebar.active_id().is_none())
+            .disabled(
+                inert
+                    || !self.client_connected
+                    || self.sidebar.active_id().is_none()
+                    || self.topic_write_notice().is_some(),
+            )
             .on_click(cx.listener(|this, _, _, cx| this.pick_composer_attachments(cx)));
         // Stop keeps its own fixed slot, apart from the primary action.
         let stop = button("composer-stop", Command::Stop, cx).danger();
