@@ -131,11 +131,25 @@ const ONBOARDING_TH: &[(&str, &str)] = &[
     ("Setup cancelled; your existing setup is unchanged.", "ยกเลิกการตั้งค่าแล้ว การตั้งค่าเดิมยังอยู่"),
     ("New here? /tour runs a 2-minute guided first task (/tour skip hides this for good).", "เพิ่งเริ่มใช้ใช่ไหม ใช้ /tour เพื่อทดลองงานแรกแบบมีคำแนะนำใน 2 นาที (ใช้ /tour skip เพื่อซ่อนคำแนะนำนี้)"),
     ("tour skipped; /tour starts it any time", "ข้ามการแนะนำแล้ว ใช้ /tour เพื่อเริ่มได้ทุกเมื่อ"),
-    ("usage: /tour starts the guided first task; /tour skip hides the offer", "ใช้ /tour เพื่อเริ่มงานแรกแบบมีคำแนะนำ หรือ /tour skip เพื่อซ่อนคำแนะนำ"),
-    ("Tour 1/3 · A sample task is in the input. Press Enter: the agent has no Tool for this yet, so it builds one, and keeps it for next time.", "แนะนำ 1/3 · ตัวอย่างงานอยู่ในช่องข้อความ กด Enter เอเจนต์จะสร้างเครื่องมือสำหรับงานนี้และเก็บไว้ใช้ครั้งต่อไป"),
-    ("Tour 2/3 · The agent just built a Tool. It's in the Tools view now (Tab to switch views, Esc back): its code, versions and how well it does. Watch it use the Tool next.", "แนะนำ 2/3 · เอเจนต์สร้างเครื่องมือแล้ว ดูโค้ด เวอร์ชัน และผลการทำงานได้ในมุมมองเครื่องมือ (Tab เพื่อสลับมุมมอง Esc เพื่อย้อนกลับ) จากนั้นดูเอเจนต์ใช้เครื่องมือนี้"),
-    ("Tour 3/3 · Done. Ask for anything: the agent reuses its Tools and builds new ones. /help lists every command and key; Tab switches views.", "แนะนำ 3/3 · เสร็จแล้ว ขอให้เอเจนต์ทำงานได้ตามต้องการ เอเจนต์จะใช้เครื่องมือเดิมหรือสร้างใหม่ ดูคำสั่งและปุ่มลัดด้วย /help และใช้ Tab เพื่อสลับมุมมอง"),
-    ("Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"", "สร้างเครื่องมือเพื่อนับจำนวนคำ บรรทัด และอักขระในข้อความ แล้วลองใช้กับข้อความนี้: \"The quick brown fox jumps over the lazy dog.\""),
+    ("Use /tour to start, /tour skip to hide the offer, and /tour cleanup to archive the tour and retire its sample.", "ใช้ /tour เพื่อเริ่ม /tour skip เพื่อซ่อนคำแนะนำ และ /tour cleanup เพื่อเก็บเซสชันและเลิกใช้เครื่องมือตัวอย่าง"),
+    ("Build a Tool named {} that counts the words, lines and characters of a text. Reuse it if it already exists. Then call it on: \"The quick brown fox jumps over the lazy dog.\"", "สร้างเครื่องมือชื่อ {} เพื่อนับจำนวนคำ บรรทัด และอักขระในข้อความ หากมีอยู่แล้วให้ใช้เครื่องมือเดิม แล้วเรียกใช้กับข้อความนี้: \"The quick brown fox jumps over the lazy dog.\""),
+    ("Use the existing Tool {} to count the words, lines and characters of: \"The quick brown fox jumps over the lazy dog.\"", "ใช้เครื่องมือ {} ที่มีอยู่เพื่อนับจำนวนคำ บรรทัด และอักขระในข้อความนี้: \"The quick brown fox jumps over the lazy dog.\""),
+    ("Tour 1/3 · Press Enter to run the sample task in this Session. /tour cleanup archives the tour and retires its sample.", "แนะนำ 1/3 · กด Enter เพื่อทำงานตัวอย่างในเซสชันนี้ ใช้ /tour cleanup เพื่อเก็บเซสชันและเลิกใช้เครื่องมือตัวอย่าง"),
+    ("Tour 2/3 · The agent built the sample Tool. Open the Tools view with Tab to inspect its code and versions.", "แนะนำ 2/3 · เอเจนต์สร้างเครื่องมือตัวอย่างแล้ว กด Tab เพื่อเปิดมุมมองเครื่องมือและดูโค้ดกับเวอร์ชัน"),
+    ("Tour 2/3 · The agent reused the sample Tool. Open the Tools view with Tab to inspect its code and versions.", "แนะนำ 2/3 · เอเจนต์ใช้เครื่องมือตัวอย่างเดิม กด Tab เพื่อเปิดมุมมองเครื่องมือและดูโค้ดกับเวอร์ชัน"),
+    ("Tour 3/3 · Done. The agent used its sample Tool. /help lists commands and keys.", "แนะนำ 3/3 · เสร็จแล้ว เอเจนต์ใช้เครื่องมือตัวอย่างแล้ว ดูคำสั่งและปุ่มลัดด้วย /help"),
+    ("Tour guidance paused. Return to the Guided tour Session or type /tour to continue.", "หยุดคำแนะนำชั่วคราว กลับไปที่เซสชัน Guided tour หรือพิมพ์ /tour เพื่อดำเนินการต่อ"),
+    ("Tour guidance stopped. Use /tour to start a new sample task.", "หยุดคำแนะนำแล้ว ใช้ /tour เพื่อเริ่มงานตัวอย่างใหม่"),
+    ("The tour send was unconfirmed. Check the Guided tour Session before retrying.", "ยังไม่ได้รับการยืนยันการส่งงานตัวอย่าง ตรวจสอบเซสชัน Guided tour ก่อนลองใหม่"),
+    ("The tour send did not start a new Run. Use /tour to try again.", "การส่งงานตัวอย่างไม่ได้เริ่มการรันใหม่ ใช้ /tour เพื่อลองอีกครั้ง"),
+    ("The tour built its Tool but did not use it successfully. Check the transcript for details.", "สร้างเครื่องมือตัวอย่างแล้วแต่ใช้งานไม่สำเร็จ ดูรายละเอียดในประวัติการสนทนา"),
+    ("The agent answered without building or using the sample Tool. Some models answer directly. Try /tour with a different model.", "เอเจนต์ตอบโดยไม่ได้สร้างหรือใช้เครื่องมือตัวอย่าง บางโมเดลตอบโดยตรง ลองใช้ /tour กับโมเดลอื่น"),
+    ("The tour Run paused. Check the Run error in this Session, or use /tour to try again.", "การรันงานตัวอย่างหยุดชั่วคราว ตรวจสอบข้อผิดพลาดในเซสชันนี้ หรือใช้ /tour เพื่อลองอีกครั้ง"),
+    ("The tour Run was interrupted. Use /tour to try again.", "การรันงานตัวอย่างถูกขัดจังหวะ ใช้ /tour เพื่อลองอีกครั้ง"),
+    ("The tour Run ended with status {}. Check the transcript for details.", "การรันงานตัวอย่างสิ้นสุดด้วยสถานะ {} ดูรายละเอียดในประวัติการสนทนา"),
+    ("Tour Sessions archived: {}.", "เก็บเซสชันแนะนำแล้ว {} เซสชัน"),
+    ("The sample Tool was retired.", "เลิกใช้เครื่องมือตัวอย่างแล้ว"),
+    ("The sample Tool was kept because it was modified or pinned.", "เก็บเครื่องมือตัวอย่างไว้เนื่องจากมีการแก้ไขหรือปักหมุด"),
     ("⚠ The endpoint didn't stream its test reply: answers may arrive all at once, and a long one can look stuck until it ends.", "⚠ ปลายทางไม่ได้สตรีมคำตอบทดสอบ คำตอบอาจปรากฏพร้อมกันทั้งหมด และคำตอบยาวอาจดูเหมือนค้างจนกว่าจะเสร็จ"),
     ("Approvals are on: a Tool asks before it uses files, the network or programs.", "เปิดการอนุมัติแล้ว เครื่องมือจะขออนุญาตก่อนใช้ไฟล์ เครือข่าย หรือโปรแกรม"),
     ("Tools run without asking (approvals are off). To be asked first, set security.secure = true in config.toml or start with `formless --secure`.", "เครื่องมือทำงานโดยไม่ถาม (ปิดการอนุมัติ) หากต้องการให้ถามก่อน ให้ตั้ง security.secure = true ใน config.toml หรือเริ่มด้วย `formless --secure`"),
@@ -408,7 +422,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn onboarding_copy_has_thai_entries_and_uses_catalog_calls() {
-    let tui = include_str!("lib.rs");
+    let tui = concat!(include_str!("lib.rs"), include_str!("tour.rs"));
     let core = include_str!("../../formless-core/src/local_servers.rs");
     let missing: Vec<_> = ONBOARDING_TH
         .iter()
@@ -425,9 +439,7 @@ fn onboarding_copy_has_thai_entries_and_uses_catalog_calls() {
             let discovery_hint = english.contains("OLLAMA_HOST")
                 && core.contains(&serde_json::to_string(&discovery_template).unwrap())
                 && tui.contains("discovery.hint.as_deref().map(i18n::tr_str)");
-            let tour_task = english.starts_with("Build a Tool that counts")
-                && tui.contains("self.input.set(tr(TOUR_TASK))");
-            (!(direct || through_offer || discovery_hint || tour_task)
+            (!(direct || through_offer || discovery_hint)
                 || english.matches("{}").count() != thai.matches("{}").count()
                 || !thai.chars().any(|c| ('\u{e00}'..='\u{e7f}').contains(&c)))
             .then_some(*english)

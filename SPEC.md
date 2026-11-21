@@ -3936,9 +3936,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   Promotion answers do not dismiss this help.
 - **A guided first task.** Once setup finishes, a note offers `/tour`
   (and `/tour skip`, which hides the offer for good); it is offered once.
-  `/tour` puts a sample task in the input that makes the agent build a
-  Tool, then points to the Tools view when `create_tool` succeeds and to
-  `/help` when the Run ends.
+  `/tour` opens a labelled Guided tour Session and puts the sample task in
+  its composer. Previous Session drafts stay available. Progress follows the
+  exact Run started by sending the sample task and resumes when the user
+  returns to the tour Session. When the agent successfully uses the sample
+  Tool, the tour points to the Tools view and `/help`. Other outcomes have
+  separate notes. Repeat tours reuse the labelled sample Tool. `/tour cleanup`
+  archives guided Sessions and retires the unmodified, unpinned sample.
 
 - **What opens on launch.** `tui.on_start` is `last` (default: the most
   recently active, unarchived Session; not the first row, since pinned
