@@ -56,7 +56,8 @@ can't write its database), and `docker logs formless` says so.
 
 - `linux/amd64` only for now; on Apple silicon or other arm64 servers it
   runs under emulation (slow) or build it yourself with
-  `docker build -t formless .`.
+  `docker build -t formless .`. The release installer also offers a native
+  Linux ARM64 tarball for running Formless on the host.
 - Bases are pinned by digest in the `Dockerfile`; a release updates them
   together.
 - `HEALTHCHECK` runs `formless daemon status --check` and succeeds when
