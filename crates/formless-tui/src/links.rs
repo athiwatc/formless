@@ -284,13 +284,13 @@ pub fn scan(
     area: Rect,
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Vec<Painted> {
-    scan_with_explicit(buf, area, &[], resolve)
+    scan_with_layout_links(buf, area, &[], resolve)
 }
 
-pub fn scan_with_explicit(
+pub fn scan_with_layout_links(
     buf: &Buffer,
     area: Rect,
-    explicit: &[Painted],
+    laid_out: &[Painted],
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Vec<Painted> {
     let rows: Vec<(u16, Vec<u16>, Vec<char>)> = (area.top()..area.bottom())
@@ -319,13 +319,11 @@ pub fn scan_with_explicit(
             (y, xs, text)
         })
         .collect();
-    let first_ink = |t: &[char]| t.iter().position(|c| !c.is_whitespace());
-    let last_ink = |t: &[char]| t.iter().rposition(|c| !c.is_whitespace());
-    // Char ranges per row already covered by a URL (a fragment of one
-    // wrapped from the row above included).
+    // Mark laid-out URLs first so their fragments do not become inferred
+    // URLs or file paths.
     let mut covered: Vec<Vec<(usize, usize)>> = vec![Vec::new(); rows.len()];
     let mut out = Vec::new();
-    for link in explicit {
+    for link in laid_out {
         let Some(i) = link.y.checked_sub(area.top()).map(usize::from) else {
             continue;
         };
@@ -349,65 +347,26 @@ pub fn scan_with_explicit(
             if covered[i].iter().any(|&(ca, cb)| a < cb && b > ca) {
                 continue;
             }
-            // A long URL hard-split across rows (#880): it is alone on its
-            // row, fills it, and the next row carries on at the same
-            // column. Join the pieces into one target for every fragment.
-            let mut pieces = vec![(i, a, run_end(chars, a))];
-            loop {
-                let &(r, pa, pb) = pieces.last().expect("one piece");
-                let (ry, rxs, rc) = &rows[r];
-                let alone = first_ink(rc) == Some(pa) && last_ink(rc).map(|l| l + 1) == Some(pb);
-                if !alone {
-                    break;
-                }
-                let last_x = rxs[pb - 1];
-                let width =
-                    usize::from(last_x - rxs[pa]) + buf[(last_x, *ry)].symbol().width().max(1);
-                let Some((_, next_xs, next)) = rows.get(r + 1) else {
-                    break;
-                };
-                let Some(next_start) = first_ink(next) else {
-                    break;
-                };
-                if width < 16 || next_xs[next_start] != xs[a] {
-                    break;
-                }
-                let next_end = run_end(next, next_start);
-                if covered[r + 1]
-                    .iter()
-                    .any(|&(a, b)| next_start < b && next_end > a)
-                {
-                    break;
-                }
-                pieces.push((r + 1, next_start, next_end));
+            let end = xs[b - 1];
+            // When a URL runs up to the right edge with no following
+            // delimiter, raw cells cannot distinguish completion from a
+            // fragment. The layout supplies authoritative spans above.
+            let next = end.saturating_add(
+                u16::try_from(buf[(end, *y)].symbol().width())
+                    .unwrap_or(u16::MAX)
+                    .max(1),
+            );
+            let final_ink = chars[b..].iter().all(|ch| ch.is_whitespace());
+            if final_ink && area.right().saturating_sub(next) < 2 {
+                continue;
             }
-            let target = if pieces.len() == 1 {
-                url
-            } else {
-                let joined: Vec<char> = pieces
-                    .iter()
-                    .flat_map(|&(r, pa, pb)| rows[r].2[pa..pb].iter().copied())
-                    .collect();
-                let end = url_end(&joined, 0, joined.len());
-                joined[..end].iter().collect()
-            };
-            let target = http_target(target);
-            let mut left = target.chars().count();
-            for &(r, pa, pb) in &pieces {
-                let n = (pb - pa).min(left);
-                if n == 0 {
-                    break;
-                }
-                left -= n;
-                let (ry, rxs, _) = &rows[r];
-                out.push(Painted {
-                    y: *ry,
-                    x0: rxs[pa],
-                    x1: rxs[pa + n - 1],
-                    url: target.clone(),
-                });
-                covered[r].push((pa, pa + n));
-            }
+            out.push(Painted {
+                y: *y,
+                x0: xs[a],
+                x1: end,
+                url,
+            });
+            covered[i].push((a, b));
         }
         for (a, b, path, _) in find_paths(&text) {
             if covered[i].iter().any(|&(ua, ub)| a < ub && b > ua) {
@@ -679,17 +638,33 @@ mod tests {
         assert!(find_paths(text).is_empty());
     }
 
+    fn rendered_markdown_links(source: &str, indent: &str, width: u16) -> (Buffer, Vec<Painted>) {
+        let rendered =
+            crate::markdown::render_with_links(source, false, indent, usize::from(width));
+        let area = Rect::new(0, 0, width, rendered.lines.len() as u16);
+        let mut buffer = Buffer::empty(area);
+        for (y, line) in rendered.lines.iter().enumerate() {
+            buffer.set_line(0, y as u16, line, width);
+        }
+        let laid_out: Vec<_> = rendered
+            .links
+            .into_iter()
+            .map(|link| Painted {
+                y: link.row as u16,
+                x0: link.columns.start as u16,
+                x1: (link.columns.end - 1) as u16,
+                url: link.target.to_string(),
+            })
+            .collect();
+        let links = scan_with_layout_links(&buffer, area, &laid_out, &mut |_| None);
+        (buffer, links)
+    }
+
     #[test]
     fn mixed_case_wrapped_links_paint_original_text_with_normalized_targets() {
         let original = "HtTpS://Case.Example/Long/Path%2FCase?Token=AbC#Frag";
         let target = "https://Case.Example/Long/Path%2FCase?Token=AbC#Frag";
-        let lines = crate::markdown::render(original, false, "", 24);
-        let area = Rect::new(0, 0, 24, lines.len() as u16);
-        let mut buf = Buffer::empty(area);
-        for (y, line) in lines.iter().enumerate() {
-            buf.set_line(0, y as u16, line, 24);
-        }
-        let links = scan(&buf, area, &mut |_| panic!("URL is not a file path"));
+        let (buf, links) = rendered_markdown_links(original, "", 24);
         assert!(links.len() >= 2, "{links:?}");
         assert!(links.iter().all(|link| link.url == target), "{links:?}");
         assert_eq!(
@@ -758,13 +733,7 @@ mod tests {
     #[test]
     fn a_url_wrapped_across_rows_is_one_link() {
         let url = "https://example.com/very/long/path/to/a/page";
-        let lines = crate::markdown::render(&format!("see {url} now"), false, "", 24);
-        let area = Rect::new(0, 0, 24, lines.len() as u16);
-        let mut buf = Buffer::empty(area);
-        for (y, l) in lines.iter().enumerate() {
-            buf.set_line(0, y as u16, l, 24);
-        }
-        let links = scan(&buf, area, &mut |_| None);
+        let (_, links) = rendered_markdown_links(&format!("see {url} now"), "", 24);
         assert!(links.len() >= 2, "{links:?}");
         assert!(links.iter().all(|l| l.url == url), "{links:?}");
         let painted: usize = links.iter().map(|l| (l.x1 - l.x0 + 1) as usize).sum();
@@ -772,14 +741,8 @@ mod tests {
 
         // A short URL that ends a soft-wrapped row is not joined to the
         // words below it.
-        let lines =
-            crate::markdown::render("read https://x.dev/a then continue reading", false, "", 20);
-        let area = Rect::new(0, 0, 20, lines.len() as u16);
-        let mut buf = Buffer::empty(area);
-        for (y, l) in lines.iter().enumerate() {
-            buf.set_line(0, y as u16, l, 20);
-        }
-        let links = scan(&buf, area, &mut |_| None);
+        let (_, links) =
+            rendered_markdown_links("read https://x.dev/a then continue reading", "", 20);
         assert_eq!(
             links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
             ["https://x.dev/a"]
@@ -906,40 +869,47 @@ mod tests {
 
     #[test]
     fn wrapped_urls_use_terminal_columns_and_keep_complete_graphemes() {
-        let area = Rect::new(2, 1, 20, 2);
-        let mut buf = Buffer::empty(area);
-        let first = "https://x/日本語";
-        let second = "文e\u{301}❤️👩‍💻";
-        let x0 = 6;
-        assert_eq!(first.width(), 16);
-        buf.set_string(x0, 1, first, ratatui::style::Style::default());
-        buf.set_string(x0, 2, second, ratatui::style::Style::default());
-        let target = format!("{first}{second}");
-
-        let links = scan(&buf, area, &mut |_| None);
-        assert_eq!(
-            links,
-            [
-                Painted {
-                    y: 1,
-                    x0,
-                    x1: area.right() - 2,
-                    url: target.clone(),
-                },
-                Painted {
-                    y: 2,
-                    x0,
-                    x1: x0 + "文e\u{301}❤️".width() as u16,
-                    url: target,
-                },
-            ]
+        let url = "https://x/日本語文e\u{301}❤️👩‍💻";
+        let (buffer, links) = rendered_markdown_links(url, "    ", 20);
+        assert!(links.len() >= 2, "{links:?}");
+        assert!(
+            links.iter().all(|link| link.url == url && link.x0 >= 4),
+            "{links:?}"
         );
-        for (link, text) in links.iter().zip([first, second]) {
-            let visible: String = link_cells(&buf, link)
-                .map(|(_, cell)| cell.symbol())
-                .collect();
-            assert_eq!(visible, text);
+        let visible: String = links
+            .iter()
+            .flat_map(|link| link_cells(&buffer, link))
+            .map(|(_, cell)| cell.symbol())
+            .collect();
+        assert_eq!(visible, url);
+    }
+
+    #[test]
+    fn a_bare_row_never_joins_an_unrelated_row() {
+        let url = "https://example.test";
+        for (width, targets) in [(80, vec![url]), (url.len() as u16, vec![])] {
+            let area = Rect::new(0, 0, width, 2);
+            let mut buffer = Buffer::empty(area);
+            buffer.set_string(0, 0, url, ratatui::style::Style::default());
+            buffer.set_string(0, 1, "Details", ratatui::style::Style::default());
+            let links = scan(&buffer, area, &mut |_| None);
+            assert_eq!(
+                links
+                    .iter()
+                    .map(|link| link.url.as_str())
+                    .collect::<Vec<_>>(),
+                targets
+            );
         }
+        let (_, links) =
+            rendered_markdown_links(&format!("{url}  \nDetails"), "", url.len() as u16);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.url.as_str())
+                .collect::<Vec<_>>(),
+            [url]
+        );
     }
 
     #[test]

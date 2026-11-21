@@ -1017,6 +1017,78 @@ fn fit_widths(natural: &[usize], room: usize) -> Vec<usize> {
     widths
 }
 
+/// Discover bare URLs in a logical row before layout splits words or
+/// graphemes. Parsed Markdown destinations keep their existing priority.
+fn mark_bare_urls(spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+    if !spans.iter().any(|span| span.content.contains(':')) {
+        return spans;
+    }
+    let mut text = String::new();
+    let mut parsed = Vec::new();
+    for span in &spans {
+        let start = text.len();
+        text.push_str(&span.content);
+        if span.target.is_some() {
+            parsed.push(start..text.len());
+        }
+    }
+    let urls = super::links::find_urls(&text);
+    if urls.is_empty() {
+        return spans;
+    }
+    let offsets: Vec<_> = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut urls = urls
+        .into_iter()
+        .filter_map(|(first, last, target)| {
+            let range = offsets[first]..offsets[last];
+            (!parsed
+                .iter()
+                .any(|p| range.start < p.end && range.end > p.start))
+            .then(|| (range, Arc::<str>::from(target)))
+        })
+        .peekable();
+    if urls.peek().is_none() {
+        return spans;
+    }
+
+    let mut tagged = Vec::with_capacity(spans.len());
+    let mut offset = 0;
+    for span in spans {
+        let end = offset + span.content.len();
+        let mut start = offset;
+        while let Some((range, target)) = urls
+            .peek()
+            .filter(|(range, _)| start < end && range.start < end)
+        {
+            let first = range.start.max(start);
+            let last = range.end.min(end);
+            if first > start {
+                tagged.push(span.with_content(text[start..first].to_owned()));
+            }
+            let mut linked = span.with_content(text[first..last].to_owned());
+            linked.target = Some(target.clone());
+            tagged.push(linked);
+            start = last;
+            if last == range.end {
+                urls.next();
+            } else {
+                break;
+            }
+        }
+        if start == offset {
+            tagged.push(span);
+        } else if start < end {
+            tagged.push(span.with_content(text[start..end].to_owned()));
+        }
+        offset = end;
+    }
+    tagged
+}
+
 /// Greedy word wrap of styled spans; `\n` inside a span forces a break.
 fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<InlineSpan>> {
     // Split into words (non-space runs, possibly multi-style) and spaces.
@@ -1029,7 +1101,7 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<InlineSpan>> {
         Break,
     }
     let mut pieces: Vec<Piece> = Vec::new();
-    for span in spans {
+    for span in mark_bare_urls(spans) {
         let mut word = String::new();
         let flush_word = |word: &mut String, pieces: &mut Vec<Piece>| {
             if word.is_empty() {
