@@ -11,6 +11,12 @@ from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent
 FAMILIES = [
+    (('yaml', 'YML'), 'msg: | # header\n\n  keep # literal\n  name: text\nnext: "quoted # value" # tail',
+     [('tok-key', 'msg'), ('tok-com', '# header'), ('tok-str', '  keep # literal'),
+      ('tok-str', '  name: text'), ('tok-key', 'next'), ('tok-str', '"quoted # value"'), ('tok-com', '# tail')]),
+    (('yaml',), 'parent:\n  folded: >+2\n    # string\n  after: true',
+     [('tok-key', 'parent'), ('tok-key', 'folded'), ('tok-num', '2'), ('tok-str', '    # string'),
+      ('tok-key', 'after'), ('tok-lit', 'true')]),
     (('c#', 'C#', 'cs', 'csharp', 'f#', 'fsharp', 'objc'),
      'class Item {} // comment', [('tok-kw', 'class'), ('tok-type', 'Item'), ('tok-com', '// comment')]),
     (('dockerfile', 'docker', 'make', 'makefile', 'mk', 'ruby', 'rb', 'perl', 'pl', 'elixir', 'ex', 'exs', 'r'),
@@ -42,6 +48,13 @@ FAMILIES = [
     (('fish', 'ruby', 'perl'), r"echo 'it\'s'; if true",
      [('tok-kw', 'echo'), ('tok-str', r"'it\'s'"), ('tok-kw', 'if'), ('tok-lit', 'true')]),
     (('dash', 'no-such-language', ''), 'local let 2 -- comment', []),
+    (('sql', 'postgres', 'PostgreSQL'), "AS $$\n/* open-looking -- ' $other$\n\\$$; SELECT $1 -- tail",
+     [('tok-kw', 'AS'), ('tok-str', "$$\n/* open-looking -- ' $other$\n\\$$"),
+      ('tok-kw', 'SELECT'), ('tok-com', '-- tail')]),
+    (('postgresql',), "SELECT $Tag_2$ $tag_2$ /* literal $Tag_2$, $λ$-- literal$λ$, col$tag$ FROM t",
+     [('tok-kw', 'SELECT'), ('tok-str', '$Tag_2$ $tag_2$ /* literal $Tag_2$'),
+      ('tok-str', '$λ$-- literal$λ$'), ('tok-kw', 'FROM')]),
+    (('sqlite', 'mysql'), 'SELECT $$ /* block */ $$', [('tok-kw', 'SELECT'), ('tok-com', '/* block */')]),
 ]
 
 
