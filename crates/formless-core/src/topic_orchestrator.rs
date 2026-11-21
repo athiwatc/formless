@@ -336,6 +336,7 @@ impl Daemon {
             self.with_store(|st| {
                 st.fail_topic_workflow(&topic_id, &format!("orchestrator start failed: {error:#}"))
             })?;
+            self.close_topic_interactions(&topic_id, None);
             self.broadcast(Event::TopicChanged { topic_id });
             return Err(error.context("could not start topic orchestrator"));
         }
@@ -426,6 +427,14 @@ impl Daemon {
         }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
+        if matches!(
+            topic.status,
+            TopicStatus::Complete | TopicStatus::Failed | TopicStatus::Cancelled
+        ) {
+            self.close_topic_interactions(&topic.id, None);
+        } else {
+            self.close_topic_decisions(&topic.id, Some(feature));
+        }
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),
         });

@@ -1265,6 +1265,84 @@ async fn topic_unknown_auth_is_ready() {
         "succeeded"
     );
 }
+
+#[tokio::test]
+async fn topic_terminal_failure_closes_limit_question_and_does_not_block_idle() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| {
+            st.claim_topic_workflow(&topic.id)?;
+            st.set_topic_limits(
+                &topic.id,
+                &TopicLimits {
+                    max_retries_per_step: 0,
+                    max_attempts_per_topic: 0,
+                },
+            )
+        })
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(
+            session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[]
+            ),
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+    assert_eq!(f.daemon().topic_decisions.locked().len(), 1);
+    assert!(f.daemon().topic_work_in_flight());
+    let id = f
+        .daemon()
+        .topic_decisions
+        .locked()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let (tx, mut rx) = mpsc::channel(64);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 981,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    f.daemon()
+        .finish_topic_feature_tool(
+            session,
+            &json!({"feature_id":topic.features[0].id,"reason":"User is stopping this feature"}),
+            false,
+        )
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+    assert!(f.daemon().topic_decisions.locked().is_empty());
+    assert!(!f.daemon().topic_work_in_flight());
+    assert!(!f
+        .daemon()
+        .pending_attention
+        .locked()
+        .iter()
+        .any(|event| matches!(event,Event::UserQuestion{question_id,..} if question_id==&id)));
+    let mut closed = false;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message,ServerMessage::Event(Event::UserQuestionClosed{question_id,answered_by:None}) if question_id==id)
+        {
+            closed = true;
+        }
+    }
+    assert!(closed);
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();

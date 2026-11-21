@@ -933,29 +933,37 @@ impl Daemon {
         removed.is_some()
     }
 
+    pub(super) fn close_topic_decisions(&self, topic_id: &str, feature_id: Option<&str>) {
+        self.topic_substitutes
+            .locked()
+            .retain(|(topic, feature, _), _| {
+                topic != topic_id || feature_id.is_some_and(|id| id != feature)
+            });
+        let ids = {
+            let mut decisions = self.topic_decisions.locked();
+            let ids: Vec<_> = decisions
+                .iter()
+                .filter(|(_, decision)| {
+                    decision.topic_id == topic_id
+                        && feature_id.is_none_or(|id| id == decision.feature_id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                decisions.remove(id);
+            }
+            ids
+        };
+        for question_id in ids {
+            self.broadcast(Event::UserQuestionClosed {
+                question_id,
+                answered_by: None,
+            });
+        }
+    }
     pub(super) fn close_topic_interactions(&self, topic_id: &str, attempt_id: Option<&str>) {
         if attempt_id.is_none() {
-            self.topic_substitutes
-                .locked()
-                .retain(|(topic, _, _), _| topic != topic_id);
-            let ids = {
-                let mut decisions = self.topic_decisions.locked();
-                let ids: Vec<_> = decisions
-                    .iter()
-                    .filter(|(_, decision)| decision.topic_id == topic_id)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in &ids {
-                    decisions.remove(id);
-                }
-                ids
-            };
-            for question_id in ids {
-                self.broadcast(Event::UserQuestionClosed {
-                    question_id,
-                    answered_by: None,
-                });
-            }
+            self.close_topic_decisions(topic_id, None);
         }
         let attempts = match attempt_id {
             Some(id) => vec![id.to_owned()],

@@ -7208,3 +7208,8 @@ trimmed step title; the next successful launch consumes it. A request to run
 the wanted harness then uses the explicitly approved substitute, which must
 itself be ready. Formless never substitutes without that approval. Other
 answers and cancellation record no approval and start no work.
+
+Terminal topic transitions close pending limit/substitute decisions with
+UserQuestionClosed answered_by=None. Finalizing one feature also closes its
+own decisions while leaving sibling work alone. Closed decisions no longer
+keep the daemon busy or leave stale user prompts.
