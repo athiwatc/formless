@@ -1100,6 +1100,11 @@ async fn topic_fixture_scoped_mcp_results_conversations_files_and_cancellation()
         }))
         .await
         .is_err());
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(&report.id, TopicAttemptStatus::Succeeded, "Done", &[], None)
+        })
+        .unwrap();
     let second = f
         .daemon()
         .with_store(|st| {

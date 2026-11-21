@@ -29,7 +29,10 @@ if mode=='permission':
 if mode=='question':
     answer=rpc({'operation':'ask_user','questions':[{'question':'Use the user-approved accounting inputs?','options':[{'label':'Yes'},{'label':'No'}]}]})
     assert answer[0]['selected']==['Yes']
-if mode=='release':
+if mode in ('report_release','report_dirty'):
+    if mode=='report_dirty':pathlib.Path('uncommitted.txt').write_text('not a validated commit')
+    rpc({'operation':'report_result','status':'succeeded','summary':'provisional result','outputs':[]})
+if mode in ('release','report_release','report_dirty'):
     gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
     gate.with_suffix('.ready').write_text(str(os.getpid()))
     while not gate.with_suffix('.go').exists():time.sleep(0.01)
@@ -795,6 +798,87 @@ async fn topic_retry_refuses_live_steps_after_normal_model_end_without_losing_re
     assert_eq!(retried["attempts"][0]["status"], "succeeded");
     assert!(f.daemon().runs.locked().is_empty());
     assert!(f.daemon().topic_steps.locked().is_empty());
+}
+
+#[tokio::test]
+async fn topic_reported_result_cannot_complete_feature_before_exit_and_validation() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for dirty in [false, true] {
+        env.set(
+            "TOPIC_FIXTURE_MODE",
+            if dirty {
+                "report_dirty"
+            } else {
+                "report_release"
+            },
+        );
+        let f = Fixture::new(&env);
+        script(&f, &env);
+        let repo = dirty.then(|| repository(&f));
+        let topic = topic(&f, repo, false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let ipc = tokio::spawn(f.daemon().clone().serve());
+        wait_until(|| f.paths.socket_path().exists()).await;
+        let session = topic.topic_session_id.clone().unwrap();
+        let cancel = CancellationToken::new();
+        let started = f
+            .daemon()
+            .run_topic_step(
+                &session,
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let id = started["attempt_id"].as_str().unwrap();
+        wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+        let reported = state(&f, &topic.id);
+        assert_eq!(reported.features[0].active_attempt_id.as_deref(), Some(id));
+        let args = json!({"feature_id":topic.features[0].id,"summary":"too early"});
+        assert!(f
+            .daemon()
+            .finish_topic_feature_tool(&session, &args, true)
+            .is_err());
+        assert!(f
+            .daemon()
+            .with_store(|st| st.finish_topic_feature(
+                &session,
+                &topic.features[0].id,
+                true,
+                "too early"
+            ))
+            .is_err());
+        std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+        let done = f
+            .daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(done["status"], if dirty { "failed" } else { "succeeded" });
+        assert_eq!(
+            state(&f, &topic.id).features[0].status,
+            TopicFeatureStatus::Pending
+        );
+        if dirty {
+            assert!(done["summary"].as_str().unwrap().contains("clean worktree"));
+        } else {
+            assert_eq!(
+                f.daemon()
+                    .finish_topic_feature_tool(&session, &args, true)
+                    .unwrap()["status"],
+                "complete"
+            );
+        }
+        f.daemon().request_shutdown();
+        ipc.await.unwrap().unwrap();
+    }
 }
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");

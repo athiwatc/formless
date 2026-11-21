@@ -162,6 +162,15 @@ fn topic_context_branch_scope_search_and_external_opt_in() {
         )
         .unwrap();
     store
+        .finish_topic_step(
+            &ancestor.id,
+            TopicAttemptStatus::Succeeded,
+            "done",
+            &[],
+            None,
+        )
+        .unwrap();
+    store
         .finish_topic_feature(
             parent.topic_session_id.as_ref().unwrap(),
             &parent.features[0].id,
@@ -1017,6 +1026,15 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
             .report_topic_result(&attempt.id, &token, TopicAttemptStatus::Succeeded, "", &[])
             .unwrap();
         assert!(result.outputs.is_empty());
+        store
+            .finish_topic_step(
+                &attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "validated",
+                &[],
+                None,
+            )
+            .unwrap();
         assert_eq!(
             store.get_topic(&topic.id).unwrap().unwrap().features[0].attempt_count,
             count
@@ -1036,6 +1054,101 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
             Path::new("/topic/build")
         )
         .is_err());
+}
+
+#[test]
+fn topic_reported_unvalidated_attempts_remain_active_for_stop_and_recovery() {
+    for reported in [
+        TopicAttemptStatus::Succeeded,
+        TopicAttemptStatus::Failed,
+        TopicAttemptStatus::NeedsUser,
+    ] {
+        for action in ["cancel", "fail", "recover", "restart"] {
+            let (store, _, _, request) = fixture();
+            let topic = store
+                .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+                .unwrap();
+            let session = store
+                .approve_topic(&topic.id)
+                .unwrap()
+                .topic_session_id
+                .unwrap();
+            store.claim_topic_workflow(&topic.id).unwrap();
+            let token = "capability".repeat(5);
+            let first = store
+                .begin_topic_attempt(
+                    &topic.id,
+                    &topic.features[0].id,
+                    "Validated",
+                    StepAccess::ReadOnly,
+                    HarnessKind::Claude,
+                    None,
+                    None,
+                    &[],
+                    &token,
+                    Path::new("/topic/validated"),
+                )
+                .unwrap();
+            store
+                .finish_topic_step(
+                    &first.id,
+                    TopicAttemptStatus::Succeeded,
+                    "validated",
+                    &[],
+                    None,
+                )
+                .unwrap();
+            let second = store
+                .begin_topic_attempt(
+                    &topic.id,
+                    &topic.features[0].id,
+                    "Provisional",
+                    StepAccess::ReadOnly,
+                    HarnessKind::Claude,
+                    None,
+                    None,
+                    &[],
+                    &token,
+                    Path::new("/topic/provisional"),
+                )
+                .unwrap();
+            store
+                .report_topic_result(&second.id, &token, reported, "reported", &[])
+                .unwrap();
+            assert!(store
+                .finish_topic_feature(&session, &topic.features[0].id, true, "too early")
+                .is_err());
+            let expected = match action {
+                "cancel" => {
+                    store.cancel_topic(&topic.id).unwrap();
+                    TopicAttemptStatus::Cancelled
+                }
+                "fail" => {
+                    store
+                        .fail_topic_workflow(&topic.id, "provider failed")
+                        .unwrap();
+                    TopicAttemptStatus::Failed
+                }
+                "recover" => {
+                    store.recover_topic(&topic.id).unwrap();
+                    TopicAttemptStatus::Abandoned
+                }
+                "restart" => {
+                    store.recover_topic_workflows().unwrap();
+                    TopicAttemptStatus::Abandoned
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_topic_attempt(&second.id).unwrap().unwrap().status,
+                expected
+            );
+            assert_eq!(
+                store.get_topic_attempt(&first.id).unwrap().unwrap().status,
+                TopicAttemptStatus::Succeeded
+            );
+        }
+    }
 }
 
 fn nested_topic(store: &Store, source: &str, parent: Option<String>) -> Result<TopicInfo> {

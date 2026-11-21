@@ -404,6 +404,16 @@ impl Daemon {
         let detail = args[field]
             .as_str()
             .with_context(|| format!("{field} is required"))?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        if self
+            .topic_steps
+            .locked()
+            .contains_key(&(topic.id, feature.into()))
+        {
+            bail!("feature has a live attempt; wait for CLI exit and output validation");
+        }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
         self.broadcast(Event::TopicChanged {

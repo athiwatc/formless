@@ -67,7 +67,7 @@ impl Store {
             st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR EXISTS(SELECT 1 FROM topics t JOIN messages m ON m.id=runs.start_message_id AND m.session_id=t.topic_session_id WHERE t.topic_session_id=runs.session_id AND t.status NOT IN ('running','needs_user') AND m.generated_by='topic_kickoff'))",params![now()])?;
             let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in topics {
-                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))",params![id,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,detail='daemon restarted; inspect abandoned attempts before continuing',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![id,now()])?;
                 let topic=topic_row(st,&id)?.context("topic vanished")?;
@@ -89,7 +89,7 @@ impl Store {
         self.transaction(|st|{
             let topic=st.topic_for_session(session)?.context("not a Topic Chat")?;
             if !st.is_topic_orchestrator(session)?{bail!("topic is not running or waiting for input");}
-            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
+            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL AND NOT EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND feature_id=?2 AND status='running')",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
             if changed!=1{bail!("feature is missing, terminal, or has an active attempt");}
             let open:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('pending','running','needs_user'))",[&topic.id],|row|row.get(0))?;
             if !open {
@@ -593,7 +593,7 @@ impl Store {
                 _ => bail!("only an approved, running or needs-user topic can be cancelled"),
             }
             let timestamp = now();
-            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,timestamp])?;
+            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,timestamp])?;
             st.conn.execute("UPDATE topic_features SET status='cancelled',active_attempt_id=NULL,detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,timestamp])?;
             st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1", [topic_id])?;
             st.conn.execute("UPDATE topics SET status='cancelled',updated_at=?2 WHERE id=?1", params![topic_id,timestamp])?;
@@ -736,8 +736,8 @@ impl Store {
             st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,updated_at=?5 WHERE id=?1",
                 params![id,enum_text(status)?,summary,serde_json::to_string(&outputs)?,timestamp])?;
             st.append_message(&attempt.conversation_session_id,"assistant",summary)?;
-            st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,updated_at=?3 WHERE id=?1",
-                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"pending"},timestamp])?;
+            st.conn.execute("UPDATE topic_features SET status=?2,updated_at=?3 WHERE id=?1",
+                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"running"},timestamp])?;
             if status==TopicAttemptStatus::NeedsUser {st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1", params![attempt.topic_id,timestamp])?;}
             topic_attempt(st,id)?.context("attempt vanished")
         })
@@ -747,7 +747,7 @@ impl Store {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
             if topic.status=="running" || topic.status=="needs_user" {
-                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,detail,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,detail,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='failed',active_attempt_id=NULL,detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,detail,now()])?;
                 st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[topic_id])?;
                 st.conn.execute("UPDATE topics SET status='failed',updated_at=?2 WHERE id=?1",params![topic_id,now()])?;
