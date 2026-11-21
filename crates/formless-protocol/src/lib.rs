@@ -196,6 +196,8 @@ pub struct TopicFeatureInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicInfo {
     pub id: String,
+    #[serde(default)]
+    pub allow_external_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_topic_id: Option<String>,
     pub name: String,
@@ -210,6 +212,35 @@ pub struct TopicInfo {
     pub attempts: Vec<TopicAttemptInfo>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[cfg(test)]
+mod topic_context_wire_tests {
+    use super::*;
+    #[test]
+    fn topic_context_access_defaults_and_client_only_operations() {
+        let request = Request::SetTopicContextAccess {
+            topic_id: "topic".into(),
+            allow: true,
+        };
+        assert!(matches!(
+            serde_json::from_value::<Request>(serde_json::to_value(request).unwrap()).unwrap(),
+            Request::SetTopicContextAccess { allow: true, .. }
+        ));
+        let topic:TopicInfo=serde_json::from_value(serde_json::json!({"id":"t","name":"T","workspace":null,"workspace_kind":"scratch","base_revision":null,"outline":[],"source_session_id":"s","topic_session_id":null,"status":"pending_approval","features":[],"attempts":[],"created_at":"2026","updated_at":"2026"})).unwrap();
+        assert!(!topic.allow_external_context);
+        let op = TopicMcpOperation::SearchConversations {
+            query: "needle".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(op).unwrap(),
+            serde_json::json!({"operation":"search_conversations","query":"needle"})
+        );
+        assert!(serde_json::from_value::<TopicMcpOperation>(
+            serde_json::json!({"operation":"set_topic_context_access","topic_id":"t","allow":true})
+        )
+        .is_err());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +289,9 @@ pub enum TopicMcpOperation {
         questions: Vec<Question>,
     },
     ListConversations,
+    SearchConversations {
+        query: String,
+    },
     ReadConversation {
         session_id: String,
     },
@@ -2360,6 +2394,10 @@ pub enum Request {
         rejection: TopicRejectionRequest,
     },
     ListTopics,
+    SetTopicContextAccess {
+        topic_id: String,
+        allow: bool,
+    },
     GetTopic {
         topic_id: String,
     },

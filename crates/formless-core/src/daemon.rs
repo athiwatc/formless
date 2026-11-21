@@ -2082,6 +2082,11 @@ impl Daemon {
                 Ok(serde_json::to_value(attempt)?)
             }
             Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id).await,
+            Request::SetTopicContextAccess { topic_id, allow } => {
+                let topic = self.with_store(|st| st.set_topic_context_access(&topic_id, allow))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
             Request::CancelTopic { topic_id } => {
                 let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
@@ -2152,11 +2157,10 @@ impl Daemon {
                         let mut message=None;
                         let value=match request.operation {
                             TopicMcpOperation::RequestPermission {..} | TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
-                            TopicMcpOperation::ListConversations => serde_json::to_value(st.list_sessions()?)?,
+                            TopicMcpOperation::ListConversations => st.topic_list_conversations(&attempt.topic_id)?,
+                            TopicMcpOperation::SearchConversations {query} => st.topic_search_conversations(&attempt.topic_id,&query)?,
                             TopicMcpOperation::ReadConversation {session_id} => {
-                                if st.session_deleted(&session_id)? {bail!("conversation is deleted");}
-                                json!({"session":st.get_session(&session_id)?.context("conversation not found")?,
-                                    "messages":st.list_messages(&session_id)?})
+                                st.topic_read_conversation(&attempt.topic_id,&session_id)?
                             }
                             TopicMcpOperation::AppendConversation {content} => {
                                 let msg=st.append_message(&attempt.conversation_session_id,"assistant",&content)?;
@@ -8659,6 +8663,32 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            toolreg::TOPIC_LIST_CONVERSATIONS
+            | toolreg::TOPIC_READ_CONVERSATION
+            | toolreg::TOPIC_SEARCH_CONVERSATIONS => match self.with_reader(|st| {
+                if !st.is_topic_orchestrator(session_id)? {
+                    bail!("topic conversation tool requires an active Topic Chat");
+                }
+                let topic = st
+                    .topic_for_session(session_id)?
+                    .context("topic not found")?;
+                match tc.name.as_str() {
+                    toolreg::TOPIC_LIST_CONVERSATIONS => st.topic_list_conversations(&topic.id),
+                    toolreg::TOPIC_READ_CONVERSATION => st.topic_read_conversation(
+                        &topic.id,
+                        args["session_id"]
+                            .as_str()
+                            .context("session_id is required")?,
+                    ),
+                    _ => st.topic_search_conversations(
+                        &topic.id,
+                        args["query"].as_str().context("query is required")?,
+                    ),
+                }
+            }) {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: {error:#}")),
+            },
             toolreg::TOPIC_RUN_STEP => match self.run_topic_step(session_id, &args, cancel).await {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),

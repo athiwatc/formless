@@ -33,6 +33,132 @@ fn topic_main_identity_is_non_creating_and_persistent() {
 }
 
 #[test]
+fn topic_context_branch_scope_search_and_external_opt_in() {
+    let (store, source, _, _) = fixture();
+    let parent = nested_topic(&store, &source.id, None).unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    store.claim_topic_workflow(&parent.id).unwrap();
+    let ancestor = store
+        .begin_topic_attempt(
+            &parent.id,
+            &parent.features[0].id,
+            "Prior",
+            StepAccess::ReadOnly,
+            HarnessKind::Claude,
+            None,
+            None,
+            &[],
+            &"token".repeat(8),
+            Path::new("/topic/prior"),
+        )
+        .unwrap();
+    store
+        .report_topic_result(
+            &ancestor.id,
+            &"token".repeat(8),
+            TopicAttemptStatus::Succeeded,
+            "done",
+            &[],
+        )
+        .unwrap();
+    store
+        .finish_topic_feature(
+            parent.topic_session_id.as_ref().unwrap(),
+            &parent.features[0].id,
+            true,
+            "done",
+        )
+        .unwrap();
+    let parent_session = parent.topic_session_id.as_ref().unwrap();
+    let child = nested_topic(&store, parent_session, None).unwrap();
+    let child = store.approve_topic(&child.id).unwrap();
+    store.claim_topic_workflow(&child.id).unwrap();
+    let own = store
+        .begin_topic_attempt(
+            &child.id,
+            &child.features[0].id,
+            "Own",
+            StepAccess::ReadOnly,
+            HarnessKind::Claude,
+            None,
+            None,
+            &[],
+            &"child".repeat(8),
+            Path::new("/topic/own"),
+        )
+        .unwrap();
+    let sibling = nested_topic(&store, &source.id, Some(parent.id.clone())).unwrap();
+    let sibling = store.approve_topic(&sibling.id).unwrap();
+    let sibling_session = sibling.topic_session_id.unwrap();
+    let own_session = child.topic_session_id.as_ref().unwrap();
+    for session in [
+        own_session,
+        parent_session,
+        &own.conversation_session_id,
+        &ancestor.conversation_session_id,
+        &sibling_session,
+        &source.id,
+    ] {
+        store
+            .append_message(session, "user", "A NeEdLe to locate")
+            .unwrap();
+    }
+    for session in [
+        own_session,
+        parent_session,
+        &own.conversation_session_id,
+        &ancestor.conversation_session_id,
+    ] {
+        assert!(store.topic_read_conversation(&child.id, session).is_ok());
+    }
+    for session in [&source.id, &sibling_session] {
+        assert!(store.topic_read_conversation(&child.id, session).is_err());
+    }
+    let matches = store
+        .topic_search_conversations(&child.id, "needle")
+        .unwrap();
+    assert_eq!(matches.as_array().unwrap().len(), 4);
+    assert_eq!(
+        store.topic_search_conversations(&child.id, " ").unwrap(),
+        json!([])
+    );
+    assert!(store
+        .topic_search_conversations(&child.id, &"x".repeat(1001))
+        .is_err());
+    assert!(!child.allow_external_context);
+    store.set_topic_context_access(&child.id, true).unwrap();
+    assert!(store.topic_read_conversation(&child.id, &source.id).is_ok());
+    assert!(store
+        .topic_read_conversation(&child.id, &sibling_session)
+        .is_ok());
+    assert_eq!(
+        store
+            .topic_search_conversations(&child.id, "NEEDLE")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    store.soft_delete_session(&sibling_session).unwrap();
+    assert!(store
+        .topic_read_conversation(&child.id, &sibling_session)
+        .is_err());
+    for _ in 0..45 {
+        store.append_message(own_session, "user", "needle").unwrap();
+    }
+    assert_eq!(
+        store
+            .topic_search_conversations(&child.id, "needle")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        40
+    );
+}
+
+#[test]
 fn topic_needs_user_feature_does_not_block_active_sibling() {
     let (store, _, message, mut request) = fixture();
     request.features = vec![
