@@ -1,0 +1,63 @@
+#!/usr/bin/python3
+import json
+import os
+import sys
+
+
+def read():
+    return json.loads(sys.stdin.readline())
+
+
+def send(message):
+    print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+
+
+def reply(request, result):
+    send({"id": request["id"], "result": result})
+
+
+assert sys.argv[1:] == ["acp"]
+assert os.environ["PWD"] == os.getcwd()
+assert "PROBE_ENV" not in os.environ
+config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
+assert config["default_agent"] == "build"
+assert "mcp" not in config
+assert "cap-secret" not in json.dumps(config)
+request = read()
+assert request["method"] == "initialize"
+assert request["params"]["clientCapabilities"]["elicitation"] == {"form": {}}
+reply(request, {"protocolVersion": 1, "agentInfo": {"name": "OpenCode", "version": "2.3.2"}})
+request = read()
+assert request["method"] == "session/new"
+assert request["params"]["cwd"] == os.getcwd()
+assert request["params"]["mcpServers"][0]["name"] == "formless"
+assert request["params"]["mcpServers"][0]["env"] == [{"name": "PROBE_ENV", "value": "cap-secret"}]
+reply(request, {"sessionId": "fake-session", "configOptions": [{
+    "id": "mode", "category": "mode", "type": "select", "currentValue": "user-default",
+    "options": [{"value": "build", "name": "Build"}],
+}]})
+request = read()
+assert request["method"] == "session/set_config_option"
+assert request["params"]["value"] == "build"
+reply(request, {})
+prompt = read()
+assert prompt["method"] == "session/prompt"
+send({"id": 90, "method": "session/request_permission", "params": {
+    "sessionId": "fake-session",
+    "toolCall": {"name": "execute", "title": "execute", "kind": "other",
+                 "rawInput": {"code": "return await tools.other.echo_env()"}},
+    "options": [
+        {"optionId": "once", "name": "Allow once", "kind": "allow_once"},
+        {"optionId": "always", "name": "Always allow", "kind": "allow_always"},
+        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+    ],
+}})
+assert read()["result"]["outcome"] == {"outcome": "selected", "optionId": "once"}
+with open(os.environ["QUESTION_FIXTURE"]) as fixture:
+    question = json.load(fixture)
+send({"id": 91, "method": "elicitation/create", "params": question})
+assert read()["result"] == {"action": "accept", "content": {"q0": "Blue"}}
+send({"method": "session/update", "params": {"sessionId": "fake-session", "update": {
+    "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "done"},
+}}})
+reply(prompt, {"stopReason": "end_turn"})

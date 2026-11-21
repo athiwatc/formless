@@ -1,13 +1,94 @@
 use super::*;
 use anyhow::{anyhow, bail, Context};
 use formless_protocol::{
-    HarnessKind, HarnessRole, TopicAttemptStatus, TopicFeatureProposal, TopicProposalRequest,
-    TopicReviewOutcome,
+    HarnessKind, StepAccess, TopicArtifact, TopicAttemptStatus, TopicFeatureProposal,
+    TopicProposalRequest, WorkspaceKind,
 };
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 
 impl Store {
+    pub(crate) fn pause_topic_attempt(&self, id: &str, token: &str) -> Result<TopicAttemptInfo> {
+        self.transaction(|st| {
+            let attempt=st.authenticate_topic_attempt(id,token)?;
+            if attempt.status!=TopicAttemptStatus::Running {bail!("attempt already has a pending interaction");}
+            st.conn.execute("UPDATE topic_attempts SET status='needs_user',updated_at=?2 WHERE id=?1",params![id,now()])?;
+            st.conn.execute("UPDATE topic_features SET status='needs_user',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;
+            topic_attempt(st,id)?.context("attempt vanished")
+        })
+    }
+
+    pub(crate) fn resume_topic_attempt(&self, id: &str) -> Result<bool> {
+        self.transaction(|st| {
+            let changed=st.conn.execute("UPDATE topic_attempts SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user' AND EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status='needs_user' AND t.status='running')",params![id,now()])?;
+            if changed>0 {st.conn.execute("UPDATE topic_features SET status='running',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;}
+            Ok(changed>0)
+        })
+    }
+    pub(crate) fn ensure_topic_chat_writable(&self, id: &str) -> Result<()> {
+        let kind: Option<String> = self
+            .conn
+            .query_row("SELECT session_kind FROM sessions WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if kind.as_deref() == Some("topic_attempt") {
+            bail!("attempt conversations are read-only; send messages in the Topic Chat instead");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_topic_input_file(
+        &self,
+        id: &str,
+        path: &Path,
+        sha256: &str,
+    ) -> Result<Vec<u8>> {
+        let cwd: Option<String> = self.conn.query_row(
+            "SELECT worktree_path FROM topic_attempts WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let cwd = PathBuf::from(cwd.context("attempt has no workspace")?).canonicalize()?;
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+        .canonicalize()?;
+        let private = self
+            .artifact_root
+            .as_ref()
+            .and_then(|root| root.parent())
+            .map(|p| p.join("topic-attempts"));
+        let in_private = private
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| path.starts_with(p));
+        if !path.starts_with(&cwd) && !in_private {
+            bail!("input artifact is outside the attempt workspace and private outputs");
+        }
+        if std::fs::metadata(&path)?.len() > 16 * 1024 * 1024 {
+            bail!("input artifact exceeds 16 MiB");
+        }
+        let bytes = std::fs::read(path)?;
+        if hash_bytes(&bytes) != sha256 {
+            bail!("input artifact SHA-256 does not match");
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn topic_artifact_access(
+        &self,
+        id: &str,
+        scope: &str,
+        seq: Option<i64>,
+        owner: Option<&str>,
+    ) -> Result<bool> {
+        crate::attachment_access::topic_provenance(&self.conn, id, scope, seq, owner)
+    }
+
     pub fn is_main_chat(&self, session_id: &str) -> Result<bool> {
         let main_id: Option<String> = self
             .conn
@@ -56,16 +137,38 @@ impl Store {
     pub fn propose_topic(
         &self,
         proposal: &TopicProposalRequest,
-        base_revision: &str,
+        workspace_kind: WorkspaceKind,
+        base_revision: Option<&str>,
     ) -> Result<TopicInfo> {
+        self.ensure_topic_chat_writable(&proposal.source_session_id)?;
         if proposal.name.trim().is_empty() {
             bail!("topic name must not be empty");
         }
         if proposal.message_ids.is_empty() {
             bail!("select at least one user message");
         }
-        if !proposal.repo.is_absolute() {
-            bail!("topic repository path must be absolute");
+        if proposal
+            .workspace
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            bail!("topic workspace path must be absolute");
+        }
+        if proposal.outline.len() > 20
+            || proposal
+                .outline
+                .iter()
+                .any(|step| step.title.trim().is_empty())
+        {
+            bail!("topic outline must contain at most 20 steps with nonblank titles");
+        }
+        if (workspace_kind == WorkspaceKind::Scratch) != proposal.workspace.is_none()
+            || (workspace_kind == WorkspaceKind::Git) != base_revision.is_some()
+        {
+            bail!("workspace kind, path and base revision are inconsistent");
+        }
+        for step in &proposal.outline {
+            crate::local_harness::validate_acp_agent(step.harness, step.acp_agent.as_deref())?;
         }
         let mut seen = HashSet::new();
         if proposal.message_ids.iter().any(|id| !seen.insert(id)) {
@@ -134,23 +237,30 @@ impl Store {
                 bail!("every selected message must have at least one feature request");
             }
 
+            let parent_topic_id = match &proposal.parent_topic_id {
+                Some(id) => {
+                    let parent=topic_info(st,id)?.context("parent topic not found")?;
+                    if matches!(parent.status,formless_protocol::TopicStatus::PendingApproval|formless_protocol::TopicStatus::Rejected) {
+                        bail!("parent topic must be approved before it can have children");
+                    }
+                    Some(id.clone())
+                }
+                None => st.conn.query_row("SELECT id FROM topics WHERE topic_session_id=?1",[&proposal.source_session_id],|r|r.get::<_,String>(0)).optional()?,
+            };
+            let mut cursor=parent_topic_id.clone();
+            let mut ancestors=HashSet::new();
+            while let Some(parent)=cursor {
+                if !ancestors.insert(parent.clone()) {bail!("topic hierarchy contains a cycle");}
+                cursor=st.conn.query_row("SELECT parent_topic_id FROM topics WHERE id=?1",[parent],|r|r.get(0))?;
+            }
             let id = uuid::Uuid::new_v4().to_string();
             let timestamp = now();
             st.conn.execute(
-                "INSERT INTO topics(id,name,repo,base_revision,source_session_id,status,builder_kind,builder_model,reviewer_kind,reviewer_model,created_at,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,'pending_approval',?6,?7,?8,?9,?10,?10)",
-                params![
-                    id,
-                    proposal.name.trim(),
-                    proposal.repo.to_string_lossy(),
-                    base_revision,
-                    proposal.source_session_id,
-                    serde_json::to_value(proposal.builder)?.as_str().unwrap(),
-                    proposal.builder_model,
-                    serde_json::to_value(proposal.reviewer)?.as_str().unwrap(),
-                    proposal.reviewer_model,
-                    timestamp,
-                ],
+                "INSERT INTO topics(id,name,parent_topic_id,workspace,workspace_kind,base_revision,outline,source_session_id,status,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending_approval',?9,?9)",
+                params![id, proposal.name.trim(), parent_topic_id, proposal.workspace.as_ref().map(|p|p.to_string_lossy().into_owned()),
+                    enum_text(workspace_kind)?, base_revision, serde_json::to_string(&proposal.outline)?,
+                    proposal.source_session_id, timestamp],
             )?;
             for message in selected {
                 st.conn.execute(
@@ -178,7 +288,7 @@ impl Store {
             let Some(mut topic) = topic_row(st, topic_id)? else {
                 bail!("topic not found");
             };
-            if topic.status == "approved" || topic.status == "running" || topic.status == "complete" {
+            if topic.topic_session_id.is_some() {
                 return topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"));
             }
             if topic.status != "pending_approval" {
@@ -193,6 +303,25 @@ impl Store {
             if active {
                 bail!("cannot move selected messages while the source session has a running, paused, or queued run");
             }
+            let workspace = match &topic.workspace {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    let data = st.artifact_root.as_ref().and_then(|root| root.parent())
+                        .context("scratch approval requires a profile-backed Store")?;
+                    let path = data.join("topic-workspaces").join(topic_id);
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.recursive(true);
+                    #[cfg(unix)]
+                    { builder.mode(0o700); }
+                    builder.create(&path)?;
+                    st.conn.execute("UPDATE topics SET workspace=?2 WHERE id=?1", params![topic_id, path.to_string_lossy()])?;
+                    path
+                }
+            };
+            let parent_session=match &topic.parent_topic_id {
+                Some(parent)=>topic_row(st,parent)?.context("parent topic not found")?.topic_session_id.context("parent topic has no conversation")?,
+                None=>topic.source_session_id.clone(),
+            };
             let session = st.create_session(Some(topic.name.clone()))?;
             let timestamp = now();
             st.conn.execute(
@@ -200,9 +329,9 @@ impl Store {
                  WHERE id=?1",
                 params![
                     session.id,
-                    topic.source_session_id,
+                    parent_session,
                     topic.id,
-                    topic.repo,
+                    workspace.to_string_lossy(),
                 ],
             )?;
             let refs = st.conn.prepare(
@@ -220,21 +349,6 @@ impl Store {
                     .ok_or_else(|| anyhow!("selected source message {message_id} no longer exists"))?;
                 if current.role != "user" || hash_token(&current.content) != *snapshot {
                     bail!("selected source message {message_id} changed since proposal; create a new proposal to approve the edited request");
-                }
-                if let Some(meta) = &current.meta {
-                    let meta: Value = serde_json::from_str(meta)
-                        .context("selected source message has invalid attachment metadata")?;
-                    for attachment in meta["attachments"].as_array().into_iter().flatten() {
-                        if attachment["imported"] == true || attachment["reference"] == true || attachment["expired"] == true {
-                            continue;
-                        }
-                        for id in [attachment["id"].as_str(), attachment["_artifact_id"].as_str()].into_iter().flatten() {
-                            st.conn.execute(
-                                "UPDATE artifacts SET session_id=?2 WHERE id=?1 AND session_id=?3",
-                                params![id, session.id, topic.source_session_id],
-                            )?;
-                        }
-                    }
                 }
                 let changed = st.conn.execute(
                     "UPDATE messages SET session_id=?2,seq=?3 WHERE id=?1 AND session_id=?4",
@@ -350,308 +464,196 @@ impl Store {
         topic_attempt(self, attempt_id)
     }
 
-    pub(crate) fn claim_topic_workflow(&self, topic_id: &str) -> Result<TopicInfo> {
+    pub fn cancel_topic(&self, topic_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
-            let topic = topic_row(st, topic_id)?.ok_or_else(|| anyhow!("topic not found"))?;
-            if topic.status == "running" {
-                bail!("topic workflow is already active; recover it explicitly if its child process is unknown");
-            }
-            if topic.status != "approved" {
-                bail!("topic must be approved before its workflow can start");
-            }
-            let lock_owner: Option<String> = st.conn.query_row(
-                "SELECT topic_id FROM topic_repo_locks WHERE repo=?1",
-                params![topic.repo],
-                |row| row.get(0),
-            ).optional()?;
-            if let Some(owner) = lock_owner {
-                bail!("repository already has an active topic workflow ({owner})");
+            let topic = topic_row(st, topic_id)?.context("topic not found")?;
+            match topic.status.as_str() {
+                "cancelled" => return topic_info(st, topic_id)?.context("topic vanished"),
+                "approved" | "running" | "needs_user" => {},
+                "pending_approval" => bail!("pending topics must be rejected, not cancelled"),
+                _ => bail!("only an approved, running or needs-user topic can be cancelled"),
             }
             let timestamp = now();
-            st.conn.execute(
-                "INSERT INTO topic_repo_locks(repo,topic_id,acquired_at) VALUES(?1,?2,?3)",
-                params![topic.repo, topic_id, timestamp],
-            )?;
-            st.conn.execute(
-                "UPDATE topics SET status='running',updated_at=?2 WHERE id=?1",
-                params![topic_id, timestamp],
-            )?;
-            topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"))
+            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,timestamp])?;
+            st.conn.execute("UPDATE topic_features SET status='cancelled',active_attempt_id=NULL,detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,timestamp])?;
+            st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1", [topic_id])?;
+            st.conn.execute("UPDATE topics SET status='cancelled',updated_at=?2 WHERE id=?1", params![topic_id,timestamp])?;
+            topic_info(st, topic_id)?.context("topic vanished")
         })
     }
 
+    pub(crate) fn claim_topic_workflow(&self, topic_id: &str) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            let topic = topic_row(st, topic_id)?.context("topic not found")?;
+            if topic.status != "approved" {
+                bail!(
+                    "topic must be approved and not already running before its workflow can start"
+                );
+            }
+            let workspace = topic.workspace.context("approved topic has no workspace")?;
+            st.conn
+                .execute(
+                    "INSERT INTO topic_repo_locks(workspace,topic_id,acquired_at) VALUES(?1,?2,?3)",
+                    params![workspace, topic_id, now()],
+                )
+                .context("workspace already has an active topic workflow")?;
+            st.conn.execute(
+                "UPDATE topics SET status='running',updated_at=?2 WHERE id=?1",
+                params![topic_id, now()],
+            )?;
+            topic_info(st, topic_id)?.context("topic vanished")
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin_topic_attempt(
         &self,
         topic_id: &str,
         feature_id: &str,
-        role: HarnessRole,
+        step_title: &str,
+        access: StepAccess,
         harness: HarnessKind,
-        round: u32,
+        model: Option<&str>,
+        acp_agent: Option<&str>,
+        inputs: &[TopicArtifact],
         capability_token: &str,
-        worktree: &Path,
-        base_revision: &str,
+        cwd: &Path,
     ) -> Result<TopicAttemptInfo> {
+        crate::local_harness::validate_acp_agent(Some(harness), acp_agent)?;
         if capability_token.len() < 32 {
             bail!("topic attempt capability token is too short");
         }
+        if step_title.trim().is_empty() {
+            bail!("step title must not be blank");
+        }
         self.transaction(|st| {
-            let topic = topic_row(st, topic_id)?.ok_or_else(|| anyhow!("topic not found"))?;
-            if topic.status != "running" || topic.topic_session_id.is_none() {
-                bail!("topic must be approved and running to create an attempt");
-            }
-            let feature_status: String = st.conn.query_row(
-                "SELECT status FROM topic_features WHERE id=?1 AND topic_id=?2",
-                params![feature_id, topic_id],
-                |row| row.get(0),
-            ).optional()?.ok_or_else(|| anyhow!("topic feature not found"))?;
-            let expected = match role {
-                HarnessRole::Build => "pending",
-                HarnessRole::Review => "reviewing",
-            };
-            if feature_status != expected {
-                bail!("topic feature is not ready for this attempt role");
-            }
-            if role == HarnessRole::Review {
-                let reviewed: bool = st.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM topic_reviews WHERE feature_id=?1 AND revision=?2)",
-                    params![feature_id, base_revision],
-                    |row| row.get(0),
-                )?;
-                if reviewed {
-                    bail!("this feature revision already has a submitted review");
-                }
-                let reserved: bool = st.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM topic_attempts WHERE feature_id=?1 AND revision=?2 AND role='review' AND status='reviewing')",
-                    params![feature_id, base_revision],
-                    |row| row.get(0),
-                )?;
-                if reserved {
-                    bail!("a reviewer attempt is already reserved for this feature revision");
-                }
-            }
+            let topic = topic_row(st, topic_id)?.context("topic not found")?;
+            if topic.status != "running" { bail!("topic must be running to launch an attempt"); }
+            let (status, count, active): (String, u32, Option<String>) = st.conn.query_row(
+                "SELECT status,attempt_count,active_attempt_id FROM topic_features WHERE topic_id=?1 AND id=?2",
+                params![topic_id,feature_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            if status != "pending" || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
+            if count >= 12 { bail!("work item reached the 12-attempt limit"); }
             let id = uuid::Uuid::new_v4().to_string();
-            let session = st.create_session(Some(format!("{} {}", harness_label(harness), topic.name)))?;
-            let timestamp = now();
-            let role_text = serde_json::to_value(role)?.as_str().unwrap().to_owned();
-            let harness_text = serde_json::to_value(harness)?.as_str().unwrap().to_owned();
-            let pinned_revision = (role == HarnessRole::Review).then_some(base_revision);
-            st.conn.execute(
-                "INSERT INTO topic_attempts(id,topic_id,feature_id,round,role,harness_kind,status,conversation_session_id,capability_hash,worktree_path,base_revision,revision,created_at,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
-                params![
-                    id, topic_id, feature_id, round as i64, role_text, harness_text,
-                    match role { HarnessRole::Build => "building", HarnessRole::Review => "reviewing" },
-                    session.id, hash_token(capability_token), worktree.to_string_lossy(), base_revision, pinned_revision, timestamp,
-                ],
-            )?;
-            st.conn.execute(
-                "UPDATE sessions SET parent_session_id=?2,session_kind='topic_attempt',topic_id=?3,topic_attempt_id=?4,harness_kind=?5,cwd=?6 WHERE id=?1",
-                params![session.id, topic.topic_session_id, topic_id, id, harness_text, worktree.to_string_lossy()],
-            )?;
-            st.conn.execute(
-                "UPDATE topic_features SET status=?2,active_attempt_id=?3,detail=NULL,updated_at=?4 WHERE id=?1",
-                params![feature_id, if role == HarnessRole::Build { "building" } else { "reviewing" }, id, timestamp],
-            )?;
-            st.conn.execute(
-                "UPDATE topics SET updated_at=?2 WHERE id=?1",
-                params![topic_id, timestamp],
-            )?;
-            topic_attempt(st, &id)?.ok_or_else(|| anyhow!("topic attempt vanished"))
+            let session = st.create_session(Some(format!("{}: {}", harness_label(harness), step_title.trim())))?;
+            let outputs_dir = st.artifact_root.as_ref().and_then(|root|root.parent())
+                .map(|data|data.join("topic-attempts").join(&id).join("outputs"));
+            if let Some(dir) = &outputs_dir {
+                let mut builder=std::fs::DirBuilder::new(); builder.recursive(true);
+                #[cfg(unix)] {builder.mode(0o700);}
+                builder.create(dir)?;
+            }
+            let timestamp=now();
+            st.conn.execute("INSERT INTO topic_attempts(id,topic_id,feature_id,step_title,access,harness_kind,model,acp_agent,inputs,status,conversation_session_id,capability_hash,worktree_path,outputs_dir,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'running',?10,?11,?12,?13,?14,?14)",
+                params![id,topic_id,feature_id,step_title.trim(),enum_text(access)?,enum_text(harness)?,model,acp_agent,serde_json::to_string(inputs)?,session.id,hash_token(capability_token),cwd.to_string_lossy(),outputs_dir.as_ref().map(|p|p.to_string_lossy().into_owned()),timestamp])?;
+            st.conn.execute("UPDATE sessions SET parent_session_id=?2,session_kind='topic_attempt',topic_id=?3,topic_attempt_id=?4,harness_kind=?5,cwd=?6 WHERE id=?1",
+                params![session.id,topic.topic_session_id,topic_id,id,enum_text(harness)?,cwd.to_string_lossy()])?;
+            st.conn.execute("UPDATE topic_features SET status='running',attempt_count=attempt_count+1,active_attempt_id=?2,detail=NULL,updated_at=?3 WHERE id=?1", params![feature_id,id,timestamp])?;
+            topic_attempt(st,&id)?.context("attempt vanished")
         })
     }
 
     pub(crate) fn authenticate_topic_attempt(
         &self,
-        attempt_id: &str,
-        capability_token: &str,
+        id: &str,
+        token: &str,
     ) -> Result<TopicAttemptInfo> {
-        let attempt =
-            topic_attempt(self, attempt_id)?.ok_or_else(|| anyhow!("topic attempt not found"))?;
-        let hash: String = self.conn.query_row(
-            "SELECT capability_hash FROM topic_attempts WHERE id=?1",
-            params![attempt_id],
-            |row| row.get(0),
-        )?;
-        if hash != hash_token(capability_token) {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT capability_hash FROM topic_attempts WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() != Some(hash_token(token).as_str()) {
             bail!("invalid topic attempt capability");
+        }
+        let attempt = topic_attempt(self, id)?.context("attempt not found")?;
+        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status='running')", [id], |r|r.get(0))?;
+        if !matches!(
+            attempt.status,
+            TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
+        ) || !active
+        {
+            bail!("topic attempt is no longer active");
         }
         Ok(attempt)
     }
 
-    pub(crate) fn topic_attempt_paths(&self, attempt_id: &str) -> Result<(PathBuf, String)> {
-        Ok(self.conn.query_row(
-            "SELECT worktree_path,base_revision FROM topic_attempts WHERE id=?1",
-            params![attempt_id],
-            |row| Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?)),
-        )?)
-    }
-
-    pub(crate) fn ready_for_topic_review(
+    pub(crate) fn report_topic_result(
         &self,
-        attempt_id: &str,
-        capability_token: &str,
-        revision: &str,
-        test_report: &str,
+        id: &str,
+        token: &str,
+        status: TopicAttemptStatus,
+        summary: &str,
+        outputs: &[TopicArtifact],
     ) -> Result<TopicAttemptInfo> {
-        let attempt = self.authenticate_topic_attempt(attempt_id, capability_token)?;
-        if attempt.role != HarnessRole::Build || attempt.status != TopicAttemptStatus::Building {
-            bail!("only the active builder attempt can request review");
+        if !matches!(
+            status,
+            TopicAttemptStatus::Succeeded
+                | TopicAttemptStatus::Failed
+                | TopicAttemptStatus::NeedsUser
+        ) {
+            bail!("result status must be succeeded, failed or needs_user");
         }
         self.transaction(|st| {
-            let timestamp = now();
-            let changed = st.conn.execute(
-                "UPDATE topic_attempts SET status='awaiting_review',revision=?2,test_report=?3,updated_at=?4 WHERE id=?1 AND status='building'",
-                params![attempt_id, revision, test_report, timestamp],
-            )?;
-            if changed != 1 { bail!("builder attempt is no longer active"); }
-            st.conn.execute(
-                "UPDATE topic_features SET status='reviewing',ready_revision=?2,updated_at=?3 WHERE id=?1",
-                params![attempt.feature_id, revision, timestamp],
-            )?;
-            topic_attempt(st, attempt_id)?.ok_or_else(|| anyhow!("topic attempt vanished"))
+            let attempt=st.authenticate_topic_attempt(id,token)?;
+            let mut outputs=outputs.to_vec();
+            for artifact in &mut outputs {
+                if let TopicArtifact::File {path,sha256} = artifact {
+                    let root: Option<String> = st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1", [id], |r|r.get(0))?;
+                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
+                    let file=if path.is_absolute(){path.clone()}else{root.join(&*path)}.canonicalize()?;
+                    if !file.starts_with(&root) || !file.is_file() {bail!("file output must be inside this attempt's private outputs directory");}
+                    if hash_bytes(&std::fs::read(&file)?) != *sha256 {bail!("file output SHA-256 does not match");}
+                    *path=file;
+                }
+                if let TopicArtifact::GitRevision {revision} = artifact {
+                    if revision.len()!=40 || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40-character SHA");}
+                }
+            }
+            let timestamp=now();
+            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,updated_at=?5 WHERE id=?1",
+                params![id,enum_text(status)?,summary,serde_json::to_string(&outputs)?,timestamp])?;
+            st.append_message(&attempt.conversation_session_id,"assistant",summary)?;
+            st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,updated_at=?3 WHERE id=?1",
+                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"pending"},timestamp])?;
+            if status==TopicAttemptStatus::NeedsUser {st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1", params![attempt.topic_id,timestamp])?;}
+            topic_attempt(st,id)?.context("attempt vanished")
         })
     }
 
-    pub(crate) fn submit_topic_review(
-        &self,
-        attempt_id: &str,
-        capability_token: &str,
-        revision: &str,
-        outcome: &TopicReviewOutcome,
-    ) -> Result<TopicAttemptInfo> {
-        let attempt = self.authenticate_topic_attempt(attempt_id, capability_token)?;
-        if attempt.role != HarnessRole::Review || attempt.status != TopicAttemptStatus::Reviewing {
-            bail!("only the active reviewer attempt can submit a review");
-        }
-        if attempt.revision.as_deref() != Some(revision) {
-            bail!("review revision does not match the pinned attempt revision");
-        }
+    pub(crate) fn fail_topic_workflow(&self, topic_id: &str, detail: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
-            let timestamp = now();
-            let (feature_id,): (String,) = st.conn.query_row(
-                "SELECT feature_id FROM topic_attempts WHERE id=?1",
-                params![attempt_id],
-                |row| Ok((row.get(0)?,)),
-            )?;
-            let (outcome_name, detail, attempt_status, feature_status) = match outcome {
-                TopicReviewOutcome::Passed => ("passed", "", "passed", "ready"),
-                TopicReviewOutcome::Findings { detail } => ("findings", detail.as_str(), "findings", "pending"),
-                TopicReviewOutcome::NeedsUser { reason } => ("needs_user", reason.as_str(), "needs_user", "needs_user"),
-            };
-            st.conn.execute(
-                "INSERT INTO topic_reviews(id,feature_id,attempt_id,revision,outcome,detail,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![uuid::Uuid::new_v4().to_string(), feature_id, attempt_id, revision, outcome_name, detail, timestamp],
-            ).context("review for this feature revision already exists")?;
-            let round: i64 = st.conn.query_row(
-                "SELECT review_round FROM topic_features WHERE id=?1",
-                params![feature_id],
-                |row| row.get(0),
-            )?;
-            let next_round = if matches!(outcome, TopicReviewOutcome::Findings { .. }) { round + 1 } else { round };
-            let bounded = next_round >= 3 && matches!(outcome, TopicReviewOutcome::Findings { .. });
-            let feature_status = if bounded { "needs_user" } else { feature_status };
-            let attempt_status = if bounded { "needs_user" } else { attempt_status };
-            st.conn.execute(
-                "UPDATE topic_attempts SET status=?2,detail=?3,updated_at=?4 WHERE id=?1",
-                params![attempt_id, attempt_status, detail, timestamp],
-            )?;
-            st.conn.execute(
-                "UPDATE topic_features SET status=?2,review_round=?3,active_attempt_id=NULL,detail=?4,updated_at=?5 WHERE id=?1",
-                params![feature_id, feature_status, next_round, if bounded { "review rounds exhausted" } else { detail }, timestamp],
-            )?;
-            topic_attempt(st, attempt_id)?.ok_or_else(|| anyhow!("topic attempt vanished"))
-        })
-    }
-
-    pub(crate) fn fail_topic_attempt(
-        &self,
-        attempt_id: &str,
-        detail: &str,
-    ) -> Result<TopicAttemptInfo> {
-        self.transaction(|st| {
-            let attempt = topic_attempt(st, attempt_id)?.ok_or_else(|| anyhow!("topic attempt not found"))?;
-            st.conn.execute(
-                "UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE id=?1",
-                params![attempt_id, detail, now()],
-            )?;
-            st.conn.execute(
-                "UPDATE topic_features SET status='failed',active_attempt_id=NULL,detail=?2,updated_at=?3 WHERE id=?1",
-                params![attempt.feature_id, detail, now()],
-            )?;
-            topic_attempt(st, attempt_id)?.ok_or_else(|| anyhow!("topic attempt vanished"))
-        })
-    }
-
-    pub(crate) fn finish_topic_workflow(&self, topic_id: &str) -> Result<TopicInfo> {
-        self.transaction(|st| {
-            let topic = topic_row(st, topic_id)?.ok_or_else(|| anyhow!("topic not found"))?;
-            let active: bool = st.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('pending','building','reviewing'))",
-                params![topic_id],
-                |row| row.get(0),
-            )?;
-            if active { bail!("topic still has work that is not terminal"); }
-            st.conn.execute("DELETE FROM topic_repo_locks WHERE repo=?1 AND topic_id=?2", params![topic.repo, topic_id])?;
-            st.conn.execute("UPDATE topics SET status='complete',updated_at=?2 WHERE id=?1", params![topic_id, now()])?;
-            topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"))
+            let topic=topic_row(st,topic_id)?.context("topic not found")?;
+            if topic.status=="running" || topic.status=="needs_user" {
+                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,detail,now()])?;
+                st.conn.execute("UPDATE topic_features SET status='failed',active_attempt_id=NULL,detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,detail,now()])?;
+                st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[topic_id])?;
+                st.conn.execute("UPDATE topics SET status='failed',updated_at=?2 WHERE id=?1",params![topic_id,now()])?;
+            }
+            topic_info(st,topic_id)?.context("topic vanished")
         })
     }
 
     pub fn recover_topic(&self, topic_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
-            let topic = topic_row(st, topic_id)?.ok_or_else(|| anyhow!("topic not found"))?;
-            if topic.status != "running" {
-                return topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"));
-            }
-            let timestamp = now();
-            st.conn.execute(
-                "UPDATE topic_attempts SET status='abandoned',detail='unknown child after restart; recovered explicitly',updated_at=?2 WHERE topic_id=?1 AND status IN ('building','awaiting_review','reviewing')",
-                params![topic_id, timestamp],
-            )?;
-            st.conn.execute(
-                "UPDATE topic_features SET status='pending',active_attempt_id=NULL,detail='recovered after an unknown child process',updated_at=?2 WHERE topic_id=?1 AND status IN ('building','reviewing')",
-                params![topic_id, timestamp],
-            )?;
-            st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1", params![topic_id])?;
-            st.conn.execute("UPDATE topics SET status='approved',updated_at=?2 WHERE id=?1", params![topic_id, timestamp])?;
-            topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"))
+            st.fail_topic_workflow(topic_id,"unknown child after recovery; retry explicitly")?;
+            st.conn.execute("UPDATE topic_attempts SET status='abandoned' WHERE topic_id=?1 AND status='failed' AND detail='unknown child after recovery; retry explicitly'",[topic_id])?;
+            topic_info(st,topic_id)?.context("topic vanished")
         })
     }
 
     pub fn retry_topic_feature(&self, topic_id: &str, feature_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
-            let topic = topic_row(st, topic_id)?.ok_or_else(|| anyhow!("topic not found"))?;
-            let status: Option<String> = st.conn.query_row(
-                "SELECT status FROM topic_features WHERE id=?1 AND topic_id=?2",
-                params![feature_id, topic_id],
-                |row| row.get(0),
-            ).optional()?;
-            match status.as_deref() {
-                None => bail!("topic feature not found"),
-                Some("failed" | "needs_user") => {},
-                _ => bail!("only a failed or needs-user feature can be retried"),
-            }
-            let timestamp = now();
-            st.conn.execute(
-                "UPDATE topic_features SET status='pending',active_attempt_id=NULL,review_round=0,detail=NULL,updated_at=?3 WHERE id=?1 AND topic_id=?2",
-                params![feature_id, topic_id, timestamp],
-            )?;
-            if topic.status == "running" {
-                bail!("cannot retry a feature while its topic workflow is running; recover it first");
-            }
-            if topic.status == "complete" || topic.status == "failed" {
-                st.conn.execute(
-                    "DELETE FROM topic_repo_locks WHERE repo=?1 AND topic_id=?2",
-                    params![topic.repo, topic_id],
-                )?;
-                st.conn.execute(
-                    "UPDATE topics SET status='approved',updated_at=?2 WHERE id=?1",
-                    params![topic_id, timestamp],
-                )?;
-            } else if topic.status != "approved" {
-                bail!("topic must be approved or terminal before a feature can be retried");
-            }
-            topic_info(st, topic_id)?.ok_or_else(|| anyhow!("topic vanished"))
+            let topic=topic_row(st,topic_id)?.context("topic not found")?;
+            if !matches!(topic.status.as_str(),"approved"|"failed"|"complete"|"needs_user"|"cancelled") {bail!("topic must be approved or terminal before retry; recover a running topic first");}
+            let changed=st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,outputs='[]',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2",params![topic_id,feature_id,now()])?;
+            if changed!=1 {bail!("topic feature not found");}
+            st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[topic_id])?;
+            st.conn.execute("UPDATE topics SET status='approved',updated_at=?2 WHERE id=?1",params![topic_id,now()])?;
+            topic_info(st,topic_id)?.context("topic vanished")
         })
     }
 }
@@ -659,47 +661,46 @@ impl Store {
 #[derive(Debug)]
 struct TopicRow {
     id: String,
+    parent_topic_id: Option<String>,
     name: String,
-    repo: String,
-    base_revision: String,
+    workspace: Option<String>,
+    workspace_kind: String,
+    base_revision: Option<String>,
+    outline: String,
     source_session_id: String,
     topic_session_id: Option<String>,
     status: String,
-    builder_kind: String,
-    builder_model: Option<String>,
-    reviewer_kind: String,
-    reviewer_model: Option<String>,
     created_at: String,
     updated_at: String,
 }
 
 fn topic_row(st: &Store, id: &str) -> Result<Option<TopicRow>> {
-    Ok(st.conn.query_row(
-        "SELECT id,name,repo,base_revision,source_session_id,topic_session_id,status,builder_kind,builder_model,reviewer_kind,reviewer_model,created_at,updated_at FROM topics WHERE id=?1",
-        params![id],
-        |row| Ok(TopicRow {
-            id: row.get(0)?, name: row.get(1)?, repo: row.get(2)?, base_revision: row.get(3)?,
-            source_session_id: row.get(4)?, topic_session_id: row.get(5)?, status: row.get(6)?,
-            builder_kind: row.get(7)?, builder_model: row.get(8)?, reviewer_kind: row.get(9)?,
-            reviewer_model: row.get(10)?, created_at: row.get(11)?, updated_at: row.get(12)?,
-        }),
-    ).optional()?)
+    Ok(st.conn.query_row("SELECT id,name,workspace,workspace_kind,base_revision,outline,source_session_id,topic_session_id,status,created_at,updated_at,parent_topic_id FROM topics WHERE id=?1",[id],|r|Ok(TopicRow{
+        id:r.get(0)?,name:r.get(1)?,workspace:r.get(2)?,workspace_kind:r.get(3)?,base_revision:r.get(4)?,outline:r.get(5)?,source_session_id:r.get(6)?,topic_session_id:r.get(7)?,status:r.get(8)?,created_at:r.get(9)?,updated_at:r.get(10)?,parent_topic_id:r.get(11)?,
+    })).optional()?)
 }
 
 fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
     let Some(row) = topic_row(st, id)? else {
         return Ok(None);
     };
-    let feature_rows = st.conn.prepare(
-        "SELECT id,source_message_id,source_seq,request,status,active_attempt_id,ready_revision,review_round,detail FROM topic_features WHERE topic_id=?1 ORDER BY source_seq,rowid",
-    )?.query_map(params![id], |row| {
-        Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?, row.get::<_, i64>(7)?, row.get::<_, Option<String>>(8)?,
-        ))
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let features = feature_rows
+    let mut statement=st.conn.prepare("SELECT id,source_message_id,source_seq,request,status,active_attempt_id,outputs,attempt_count,detail FROM topic_features WHERE topic_id=?1 ORDER BY source_seq,rowid")?;
+    let raw = statement
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, u32>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let features = raw
         .into_iter()
         .map(
             |(
@@ -709,8 +710,8 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
                 request,
                 status,
                 active_attempt_id,
-                ready_revision,
-                review_round,
+                outputs,
+                attempt_count,
                 detail,
             )| {
                 Ok(TopicFeatureInfo {
@@ -718,87 +719,72 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
                     source_message_id,
                     source_seq,
                     request,
-                    status: db_enum(status, "topic feature status")?,
+                    status: db_enum(status, "feature status")?,
                     active_attempt_id,
-                    ready_revision,
-                    review_round: review_round as u32,
+                    outputs: serde_json::from_str(&outputs)?,
+                    attempt_count,
                     detail,
                 })
             },
         )
         .collect::<Result<Vec<_>>>()?;
-    let attempts = st
-        .conn
-        .prepare("SELECT id FROM topic_attempts WHERE topic_id=?1 ORDER BY created_at,id")?
-        .query_map(params![id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .map(|attempt_id| {
-            topic_attempt(st, attempt_id)?.ok_or_else(|| anyhow!("topic attempt vanished"))
-        })
-        .collect::<Result<Vec<_>>>()?;
     Ok(Some(TopicInfo {
         id: row.id,
+        parent_topic_id: row.parent_topic_id,
         name: row.name,
-        repo: PathBuf::from(row.repo),
+        workspace: row.workspace.map(PathBuf::from),
+        workspace_kind: db_enum(row.workspace_kind, "workspace kind")?,
         base_revision: row.base_revision,
+        outline: serde_json::from_str(&row.outline)?,
         source_session_id: row.source_session_id,
         topic_session_id: row.topic_session_id,
-        status: serde_json::from_value(json!(row.status))
-            .context("stored topic has invalid status")?,
-        builder: serde_json::from_value(json!(row.builder_kind))
-            .context("stored topic has invalid builder")?,
-        builder_model: row.builder_model,
-        reviewer: serde_json::from_value(json!(row.reviewer_kind))
-            .context("stored topic has invalid reviewer")?,
-        reviewer_model: row.reviewer_model,
+        status: db_enum(row.status, "topic status")?,
         features,
-        attempts,
+        attempts: st.list_topic_attempts(id)?,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }))
 }
 
 fn topic_attempt(st: &Store, id: &str) -> Result<Option<TopicAttemptInfo>> {
-    let row = st.conn.query_row(
-        "SELECT id,topic_id,feature_id,round,role,harness_kind,status,conversation_session_id,revision,harness_session_id,detail,created_at,updated_at FROM topic_attempts WHERE id=?1",
-        params![id],
-        |row| Ok((
-            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, Option<String>>(8)?,
-            row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?,
-            row.get::<_, String>(11)?, row.get::<_, String>(12)?,
-        )),
-    ).optional()?;
+    let row=st.conn.query_row("SELECT topic_id,feature_id,step_title,access,harness_kind,model,inputs,outputs,summary,status,conversation_session_id,harness_session_id,detail,created_at,updated_at,acp_agent FROM topic_attempts WHERE id=?1",[id],|r|Ok((
+        r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,String>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<String>>(11)?,r.get::<_,Option<String>>(12)?,r.get::<_,String>(13)?,r.get::<_,String>(14)?,r.get::<_,Option<String>>(15)?
+    ))).optional()?;
     let Some((
-        id,
         topic_id,
         feature_id,
-        round,
-        role,
+        step_title,
+        access,
         harness,
+        model,
+        inputs,
+        outputs,
+        summary,
         status,
         conversation_session_id,
-        revision,
         harness_session_id,
         detail,
         created_at,
         updated_at,
+        acp_agent,
     )) = row
     else {
         return Ok(None);
     };
     Ok(Some(TopicAttemptInfo {
-        id,
+        id: id.into(),
         topic_id,
         feature_id,
-        round: round as u32,
-        role: db_enum(role, "topic attempt role")?,
-        harness: db_enum(harness, "topic attempt harness")?,
-        status: db_enum(status, "topic attempt status")?,
+        step_title,
+        access: db_enum(access, "step access")?,
+        harness: db_enum(harness, "harness")?,
+        acp_agent,
+        model,
+        inputs: serde_json::from_str(&inputs)?,
+        outputs: serde_json::from_str(&outputs)?,
+        summary,
+        status: db_enum(status, "attempt status")?,
         conversation_session_id,
-        revision,
         harness_session_id,
         detail,
         created_at,
@@ -809,16 +795,27 @@ fn topic_attempt(st: &Store, id: &str) -> Result<Option<TopicAttemptInfo>> {
 fn db_enum<T: serde::de::DeserializeOwned>(value: String, label: &str) -> Result<T> {
     serde_json::from_value(json!(value)).with_context(|| format!("stored {label} is invalid"))
 }
-
-fn hash_token(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+fn enum_text<T: serde::Serialize>(value: T) -> Result<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_owned)
+        .context("enum is not a string")
 }
-
+fn hash_token(token: &str) -> String {
+    hash_bytes(token.as_bytes())
+}
+fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
 fn harness_label(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "Claude",
         HarnessKind::Codex => "Codex",
+        HarnessKind::Pi => "Pi",
         HarnessKind::OpenCode => "OpenCode",
+        HarnessKind::Antigravity => "Antigravity",
+        HarnessKind::Acp => "ACP",
+        HarnessKind::Muse => "Muse",
     }
 }

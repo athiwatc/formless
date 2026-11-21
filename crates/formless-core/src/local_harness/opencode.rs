@@ -1,613 +1,343 @@
-//! V2-only adapter for OpenCode's local CLI.
+//! OpenCode V2 over the shared ACP client; verified against OpenCode 2.3.2.
 //!
-//! Verified against OpenCode v2.3.2.
+//! See <https://opencode.ai/docs/acp/>, <https://opencode.ai/config.json> and
+//! <https://opencode.ai/docs/permissions/>. Settings are supplied only through
+//! OPENCODE_CONFIG_CONTENT; user/project configuration is read, never written.
+//! MCP credentials travel through ACP, not configuration or the agent environment.
 //!
-//! Uses the V2 `opencode run --standalone --format json` interface and
-//! `OPENCODE_CONFIG_CONTENT` so per-run MCP and agent settings stay in the child
-//! process. V1 configuration and CLI flags are unsupported. This adapter starts
-//! new runs only; it does not resume, import files, or make provider calls itself.
-//! User/project OpenCode configuration is still read, never written; per-run
-//! settings come from `OPENCODE_CONFIG_CONTENT`. It requires a V2 CLI with those flags.
+//! MCP actions are normalized as server_tool. There is no MCP-only permission
+//! wildcard: *_* asks for all such actions (and built-ins containing underscores),
+//! followed by the trusted formless_* exception. Other built-ins remain allowed in
+//! Build. Review additionally denies edit/shell and native subagents are disabled.
+//! Formless must authorize every bridge operation independently.
+//! OpenCode flattens namespaces: configured server names beginning formless_ also
+//! collide with that exception and must not be treated as untrusted servers.
+//! Rules are last-match-wins, verified by the ignored real-binary test. "Always"
+//! decisions stay in core's attempt cache and become allow-once replies to OpenCode.
 //!
-//! The command and configuration follow the official [CLI], [MCP], [agent],
-//! [permission], and [configuration schema] documentation. JSON event fields
-//! follow the upstream [non-interactive run renderer] and MCP tool permission
-//! naming implementation. Fixture and fake-process tests do not cover a live
-//! provider call or authenticated MCP server.
+//! Code-mode approvals identify execute, not the inner action. They always require
+//! the user; JavaScript is never used to recognize a trusted bridge invocation.
+//! V1, run/JSONL, importing and resuming sessions are not supported here.
+//! Question forms currently support the observed optional single-choice oneOf and
+//! paired custom-text schema; other schemas (including arrays) are declined.
 //!
-//! [CLI]: https://opencode.ai/docs/cli/
-//! [MCP]: https://opencode.ai/docs/mcp-servers/
-//! [agent]: https://opencode.ai/docs/agents/
-//! [permission]: https://opencode.ai/docs/permissions/
-//! [configuration schema]: https://opencode.ai/config.json
-//! [non-interactive run renderer]: https://github.com/anomalyco/opencode/blob/dev/packages/cli/src/run/noninteractive.ts
-//! [MCP tool permission naming implementation]: https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/mcp.ts
+//! Live smoke: set FORMLESS_OPENCODE_BIN and FORMLESS_OPENCODE_SMOKE_DIR (a persistent
+//! directory containing work/), then run the ignored real_binary_acp_permissions_and_read_only
+//! test with --nocapture. It uses fresh HOME/XDG directories and the default free model.
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
+use formless_protocol::{Question, QuestionAnswer, QuestionOption};
 use serde_json::{json, Map, Value};
+use tokio_util::sync::CancellationToken;
 
-use super::{CommandSpec, HarnessKind, HarnessRequest, HarnessResult, HarnessRole};
+use super::acp::{self, AgentSpec, PermissionHandler};
+use super::{HarnessRequest, HarnessResult, InteractionHandler};
 
-const CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
-const REVIEW_AGENT: &str = "formless-review";
-const TERMINAL_SUCCESS_REASON: &str = "stop";
+pub const SPEC: AgentSpec = AgentSpec {
+    name: "OpenCode",
+    program: "opencode",
+    args: |_| vec!["acp".into()],
+    check_agent,
+    not_signed_in:
+        "OpenCode requires provider authentication. Configure OpenCode in a terminal, then retry.",
+    read_only_modes: &["formless-review"],
+    read_only_fail_closed: true,
+    write_modes: &["build"],
+    client_capabilities: |caps| caps["elicitation"] = json!({"form": {}}),
+    strip_env: &[],
+    set_env: &[],
+    bridge_tool: acp::no_bridge_tools,
+    vendor_request,
+};
 
-pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
-    validate_request(request)?;
-
-    let mcp_command = request
-        .mcp_command
-        .to_str()
-        .context("MCP executable path must be valid UTF-8")?;
-    let mut command = Vec::with_capacity(request.mcp_args.len() + 1);
-    command.push(mcp_command.to_owned());
-    command.extend(request.mcp_args.iter().cloned());
-
-    let mut mcp_environment = Map::new();
-    for name in &request.mcp_env_vars {
-        mcp_environment.insert(name.clone(), Value::String(format!("{{env:{name}}}")));
-    }
-
-    let build_permissions = json!([
-        permission("execute", "allow"),
-        permission("formless_*", "allow"),
-        permission("subagent", "deny"),
-    ]);
-    let review_permissions = json!([
-        permission("execute", "allow"),
-        permission("formless_*", "allow"),
-        permission("edit", "deny"),
-        permission("shell", "deny"),
-        permission("subagent", "deny"),
-    ]);
-    let review_agent = json!({
-        "description": "Read-only Formless review agent",
-        "mode": "primary",
-        "system": "Review the requested changes for correctness, regressions, and security issues. Do not modify files. Report actionable findings with file and line references; if there are no findings, say so.",
-        "permissions": review_permissions,
-    });
-    let configuration = json!({
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {
-            "servers": {
-                "formless": {
-                    "type": "local",
-                    "command": command,
-                    "cwd": ".",
-                    "environment": mcp_environment,
-                }
-            }
-        },
-        "agents": {
-            "build": {
-                "mode": "primary",
-                "permissions": build_permissions,
-            },
-            REVIEW_AGENT: review_agent,
-        }
-    });
-    let config_content = serde_json::to_string(&configuration)
-        .context("could not serialize OpenCode run configuration")?;
-
-    let agent = match request.role {
-        HarnessRole::Build => "build",
-        HarnessRole::Review => REVIEW_AGENT,
-    };
-    let mut args = vec![
-        "run".into(),
-        "--standalone".into(),
-        "--format".into(),
-        "json".into(),
-        "--agent".into(),
-        agent.into(),
-    ];
-    if let Some(model) = &request.model {
-        args.extend(["--model".into(), model.into()]);
-    }
-    args.push("--".into());
-    args.push(request.prompt.as_str().into());
-
-    let mut environment = request.environment.clone();
-    environment.insert(CONFIG_ENV.into(), config_content.into());
-    environment.insert("PWD".into(), request.cwd.as_os_str().to_owned());
-
-    Ok(CommandSpec {
-        program: request
-            .executable
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("opencode")),
-        args,
-        cwd: request.cwd.clone(),
-        environment,
+/// Runs the shared blocking ACP driver off the async core's executor.
+pub async fn run(
+    request: &HarnessRequest,
+    interactions: Arc<dyn InteractionHandler>,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    let request = prepare(request)?;
+    let runtime = tokio::runtime::Handle::current();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut permissions = AttemptScoped(acp::Interactions {
+            handler: interactions.as_ref(),
+            runtime,
+        });
+        acp::run(&SPEC, &request, &mut permissions, &cancel)
     })
+    .await
+    .context("OpenCode ACP task failed")?
 }
 
-fn permission(action: &str, effect: &str) -> Value {
-    json!({
-        "action": action,
-        "resource": "*",
-        "effect": effect,
-    })
+pub fn open_session(request: &HarnessRequest) -> Result<String> {
+    acp::open_session(&SPEC, &prepare(request)?)
 }
 
-fn validate_request(request: &HarnessRequest) -> Result<()> {
-    if request.kind != HarnessKind::OpenCode {
-        bail!("OpenCode adapter requires the OpenCode harness kind");
-    }
-    if request.prompt.trim().is_empty() {
-        bail!("harness prompt must not be empty");
-    }
-    if request.prompt.contains('\0') {
-        bail!("harness prompt must not contain NUL bytes");
-    }
-    if !request.cwd.is_absolute() {
-        bail!("harness working directory must be absolute");
-    }
-    if !request.mcp_command.is_absolute() {
-        bail!("MCP server executable must be an absolute path");
-    }
-    let mcp_command = request
-        .mcp_command
-        .to_str()
-        .context("MCP executable path must be valid UTF-8")?;
-    if mcp_command.contains('\0') {
-        bail!("MCP executable path must not contain NUL bytes");
-    }
-    if request.mcp_args.iter().any(|arg| arg.contains('\0')) {
-        bail!("MCP server arguments must not contain NUL bytes");
-    }
-    if let Some(model) = request.model.as_deref() {
-        if model.trim().is_empty() {
-            bail!("harness model must not be empty");
+struct AttemptScoped<'a>(acp::Interactions<'a>);
+
+fn once_option(options: &[Value], allow: bool) -> Option<String> {
+    let kind = if allow { "allow_once" } else { "reject_once" };
+    options.iter().find(|o| o["kind"] == kind)?["optionId"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+impl PermissionHandler for AttemptScoped<'_> {
+    fn decide(&mut self, request: &acp::PermissionRequest<'_>) -> Option<String> {
+        let reject = || once_option(request.options, false);
+        if request.cancel.is_cancelled() {
+            return reject();
         }
-        if model.contains('\0') || !valid_model(model) {
-            bail!("OpenCode model must use the provider/model[#variant] format");
+        let decision = self.0.decide(request);
+        if request.cancel.is_cancelled() {
+            return reject();
         }
-    }
-    for name in &request.mcp_env_vars {
-        if !valid_environment_name(name) {
-            bail!("MCP environment variable names must be shell-independent identifiers");
+        let Some(option) = decision.as_ref().and_then(|id| {
+            request
+                .options
+                .iter()
+                .find(|o| o["optionId"].as_str() == Some(id))
+        }) else {
+            return reject();
+        };
+        match option["kind"].as_str() {
+            // Core owns attempt-scoped "always"; never persist it in OpenCode.
+            Some("allow_once" | "allow_always") => once_option(request.options, true),
+            _ => reject(),
         }
     }
-    if request
-        .executable
-        .as_ref()
-        .is_some_and(|executable| executable.as_os_str().is_empty())
+
+    fn ask_question(&mut self, questions: &Value, cancel: &CancellationToken) -> Option<Value> {
+        self.0.ask_question(questions, cancel)
+    }
+
+    fn on_update(&mut self, params: &Value) {
+        self.0.on_update(params);
+    }
+}
+
+fn check_agent(initialized: &Value) -> Result<()> {
+    if initialized["protocolVersion"].as_u64() != Some(1)
+        || initialized["agentInfo"]["name"] != "OpenCode"
     {
-        bail!("OpenCode executable path must not be empty");
+        bail!("OpenCode must identify itself and support ACP v1; install OpenCode V2.");
+    }
+    let version = initialized["agentInfo"]["version"]
+        .as_str()
+        .and_then(acp::parse_version)
+        .context("OpenCode did not report a recognizable version; install OpenCode V2 >= 2.3.2.")?;
+    if version.0 != 2 || version < (2, 3, 2) {
+        bail!("This adapter requires OpenCode V2 >= 2.3.2, the oldest verified release.");
     }
     Ok(())
 }
 
-fn valid_model(model: &str) -> bool {
-    let Some((provider, name_and_variant)) = model.split_once('/') else {
-        return false;
-    };
-    if provider.is_empty() || provider.contains('#') || model.trim() != model {
-        return false;
+fn config() -> Value {
+    let mut rules = vec![
+        json!({"action":"*","resource":"*","effect":"allow"}),
+        json!({"action":"*_*","resource":"*","effect":"ask"}),
+        json!({"action":"formless_*","resource":"*","effect":"allow"}),
+        json!({"action":"subagent","resource":"*","effect":"deny"}),
+        json!({"action":"task","resource":"*","effect":"deny"}),
+    ];
+    let build = rules.clone();
+    for action in ["edit", "shell"] {
+        rules.push(json!({"action":action,"resource":"*","effect":"deny"}));
     }
-    let (name, variant) = name_and_variant
-        .split_once('#')
-        .map_or((name_and_variant, None), |(name, variant)| {
-            (name, Some(variant))
-        });
-    !name.is_empty()
-        && !name.contains('\0')
-        && variant.is_none_or(|variant| !variant.is_empty() && !variant.contains('#'))
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-pub fn parse_output(stdout: &str) -> Result<HarnessResult> {
-    let mut events = Vec::new();
-    let mut session_id: Option<String> = None;
-    let mut message = String::new();
-    let mut finish_reason: Option<String> = None;
-
-    for (index, line) in stdout
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-    {
-        let event: Value = serde_json::from_str(line)
-            .map_err(|_| anyhow!("OpenCode CLI returned malformed JSONL event {}", index + 1))?;
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("OpenCode CLI event is missing its type"))?;
-
-        if event_type == "error" {
-            bail!("OpenCode CLI returned an error event");
-        }
-
-        if let Some(value) = event.get("sessionID") {
-            let id = value
-                .as_str()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| anyhow!("OpenCode CLI event has an invalid session ID"))?;
-            if session_id.as_deref().is_some_and(|current| current != id) {
-                bail!("OpenCode CLI returned conflicting session IDs");
+    json!({
+        "$schema": "https://opencode.ai/config.json",
+        "default_agent": "build",
+        "agents": {
+            "build": {"permissions": build},
+            "formless-review": {
+                "mode": "primary",
+                "description": "Read-only Formless review",
+                "system": "Review only. Do not modify files or state. Report through the Formless MCP tools, whose role authorization remains authoritative.",
+                "permissions": rules
             }
-            session_id.get_or_insert_with(|| id.to_owned());
         }
-
-        match event_type {
-            "step_start" => finish_reason = None,
-            "text" => {
-                let part = event
-                    .get("part")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| anyhow!("OpenCode CLI returned a malformed text event"))?;
-                if part.get("type").and_then(Value::as_str) != Some("text") {
-                    bail!("OpenCode CLI returned a malformed text event");
-                }
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("OpenCode CLI returned a malformed text event"))?;
-                message.push_str(text);
-            }
-            "step_finish" => {
-                let part = event
-                    .get("part")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        anyhow!("OpenCode CLI returned a malformed step-finish event")
-                    })?;
-                if part.get("type").and_then(Value::as_str) != Some("step-finish") {
-                    bail!("OpenCode CLI returned a malformed step-finish event");
-                }
-                let reason = part.get("reason").and_then(Value::as_str).ok_or_else(|| {
-                    anyhow!("OpenCode CLI returned a malformed step-finish event")
-                })?;
-                finish_reason = Some(reason.to_owned());
-            }
-            _ => {}
-        }
-
-        events.push(event);
-    }
-
-    if events.is_empty() {
-        bail!("OpenCode CLI returned no events");
-    }
-    if message.trim().is_empty() {
-        bail!("OpenCode CLI returned no text output");
-    }
-    if finish_reason.as_deref() != Some(TERMINAL_SUCCESS_REASON) {
-        bail!("OpenCode CLI did not report a successful terminal step");
-    }
-
-    Ok(HarnessResult {
-        session_id,
-        message,
-        events,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{collections::BTreeMap, ffi::OsString};
-
-    const COMPLETE_OUTPUT: &str = concat!(
-        "{\"type\":\"step_start\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"step-start\"}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"text\",\"text\":\"hello \"}}\n",
-        "{\"type\":\"reasoning\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"reasoning\",\"text\":\"not user output\"}}\n",
-        "{\"type\":\"text\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"text\",\"text\":\"world\"}}\n",
-        "{\"type\":\"step_finish\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
+fn prepare(request: &HarnessRequest) -> Result<HarnessRequest> {
+    super::validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    if request.kind != super::HarnessKind::OpenCode {
+        bail!("OpenCode adapter requires an OpenCode harness request.");
+    }
+    acp::validate(request)?;
+    let mut environment = request.environment.clone();
+    environment.insert("PWD".into(), request.cwd.as_os_str().to_owned());
+    environment.insert(
+        "OPENCODE_CONFIG_CONTENT".into(),
+        config().to_string().into(),
     );
+    Ok(HarnessRequest {
+        kind: request.kind,
+        acp_agent: request.acp_agent.clone(),
+        model: request.model.clone(),
+        cwd: request.cwd.clone(),
+        prompt: request.prompt.clone(),
+        access: request.access,
+        mcp_command: request.mcp_command.clone(),
+        mcp_args: request.mcp_args.clone(),
+        mcp_env_vars: request.mcp_env_vars.clone(),
+        executable: request.executable.clone(),
+        environment,
+    })
+}
 
-    fn request(role: HarnessRole) -> HarnessRequest {
-        HarnessRequest {
-            kind: HarnessKind::OpenCode,
-            model: Some("provider/model#variant".into()),
-            cwd: PathBuf::from("/tmp/repo"),
-            prompt: "--prompt-as-one-argument".into(),
-            role,
-            mcp_command: PathBuf::from("/usr/bin/formless"),
-            mcp_args: vec!["mcp".into(), "serve".into()],
-            mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
-            executable: Some(PathBuf::from("/opt/test/opencode")),
-            environment: BTreeMap::new(),
-        }
+struct Field {
+    name: String,
+    custom: bool,
+    question: Question,
+}
+
+fn fields(params: &Value) -> Option<Vec<Field>> {
+    if params["mode"] != "form" || params["requestedSchema"]["type"] != "object" {
+        return None;
     }
-
-    fn config(spec: &CommandSpec) -> Value {
-        serde_json::from_str(
-            spec.environment
-                .get(&OsString::from(CONFIG_ENV))
-                .unwrap()
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap()
+    let schema = &params["requestedSchema"];
+    if schema.as_object()?.keys().any(|key| {
+        !["type", "properties", "required", "additionalProperties"].contains(&key.as_str())
+    }) || schema
+        .get("required")
+        .is_some_and(|r| r.as_array().is_none_or(|r| !r.is_empty()))
+        || schema
+            .get("additionalProperties")
+            .is_some_and(|v| !v.is_boolean())
+    {
+        return None;
     }
-
-    #[test]
-    fn command_spec_builds_isolated_v2_build_and_review_runs() {
-        for (role, agent) in [
-            (HarnessRole::Build, "build"),
-            (HarnessRole::Review, REVIEW_AGENT),
-        ] {
-            let spec = super::super::command_spec(&request(role)).unwrap();
-            let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
-            assert_eq!(spec.program, PathBuf::from("/opt/test/opencode"));
-            assert_eq!(
-                spec.environment[&OsString::from("PWD")],
-                spec.cwd.as_os_str()
-            );
-            assert_eq!(
-                &args[..6],
-                ["run", "--standalone", "--format", "json", "--agent", agent,]
-            );
-            assert_eq!(
-                &args[6..],
-                [
-                    "--model",
-                    "provider/model#variant",
-                    "--",
-                    "--prompt-as-one-argument",
-                ]
-            );
-
-            let configuration = config(&spec);
-            let server = &configuration["mcp"]["servers"]["formless"];
-            assert_eq!(server["type"], "local");
-            assert_eq!(server["command"][0], "/usr/bin/formless");
-            assert_eq!(server["command"][1], "mcp");
-            assert_eq!(server["command"][2], "serve");
-            assert_eq!(
-                server["environment"]["FORMLESS_TOPIC_CAPABILITY"],
-                "{env:FORMLESS_TOPIC_CAPABILITY}"
-            );
-            let build_permissions = configuration["agents"]["build"]["permissions"]
-                .as_array()
-                .unwrap();
-            assert_eq!(
-                build_permissions
-                    .iter()
-                    .find(|rule| rule["action"] == "subagent")
-                    .unwrap()["effect"],
-                "deny"
-            );
-            assert_eq!(
-                build_permissions
-                    .iter()
-                    .find(|rule| rule["action"] == "formless_*")
-                    .unwrap()["effect"],
-                "allow"
-            );
-            let review = &configuration["agents"][REVIEW_AGENT];
-            assert_eq!(review["mode"], "primary");
-            assert_eq!(
-                review["permissions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|rule| rule["action"] == "execute")
-                    .unwrap()["effect"],
-                "allow"
-            );
-            for action in ["edit", "shell", "subagent"] {
-                assert_eq!(
-                    review["permissions"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|rule| rule["action"] == action)
-                        .unwrap()["effect"],
-                    "deny"
-                );
+    let properties = schema["properties"].as_object()?;
+    let mut fields = Vec::new();
+    for (name, property) in properties {
+        if name.ends_with("_custom") {
+            let parent = name.strip_suffix("_custom")?;
+            if !properties.contains_key(parent)
+                || !string_property(property)
+                || property.get("oneOf").is_some()
+            {
+                return None;
             }
-            assert_eq!(
-                review["permissions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|rule| rule["action"] == "formless_*")
-                    .unwrap()["effect"],
-                "allow"
-            );
+            continue;
         }
-    }
-
-    #[test]
-    fn command_spec_keeps_secrets_out_of_config_and_uses_only_allowlisted_references() {
-        let mut request = request(HarnessRole::Review);
-        request.environment.insert(
-            OsString::from("FORMLESS_TOPIC_CAPABILITY"),
-            OsString::from("unit-test-secret"),
-        );
-        request.environment.insert(
-            OsString::from("OTHER_SECRET"),
-            OsString::from("not-allowlisted"),
-        );
-        request.environment.insert(
-            OsString::from(CONFIG_ENV),
-            OsString::from("previous config"),
-        );
-
-        let spec = command_spec(&request).unwrap();
-        let config_content = spec.environment[&OsString::from(CONFIG_ENV)]
-            .to_str()
-            .unwrap();
-        assert!(!config_content.contains("unit-test-secret"));
-        assert!(!config_content.contains("not-allowlisted"));
-        assert_eq!(
-            spec.environment
-                .get(&OsString::from("FORMLESS_TOPIC_CAPABILITY")),
-            Some(&OsString::from("unit-test-secret"))
-        );
-        let configuration = config(&spec);
-        let environment = configuration["mcp"]["servers"]["formless"]["environment"]
-            .as_object()
-            .unwrap();
-        assert_eq!(environment.len(), 1);
-        assert_eq!(
-            environment["FORMLESS_TOPIC_CAPABILITY"],
-            "{env:FORMLESS_TOPIC_CAPABILITY}"
-        );
-    }
-
-    #[test]
-    fn command_spec_validates_prompt_paths_and_model_format() {
-        let mut request = request(HarnessRole::Build);
-        request.prompt = " \n".into();
-        assert!(command_spec(&request).is_err());
-        request.prompt = "prompt".into();
-        request.cwd = PathBuf::from("relative");
-        assert!(command_spec(&request).is_err());
-        request.cwd = PathBuf::from("/tmp/repo");
-        request.mcp_command = PathBuf::from("formless");
-        assert!(command_spec(&request).is_err());
-        request.mcp_command = PathBuf::from("/usr/bin/formless");
-        request.model = Some("model-without-provider".into());
-        assert!(command_spec(&request).is_err());
-        request.model = None;
-        request.environment.insert("PWD".into(), "/wrong".into());
-        let spec = command_spec(&request).unwrap();
-        assert_eq!(
-            spec.environment[&OsString::from("PWD")],
-            request.cwd.as_os_str()
-        );
-        let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
-        assert_eq!(&args[6..], ["--", "prompt"]);
-        request.executable = None;
-        assert_eq!(
-            command_spec(&request).unwrap().program,
-            PathBuf::from("opencode")
-        );
-    }
-
-    #[test]
-    fn parse_output_accepts_v2_3_2_tool_call_steps() {
-        let output = r#"{"type":"tool_use","timestamp":1795274606996,"sessionID":"ses-smoke","part":{"partID":"prt-tool","sessionID":"ses-smoke","messageID":"msg-tool","type":"tool","id":"call-1","tool":"execute","state":{"status":"completed","input":{"code":"return await tools.formless.topic_read()"},"output":"null","title":"execute","metadata":{"metadata":{"toolCalls":[{"tool":"formless.topic_read","status":"completed"}],"truncated":false},"content":[{"type":"text","text":"null"}],"providerCall":{"executed":false},"providerResult":{"executed":false},"rawInput":"{}"},"time":{"start":1795274606882,"end":1795274606996}}}}
-{"type":"step_finish","timestamp":1795274607002,"sessionID":"ses-smoke","part":{"id":"prt-finish","sessionID":"ses-smoke","messageID":"msg-tool","type":"step-finish","reason":"tool-calls","snapshot":"snapshot","cost":0,"tokens":{"input":700,"output":21,"reasoning":156,"cache":{"read":6656,"write":0}}}}
-{"type":"step_start","timestamp":1795274620374,"sessionID":"ses-smoke","part":{"id":"prt-start","sessionID":"ses-smoke","messageID":"msg-text","type":"step-start","snapshot":"snapshot"}}
-{"type":"text","timestamp":1795274622162,"sessionID":"ses-smoke","part":{"id":"prt-text","sessionID":"ses-smoke","messageID":"msg-text","type":"text","text":"I received your message literally.","time":{"start":1795274621867,"end":1795274622162}}}
-{"type":"step_finish","timestamp":1795274622171,"sessionID":"ses-smoke","part":{"id":"prt-stop","sessionID":"ses-smoke","messageID":"msg-text","type":"step-finish","reason":"stop","snapshot":"snapshot","cost":0,"tokens":{"input":713,"output":47,"reasoning":215,"cache":{"read":8192,"write":0}}}}
-"#;
-        let result = parse_output(output).unwrap();
-        assert_eq!(result.session_id.as_deref(), Some("ses-smoke"));
-        assert_eq!(result.message, "I received your message literally.");
-        assert_eq!(result.events.len(), 5);
-        assert_eq!(result.events[0]["type"], "tool_use");
-        assert_eq!(result.events[1]["part"]["reason"], "tool-calls");
-    }
-
-    #[test]
-    fn parse_output_joins_only_text_parts_and_preserves_events() {
-        let result = super::super::parse_output(HarnessKind::OpenCode, COMPLETE_OUTPUT).unwrap();
-        assert_eq!(result.session_id.as_deref(), Some("session-1"));
-        assert_eq!(result.message, "hello world");
-        assert_eq!(result.events.len(), 5);
-        assert_eq!(result.events[2]["type"], "reasoning");
-    }
-
-    #[test]
-    fn parse_output_fails_closed_for_empty_malformed_truncated_and_nonterminal_output() {
-        assert!(parse_output("").is_err());
-        assert!(parse_output("\n \n").is_err());
-        assert!(parse_output("not-json\n").is_err());
-        assert!(parse_output(
-            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"partial\"}}\n{\"type\":\"text\""
-        )
-        .is_err());
-        assert!(parse_output(
-            "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"partial\"}}\n{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"tool-calls\"}}\n"
-        )
-        .is_err());
-        assert!(parse_output(
-            "{\"type\":\"step_finish\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n"
-        )
-        .is_err());
-        assert!(parse_output(&format!(
-            "{COMPLETE_OUTPUT}{{\"type\":\"step_start\",\"sessionID\":\"session-1\"}}\n"
-        ))
-        .is_err());
-    }
-
-    #[test]
-    fn parse_output_rejects_errors_and_conflicting_session_ids_without_echoing_payloads() {
-        let error = parse_output(
-            "{\"type\":\"error\",\"sessionID\":\"session-1\",\"error\":{\"message\":\"private-payload\"}}\n",
-        )
-        .unwrap_err();
-        assert!(!error.to_string().contains("private-payload"));
-
-        let conflict = parse_output(
-            "{\"type\":\"text\",\"sessionID\":\"session-1\",\"part\":{\"type\":\"text\",\"text\":\"partial\"}}\n{\"type\":\"step_finish\",\"sessionID\":\"session-2\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}\n",
-        )
-        .unwrap_err();
-        assert!(conflict.to_string().contains("conflicting session IDs"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fake_process_receives_isolated_config_and_argument_separator() {
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt,
-            time::{SystemTime, UNIX_EPOCH},
-        };
-
-        struct TestDirectory(PathBuf);
-
-        impl Drop for TestDirectory {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
+        if !string_property(property) {
+            return None;
+        }
+        let choices = property["oneOf"].as_array()?;
+        if choices.is_empty() {
+            return None;
+        }
+        let mut options: Vec<QuestionOption> = Vec::new();
+        for choice in choices {
+            if choice
+                .as_object()?
+                .keys()
+                .any(|key| !["const", "title", "description"].contains(&key.as_str()))
+            {
+                return None;
             }
+            let label = choice["const"].as_str()?.to_owned();
+            optional_string(choice, "title")?;
+            if label.trim().is_empty() || options.iter().any(|o| o.label == label) {
+                return None;
+            }
+            options.push(QuestionOption {
+                label,
+                description: optional_string(choice, "description")?,
+            });
         }
+        fields.push(Field {
+            name: name.clone(),
+            custom: properties.contains_key(&format!("{name}_custom")),
+            question: Question {
+                question: property["description"].as_str()?.to_owned(),
+                header: optional_string(property, "title")?,
+                options,
+                multi_select: false,
+            },
+        });
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(fields)
+}
 
-        let id = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("formless-opencode-{}-{id}", std::process::id())),
-        );
-        fs::create_dir(&directory.0).unwrap();
-        let executable = directory.0.join("fake-opencode");
-        fs::write(
-            &executable,
-            "#!/bin/sh\nset -eu\n[ \"$#\" -eq 8 ]\n[ \"$1\" = run ]\n[ \"$2\" = --standalone ]\n[ \"$3\" = --format ]\n[ \"$4\" = json ]\n[ \"$5\" = --agent ]\n[ \"$6\" = build ]\n[ \"$7\" = -- ]\n[ \"$8\" = --prompt-as-one-argument ]\n[ \"$(pwd)\" = \"$EXPECTED_CWD\" ]\n[ \"$PWD\" = \"$EXPECTED_CWD\" ]\n[ \"$FORMLESS_TOPIC_CAPABILITY\" = unit-test-secret ]\ncase \"$OPENCODE_CONFIG_CONTENT\" in *'{env:FORMLESS_TOPIC_CAPABILITY}'*) ;; *) exit 11 ;; esac\ncase \"$OPENCODE_CONFIG_CONTENT\" in *\"$FORMLESS_TOPIC_CAPABILITY\"*) exit 12 ;; esac\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"text\",\"text\":\"fake response\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&executable, permissions).unwrap();
-
-        let mut request = request(HarnessRole::Build);
-        request.cwd = directory.0.clone();
-        request.prompt = "--prompt-as-one-argument".into();
-        request.model = None;
-        request.executable = Some(executable);
-        request.environment.insert(
-            OsString::from("EXPECTED_CWD"),
-            directory.0.as_os_str().to_owned(),
-        );
-        request.environment.insert(
-            OsString::from("FORMLESS_TOPIC_CAPABILITY"),
-            OsString::from("unit-test-secret"),
-        );
-
-        let output = command_spec(&request).unwrap().command().output().unwrap();
-        assert!(
-            output.status.success(),
-            "fake process exited unsuccessfully"
-        );
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let result = parse_output(&stdout).unwrap();
-        assert_eq!(result.session_id.as_deref(), Some("fake-session"));
-        assert_eq!(result.message, "fake response");
+fn optional_string(value: &Value, name: &str) -> Option<Option<String>> {
+    match value.get(name) {
+        None => Some(None),
+        Some(value) => value.as_str().map(|s| Some(s.to_owned())),
     }
 }
+
+fn string_property(value: &Value) -> bool {
+    value["type"] == "string"
+        && value.as_object().is_some_and(|p| {
+            p.keys()
+                .all(|key| ["type", "title", "description", "oneOf"].contains(&key.as_str()))
+        })
+}
+
+fn answer(fields: &[Field], value: Value) -> Option<Value> {
+    let answers: Vec<QuestionAnswer> = serde_json::from_value(value).ok()?;
+    if answers.is_empty() {
+        return Some(json!({"action":"cancel"}));
+    }
+    if answers.len() != fields.len() {
+        return None;
+    }
+    let mut content = Map::new();
+    for (field, answer) in fields.iter().zip(answers) {
+        let text = answer.text.filter(|s| !s.trim().is_empty());
+        if answer.selected.is_empty() && text.is_none() {
+            return Some(json!({"action":"cancel"}));
+        }
+        if answer.selected.len() > 1
+            || answer
+                .selected
+                .iter()
+                .any(|label| !field.question.options.iter().any(|o| &o.label == label))
+            || (text.is_some() && (!field.custom || !answer.selected.is_empty()))
+        {
+            return None;
+        }
+        if let Some(text) = text {
+            content.insert(format!("{}_custom", field.name), json!(text));
+        } else {
+            content.insert(field.name.clone(), json!(answer.selected.first()?));
+        }
+    }
+    Some(json!({"action":"accept","content":content}))
+}
+
+fn vendor_request(
+    method: &str,
+    params: &Value,
+    handler: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+) -> Option<std::result::Result<Value, i64>> {
+    if method != "elicitation/create" {
+        return None;
+    }
+    Some(Ok(match fields(params) {
+        None => json!({"action":"decline"}),
+        Some(fields) if !cancel.is_cancelled() => {
+            let questions: Vec<_> = fields.iter().map(|f| &f.question).collect();
+            match handler.ask_question(&json!(questions), cancel) {
+                Some(value) if !cancel.is_cancelled() => {
+                    answer(&fields, value).unwrap_or_else(|| json!({"action":"decline"}))
+                }
+                _ => json!({"action":"cancel"}),
+            }
+        }
+        Some(_) => json!({"action":"cancel"}),
+    }))
+}
+
+#[cfg(test)]
+#[path = "opencode_tests.rs"]
+mod tests;
