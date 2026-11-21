@@ -426,15 +426,15 @@ pub async fn run(
         }
         command.process_group(0);
     }
-    let mut child = PiChild(
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to start Pi RPC process")?,
-    );
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if cancel.is_cancelled() {
+        bail!("Pi run cancelled");
+    }
+    let mut child = PiChild(command.spawn().context("failed to start Pi RPC process")?);
     let mut stdin = child.stdin.take().context("Pi stdin unavailable")?;
     let stdout = child.stdout.take().context("Pi stdout unavailable")?;
     let mut stderr = child.stderr.take().context("Pi stderr unavailable")?;
@@ -1651,8 +1651,7 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
     #[tokio::test]
     async fn precancelled_rpc_does_not_spawn() {
         let _guard = FAKE_PROCESS_LOCK.lock().await;
-        let (dir, extension, mut request) = fake_pi("exit 99");
-        request.executable = Some(dir.join("nonexistent"));
+        let (dir, extension, request) = fake_pi("touch spawned-marker; exit 99");
         let cancel = CancellationToken::new();
         cancel.cancel();
         let error = run(
@@ -1664,6 +1663,7 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
         .await
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
+        assert!(!request.cwd.join("spawned-marker").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
