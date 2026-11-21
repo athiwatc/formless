@@ -44,6 +44,17 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn java_keystores_are_credential_paths_by_suffix() {
+    let project = std::env::temp_dir().join("formless-attachment-project");
+    for name in ["release.jks", "debug.KEYSTORE"] {
+        assert!(credential_path(&project.join(name)).is_some(), "{name}");
+    }
+    for name in ["keys.jks.txt", "release.keystore.bak", "notes.txt"] {
+        assert!(credential_path(&project.join(name)).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn detects_terraform_config_in_attachment_paths() {
     for name in [
         ".terraform.d/credentials.tfrc.json",

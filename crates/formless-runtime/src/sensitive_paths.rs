@@ -291,6 +291,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
             || name.ends_with(".pem")
             || name.ends_with(".ppk")
             || name.ends_with(".key")
+            || name.ends_with(".jks")
+            || name.ends_with(".keystore")
         {
             return Some("credential-shaped filename");
         }
