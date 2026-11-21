@@ -18,6 +18,8 @@ pub const SPEC: AgentSpec = AgentSpec {
     not_signed_in: "Antigravity is not signed in. Run `agy` in a terminal and complete its sign-in, then retry. Formless does not handle Antigravity credentials.",
     read_only_modes: &["plan"],
     read_only_fail_closed: true,
+    write_modes: &[],
+    client_capabilities: acp::no_extra_capabilities,
     strip_env: &[],
     set_env: &[],
     bridge_tool: acp::no_bridge_tools,
