@@ -5,6 +5,7 @@
 // (WebCrypto only).
 
 const enc = new TextEncoder();
+const PUSH_TIMEOUT_MS = 10_000;
 
 export function b64u(bytes) {
   let s = "";
@@ -31,11 +32,36 @@ export async function vapidAuth(endpoint, publicKey, privateKey, subject) {
  * refused our VAPID signature). `vapid` is from `loadVapid`. */
 export async function sendPush(sub, vapid) {
   const auth = await vapidAuth(sub.endpoint, vapid.publicKey, vapid.key, vapid.subject);
-  const res = await fetch(sub.endpoint, {
-    method: "POST",
-    headers: { authorization: auth, ttl: "3600", urgency: "high", "content-length": "0" },
+  const controller = new AbortController();
+  const timeout = new DOMException("push timed out", "TimeoutError");
+  let timer;
+  const deadline = new Promise(resolve => {
+    timer = setTimeout(() => {
+      resolve(null);
+      controller.abort(timeout);
+    }, PUSH_TIMEOUT_MS);
   });
-  return res.status;
+  try {
+    const request = fetch(sub.endpoint, {
+      method: "POST",
+      headers: { authorization: auth, ttl: "3600", urgency: "high", "content-length": "0" },
+      signal: controller.signal,
+    });
+    const res = await Promise.race([request, deadline]);
+    if (!res) throw timeout;
+    if (res.body) {
+      // Cleanup shares the request deadline. A received 404 or 410 still
+      // identifies an expired subscription if cleanup fails or stalls.
+      const cleaned = await Promise.race([res.body.cancel().catch(() => controller.abort()), deadline]);
+      if (cleaned === null) console.error("relay: push response cleanup timed out");
+    }
+    return res.status;
+  } catch (error) {
+    if (controller.signal.reason === timeout) throw timeout;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The browsers' push services (#837). A self-hosted relay adds its own

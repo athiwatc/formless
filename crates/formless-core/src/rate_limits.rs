@@ -62,29 +62,26 @@ fn display_endpoint(base: &str) -> String {
     }
 }
 
+fn header_parts(header: &str) -> Option<(&str, &str)> {
+    let (field, kind) = if let Some(short) = header.strip_prefix("x-ratelimit-") {
+        short.split_once('-').unwrap_or((short, "requests"))
+    } else {
+        let (kind, field) = header
+            .strip_prefix("anthropic-ratelimit-")?
+            .rsplit_once('-')?;
+        (field, kind)
+    };
+    (matches!(field, "limit" | "remaining" | "reset") && KINDS.contains(&kind))
+        .then_some((field, kind))
+}
+
 fn canonical(header: &str) -> Option<String> {
-    if let Some(short) = header.strip_prefix("x-ratelimit-") {
-        for field in ["limit", "remaining", "reset"] {
-            if short == field {
-                return Some(format!("{field}-requests"));
-            }
-            for kind in KINDS {
-                if short == format!("{field}-{kind}") {
-                    return Some(short.into());
-                }
-            }
-        }
-    }
-    if let Some(short) = header.strip_prefix("anthropic-ratelimit-") {
-        for kind in KINDS {
-            for field in ["limit", "remaining", "reset"] {
-                if short == format!("{kind}-{field}") {
-                    return Some(format!("{field}-{kind}"));
-                }
-            }
-        }
-    }
-    None
+    let (field, kind) = header_parts(header)?;
+    Some(format!("{field}-{kind}"))
+}
+
+pub(crate) fn is_reset_header(header: &str) -> bool {
+    matches!(header_parts(header), Some(("reset", _)))
 }
 
 fn duration_millis(raw: &str) -> Option<i64> {
@@ -114,22 +111,29 @@ fn duration_millis(raw: &str) -> Option<i64> {
         .then(|| total.ceil() as i64)
 }
 
-fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub(crate) fn absolute_reset_at(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(date) = DateTime::parse_from_rfc3339(raw.trim()) {
         return Some(date.with_timezone(&Utc));
     }
-    if let Ok(epoch) = raw.trim().parse::<f64>() {
-        // A small bare number may mean relative seconds. Without a unit we
-        // cannot distinguish that from an old epoch; retain a labelled raw
-        // value rather than silently treating it as an expired 1970 reset.
-        let millis = if epoch >= 100_000_000_000.0 {
-            epoch
-        } else {
-            epoch * 1000.0
-        };
-        if millis.is_finite() && millis >= 1_000_000_000_000.0 && millis < i64::MAX as f64 {
-            return DateTime::from_timestamp_millis(millis.ceil() as i64);
-        }
+    let epoch: f64 = raw.trim().parse().ok()?;
+    let millis = if epoch >= 100_000_000_000.0 {
+        epoch
+    } else {
+        epoch * 1000.0
+    };
+    if (1_000_000_000_000.0..i64::MAX as f64).contains(&millis) {
+        return DateTime::from_timestamp_millis(millis.ceil() as i64);
+    }
+    None
+}
+
+fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Some(date) = absolute_reset_at(raw) {
+        return Some(date);
+    }
+    if raw.trim().parse::<f64>().is_ok() {
+        // A small bare number may mean relative seconds. Retain a labelled
+        // raw value in the snapshot rather than guessing.
         return None;
     }
     at.checked_add_signed(TimeDelta::try_milliseconds(duration_millis(raw)?)?)

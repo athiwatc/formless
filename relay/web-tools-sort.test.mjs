@@ -23,12 +23,12 @@ function constStatement(name) {
 }
 
 const tools = [
-  { id: 'beta', name: 'ベータ', current_version: 2, invocations: 10, success_rate: 0.5, updated_at: '2024-01-02T00:00:00Z', tags: ['計測'], description: '測定器', capabilities: ['fs:read', '計測'] },
+  { id: 'beta', name: 'ベータ', current_version: 2, invocations: 10, success_rate: 0.5, updated_at: '2024-01-02T00:00:00Z', last_used_at: '2024-03-01T00:00:00.123+00:00', tags: ['計測'], description: '測定器', capabilities: ['fs:read', '計測'] },
   { id: 'ecl', name: 'éclair', current_version: 10, invocations: 3, success_rate: null, updated_at: '2024-03-01T00:00:00Z', tags: ['pastry'], description: 'dessert' },
-  { id: 'zebra', name: 'ゼブラ', current_version: 1, invocations: 10, success_rate: 0.95, updated_at: '2023-12-01T00:00:00Z', tags: ['計測'], description: 'しまうま', needs_attention: true },
-  { id: 'retired', name: '引退', current_version: 4, invocations: 1, success_rate: 0.2, updated_at: '2024-06-01T00:00:00Z', tags: ['旧'], description: '終了', retired: true },
-  { id: 'zero', name: 'fennel', current_version: 3, invocations: 0, success_rate: 0, updated_at: '2022-05-05T00:00:00Z', tags: ['herb'], description: 'zero successes' },
-  { id: 'alpha', name: 'alpha', current_version: 8, invocations: 7, success_rate: 0.8, updated_at: '2024-02-02T00:00:00Z', tags: ['latin'], description: 'first' },
+  { id: 'zebra', name: 'ゼブラ', current_version: 1, invocations: 10, success_rate: 0.95, updated_at: '2023-12-01T00:00:00Z', last_used_at: '2024-03-01T00:00:00+00:00', tags: ['計測'], description: 'しまうま', needs_attention: true },
+  { id: 'retired', name: '引退', current_version: 4, invocations: 1, success_rate: 0.2, updated_at: '2024-06-01T00:00:00Z', last_used_at: '2024-01-01T00:00:00+00:00', tags: ['旧'], description: '終了', retired: true },
+  { id: 'zero', name: 'fennel', current_version: 3, invocations: 0, success_rate: 0, updated_at: '2022-05-05T00:00:00Z', last_used_at: null, tags: ['herb'], description: 'zero successes' },
+  { id: 'alpha', name: 'alpha', current_version: 8, invocations: 7, success_rate: 0.8, updated_at: '2024-02-02T00:00:00Z', last_used_at: '2024-03-01T00:00:00+00:00', tags: ['latin'], description: 'first' },
 ];
 const byId = new Map(tools.map((tool) => [tool.id, tool]));
 const COLUMNS = [
@@ -41,12 +41,12 @@ const COLUMNS = [
 const VERSION_NATURAL = ['zebra', 'beta', 'zero', 'retired', 'alpha', 'ecl'];
 const CALLS_NATURAL = ['beta', 'zebra', 'alpha', 'ecl', 'retired', 'zero'];
 const RATE_NATURAL = ['zebra', 'alpha', 'beta', 'retired', 'zero', 'ecl'];
-const USED_NATURAL = ['retired', 'ecl', 'alpha', 'beta', 'zebra', 'zero'];
+const USED_NATURAL = ['beta', 'alpha', 'zebra', 'retired', 'ecl', 'zero'];
+const USED_REVERSE = ['retired', 'alpha', 'zebra', 'beta', 'ecl', 'zero'];
 const ORDER = {
   version: VERSION_NATURAL,
   calls: CALLS_NATURAL,
   rate: RATE_NATURAL,
-  used: USED_NATURAL,
 };
 
 class Node {
@@ -79,20 +79,26 @@ function fixture() {
     'tools-filter': { value: '' },
     'tools-quick': { value: '' },
     'tools-sort': { value: 'name', options: ['name', 'rate', 'used', 'calls'].map((value) => ({ value })) },
+    'tools-count': { textContent: '' },
+    'tools-table': new Node('table'),
+    'tool-detail': new Node('div'),
   };
   const context = vm.createContext({
     Node,
     document: { createElement: (tag) => new Node(tag) },
-    S: { tools, toolSort: { key: 'name', reverse: false }, selectedTool: null },
+    S: { tools, modules: [], toolSort: { key: 'name', reverse: false }, selectedTool: null },
     $: (id) => controls[id],
     uiFormat: (value) => String(value),
+    tr: text => text,
     rateCell: (rate) => rate == null ? DASH : String(rate),
     relTime: (ts) => String(ts || ''),
     bar: (rate) => 'bar:' + String(rate),
+    selectTool: () => {},
+    toolDetailFailure: () => null,
   });
   vm.runInContext([
     constStatement('TOOL_COLS'),
-    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'toolsTable', 'visibleTools'].map(fn),
+    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'recentCalls', 'toolRecent', 'toolsTable', 'visibleTools', 'renderToolsTable', 'renderTools'].map(fn),
   ].join('\n'), context);
   return { context, controls };
 }
@@ -166,6 +172,7 @@ function idsByName(list, reverse) {
   return reverse ? ids.slice().reverse() : ids;
 }
 function expectedIds(key, reverse) {
+  if (key === 'used') return reverse ? USED_REVERSE : USED_NATURAL;
   const natural = key === 'name' ? idsByName(tools, false) : ORDER[key];
   return reverse ? natural.slice().reverse() : natural.slice();
 }
@@ -178,8 +185,8 @@ function proveOrders() {
   assert.deepEqual(CALLS_NATURAL.map((id) => byId.get(id).invocations), [10, 10, 7, 3, 1, 0]);
   assert.deepEqual(tools.filter((tool) => tool.invocations === 10).map((tool) => tool.id), ['beta', 'zebra']);
   assert.deepEqual(RATE_NATURAL.map((id) => byId.get(id).success_rate ?? -1), [0.95, 0.8, 0.5, 0.2, 0, -1]);
-  const stamps = USED_NATURAL.map((id) => byId.get(id).updated_at);
-  assert.deepEqual(stamps, stamps.slice().sort((a, b) => b.localeCompare(a)));
+  const stamps = USED_NATURAL.map((id) => byId.get(id).last_used_at).filter(Boolean);
+  assert.deepEqual(stamps, stamps.slice().sort().reverse());
   const collated = tools.map((tool) => tool.name).sort((a, b) => a.localeCompare(b));
   assert.notDeepEqual(collated, tools.map((tool) => tool.name).sort());
   assert.ok(collated.indexOf('alpha') < collated.indexOf('éclair') && collated.indexOf('éclair') < collated.indexOf('fennel'));
@@ -189,7 +196,7 @@ function paint(setup) {
   const draw = () => setup.context.toolsTable(table, setup.context.visibleTools(), {
     selected: setup.context.S.selectedTool, onselect(id) { setup.context.S.selectedTool = id; }, sortable: true,
   });
-  setup.context.renderTools = draw;
+  setup.context.renderToolsTable = draw;
   draw();
   return table;
 }
@@ -221,6 +228,26 @@ test('sortable headers show one shared direction for every column and both rever
   expectHeaders(table, 'name', false);
 });
 
+test('filtered-empty Tools keep count and selection while an empty registry keeps its guidance', () => {
+  const { context, controls } = fixture();
+  context.S.selectedTool = 'alpha';
+  controls['tools-filter'].value = 'no matching tool';
+  context.renderTools();
+  assert.equal(controls['tools-count'].textContent, '(0/6)');
+  assert.match(controls['tools-table'].textContent, /No Tools match the current filters/);
+  assert.equal(context.S.selectedTool, 'alpha');
+  controls['tools-filter'].value = '';
+  context.renderTools();
+  const selected = controls['tools-table'].children[1].children.find(row => row.className === 'selected');
+  assert.equal(nameOf(selected), 'alpha');
+  context.S.tools = [];
+  context.renderTools();
+  assert.match(controls['tools-table'].textContent, /No Tools yet — the agent builds them with create_tool/);
+  const metrics = new Node('table');
+  context.toolsTable(metrics, [], { bars: true });
+  assert.match(metrics.textContent, /No Tools yet — the agent builds them with create_tool/);
+});
+
 test('a header click sorts naturally and the next click on that header reverses', () => {
   const setup = fixture();
   clearFilters(setup);
@@ -243,7 +270,7 @@ test('a header click sorts naturally and the next click on that header reverses'
     [3, 'rate', false, 'rate', RATE_NATURAL],
     [3, 'rate', true, 'rate', RATE_NATURAL.slice().reverse()],
     [4, 'used', false, 'used', USED_NATURAL],
-    [4, 'used', true, 'used', USED_NATURAL.slice().reverse()],
+    [4, 'used', true, 'used', USED_REVERSE],
   ];
   for (const [index, key, reverse, select, ids] of steps) {
     activate(table, index);
@@ -272,12 +299,12 @@ test('filters and non-ASCII fields keep production order in the rendered table',
   assert.deepEqual(version.table.children[1].children[0].children.map((cell) => cell.className), ['', '', 'num', 'num', 'muted', 'caps']);
   assert.deepEqual(version.table.children[1].children.map((row) => row.children.map((cell, index) => index === 0
     ? nameOf(row) : cell.textContent)), [
-    ['ゼブラ', 'v1', '10', '0.95', '2023-12-01T00:00:00Z', DASH],
-    ['ベータ', 'v2', '10', '0.5', '2024-01-02T00:00:00Z', 'fs:read, 計測'],
+    ['ゼブラ', 'v1', '10', '0.95', '2024-03-01T00:00:00+00:00', DASH],
+    ['ベータ', 'v2', '10', '0.5', '2024-03-01T00:00:00.123+00:00', 'fs:read, 計測'],
     ['fennel', 'v3', '0', '0', DASH, DASH],
-    ['引退', 'v4', '1', '0.2', '2024-06-01T00:00:00Z', DASH],
-    ['alpha', 'v8', '7', '0.8', '2024-02-02T00:00:00Z', DASH],
-    ['éclair', 'v10', '3', DASH, '2024-03-01T00:00:00Z', DASH],
+    ['引退', 'v4', '1', '0.2', '2024-01-01T00:00:00+00:00', DASH],
+    ['alpha', 'v8', '7', '0.8', '2024-03-01T00:00:00+00:00', DASH],
+    ['éclair', 'v10', '3', DASH, DASH, DASH],
   ]);
   assert.ok(version.table.children[1].children[3].children[0].textContent.includes('(retired)'));
 
@@ -285,7 +312,7 @@ test('filters and non-ASCII fields keep production order in the rendered table',
   setup.context.S.selectedTool = null;
   setup.controls['tools-quick'].value = 'active';
   setup.context.S.toolSort = { key: 'used', reverse: false };
-  assert.deepEqual(renderFiltered(setup).filteredTools.map((tool) => tool.id), ['ecl', 'alpha', 'beta', 'zebra', 'zero']);
+  assert.deepEqual(renderFiltered(setup).filteredTools.map((tool) => tool.id), ['beta', 'alpha', 'zebra', 'ecl', 'zero']);
   setup.context.S.toolSort = { key: 'name', reverse: false };
   const activeNames = renderFiltered(setup).filteredTools.map((tool) => tool.name);
   assert.deepEqual(activeNames, activeNames.slice().sort((a, b) => a.localeCompare(b)));
@@ -376,4 +403,83 @@ test('row selection follows the rendered tool', () => {
   assert.deepEqual(picks, ['ecl', 'zebra']);
   assert.equal(row('alpha').className, 'selected');
   assert.deepEqual(idsOf(table), rows.map((tool) => tool.id));
+});
+
+
+test('Tools and Metrics rows display retained use and treat old or empty history as unknown', () => {
+  for (const bars of [false, true]) {
+    const setup = fixture();
+    const table = new Node('table');
+    const retained = byId.get('beta');
+    const legacy = byId.get('ecl');
+    const pruned = byId.get('zero');
+    setup.context.toolsTable(table, [retained, legacy, pruned], { bars, onselect: () => {} });
+    const stamps = table.children[1].children.map((row) => row.children[4].textContent);
+    assert.deepEqual(stamps, [retained.last_used_at, DASH, DASH]);
+    assert.notEqual(retained.last_used_at, retained.updated_at);
+    assert.ok(legacy.invocations > 0 && !Object.hasOwn(legacy, 'last_used_at'));
+  }
+});
+
+test('Tools and Metrics rows show the same retained sample without changing lifetime success', () => {
+  for (const bars of [false, true]) {
+    const setup = fixture();
+    const table = new Node('table');
+    const tool = { ...tools[0], recent: 's'.repeat(20) + 'sfff'.repeat(5) };
+    setup.context.toolsTable(table, [tool], { bars, onselect: () => {} });
+    const cell = table.children[1].children[0].children[3];
+    assert.equal(cell.children[0], '0.5');
+    const recent = cell.children[1];
+    assert.equal(recent.attrs.role, 'img');
+    assert.match(recent.attrs['aria-label'], /Succeeded: 5; Failed: 15; Recent sample trend: down/);
+    assert.equal(recent.children[0].children.length, 20);
+    assert.equal(recent.children[1].textContent, '5/20 ✓ ↓');
+  }
+});
+
+
+test('filter, quick filter and menu sort leave the selected detail and editor untouched', () => {
+  const { context, controls } = fixture();
+  for (const id of ['tools-filter', 'tools-quick', 'tools-sort']) {
+    controls[id].listeners = {};
+    controls[id].addEventListener = Node.prototype.addEventListener;
+  }
+  const detail = controls['tool-detail'];
+  const editor = new Node('textarea');
+  editor.value = 'unsaved code';
+  editor.selectionStart = 3;
+  const tags = new Node('input');
+  tags.value = 'unsaved tags';
+  const changes = new Node('details');
+  changes.open = true;
+  detail.append(editor, tags, changes);
+  context.S.selectedTool = 'alpha';
+  context.S.toolDetail = { tool: { id: 'alpha' } };
+  context.renderToolDetail = () => { throw new Error('detail rebuilt: would request diff and focus editor'); };
+  context.document.activeElement = controls['tools-filter'];
+  let paints = 0;
+  const paintTable = context.toolsTable;
+  context.toolsTable = (...args) => { paints++; return paintTable(...args); };
+  const start = source.indexOf('  for (const id of ["tools-filter"');
+  const end = source.indexOf('  for (const id of ["proposals-filter"', start);
+  assert.ok(start >= 0 && end > start);
+  vm.runInContext(source.slice(start, end), context);
+  for (const text of ['a', 'al', 'alp']) {
+    controls['tools-filter'].value = text;
+    for (const listener of controls['tools-filter'].listeners.input) listener();
+  }
+  controls['tools-quick'].value = '';
+  for (const listener of controls['tools-quick'].listeners.input) listener();
+  controls['tools-sort'].value = 'calls';
+  assert.equal(controls['tools-sort'].listeners.input.length, 1);
+  for (const listener of controls['tools-sort'].listeners.input) listener();
+  assert.equal(paints, 5);
+  assert.equal(context.S.toolSort.key, 'calls');
+  assert.deepEqual(detail.children, [editor, tags, changes]);
+  assert.equal(editor.value, 'unsaved code');
+  assert.equal(editor.selectionStart, 3);
+  assert.equal(tags.value, 'unsaved tags');
+  assert.equal(changes.open, true);
+  assert.equal(context.document.activeElement, controls['tools-filter']);
+  expectHeaders(controls['tools-table'], 'calls', false);
 });
