@@ -843,6 +843,8 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
         )
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(TopicInfo {
+        permission_rules: vec![],
+        limits: Default::default(),
         allow_external_context: st.conn.query_row(
             "SELECT allow_external_context FROM topics WHERE id=?1",
             [id],

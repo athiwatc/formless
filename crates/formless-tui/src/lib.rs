@@ -443,7 +443,7 @@ fn attention_key(event: &Event) -> Option<(u8, &str)> {
         | Event::ApprovalAnswered { approval_id, .. }
         | Event::ApprovalClosed { approval_id }
         | Event::ApprovalSummary { approval_id, .. } => Some((0, approval_id)),
-        Event::UserQuestion { question_id, .. } | Event::UserQuestionClosed { question_id } => {
+        Event::UserQuestion { question_id, .. } | Event::UserQuestionClosed { question_id, .. } => {
             Some((1, question_id))
         }
         Event::PromotionApprovalRequested { promotion_id, .. }
@@ -6453,7 +6453,7 @@ impl App {
                 }
                 self.run_usage.insert(session_id, usage);
             }
-            Event::UserQuestionClosed { question_id } => {
+            Event::UserQuestionClosed { question_id, .. } => {
                 self.questions.retain(|q| q.id != question_id);
             }
             Event::SessionClients {
@@ -21290,6 +21290,7 @@ mod tests {
             memory_mb: 64,
         });
         app.on_event(Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: "old-question".into(),
@@ -21403,6 +21404,7 @@ mod tests {
             vec![
                 reconnect_approval("current-approval", "background-session"),
                 Event::UserQuestion {
+                    user_only: false,
                     topic_id: None,
                     attempt_id: None,
                     question_id: "current-question".into(),
@@ -21485,6 +21487,7 @@ mod tests {
                 promotion_id: "resolved-promotion".into(),
             },
             Event::UserQuestionClosed {
+                answered_by: None,
                 question_id: "closed-question".into(),
             },
             reconnect_approval("new-approval", "s1"),
@@ -21519,6 +21522,7 @@ mod tests {
                     memory_mb: 64,
                 },
                 Event::UserQuestion {
+                    user_only: false,
                     topic_id: None,
                     attempt_id: None,
                     question_id: "closed-question".into(),
@@ -25024,6 +25028,7 @@ mod tests {
         let mut app = test_app();
         app.current = Some("s".into());
         app.on_event(Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: "q".into(),
@@ -26325,6 +26330,7 @@ mod tests {
 
         app.input.clear();
         app.on_event(Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: "question-fixture".into(),

@@ -5,6 +5,7 @@ use formless_protocol::{Event, Question, QuestionOption};
 
 pub fn definition(session: &str) -> Open {
     Open::from_event(&Event::UserQuestion {
+        user_only: false,
         topic_id: None,
         attempt_id: None,
         question_id: "native-question".into(),

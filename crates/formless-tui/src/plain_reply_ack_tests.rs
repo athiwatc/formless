@@ -95,6 +95,7 @@ fn close_events_before_ack_keep_the_next_prompt_and_do_not_discard_confirmation(
     remove_resolved_prompt(
         &mut prompts,
         &Event::UserQuestionClosed {
+            answered_by: None,
             question_id: "stale".into(),
         },
     );

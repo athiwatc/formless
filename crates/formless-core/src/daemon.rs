@@ -1801,7 +1801,7 @@ impl Daemon {
             Event::ApprovalAnswered { approval_id, .. } | Event::ApprovalClosed { approval_id } => {
                 self.remove_attention(approval_id)
             }
-            Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            Event::UserQuestionClosed { question_id, .. } => self.remove_attention(question_id),
             Event::HarnessPermissionClosed { permission_id, .. } => {
                 self.remove_attention(permission_id)
             }
@@ -2088,6 +2088,12 @@ impl Daemon {
                 let topic = self.with_store(|st| st.set_topic_context_access(&topic_id, allow))?;
                 self.broadcast(Event::TopicChanged { topic_id });
                 Ok(serde_json::to_value(topic)?)
+            }
+            Request::AddTopicPermissionRule { .. }
+            | Request::RemoveTopicPermissionRule { .. }
+            | Request::SetTopicLimits { .. }
+            | Request::ListHarnesses => {
+                bail!("topic control request is not implemented yet");
             }
             Request::CancelTopic { topic_id } => {
                 let topic = self.cancel_topic_work(&topic_id)?;
@@ -12866,6 +12872,7 @@ impl Daemon {
             ),
         };
         self.broadcast(Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: question_id.clone(),
@@ -12875,7 +12882,10 @@ impl Daemon {
             questions: questions.clone(),
         });
         let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
-        self.broadcast(Event::UserQuestionClosed { question_id });
+        self.broadcast(Event::UserQuestionClosed {
+            answered_by: None,
+            question_id,
+        });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
         if answers.is_empty() {
             // Free text from a client that answers in one line.
