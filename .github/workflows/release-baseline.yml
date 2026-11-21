@@ -240,7 +240,7 @@ jobs:
             dpkg -I dist/*.deb | sed -n '/Depends/p'
           }
       - name: Transfer fixtures only to this run's install jobs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: baseline-linux
           retention-days: 1
