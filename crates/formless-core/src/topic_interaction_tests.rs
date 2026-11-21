@@ -116,6 +116,62 @@ fn permission(always: bool) -> HarnessPermissionRequest {
 }
 
 #[tokio::test]
+async fn topic_shutdown_closes_pending_permission_and_question() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::HarnessPermissionRequested { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::HarnessPermissionClosed {
+                option_id: None,
+                ..
+            }
+        )
+    })
+    .await;
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Proceed?".into(), vec![])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::UserQuestionClosed {
+                answered_by: None,
+                ..
+            }
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
     let env = crate::credential_env::EnvGuard::isolated();
     let fixture = Fixture::new(&env);

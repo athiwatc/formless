@@ -356,6 +356,54 @@ async fn topic_orchestrator_fixture_duplicate_cancel_kills_cli_and_prevents_late
 }
 
 #[tokio::test]
+async fn topic_shutdown_cancels_live_step_token_and_harness() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "hold");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    let daemon = f.daemon().clone();
+    let running = tokio::spawn(async move {
+        daemon
+            .run_topic_step(&session, &args, &CancellationToken::new())
+            .await
+    });
+    wait_until(|| {
+        std::fs::read_to_string(f.root.join("pid"))
+            .ok()
+            .and_then(|p| p.parse::<i32>().ok())
+            .is_some()
+    })
+    .await;
+    let pid: i32 = std::fs::read_to_string(f.root.join("pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let token = f
+        .daemon()
+        .topic_steps
+        .locked()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    f.daemon().request_shutdown();
+    assert!(token.is_cancelled());
+    assert_eq!(running.await.unwrap().unwrap()["status"], "cancelled");
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+}
+
+#[tokio::test]
 async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_are_step_failures() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);

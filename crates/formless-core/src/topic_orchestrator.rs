@@ -279,7 +279,10 @@ impl Daemon {
         {
             bail!("inputs must be exact artifacts from this feature's outputs");
         }
-        let step_cancel = cancel.child_token();
+        if cancel.is_cancelled() {
+            bail!("step cancelled before preparation");
+        }
+        let step_cancel = self.shutdown.child_token();
         let key = (topic.id.clone(), feature.id.clone());
         {
             let mut steps = self.topic_steps.locked();
