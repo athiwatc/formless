@@ -186,9 +186,11 @@ impl Shell {
                 ""
             }
         );
+        let end = text.len();
         self.composer.update(cx, |input, cx| {
             input.set_value(text, window, cx);
             input.focus(window, cx);
+            input.set_selected_range(end..end, cx);
         });
         self.slash.selected = 0;
         if run && !entry.needs_args() {

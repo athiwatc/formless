@@ -70,6 +70,23 @@ fn slash_popup_filters_navigates_completes_and_dismisses(cx: &mut TestAppContext
 }
 
 #[gpui_kit::test]
+fn slash_tab_completion_leaves_caret_after_the_completed_command(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 3, 4);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |s, cx| {
+            s.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("/sear", cx);
+        window.render_frame(cx);
+        window.press("tab", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "/search ");
+        assert_eq!(shell.read(cx).composer_selection(cx), 8..8);
+        window.input("abc", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "/search abc");
+    });
+}
+
+#[gpui_kit::test]
 fn slash_selection_stops_at_last_and_scrolls_into_view(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 3, 4);
     step(cx, handle, |window, cx| {
