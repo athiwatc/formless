@@ -440,6 +440,10 @@ async fn rpc_session(
                             if event["command"] != "prompt" || event["success"] != true {
                                 bail!("Pi RPC prompt was rejected");
                             }
+                            let disposition = event["data"]["disposition"].as_str().unwrap_or("missing");
+                            if disposition != "started" {
+                                bail!("Pi RPC prompt did not start an agent run (disposition: {disposition}); extension commands and handled inputs cannot complete a Formless attempt");
+                            }
                             prompt_accepted = true;
                         }
                         Some("state-1") => {
@@ -992,7 +996,7 @@ IFS= read -r state
 printf '%s\n' '{"type":"response","id":"state-1","command":"get_state","success":true,"data":{"sessionId":"rpc-session"}}'
 IFS= read -r prompt
 printf '{"type":"received_prompt","value":%s}\n' "$prompt"
-printf '%s\n' '{"type":"response","id":"prompt-1","command":"prompt","success":true}'
+printf '%s\n' '{"type":"response","id":"prompt-1","command":"prompt","success":true,"data":{"disposition":"started"}}'
 printf '%s\n' '{"type":"message_end","message":{"role":"custom","customType":"formless-pi-bridge","content":"formless-pi-mcp-registered"}}'
 "#;
 
@@ -1237,6 +1241,36 @@ wait
             if expected == "before successful settle" {
                 assert!(error.contains("early failure"));
             }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_rejects_handled_or_queued_prompt_without_waiting_for_settle() {
+        for disposition in ["handled", "queued", "missing"] {
+            let response = json!({"id":"prompt-1","type":"response","command":"prompt","success":true,"data":{"disposition":disposition}});
+            let body = format!(
+                r#"
+IFS= read -r state
+IFS= read -r prompt
+printf '%s\n' '{response}'
+while IFS= read -r command; do :; done
+"#
+            );
+            let (dir, extension, mut request) = fake_pi(&body);
+            request.prompt = "/mcp".into();
+            let handler = RecordingHandler::new(true, false);
+            let error = timeout(
+                Duration::from_secs(2),
+                run(&request, &extension, &handler, &CancellationToken::new()),
+            )
+            .await
+            .expect("handled prompt waited for an agent_settled that never comes")
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("disposition: {disposition}")));
             fs::remove_dir_all(dir).unwrap();
         }
     }

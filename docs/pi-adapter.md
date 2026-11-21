@@ -19,6 +19,8 @@ Pi's configured MCP servers remain configured. The random Formless server name a
 
 RPC prompt text bypasses CLI `@file` expansion, including prompts beginning with `@`. There is no newline transport escape or extension input rewrite.
 
+Pi 1.6.0 RPC does not expose its internal `expandPromptTemplates:false` option: extension slash commands, skills, templates and input interception retain their normal Pi semantics. Prompt acknowledgement must have `data.disposition:"started"`; `handled` (for example, a completed extension command) and other dispositions fail immediately instead of waiting indefinitely for an agent run that never starts.
+
 `FORMLESS_PI_MCP_CONFIG` is an internal per-attempt JSON environment value containing the server name, command, arguments, working directory, and allowed environment-variable names. Values named by `mcp_env_vars` are not copied into this JSON value; the embedded extension copies those values from the child's environment into the MCP server configuration. Do not put credentials in command arguments. This variable must not be supplied in `HarnessRequest.environment` or `mcp_env_vars`, and the adapter does not log its contents.
 
 For `StepAccess::ReadOnly`, Pi's built-in tool allowlist is limited to `read`, `grep`, `find`, and `ls`, plus the per-attempt MCP server. `StepAccess::Write` uses normal tool selection. These access levels replace the former Review and Build roles, respectively. This is a tool allowlist, not an OS sandbox: Pi and its extension still run with the host process's permissions, and the MCP capability token remains the server-side authority boundary.
