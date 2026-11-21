@@ -119,7 +119,7 @@ pub(super) fn editor(
             .disabled(busy)
             .on_click(cx.listener(move |this, _, _, cx| this.topic_action(Action::SetContext { topic: id.clone(), allow }, cx))))
         .child(Label::new("Saved permission rules").font_semibold().text_sm())
-        .child(readable("topic-rules-help", "Only you create or remove these rules. They decide matching future requests in this topic, across attempts; reject rules take precedence. ‘Allow always’ on a prompt remains attempt-only and never creates a rule.").text_sm())
+        .child(readable("topic-rules-help", "Only you create or remove these rules. They decide matching future requests in this topic, across attempts; reject rules take precedence. Saved rules never decide workspace trust. ‘Allow always’ on a prompt remains attempt-only and never creates a rule.").text_sm())
         .child(readable("topic-pattern-help", "Patterns match the entire permission title or command, case-sensitively. * matches any text; ? matches one character. For example: *cargo test*.").text_xs());
     for rule in &topic.permission_rules {
         let id = topic.id.clone();
