@@ -3403,9 +3403,8 @@ impl Shell {
         if self.attachments.busy() {
             actions.disabled_reason = Some("Wait for pending attachments to finish loading");
         }
-        if self.harness_read_only() {
-            actions.disabled_reason =
-                Some("Harness conversation is read only; Formless manages the handoff");
+        if let Some(notice) = self.topic_write_notice() {
+            actions.disabled_reason = Some(notice);
             actions.secondary = None;
             actions.stop_enabled = false;
         }
@@ -3493,7 +3492,7 @@ impl Shell {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
             has_history: self.timeline.read(cx).item_count() > 0,
-            can_recover: !self.harness_read_only()
+            can_recover: self.topic_write_notice().is_none()
                 && self.client_connected
                 && self.client_snapshot_ready
                 && self
@@ -3510,7 +3509,7 @@ impl Shell {
                 && self.mode_disable_action().is_none())
             .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
-            can_edit_session: !self.harness_read_only()
+            can_edit_session: self.topic_write_notice().is_none()
                 && self.client_connected
                 && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
@@ -6179,7 +6178,7 @@ impl Shell {
                 inert
                     || !self.client_connected
                     || self.sidebar.active_id().is_none()
-                    || self.harness_read_only(),
+                    || self.topic_write_notice().is_some(),
             )
             .on_click(cx.listener(|this, _, _, cx| this.pick_composer_attachments(cx)));
         // Stop keeps its own fixed slot, apart from the primary action.

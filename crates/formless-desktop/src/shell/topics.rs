@@ -286,6 +286,16 @@ impl Shell {
             .is_some_and(|id| self.topic_ui.state.attempt_for(id).is_some())
     }
 
+    pub(super) fn topic_write_notice(&self) -> Option<&'static str> {
+        if self.topic_ui.state.supported && !self.topic_ui.state.inventory_loaded {
+            Some("Waiting for topic conversations to load")
+        } else if self.harness_read_only() {
+            Some("Harness conversation is read only; Formless manages the handoff")
+        } else {
+            None
+        }
+    }
+
     pub(super) fn render_topic_tree(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.topic_ui.state;
         let mut tree = v_flex()
@@ -476,7 +486,7 @@ impl Shell {
                                 "Move requests to topic"
                             })
                             .disabled(
-                                busy || read_only
+                                busy || self.topic_write_notice().is_some()
                                     || !self.client_snapshot_ready
                                     || self.sidebar.active_id().is_none(),
                             )

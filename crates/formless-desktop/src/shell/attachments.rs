@@ -121,7 +121,7 @@ impl Shell {
     }
 
     pub(super) fn pick_composer_attachments(&mut self, cx: &mut Context<Self>) {
-        if self.harness_read_only() {
+        if self.topic_write_notice().is_some() {
             return;
         }
         let owner = (self.client_identity(), self.client_generation);
@@ -221,10 +221,8 @@ impl Shell {
         notice_revision: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.harness_read_only() {
-            self.attachment_notice(
-                "Harness conversations are read only. Attach files in the topic chat instead.",
-            );
+        if let Some(notice) = self.topic_write_notice() {
+            self.attachment_notice(notice);
             return;
         }
         let Some(session_id) = self.sidebar.active_id().map(str::to_owned) else {

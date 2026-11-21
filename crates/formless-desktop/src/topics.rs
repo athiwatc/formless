@@ -148,6 +148,7 @@ pub fn feature_status(status: TopicFeatureStatus) -> &'static str {
 #[derive(Default)]
 pub struct State {
     pub supported: bool,
+    pub inventory_loaded: bool,
     pub main: Option<SessionInfo>,
     pub topics: Vec<TopicInfo>,
     pub selected: Option<String>,
@@ -160,7 +161,10 @@ impl State {
     pub fn apply(&mut self, reply: Reply) {
         match reply {
             Reply::Main(main) => self.main = Some(main),
-            Reply::Inventory(topics) => self.topics = topics,
+            Reply::Inventory(topics) => {
+                self.topics = topics;
+                self.inventory_loaded = true;
+            }
             Reply::Topic(topic) => {
                 self.selected = Some(topic.id.clone());
                 if let Some(old) = self.topics.iter_mut().find(|t| t.id == topic.id) {
@@ -195,6 +199,7 @@ impl State {
         })
     }
     pub fn disconnect(&mut self) {
+        self.inventory_loaded = false;
         if self.pending.take().is_some() {
             self.notice = Some("Connection changed. The last action's outcome is unknown; refresh before trying again. Nothing was replayed.".into());
         }
