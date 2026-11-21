@@ -278,12 +278,9 @@ pub enum HarnessPermissionOptionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessPermissionOption {
-    #[serde(alias = "optionId")]
     pub option_id: String,
     pub name: String,
     pub kind: HarnessPermissionOptionKind,
-    #[serde(default, flatten)]
-    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Disable Step mode only if the Session is still idle at the daemon.
@@ -5391,22 +5388,6 @@ mod topic_v2_tests {
 #[cfg(test)]
 mod topic_interaction_wire_tests {
     use super::*;
-    #[test]
-    fn acp_permission_options_preserve_opaque_metadata() {
-        let acp = serde_json::json!({"optionId":"allow","name":"Allow once","kind":"allow_once","_meta":{"vendor":"opaque"},"extra":[1,2]});
-        let option: HarnessPermissionOption = serde_json::from_value(acp.clone()).unwrap();
-        assert_eq!(option.option_id, "allow");
-        let mut wire = serde_json::to_value(option).unwrap();
-        let id = wire.as_object_mut().unwrap().remove("option_id").unwrap();
-        wire.as_object_mut().unwrap().insert("optionId".into(), id);
-        assert_eq!(wire, acp);
-        for invalid in [
-            serde_json::json!({}),
-            serde_json::json!({"optionId":"a","name":"Allow","kind":"unknown"}),
-        ] {
-            assert!(serde_json::from_value::<HarnessPermissionOption>(invalid).is_err());
-        }
-    }
     #[test]
     fn topic_v2_acp_muse_and_user_permissions_wire() {
         for (kind, name) in [(HarnessKind::Acp, "acp"), (HarnessKind::Muse, "muse")] {

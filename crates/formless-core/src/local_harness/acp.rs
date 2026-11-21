@@ -141,9 +141,13 @@ impl PermissionHandler for Interactions<'_> {
         let options = request
             .options
             .iter()
-            .map(|option| serde_json::from_value(option.clone()))
-            .collect::<std::result::Result<Vec<formless_protocol::HarnessPermissionOption>, _>>()
-            .ok()?;
+            .filter_map(|option| serde_json::from_value::<WireOption>(option.clone()).ok())
+            .map(|option| formless_protocol::HarnessPermissionOption {
+                option_id: option.option_id,
+                name: option.name,
+                kind: option.kind,
+            })
+            .collect();
         let text = |key: &str| {
             request
                 .tool_call
@@ -193,6 +197,14 @@ fn permission_raw_input(tool_call: &Value) -> Option<Value> {
     };
     raw.insert("_meta".into(), meta);
     Some(Value::Object(raw))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireOption {
+    option_id: String,
+    name: String,
+    kind: formless_protocol::HarnessPermissionOptionKind,
 }
 
 /// Maps an ACP `session/update` payload to the daemon's live update, when it has one.
