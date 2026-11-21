@@ -712,12 +712,6 @@ fn main() {
             {
                 gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
                 formless_desktop::theme::apply(cx);
-                window
-                    .observe_window_appearance(|window, cx| {
-                        gpui_kit::component::Theme::sync_system_appearance(Some(window), cx);
-                        formless_desktop::theme::apply(cx);
-                    })
-                    .detach();
             }
             window.set_window_title(if options.connect.is_some() {
                 "Formless"
@@ -746,6 +740,17 @@ fn main() {
                     shell.open_panel(sessions, window, cx);
                 }
             });
+            #[cfg(target_os = "macos")]
+            {
+                let shell = shell.downgrade();
+                window
+                    .observe_window_appearance(move |window, cx| {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.sync_system_appearance(window, cx);
+                        });
+                    })
+                    .detach();
+            }
             shell
         })
         .expect("failed to open the shell window");
