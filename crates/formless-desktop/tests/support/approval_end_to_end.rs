@@ -20,6 +20,7 @@ struct Fixture {
     server: tokio::task::JoinHandle<Result<(), String>>,
     provider: tokio::task::JoinHandle<()>,
     calls: Arc<AtomicUsize>,
+    tool_response: Arc<tokio::sync::Semaphore>,
 }
 fn response(n: usize, tool_call: bool) -> axum::response::Response {
     let value = if tool_call {
@@ -53,8 +54,9 @@ impl Fixture {
         std::fs::create_dir(&root).unwrap();
         let marker = root.join("approved-marker.txt");
         let calls = Arc::new(AtomicUsize::new(0));
+        let tool_response = Arc::new(tokio::sync::Semaphore::new(0));
         let (daemon,server,provider,endpoint,session,tool)=runtime.block_on(async{
-            let app=axum::Router::new().route("/models",axum::routing::get(||async{axum::Json(json!({"data":[{"id":"approval-private"}]}))})).route("/chat/completions",axum::routing::post({let calls=calls.clone();move|axum::Json(body):axum::Json<Value>|{let calls=calls.clone();async move{let n=calls.fetch_add(1,Ordering::SeqCst);assert!(n<4,"unexpected extra provider work");let tool_call=if multiple{!body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool")}else{n.is_multiple_of(2)};response(n,tool_call)}}}));
+            let app=axum::Router::new().route("/models",axum::routing::get(||async{axum::Json(json!({"data":[{"id":"approval-private"}]}))})).route("/chat/completions",axum::routing::post({let calls=calls.clone();let tool_response=tool_response.clone();move|axum::Json(body):axum::Json<Value>|{let calls=calls.clone();let tool_response=tool_response.clone();async move{let n=calls.fetch_add(1,Ordering::SeqCst);assert!(n<4,"unexpected extra provider work");let tool_call=if multiple{!body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool")}else{n.is_multiple_of(2)};if tool_call { tool_response.acquire().await.unwrap().forget(); } response(n,tool_call)}}}));
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let base=format!("http://{}",listener.local_addr().unwrap());let provider=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
             let paths=formless_core::Paths::from_dirs(root.join("d"),root.join("c")).unwrap();let mut config=formless_core::Config::default();config.provider.base_url=base;config.provider.api_style="openai".into();config.provider.model="approval-private".into();config.provider.max_retries=0;config.provider.auto_test_models=false;config.provider.model_context_tokens.insert("approval-private".into(),100_000);config.security.secure=true;config.naming.enabled=false;config.skills.auto_create=false;config.tools.approval_summaries=false;config.daemon.idle_grace_secs=3600;config.save(&paths).unwrap();
             let store=formless_core::Store::open(&paths.db_file()).unwrap();let project=root.join("project");std::fs::create_dir(&project).unwrap();let session=store.create_session(Some("Native approval private flow".into())).unwrap();store.set_session_cwd(&session.id,project.to_str()).unwrap();
@@ -77,17 +79,23 @@ impl Fixture {
             server,
             provider,
             calls,
+            tool_response,
         }
     }
-    fn send(&self) {
-        self.runtime
-            .block_on(self.daemon.handle(Request::SendMessage {
-                session_id: self.session.clone(),
-                content: "Private fixture request".into(),
-                mode: SendMode::Send,
-                client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
-            }))
-            .unwrap();
+    fn send(&self, session: &str) -> tokio::task::JoinHandle<Value> {
+        let daemon = self.daemon.clone();
+        let session_id = session.to_owned();
+        self.runtime.spawn(async move {
+            daemon
+                .handle(Request::SendMessage {
+                    session_id,
+                    content: "Private fixture request".into(),
+                    mode: SendMode::Send,
+                    client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+                })
+                .await
+                .unwrap()
+        })
     }
     fn snapshot(&self) -> Value {
         self.runtime
@@ -101,14 +109,27 @@ impl Fixture {
             .block_on(self.daemon.handle(Request::PendingApprovals))
             .unwrap()
     }
-    fn wait(&self, label: &str, mut test: impl FnMut() -> bool) {
+    fn wait(
+        &self,
+        cx: &mut TestAppContext,
+        h: WindowHandle<Root>,
+        s: &Entity<Shell>,
+        label: &str,
+        mut test: impl FnMut() -> bool,
+    ) {
         // The first real Tool run includes cold sandbox startup on CI runners.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !test() {
+        loop {
+            pump(cx, h, s);
+            if test() {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
-                "{label}; provider calls={}; session={}; pending={}",
+                "{label}; provider calls={}; subscribers={}; desktop={}; session={}; pending={}",
                 self.calls.load(Ordering::SeqCst),
+                self.daemon.subscriber_count(),
+                step(cx, h, |_, cx| s.read(cx).client_status_notice().to_owned()),
                 self.snapshot(),
                 self.pending()
             );
@@ -195,8 +216,29 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
     let mut first_id = None;
     for (index, allow) in [true, false].into_iter().enumerate() {
         assert!(!f.marker.exists());
-        f.send();
-        f.wait("one real approval", || {
+        let sending = f.send(&f.session);
+        // A fake model must not emit a whole Tool exchange while this fixture
+        // blocks the desktop's bounded update consumer. Observe the new Run
+        // and a live desktop subscriber before releasing its Tool response.
+        until(
+            cx,
+            handle,
+            &shell,
+            "new Run observed before Tool response",
+            |s| {
+                sending.is_finished()
+                    && f.calls.load(Ordering::SeqCst) == index * 2 + 1
+                    && s.step_mode_enable_target()
+                        .is_some_and(|a| a.session_id == f.session)
+                    && s.sidebar()
+                        .active_row()
+                        .is_some_and(|r| r.run_state == formless_desktop::model::RunState::Running)
+                    && f.daemon.subscriber_count() > 0
+            },
+        );
+        f.runtime.block_on(sending).unwrap();
+        f.tool_response.add_permits(1);
+        f.wait(cx, handle, &shell, "one real approval", || {
             f.pending().as_array().is_some_and(|a| a.len() == 1)
         });
         step(cx, handle, |window, cx| {
@@ -266,7 +308,9 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
         until(cx, handle, &shell, "canonical completion", |s| {
             s.last_block_preview() == expected
         });
-        f.wait("Run idle", || f.snapshot()["running"] == false);
+        f.wait(cx, handle, &shell, "Run idle", || {
+            f.snapshot()["running"] == false
+        });
         if allow {
             assert_eq!(
                 std::fs::read_to_string(&f.marker).unwrap(),
@@ -380,16 +424,23 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
         w.input("Unsent multi approval draft ไทย😀", cx);
         s.read(cx).composer().clone()
     });
-    f.send();
-    f.runtime
-        .block_on(f.daemon.handle(Request::SendMessage {
-            session_id: other.clone(),
-            content: "Second private fixture request".into(),
-            mode: SendMode::Send,
-            client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
-        }))
-        .unwrap();
-    f.wait("two simultaneous approvals", || {
+    let first = f.send(&f.session);
+    let second = f.send(&other);
+    until(cx, h, &s, "both Runs started before Tool responses", |s| {
+        first.is_finished()
+            && second.is_finished()
+            && f.calls.load(Ordering::SeqCst) == 2
+            && s.step_mode_enable_target()
+                .is_some_and(|a| a.session_id == f.session)
+            && s.sidebar()
+                .active_row()
+                .is_some_and(|r| r.run_state == formless_desktop::model::RunState::Running)
+            && f.daemon.subscriber_count() > 0
+    });
+    f.runtime.block_on(first).unwrap();
+    f.runtime.block_on(second).unwrap();
+    f.tool_response.add_permits(2);
+    f.wait(cx, h, &s, "two simultaneous approvals", || {
         f.pending().as_array().unwrap().len() == 2
     });
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
@@ -427,7 +478,7 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
         "selected allow receipt",
         |s| matches!(s.approval_review_status(),Status::Finished{action,outcome:Outcome::Accepted{audit_recorded:true}}if action.allow&&action.prompt.id()==chosen.0),
     );
-    f.wait("selected Run completed only", || {
+    f.wait(cx, h, &s, "selected Run completed only", || {
         snapshot(&chosen.1)["running"] == false && f.pending().as_array().unwrap().len() == 1
     });
     assert_eq!(f.calls.load(Ordering::SeqCst), 3);
@@ -455,7 +506,7 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
         "other deny receipt",
         |s| matches!(s.approval_review_status(),Status::Finished{action,outcome:Outcome::Accepted{audit_recorded:true}}if !action.allow&&action.prompt.session()==remaining),
     );
-    f.wait("both explicit Runs idle", || {
+    f.wait(cx, h, &s, "both explicit Runs idle", || {
         snapshot(&f.session)["running"] == false
             && snapshot(&other)["running"] == false
             && f.pending().as_array().unwrap().is_empty()
