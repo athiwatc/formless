@@ -733,6 +733,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "tcsh"
                 | "mksh"
                 | "ash"
+                | "busybox"
                 | "cmd"
                 | "powershell"
                 | "pwsh"
@@ -3903,6 +3904,21 @@ mod tests {
         assert!(
             matches!(decoded, Event::DeltasDropped { model: Some(model), .. } if model == "model")
         );
+    }
+
+    #[test]
+    fn ash_and_busybox_use_the_shell_broad_grant_warning() {
+        let shell = broad_capability("process:dash").unwrap();
+        for spec in [
+            "process:ash",
+            "process:busybox",
+            "process:/bin/busybox",
+            "process:ash.exe",
+        ] {
+            assert_eq!(broad_capability(spec), Some(shell), "{spec}");
+        }
+        assert_eq!(broad_capability("process:ls"), None);
+        assert_eq!(broad_capability("process:busybox-helper"), None);
     }
 
     #[test]
