@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regression tests; never use real credentials or network."""
 import importlib.util
+from decimal import Decimal
 from pathlib import Path
 import os
 import re
@@ -13,6 +14,35 @@ links = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(links)
 
 ROOT = "https://github.com/athiwatc/formless"
+
+
+class NamingModelDocs(unittest.TestCase):
+    def test_readme_weights_and_model_ids_match_catalogue(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "crates/formless-core/src/namer.rs").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        catalogue = re.search(r"(?m)^pub const MODELS: &\[ModelSpec\] = &\[([^\]]+)\];$", source)
+        self.assertIsNotNone(catalogue, "model catalogue declaration missing")
+        weights = {}
+        for name in catalogue[1].split(","):
+            name = name.strip()
+            if not name:
+                continue
+            model = re.search(
+                rf"(?ms)^pub const {re.escape(name)}: ModelSpec = ModelSpec \{{(.*?)^\}};",
+                source,
+            )
+            self.assertIsNotNone(model, f"{name} declaration missing")
+            model_id = re.search(r'(?m)^    id: "([^"]+)",$', model[1])
+            size = re.search(r"(?m)^    gguf_bytes: ([0-9_]+),$", model[1])
+            self.assertIsNotNone(model_id, f"{name} id missing")
+            self.assertIsNotNone(size, f"{name} byte size missing")
+            megabytes = Decimal(int(size[1])) / 1_000_000
+            weights[model_id[1]] = f"{megabytes:.2f}"
+        section = re.search(r"(?ms)^#### Local naming models\n(.*?)(?=^#|\Z)", readme)
+        self.assertIsNotNone(section, "README model table missing")
+        rows = re.findall(r"(?m)^\| `([^\n`]+)` \| [^|\n]+ \| [^|\n]+ \| (\d+\.\d{2}) MB \|", section[1])
+        self.assertEqual(sorted(rows), sorted(weights.items()))
 
 
 class LinkChecks(unittest.TestCase):

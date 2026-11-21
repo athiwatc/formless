@@ -12,7 +12,7 @@ use std::{
     process::{Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ struct Fixture {
     paths: Paths,
     session: formless_protocol::SessionInfo,
     events: Vec<Event>,
+    requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
 }
@@ -33,6 +34,9 @@ impl Fixture {
         Self::with_history(paused, false)
     }
     fn with_history(paused: bool, obsolete: bool) -> Self {
+        Self::with_send_reply(paused, obsolete, json!({"run_id": "headless-761"}))
+    }
+    fn with_send_reply(paused: bool, obsolete: bool, send_reply: Value) -> Self {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
             "fl-ho-{}-{}-{}",
@@ -55,6 +59,13 @@ impl Fixture {
         let store = Store::open_in_memory().unwrap();
         let session = store
             .create_session(Some("headless acceptance".into()))
+            .unwrap();
+        store
+            .set_session_model(&session.id, Some("stored-model".into()), Some("low".into()))
+            .unwrap();
+        let session = store
+            .set_session_cwd(&session.id, Some("stored-directory"))
+            .unwrap()
             .unwrap();
         let answer = store
             .append_message(&session.id, "assistant", "ONLY_FINAL_ANSWER_761")
@@ -90,6 +101,8 @@ impl Fixture {
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
         let exported = session.clone();
         let emitted = events.clone();
         let server = std::thread::spawn(move || {
@@ -100,8 +113,18 @@ impl Fixture {
                         let stopped = stopped.clone();
                         let session = exported.clone();
                         let events = emitted.clone();
+                        let seen = seen.clone();
+                        let send_reply = send_reply.clone();
                         peers.push(std::thread::spawn(move || {
-                            serve_peer(stream, stopped, session, events, obsolete)
+                            serve_peer(
+                                stream,
+                                stopped,
+                                session,
+                                events,
+                                obsolete,
+                                &seen,
+                                &send_reply,
+                            );
                         }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -119,11 +142,15 @@ impl Fixture {
             paths,
             session,
             events,
+            requests,
             stop,
             server: Some(server),
         }
     }
     fn run(&self, mode: &str, quiet: bool, file: bool) -> Output {
+        self.run_args(mode, quiet, file, &["--session", &self.session.id])
+    }
+    fn run_args(&self, mode: &str, quiet: bool, file: bool, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
         command.env_clear();
         for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
@@ -137,14 +164,8 @@ impl Fixture {
             .env("FORMLESS_API_KEY", "private-headless-dummy")
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "error")
-            .args([
-                "run",
-                "private headless task",
-                "--session",
-                &self.session.id,
-                "--output",
-                mode,
-            ])
+            .args(["run", "private headless task", "--output", mode])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -210,6 +231,8 @@ fn serve_peer(
     session: formless_protocol::SessionInfo,
     events: Vec<Event>,
     obsolete: bool,
+    requests: &Mutex<Vec<Request>>,
+    send_reply: &Value,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut stream =
@@ -235,20 +258,24 @@ fn serve_peer(
         while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
             let request: RequestEnvelope = serde_json::from_slice(&line).unwrap();
-            let send = matches!(request.request, Request::SendMessage { .. });
+            requests.lock().unwrap().push(request.request.clone());
+            let emit_run = matches!(request.request, Request::SendMessage { .. })
+                && send_reply["run_id"].is_string();
             let result = match request.request {
                 Request::Status | Request::Ping => {
                     json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"secure":true})
                 }
                 Request::ListSessions => json!([session]),
+                Request::GetSession { id } if id == session.id => json!({"session":session}),
                 Request::Subscribe { .. } => json!({}),
+                Request::SetSessionModel { .. } | Request::SetSessionCwd { .. } => json!({}),
                 Request::SendMessage { session_id, .. } => {
                     assert_eq!(session_id, session.id);
-                    json!({"run_id":"headless-761"})
+                    send_reply.clone()
                 }
                 other => panic!("unexpected private headless request: {other:?}"),
             };
-            if send {
+            if emit_run {
                 if obsolete {
                     // The ack, rather than an unsolicited RunStarted, owns
                     // this command. Delay the ack across both old and target
@@ -276,7 +303,7 @@ fn serve_peer(
                     error: None,
                 },
             );
-            if send {
+            if emit_run {
                 if obsolete {
                     // An old terminal tail can also arrive after binding.
                     for event in obsolete_events(&session.id).into_iter().skip(1) {
@@ -293,6 +320,90 @@ fn serve_peer(
                 }
             }
         }
+    }
+}
+
+#[test]
+fn cli_run_overrides_restore_the_canonical_session_on_success_and_error() {
+    for (selector, success) in [
+        ("prefix", true),
+        ("name", true),
+        ("name", false),
+        ("exact", true),
+        ("continue", true),
+        ("last", true),
+    ] {
+        let reply = if success {
+            json!({"run_id": "headless-761"})
+        } else {
+            json!({})
+        };
+        let fixture = Fixture::with_send_reply(false, false, reply);
+        let id = fixture.session.id.as_str();
+        let cwd = fixture.root.canonicalize().unwrap();
+        let mut args = vec!["--effort", "high", "--cwd", cwd.to_str().unwrap()];
+        match selector {
+            "prefix" => args.extend(["--session", &id[..12]]),
+            "name" => args.extend(["--session", "HEADLESS ACCEPTANCE"]),
+            "exact" => args.extend(["--session", id]),
+            "continue" | "last" => {
+                std::fs::write(fixture.paths.last_run_session_file(), id).unwrap();
+                if selector == "continue" {
+                    args.push("--continue");
+                } else {
+                    args.extend(["--session", "last"]);
+                }
+            }
+            _ => unreachable!(),
+        }
+        let output = fixture.run_args("final", true, false, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(if success { 0 } else { 1 }),
+            "{output:?}"
+        );
+        if success {
+            assert_eq!(output.stdout, b"ONLY_FINAL_ANSWER_761\n");
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("did not identify the accepted Run"));
+        }
+
+        let seen = fixture.requests.lock().unwrap();
+        let requests: Vec<_> = seen
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request,
+                    Request::SetSessionCwd { .. }
+                        | Request::SetSessionModel { .. }
+                        | Request::SendMessage { .. }
+                )
+            })
+            .collect();
+        assert!(
+            matches!(&requests[..], [
+                Request::SetSessionCwd { id: cwd_id, cwd: Some(temporary) },
+                Request::SetSessionModel { id: model_id, model: Some(model), reasoning_effort: Some(effort) },
+                Request::SendMessage { session_id, .. },
+                Request::SetSessionModel { id: restore_model_id, model: previous_model, reasoning_effort: previous_effort },
+                Request::SetSessionCwd { id: restore_cwd_id, cwd: previous_cwd },
+            ] if [cwd_id, model_id, session_id, restore_model_id, restore_cwd_id]
+                .into_iter().all(|owner| owner == id)
+                && temporary == cwd.to_str().unwrap()
+                && model == "stored-model"
+                && effort == "high"
+                && previous_model == &fixture.session.model
+                && previous_effort == &fixture.session.reasoning_effort
+                && previous_cwd == &fixture.session.cwd),
+            "{selector} success={success}: {requests:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|request| matches!(request, Request::ListSessions))
+                .count(),
+            1
+        );
     }
 }
 
