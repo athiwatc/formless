@@ -889,7 +889,7 @@ async fn topic_retry_refuses_live_steps_after_normal_model_end_without_losing_re
 }
 
 #[tokio::test]
-async fn topic_reported_result_cannot_complete_feature_before_exit_and_validation() {
+async fn topic_reported_result_waits_for_exit_and_is_not_overwritten_by_validation_errors() {
     let env = crate::credential_env::EnvGuard::isolated();
     for dirty in [false, true] {
         env.set(
@@ -949,21 +949,18 @@ async fn topic_reported_result_cannot_complete_feature_before_exit_and_validatio
             .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
             .await
             .unwrap();
-        assert_eq!(done["status"], if dirty { "failed" } else { "succeeded" });
+        assert_eq!(done["status"], "succeeded");
+        assert_eq!(done["summary"], "provisional result");
         assert_eq!(
             state(&f, &topic.id).features[0].status,
             TopicFeatureStatus::Pending
         );
-        if dirty {
-            assert!(done["summary"].as_str().unwrap().contains("clean worktree"));
-        } else {
-            assert_eq!(
-                f.daemon()
-                    .finish_topic_feature_tool(&session, &args, true)
-                    .unwrap()["status"],
-                "complete"
-            );
-        }
+        assert_eq!(
+            f.daemon()
+                .finish_topic_feature_tool(&session, &args, true)
+                .unwrap()["status"],
+            "complete"
+        );
         f.daemon().request_shutdown();
         ipc.await.unwrap().unwrap();
     }

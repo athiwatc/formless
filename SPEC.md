@@ -7252,5 +7252,11 @@ Harness-reported directories must be inside that attempt's private outputs.
 Concurrent workflows and Write steps may share a source workspace because
 the old exclusive source-workspace lock is no longer acquired. Per-attempt
 leases/cancel tokens remain live through validation and are released on stop.
+Launcher finalization never replaces an already Succeeded, Failed, Cancelled
+or Abandoned attempt status. Errors after a terminal report are logged; the
+reported status, summary and outputs survive. CLI exit still releases the
+active-attempt gate before explicit feature completion is allowed. A feature's
+successful terminal state is Ready, reached through topic_complete_feature,
+not automatically through report_result.
 Combining outputs is explicit work in a later isolated step, never an
 automatic merge or push into the source workspace.

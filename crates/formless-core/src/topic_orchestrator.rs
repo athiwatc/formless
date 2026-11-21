@@ -865,11 +865,26 @@ impl Daemon {
             execution
         };
         let execution = handler.finish().and(execution);
+        self.finish_topic_attempt_execution(
+            &topic.id,
+            &attempt.id,
+            execution,
+            step_cancel.is_cancelled(),
+        )
+    }
+
+    pub(super) fn finish_topic_attempt_execution(
+        &self,
+        topic_id: &str,
+        attempt_id: &str,
+        execution: Result<(HarnessResult, Vec<TopicArtifact>)>,
+        cancelled: bool,
+    ) -> Result<()> {
+        let saved = self
+            .with_reader(|st| st.get_topic_attempt(attempt_id))?
+            .context("attempt vanished")?;
         let (status, summary, outputs, harness_session) = match execution {
             Ok((result, outputs)) => {
-                let saved = self
-                    .with_reader(|st| st.get_topic_attempt(&attempt.id))?
-                    .context("attempt vanished")?;
                 let status = if saved.summary.is_some()
                     && matches!(
                         saved.status,
@@ -882,28 +897,41 @@ impl Daemon {
                 let summary = saved.summary.unwrap_or(result.message);
                 (status, summary, outputs, result.session_id)
             }
-            Err(error) => (
-                if step_cancel.is_cancelled() {
-                    TopicAttemptStatus::Cancelled
-                } else {
-                    TopicAttemptStatus::Failed
-                },
-                format!("{error:#}"),
-                vec![],
-                None,
-            ),
+            Err(error) => {
+                if matches!(
+                    saved.status,
+                    TopicAttemptStatus::Succeeded
+                        | TopicAttemptStatus::Failed
+                        | TopicAttemptStatus::Cancelled
+                        | TopicAttemptStatus::Abandoned
+                ) {
+                    tracing::warn!(attempt_id,error=%format!("{error:#}"),"harness error after terminal topic attempt report");
+                }
+                (
+                    if cancelled {
+                        TopicAttemptStatus::Cancelled
+                    } else {
+                        TopicAttemptStatus::Failed
+                    },
+                    format!("{error:#}"),
+                    vec![],
+                    None,
+                )
+            }
         };
         self.with_store(|st| {
             st.finish_topic_step(
-                &attempt.id,
+                attempt_id,
                 status,
                 &summary,
                 &outputs,
                 harness_session.as_deref(),
             )
         })?;
-        self.close_topic_interactions(&topic.id, Some(&attempt.id));
-        self.broadcast(Event::TopicChanged { topic_id: topic.id });
+        self.close_topic_interactions(topic_id, Some(attempt_id));
+        self.broadcast(Event::TopicChanged {
+            topic_id: topic_id.into(),
+        });
         Ok(())
     }
 

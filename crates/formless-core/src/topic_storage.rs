@@ -233,11 +233,15 @@ impl Store {
             if !matches!(topic.status.as_str(),"running"|"needs_user") || matches!(before.status,TopicAttemptStatus::Cancelled|TopicAttemptStatus::Abandoned){return Ok(before);}
             let feature=topic_info(st,&before.topic_id)?.context("topic vanished")?.features.into_iter().find(|feature|feature.id==before.feature_id).context("feature vanished")?;
             if feature.active_attempt_id.as_ref().is_some_and(|active|active!=id){bail!("attempt was superseded");}
+            let terminal=matches!(before.status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::Failed);
+            if terminal && feature.active_attempt_id.is_none(){return Ok(before);}
+            let outputs=if terminal && (before.status!=TopicAttemptStatus::Succeeded || status!=TopicAttemptStatus::Succeeded){&[][..]}else{outputs};
+            let(status,summary)=if terminal{(before.status,before.summary.as_deref().unwrap_or(summary))}else{(status,summary)};
             let mut merged=before.outputs.clone();
             for output in outputs {if !merged.contains(output){merged.push(output.clone());}}
             let mut feature_outputs=feature.outputs;
             for output in &merged {if !feature_outputs.contains(output){feature_outputs.push(output.clone());}}
-            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session,now()])?;
+            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session.or(before.harness_session_id.as_deref()),now()])?;
             st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,outputs=?3,detail=NULL,updated_at=?4 WHERE id=?1",params![before.feature_id,if status==TopicAttemptStatus::NeedsUser{"needs_user"}else{"pending"},serde_json::to_string(&feature_outputs)?,now()])?;
             if before.summary.as_deref()!=Some(summary) && !st.list_messages(&before.conversation_session_id)?.iter().any(|message|message.role=="assistant" && message.content==summary){st.append_message(&before.conversation_session_id,"assistant",summary)?;}
             topic_attempt(st,id)?.context("attempt vanished")
