@@ -1,10 +1,72 @@
-pub mod acp;
+use std::ffi::OsString;
 
-pub use acp::{open_session, run, PermissionHandler, PermissionRequest, RejectAll};
-
-use super::{CommandSpec, HarnessRequest, HarnessResult};
-use anyhow::{anyhow, Result};
+use super::acp::{self, AgentSpec, PermissionHandler};
+use super::{CommandSpec, HarnessRequest, HarnessResult, HarnessRole};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+/// Oldest released `agy` whose ACP negotiation has been observed live.
+pub const MIN_AGY_VERSION: (u64, u64, u64) = (1, 5, 14);
+
+/// The official `agy acp` server.
+pub const SPEC: AgentSpec = AgentSpec {
+    name: "Antigravity",
+    program: "agy",
+    args: agent_args,
+    check_agent,
+    not_signed_in: "Antigravity is not signed in. Run `agy` in a terminal and complete its sign-in, then retry. Formless does not handle Antigravity credentials.",
+    read_only_modes: &["plan"],
+    read_only_fail_closed: true,
+    strip_env: &[],
+    bridge_tool: acp::no_bridge_tools,
+    vendor_request: acp::no_vendor_requests,
+};
+
+/// Runs one prompt in a new `agy acp` session with the Formless bridge attached.
+pub fn run(
+    request: &HarnessRequest,
+    permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    acp::run(&SPEC, request, permissions, cancel)
+}
+
+/// Opens an `agy acp` session with the Formless bridge attached, without prompting.
+pub fn open_session(request: &HarnessRequest) -> Result<String> {
+    acp::open_session(&SPEC, request)
+}
+
+/// `agy acp` flags; review runs also get agy's terminal sandbox.
+fn agent_args(request: &HarnessRequest) -> Vec<OsString> {
+    let mut args = vec!["acp".into(), "--disable-telemetry".into()];
+    if request.role == HarnessRole::Review {
+        args.push("--sandbox".into());
+    }
+    args
+}
+
+fn check_agent(initialized: &Value) -> Result<()> {
+    if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+        bail!("This Antigravity CLI does not speak ACP v1; update it with `agy update`.");
+    }
+    let info = initialized.get("agentInfo");
+    let version = info
+        .and_then(|info| info.get("version"))
+        .and_then(Value::as_str)
+        .and_then(acp::parse_version)
+        .context("Antigravity ACP did not report a recognisable agentInfo version.")?;
+    if version < MIN_AGY_VERSION {
+        let (major, minor, patch) = MIN_AGY_VERSION;
+        bail!(
+            "Antigravity CLI {}.{}.{} is older than {major}.{minor}.{patch}, the oldest version verified with Formless over ACP; update it with `agy update`.",
+            version.0,
+            version.1,
+            version.2
+        );
+    }
+    Ok(())
+}
 
 pub fn command_spec(_request: &HarnessRequest) -> Result<CommandSpec> {
     Err(anyhow!("Antigravity headless mode (`agy -p`) has no documented per-invocation MCP server option, and its project `.agents/mcp_config.json` is static with no documented way to pass a per-run capability to a stdio server, so Formless will not launch it as a one-shot command or modify MCP configuration. Launch Antigravity through `local_harness::antigravity::run`, which attaches the Formless MCP server per session over `agy acp`. See https://antigravity.google/docs/cli/reference/, https://antigravity.google/docs/mcp/ and https://antigravity.google/docs/ide/extensions/acp/."))

@@ -1,8 +1,9 @@
-//! Stateful Antigravity integration over the official `agy acp` server (ACP v1).
+//! Stateful harness integration over the Agent Client Protocol (ACP v1) on stdio.
 //!
 //! The Formless bridge is registered per session through `session/new.mcpServers`, so no
-//! Antigravity settings are written. Its environment (for example a run capability) is sent
-//! over the ACP pipe and removed from the `agy` process environment.
+//! harness settings are written. Its environment (for example a run capability) is sent
+//! over the ACP pipe and removed from the agent process environment. Each harness supplies
+//! an [`AgentSpec`] with its command line, version check, sign-in hint and read-only mode.
 
 use std::{
     collections::BTreeMap,
@@ -20,22 +21,73 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::super::{HarnessRequest, HarnessResult, HarnessRole};
+use super::{HarnessRequest, HarnessResult, HarnessRole};
 
 const PROTOCOL_VERSION: u64 = 1;
-/// Oldest released `agy` whose ACP negotiation has been observed live.
-pub const MIN_AGY_VERSION: (u64, u64, u64) = (1, 5, 14);
 const JSON_RPC_AUTH_REQUIRED: i64 = -32000;
-const CANCELLED: &str = "The Antigravity run was cancelled.";
+const CANCELLED: &str = "The harness run was cancelled.";
 const POLL: Duration = Duration::from_millis(50);
-/// How long Antigravity may take to end a turn after `session/cancel` before it is killed.
+/// How long the agent may take to end a turn after `session/cancel` before it is killed.
 #[cfg(not(test))]
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const CANCEL_GRACE: Duration = Duration::from_millis(200);
-const WRITE_TOOL_KINDS: &[&str] = &["edit", "delete", "move", "execute"];
+/// ACP tool kinds a read-only run may approve; every other kind is rejected.
+const READ_ONLY_TOOL_KINDS: &[&str] = &["read", "search", "think", "fetch"];
 
-/// A `session/request_permission` from Antigravity, passed through to the user.
+/// How one harness is launched and checked over ACP.
+pub struct AgentSpec {
+    /// Harness name used in errors, e.g. "Antigravity".
+    pub name: &'static str,
+    /// Executable used when the request names none.
+    pub program: &'static str,
+    /// Command-line arguments that start the ACP stdio server for this request.
+    pub args: fn(&HarnessRequest) -> Vec<OsString>,
+    /// Validates the `initialize` result (protocol, version, capabilities).
+    pub check_agent: fn(&Value) -> Result<()>,
+    /// Returned when `session/new` reports JSON-RPC -32000 (authentication required).
+    pub not_signed_in: &'static str,
+    /// Read-only session modes for review runs, most preferred first. The first one the
+    /// session advertises (a `mode` config option, or `modes.availableModes`) is selected;
+    /// if none is advertised, `session/set_mode` is tried with the first candidate.
+    pub read_only_modes: &'static [&'static str],
+    /// Fail a review run when no read-only mode can be selected. When false, the run
+    /// relies on the spec's arguments (such as a sandbox) and the read-only tool allow-list.
+    pub read_only_fail_closed: bool,
+    /// Extra variables removed from the agent environment, besides the bridge's.
+    pub strip_env: &'static [&'static str],
+    /// Identifies approval requests for the Formless bridge's own tools, which review
+    /// runs may approve whatever their kind.
+    pub bridge_tool: fn(&Value) -> bool,
+    /// Serves agent requests the shared loop does not handle, such as a vendor question
+    /// method. `None` answers JSON-RPC -32601; `Some` is sent as the result or error.
+    pub vendor_request: VendorRequest,
+}
+
+/// See [`AgentSpec::vendor_request`].
+pub type VendorRequest = fn(
+    method: &str,
+    params: &Value,
+    handler: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+) -> Option<std::result::Result<Value, i64>>;
+
+/// For [`AgentSpec::vendor_request`] when the harness sends no vendor requests.
+pub fn no_vendor_requests(
+    _: &str,
+    _: &Value,
+    _: &mut dyn PermissionHandler,
+    _: &CancellationToken,
+) -> Option<std::result::Result<Value, i64>> {
+    None
+}
+
+/// For [`AgentSpec::bridge_tool`] when the harness gives no reliable way to tell.
+pub fn no_bridge_tools(_: &Value) -> bool {
+    false
+}
+
+/// A `session/request_permission` from the agent, passed through to the user.
 pub struct PermissionRequest<'a> {
     pub tool_call: &'a Value,
     pub options: &'a [Value],
@@ -43,11 +95,20 @@ pub struct PermissionRequest<'a> {
     pub cancel: &'a CancellationToken,
 }
 
-/// Decides Antigravity tool approvals. Returns the chosen `optionId`, or `None` to cancel.
+/// Decides harness tool approvals. Returns the chosen `optionId`, or `None` to cancel.
 /// A handler that waits for a person must stop waiting and return `None` once
 /// `request.cancel` fires; the run cannot be cancelled while `decide` blocks.
 pub trait PermissionHandler {
     fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String>;
+
+    /// Receives each `session/update` (`{sessionId, update}`) as it streams in.
+    fn on_update(&mut self, _update: &Value) {}
+
+    /// Asks the user a harness question translated by a spec's `vendor_request`.
+    /// Returns the answer, or `None` when unanswered or once `cancel` fires.
+    fn ask_question(&mut self, _question: &Value, _cancel: &CancellationToken) -> Option<Value> {
+        None
+    }
 }
 
 /// Rejects every approval request; used when no user is available to answer.
@@ -59,27 +120,29 @@ impl PermissionHandler for RejectAll {
     }
 }
 
-/// Runs one prompt in a new Antigravity ACP session with the Formless bridge attached.
+/// Runs one prompt in a new ACP session with the Formless bridge attached.
 ///
 /// When `cancel` fires during the turn, Formless sends ACP `session/cancel`, answers any
 /// further approval request as cancelled, and returns an error once the turn ends or after
-/// a short grace period. `agy` and every process it started are killed when this returns.
+/// a short grace period. The agent and every process it started are killed when this returns.
 pub fn run(
+    spec: &AgentSpec,
     request: &HarnessRequest,
     permissions: &mut dyn PermissionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    let mut agent = AgentProcess::spawn(request)?;
+    let mut agent = AgentProcess::spawn(spec, request)?;
     let (reader, writer) = agent.pipes()?;
-    drive(reader, writer, request, permissions, cancel, true)
+    drive(spec, reader, writer, request, permissions, cancel, true)
 }
 
 /// Negotiates ACP and opens a session with the Formless bridge attached, without prompting.
-/// Returns the Antigravity session id.
-pub fn open_session(request: &HarnessRequest) -> Result<String> {
-    let mut agent = AgentProcess::spawn(request)?;
+/// Returns the agent's session id.
+pub fn open_session(spec: &AgentSpec, request: &HarnessRequest) -> Result<String> {
+    let mut agent = AgentProcess::spawn(spec, request)?;
     let (reader, writer) = agent.pipes()?;
     drive(
+        spec,
         reader,
         writer,
         request,
@@ -131,7 +194,7 @@ pub(super) fn validate(request: &HarnessRequest) -> Result<()> {
     Ok(())
 }
 
-/// The `agy acp` process environment: the request environment without the bridge's variables.
+/// The agent process environment: the request environment without the bridge's variables.
 pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, OsString> {
     let mut environment = request.environment.clone();
     for name in &request.mcp_env_vars {
@@ -140,55 +203,57 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
     environment
 }
 
-/// `agy acp` flags; review runs also get agy's terminal sandbox.
-pub(super) fn agent_args(request: &HarnessRequest) -> Vec<&'static str> {
-    let mut args = vec!["acp", "--disable-telemetry"];
-    if request.role == HarnessRole::Review {
-        args.push("--sandbox");
-    }
-    args
-}
-
-/// `agy acp` and every process it starts (MCP servers, tools); dropping it kills them all.
-struct AgentProcess(SupervisedProcess);
+/// The agent and every process it starts (MCP servers, tools); dropping it kills them all.
+pub(super) struct AgentProcess(SupervisedProcess);
 
 impl AgentProcess {
-    fn spawn(request: &HarnessRequest) -> Result<Self> {
+    pub(super) fn spawn(spec: &AgentSpec, request: &HarnessRequest) -> Result<Self> {
         validate(request)?;
         let program = request
             .executable
             .clone()
-            .unwrap_or_else(|| PathBuf::from("agy"));
+            .unwrap_or_else(|| PathBuf::from(spec.program));
         let mut command = Command::new(&program);
         command
-            .args(agent_args(request))
+            .args((spec.args)(request))
             .current_dir(&request.cwd)
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| {
                 !request
                     .mcp_env_vars
                     .iter()
-                    .any(|var| OsString::from(var) == *name)
+                    .map(String::as_str)
+                    .chain(spec.strip_env.iter().copied())
+                    .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
             }))
-            .envs(agent_environment(request))
+            .envs(agent_environment(request).into_iter().filter(|(name, _)| {
+                !spec
+                    .strip_env
+                    .iter()
+                    .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
+            }))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let process = SupervisedProcess::spawn(command).map_err(|error| {
-            anyhow!("failed to start `agy acp` ({error}); is the Antigravity CLI installed and on PATH?")
+            anyhow!(
+                "failed to start {} ({error}); is it installed and on PATH?",
+                spec.name
+            )
         })?;
         Ok(Self(process))
     }
 
-    fn pipes(&mut self) -> Result<(BufReader<ChildStdout>, ChildStdin)> {
+    pub(super) fn pipes(&mut self) -> Result<(BufReader<ChildStdout>, ChildStdin)> {
         let (stdin, stdout, _) = self.0.take_pipes();
-        let stdout = stdout.context("agy acp stdout unavailable")?;
-        let stdin = stdin.context("agy acp stdin unavailable")?;
+        let stdout = stdout.context("agent stdout unavailable")?;
+        let stdin = stdin.context("agent stdin unavailable")?;
         Ok((BufReader::new(stdout), stdin))
     }
 }
 
 pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
+    spec: &AgentSpec,
     reader: R,
     writer: W,
     request: &HarnessRequest,
@@ -201,6 +266,9 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
         lines: read_lines(reader),
         writer,
         cancel: cancel.clone(),
+        name: spec.name,
+        bridge_tool: spec.bridge_tool,
+        vendor_request: spec.vendor_request,
         prompting: false,
         cancel_deadline: None,
         next_id: 0,
@@ -223,8 +291,13 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             }),
             permissions,
         )?
-        .map_err(|code| anyhow!("Antigravity rejected ACP initialize (JSON-RPC error {code})."))?;
-    check_agent(&initialized)?;
+        .map_err(|code| {
+            anyhow!(
+                "{} rejected ACP initialize (JSON-RPC error {code}).",
+                spec.name
+            )
+        })?;
+    (spec.check_agent)(&initialized)?;
 
     let env: Vec<Value> = request
         .mcp_env_vars
@@ -251,28 +324,51 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             permissions,
         )?
         .map_err(|code| match code {
-            JSON_RPC_AUTH_REQUIRED => anyhow!(
-                "Antigravity is not signed in. Run `agy` in a terminal and complete its sign-in, then retry. Formless does not handle Antigravity credentials."
+            JSON_RPC_AUTH_REQUIRED => {
+                let methods: Vec<&str> = initialized
+                    .get("authMethods")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|method| method.get("id").and_then(Value::as_str))
+                    .collect();
+                if methods.is_empty() {
+                    anyhow!(spec.not_signed_in)
+                } else {
+                    anyhow!(
+                        "{} (sign-in methods it offers: {}.)",
+                        spec.not_signed_in,
+                        methods.join(", ")
+                    )
+                }
+            }
+            code => anyhow!(
+                "{} rejected session/new with the Formless MCP server (JSON-RPC error {code}).",
+                spec.name
             ),
-            code => anyhow!("Antigravity rejected session/new with the Formless MCP server (JSON-RPC error {code})."),
         })?;
     let session_id = session
         .get("sessionId")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .context("Antigravity session/new response is missing its sessionId.")?
+        .with_context(|| {
+            format!(
+                "{} session/new response is missing its sessionId.",
+                spec.name
+            )
+        })?
         .to_owned();
     rpc.session_id = Some(session_id.clone());
 
     if request.role == HarnessRole::Review {
-        let mode = find_config_option(&session, "mode", "plan").context(
-            "This Antigravity version does not offer a plan mode over ACP, so Formless cannot keep a review session read-only.",
-        )?;
-        rpc.set_config(&session_id, &mode, "plan", permissions)?;
+        select_read_only_mode(spec, &mut rpc, &session, &session_id, permissions)?;
     }
     if let Some(model) = &request.model {
         let option = find_config_option(&session, "model", model).with_context(|| {
-            "This Antigravity session does not offer the requested model over ACP.".to_string()
+            format!(
+                "This {} session does not offer the requested model over ACP.",
+                spec.name
+            )
         })?;
         rpc.set_config(&session_id, &option, model, permissions)?;
     }
@@ -295,17 +391,26 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             }),
             permissions,
         )?
-        .map_err(|code| anyhow!("Antigravity prompt turn failed (JSON-RPC error {code})."))?;
+        .map_err(|code| anyhow!("{} prompt turn failed (JSON-RPC error {code}).", spec.name))?;
     match turn.get("stopReason").and_then(Value::as_str) {
         _ if rpc.cancel.is_cancelled() => bail!(CANCELLED),
         Some("end_turn") => {}
         Some(reason @ ("max_tokens" | "max_turn_requests" | "refusal" | "cancelled")) => {
-            bail!("Antigravity ended the turn without completing it (stopReason {reason}).")
+            bail!(
+                "{} ended the turn without completing it (stopReason {reason}).",
+                spec.name
+            )
         }
-        _ => bail!("Antigravity prompt response has no recognised stopReason."),
+        _ => bail!(
+            "{} prompt response has no recognised stopReason.",
+            spec.name
+        ),
     }
     if rpc.message.trim().is_empty() {
-        bail!("Antigravity completed the turn without a response message.");
+        bail!(
+            "{} completed the turn without a response message.",
+            spec.name
+        );
     }
     Ok(HarnessResult {
         session_id: Some(session_id),
@@ -314,29 +419,66 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     })
 }
 
-fn check_agent(initialized: &Value) -> Result<()> {
-    if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(PROTOCOL_VERSION) {
-        bail!("This Antigravity CLI does not speak ACP v1; update it with `agy update`.");
+fn select_read_only_mode<W: Write>(
+    spec: &AgentSpec,
+    rpc: &mut Rpc<W>,
+    session: &Value,
+    session_id: &str,
+    permissions: &mut dyn PermissionHandler,
+) -> Result<()> {
+    let refused = |detail: String| {
+        anyhow!(
+            "{} {detail}, so Formless cannot keep a review session read-only.",
+            spec.name
+        )
+    };
+    let available_modes: Vec<&str> = session
+        .pointer("/modes/availableModes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|mode| mode.get("id").and_then(Value::as_str))
+        .collect();
+    for &mode in spec.read_only_modes {
+        if let Some(option) = find_config_option(session, "mode", mode) {
+            return rpc.set_config(session_id, &option, mode, permissions);
+        }
+        if available_modes.contains(&mode) {
+            return set_mode(rpc, session_id, mode, permissions).map_err(|code| {
+                refused(format!("refused its `{mode}` mode (JSON-RPC error {code})"))
+            });
+        }
     }
-    let info = initialized.get("agentInfo");
-    let version = info
-        .and_then(|info| info.get("version"))
-        .and_then(Value::as_str)
-        .and_then(parse_version)
-        .context("Antigravity ACP did not report a recognisable agentInfo version.")?;
-    if version < MIN_AGY_VERSION {
-        let (major, minor, patch) = MIN_AGY_VERSION;
-        bail!(
-            "Antigravity CLI {}.{}.{} is older than {major}.{minor}.{patch}, the oldest version verified with Formless over ACP; update it with `agy update`.",
-            version.0,
-            version.1,
-            version.2
-        );
+    let attempt = match spec.read_only_modes.first() {
+        Some(&mode) => set_mode(rpc, session_id, mode, permissions)
+            .map_err(|code| format!("refused its `{mode}` mode (JSON-RPC error {code})")),
+        None => Err("has no read-only mode over ACP".to_owned()),
+    };
+    match attempt {
+        Err(detail) if spec.read_only_fail_closed => Err(refused(detail)),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+fn set_mode<W: Write>(
+    rpc: &mut Rpc<W>,
+    session_id: &str,
+    mode: &str,
+    permissions: &mut dyn PermissionHandler,
+) -> std::result::Result<(), String> {
+    match rpc.call(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": mode}),
+        permissions,
+    ) {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(code)) => Err(code.to_string()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Parses `major.minor.patch`, ignoring any pre-release or build suffix.
+pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     let core = version.split(['-', '+']).next()?;
     let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
     let version = (parts.next()??, parts.next()??, parts.next()??);
@@ -413,6 +555,9 @@ struct Rpc<W> {
     lines: mpsc::Receiver<std::io::Result<String>>,
     writer: W,
     cancel: CancellationToken,
+    name: &'static str,
+    bridge_tool: fn(&Value) -> bool,
+    vendor_request: VendorRequest,
     prompting: bool,
     cancel_deadline: Option<Instant>,
     next_id: u64,
@@ -429,7 +574,7 @@ impl<W: Write> Rpc<W> {
         self.writer
             .write_all(&line)
             .and_then(|()| self.writer.flush())
-            .context("agy acp closed its input")
+            .with_context(|| format!("{} closed its input", self.name))
     }
 
     fn set_config(
@@ -445,7 +590,10 @@ impl<W: Write> Rpc<W> {
             permissions,
         )?
         .map_err(|code| {
-            anyhow!("Antigravity rejected setting {config_id} (JSON-RPC error {code}).")
+            anyhow!(
+                "{} rejected setting {config_id} (JSON-RPC error {code}).",
+                self.name
+            )
         })?;
         Ok(())
     }
@@ -467,20 +615,20 @@ impl<W: Write> Rpc<W> {
         loop {
             self.check_cancel()?;
             let line = match self.lines.recv_timeout(POLL) {
-                Ok(line) => line.context("failed to read from agy acp")?,
+                Ok(line) => line.with_context(|| format!("failed to read from {}", self.name))?,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) if self.cancel.is_cancelled() => {
                     bail!(CANCELLED)
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("agy acp exited before answering {method}.")
+                    bail!("{} exited before answering {method}.", self.name)
                 }
             };
             if line.trim().is_empty() {
                 continue;
             }
             let message: Value = serde_json::from_str(&line)
-                .map_err(|_| anyhow!("agy acp sent a malformed JSON-RPC message."))?;
+                .map_err(|_| anyhow!("{} sent a malformed JSON-RPC message.", self.name))?;
             match (
                 message.get("method").and_then(Value::as_str),
                 message.get("id"),
@@ -497,11 +645,11 @@ impl<W: Write> Rpc<W> {
                         }),
                     })?;
                 }
-                (Some("session/update"), None) => self.record_update(message)?,
+                (Some("session/update"), None) => self.record_update(message, permissions)?,
                 (Some(_), None) => self.events.push(message),
                 (None, Some(response_id)) => {
                     if response_id.as_u64() != Some(id) {
-                        bail!("agy acp answered a request Formless did not send.");
+                        bail!("{} answered a request Formless did not send.", self.name);
                     }
                     if let Some(result) = message.get("result") {
                         return Ok(Ok(result.clone()));
@@ -509,15 +657,23 @@ impl<W: Write> Rpc<W> {
                     let code = message
                         .pointer("/error/code")
                         .and_then(Value::as_i64)
-                        .context("agy acp sent a response with neither result nor error.")?;
+                        .with_context(|| {
+                            format!(
+                                "{} sent a response with neither result nor error.",
+                                self.name
+                            )
+                        })?;
                     return Ok(Err(code));
                 }
-                (None, None) => bail!("agy acp sent a JSON-RPC message without method or id."),
+                (None, None) => bail!(
+                    "{} sent a JSON-RPC message without method or id.",
+                    self.name
+                ),
             }
         }
     }
 
-    /// Asks Antigravity to end the turn once cancelled, and gives up after the grace period.
+    /// Asks the agent to end the turn once cancelled, and gives up after the grace period.
     fn check_cancel(&mut self) -> Result<()> {
         if !self.cancel.is_cancelled() {
             return Ok(());
@@ -540,11 +696,15 @@ impl<W: Write> Rpc<W> {
         Ok(())
     }
 
-    fn record_update(&mut self, message: Value) -> Result<()> {
+    fn record_update(
+        &mut self,
+        message: Value,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<()> {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         if let Some(session_id) = &self.session_id {
             if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
-                bail!("agy acp sent an update for a different session.");
+                bail!("{} sent an update for a different session.", self.name);
             }
         }
         let update = &params["update"];
@@ -553,6 +713,7 @@ impl<W: Write> Rpc<W> {
                 self.message.push_str(text);
             }
         }
+        permissions.on_update(&params);
         self.events.push(params);
         Ok(())
     }
@@ -564,7 +725,11 @@ impl<W: Write> Rpc<W> {
         permissions: &mut dyn PermissionHandler,
     ) -> std::result::Result<Value, i64> {
         if method != "session/request_permission" {
-            return Err(-32601);
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            self.events
+                .push(json!({"agentRequest": {"method": method, "params": params}}));
+            return (self.vendor_request)(method, &params, permissions, &self.cancel)
+                .unwrap_or(Err(-32601));
         }
         let params = message.get("params").ok_or(-32602)?;
         self.events.push(json!({"permissionRequest": params}));
@@ -573,13 +738,14 @@ impl<W: Write> Rpc<W> {
             .get("options")
             .and_then(Value::as_array)
             .ok_or(-32602)?;
-        let is_write = tool_call
+        let read_only_safe = tool_call
             .get("kind")
             .and_then(Value::as_str)
-            .is_some_and(|kind| WRITE_TOOL_KINDS.contains(&kind));
+            .is_some_and(|kind| READ_ONLY_TOOL_KINDS.contains(&kind))
+            || (self.bridge_tool)(tool_call);
         let choice = if self.cancel.is_cancelled() {
             None
-        } else if self.role == HarnessRole::Review && is_write {
+        } else if self.role == HarnessRole::Review && !read_only_safe {
             reject_option(options)
         } else {
             permissions
@@ -604,6 +770,7 @@ impl<W: Write> Rpc<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_harness::antigravity::{MIN_AGY_VERSION, SPEC};
     use crate::local_harness::HarnessKind;
     use std::io::Cursor;
 
@@ -668,9 +835,19 @@ mod tests {
         lines: &[String],
         permissions: &mut dyn PermissionHandler,
     ) -> (Result<HarnessResult>, Vec<Value>) {
+        drive_spec(&SPEC, request, lines, permissions)
+    }
+
+    fn drive_spec(
+        spec: &AgentSpec,
+        request: &HarnessRequest,
+        lines: &[String],
+        permissions: &mut dyn PermissionHandler,
+    ) -> (Result<HarnessResult>, Vec<Value>) {
         let input = lines.join("\n") + "\n";
         let mut written = Vec::new();
         let result = drive(
+            spec,
             Cursor::new(input),
             &mut written,
             request,
@@ -783,13 +960,169 @@ mod tests {
     #[test]
     fn review_fails_closed_without_plan_mode() {
         let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#;
-        let lines = [LIVE_INITIALIZE.into(), session.into()];
+        let refused =
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown mode"}}"#;
+        let lines = [LIVE_INITIALIZE.into(), session.into(), refused.into()];
         let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut RejectAll);
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("cannot keep a review session read-only"));
-        assert_eq!(sent.len(), 2);
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[2]["method"], "session/set_mode");
+        assert_eq!(
+            sent[2]["params"],
+            json!({"sessionId": "sess-1", "modeId": "plan"})
+        );
+    }
+
+    #[test]
+    fn vendor_requests_reach_the_spec_and_its_question_handler() {
+        struct Answer;
+        impl PermissionHandler for Answer {
+            fn decide(&mut self, _: &PermissionRequest<'_>) -> Option<String> {
+                None
+            }
+            fn ask_question(&mut self, question: &Value, _: &CancellationToken) -> Option<Value> {
+                Some(json!({"answer": question["question"]}))
+            }
+        }
+        fn ask(
+            method: &str,
+            params: &Value,
+            handler: &mut dyn PermissionHandler,
+            cancel: &CancellationToken,
+        ) -> Option<std::result::Result<Value, i64>> {
+            (method == "_vendor/ask").then(|| handler.ask_question(params, cancel).ok_or(-32000))
+        }
+        let spec = AgentSpec {
+            vendor_request: ask,
+            ..SPEC
+        };
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            r#"{"jsonrpc":"2.0","id":80,"method":"_vendor/ask","params":{"question":"which?"}}"#
+                .into(),
+            r#"{"jsonrpc":"2.0","id":81,"method":"_vendor/other","params":{}}"#.into(),
+            update("ok"),
+            stop(3, "end_turn"),
+        ];
+        let (result, sent) = drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut Answer);
+        result.unwrap();
+        let reply = |id: u64| {
+            sent.iter()
+                .find(|message| message["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(reply(80)["result"], json!({"answer": "which?"}));
+        assert_eq!(reply(81)["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn streams_each_update_to_the_handler() {
+        struct Collect(Vec<Value>);
+        impl PermissionHandler for Collect {
+            fn decide(&mut self, _: &PermissionRequest<'_>) -> Option<String> {
+                None
+            }
+            fn on_update(&mut self, update: &Value) {
+                self.0.push(update.clone());
+            }
+        }
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            update("a"),
+            update("b"),
+            stop(3, "end_turn"),
+        ];
+        let mut handler = Collect(Vec::new());
+        let (result, _) = drive_lines(&request(HarnessRole::Build), &lines, &mut handler);
+        assert_eq!(result.unwrap().message, "ab");
+        let texts: Vec<_> = handler
+            .0
+            .iter()
+            .map(|update| update["update"]["content"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, ["a", "b"]);
+    }
+
+    #[test]
+    fn review_selects_first_advertised_mode_candidate() {
+        let spec = AgentSpec {
+            read_only_modes: &["read-only", "plan"],
+            ..SPEC
+        };
+        let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1","modes":{"currentModeId":"code","availableModes":[{"id":"code"},{"id":"plan"}]}}}"#;
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            session.into(),
+            ok(3),
+            update("done"),
+            stop(4, "end_turn"),
+        ];
+        let (result, sent) =
+            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        result.unwrap();
+        assert_eq!(sent[2]["method"], "session/set_mode");
+        assert_eq!(sent[2]["params"]["modeId"], "plan");
+    }
+
+    #[test]
+    fn review_without_mode_continues_only_when_spec_allows() {
+        let spec = AgentSpec {
+            read_only_modes: &[],
+            read_only_fail_closed: false,
+            ..SPEC
+        };
+        let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#;
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            session.into(),
+            update("done"),
+            stop(3, "end_turn"),
+        ];
+        let (result, sent) =
+            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        result.unwrap();
+        assert_eq!(sent[2]["method"], "session/prompt");
+
+        let strict = AgentSpec {
+            read_only_modes: &[],
+            ..SPEC
+        };
+        let (result, _) = drive_spec(
+            &strict,
+            &request(HarnessRole::Review),
+            &lines,
+            &mut RejectAll,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot keep a review session read-only"));
+    }
+
+    #[test]
+    fn review_falls_back_to_session_set_mode() {
+        let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#;
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            session.into(),
+            ok(3),
+            permission(90, "other"),
+            update("done"),
+            stop(4, "end_turn"),
+        ];
+        let mut handler = Choose("allow", 0);
+        let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut handler);
+        result.unwrap();
+        assert_eq!(sent[2]["method"], "session/set_mode");
+        assert_eq!(handler.1, 0, "review runs never ask about non-read tools");
+        let answer = sent.iter().find(|message| message["id"] == 90).unwrap();
+        assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
     }
 
     #[test]
@@ -823,6 +1156,7 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("not signed in"));
         assert!(error.contains("Run `agy`"));
+        assert!(error.contains("oauth-personal"), "{error}");
         assert!(!error.contains("cap-secret"));
         assert!(!sent
             .iter()
@@ -946,6 +1280,7 @@ mod tests {
         }
         let mut written = Vec::new();
         let result = drive(
+            &SPEC,
             std::io::BufReader::new(Channel(receiver, Vec::new())),
             &mut written,
             &request(HarnessRole::Build),
@@ -1016,11 +1351,11 @@ mod tests {
     #[test]
     fn review_runs_use_the_agy_sandbox() {
         assert_eq!(
-            agent_args(&request(HarnessRole::Build)),
+            (SPEC.args)(&request(HarnessRole::Build)),
             ["acp", "--disable-telemetry"]
         );
         assert_eq!(
-            agent_args(&request(HarnessRole::Review)),
+            (SPEC.args)(&request(HarnessRole::Review)),
             ["acp", "--disable-telemetry", "--sandbox"]
         );
     }
@@ -1074,9 +1409,10 @@ mod tests {
         request.environment =
             BTreeMap::from([("FORMLESS_TOPIC_CAPABILITY".into(), "live-cap".into())]);
 
-        let mut agent = AgentProcess::spawn(&request).unwrap();
+        let mut agent = AgentProcess::spawn(&SPEC, &request).unwrap();
         let (reader, writer) = agent.pipes().unwrap();
         let outcome = drive(
+            &SPEC,
             reader,
             writer,
             &request,
