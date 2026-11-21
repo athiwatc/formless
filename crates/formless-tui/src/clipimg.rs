@@ -2,7 +2,8 @@
 //! platform's own tools, so no image library is linked in:
 //! macOS `osascript`, Wayland `wl-paste`, X11 `xclip`, Windows PowerShell.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// PNG bytes of the clipboard's image, or why there is none.
 pub fn read_png() -> Result<Vec<u8>, String> {
@@ -52,14 +53,54 @@ fn non_empty(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("can't run {cmd}: {e}"))?;
-    if !out.status.success() {
-        return Err("no image on the clipboard".into());
-    }
-    Ok(out.stdout)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    run_bounded(command, Duration::from_secs(2))
+}
+
+fn run_bounded(command: Command, deadline: Duration) -> Result<Vec<u8>, String> {
+    // Use a worker so callers can already be inside a Tokio runtime. Drain
+    // stdout while waiting, including when the image is larger than a pipe.
+    std::thread::Builder::new()
+        .name("formless-clipboard".into())
+        .spawn(move || {
+            use tokio::io::AsyncReadExt;
+            let name = command.get_program().to_string_lossy().into_owned();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("clipboard helper runtime: {error}"))?;
+            runtime.block_on(async move {
+                let mut child = tokio::process::Command::from(command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| format!("can't run {name}: {error}"))?;
+                let mut stdout = child.stdout.take().expect("piped clipboard output");
+                let mut bytes = Vec::new();
+                let result = tokio::time::timeout(deadline, async {
+                    tokio::try_join!(child.wait(), stdout.read_to_end(&mut bytes))
+                })
+                .await;
+                match result {
+                    Ok(Ok((status, _))) if status.success() => Ok(bytes),
+                    Ok(Ok(_)) => Err("no image on the clipboard".into()),
+                    Ok(Err(error)) => {
+                        let _ = child.kill().await;
+                        Err(format!("clipboard helper {name}: {error}"))
+                    }
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        Err(format!("clipboard helper timed out ({name})"))
+                    }
+                }
+            })
+        })
+        .map_err(|error| format!("can't start clipboard worker: {error}"))?
+        .join()
+        .map_err(|_| "clipboard worker panicked".to_string())?
 }
 
 /// AppleScript prints clipboard data as `«data PNGf89504E47…»`.
@@ -180,6 +221,45 @@ fn has_shell_comment(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_helper_child_fixture() {
+        use std::io::Write;
+        match std::env::var("FORMLESS_CLIPBOARD_CHILD_FIXTURE").as_deref() {
+            Ok("hang") => loop {
+                std::thread::park();
+            },
+            Ok("bytes") => std::io::stdout()
+                .lock()
+                .write_all(&[0x89; 128 * 1024])
+                .unwrap(),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn clipboard_helpers_have_a_deadline_and_can_write_more_than_a_pipe() {
+        let command = |mode| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "clipimg::tests::clipboard_helper_child_fixture",
+                    "--nocapture",
+                ])
+                .env("FORMLESS_CLIPBOARD_CHILD_FIXTURE", mode);
+            command
+        };
+        let bytes = run_bounded(command("bytes"), Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            bytes.iter().filter(|&&byte| byte == 0x89).count(),
+            128 * 1024
+        );
+        let start = std::time::Instant::now();
+        let error = run_bounded(command("hang"), Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("clipboard helper timed out"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn parses_applescript_png_data() {

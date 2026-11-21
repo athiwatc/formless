@@ -50,6 +50,7 @@ impl Shell {
             Some(window),
             cx,
         );
+        crate::theme::apply(cx);
         self.set_text_scale(TextScale::from_percent(settings.text_scale), window, cx);
         self.settle(window, cx);
     }

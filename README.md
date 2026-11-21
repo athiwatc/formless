@@ -557,6 +557,8 @@ formless tools list       # registry inspection (also export / import)
 formless tools show fetch_page                       # description, schemas, versions, stats
 formless tools reviews                               # retained description warnings and diffs
 formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
+formless tools run fetch_page --input-file request.json
+printf '%s' '{"url":"https://example.com"}' | formless tools run fetch_page --input-file -
 formless reset --force    # destructive: config, key, whole data dir
 ```
 
@@ -723,7 +725,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--text`, `--print`, `--keys` | Read bundled Markdown, open the current online guide (gallery by default), print its URL, or print the keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
-| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE`, `--overwrite` | Write a portable setup bundle, optionally including Session transcripts. To replace a file, pass `--overwrite` with `--output`. |
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
@@ -785,6 +787,9 @@ the **entire** stored tag list, and `--clear` explicitly replaces it with an emp
 list (conflicting with positional tags). Tags reach storage unchanged for its
 existing normalization; confirmation shows returned stored values. These three
 actions accept `--json` for the selected/returned Session object.
+
+`tools tag NAME` reads the Tool's stored tags. Pass positional tags to replace
+the entire list, or `--clear` to remove all tags.
 
 Ambiguous Session prefixes/names remain usage errors and display up to ten
 matching full IDs, bounded names and archive labels. Extra matches are counted,
