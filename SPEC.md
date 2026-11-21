@@ -6827,8 +6827,9 @@ an active Run query exits 0, and cancel exits 0 when its request succeeds.
 `--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
-Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
-returned stalled/abandoned flags and optional progress fraction/label.
+Tool/Session identifiers, optional Invocation ID, compact elapsed/silent
+durations for a minute or longer, returned stalled/abandoned flags and
+optional progress as a clamped whole percentage with its label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
 Outer `runs --json running` is also supported.
