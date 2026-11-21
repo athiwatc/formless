@@ -312,7 +312,7 @@ async fn compiled_output_failure_claims_actual_fallback_only_after_complete_resp
                 error.downcast_ref::<StructuredOutputError>(),
                 Some(
                     StructuredOutputError::InvalidJson { .. }
-                        | StructuredOutputError::SchemaViolation
+                        | StructuredOutputError::SchemaViolation { .. }
                 )
             ),
             "{error:#}"

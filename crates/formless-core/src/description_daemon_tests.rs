@@ -490,6 +490,7 @@ async fn raw_legacy_skill_prefix_refuses_all_run_admission_writes_and_explicit_f
         },
         Request::RetryRun {
             session_id: session.id.clone(),
+            expected_run_id: None,
             model: None,
             keep_original: true,
         },

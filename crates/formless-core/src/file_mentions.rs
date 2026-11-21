@@ -5,7 +5,10 @@
 use std::ops::Range;
 
 fn punctuation(c: char) -> bool {
-    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '"' | '\'')
+    matches!(
+        c,
+        ',' | '.' | ';' | ':' | '!' | '?' | ')' | '"' | '\'' | '`' | ']' | '}' | '>'
+    )
 }
 
 fn decode(raw: &str) -> Option<String> {
@@ -40,7 +43,7 @@ fn tokens(text: &str) -> Vec<Token> {
         let c = text[at..].chars().next().unwrap();
         if c != '@' || !boundary {
             at += c.len_utf8();
-            boundary = c.is_whitespace();
+            boundary = c.is_whitespace() || matches!(c, '`' | '(' | '[' | '{');
             continue;
         }
         let start = at;
@@ -199,6 +202,10 @@ mod tests {
             "a\\b.md",
             "a.",
             "name)",
+            "name]",
+            "name}",
+            "name`",
+            "name>",
             "line\nbreak",
             " leading",
             "trailing ",
@@ -213,6 +220,22 @@ mod tests {
             assert_eq!(completion.query, expected);
             assert_eq!(completion.range, 0..inserted.text.len());
         }
+    }
+
+    #[test]
+    fn markdown_wrappers_allow_mentions_and_preserve_quoted_path_punctuation() {
+        assert_eq!(
+            mentions("`@src/main.rs` (@README.md) [@Cargo.toml] {@src/lib.rs}"),
+            vec!["src/main.rs", "README.md", "Cargo.toml", "src/lib.rs"]
+        );
+        assert_eq!(
+            mentions("mail a@b.c, see @src/main.rs], @README.md}> and [@\"draft].md\"]"),
+            vec!["src/main.rs", "README.md", "draft].md"]
+        );
+        let text = "see (`@src/";
+        let query = mention_completion(text, text.len()).unwrap();
+        assert_eq!(query.query, "src/");
+        assert_eq!(&text[query.range], "@src/");
     }
 
     #[test]
