@@ -178,7 +178,7 @@ impl Drop for Lease {
                 .is_some()
             {
                 self.daemon.broadcast(Event::UserQuestionClosed {
-                    answered_by: None,
+                    answered_by: self.daemon.question_answered_by.locked().remove(&self.id),
                     question_id: self.id.clone(),
                 });
             }
@@ -193,6 +193,81 @@ impl Drop for Lease {
 }
 
 impl Daemon {
+    pub(super) fn answer_topic_question_tool(&self, session: &str, args: &Value) -> Result<Value> {
+        let basis = args["basis"].as_str().context("basis is required")?.trim();
+        if basis.is_empty() {
+            bail!("basis must quote or reference a user message or decision");
+        }
+        let question_id = args["question_id"]
+            .as_str()
+            .context("question_id is required")?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        let event = self
+            .pending_attention
+            .locked()
+            .iter()
+            .find(|event| matches!(event,Event::UserQuestion{question_id:id,..} if id==question_id))
+            .cloned()
+            .context("question is not pending")?;
+        let Event::UserQuestion {
+            topic_id,
+            attempt_id,
+            questions,
+            user_only,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        if topic_id.as_deref() != Some(topic.id.as_str()) {
+            bail!("question is outside this topic");
+        }
+        if user_only {
+            bail!("this question is user_only and must be answered by the user");
+        }
+        let attempt_id =
+            attempt_id.context("only harness questions can be answered by this tool")?;
+        let answers: Vec<QuestionAnswer> = serde_json::from_value(args["answers"].clone())?;
+        if answers.len() != questions.len()
+            || answers.iter().any(|answer| {
+                answer.selected.is_empty()
+                    && answer
+                        .text
+                        .as_deref()
+                        .is_none_or(|text| text.trim().is_empty())
+            })
+        {
+            bail!("supply one non-empty answer per question");
+        }
+        let message=self.with_store(|st|st.transaction(|st|{
+            if !st.is_topic_orchestrator(session)?{bail!("topic is not active");}
+            let attempt=st.get_topic_attempt(&attempt_id)?.context("attempt not found")?;
+            let mut waiters=self.questions.locked();
+            if !waiters.contains_key(question_id){return Ok(None);}
+            let message=st.append_message_meta(session,"assistant",&format!(
+                "Orchestrator answer for {:?}, attempt {}\nQuestions: {}\nAnswers: {}\nBasis: {}",
+                attempt.harness,attempt_id,serde_json::to_string(&questions)?,serde_json::to_string(&answers)?,basis
+            ),Some(json!({"topic_question_answer":question_id,"answered_by":"model","basis":basis}).to_string()))?;
+            self.question_answered_by.locked().insert(question_id.into(),"model".into());
+            if waiters.remove(question_id).unwrap().send((String::new(),answers)).is_err(){
+                self.question_answered_by.locked().remove(question_id);
+                bail!("question expired before delivery");
+            }
+            Ok(Some(message))
+        }))?;
+        if let Some(message) = message {
+            self.broadcast(Event::MessageAppended {
+                session_id: session.into(),
+                message,
+            });
+            Ok(json!({"answered":true}))
+        } else {
+            Ok(json!({"answered":false}))
+        }
+    }
+
     pub(crate) fn topic_interaction_handler(
         self: &Arc<Self>,
         attempt_id: &str,
@@ -367,7 +442,7 @@ impl Daemon {
             self.questions.locked().remove(&id);
             if self.topic_questions.locked().remove(&id).is_some() {
                 self.broadcast(Event::UserQuestionClosed {
-                    answered_by: None,
+                    answered_by: self.question_answered_by.locked().remove(&id),
                     question_id: id,
                 });
             }
@@ -465,10 +540,16 @@ impl Daemon {
         self.broadcast(Event::TopicChanged {
             topic_id: attempt.topic_id,
         });
-        let reply = tokio::select! {
-            _ = self.shutdown.cancelled() => None,
-            reply=prompt_reply::wait(&self.questions,&id,receiver,cancel,||{}) => reply,
-        };
+        let reply = prompt_reply::wait_until(
+            &self.questions,
+            &id,
+            receiver,
+            async {
+                tokio::select! {_=self.shutdown.cancelled()=>{},_=cancel.cancelled()=>{}}
+            },
+            || {},
+        )
+        .await;
         Ok(reply.map(|(answer, answers)| {
             let answers = if answers.is_empty() {
                 vec![questions[0].parse_reply(&answer)]

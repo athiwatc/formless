@@ -926,6 +926,7 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    question_answered_by: StdMutex<HashMap<String, String>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     topic_activity: tokio::sync::Notify,
@@ -1174,6 +1175,7 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            question_answered_by: StdMutex::new(HashMap::new()),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
             topic_activity: tokio::sync::Notify::new(),
@@ -4101,9 +4103,17 @@ impl Daemon {
                 // First answer wins; the others find it gone.
                 let answered = {
                     let mut waiters = self.questions.locked();
-                    waiters
-                        .remove(&question_id)
-                        .is_some_and(|tx| tx.send((answer, answers)).is_ok())
+                    waiters.remove(&question_id).is_some_and(|tx| {
+                        self.question_answered_by
+                            .locked()
+                            .insert(question_id.clone(), "user".into());
+                        if tx.send((answer, answers)).is_ok() {
+                            true
+                        } else {
+                            self.question_answered_by.locked().remove(&question_id);
+                            false
+                        }
+                    })
                 };
                 self.remove_attention(&question_id);
                 Ok(json!({"answered": answered}))
@@ -8739,6 +8749,12 @@ impl Daemon {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
             },
+            toolreg::TOPIC_ANSWER_QUESTION => {
+                match self.answer_topic_question_tool(session_id, &args) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => call_failed(format!("error: topic_answer_question: {error:#}")),
+                }
+            }
             toolreg::TOPIC_COMPLETE_FEATURE | toolreg::TOPIC_FAIL_FEATURE => match self
                 .finish_topic_feature_tool(
                     session_id,
@@ -12886,7 +12902,7 @@ impl Daemon {
         });
         let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
         self.broadcast(Event::UserQuestionClosed {
-            answered_by: None,
+            answered_by: self.question_answered_by.locked().remove(&question_id),
             question_id,
         });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
