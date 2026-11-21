@@ -492,10 +492,11 @@
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
-      const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
+      const credentialKey = k.endsWith("_PWD") || (!schemaRole && k.split("_").includes("KEY")) ||
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
       if (credentialKey || k.endsWith("_PAT") ||
+          ["DATABASE_URL", "REDIS_URL", "MONGODB_URI"].includes(k) ||
           ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
         return "a secret from your environment";
       }
@@ -1734,8 +1735,11 @@
       out.push(h("span", { class: cls }, s));
     };
     const word = /[\p{L}\p{N}_$]/u;
+    const yaml = lang === "yaml" || lang === "yml";
+    let yamlScalar = null;
     let i = 0;
     let lineStart = true;
+    const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
     while (i < code.length) {
       const c = code[i];
       if (L === HL.js && (c === "." || /\d/.test(c))) {
@@ -1758,6 +1762,23 @@
           i++;
           continue;
         }
+      }
+      if (yaml && lineStart) {
+        const newline = code.indexOf("\n", i);
+        const end = newline === -1 ? code.length : newline;
+        const line = code.slice(i, end);
+        if (yamlScalar) {
+          const indent = line.length - line.replace(/^ +/, "").length;
+          const blank = !line.trim();
+          if (blank || indent >= (yamlScalar.contentIndent ?? yamlScalar.headerIndent + 1)) {
+            if (!blank) yamlScalar.contentIndent ??= indent;
+            if (line) tok("tok-str", line);
+            if (newline !== -1) plain += "\n";
+            i = newline === -1 ? end : end + 1;
+            continue;
+          }
+        }
+        yamlScalar = yamlScalarHeader(line);
       }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
@@ -1808,6 +1829,17 @@
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
+      }
+      if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
+        const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
+        if (opener) {
+          const delimiter = opener[0];
+          const closer = code.indexOf(delimiter, i + delimiter.length);
+          const stop = closer === -1 ? code.length : closer + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
       }
       if (L.q.includes(c)) {
         const multiline = toml && code.startsWith(c.repeat(3), i);
@@ -1862,6 +1894,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function yamlScalarHeader(line) {
+    let rest = line.replace(/^ +/, "");
+    let headerIndent = line.length - rest.length;
+    while (/^-[ \t]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      rest = rest.replace(/^-[ \t]+/, "");
+    }
+    if (!/^[|>]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      let quote = rest[0] === "'" || rest[0] === '"' ? rest[0] : null;
+      let colon = -1;
+      for (let i = quote ? 1 : 0; i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if ((quote === '"' && c === "\\") || (quote === "'" && c === "'" && rest[i + 1] === "'")) i++;
+          else if (c === quote) quote = null;
+        } else if (c === "#" && (i === 0 || /\s/.test(rest[i - 1]))) {
+          break;
+        } else if (i > 0 && c === ":" && /[ \t]/.test(rest[i + 1] || "")) {
+          colon = i;
+          break;
+        }
+      }
+      if (colon === -1) return null;
+      rest = rest.slice(colon + 1).replace(/^[ \t]+/, "");
+    }
+    const match = /^[|>]([1-9][+-]?|[+-][1-9]?)?(?:[ \t]+(?:#.*)?)?\r?$/.exec(rest);
+    if (!match) return null;
+    const digit = match[1]?.match(/[1-9]/);
+    return { headerIndent, contentIndent: digit ? headerIndent + Number(digit[0]) : null };
   }
 
   function javascriptNumberEnd(code, start) {
