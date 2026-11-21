@@ -269,6 +269,12 @@ const C_LIKE: Lang = Lang {
     regex: false,
 };
 
+// PHP hash comments are distinct from C preprocessor directives.
+const PHP: Lang = Lang {
+    line_comments: &["//", "#"],
+    ..C_LIKE
+};
+
 const JSON: Lang = Lang {
     line_comments: NONE,
     block_comment: None,
@@ -282,6 +288,17 @@ const JSON: Lang = Lang {
     nested: false,
     raw_strings: false,
     regex: false,
+};
+
+// Strict JSON stays comment-free; the extensions opt into their own grammar.
+const JSONC: Lang = Lang {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    ..JSON
+};
+const JSON5: Lang = Lang {
+    quotes: &['"', '\''],
+    ..JSONC
 };
 
 /// YAML and TOML: `#` comments only, so `key: a;b` keeps its `;` (#877).
@@ -415,6 +432,14 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+/// MySQL requires whitespace or a control character after a double dash.
+const MYSQL: Lang = Lang {
+    line_comments: &["--", "#"],
+    quotes: &['\'', '"', '`'],
+    multiline: &["'", "\"", "`"],
+    ..SQL
+};
+
 /// `--` comments: Lua, Haskell.
 const SQL_DASH: Lang = Lang {
     line_comments: &["--"],
@@ -445,12 +470,16 @@ fn lang(name: &str) -> Option<&'static Lang> {
         | "dockerfile" | "docker" | "make" | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir"
         | "ex" | "exs" | "perl" | "pl" => &SHELL,
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
-        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "php" | "zig" | "objc" => &C_LIKE,
+        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "zig" | "objc" => &C_LIKE,
+        "php" => &PHP,
         "lua" | "haskell" | "hs" => &SQL_DASH,
-        "json" | "jsonc" | "json5" => &JSON,
+        "json" => &JSON,
+        "jsonc" => &JSONC,
+        "json5" => &JSON5,
         "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
-        "sql" | "sqlite" | "postgres" | "postgresql" | "mysql" => &SQL,
+        "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
+        "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
         "css" | "scss" | "less" => &CSS,
         _ => return None,
@@ -476,11 +505,15 @@ pub(crate) struct Highlighter {
     python_comments: bool,
     shell: Option<ShellComments>,
     raw_backticks: bool,
+    mysql_comments: bool,
+    php_comments: bool,
+    json5_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
+    js_typescript: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -947,6 +980,32 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
     end
 }
 
+// After a contextual `await`, an apparent closing slash can instead be the
+// second division operator. Check the flags and the next operand token.
+fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> bool {
+    if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
+        return false;
+    }
+    loop {
+        let whitespace = suffix.iter().take_while(|c| c.is_whitespace()).count();
+        suffix = &suffix[whitespace..];
+        if !suffix.starts_with(&['/', '*']) {
+            break;
+        }
+        let Some(end) = suffix[2..].windows(2).position(|pair| pair == ['*', '/']) else {
+            return true;
+        };
+        suffix = &suffix[end + 4..];
+    }
+    let word: String = suffix
+        .iter()
+        .take_while(|c| c.is_alphanumeric() || "_$".contains(**c))
+        .collect();
+    (matches!(word.as_str(), "" | "in" | "instanceof")
+        || typescript && matches!(word.as_str(), "as" | "satisfies"))
+        && !matches!(suffix.first(), Some('"' | '\''))
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
@@ -969,9 +1028,13 @@ impl Highlighter {
                 ansi_quote: false,
             }),
             raw_backticks: matches!(name.as_str(), "go" | "golang"),
+            mysql_comments: name == "mysql",
+            php_comments: name == "php",
+            json5_strings: name == "json5",
             color,
             in_block: 0,
             in_str: None,
+            js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
         })
     }
 
@@ -1000,13 +1063,18 @@ impl Highlighter {
             return vec![Span::raw(line.to_owned())];
         }
         let l = self.lang;
+        let mysql = self.mysql_comments;
+        let php = self.php_comments;
         let chars: Vec<char> = line.chars().collect();
+        let continues_string =
+            self.json5_strings && line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0;
         let at = |i: usize, pat: &str| {
             (i..)
                 .zip(pat.chars())
                 .all(|(k, p)| chars.get(k) == Some(&p))
         };
         let mut toks: Vec<(Tok, String)> = Vec::new();
+        let mut js_block_comments = Vec::new();
         let mut push = |tok: Tok, s: &[char]| {
             if let Some((t, last)) = toks.last_mut() {
                 if std::mem::discriminant(t) == std::mem::discriminant(&tok) {
@@ -1046,7 +1114,7 @@ impl Highlighter {
                 || posix_shell && close == "'" && !ansi_quote);
             let mut j = from;
             while j < chars.len() {
-                if escapes && chars[j] == '\\' {
+                if escapes && chars[j] == '\\' && !(mysql && close == "`") {
                     j += 2;
                     continue;
                 }
@@ -1083,14 +1151,21 @@ impl Highlighter {
                     }
                 }
                 push(Tok::Comment, &chars[i..j]);
+                if l.regex {
+                    js_block_comments.push((i, j));
+                }
                 i = j;
                 continue;
             }
             if let Some((open, _)) = l.block_comment {
                 if at(i, open) {
                     self.in_block = 1;
-                    push(Tok::Comment, &chars[i..i + open.chars().count()]);
-                    i += open.chars().count();
+                    let end = i + open.chars().count();
+                    push(Tok::Comment, &chars[i..end]);
+                    if l.regex {
+                        js_block_comments.push((i, end));
+                    }
+                    i = end;
                     continue;
                 }
             }
@@ -1120,10 +1195,34 @@ impl Highlighter {
                     |shell| shell.comment(&chars[..i]),
                 )
             };
-            if l.line_comments.iter().any(|p| at(i, p)) && (c != '#' || hash_is_comment()) {
-                push(Tok::Comment, &chars[i..]);
+            let hash_comment = c != '#'
+                || if php {
+                    chars.get(i + 1) != Some(&'[')
+                } else {
+                    mysql || hash_is_comment()
+                };
+            if hash_comment
+                && l.line_comments.iter().any(|p| {
+                    at(i, p)
+                        && (!mysql
+                            || *p != "--"
+                            || chars
+                                .get(i + 2)
+                                .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
+                })
+            {
+                // A PHP closing tag ends a line comment as well as the code.
+                let end = if php {
+                    (i..chars.len())
+                        .find(|&j| at(j, "?>"))
+                        .unwrap_or(chars.len())
+                } else {
+                    chars.len()
+                };
+                push(Tok::Comment, &chars[i..end]);
                 ended_by_comment = true;
-                break;
+                i = end;
+                continue;
             }
             if let Some(shell) = &mut self.shell {
                 if let Some(end) = shell.here_doc(&chars, i) {
@@ -1152,23 +1251,54 @@ impl Highlighter {
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
             if l.regex && c == '/' && !at(i, "//") && !at(i, "/*") {
-                let before = chars[..i].iter().rev().find(|c| !c.is_whitespace());
-                let prev_word: String = {
-                    let end = chars[..i]
+                let token_end = |mut end| loop {
+                    end = chars[..end]
                         .iter()
                         .rposition(|c| !c.is_whitespace())
                         .map_or(0, |e| e + 1);
-                    let start = chars[..end]
-                        .iter()
-                        .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
-                        .map_or(0, |s| s + 1);
-                    chars[start..end].iter().collect()
+                    match js_block_comments.binary_search_by_key(&end, |&(_, end)| end) {
+                        Ok(comment) => end = js_block_comments[comment].0,
+                        Err(_) => break end,
+                    }
                 };
-                let value_expected = before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b))
-                    || matches!(
+                let end = token_end(i);
+                let before = chars[..end].last();
+                let start = chars[..end]
+                    .iter()
+                    .rposition(|c| !(c.is_alphanumeric() || "_$".contains(*c)))
+                    .map_or(0, |s| s + 1);
+                let prev_word: String = chars[start..end].iter().collect();
+                // A property name after a dot or a private-name marker
+                // stays an operand even when it spells a keyword.
+                let word_boundary = chars[..start]
+                    .last()
+                    .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
+                let before_word = &chars[..token_end(start)];
+                let member_name = before_word.ends_with(&['#'])
+                    || before_word.ends_with(&['.']) && !before_word.ends_with(&['.', '.', '.']);
+                let after_keyword = word_boundary
+                    && !member_name
+                    && matches!(
                         prev_word.as_str(),
-                        "return" | "typeof" | "case" | "in" | "of" | "yield"
+                        "await"
+                            | "case"
+                            | "delete"
+                            | "do"
+                            | "else"
+                            | "extends"
+                            | "in"
+                            | "instanceof"
+                            | "new"
+                            | "of"
+                            | "return"
+                            | "throw"
+                            | "typeof"
+                            | "void"
+                            | "yield"
                     );
+                let value_expected =
+                    before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b)) || after_keyword;
+                let contextual_await = after_keyword && prev_word == "await";
                 if value_expected {
                     let (mut j, mut class) = (i + 1, false);
                     let mut closed = None;
@@ -1185,13 +1315,22 @@ impl Highlighter {
                         }
                         j += 1;
                     }
-                    if let Some(mut end) = closed {
+                    if let Some(flags) = closed {
+                        let mut end = flags;
                         while end < chars.len() && chars[end].is_ascii_alphabetic() {
                             end += 1;
                         }
-                        push(Tok::Str, &chars[i..end]);
-                        i = end;
-                        continue;
+                        if !contextual_await
+                            || js_regex_suffix(
+                                &chars[flags..end],
+                                &chars[end..],
+                                self.js_typescript,
+                            )
+                        {
+                            push(Tok::Str, &chars[i..end]);
+                            i = end;
+                            continue;
+                        }
                     }
                 }
             }
@@ -1213,23 +1352,40 @@ impl Highlighter {
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
+                if continues_string && j >= chars.len() {
+                    self.in_str = Some(c.to_string());
+                }
                 i = stop;
                 continue;
             }
-            if c.is_ascii_digit() && word_start {
-                let mut j = if self.rust_numbers {
+            if l.regex && c == '.' && at(i, "...") {
+                push(Tok::Plain, &chars[i..i + 3]);
+                i += 3;
+                continue;
+            }
+            let js_number = l.regex
+                && (c == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit)
+                    || c.is_ascii_digit()
+                        && chars[..i].last().is_none_or(|c| {
+                            c.is_whitespace()
+                                || *c == '\u{feff}'
+                                || c.is_ascii_punctuation() && !"_$".contains(*c)
+                        }));
+            if js_number || !l.regex && c.is_ascii_digit() && word_start {
+                let j = if js_number {
+                    formless_core::scripts::javascript_number_end(&chars, i)
+                } else if self.rust_numbers {
                     rust_number_end(&chars, i)
                 } else {
-                    i
-                };
-                if !self.rust_numbers {
                     // Keep the existing policy for other language families.
+                    let mut j = i;
                     while j < chars.len()
                         && (chars[j].is_ascii_alphanumeric() || "._".contains(chars[j]))
                     {
                         j += 1;
                     }
-                }
+                    j
+                };
                 push(Tok::Num, &chars[i..j]);
                 i = j;
                 continue;
@@ -1290,6 +1446,11 @@ impl Highlighter {
         }
         if let Some(shell) = &mut self.shell {
             shell.end_line(&chars, ended_by_comment, self.in_str.is_some());
+        }
+        // JSON5 needs a fresh escape on every physical line of a
+        // continued string, including when the next line is empty.
+        if self.json5_strings && !continues_string {
+            self.in_str = None;
         }
         toks.into_iter()
             .map(|(t, s)| Span::styled(s, self.style(t)))
@@ -1418,6 +1579,168 @@ mod tests {
     }
 
     #[test]
+    fn json_extensions_keep_comments_and_strings_separate() {
+        for lang in ["jsonc", "json5"] {
+            let source = r#"// keep "draft": true /*"#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+            let mut h = Highlighter::new(lang, true).unwrap();
+            h.line(r#"/* "draft": true"#);
+            let next = h.line("// keep */ null");
+            assert_eq!(next[0].style.fg, Some(Color::DarkGray));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "null" && s.style.fg != Some(Color::DarkGray)));
+            let source = r#""https://example.com/ /* \" true""#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::Green))]
+            );
+            let non_nested = toks(lang, "/* outer /* inner */ true");
+            assert!(non_nested
+                .iter()
+                .any(|(s, c)| s == "true" && *c != Some(Color::DarkGray)));
+        }
+        let source = r"'it\'s // /* true'";
+        assert_eq!(
+            toks("json5", source),
+            vec![(source.into(), Some(Color::Green))]
+        );
+        for lang in ["json", "jsonc"] {
+            assert!(!toks(lang, "'formless'")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::Green)));
+        }
+        assert!(!toks("json", r#"// "draft": true /* false */"#)
+            .iter()
+            .any(|(_, c)| *c == Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn json5_string_continuation_keeps_comment_markers_literal() {
+        for quote in ['"', '\''] {
+            let first = format!("{{{quote}message{quote}: {quote}first\\");
+            let mut highlighter = Highlighter::new("json5", true).unwrap();
+            highlighter.line(&first);
+            let middle = "// continued \\";
+            let second = highlighter.line(middle);
+            assert_eq!(second[0].style.fg, Some(Color::Green));
+            assert_eq!(second[0].content, middle);
+            let last = format!("/* literal */{quote}, ok: true}}");
+            let third = highlighter.line(&last);
+            assert_eq!(third[0].content, format!("/* literal */{quote}"));
+            assert_eq!(third[0].style.fg, Some(Color::Green));
+            assert!(third.iter().any(|span| {
+                span.content == "true" && span.style.fg == Some(Color::LightMagenta)
+            }));
+        }
+
+        let mut highlighter = Highlighter::new("json5", true).unwrap();
+        highlighter.line(r"'even slashes \\");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
+        highlighter.line(r"'continued \");
+        highlighter.line("");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn mysql_comments_do_not_change_generic_sql() {
+        let tokens = toks("mysql", "SELECT 1;# keep /* false");
+        assert!(tokens.contains(&("# keep /* false".into(), Some(Color::DarkGray))));
+        let tokens = toks("mysql", "SELECT 1--2 AS n");
+        assert!(!tokens.iter().any(|(_, c)| *c == Some(Color::DarkGray)));
+        assert!(tokens
+            .iter()
+            .any(|(s, c)| s == "AS" && *c == Some(Color::Magenta)));
+        for source in ["--", "-- comment", "--\tcomment"] {
+            assert_eq!(
+                toks("mysql", source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+        }
+        for quoted in ["'# -- /*'", r##""# -- /*""##, "`# -- /*`", "`a\\`"] {
+            assert_eq!(
+                toks("mysql", quoted),
+                vec![(quoted.into(), Some(Color::Green))]
+            );
+        }
+        let mut h = Highlighter::new("mysql", true).unwrap();
+        h.line("# keep /* false");
+        assert!(h.line("SELECT 1").iter().any(|s| s.content == "SELECT"));
+        h.line("/* real block");
+        assert!(h
+            .line("# --")
+            .iter()
+            .all(|s| s.style.fg == Some(Color::DarkGray)));
+        assert!(h.line("*/ SELECT 2").iter().any(|s| s.content == "SELECT"));
+        h.line(r#"SELECT "first"#);
+        let closing = h.line(r##"# continued" AS label # comment"##);
+        assert_eq!(closing[0].content, "# continued\"");
+        assert_eq!(closing[0].style.fg, Some(Color::Green));
+        assert!(closing
+            .iter()
+            .any(|s| s.content == "# comment" && s.style.fg == Some(Color::DarkGray)));
+        assert!(
+            toks("mysql", "`a\\`# comment").contains(&("# comment".into(), Some(Color::DarkGray)))
+        );
+        for lang in ["sql", "sqlite", "postgres", "postgresql"] {
+            assert!(toks(lang, "1--2 AS n").contains(&("--2 AS n".into(), Some(Color::DarkGray))));
+            assert!(!toks(lang, "# drop table")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::DarkGray)));
+        }
+    }
+
+    #[test]
+    fn javascript_numeric_literals_keep_member_calls() {
+        for (source, number, method) in [
+            ("1.5.toFixed(2)", "1.5", "toFixed"),
+            ("1..toString()", "1.", "toString"),
+            ("0x1f.toString(16)", "0x1f", "toString"),
+            ("1e2.toFixed(2)", "1e2", "toFixed"),
+            ("1e+2.toPrecision(2)", "1e+2", "toPrecision"),
+            ("2_000n.toString()", "2_000n", "toString"),
+            ("077.valueOf()", "077", "valueOf"),
+            (".5.toFixed(2)", ".5", "toFixed"),
+        ] {
+            for lang in ["js", "javascript", "tsx", "typescript"] {
+                let tokens = toks(lang, source);
+                assert!(
+                    tokens.contains(&(number.into(), Some(Color::LightYellow))),
+                    "{lang} {source}: {tokens:?}"
+                );
+                assert!(
+                    tokens.contains(&(method.into(), Some(Color::Blue))),
+                    "{lang} {source}: {tokens:?}"
+                );
+            }
+        }
+        for (source, numbers) in [
+            ("let value = 1_000 / 1.5", vec!["1_000", "1.5"]),
+            ("0..len", vec!["0."]),
+            ("[...5, ....5]", vec!["5", ".5"]),
+            ("item1 / α\u{301}2", vec![]),
+            ("return\u{feff}2", vec!["2"]),
+        ] {
+            let tokens = toks("js", source);
+            let actual: Vec<_> = tokens
+                .iter()
+                .filter(|(_, color)| *color == Some(Color::LightYellow))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(actual, numbers, "{source}: {tokens:?}");
+        }
+    }
+
+    #[test]
     fn rust_numbers_leave_ranges_members_and_suffix_boundaries_to_normal_tokens() {
         let number = Some(Color::LightYellow);
         let call = Some(Color::Blue);
@@ -1490,7 +1813,7 @@ mod tests {
                 "{tokens:?}"
             );
         }
-        for lang in ["js", "python", "go", "c", "json", "toml", "sql", "css"] {
+        for lang in ["python", "go", "c", "json", "toml", "sql", "css"] {
             assert_eq!(
                 toks(lang, "0..len"),
                 vec![("0..len".into(), number)],
@@ -1668,6 +1991,71 @@ mod tests {
     }
 
     #[test]
+    fn php_hash_comments_do_not_open_blocks_or_consume_attributes() {
+        for lang in ["php", "PHP"] {
+            for first in ["# note: /* not a block", "foo();# /* note"] {
+                let mut h = Highlighter::new(lang, true).unwrap();
+                let spans = h.line(first);
+                assert_eq!(
+                    spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                    first
+                );
+                let comments: String = spans
+                    .iter()
+                    .filter(|s| s.style.fg == Some(Color::DarkGray))
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(comments, &first[first.find('#').unwrap()..]);
+                assert_eq!(h.in_block, 0);
+                for line in [r#"return "hi";"#, "class User {}"] {
+                    let spans = h.line(line);
+                    assert!(spans.iter().all(|s| s.style.fg != Some(Color::DarkGray)));
+                    assert!(spans.iter().any(|s| {
+                        s.content == line.split_whitespace().next().unwrap()
+                            && s.style.fg == Some(Color::Magenta)
+                    }));
+                }
+            }
+            for line in [r##"#[Route("/users")]"##, r##""# not a comment""##] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+            assert!(toks(lang, "// return").contains(&("// return".into(), Some(Color::DarkGray))));
+        }
+        for lang in ["c", "cpp", "java", "rust"] {
+            for line in ["#include <stdio.h>", "#define VALUE 1"] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+        }
+        assert!(toks("python", "x=1# note").contains(&("# note".into(), Some(Color::DarkGray))));
+        assert!(toks("yaml", "key: foo#bar")
+            .iter()
+            .all(|(_, color)| *color != Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn php_line_comments_stop_before_a_closing_tag() {
+        for opener in ["#", "//"] {
+            let line = format!("<?php foo();{opener} note ?> <p>outside</p>");
+            let tokens = toks("php", &line);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                line
+            );
+            assert!(tokens.contains(&(format!("{opener} note "), Some(Color::DarkGray))));
+            assert!(!tokens.iter().any(|(text, color)| {
+                *color == Some(Color::DarkGray) && text.contains("outside")
+            }));
+        }
+    }
+
+    #[test]
     fn tokenizes_common_shapes() {
         let t = toks("rust", "let x = foo(\"hi\", 42); // done");
         assert!(t.contains(&("let".into(), Some(Color::Magenta))));
@@ -1815,6 +2203,84 @@ mod tests {
 
     /// Nested Rust comments, raw strings, JS regexes, YAML `;` and
     /// unknown languages (#877).
+    #[test]
+    fn js_regex_literals_after_expression_keywords_preserve_the_rest_of_the_line() {
+        let regex = r"/https:\/\//gi";
+        for keyword in [
+            "await",
+            "throw",
+            "void",
+            "else",
+            "delete",
+            "new",
+            "do",
+            "instanceof",
+            "extends",
+        ] {
+            let source = format!("{keyword} {regex}; next(); // outside");
+            let tokens = toks("js", &source);
+            assert!(
+                tokens.contains(&(regex.into(), Some(Color::Green))),
+                "{source}: {tokens:?}"
+            );
+            assert!(
+                tokens.contains(&("next".into(), Some(Color::Blue))),
+                "{source}: {tokens:?}"
+            );
+            let comments: Vec<_> = tokens
+                .iter()
+                .filter(|(_, color)| *color == Some(Color::DarkGray))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(comments, ["// outside"], "{source}");
+        }
+        for source in [
+            "throw value / 2 / 3",
+            "await value / 2 / 3",
+            "const await = 48; return await / 2 / 3",
+            "return await / 2 / /* rhs */ 3",
+            "return await /x/factor",
+            "object.throw / 2 / 3",
+            "object./* comment *//* more */throw / 2 / 3",
+            "object?.await / 2 / 3",
+            "object?. /* note */ await / 2 / 3",
+            "this.#delete / 2 / 3",
+            "$await / 2 / 3",
+            "a\u{301}await / 2 / 3",
+            "π\u{200c}await / 2 / 3",
+            "f(awaited / 2 / 3)",
+        ] {
+            let tokens = toks("js", source);
+            assert!(
+                tokens.iter().all(|(_, color)| *color != Some(Color::Green)),
+                "{source}: {tokens:?}"
+            );
+        }
+        for source in [
+            format!("await /* note */ {regex};"),
+            format!("throw /* reason */ {regex};"),
+            format!("return {regex} /* operator */ instanceof RegExp"),
+            format!("const result = await {regex} in object"),
+            format!("return [...typeof {regex}];"),
+        ] {
+            assert!(
+                toks("js", &source).contains(&(regex.into(), Some(Color::Green))),
+                "{source}"
+            );
+        }
+        for lang in ["ts", "tsx", "typescript"] {
+            for source in [
+                format!("return {regex} as RegExp"),
+                format!("return await {regex} satisfies RegExp"),
+            ] {
+                assert!(
+                    toks(lang, &source).contains(&(regex.into(), Some(Color::Green))),
+                    "{lang}: {source}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn traps_that_used_to_mis_colour() {
         let t = toks("rust", "/* a /* b */ still comment */ let x = 1;");

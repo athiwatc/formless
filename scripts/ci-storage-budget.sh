@@ -61,7 +61,9 @@ case "${1:?expected snapshot, clean-debug or install-package-tools}" in
     }
     trap cleanup EXIT
     snapshot before-packaging-tools
-    time -p env CARGO_TARGET_DIR="$ci_tool_target" cargo install cargo-deb cargo-generate-rpm --locked
+    # Release and baseline share these exact tool versions and their lockfiles.
+    time -p env CARGO_TARGET_DIR="$ci_tool_target" \
+      cargo install cargo-deb@3.8.0 cargo-generate-rpm@0.21.1 --locked
     snapshot packaging-tools-installed
     ;;
   *) echo 'Unknown CI storage operation' >&2; exit 2 ;;
