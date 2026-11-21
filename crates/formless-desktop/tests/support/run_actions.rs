@@ -274,6 +274,35 @@ fn delete_undo_is_explicit_expires_and_is_cleared_on_disconnect(cx: &mut TestApp
     });
 }
 #[gpui_kit::test]
+fn measured_run_context_survives_estimates_errors_and_resets_for_next_run(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        select(&shell, &sessions[0].id, window, cx);
+        let (owner, _) = open_action(&shell, Kind::Cwd, window, cx);
+        window.render_frame(cx);
+        window.click("run-action-close", cx);
+        shell.update(cx, |s, cx| s.apply_client_update(Update::RunActivity {
+            owner: owner.clone(),
+            event: formless_protocol::Event::RunUsage { session_id: owner.session.clone(), run_id: "r".into(),
+                usage: formless_protocol::UsageInfo { context_used: 75, context_tokens: 100, ..Default::default() } },
+        }, window, cx));
+        for result in [Ok(ContextUsage { used: 12, limit: 100, measured: false }), Err("unavailable".into())] {
+            shell.update(cx, |s, cx| s.apply_client_update(Update::LiveContext { owner: owner.clone(), result }, window, cx));
+            window.render_frame(cx);
+            let label = window.find("status-context").value().unwrap().to_string();
+            assert!(label.contains("75%") && label.contains("measured"));
+        }
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::RunActivity { owner: owner.clone(), event: formless_protocol::Event::RunStarted { session_id: owner.session.clone(), run_id: "next".into() } }, window, cx);
+            s.apply_client_update(Update::LiveContext { owner, result: Ok(ContextUsage { used: 12, limit: 100, measured: false }) }, window, cx);
+        });
+        window.render_frame(cx);
+        let label = window.find("status-context").value().unwrap().to_string();
+        assert!(label.contains("12%") && label.contains("estimated"));
+    });
+}
+#[gpui_kit::test]
 fn context_provider_and_compaction_notices_are_live_and_selection_guarded(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, handle, &shell);

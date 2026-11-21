@@ -309,7 +309,11 @@ impl Shell {
                 self.run_actions.notice = Some((owner, format!("Run usage · {} prompt / {} completion tokens · {} steps · {}", usage.prompt_tokens, usage.completion_tokens, usage.steps, usage.cost.map_or_else(|| "cost unavailable".into(), |v| format!("${v:.4}")))));
                 if self.run_actions.activity.as_ref().is_some_and(|(_, r, _)| *r == run_id) { self.run_actions.activity = None; }
             }
-            Event::RunStarted { .. } | Event::RunFinished { .. } | Event::RunPaused { .. } | Event::MessageComplete { .. } | Event::StreamRestarted { .. } => self.run_actions.activity = None,
+            Event::RunStarted { .. } => {
+                self.run_actions.context = None;
+                self.run_actions.activity = None;
+            },
+            Event::RunFinished { .. } | Event::RunPaused { .. } | Event::MessageComplete { .. } | Event::StreamRestarted { .. } => self.run_actions.activity = None,
             _ => {},
         }
         cx.notify();

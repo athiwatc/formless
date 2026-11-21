@@ -2343,7 +2343,12 @@ impl Shell {
             }
             ClientUpdate::LiveContext { owner, result } => {
                 if self.run_action_owner().as_ref() == Some(&owner) {
-                    self.run_actions.context = result.ok().map(|c| (owner, c));
+                    if let Ok(context) = result {
+                        let keep_measured = self.run_actions.context.as_ref().is_some_and(|(current, c)| *current == owner && c.measured && !context.measured);
+                        if !keep_measured {
+                            self.run_actions.context = Some((owner, context));
+                        }
+                    }
                 }
             }
             ClientUpdate::RunActivity { owner, event } => self.run_activity(owner, event, cx),
