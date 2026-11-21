@@ -192,7 +192,10 @@ impl Shell {
             self.pasted_image_number = self.pasted_image_number.saturating_add(1);
             self.stage_composer_attachments(
                 Intake::Bytes {
-                    name: format!("pasted-image-{}.png", self.pasted_image_number),
+                    name: client::attachments::clipboard_image_name(
+                        self.pasted_image_number,
+                        &mime,
+                    ),
                     bytes,
                     mime,
                 },

@@ -11,6 +11,16 @@ pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 
+pub fn clipboard_image_name(number: u64, mime: &str) -> String {
+    let extension = match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    format!("pasted-image-{number}.{extension}")
+}
+
 #[derive(Default)]
 struct ClipboardPng(Cursor<Vec<u8>>);
 
@@ -93,7 +103,7 @@ impl Operation {
             id: uuid::Uuid::new_v4(),
             session_id,
             intake: Intake::Bytes {
-                name: format!("pasted-image-{number}.png"),
+                name: clipboard_image_name(number, &mime),
                 bytes,
                 mime,
             },
@@ -397,6 +407,22 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_upload_names_match_the_final_mime() {
+        for (mime, extension) in [
+            ("image/png", "png"),
+            ("image/jpeg", "jpg"),
+            ("image/gif", "gif"),
+            ("image/webp", "webp"),
+            ("image/tiff", "png"),
+        ] {
+            let operation = Operation::clipboard_image("chosen".into(), 3, vec![], mime.into());
+            assert!(
+                matches!(operation.intake, Intake::Bytes { name, .. } if name == format!("pasted-image-3.{extension}"))
+            );
+        }
+    }
 
     fn solid_tiff(width: u32, height: u32) -> Vec<u8> {
         // One RGB strip using PackBits repeat runs, with an out-of-line BitsPerSample.
