@@ -267,6 +267,9 @@ pub fn is_env_template_file(path: &Path) -> bool {
 }
 
 fn builtin(path: &Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     let parts: Vec<_> = path
         .components()
         .filter_map(|part| {
@@ -286,6 +289,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
             || name.ends_with(".pem")
+            || name.ends_with(".ppk")
             || name.ends_with(".key")
         {
             return Some("credential-shaped filename");
@@ -315,6 +319,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
+        ".psql_history" | "psql_history" | ".mysql_history"
+    ) {
+        return Some("database client history");
+    }
+    if matches!(
+        name.as_str(),
         "login data"
             | "login data for account"
             | "logins.json"
@@ -334,10 +344,13 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | ".netrc"
             | "_netrc"
             | ".git-credentials"
+            | ".pgpass"
+            | "pgpass.conf"
             | "credentials.tfrc.json"
             | ".terraformrc"
             | "terraform.rc"
-    ) || name.ends_with(".keychain")
+    ) || name == "credentials.toml"
+        || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
         return Some("credential store file");
@@ -349,12 +362,41 @@ fn builtin(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     #[test]
+    fn cargo_credential_files_are_sensitive_without_classifying_the_cache() {
+        let home = std::env::temp_dir().join("formless-home");
+        let policy = PathPolicy::default();
+        for relative in [".cargo/credentials.toml", "custom-cargo/CREDENTIALS.TOML"] {
+            let path = home.join(relative);
+            assert!(matches!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            ".cargo/registry/cache.txt",
+            ".cargo/credentials.toml.example",
+            "notes.txt",
+        ] {
+            let path = home.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_paths_stay_quiet_and_all_required_shapes_are_sensitive() {
         let root = std::env::temp_dir();
         let policy = PathPolicy::default();
         let project = root.join("project").join("notes.txt");
         assert_eq!(
             policy.classify(&project, &project).unwrap(),
+            PathDecision::Ordinary
+        );
+        let note = root.join("project/ppk-notes.txt");
+        assert_eq!(
+            policy.classify(&note, &note).unwrap(),
             PathDecision::Ordinary
         );
         for relative in [
@@ -370,9 +412,16 @@ mod tests {
             ".env",
             ".env.local",
             "server.pem",
+            "server.ppk",
+            "identity.PPK",
             "server.key",
             ".bash_history",
             "fish_history",
+            ".PSQL_HISTORY",
+            "psql_history",
+            ".mysql_history",
+            ".pgpass",
+            "postgresql/PGPASS.CONF",
             "Profiles/default/logins.json",
             "Chrome/Profile/Login Data",
         ] {
@@ -386,6 +435,31 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn composer_auth_file_is_classified_before_ordinary_config_files() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for relative in [".composer/auth.json", ".config/composer/auth.json"] {
+            let path = root.join(relative);
+            let alias = root.join("alias.txt");
+            assert!(matches!(
+                policy.classify(&alias, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            "auth.json",
+            ".composer/cache/auth.json",
+            ".config/composer/config.json",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
     #[test]
     fn protects_terraform_config_during_tool_reads() {
         let root = std::env::temp_dir();

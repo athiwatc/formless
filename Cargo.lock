@@ -1339,8 +1339,11 @@ dependencies = [
  "libc",
  "regex",
  "reqwest 0.12.28",
+ "semver",
+ "serde",
  "serde_json",
  "shlex",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
  "unicode-segmentation",
@@ -1353,6 +1356,7 @@ name = "formless-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",

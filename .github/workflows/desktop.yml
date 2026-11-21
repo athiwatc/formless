@@ -30,7 +30,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_BUILD_JOBS: '2'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -63,5 +63,6 @@ jobs:
             ${{ runner.temp }}/formless-desktop-package/*.zip
             ${{ runner.temp }}/formless-desktop-package/SHA256SUMS
           if-no-files-found: error
+          retention-days: 2
       - name: Scope of evidence
         run: echo 'Build, model, daemon/provider and headless layout coverage only. Actual OS IME, screen-reader use, foreground input and 200% visual acceptance remain separate native gates.' >> "$GITHUB_STEP_SUMMARY"

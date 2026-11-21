@@ -4,6 +4,7 @@ mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;
@@ -32,6 +33,7 @@ mod profile_context_tests;
 pub mod qr;
 mod query;
 mod review_wrap;
+mod search_display;
 mod search_jump;
 mod session_rename;
 mod session_ui;
@@ -330,7 +332,12 @@ enum Pending {
     ReconnectSession,
     CreateSession,
     ForkSession,
-    SearchSessions,
+    SearchSessions {
+        context: search_display::Context,
+        serial: u64,
+        view: View,
+        session: Option<String>,
+    },
     ListTools,
     ListModules,
     ListModelStats,
@@ -1986,6 +1993,8 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_context: Option<search_display::Context>,
+    search_serial: u64,
     search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
@@ -2269,6 +2278,8 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -2874,6 +2885,11 @@ impl App {
         }
     }
 
+    fn stale_search(&self, pending: &Pending) -> bool {
+        matches!(pending, Pending::SearchSessions { serial, view, session, .. }
+            if *serial != self.search_serial || *view != self.view || *session != self.current)
+    }
+
     /// Give up on requests the daemon never answered.
     fn expire_pending(&mut self) {
         let late: Vec<u64> = self
@@ -2889,6 +2905,9 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if self.stale_search(&kind) {
+                continue;
+            }
             if matches!(kind, Pending::ProviderRetry { .. }) {
                 self.notes.push(
                     "Provider retry was not confirmed; the request may already have been re-sent."
@@ -3128,6 +3147,9 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if self.stale_search(&kind) {
+                        continue;
+                    }
                     if let Pending::SuggestName { target } = &kind {
                         self.finish_rename_suggestion(
                             target,
@@ -3402,10 +3424,11 @@ impl App {
                                 }
                             }
                         }
-                        Pending::SearchSessions => {
+                        Pending::SearchSessions { context, .. } => {
                             if let Ok(v) = serde_json::from_value::<Vec<SearchHit>>(result) {
                                 self.notes.push(format!("{} search hit(s)", v.len()));
                                 self.search_hits = v;
+                                self.search_context = Some(context);
                                 self.search_idx = 0;
                                 self.open_view(View::Search);
                             }
@@ -5534,6 +5557,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
@@ -6720,7 +6744,10 @@ impl App {
                 || (mention.starts_with("~/")
                     && directories::BaseDirs::new()
                         .is_some_and(|b| path.starts_with(b.home_dir())));
-            if !inside || formless_core::daemon::credential_path(&path).is_some() {
+            if !inside
+                || formless_core::daemon::credential_path(&path).is_some()
+                || formless_core::daemon::credential_path(&candidate).is_some()
+            {
                 continue;
             }
             let Ok(meta) = path.metadata() else {
@@ -6969,11 +6996,21 @@ impl App {
         }
         if self.search_mode {
             self.search_mode = false;
+            const LIMIT: usize = 50;
+            self.search_serial = self.search_serial.wrapping_add(1);
             self.request(
-                Pending::SearchSessions,
+                Pending::SearchSessions {
+                    context: search_display::Context {
+                        query: text.clone(),
+                        limit: LIMIT,
+                    },
+                    serial: self.search_serial,
+                    view: self.view,
+                    session: self.current.clone(),
+                },
                 Request::SearchSessions {
                     query: text,
-                    limit: Some(50),
+                    limit: Some(LIMIT),
                 },
             );
             return;
@@ -7501,6 +7538,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
             self.search_jump = None;
@@ -7575,6 +7613,7 @@ impl App {
             },
             cmd if cmd.starts_with("template ") => self.template_cmd(cmd[9..].trim()),
             "search" => {
+                self.search_serial = self.search_serial.wrapping_add(1);
                 self.search_mode = true;
                 self.notes
                     .push("Type a search query, then Enter (searches all sessions).".into());
@@ -9142,8 +9181,14 @@ impl App {
         if self.wizard.is_some() {
             return;
         }
-        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+        let left_released = matches!(m.kind, MouseEventKind::Up(MouseButton::Left));
+        if left_released {
             self.selecting_draft = false;
+        }
+        // A fullscreen pager covers all hit targets. Keep release cleanup
+        // for both draft editors if a pager appeared during a drag.
+        if self.pager.is_some() && !left_released {
+            return;
         }
         if self.editor.is_none() && self.renaming.is_some() {
             if self.rename_mouse(m) {
@@ -9518,6 +9563,15 @@ impl App {
                 return;
             }
             self.ctrl_c();
+            return;
+        }
+        if self.wizard.is_none()
+            && self.editor.is_none()
+            && self
+                .pager
+                .as_mut()
+                .is_some_and(|pager| pager_view::search_key(pager, &key))
+        {
             return;
         }
         if self.branch_summary.intent.is_some() && key.code == KeyCode::Esc {
@@ -9917,6 +9971,13 @@ impl App {
             self.begin_external_edit();
             return;
         }
+        if key.code == KeyCode::F(6)
+            && key.modifiers.is_empty()
+            && self.chat_focus_actions_available()
+            && self.open_focused_call()
+        {
+            return;
+        }
         if self.vim_mode
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
@@ -9973,6 +10034,34 @@ impl App {
         }
         if self.list_filter_key(&key) || self.list_nav_key(&key) {
             return;
+        }
+        // Keep filter, overlay and delete-confirmation ownership ahead of list help.
+        if !modal_open
+            && !(self.view == View::Sessions && self.delete_arm.is_some())
+            && !self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::ProposalDiff))
+            && self.branch_summary.intent.is_none()
+            && self.branch_summary.review.is_none()
+            && !self.branch_summary.committing
+            && key.code == KeyCode::Char('?')
+            && query::plain(&key)
+        {
+            if let Some((title, lines)) = keys::contextual_help(self.view) {
+                // A failed diff may leave its owner behind without a pager
+                // or request. Never carry its decision keys into list help.
+                self.reviewing = None;
+                self.pager = Some(Pager {
+                    title: title.into(),
+                    lines,
+                    top: 0,
+                    left: 0,
+                    viewport: Default::default(),
+                    styled: Vec::new(),
+                });
+                return;
+            }
         }
         match self.view {
             View::Settings => self.settings_key(key),
@@ -10926,6 +11015,25 @@ impl App {
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
         if let Some(form) = &mut self.settings_form {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
+                form.viewport.get_mut().page(key.code == KeyCode::PageDown);
+                return;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Down
+                    | KeyCode::Up
+                    | KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Left
+                    | KeyCode::Right
+            ) || matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                form.viewport.get_mut().inspecting = false;
+            }
             let n = form.fields.len();
             match key.code {
                 KeyCode::Esc => self.settings_form = None,
@@ -11280,6 +11388,99 @@ impl App {
             format!("{name} {args}\n{result}")
         };
         Some((text, format!("the {name} call")))
+    }
+
+    fn chat_focus_input_available(&self) -> bool {
+        self.input.is_empty() && (!self.vim_mode || self.vim_input.mode == vim::Mode::Normal)
+    }
+
+    fn chat_focus_actions_available(&self) -> bool {
+        self.view == View::Chat
+            && self.chat_focus_input_available()
+            && self.input.searching().is_none()
+            && (!self.vim_mode || !self.vim_input.waiting_for_argument())
+            && self.current_question().is_none()
+            && self.find.is_none()
+            && self.renaming.is_none()
+            && self.instructing.is_none()
+            && !self.search_mode
+            && self.import_mode.is_none()
+            && self.bulk.is_none()
+            && self.editing_id.is_none()
+            && self.editing_queued.is_none()
+            && self.step.is_none()
+            && !self.editing_step
+            && self.approvals.is_empty()
+            && self.promotions.is_empty()
+            // These reviews can claim generic pager keys even before their
+            // asynchronous content arrives.
+            && !self.pending.values().any(|p| matches!(p, Pending::ProposalDiff))
+            && self.branch_summary.intent.is_none()
+            && self.branch_summary.review.is_none()
+            && !self.branch_summary.committing
+            && self.pager.is_none()
+            && self.wizard.is_none()
+            && self.editor.is_none()
+            && self.switcher.is_none()
+            && self.rollback_pick.is_none()
+            && self.model_overlay.is_none()
+            && self.forecast.modal.is_none()
+            && !self.quit_confirm
+            && !self.hunk_review_is_visible()
+            && !self.external_edit.awaiting_confirmation()
+    }
+
+    fn open_focused_call(&mut self) -> bool {
+        let Some(id) = self
+            .call_focus
+            .as_deref()
+            .filter(|id| !id.is_empty() && !id.starts_with("msg:"))
+        else {
+            return false;
+        };
+        // Chat's focus anchor is the last matching call in the transcript.
+        // Pair it only with a result after that occurrence.
+        let Some((index, (_, name, arguments))) = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, m)| !matches!(m.role.as_str(), "user" | "tool" | "system-note"))
+            .find_map(|(index, m)| {
+                persisted_calls(m.meta.as_deref()?)
+                    .into_iter()
+                    .rev()
+                    .find(|(call_id, _, _)| call_id == id)
+                    .map(|call| (index, call))
+            })
+        else {
+            return false;
+        };
+        let result = self.messages[index + 1..]
+            .iter()
+            .rev()
+            .find(|m| m.role == "tool" && result_call_id(m).as_deref() == Some(id));
+        let mut lines = vec!["Input:".into()];
+        lines.extend(arguments.split('\n').map(text::escape_terminal_line));
+        lines.push(String::new());
+        if let Some(result) = result {
+            lines.push("Result:".into());
+            lines.extend(result.content.split('\n').map(text::escape_terminal_line));
+        } else {
+            lines.push("Result unavailable.".into());
+        }
+        // A failed or offline Proposal diff can leave an owner without a
+        // pending request or a pager. Do not carry its keys into this viewer.
+        self.reviewing = None;
+        self.pager = Some(Pager {
+            title: format!("{} call", text::escape_terminal_line(&name)),
+            lines,
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        true
     }
 
     /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
@@ -11752,9 +11953,10 @@ impl App {
             ed.apply_modal_line(line);
             return;
         }
-        // Neither a pager nor a confirmation should interpret pasted text
-        // as typed commands, or let it reach a covered surface.
-        if self.pager.is_some() {
+        // Paste is literal query text while searching the pager. Otherwise
+        // it stops here so it cannot reach the covered surface.
+        if let Some(pager) = &mut self.pager {
+            pager.viewport.search_paste(text);
             return;
         }
         if let Some((query, selected)) = &mut self.switcher {
@@ -11779,6 +11981,7 @@ impl App {
         if self.view == View::Settings {
             if let Some(f) = &mut self.settings_form {
                 f.fields[f.idx].input.paste(text.trim());
+                f.viewport.get_mut().inspecting = false;
             } else if let Some((_, edit)) = &mut self.settings_edit {
                 edit.paste(text.trim());
             }
@@ -11878,9 +12081,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(f.area());
     draw_tab_bar(f, chunks[0], app);
     let toast_area = chunks[1];
+    let mut chat_focus = None;
     match app.view {
-        View::Chat if pane_layout(app.multi_pane, chunks[1].width) => draw_panes(f, chunks[1], app),
-        View::Chat => draw_chat(f, chunks[1], app),
+        View::Chat if pane_layout(app.multi_pane, chunks[1].width) => {
+            chat_focus = draw_panes(f, chunks[1], app);
+        }
+        View::Chat => chat_focus = draw_chat(f, chunks[1], app),
         View::Sessions => draw_sessions(f, chunks[1], app),
         View::Settings => draw_settings(f, chunks[1], app),
         View::Tools => draw_tools(f, chunks[1], app),
@@ -11899,8 +12105,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         chunks[2],
         app,
         typing && (modal.is_none() || app.input_focus),
+        chat_focus,
     );
-    draw_status(f, chunks[3], app);
+    draw_status(f, chunks[3], app, chat_focus);
+    // Give the form the full frame after drawing its background. Approval
+    // and other modal overlays below keep their existing priority.
+    if app.view == View::Settings {
+        if let Some(form) = &app.settings_form {
+            draw_settings_form(f, form, app.color);
+        }
+    }
     if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
@@ -12842,7 +13056,13 @@ fn composer_prompt(app: &App) -> (&'static str, Color) {
     }
 }
 
-fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
+fn draw_input(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    show_cursor: bool,
+    focus: Option<keys::ChatFocus>,
+) {
     if let Some(find) = composer_find(app) {
         let n = find.rows.len();
         let count = if find.query.is_empty() {
@@ -12952,7 +13172,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if flashing {
         block = block.border_style(bold_fg(app.color, Color::Yellow));
     }
-    if area.width > 64 {
+    if area.width > 64 && focus.is_none() {
         block = block.title(ui::hint(
             &if app.running() {
                 format!("Enter steer · {} queue · Esc stop", app.queue_label())
@@ -13257,13 +13477,31 @@ fn compact_status(
     spans
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+fn draw_status(f: &mut Frame, area: Rect, app: &App, focus: Option<keys::ChatFocus>) {
     let width = area.width as usize;
     let mut spans = status_left(app, width);
-    let used: usize = spans.iter().map(status_width).sum();
+    let mut used: usize = spans.iter().map(status_width).sum();
+    // Make room for the omission marker without displacing the existing
+    // high-ranked shortcuts or the pending-approval indicator.
+    let reserve = text::width(keys::LIST_MORE) + 3;
+    if width >= reserve
+        && keys::list_footer_truncated(app.view, width.saturating_sub(used + 3))
+        && app.approvals.is_empty()
+        && app.promotions.is_empty()
+    {
+        let status_budget = used.min(width - 3).saturating_sub(reserve);
+        spans = status_left(app, status_budget);
+        used = spans.iter().map(status_width).sum();
+    }
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
-    let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
+    let hint_width = width.saturating_sub(used + 3);
+    let hints = if focus.is_some() {
+        keys::line_with_chat_focus(app.view, hint_width, focus)
+    } else {
+        keys::line(app.view, hint_width)
+    };
+    let tip = format!("{hints} ");
     if tip.len() > 1 {
         spans.push(Span::raw(
             " ".repeat(width.saturating_sub(used + text::width(&tip))),
@@ -15871,14 +16109,36 @@ impl App {
     }
 }
 
-fn tool_result_line(content: &str, color: bool) -> Line<'static> {
+fn tool_result_failed(result: &MessageInfo) -> bool {
+    if let Some(is_error) = result
+        .meta
+        .as_deref()
+        .and_then(|meta| serde_json::from_str::<serde_json::Value>(meta).ok())
+        .and_then(|meta| {
+            meta.get("is_error")
+                .map(|flag| flag.as_bool() == Some(true))
+        })
+    {
+        return is_error;
+    }
+    // Older rows without an outcome may hold a JSON reply or a plain error.
+    // Only a top-level boolean `ok` describes a legacy JSON reply's outcome.
+    let content = result.content.trim_start();
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(reply) => reply.get("ok").and_then(serde_json::Value::as_bool) == Some(false),
+        Err(_) => content
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error")),
+    }
+}
+
+fn tool_result_line(result: &MessageInfo, color: bool) -> Line<'static> {
+    let content = &result.content;
     let n = content.lines().count();
-    let failed = content.contains("\"ok\":false")
-        || content.trim_start().to_lowercase().starts_with("error");
     let mut spans = vec![
         Span::styled(
             "  ↳ ",
-            if failed {
+            if tool_result_failed(result) {
                 bold_fg(color, Color::Red)
             } else {
                 fg(color, Color::Yellow)
@@ -16078,13 +16338,12 @@ fn result_diff(result: &str) -> Option<String> {
 fn tool_call_block(
     app: &App,
     (id, name, args): &(String, String, String),
-    result: Option<&str>,
+    result: Option<&MessageInfo>,
 ) -> Vec<Line<'static>> {
     let focused = app.call_focus.as_deref() == Some(id.as_str());
     let expanded = app.expanded_calls.contains(id);
-    let failed = result.is_some_and(|r| {
-        r.contains("\"ok\":false") || r.trim_start().to_lowercase().starts_with("error")
-    });
+    let failed = result.is_some_and(tool_result_failed);
+    let result = result.map(|message| message.content.as_str());
     let (mark, mark_style) = match result {
         None => ("…".to_owned(), ui::dim(app.color)),
         Some(_) if failed => (
@@ -16202,13 +16461,14 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
     let mut call_lines: Vec<(usize, String)> = Vec::new();
+    let focus_actions = app.chat_focus_actions_available();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
-    let results: HashMap<String, &str> = app
+    let results: HashMap<String, &MessageInfo> = app
         .messages
         .iter()
         .filter(|m| m.role == "tool")
-        .filter_map(|m| result_call_id(m).map(|id| (id, m.content.as_str())))
+        .filter_map(|m| result_call_id(m).map(|id| (id, m)))
         .collect();
     let called: HashSet<String> = app
         .messages
@@ -16305,7 +16565,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     continue;
                 }
                 open_group(&mut lines, &mut group, "assistant", when);
-                lines.push(tool_result_line(&m.content, app.color));
+                lines.push(tool_result_line(m, app.color));
             }
             "system-note" => {
                 open_group(&mut lines, &mut group, "system-note", when);
@@ -16338,12 +16598,25 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
                 if let Some(meta) = &m.meta {
                     for call in persisted_calls(meta) {
-                        if app.call_focus.as_deref() == Some(call.0.as_str()) {
+                        let focused = !call.0.is_empty()
+                            && !call.0.starts_with("msg:")
+                            && app.call_focus.as_deref() == Some(call.0.as_str());
+                        if focused {
                             focus_line = Some(lines.len());
                         }
                         call_lines.push((lines.len(), call.0.clone()));
                         let result = results.get(&call.0).copied();
-                        lines.extend(tool_call_block(app, &call, result));
+                        let mut block = tool_call_block(app, &call, result);
+                        if focused && focus_actions {
+                            block.insert(
+                                1,
+                                Line::styled(
+                                    "  ▲ Enter toggle · F6 full call · c copy · C Markdown · [ ] move · Esc",
+                                    bold_fg(app.color, Color::Yellow),
+                                ),
+                            );
+                        }
+                        lines.extend(block);
                     }
                 }
             }
@@ -16576,7 +16849,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     }
 }
 
-fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus> {
     app.chat_area = Some(area.inner(Margin {
         vertical: 1,
         horizontal: 1,
@@ -16592,6 +16865,21 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         image_lines,
         call_lines,
     } = chat_lines(app, width as usize, height);
+    let focus = app
+        .call_focus
+        .as_deref()
+        .filter(|_| app.chat_focus_input_available())
+        .map(|id| {
+            if focus_line.is_none() || !app.chat_focus_actions_available() {
+                // Focus may still receive Enter through the existing key
+                // path beneath a prompt. Suppress the generic send hint.
+                keys::ChatFocus::Unavailable
+            } else if id.starts_with("msg:") {
+                keys::ChatFocus::Message
+            } else {
+                keys::ChatFocus::Call
+            }
+        });
     // Find (Ctrl+F): highlight matches; the current one stands out.
     let mut match_lines = Vec::new();
     if let Some(find) = app.find.as_ref().filter(|f| !f.query.is_empty()) {
@@ -16816,6 +17104,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             &mut state,
         );
     }
+    focus
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
@@ -17025,73 +17314,159 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         )),
         area,
     );
-    if let Some(form) = &app.settings_form {
-        draw_settings_form(f, form, app.color);
+}
+
+/// The normal word wrapper can overhang the last column with a wide
+/// grapheme. Split those rows before painting them inside the form border.
+fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
+    let columns = usize::from(width);
+    let mut rows = Vec::new();
+    for row in review_wrap::window(&line, width, 0, usize::MAX) {
+        if row.width() <= columns {
+            rows.push(row);
+            continue;
+        }
+        let mut chunk = Vec::new();
+        let mut used = 0;
+        // The wrapper emits one complete grapheme per span.
+        for span in row.spans {
+            let span_width = span.width();
+            if used + span_width > columns && !chunk.is_empty() {
+                rows.push(Line::from(std::mem::take(&mut chunk)));
+                used = 0;
+            }
+            used += span_width;
+            chunk.push(span);
+        }
+        if !chunk.is_empty() {
+            rows.push(Line::from(chunk));
+        }
     }
+    rows
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
-    let mut lines = vec![Line::raw("")];
-    let width = f.area().width.saturating_sub(6).min(66).max(1) as usize;
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        form.viewport.set(Default::default());
+        return;
+    }
+    // In very narrow terminals use all columns so a two-column grapheme
+    // still fits. A one-column frame can only paint one-column graphemes.
+    let bordered = area.width >= 6 && area.height >= 3;
+    let border = if bordered { 2 } else { 0 };
+    let width = area.width.saturating_sub(border).min(72);
+    let inner_width = width - border;
+    let wrap = |line: Line<'_>| settings_form_rows(line, inner_width);
+    let mut body = vec![Line::raw("")];
     for text in &form.review {
-        let chars: Vec<char> = text.chars().collect();
-        for part in chars.chunks(width) {
-            lines.push(Line::raw(part.iter().collect::<String>()));
+        for line in text.split('\n') {
+            body.extend(wrap(Line::raw(line)));
         }
     }
+    let mut active_rows = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
-        let text = if field.masked {
+        let mut text = if field.masked {
             "•".repeat(field.input.chars().count())
         } else {
             field.input.to_string()
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} {:<12}", if active { "›" } else { " " }, field.label),
-                if active {
-                    bold_fg(color, Color::Green)
-                } else {
-                    ui::dim(color)
-                },
-            ),
-            Span::raw(if active { format!("{text}▏") } else { text }),
-        ]));
         if active {
-            lines.push(Line::styled(
+            text.push('▏');
+        }
+        let start = body.len();
+        for (row, line) in text.split('\n').enumerate() {
+            if row == 0 {
+                body.extend(wrap(Line::from(vec![
+                    Span::styled(
+                        format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                        if active {
+                            bold_fg(color, Color::Green)
+                        } else {
+                            ui::dim(color)
+                        },
+                    ),
+                    Span::raw(line),
+                ])));
+            } else {
+                body.extend(wrap(Line::raw(line)));
+            }
+        }
+        if active {
+            active_rows = Some(start..body.len());
+            body.extend(wrap(Line::styled(
                 format!("               {}", field.hint),
                 ui::dim(color),
-            ));
+            )));
         }
     }
-    if let Some(e) = &form.error {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}")),
-            fg(color, Color::Red),
-        ));
+    if let Some(error) = &form.error {
+        body.push(Line::raw(""));
+        let title = ui::status_text(color, SemanticTone::Bad, format!("  ✗ {error}"));
+        for line in title.split('\n') {
+            body.extend(wrap(Line::styled(line, fg(color, Color::Red))));
+        }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
+
+    let capacity = usize::from(area.height - border);
+    let mut footer = wrap(Line::styled(
         "  Tab/↑↓ field · Enter next, then save · Esc cancel",
         ui::dim(color),
     ));
-    let area = f.area();
-    let w = 72.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 3,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(format!(" {} ", form.title), color, Color::Cyan))
-            .wrap(Wrap { trim: false }),
-        rect,
+    if footer.len() >= capacity {
+        // Leave room to follow the active field even at one terminal row.
+        // The full footer remains reachable by paging through the body.
+        body.push(Line::raw(""));
+        body.append(&mut footer);
+    } else if body.len() + footer.len() < capacity {
+        footer.insert(0, Line::raw(""));
+    } else {
+        let hint = wrap(Line::styled("  PgUp/PgDn scroll form", ui::dim(color)));
+        if footer.len() + hint.len() + 1 < capacity {
+            footer.extend(hint);
+        }
+    }
+
+    let mut viewport = form.viewport.get();
+    viewport.page = body.len().min(capacity - footer.len());
+    viewport.max_top = body.len() - viewport.page;
+    if !viewport.inspecting {
+        if let Some(active) = active_rows {
+            let first_with_end = active.end.saturating_sub(viewport.page);
+            // Keep the entire active field visible when it fits. Otherwise
+            // keep its trailing editing marker in view.
+            viewport.top = viewport
+                .top
+                .clamp(first_with_end, active.start.max(first_with_end));
+        }
+    }
+    viewport.top = viewport.top.min(viewport.max_top);
+    form.viewport.set(viewport);
+
+    let height = (viewport.page + footer.len()) as u16 + border;
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 3,
+        width,
+        height,
     );
+    f.render_widget(Clear, rect);
+    let inner = if bordered {
+        let panel = ui::panel(format!(" {} ", form.title), color, Color::Cyan);
+        let inner = panel.inner(rect);
+        f.render_widget(panel, rect);
+        inner
+    } else {
+        rect
+    };
+    let rows = body
+        .into_iter()
+        .skip(viewport.top)
+        .take(viewport.page)
+        .chain(footer)
+        .collect();
+    f.render_widget(review_wrap::Rows(rows), inner);
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -17101,20 +17476,30 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
             .len()
             .min(area.height.saturating_sub(2) as usize),
     );
+    let context = app.search_context.as_ref();
     let items: Vec<ListItem> = if app.search_hits.is_empty() {
+        let budget = usize::from(area.width.saturating_sub(2));
         vec![ListItem::new(Line::styled(
-            "No hits. /search to try again.",
+            search_display::empty(context, budget),
             ui::dim(app.color),
         ))]
     } else {
+        let terms = search_display::Terms::new(context.map_or("", |context| &context.query));
         app.search_hits
             .iter()
             .map(|h| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(h.session_name.clone(), bold_fg(app.color, Color::Cyan)),
-                    Span::styled(format!("  #{} {}  ", h.seq, h.role), ui::dim(app.color)),
-                    Span::raw(h.snippet.clone()),
-                ]))
+                let mut spans = vec![
+                    Span::styled(
+                        search_display::label(&h.session_name),
+                        bold_fg(app.color, Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("  #{} {}  ", h.seq, search_display::label(&h.role)),
+                        ui::dim(app.color),
+                    ),
+                ];
+                spans.extend(terms.snippet_spans(&h.snippet, Style::default()));
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -17125,7 +17510,11 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(
         List::new(items)
             .block(ui::panel(
-                format!(" Search ({} hits) ", app.search_hits.len()),
+                search_display::title(
+                    app.search_hits.len(),
+                    context,
+                    usize::from(area.width.saturating_sub(2)),
+                ),
                 app.color,
                 Color::Magenta,
             ))
@@ -19176,7 +19565,7 @@ fn draw_editor_review(
     );
 }
 
-fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus> {
     // Side panes at their set widths (0 hides one; zero-size areas draw
     // nothing); the chat takes the rest.
     let (l, r) = app.pane_widths;
@@ -19257,7 +19646,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             left[1],
         );
     }
-    draw_chat(f, cols[1], app);
+    let focus = draw_chat(f, cols[1], app);
     let right = Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).split(cols[2]);
     let total: i64 = app.tools.iter().map(|t| t.invocations).sum();
     let attention = app.tools.iter().filter(|t| t.needs_attention).count();
@@ -19339,6 +19728,7 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             .scroll((offset.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
+    focus
 }
 
 mod wizard_layout;
@@ -19509,7 +19899,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
-pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use theme::{
+    colorblind_rgb, colorblind_rgb_on_background, terminal_has_light_background, tone_marker,
+    SemanticTone,
+};
 pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
@@ -19554,7 +19947,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         && std::env::var_os("COLORFGBG").is_none()
     {
         if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
-            theme::set_kind(theme::kind_for_background(bg));
+            theme::set_background(theme::kind_for_background(bg));
         }
     }
     let mut out = stdout();
@@ -19949,6 +20342,8 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -21827,6 +22222,260 @@ mod tests {
         assert_eq!(app.input, "h");
     }
 
+    fn stored_call_fixture(name: &str, input: &str, result: &str) -> App {
+        let mut app = test_app();
+        let mut assistant = msg("assistant", "starting");
+        assistant.meta = Some(
+            serde_json::json!({"tool_calls":[
+                {"id":"focused-fixture", "function":{"name":name, "arguments":input}}
+            ]})
+            .to_string(),
+        );
+        let mut output = msg("tool", result);
+        output.meta = Some(serde_json::json!({"tool_call_id":"focused-fixture"}).to_string());
+        app.messages = vec![assistant, output];
+        app.call_focus = Some("focused-fixture".into());
+        app.scroll_to_focus = true;
+        app
+    }
+
+    #[test]
+    fn focused_call_opens_stored_pager_and_returns_to_focus() {
+        let mut app = stored_call_fixture("fixture", "private input", "private result");
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("F6 full call"), "{screen}");
+        assert!(screen.contains("Enter toggle call"), "{screen}");
+        assert!(!screen.contains("Enter send"), "{screen}");
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().expect("F6 opens focused stored call");
+        assert_eq!(
+            pager.lines,
+            ["Input:", "private input", "", "Result:", "private result"]
+        );
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.call_focus.as_deref(), Some("focused-fixture"));
+        app.key(key(KeyCode::Enter));
+        assert!(app.expanded_calls.contains("focused-fixture"));
+    }
+
+    #[test]
+    fn focused_call_keeps_chat_caps_and_pages_through_the_full_text() {
+        let input = (0..240)
+            .map(|i| format!("input row {i}\n"))
+            .collect::<String>();
+        let result = (0..340)
+            .map(|i| format!("output row {i}\n"))
+            .collect::<String>();
+        let mut app = stored_call_fixture("fixture", &input, &result);
+        app.expanded_calls.insert("focused-fixture".into());
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("F6 full call"), "{screen}");
+        let chat = chat_lines(&app, 120, 20);
+        let preview: Vec<_> = chat.lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            preview
+                .iter()
+                .filter(|line| line.contains("40 more lines"))
+                .count(),
+            2
+        );
+        assert!(preview
+            .iter()
+            .all(|line| !line.contains("input row 239") && !line.contains("output row 339")));
+
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().unwrap();
+        let result_header = pager
+            .lines
+            .iter()
+            .position(|line| line == "Result:")
+            .unwrap();
+        assert_eq!(pager.lines[1..result_header - 1].join("\n"), input);
+        assert_eq!(pager.lines[result_header + 1..].join("\n"), result);
+        app.key(key(KeyCode::End));
+        assert!(render(&mut app, 100, 12).contains("output row 339"));
+    }
+
+    #[test]
+    fn focused_call_displays_controls_safely_and_retains_all_json_fields() {
+        let mut app = stored_call_fixture(
+            "fixture\u{1b}\u{202e}",
+            "input\t\u{009b}\r\nnext line",
+            "result\u{1b}\u{0007}\u{2066}",
+        );
+        app.key(key(KeyCode::F(6)));
+        let pager = app.pager.as_ref().unwrap();
+        assert_eq!(pager.title, r"fixture\u{1b}⟨U+202E⟩ call");
+        assert_eq!(pager.lines[1], r"input\t\u{9b}\r");
+        assert_eq!(pager.lines[2], "next line");
+        assert_eq!(pager.lines.last().unwrap(), r"result\u{1b}\u{7}⟨U+2066⟩");
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains(r"result\u{1b}\u{7}⟨U+2066⟩"), "{screen}");
+        assert!(!screen
+            .chars()
+            .any(|c| c == '\u{1b}' || text::is_bidi_control(c)));
+        app.key(key(KeyCode::Esc));
+
+        let json = serde_json::json!({
+            "diff": "diff --git a/fixture b/fixture\n--- a/fixture\n+++ b/fixture\n@@ -1 +1 @@\n-old\n+new\n",
+            "other": "retained field",
+        })
+        .to_string();
+        assert!(result_diff(&json).is_some());
+        app.messages[1].content = json.clone();
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(app.pager.as_ref().unwrap().lines.last().unwrap(), &json);
+        render(&mut app, 44, 12);
+        for _ in 0..=json.len() / 8 {
+            app.key(key(KeyCode::Right));
+        }
+        assert!(render(&mut app, 44, 12).contains("retained field"));
+        app.key(key(KeyCode::Esc));
+        app.messages.pop();
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines.last().unwrap(),
+            "Result unavailable."
+        );
+    }
+
+    #[test]
+    fn focused_call_hints_and_f6_follow_current_chat_ownership() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        app.call_focus = Some(format!("msg:{}", app.messages[0].id));
+        let screen = render(&mut app, 140, 24);
+        assert!(screen.contains("Enter show focus"), "{screen}");
+        assert!(
+            !screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        app.call_focus = Some("stale-call".into());
+        let screen = render(&mut app, 140, 24);
+        assert!(
+            !screen.contains("Enter toggle call")
+                && !screen.contains("Enter send")
+                && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+
+        app.call_focus = Some("focused-fixture".into());
+        app.input.set("draft");
+        let screen = render(&mut app, 140, 24);
+        assert!(
+            screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.input, "draft");
+        app.input.clear();
+        app.input.search_older(&[] as &[&str]);
+        assert!(app.input.searching().is_some());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+
+        app.call_focus = Some("focused-fixture".into());
+        app.quit_confirm = true;
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert!(app.quit_confirm);
+        app.quit_confirm = false;
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Insert;
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+    }
+
+    #[test]
+    fn focused_call_does_not_advertise_send_when_approval_remains_open() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.on_event(Event::PromotionApprovalRequested {
+            promotion_id: "synthetic-choice".into(),
+            tool_name: "fixture".into(),
+            reason: "Pending promotion".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        app.key(key(KeyCode::Tab));
+        assert!(app.input_focus);
+        let screen = render(&mut app, 140, 36);
+        assert!(
+            !screen.contains("Enter send") && !screen.contains("F6 full call"),
+            "{screen}"
+        );
+        app.key(key(KeyCode::Enter));
+        assert!(app.expanded_calls.contains("focused-fixture"));
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.promotions.len(), 1);
+    }
+
+    #[test]
+    fn focused_call_waits_for_existing_proposal_or_branch_summary_review() {
+        let mut app = stored_call_fixture("fixture", "input", "result");
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.pending.insert(9, Pending::ProposalDiff);
+        app.reviewing = Some("synthetic-proposal".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        assert_eq!(app.reviewing.as_deref(), Some("synthetic-proposal"));
+        tx.send(ServerMessage::err(9, "synthetic unavailable diff".into()))
+            .unwrap();
+        app.drain_daemon();
+        assert!(!app.pending.contains_key(&9));
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+        assert!(app.reviewing.is_none());
+        app.key(key(KeyCode::Char('a')));
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_some());
+        assert!(app.pending.is_empty());
+        app.key(key(KeyCode::Esc));
+
+        app.call_focus = Some("focused-fixture".into());
+        app.branch_summary.intent = Some(("source".into(), "target".into()));
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_none());
+        app.key(key(KeyCode::Esc));
+        assert!(app.branch_summary.intent.is_none());
+        app.call_focus = Some("focused-fixture".into());
+        app.key(key(KeyCode::F(6)));
+        assert!(app.pager.is_some());
+    }
+
+    #[test]
+    fn focused_call_pairs_the_latest_occurrence_with_its_later_result() {
+        let mut app = stored_call_fixture("fixture", "earlier input", "earlier result");
+        let later = stored_call_fixture("fixture", "later input", "later result");
+        app.messages.push(later.messages[0].clone());
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["Input:", "later input", "", "Result unavailable."]
+        );
+        app.messages.push(later.messages[1].clone());
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::F(6)));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["Input:", "later input", "", "Result:", "later result"]
+        );
+    }
+
     /// A rejected key goes back to the key step with the reason; an
     /// unreachable endpoint says so; only an empty list just asks for a
     /// model name (#744).
@@ -23285,6 +23934,144 @@ mod tests {
     }
 
     #[test]
+    fn settings_form_paging_reads_the_body_without_submitting_or_revealing_masked_text() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.view = View::Settings;
+        let mut form = settings::Form::provider(None);
+        form.review = (0..16).map(|i| format!("review row {i:02}")).collect();
+        form.error = Some("fixture error at end".into());
+        form.fields[0].masked = true;
+        let masked = "ab界e\u{301}";
+        form.fields[0].input.set(masked);
+        app.settings_form = Some(form);
+
+        let first = render(&mut app, 65, 9);
+        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("Enter next, then save"), "{first}");
+        assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
+        assert!(!first.contains("ab界"), "{first}");
+        let form = app.settings_form.as_ref().unwrap();
+        let original_index = form.idx;
+        let original_cursor = form.fields[original_index].input.cursor_byte();
+        let original_top = form.viewport.get().top;
+
+        app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            original_top
+        );
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageUp));
+        }
+        let intro = render(&mut app, 65, 9);
+        assert!(intro.contains("review row 00"), "{intro}");
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageDown));
+        }
+        let tail = render(&mut app, 65, 9);
+        assert!(tail.contains("fixture error at end"), "{tail}");
+        assert!(tail.contains("Enter next, then save"), "{tail}");
+        let form = app.settings_form.as_ref().unwrap();
+        assert_eq!(form.idx, original_index);
+        assert_eq!(
+            form.fields[original_index].input.cursor_byte(),
+            original_cursor
+        );
+        assert_eq!(form.fields[original_index].input, masked);
+        assert_eq!(form.error.as_deref(), Some("fixture error at end"));
+        assert!(sent.try_recv().is_err());
+
+        app.key(key(KeyCode::Left));
+        let followed = render(&mut app, 65, 9);
+        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(!followed.contains("ab界"), "{followed}");
+        app.paste("X");
+        let edited = render(&mut app, 65, 9);
+        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(!edited.contains("ab界"), "{edited}");
+        app.key(key(KeyCode::Tab));
+        let next_field = render(&mut app, 65, 9);
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, original_index + 1);
+        assert!(next_field.contains("› base_url"), "{next_field}");
+        assert!(sent.try_recv().is_err());
+    }
+
+    fn render_only_settings_form(form: &settings::Form, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings_form(frame, form, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn settings_form_reflows_wide_graphemes_and_keeps_the_tiny_footer_reachable() {
+        let mut form = settings::Form::provider(None);
+        let value = format!("{} end", "界e\u{301}".repeat(65));
+        form.fields[0].input.set(&value);
+        for (width, height) in [(60, 18), (27, 8), (1, 1), (15, 2), (60, 20)] {
+            let screen = render_only_settings_form(&form, width, height);
+            let viewport = form.viewport.get();
+            assert!(viewport.top <= viewport.max_top);
+            assert!(viewport.page > 0 && viewport.page <= usize::from(height));
+            assert!(screen.contains('▏'), "{width}x{height}: {screen}");
+        }
+        let screen = render_only_settings_form(&form, 60, 20);
+        assert!(
+            screen.contains("e\u{301}") && screen.contains("end▏"),
+            "{screen}"
+        );
+        assert!(screen.contains("Enter next, then save"), "{screen}");
+        render_only_settings_form(&form, 15, 2);
+        let mut viewport = form.viewport.get();
+        for _ in 0..viewport.max_top {
+            viewport.page(true);
+        }
+        form.viewport.set(viewport);
+        let tail = render_only_settings_form(&form, 15, 2);
+        assert!(
+            tail.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("Esc cancel"),
+            "{tail}"
+        );
+        assert_eq!(form.fields[0].input, value.as_str());
+        assert_eq!(form.idx, 0);
+    }
+
+    #[test]
+    fn settings_form_preserves_wide_text_at_narrow_and_right_edges() {
+        for width in 2..=5 {
+            let mut form = settings::Form::provider(None);
+            form.fields[0].input.set("a界");
+            let screen = render_only_settings_form(&form, width, 16);
+            assert!(screen.contains('界'), "{width} columns: {screen}");
+        }
+        for width in 2..=8 {
+            let value = format!("{}界", "a".repeat(usize::from(width - 1)));
+            let rows = settings_form_rows(Line::raw(&value), width);
+            assert_eq!(
+                rows.iter().map(ToString::to_string).collect::<String>(),
+                value,
+                "{width} columns"
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
+
+    #[test]
     fn active_settings_form_owns_tabs_after_overlays_without_hidden_form_capture() {
         let mut app = test_app();
         let (client, sent) = DaemonClient::recording();
@@ -23334,6 +24121,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             cursors
         );
+        render(&mut app, 65, 9);
+        let form_top = app.settings_form.as_ref().unwrap().viewport.get().top;
         app.pager = Some(Pager {
             title: "overlay".into(),
             lines: vec!["first".into()],
@@ -23344,7 +24133,12 @@ mod tests {
         });
         app.key(key(KeyCode::Tab));
         app.key(key(KeyCode::BackTab));
+        app.key(key(KeyCode::PageDown));
         assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            form_top
+        );
         assert!(app.pager.is_some());
         assert_eq!(app.view, View::Settings);
         assert!(
@@ -25634,6 +26428,243 @@ mod tests {
     }
 
     #[test]
+    fn pager_search_finds_help_and_cycles_matching_lines() {
+        let mut app = test_app();
+        app.slash("help");
+        assert!(render(&mut app, 64, 8).contains("/ find"));
+        app.key(key(KeyCode::Char('/')));
+        app.paste("/mcp");
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 64, 8);
+        assert!(screen.contains("match 1/") && screen.contains("/mcp"));
+
+        app.pager = Some(Pager {
+            title: "fixture".into(),
+            lines: (0..24)
+                .map(|i| {
+                    if [3, 11, 21].contains(&i) {
+                        format!("needle {i:02} needle")
+                    } else {
+                        format!("row {i:02}")
+                    }
+                })
+                .collect(),
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Char('/')));
+        app.paste("needle");
+        app.key(key(KeyCode::Enter));
+        let enter = key(KeyCode::Enter);
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        for (movement, index, row) in [
+            (None, 1, 3),
+            (Some(enter), 2, 11),
+            (Some(shift_enter), 1, 3),
+            (Some(shift_enter), 3, 21),
+            (Some(key(KeyCode::Char('n'))), 1, 3),
+            (Some(key(KeyCode::Char('n'))), 2, 11),
+            (Some(key(KeyCode::Char('N'))), 1, 3),
+            (Some(key(KeyCode::Char('N'))), 3, 21),
+        ] {
+            if let Some(movement) = movement {
+                app.key(movement);
+            }
+            let screen = render(&mut app, 52, 6);
+            assert!(screen.contains(&format!("match {index}/3")), "{screen}");
+            assert!(screen.contains(&format!("needle {row:02}")), "{screen}");
+            let footer = screen.lines().last().unwrap();
+            assert!(footer.contains("needle") && footer.contains("Enter/Shift+Enter"));
+        }
+    }
+
+    #[test]
+    fn pager_search_owns_literal_keys_and_paste_in_each_review() {
+        for branch in [false, true] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set("unsent fixture");
+            let (title, lines, needle) = if branch {
+                let (basis, preview) = branch_summary::fixture();
+                let lines = branch_summary::review_lines(&basis, &preview);
+                app.current = Some(preview.target_id.clone());
+                app.branch_summary.intent =
+                    Some((basis.source_id.clone(), basis.target_id.clone()));
+                app.branch_summary.basis = Some(basis);
+                app.branch_summary.review = Some(preview);
+                (
+                    "Branch summary · review exact note",
+                    lines,
+                    "Exact candidate note",
+                )
+            } else {
+                app.reviewing = Some("proposal-fixture".into());
+                (
+                    "proposal review",
+                    vec!["fixture match".into()],
+                    "fixture match",
+                )
+            };
+            app.pager = Some(Pager {
+                title: title.into(),
+                lines,
+                top: 0,
+                left: 0,
+                viewport: Default::default(),
+                styled: vec![],
+            });
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            app.key(key(KeyCode::Char('/')));
+            app.paste(needle);
+            app.key(key(KeyCode::Enter));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            let top = app.pager.as_ref().unwrap().top;
+
+            app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            for letter in "qgjarin".chars() {
+                app.key(key(KeyCode::Char(letter)));
+            }
+            app.paste("arqi\r\nไทย");
+            app.paste("e\u{301}");
+            app.key(key(KeyCode::Backspace));
+            let screen = render(&mut app, 62, 8);
+            assert!(screen.contains("Enter find · Esc cancel"), "{screen}");
+            assert!(screen.contains("qgjarinarqi ไทย▏"), "{screen}");
+            assert_eq!(app.pager.as_ref().unwrap().top, top);
+            assert!(
+                sent.try_recv().is_err(),
+                "query keys and paste must emit no requests"
+            );
+
+            app.key(key(KeyCode::Esc));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            assert_eq!(app.reviewing.is_some(), !branch);
+            app.paste("arqi");
+            assert!(sent.try_recv().is_err());
+            app.key(key(KeyCode::Esc));
+            assert!(app.pager.is_none() && app.reviewing.is_none());
+            assert!(app.branch_summary.review.is_none() && app.branch_summary.intent.is_none());
+            assert_eq!(app.input, "unsent fixture");
+        }
+    }
+
+    #[test]
+    fn pager_search_reveals_a_styled_unicode_match_after_resize() {
+        let mut app = test_app();
+        let prefix = "x".repeat(45);
+        let styled = Line::from(vec![
+            Span::styled("1 │ ", Style::default().fg(Color::Blue)),
+            Span::styled(prefix.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("Stra", Style::default().fg(Color::Red)),
+            Span::styled("ße ไทย", Style::default().fg(Color::Green)),
+            Span::styled(" tail", Style::default().fg(Color::Yellow)),
+        ]);
+        app.pager = Some(Pager {
+            title: "code fixture".into(),
+            lines: vec![styled.to_string()],
+            top: 0,
+            left: 0,
+            viewport: pager_view::View::with_gutter(4),
+            styled: vec![styled],
+        });
+        app.key(key(KeyCode::Char('/')));
+        app.paste("STRASSE\r\nไทย");
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 80, 8);
+        assert!(screen.contains("match 1/1") && screen.contains("Straße ไทย"));
+        assert_eq!(app.pager.as_ref().unwrap().left, 0);
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "1");
+        assert!(!buffer[(1, 1)].modifier.contains(Modifier::REVERSED));
+        for (symbol, color) in [("S", Color::Red), ("ß", Color::Green)] {
+            let cell = (5..23)
+                .map(|x| &buffer[(x, 1)])
+                .find(|cell| cell.symbol() == symbol)
+                .unwrap();
+            assert_eq!(cell.fg, color);
+            assert!(cell
+                .modifier
+                .contains(Modifier::UNDERLINED | Modifier::REVERSED));
+        }
+        let tail = (5..23)
+            .map(|x| &buffer[(x, 1)])
+            .find(|cell| cell.fg == Color::Yellow && cell.symbol() == "t")
+            .unwrap();
+        assert!(!tail.modifier.contains(Modifier::REVERSED));
+        let revealed = app.pager.as_ref().unwrap().left;
+        assert!(revealed > 0);
+        app.key(key(KeyCode::Left));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.pager.as_ref().unwrap().left, revealed - 8);
+        assert!(!term.backend().buffer()[(1, 1)]
+            .modifier
+            .contains(Modifier::REVERSED));
+
+        app.key(key(KeyCode::Char('/')));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste("missing");
+        app.key(key(KeyCode::Enter));
+        assert!(render(&mut app, 24, 8).contains("no match"));
+        app.key(key(KeyCode::Char('n')));
+        assert!(render(&mut app, 24, 8).contains("no match"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run only by the owned synthetic PTY driver"]
+    fn pager_search_owned_pty_fixture() {
+        use std::io::IsTerminal;
+
+        assert_eq!(std::env::var("PAGER_PTY_FIXTURE").as_deref(), Ok("1"));
+        assert!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+        struct RawMode;
+        impl Drop for RawMode {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode().unwrap();
+        let _raw = RawMode;
+        let mut app = test_app();
+        let prefix = "x".repeat(45);
+        let content = format!(
+            "{prefix}ไทย first\n{}{prefix}ไทย second",
+            "fixture row\n".repeat(12)
+        );
+        app.pager = Some(code_pager("PTY search fixture", &content, false));
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        for phase in 0..=9 {
+            terminal.clear().unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            print!("\r\nPAGER-FRAME-{phase}\r\n");
+            std::io::stdout().flush().unwrap();
+            if app.pager.is_none() {
+                assert_eq!(phase, 9);
+                return;
+            }
+            assert!(
+                event::poll(Duration::from_secs(5)).unwrap(),
+                "phase {phase}"
+            );
+            match event::read().unwrap() {
+                CtEvent::Key(key) => app.key(key),
+                CtEvent::Paste(text) => app.paste(&text),
+                CtEvent::Resize(_, _) => app.resized(),
+                event => panic!("unexpected event in phase {phase}: {event:?}"),
+            }
+        }
+        panic!("pager did not close");
+    }
+
+    #[test]
     fn pager_moves_by_visible_rows_and_clamps_the_bottom_after_resize() {
         let mut app = test_app();
         app.pager = Some(Pager {
@@ -25942,7 +26973,7 @@ mod tests {
                 "t",
                 "tool",
                 serde_json::json!({"diff": diff, "ok": true}).to_string(),
-                serde_json::json!({"tool_call_id": "c1"}),
+                serde_json::json!({"tool_call_id": "c1", "is_error": false}),
             ),
         ];
         let screen = render(&mut app, 100, 20);
@@ -26081,7 +27112,9 @@ mod tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw_panes(frame, frame.area(), app))
+            .draw(|frame| {
+                draw_panes(frame, frame.area(), app);
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows = |start, end| {
@@ -26696,6 +27729,309 @@ mod tests {
         assert_eq!(short_dir("/a/b"), "/a/b");
         #[cfg(unix)]
         assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
+    }
+
+    #[test]
+    fn list_help_lists_real_bindings_and_preserves_the_view_and_draft() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("synthetic draft");
+        app.input.prepare_selection(true);
+        app.input.left();
+        let cursor = app.input.cursor_byte();
+        let selection = app.input.selection();
+        app.session_idx = 2;
+        app.tool_idx = 3;
+        app.search_idx = 4;
+        app.proposal_idx = 5;
+        app.click_targets
+            .borrow_mut()
+            .push((Rect::new(0, 0, 8, 1), Click::View(View::Chat)));
+        for (view, title, expected) in [
+            (View::Sessions, "Sessions keys", "T  session tree"),
+            (
+                View::Tools,
+                "Tools keys",
+                "z/Z  fold selected group / unfold all",
+            ),
+            (View::Metrics, "Metrics keys", "f  forecast versus actual"),
+            (View::Proposals, "Proposals keys", "Enter  review"),
+            (View::Search, "Search keys", "Enter  open"),
+        ] {
+            app.view = view;
+            app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+            let pager = app.pager.as_ref().unwrap();
+            assert_eq!(pager.title, title);
+            assert!(pager.lines.iter().any(|line| line == expected));
+            for hint in keys::table(view) {
+                assert!(pager
+                    .lines
+                    .contains(&format!("{}  {}", hint.keys, hint.action)));
+            }
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.selecting_draft = true;
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(!app.selecting_draft);
+            assert_eq!(app.view, view);
+            app.key(key(KeyCode::Char('?')));
+            assert_eq!(app.pager.as_ref().unwrap().title, title);
+            app.key(key(if view == View::Sessions {
+                KeyCode::Char('q')
+            } else {
+                KeyCode::Esc
+            }));
+            assert!(app.pager.is_none());
+            assert_eq!(app.view, view);
+            assert_eq!(
+                (
+                    app.session_idx,
+                    app.tool_idx,
+                    app.search_idx,
+                    app.proposal_idx
+                ),
+                (2, 3, 4, 5)
+            );
+            assert_eq!(app.current.as_deref(), Some("s1"));
+            assert_eq!(app.input, "synthetic draft");
+            assert_eq!(app.input.cursor_byte(), cursor);
+            assert_eq!(app.input.selection(), selection);
+        }
+        assert!(sent.try_recv().is_err(), "context help sends no requests");
+    }
+
+    #[test]
+    fn list_help_respects_filters_and_existing_overlay_keys() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            app.key(key(KeyCode::Char('/')));
+            app.key(key(KeyCode::Char('?')));
+            let filter = match view {
+                View::Sessions => &app.session_filter,
+                View::Tools => &app.tool_filter,
+                _ => &app.proposal_filter,
+            };
+            assert_eq!(filter.query, "?");
+            assert!(filter.editing && app.pager.is_none());
+            app.key(key(KeyCode::Esc));
+        }
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.reviewing = Some("awaiting-proposal".into());
+        app.request(
+            Pending::ProposalDiff,
+            Request::ProposalDiff {
+                id: "awaiting-proposal".into(),
+            },
+        );
+        let diff: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_none());
+        assert_eq!(app.reviewing.as_deref(), Some("awaiting-proposal"));
+
+        tx.send(ServerMessage::err(diff.id, "synthetic diff failure".into()))
+            .unwrap();
+        app.drain_daemon();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_some() && app.reviewing.is_none());
+        app.key(key(KeyCode::Char('a')));
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_some());
+        app.key(key(KeyCode::Esc));
+
+        app.view = View::Sessions;
+        app.delete_arm = Some("s1".into());
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.delete_arm.is_none() && app.pager.is_none());
+        assert_eq!(app.notes.last().unwrap(), "delete cancelled");
+
+        app.on_event(reconnect_approval("fixture", "s1"));
+        let explanation = app.approval_explain;
+        app.key(key(KeyCode::Char('?')));
+        assert_ne!(app.approval_explain, explanation);
+        assert!(app.pager.is_none());
+        assert_eq!(app.approvals.len(), 1);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn list_help_marker_survives_a_busy_narrow_status_row() {
+        let mut app = test_app();
+        app.view = View::Tools;
+        app.model_label.clear();
+        let screen = render(&mut app, 40, 16);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("Enter detail") && footer.contains("? more"),
+            "{footer}"
+        );
+
+        app.model_label = "synthetic-model-label".repeat(5);
+        app.context_fill.insert("s1".into(), (70, 100));
+        for view in [
+            View::Sessions,
+            View::Tools,
+            View::Metrics,
+            View::Proposals,
+            View::Search,
+        ] {
+            app.view = view;
+            for width in [40, 60, 80] {
+                let screen = render(&mut app, width, 16);
+                let footer = screen.lines().last().unwrap();
+                assert!(
+                    footer.contains("? more") && footer.contains("ctx 70%"),
+                    "{view:?} {width}: {footer}"
+                );
+            }
+        }
+    }
+
+    fn send_fixture_search(app: &mut App, sent: &mpsc::Receiver<String>, query: &str) -> u64 {
+        app.slash("search");
+        app.input.set(query);
+        app.submit_chat(false);
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            envelope.request,
+            Request::SearchSessions { query: text, limit: Some(50) } if text == query
+        ));
+        envelope.id
+    }
+
+    fn fixture_search_hit(seq: i64) -> SearchHit {
+        SearchHit {
+            session_id: "synthetic".into(),
+            session_name: "Fixture".into(),
+            message_id: format!("m{seq}"),
+            seq,
+            role: "user".into(),
+            snippet: "capped fixture text".into(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn search_results_follow_the_matching_reply_and_preserve_daemon_order() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let first = send_fixture_search(&mut app, &sent, "first query");
+        let second = send_fixture_search(&mut app, &sent, "second query");
+        branch_summary_reply(&tx, second, serde_json::json!([]));
+        branch_summary_reply(&tx, first, serde_json::json!([fixture_search_hit(93)]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Search);
+        assert!(app.search_hits.is_empty());
+        let screen = render(&mut app, 85, 18);
+        assert!(screen.contains("No hits for “second query”"), "{screen}");
+        assert!(!screen.contains("first query"), "{screen}");
+        assert!(!screen.contains("more may exist"), "{screen}");
+
+        for count in [2, 50] {
+            app.key(key(KeyCode::Esc));
+            let current = send_fixture_search(&mut app, &sent, "capped fixture");
+            assert_eq!(app.search_context.as_ref().unwrap().limit, 50);
+            let hits: Vec<_> = (0..count).rev().map(fixture_search_hit).collect();
+            branch_summary_reply(&tx, current, serde_json::to_value(&hits).unwrap());
+            app.drain_daemon();
+            assert_eq!(app.view, View::Search);
+            assert_eq!(app.search_hits, hits);
+            assert_eq!(app.search_idx, 0);
+            let screen = render(&mut app, 85, 18);
+            assert!(
+                screen.contains(&format!("Search ({count} hits)")),
+                "{screen}"
+            );
+            assert_eq!(screen.contains("more may exist"), count == 50, "{screen}");
+            assert!(screen.contains("capped fixture"), "{screen}");
+            render(&mut app, 14, 9);
+        }
+
+        app.key(key(KeyCode::Esc));
+        let malformed = send_fixture_search(&mut app, &sent, "malformed");
+        branch_summary_reply(&tx, malformed, serde_json::json!({"query":"wrong shape"}));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(app.search_context.as_ref().unwrap().query, "capped fixture");
+        assert_eq!(app.search_hits.len(), 50);
+    }
+
+    #[test]
+    fn search_replies_and_timeouts_do_not_interrupt_newer_views_or_sessions() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let requests: Vec<_> = ["before move", "stale error", "stale timeout"]
+            .into_iter()
+            .map(|query| send_fixture_search(&mut app, &sent, query))
+            .collect();
+        app.open_view(View::Sessions);
+        let list: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(list.request, Request::ListSessions));
+        branch_summary_reply(&tx, list.id, serde_json::json!([]));
+        app.open_view(View::Chat);
+        app.pending_since.insert(
+            requests[2],
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        let notes_before = app.notes.clone();
+        branch_summary_reply(&tx, requests[0], serde_json::json!([]));
+        tx.send(ServerMessage::Response {
+            id: requests[1],
+            ok: false,
+            result: None,
+            error: Some("obsolete fixture error".into()),
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.notes, notes_before);
+
+        let before_suggestion = send_fixture_search(&mut app, &sent, "before suggestion");
+        app.slash("rename auto");
+        let suggest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(suggest.request, Request::SuggestSessionName { id } if id == "s1"));
+        branch_summary_reply(&tx, before_suggestion, serde_json::json!([]));
+        branch_summary_reply(
+            &tx,
+            suggest.id,
+            serde_json::json!({"name":"Synthetic suggestion"}),
+        );
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(render(&mut app, 85, 18).contains("Synthetic suggestion"));
+        assert!(app.search_context.is_none());
+        app.key(key(KeyCode::Esc));
+
+        let before_switch = send_fixture_search(&mut app, &sent, "before switch");
+        app.switch_session("other".into());
+        app.switch_session("s1".into());
+        branch_summary_reply(&tx, before_switch, serde_json::json!([]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.current.as_deref(), Some("s1"));
     }
 
     fn branch_summary_test_app() -> (
@@ -28190,7 +29526,7 @@ mod tests {
         app.run_usage.insert("s1".into(), usage.clone());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(300, 1)).unwrap();
         terminal
-            .draw(|frame| draw_status(frame, frame.area(), &app))
+            .draw(|frame| draw_status(frame, frame.area(), &app, None))
             .unwrap();
         let status = terminal
             .backend()
@@ -28737,6 +30073,16 @@ mod tests {
         app.current = Some("mention-session".into());
         let (client, sent) = DaemonClient::recording();
         app.client = Some(client);
+        std::fs::write(root.join(".psql_history"), "synthetic fixture").unwrap();
+        app.input.set("read @.psql_history");
+        assert!(render(&mut app, 180, 24).contains("[@.psql_history · not sent: credential]"));
+        assert!(app.forecast_input().attachments.is_empty());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("my", root.join("psql_history")).unwrap();
+            app.input.set("read @psql_history");
+            assert!(app.forecast_input().attachments.is_empty());
+        }
         app.input.set("read @\"my notes/report.md\"");
         assert!(render(&mut app, 180, 24).contains("[@my notes/report.md]"));
         let input = app.forecast_input();
@@ -31759,7 +33105,15 @@ mod tests {
         app.color = true;
         let call = ("call".into(), "edit_file".into(), "{}".into());
         let diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
-        let result = serde_json::json!({"diff":diff}).to_string();
+        let result = MessageInfo {
+            id: "result".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "tool".into(),
+            content: serde_json::json!({"diff":diff}).to_string(),
+            created_at: String::new(),
+            meta: Some(serde_json::json!({"is_error":false}).to_string()),
+        };
         let rows = tool_call_block(&app, &call, Some(&result));
         let text = rows
             .iter()
@@ -31778,7 +33132,12 @@ mod tests {
                 .unwrap();
             assert!(span.style.add_modifier.contains(Modifier::BOLD));
         }
-        let failed = tool_call_block(&app, &call, Some("error: private fixture"));
+        let failed_result = MessageInfo {
+            content: "private fixture".into(),
+            meta: Some(serde_json::json!({"is_error":true}).to_string()),
+            ..result.clone()
+        };
+        let failed = tool_call_block(&app, &call, Some(&failed_result));
         assert!(failed[0].to_string().contains("fail ✗"));
         app.color = false;
         let plain = tool_call_block(&app, &call, Some(&result));
@@ -31791,6 +33150,90 @@ mod tests {
             text
         );
     }
+
+    #[test]
+    fn stored_tool_outcomes_drive_grouped_and_standalone_results() {
+        use serde_json::json;
+
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.color = true;
+        app.expanded_calls.insert("call".into());
+        let assistant = MessageInfo {
+            id: "assistant".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: String::new(),
+            created_at: String::new(),
+            meta: Some(
+                json!({"tool_calls":[
+                    {"id":"call","function":{"name":"fixture_tool","arguments":"{}"}}
+                ]})
+                .to_string(),
+            ),
+        };
+        for (content, flag, failed) in [
+            ("validation rejected", Some(json!(true)), true),
+            (
+                "Error is the title of the report",
+                Some(json!(false)),
+                false,
+            ),
+            (r#"{"body":{"ok":false}}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(null)), false),
+            (r#" { "ok" : false } "#, None, true),
+            (r#"{"body":{"ok":false}}"#, None, false),
+            ("  ERROR: legacy failure", None, true),
+        ] {
+            let mut meta = json!({"tool_call_id":"call"});
+            if let Some(flag) = flag {
+                meta["is_error"] = flag;
+            }
+            let grouped = MessageInfo {
+                id: "grouped".into(),
+                seq: 2,
+                role: "tool".into(),
+                content: content.into(),
+                meta: Some(meta.to_string()),
+                ..assistant.clone()
+            };
+            meta["tool_call_id"] = json!("orphan");
+            let orphan = MessageInfo {
+                id: "orphan".into(),
+                seq: 3,
+                meta: Some(meta.to_string()),
+                ..grouped.clone()
+            };
+            app.messages = vec![assistant.clone(), grouped, orphan];
+
+            let chat = chat_lines(&app, 100, 40);
+            let header = chat.lines[chat.call_lines[0].0].to_string();
+            assert!(
+                header.contains(if failed { "fail ✗" } else { "ok ✓" }),
+                "{content} {meta}: {header}"
+            );
+            let heading = if failed { "    error" } else { "    result" };
+            assert!(
+                chat.lines.iter().any(|line| line.to_string() == heading),
+                "{content} {meta}: missing expanded {heading} label"
+            );
+            let arrow = chat
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "  ↳ ")
+                .unwrap();
+            let style = if failed {
+                bold_fg(true, Color::Red)
+            } else {
+                fg(true, Color::Yellow)
+            };
+            assert_eq!(arrow.style, style, "{content} {meta}");
+        }
+    }
+
     #[test]
     fn colorblind_approval_broad_warning_keeps_identity_and_keys_without_color() {
         let _theme = theme::test_theme("colorblind");

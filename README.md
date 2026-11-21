@@ -354,7 +354,7 @@ multi-digit `$10` do not add required arguments.
 
 For red/green colour blindness, set `formless config set tui.theme colorblind`
 (or choose **colorblind** in Settings). The TUI and CLI share an Okabe–Ito-derived
-blue/orange status palette. Diffs keep bold `+`/`-` gutters; CLI status cells add
+blue/orange status palette that adapts to the terminal background. Diffs keep bold `+`/`-` gutters; CLI status cells add
 `ok`, `warn`, and `fail` markers when this theme is active or colour is disabled.
 `NO_COLOR` suppresses ANSI styling without removing status information; printable
 Unicode is preserved. JSON output retains its original machine-readable values.
@@ -418,8 +418,9 @@ can exceed the remaining amount. Unknown spend or pricing pauses further calls.
 A budget stop exits 1 and reports observed usage cost on stderr. Stopped pipeline
 Runs must be resubmitted with their options; `/resume` cannot recover ephemeral
 instructions. `--output-file` leaves stdout empty and atomically replaces the
-file only after successful output (at most 8 MiB); failure leaves the previous
-file intact.
+file only after successful output (at most 8 MiB). An existing output keeps
+its Unix access bits and group or its Windows DACL. New files are private.
+A write failure leaves the previous file intact.
 
 Schema files and `--schema -` accept one leading UTF-8 BOM; the 64 KiB input
 limit includes those bytes. With `--schema --output json`, the envelope keeps
@@ -556,6 +557,8 @@ formless tools list       # registry inspection (also export / import)
 formless tools show fetch_page                       # description, schemas, versions, stats
 formless tools reviews                               # retained description warnings and diffs
 formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
+formless tools run fetch_page --input-file request.json
+printf '%s' '{"url":"https://example.com"}' | formless tools run fetch_page --input-file -
 formless reset --force    # destructive: config, key, whole data dir
 ```
 
@@ -722,7 +725,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--text`, `--print`, `--keys` | Read bundled Markdown, open the current online guide (gallery by default), print its URL, or print the keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
-| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE`, `--overwrite` | Write a portable setup bundle, optionally including Session transcripts. To replace a file, pass `--overwrite` with `--output`. |
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
@@ -734,7 +737,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
-| `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
+| `formless prices` | `import`, `list` | Import a model-price catalog or inspect prices and configured model references offline. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
 | `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
