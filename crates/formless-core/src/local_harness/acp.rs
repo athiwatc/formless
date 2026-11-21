@@ -57,6 +57,9 @@ pub struct AgentSpec {
     pub read_only_fail_closed: bool,
     /// Extra variables removed from the agent environment, besides the bridge's.
     pub strip_env: &'static [&'static str],
+    /// Variables set on the agent process after the request environment, e.g. to turn
+    /// off a self-updater.
+    pub set_env: &'static [(&'static str, &'static str)],
     /// Identifies approval requests for the Formless bridge's own tools, which review
     /// runs may approve whatever their kind.
     pub bridge_tool: fn(&Value) -> bool,
@@ -233,6 +236,7 @@ impl AgentProcess {
                     .iter()
                     .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
             }))
+            .envs(spec.set_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
