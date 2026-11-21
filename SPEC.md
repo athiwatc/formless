@@ -7121,3 +7121,95 @@ requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
 memory, scoped to the current attempt and the exact kind/title/input, never
 persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
 permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.
+
+topic_run_step launches asynchronously and returns {attempt_id,
+conversation_session_id}. Independent features can run concurrently; a feature
+still permits only one active step. topic_wait {attempt_ids?, timeout_secs?}
+waits for a finished attempt, a question or an informational permission notice.
+timeout_secs defaults to 600 and must be in 1..=600. An empty selection or no
+active work returns a snapshot immediately. Attempt IDs are scoped to this
+topic; completion and user-only informational notices are consumed once per
+Topic Chat daemon lifetime. Ordinary harness questions remain pending until
+answered. Cancellation and daemon shutdown unblock waits. There is no child
+model run. Normal model-run completion with open work marks NeedsUser and
+appends a durable "send a message to continue" note; harnesses may continue,
+but no model follow-up is started automatically. Run interruption/error
+cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.
+
+SetTopicLimits is a user/client-only persisted control. Defaults allow three
+retries after the first attempt of a feature+trimmed step title, and twenty
+attempts across a topic. Both values accept the full u32 range; zero retries
+still allows the first attempt, while zero total attempts blocks all launches.
+Caps are checked atomically at launch, including concurrent launches. Hitting
+a cap refuses launch, marks the topic and feature NeedsUser, and raises a
+user_only question: "Raise limit and continue" or "Stop". Model answers are
+rejected. Raising increments the hit cap by its default (3 or 20, saturating)
+and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
+a model or harness automatically. SetTopicLimits itself changes limits only.
+
+ListHarnesses refreshes all seven kinds concurrently. Every probe is capped at
+10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
+detail "probe timed out". A harness is ready iff installed and signed_in is
+not Some(false): unknown auth is ready. Planning receives fresh availability,
+and each step refreshes its selected harness before launching. Claude uses
+--version and auth status; Codex uses --version and login status. Neither sends
+a model turn, and no auth output is copied into detail or logs.
+
+Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
+and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
+ACP and Muse have dedicated dispatch arms currently reporting lookup-only
+availability with unknown auth. Adapter owners can replace those fallbacks
+with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+probe initializes and creates a session with no MCP servers in a private
+temporary cwd, never prompts, maps configured auth errors, and kills its
+process group on success, failure or timeout.
+
+topic_request_harness_substitute raises a user_only question with "Sign in and
+retry", "Use <substitute>", and "Skip step". Model answers are rejected.
+Only a user's Use answer records an approval for that topic, feature and
+trimmed step title; the next successful launch consumes it. A request to run
+the wanted harness then uses the explicitly approved substitute, which must
+itself be ready. Formless never substitutes without that approval. Other
+answers and cancellation record no approval and start no work.
+
+Terminal topic transitions close pending limit/substitute decisions with
+UserQuestionClosed answered_by=None. Finalizing one feature also closes its
+own decisions while leaving sibling work alone. Closed decisions no longer
+keep the daemon busy or leave stale user prompts.
