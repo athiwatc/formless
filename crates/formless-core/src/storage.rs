@@ -2176,6 +2176,26 @@ impl Store {
             .optional()?)
     }
 
+    pub(crate) fn recent_topic_messages(&self, session_id: &str) -> Result<Vec<Value>> {
+        let mut stmt = self.ps(
+            "SELECT id, seq, CASE WHEN length(CAST(content AS BLOB)) <= 4096 THEN content END
+             FROM messages WHERE session_id=?1 AND role='user' ORDER BY seq DESC LIMIT 8",
+        )?;
+        let mut rows = stmt
+            .query_map(params![session_id], |row| {
+                let content = row.get::<_, Option<String>>(2)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "seq": row.get::<_, i64>(1)?,
+                    "content_omitted": content.is_none(),
+                    "content": content,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     /// Fork source prefix, decoded within the existing fork transaction.
     fn list_messages_up_to(&self, session_id: &str, limit: i64) -> Result<Vec<MessageInfo>> {
         let mut statement = self
@@ -7763,6 +7783,8 @@ impl ContextCache {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<BuiltContext> {
+        let system_prompt =
+            crate::main_topic_suggestions::system_prompt(store, session_id, system_prompt)?;
         let (checkpoint, summary, up_to) = store
             .latest_checkpoint_record(session_id)?
             .unwrap_or_default();
@@ -7777,7 +7799,7 @@ impl ContextCache {
             // proxies reject a second or mid-conversation `system` (§11
             // summary included).
             let system = if summary.is_empty() {
-                crate::provenance::mandatory_system(system_prompt)
+                crate::provenance::mandatory_system(&system_prompt)
             } else {
                 let origins =
                     store.data_origins(session_id, &format!("checkpoint:{checkpoint}"))?;
