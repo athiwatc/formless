@@ -598,8 +598,14 @@ mod access_tests {
                     assert!(args.windows(2).any(|p| p == ["--sandbox", "read-only"]));
                 }
             } else if kind == HarnessKind::OpenCode {
-                assert!(command_spec(&request).unwrap_err().to_string().contains("opencode::run"));
-                assert!(parse_output(kind, "{}").unwrap_err().to_string().contains("ACP"));
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("opencode::run"));
+                assert!(parse_output(kind, "{}")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ACP"));
             } else {
                 assert!(command_spec(&request)
                     .unwrap_err()
