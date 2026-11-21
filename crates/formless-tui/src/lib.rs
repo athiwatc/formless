@@ -835,7 +835,7 @@ impl Wizard {
         // Remember previous startup options: a saved config starts at the
         // API-key step (Esc returns to the URL), with model/effort restored.
         let has_saved = !cfg.provider.base_url.trim().is_empty();
-        let preset = formless_core::presets::for_url(&cfg.provider.base_url);
+        let preset = formless_core::presets::for_provider(&cfg.provider);
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
@@ -1121,6 +1121,14 @@ impl Wizard {
         self.status = status;
     }
 
+    fn apply_provider_endpoint(&self, provider: &mut formless_core::config::ProviderCfg) {
+        provider.base_url = self.base_url.trim().to_string();
+        provider.preset = self.preset.map(|preset| preset.id.to_string());
+        if let Some(preset) = self.preset {
+            provider.api_style = preset.api_style.to_string();
+        }
+    }
+
     /// List the endpoint's models in the background (`FetchModels`).
     fn fetch_models(&mut self) {
         if !self.normalize_key() {
@@ -1131,12 +1139,10 @@ impl Wizard {
         let generation = self.generation;
         self.step = WizardStep::FetchModels;
         self.status = format!("Fetching models from {}…", self.base_url.trim());
-        let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
-        cfg.provider.base_url = self.base_url.trim().to_string();
-        if let Some(p) = self.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
-        let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
+        let tx = self.job_tx.clone();
+        let mut pcfg = formless_core::config::ProviderCfg::default();
+        self.apply_provider_endpoint(&mut pcfg);
+        let key = self.api_key.clone();
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
                 generation,
@@ -1167,10 +1173,16 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
-        let endpoint = self
-            .local_offer_for(p.id)
-            .map(|offer| offer.base_url.clone())
-            .unwrap_or_else(|| p.base_url.to_string());
+        let endpoint = if p.local
+            && self.preset.is_some_and(|old| old.id == p.id)
+            && !self.base_url.trim().is_empty()
+        {
+            self.base_url.trim().to_string()
+        } else {
+            self.local_offer_for(p.id)
+                .map(|offer| offer.base_url.clone())
+                .unwrap_or_else(|| p.base_url.to_string())
+        };
         if self.preset.map(|old| old.id) != Some(p.id)
             || self.credential_endpoint != endpoint.trim()
         {
@@ -8848,10 +8860,7 @@ impl App {
             w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
             return Ok(());
         }
-        cfg.provider.base_url = w.base_url.trim().to_string();
-        if let Some(p) = w.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
+        w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
         if w.prompt_fallback {
@@ -9084,13 +9093,8 @@ impl App {
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
-                    let pcfg = formless_core::config::ProviderCfg {
-                        base_url: w.base_url.trim().to_string(),
-                        api_style: w
-                            .preset
-                            .map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
-                        ..Default::default()
-                    };
+                    let mut pcfg = formless_core::config::ProviderCfg::default();
+                    w.apply_provider_endpoint(&mut pcfg);
                     let (key2, model) = (w.api_key.clone(), w.model());
                     std::thread::spawn(move || {
                         let _ = tx.send(WizardJob::Probe(

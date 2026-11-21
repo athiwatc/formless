@@ -1038,6 +1038,9 @@ pub struct ProviderCfg {
     /// Opt into paid background tests on model selection; explicit Test is independent.
     pub auto_test_models: bool,
     pub base_url: String,
+    /// The preset selected in setup, including for a discovered custom URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     pub extra_headers: HashMap<String, String>,
     /// Vendor request fields merged into every request body (Ollama's
     /// `options`, vLLM's `chat_template_kwargs`, OpenRouter's `provider`
@@ -1202,6 +1205,7 @@ impl Default for ProviderCfg {
         Self {
             auto_test_models: false,
             base_url: String::new(),
+            preset: None,
             extra_headers: HashMap::new(),
             extra_body: BTreeMap::new(),
             image_max_px: 1568,
