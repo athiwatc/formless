@@ -103,12 +103,14 @@ pub fn command_spec_with_extension(
         .to_str()
         .context("harness working directory must be valid UTF-8 for Pi")?;
     let server_name = format!("formless_{}", Uuid::new_v4().simple());
+    let restore_leading_at = request.prompt.starts_with('@');
     let mcp_config = json!({
         "name": server_name,
         "command": command,
         "args": request.mcp_args,
         "cwd": cwd,
         "envVars": request.mcp_env_vars,
+        "restoreLeadingAt": restore_leading_at,
     })
     .to_string();
 
@@ -139,7 +141,12 @@ pub fn command_spec_with_extension(
             format!("read,grep,find,ls,mcp__{server_name}__*").into(),
         ]);
     }
-    args.extend(["--".into(), request.prompt.as_str().into()]);
+    let prompt = if restore_leading_at {
+        format!("\n{}", request.prompt)
+    } else {
+        request.prompt.clone()
+    };
+    args.extend(["--".into(), prompt.into()]);
 
     let mut environment = request.environment.clone();
     environment.insert(OsString::from(MCP_CONFIG_ENV), OsString::from(mcp_config));
@@ -543,6 +550,37 @@ mod tests {
         let spec = command_spec_with_extension(&request, &extension).unwrap();
         assert_eq!(spec.program, PathBuf::from("pi"));
         assert!(!spec.args.iter().any(|arg| arg == "--model"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn command_spec_escapes_only_leading_at_prompts_for_literal_input_restoration() {
+        let (dir, extension) = staged_extension();
+        for prompt in [
+            "@alice please review the parser",
+            "@existing-file.txt",
+            "@@literal $HOME\nnext line",
+            "\n@alice keep the leading newline",
+            "Review @alice's parser",
+        ] {
+            let mut request = request(HarnessRole::Build);
+            request.prompt = prompt.into();
+            let spec = command_spec_with_extension(&request, &extension).unwrap();
+            let config: Value = serde_json::from_str(
+                spec.environment[&OsString::from(MCP_CONFIG_ENV)]
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let escaped = prompt.starts_with('@');
+            assert_eq!(config["restoreLeadingAt"], escaped);
+            let expected = if escaped {
+                format!("\n{prompt}")
+            } else {
+                prompt.to_owned()
+            };
+            assert_eq!(spec.args.last(), Some(&OsString::from(expected)));
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
