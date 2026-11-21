@@ -1005,13 +1005,16 @@
     try { return measure(); }
     finally { if (hidden) { if (display) node.style.setProperty("display", display, priority); else node.style.removeProperty("display"); node.style.visibility = visibility; } }
   }
-  function revealViewportControl(node, container, bounds) {
+  function revealViewportControl(node, container, bounds, { partial = false } = {}) {
     if (!node || !container || !container.contains(node)) return;
     const rect = node.getBoundingClientRect(), box = container.getBoundingClientRect();
     const top = Math.max(bounds.top, box.top) + 1, bottom = Math.min(bounds.bottom, box.bottom) - 1;
     if (rect.height <= bottom - top) {
       if (rect.top < top) container.scrollTop -= top - rect.top;
       else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
+    } else if (partial) {
+      if (rect.top > top) container.scrollTop += rect.top - top;
+      else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
   function positionPopover() {
@@ -1068,7 +1071,9 @@
     withTranscriptLayout(() => {
       root.setAttribute("data-visual-viewport", "");
       root.toggleAttribute("data-viewport-zoomed", zoomed);
-      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 24);
+      const keyboardShrankViewport = !zoomed && viewport.height < root.clientHeight - fontSize * 3;
+      const shortViewport = viewport.height < fontSize * (zoomed ? 28 : 24);
+      root.toggleAttribute("data-viewport-short", shortViewport || keyboardShrankViewport);
       root.toggleAttribute("data-viewport-composing", composing);
       viewportVariable("--visual-left", viewport.left);
       viewportVariable("--visual-top", viewport.top);
@@ -1113,8 +1118,13 @@
         positionJump(bounds, fontSize);
       }
       positionPopover();
-      const modal = activeDialog()?.node.querySelector(".modal") || document.activeElement?.closest(".pair-card");
-      if (modal) revealViewportControl(document.activeElement, modal, bounds);
+      const focused = document.activeElement;
+      const focusScrollport = activeDialog()?.node.querySelector(".modal") || focused?.closest(".pair-card");
+      if (focusScrollport) revealViewportControl(focused, focusScrollport, bounds);
+      else {
+        const chrome = focused?.closest(".topbar, .statusbar");
+        if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
+      }
     }, { newContent: false });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
@@ -2154,7 +2164,9 @@
         if (d.width && d.height) { img.width = d.width; img.height = d.height; }
         img.addEventListener("click", () => box.classList.toggle("zoom"));
         img.addEventListener("load", () => {
-          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+          // The decoded image may already have resized. Keep the reading
+          // anchor captured before that reflow, even after a recent scroll.
+          if (current() && $("transcript").contains(img)) settleReadingLayout();
         }, { once: true });
         update(() => {
           view.replaceChildren(img);

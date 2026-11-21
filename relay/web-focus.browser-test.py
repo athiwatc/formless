@@ -15,8 +15,10 @@ import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '/tmp/formless-817-browser')
+OUT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else artifact_dir('/tmp/formless-817-browser')
 OUT.mkdir(parents=True, exist_ok=True)
 PASSES = 0
 
@@ -271,7 +273,7 @@ def run():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+            browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox'])
             context = browser.new_context(viewport={'width':1280,'height':900}, reduced_motion='reduce')
             context.route('**/app.js', expose_script)
             page = context.new_page()
@@ -535,6 +537,35 @@ def run():
             check(page.locator('.popover').count()==0,'mobile nonfocusable outside click closes menu')
             check(page.evaluate('document.activeElement!==document.body && !document.activeElement.closest("#sidebar:not(.open)")'),'mobile outside click does not leave focus in closed drawer')
             check(page.locator('#sessions .menu').evaluate_all('(items)=>items.every(e=>getComputedStyle(e).visibility==="hidden")'),'closed mobile drawer menu descendants are hidden from Tab navigation')
+            # At large text size the toolbar wraps into its own scrollport.
+            # Drawer dismissal must bring an obscured return target back into view.
+            for height in (740, 200, 160):
+                page.set_viewport_size({'width':320,'height':height})
+                toolbar = page.locator('.topbar')
+                for trigger, panel, to_end in [('#notes-btn','#notes-panel:not(.hidden)',False),
+                                               ('#menu-btn','#sidebar.open',True)]:
+                    page.locator(trigger).click()
+                    page.locator(panel).wait_for()
+                    sliver = height == 160 and not to_end
+                    toolbar.evaluate('''(e,{toEnd,sliver,selector})=>{
+                        if (!sliver) { e.scrollTop=toEnd?e.scrollHeight:0; return; }
+                        const button=document.querySelector(selector).getBoundingClientRect();
+                        e.scrollTop += button.top-e.getBoundingClientRect().bottom+4;
+                    }''',{'toEnd':to_end,'sliver':sliver,'selector':trigger})
+                    check(toolbar.evaluate('''(e,{sliver,selector})=>{
+                        const bounds=e.getBoundingClientRect(), button=document.querySelector(selector).getBoundingClientRect();
+                        const overlap=Math.min(button.bottom,bounds.bottom)-Math.max(button.top,bounds.top);
+                        return sliver ? overlap>0 && overlap<8 : overlap<=0;
+                    }''',{'sliver':sliver,'selector':trigger}),'scrolled toolbar clips open drawer trigger '+trigger)
+                    page.keyboard.press('Escape')
+                    page.locator(panel).wait_for(state='hidden')
+                    page.wait_for_function('''selector=>{
+                        const target=document.querySelector(selector);
+                        const button=target.getBoundingClientRect(), bounds=target.closest('.topbar').getBoundingClientRect();
+                        const overlap=Math.min(button.bottom,bounds.bottom)-Math.max(button.top,bounds.top);
+                        return target===document.activeElement && overlap>=Math.min(button.height,bounds.height-2)-1;
+                    }''',arg=trigger)
+                    check(page.locator(trigger).evaluate('e=>e===document.activeElement'),'closing drawer reveals restored toolbar focus '+trigger)
             check(not errors,'no browser page errors: '+repr(errors))
             page.screenshot(path=str(OUT/'final-state.png'))
             context.close();browser.close()

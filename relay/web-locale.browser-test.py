@@ -8,14 +8,14 @@ WebKit is engine evidence, not physical Safari or screen-reader testing.
 import functools
 import http.server
 import json
-import os
 import pathlib
 import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, browser_engines, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/workspace/.formless-browsers')
 PASSES = 0
 STAMP = '2026-12-31T20:04:05Z'
 
@@ -93,7 +93,7 @@ def assert_locale(page, expected, label):
 
 def run_engine(p, engine, url, out):
     start = PASSES
-    browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
+    browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
     contexts = []
     for native, zone in [('en-US','UTC'), ('th-TH','Asia/Bangkok')]:
         context = browser.new_context(locale=native, timezone_id=zone, reduced_motion='reduce', viewport={'width':1100,'height':800})
@@ -132,12 +132,12 @@ def run_engine(p, engine, url, out):
 
 
 def run():
-    out=pathlib.Path(sys.argv[1] if len(sys.argv)>1 else '/tmp/formless-locale-check')
+    out=pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else artifact_dir('/tmp/formless-locale-check')
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(QuietHandler,directory=str(ROOT/'web')))
     threading.Thread(target=server.serve_forever,daemon=True).start()
     try:
         with sync_playwright() as p:
-            for engine in ['chromium','webkit']:
+            for engine in browser_engines():
                 run_engine(p,engine,f'http://127.0.0.1:{server.server_port}/',out/engine)
         print(f'PASS total: {PASSES}; artifacts: {out}',flush=True)
     finally:
