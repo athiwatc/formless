@@ -2199,6 +2199,7 @@ dependencies = [
  "futures-util",
  "gpui-kit",
  "icu_segmenter",
+ "image",
  "markdown",
  "objc",
  "objc2 0.6.5",

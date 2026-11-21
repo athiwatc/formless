@@ -4,10 +4,32 @@ use base64::Engine as _;
 use formless_protocol::Request;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 
 pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+
+pub fn clipboard_bytes(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String), String> {
+    if matches!(mime, "image/png" | "image/jpeg") {
+        return Ok((bytes.to_vec(), mime.into()));
+    }
+    let format = image::ImageFormat::from_mime_type(mime).ok_or_else(|| {
+        format!("Could not convert clipboard image to PNG: unsupported format {mime}")
+    })?;
+    let convert = || -> Result<Vec<u8>, image::ImageError> {
+        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(MAX_FILE_BYTES as u64);
+        reader.limits(limits);
+        let decoded = reader.decode()?;
+        let mut output = Cursor::new(Vec::new());
+        decoded.write_to(&mut output, image::ImageFormat::Png)?;
+        Ok(output.into_inner())
+    };
+    convert()
+        .map(|bytes| (bytes, "image/png".into()))
+        .map_err(|error| format!("Could not convert clipboard image to PNG: {error}"))
+}
 
 #[derive(Debug)]
 pub enum Intake {
@@ -341,6 +363,35 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_rasters_convert_to_png_and_invalid_images_report_errors() {
+        let original = image::DynamicImage::new_rgb8(2, 2);
+        for (format, mime) in [
+            (image::ImageFormat::Tiff, "image/tiff"),
+            (image::ImageFormat::Bmp, "image/bmp"),
+        ] {
+            let mut encoded = Cursor::new(Vec::new());
+            original.write_to(&mut encoded, format).unwrap();
+            let (png, mime) = clipboard_bytes(encoded.get_ref(), mime).unwrap();
+            assert_eq!(mime, "image/png");
+            assert!(png.starts_with(b"\x89PNG"));
+            assert_eq!(
+                image::load_from_memory(&png).unwrap().to_rgb8(),
+                original.to_rgb8()
+            );
+        }
+        for mime in ["image/png", "image/jpeg"] {
+            assert_eq!(
+                clipboard_bytes(b"encoded", mime).unwrap(),
+                (b"encoded".to_vec(), mime.into())
+            );
+        }
+        assert!(clipboard_bytes(b"broken", "image/tiff")
+            .unwrap_err()
+            .contains("convert clipboard image"));
+        assert!(clipboard_bytes(b"", "image/svg+xml").is_err());
+    }
     use crate::client::{Command, ServerMessage};
     use serde_json::json;
 

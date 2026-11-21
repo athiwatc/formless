@@ -161,12 +161,23 @@ impl Shell {
             ClipboardEntry::Image(image) => Some(image),
             _ => None,
         }) {
+            let (bytes, mime) = match client::attachments::clipboard_bytes(
+                image.bytes(),
+                image.format().mime_type(),
+            ) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.composer_notice = Some(error.into());
+                    cx.notify();
+                    return true;
+                }
+            };
             self.pasted_image_number = self.pasted_image_number.saturating_add(1);
             self.stage_composer_attachments(
                 Intake::Bytes {
                     name: format!("pasted-image-{}.png", self.pasted_image_number),
-                    bytes: image.bytes().to_vec(),
-                    mime: image.format().mime_type().into(),
+                    bytes,
+                    mime,
                 },
                 cx,
             );
