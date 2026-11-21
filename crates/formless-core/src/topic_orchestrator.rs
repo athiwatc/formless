@@ -614,6 +614,7 @@ impl Daemon {
         if let Some(approval) = &approved {
             step.harness = approval.substitute.harness;
             step.acp_agent = approval.substitute.acp_agent.clone();
+            step.model = approval.substitute.model.clone();
         }
         let availability =
             local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;

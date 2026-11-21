@@ -7200,6 +7200,8 @@ with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
+Adapter blocking probes must enforce their own internal deadline and kill
+child processes on drop: core's outer timeout cannot abort spawn_blocking.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.
@@ -7208,6 +7210,8 @@ trimmed step title; the next successful launch consumes it. A request to run
 the wanted harness then uses the explicitly approved substitute, which must
 itself be ready. Formless never substitutes without that approval. Other
 answers and cancellation record no approval and start no work.
+Only the suggestion's optional model and acp_agent are used for a substitute;
+an omitted model selects the substitute's default, never the original model.
 
 Terminal topic transitions close pending limit/substitute decisions with
 UserQuestionClosed answered_by=None. Finalizing one feature also closes its

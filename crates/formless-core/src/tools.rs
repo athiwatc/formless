@@ -976,7 +976,7 @@ pub fn builtin_definitions() -> Vec<Value> {
         topic_step_definition(),
         json!({"type":"function","function":{"name":TOPIC_REQUEST_HARNESS_SUBSTITUTE,"description":"Ask the user to approve a different harness for this exact feature and step. Never substitute without approval. The user may sign in and retry, use the substitute, or skip. The model cannot answer this user-only question.","parameters":{"type":"object","properties":{
             "feature_id":{"type":"string"},"step_title":{"type":"string"},"wanted":{"type":"object","properties":{"harness":{"type":"string"},"acp_agent":{"type":"string"}},"required":["harness"],"additionalProperties":false},
-            "substitute":{"type":"object","properties":{"harness":{"type":"string"},"acp_agent":{"type":"string"}},"required":["harness"],"additionalProperties":false},"reason":{"type":"string","minLength":1,"maxLength":8192}
+            "substitute":{"type":"object","properties":{"harness":{"type":"string"},"acp_agent":{"type":"string"},"model":{"type":"string"}},"required":["harness"],"additionalProperties":false},"reason":{"type":"string","minLength":1,"maxLength":8192}
         },"required":["feature_id","step_title","wanted","substitute","reason"],"additionalProperties":false}}}),
         topic_context_definition(TOPIC_LIST_CONVERSATIONS,None),
         topic_context_definition(TOPIC_READ_CONVERSATION,Some("session_id")),

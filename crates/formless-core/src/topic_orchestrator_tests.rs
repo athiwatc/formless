@@ -72,6 +72,10 @@ if mode=='directory':
     gate.with_suffix('.ready').write_text(str(os.getpid()))
     while not gate.with_suffix('.go').exists():time.sleep(.01)
 codex='exec' in sys.argv[1:3]
+if mode=='substitute_model':
+    expected=os.environ['TOPIC_FIXTURE_EXPECT_MODEL']
+    if expected:assert sys.argv[sys.argv.index('--model')+1]==expected
+    else:assert '--model' not in sys.argv
 readonly=('plan' in sys.argv or 'read-only' in sys.argv)
 if mode in ('git','git_isolated','git_merge'):
     def git(*args):return subprocess.check_output(['git',*args],stderr=subprocess.STDOUT,text=True).strip()
@@ -1300,6 +1304,72 @@ async fn topic_substitute_retry_skip_cancel_and_invalid_requests_do_not_authoriz
         assert!(f.daemon().topic_substitutes.locked().is_empty());
     }
     assert!(state(&f, &topic.id).attempts.is_empty());
+}
+
+#[tokio::test]
+async fn topic_substitute_clears_original_model_or_uses_the_suggested_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "substitute_model");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    args["model"] = json!("claude-source-model");
+    for expected in [None, Some("codex-selected-model")] {
+        env.set("TOPIC_FIXTURE_EXPECT_MODEL", expected.unwrap_or(""));
+        let mut suggestion = json!({"harness":"codex"});
+        if let Some(model) = expected {
+            suggestion["model"] = json!(model);
+        }
+        let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":suggestion,"reason":"Use an available harness"});
+        let daemon = f.daemon().clone();
+        let session = session.clone();
+        let c = cancel.clone();
+        let waiting = tokio::spawn(async move {
+            daemon
+                .request_topic_harness_substitute(&session, &request, &c)
+                .await
+        });
+        wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+        let id = f
+            .daemon()
+            .topic_decisions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id: id,
+                answer: "Use Codex".into(),
+                answers: vec![],
+            })
+            .await
+            .unwrap();
+        waiting.await.unwrap().unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(topic.topic_session_id.as_ref().unwrap(), &args, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "succeeded", "{result}");
+        assert_eq!(result["model"], json!(expected));
+        assert_eq!(result["harness"], "codex");
+        assert!(result["acp_agent"].is_null());
+        assert!(f.daemon().topic_substitutes.locked().is_empty());
+    }
 }
 
 #[tokio::test]
