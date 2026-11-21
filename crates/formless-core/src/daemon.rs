@@ -18,6 +18,9 @@ use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
+#[path = "topic_orchestrator.rs"]
+mod topic_orchestrator;
+
 #[path = "topic_interactions.rs"]
 mod topic_interactions;
 
@@ -923,6 +926,8 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    topic_launch: StdMutex<()>,
+    topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1070,6 +1075,7 @@ impl Daemon {
             }
         }
         store.mark_orphan_runs_interrupted()?;
+        store.recover_topic_workflows()?;
         // Pending handles do not survive a restart; tell each Session's
         // agent instead of leaving a handle that later reads "unknown".
         for (handle, session_id, tool) in store.interrupt_pending_handles()? {
@@ -1167,6 +1173,8 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            topic_launch: StdMutex::new(()),
+            topic_steps: StdMutex::new(HashMap::new()),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1920,13 +1928,6 @@ impl Daemon {
         Ok(topic)
     }
 
-    fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
-        let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        self.with_store(|st| st.fail_topic_workflow(&topic.id, "orchestrator not available yet"))?;
-        self.broadcast(Event::TopicChanged { topic_id: topic.id });
-        bail!("orchestrator not available yet; topic failed and workspace lock released; no child was launched")
-    }
-
     /// Handle one request as a connected client's would be (in-process
     /// callers and tests; `Subscribe` needs a connection).
     /// Keep the large protocol dispatch state on the heap. Callers (including
@@ -2080,9 +2081,9 @@ impl Daemon {
                     .context(RequestFailure::not_found("topic attempt not found"))?;
                 Ok(serde_json::to_value(attempt)?)
             }
-            Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id),
+            Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id).await,
             Request::CancelTopic { topic_id } => {
-                let topic = self.with_store(|st| st.cancel_topic(&topic_id))?;
+                let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
                 if let Some(session) = &topic.topic_session_id {
                     if let Some(run) = self.runs.locked().get(session) {
@@ -2110,6 +2111,30 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::TopicMcp { request } => {
+                if let TopicMcpOperation::RequestPermission {
+                    title,
+                    kind,
+                    raw_input,
+                    options,
+                } = &request.operation
+                {
+                    let handler = self.topic_interaction_handler(
+                        &request.attempt_id,
+                        &request.capability_token,
+                    )?;
+                    let answer = handler
+                        .request_permission(
+                            crate::local_harness::HarnessPermissionRequest {
+                                title: title.clone(),
+                                kind: kind.clone(),
+                                raw_input: raw_input.clone(),
+                                options: options.clone(),
+                            },
+                            &self.shutdown,
+                        )
+                        .await;
+                    return Ok(serde_json::to_value(answer)?);
+                }
                 if let TopicMcpOperation::AskUser { questions } = &request.operation {
                     let questions = parse_questions(&json!({"questions": questions}))?;
                     let handler = self.topic_interaction_handler(
@@ -2126,7 +2151,7 @@ impl Daemon {
                         let attempt=st.authenticate_topic_attempt(&request.attempt_id,&request.capability_token)?;
                         let mut message=None;
                         let value=match request.operation {
-                            TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
+                            TopicMcpOperation::RequestPermission {..} | TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
                             TopicMcpOperation::ListConversations => serde_json::to_value(st.list_sessions()?)?,
                             TopicMcpOperation::ReadConversation {session_id} => {
                                 if st.session_deleted(&session_id)? {bail!("conversation is deleted");}
@@ -5577,7 +5602,7 @@ impl Daemon {
                 topic.status,
                 TopicStatus::Approved | TopicStatus::Running | TopicStatus::NeedsUser
             ) {
-                self.with_store(|st| st.cancel_topic(&topic.id))?;
+                self.cancel_topic_work(&topic.id)?;
                 self.close_topic_interactions(&topic.id, None);
                 self.broadcast(Event::TopicChanged { topic_id: topic.id });
             }
@@ -6210,6 +6235,7 @@ impl Daemon {
         run_id: String,
         admission: Arc<RunAdmission>,
     ) -> Result<()> {
+        self.with_store(|st| st.resume_topic_orchestrator(&session_id))?;
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<i64>();
@@ -6524,6 +6550,7 @@ impl Daemon {
                 None
             }
         };
+        self.topic_orchestrator_ended(&session_id, final_status);
         // Locks a panicking Run may have poisoned are still taken. Only this
         // Run's own entry goes: a newer Run of the Session keeps its
         // controls (#726).
@@ -8632,6 +8659,19 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            toolreg::TOPIC_RUN_STEP => match self.run_topic_step(session_id, &args, cancel).await {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
+            },
+            toolreg::TOPIC_COMPLETE_FEATURE | toolreg::TOPIC_FAIL_FEATURE => match self
+                .finish_topic_feature_tool(
+                    session_id,
+                    &args,
+                    tc.name == toolreg::TOPIC_COMPLETE_FEATURE,
+                ) {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic feature: {error:#}")),
+            },
             toolreg::CREATE_TOOL => match self
                 .create_agent_tool(session_id, run_id, &args, cfg, cancel_flag)
                 .await

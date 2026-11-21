@@ -246,7 +246,7 @@ async fn topic_permission_fixture_round_trip_replay_wrong_option_and_live_update
             .with_reader(|st| st.list_messages(&f.attempt.conversation_session_id))
             .unwrap()
             .len(),
-        4
+        3
     );
     let waiter = tokio::spawn(async move {
         handler

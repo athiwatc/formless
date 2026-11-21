@@ -2,6 +2,10 @@
 //! paths as file capabilities. All data and restored databases are disposable.
 use super::*;
 
+#[cfg(unix)]
+#[path = "topic_orchestrator_tests.rs"]
+mod topic_orchestrator_tests;
+
 #[path = "topic_interaction_tests.rs"]
 mod topic_interaction_tests;
 
@@ -535,11 +539,14 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
         .daemon()
         .with_store(|st| st.approve_topic(&topic.id))
         .unwrap();
-    let parent=topic.topic_session_id.unwrap();
-    proposal.source_session_id=parent.clone();
-    let child=f.daemon().propose_topic_request(&proposal).unwrap();
-    let child=f.daemon().with_store(|st|st.approve_topic(&child.id)).unwrap();
-    let session=child.topic_session_id.unwrap();
+    let parent = topic.topic_session_id.unwrap();
+    proposal.source_session_id = parent.clone();
+    let child = f.daemon().propose_topic_request(&proposal).unwrap();
+    let child = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&child.id))
+        .unwrap();
+    let session = child.topic_session_id.unwrap();
     let cancel = CancellationToken::new();
     let flag = Arc::new(AtomicBool::new(false));
     let (steer_tx, _) = mpsc::unbounded_channel();
@@ -573,7 +580,7 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
 }
 
 #[tokio::test]
-async fn topic_fixture_workspace_classification_and_unavailable_start() {
+async fn topic_fixture_workspace_classification_and_start_failure() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let ping = f.daemon().handle(Request::Ping).await.unwrap();
@@ -655,7 +662,7 @@ async fn topic_fixture_workspace_classification_and_unavailable_start() {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("orchestrator not available yet"));
+        assert!(!error.to_string().contains("read-only"));
         let failed = f
             .daemon()
             .with_reader(|st| st.get_topic(&topic.id))
@@ -663,10 +670,11 @@ async fn topic_fixture_workspace_classification_and_unavailable_start() {
             .unwrap();
         assert_eq!(failed.status, TopicStatus::Failed);
         assert_eq!(failed.features[0].status, TopicFeatureStatus::Failed);
-        assert_eq!(
-            failed.features[0].detail.as_deref(),
-            Some("orchestrator not available yet")
-        );
+        assert!(failed.features[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("orchestrator start failed"));
         assert!(failed.attempts.is_empty());
         let reply = f
             .daemon()
