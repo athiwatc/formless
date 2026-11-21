@@ -84,6 +84,37 @@ pub fn running(sessions: &[SessionInfo]) -> HashSet<String> {
         .collect()
 }
 
+/// Topic workspace used only by the desktop's headless acceptance harness.
+#[cfg(any(test, feature = "test-support"))]
+pub fn topic_workspace() -> (Vec<SessionInfo>, formless_protocol::TopicInfo) {
+    let mut sessions = sessions(4);
+    for (session, (id, name)) in sessions.iter_mut().zip([
+        ("main", "Main Chat"),
+        ("topic-chat", "Formless"),
+        ("claude-chat", "Claude · Build X"),
+        ("codex-chat", "Codex · Review X"),
+    ]) {
+        session.id = id.into();
+        session.name = name.into();
+        session.pinned = false;
+    }
+    let topic = serde_json::from_value(serde_json::json!({
+        "id":"topic-formless", "name":"Formless", "repo":"/work/formless",
+        "base_revision":"abc123", "source_session_id":"main", "topic_session_id":"topic-chat",
+        "status":"running", "builder":"claude", "builder_model":"opus", "reviewer":"codex", "reviewer_model":null,
+        "created_at":"2026-11-21T00:00:00Z", "updated_at":"2026-11-21T00:00:00Z",
+        "features":[
+            {"id":"feature-x","source_message_id":"message-x","source_seq":1,"request":"Add feature X", "status":"ready", "active_attempt_id":null,"ready_revision":"abc123","review_round":1,"detail":null},
+            {"id":"feature-y","source_message_id":"message-y","source_seq":2,"request":"Add feature Y", "status":"needs_user", "active_attempt_id":null,"ready_revision":null,"review_round":1,"detail":"Builder and reviewer disagree on the public API. Choose a direction."}
+        ],
+        "attempts":[
+            {"id":"build-x","topic_id":"topic-formless","feature_id":"feature-x","round":1,"harness":"claude","role":"build","status":"passed","revision":"abc123","conversation_session_id":"claude-chat","harness_session_id":"external-claude","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"},
+            {"id":"review-x","topic_id":"topic-formless","feature_id":"feature-x","round":1,"harness":"codex","role":"review","status":"passed","revision":"abc123","conversation_session_id":"codex-chat","harness_session_id":"external-codex","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"}
+        ]
+    })).expect("topic fixture follows the shared wire contract");
+    (sessions, topic)
+}
+
 /// `count` mixed timeline blocks with stable, strictly increasing ids.
 pub fn timeline(count: usize) -> Vec<TimelineBlock> {
     (0..count)

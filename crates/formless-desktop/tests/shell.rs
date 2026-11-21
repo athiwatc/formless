@@ -15,6 +15,8 @@ mod production_overlay_tests;
 
 #[path = "support/attachments.rs"]
 mod attachment_tests;
+#[path = "support/topics.rs"]
+mod topic_tests;
 
 use std::time::{Duration, Instant};
 

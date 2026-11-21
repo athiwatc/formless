@@ -121,6 +121,9 @@ impl Shell {
     }
 
     pub(super) fn pick_composer_attachments(&mut self, cx: &mut Context<Self>) {
+        if self.harness_read_only() {
+            return;
+        }
         let owner = (self.client_identity(), self.client_generation);
         let picker = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -218,6 +221,12 @@ impl Shell {
         notice_revision: u64,
         cx: &mut Context<Self>,
     ) {
+        if self.harness_read_only() {
+            self.attachment_notice(
+                "Harness conversations are read only. Attach files in the topic chat instead.",
+            );
+            return;
+        }
         let Some(session_id) = self.sidebar.active_id().map(str::to_owned) else {
             return;
         };

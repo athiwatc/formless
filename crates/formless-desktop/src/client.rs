@@ -38,6 +38,8 @@ mod native_send_tests;
 mod reader;
 mod run_actions;
 mod send_review;
+#[cfg(test)]
+mod topic_tests;
 pub use reader::{StreamBatch, StreamOwner, StreamStatus};
 
 use crate::forecast;
@@ -61,6 +63,17 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    TopicSupport(bool),
+    Topics {
+        connection: u64,
+        operation: Option<uuid::Uuid>,
+        result: Result<crate::topics::Reply, String>,
+    },
+    TopicCandidates {
+        generation: u64,
+        session_id: String,
+        messages: Vec<crate::topics::Candidate>,
+    },
     AttachmentStaged(attachments::Outcome),
     DeleteUndo(crate::run_actions::DeleteUndo),
     RunActionTarget {
@@ -228,6 +241,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    Topic {
+        connection: u64,
+        operation: Option<uuid::Uuid>,
+        action: crate::topics::Action,
+    },
     Manage {
         destination: Destination,
         request: Request,
@@ -646,7 +664,8 @@ impl Client {
         }
         if matches!(
             command,
-            Command::Intent(_)
+            Command::Topic { .. }
+                | Command::Intent(_)
                 | Command::ReadRunAction { .. }
                 | Command::PrepareRunAction(_)
                 | Command::ConfirmRunAction(_)
@@ -830,6 +849,11 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    Topic {
+        operation: Option<uuid::Uuid>,
+        action: crate::topics::Action,
+        revision: u64,
+    },
     Manage {
         destination: Destination,
         label: String,
@@ -1004,6 +1028,9 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    topics_revision: u64,
+    topics_available: bool,
+    topics_polled: Option<std::time::Instant>,
     attachment_conversions: VecDeque<attachments::ClipboardJob>,
     run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
     reconciled_actions: Vec<Action>,
@@ -1042,6 +1069,19 @@ struct Engine {
 }
 
 impl Engine {
+    fn topic_command(&mut self, operation: Option<uuid::Uuid>, action: crate::topics::Action) {
+        if operation.is_some() {
+            self.topics_revision = self.topics_revision.saturating_add(1);
+        }
+        self.request(
+            action.request(),
+            Pending::Topic {
+                operation,
+                action,
+                revision: self.topics_revision,
+            },
+        );
+    }
     fn emit_live_overlay(&mut self) {
         if let Some(session_id) = self.active.clone() {
             if let Some(view) = self.live_overlay.take() {
@@ -1518,6 +1558,18 @@ impl Engine {
         if !self.ready {
             return;
         }
+        if self.topics_available
+            && self
+                .topics_polled
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+            && !self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::Topic { .. }))
+        {
+            self.topics_polled = Some(std::time::Instant::now());
+            self.topic_command(None, crate::topics::Action::List);
+        }
         self.emit_live_overlay();
         if self.dirty_list
             && !self
@@ -1582,6 +1634,35 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::Topic {
+                connection,
+                operation,
+                action,
+            } => {
+                if operation.is_some()
+                    && self.pending.values().any(|p| {
+                        matches!(
+                            p,
+                            Pending::Topic {
+                                operation: Some(_),
+                                ..
+                            }
+                        )
+                    })
+                {
+                    // A single consent may have an approval/start continuation.
+                    // Duplicate clicks must not create a second workflow.
+                    return;
+                }
+                if self.ready && connection == self.connection && self.topics_available {
+                    self.topic_command(operation, action);
+                } else {
+                    self.updates.push(Update::Topics {
+                        connection: self.connection, operation,
+                        result: Err("Topics require a current connection to a topic-enabled daemon. Nothing was sent.".into()),
+                    });
+                }
+            }
             Command::StageAttachments(operation) => self.stage_attachments(operation),
             Command::UndoDelete(operation) => {
                 if let Some(ticket) = self
@@ -1715,6 +1796,7 @@ impl Engine {
             return;
         }
         match command {
+            Command::Topic { .. } => unreachable!("handled by topic dispatcher"),
             Command::StageAttachments(_) => unreachable!("handled by attachment dispatcher"),
             Command::UndoDelete(_) => unreachable!("handled by action dispatcher"),
             Command::ReadRunAction { .. }
@@ -2786,6 +2868,11 @@ impl Engine {
                             .into(),
                     );
                 }
+                self.topics_available = result["features"]
+                    .as_array()
+                    .is_some_and(|features| features.iter().any(|f| f == "topic_orchestration_v1"));
+                self.updates
+                    .push(Update::TopicSupport(self.topics_available));
                 self.session_model_cas_available =
                     result["features"].as_array().is_some_and(|features| {
                         features.iter().any(|f| f == "session_model_compare_set_v1")
@@ -2842,6 +2929,9 @@ impl Engine {
                     .into(),
                 });
                 self.emit_questions();
+                if self.topics_available {
+                    self.topic_command(None, crate::topics::Action::Main);
+                }
                 if let Some(page) = self.page {
                     self.load_page(page);
                 }
@@ -2854,6 +2944,35 @@ impl Engine {
                     .updates
                     .push(Update::Notice(format!("Could not load Sessions: {error}"))),
             },
+            Pending::Topic {
+                operation,
+                action,
+                revision,
+            } => {
+                if operation.is_none() && revision != self.topics_revision {
+                    return Ok(());
+                }
+                let result = result.and_then(|v| action.decode(v));
+                if let crate::topics::Action::MoveAndStart(id) = &action {
+                    if matches!(&result, Ok(crate::topics::Reply::Topic(t)) if t.id == *id && t.status == formless_protocol::TopicStatus::Approved)
+                    {
+                        // This continuation exists only for this explicit consent,
+                        // never for a polled approval or a move-only operation.
+                        self.topic_command(operation, crate::topics::Action::Start(id.clone()));
+                        return Ok(());
+                    }
+                }
+                if operation.is_some() {
+                    self.dirty_list = true;
+                    self.dirty_session = true;
+                    self.topics_polled = None;
+                }
+                self.updates.push(Update::Topics {
+                    connection: self.connection,
+                    operation,
+                    result,
+                });
+            }
             Pending::Snapshot {
                 session_id,
                 generation,
@@ -2875,6 +2994,13 @@ impl Engine {
                 }
                 // Refuse retired A→B→A requests before decoding/allocating.
                 if self.active.as_deref() == Some(&session_id) && self.generation == generation {
+                    if let Ok(value) = &result {
+                        self.updates.push(Update::TopicCandidates {
+                            generation,
+                            session_id: session_id.clone(),
+                            messages: crate::topics::candidates(value),
+                        });
+                    }
                     match result.and_then(|value| {
                         let attention = value
                             .get("pending_events")
@@ -3721,6 +3847,9 @@ struct WorkerState {
 
 fn disconnected_update(command: Command, fallback: &str) -> Update {
     match command {
+        Command::Topic { connection, operation, .. } => Update::Topics {
+            connection, operation, result: Err("Connection lost. Topic action was not replayed; refresh to inspect its outcome.".into()),
+        },
         Command::ReadInvocations {
             connection,
             operation,
