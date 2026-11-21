@@ -61,8 +61,7 @@ fn append(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     result.and(unlocked)
 }
 
-/// Read only the bounded suffix and start at a complete line, even for a
-/// legacy file many times larger than the live writer's cap.
+/// Read only the bounded suffix, skipping a partial line when a newline exists.
 fn tail(file: &mut File) -> io::Result<Vec<u8>> {
     let len = file.metadata()?.len();
     let start = len.saturating_sub(KEEP_BYTES);
@@ -78,7 +77,7 @@ fn tail(file: &mut File) -> io::Result<Vec<u8>> {
     file.take(len - start).read_to_end(&mut bytes)?;
     if !begins_on_line {
         let first_line = bytes.iter().position(|&byte| byte == b'\n');
-        let discard = first_line.map_or(bytes.len(), |index| index + 1);
+        let discard = first_line.map_or(0, |index| index + 1);
         bytes.drain(..discard);
     }
     Ok(bytes)
@@ -182,6 +181,21 @@ mod tests {
             );
         }
         assert_eq!(over_limit(&paths), 0);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn newline_free_logs_retain_the_bounded_suffix() {
+        let (base, paths, log) = fixture();
+        let mut file = open(&log).unwrap();
+        assert!(tail(&mut file).unwrap().is_empty());
+        let bytes = vec![b'x'; KEEP_BYTES as usize + 1234];
+        file.write_all(&bytes).unwrap();
+        assert_eq!(compact_logs(&paths, KEEP_BYTES, true).unwrap(), (1, 1234));
+        assert_eq!(fs::read(&log).unwrap(), bytes);
+        assert_eq!(compact_logs(&paths, KEEP_BYTES, false).unwrap(), (1, 1234));
+        assert_eq!(fs::read(&log).unwrap(), vec![b'x'; KEEP_BYTES as usize]);
+        drop(file);
         fs::remove_dir_all(base).unwrap();
     }
 
