@@ -39,10 +39,18 @@ impl Fixture {
                         index
                     };
                     let delta = script.get(index).expect("unexpected provider request");
-                    let sse = format!("data: {}\n\ndata: [DONE]\n\n", json!({
-                        "choices":[{"delta":delta,"finish_reason": if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" }}],
-                        "usage":{"prompt_tokens":11,"completion_tokens":3}
-                    }));
+                    if delta["wait_for_cancel"] == true {
+                        std::future::pending::<()>().await;
+                    }
+                    let reply = if delta.get("error").is_some() {
+                        delta.clone()
+                    } else {
+                        json!({
+                            "choices":[{"delta":delta,"finish_reason": if delta.get("tool_calls").is_some() { "tool_calls" } else { "stop" }}],
+                            "usage":{"prompt_tokens":11,"completion_tokens":3}
+                        })
+                    };
+                    let sse = format!("data: {reply}\n\ndata: [DONE]\n\n");
                     axum::response::Response::builder().header("content-type", "text/event-stream")
                         .body(axum::body::Body::from(sse)).unwrap()
                 }
@@ -115,6 +123,64 @@ fn authoritative_text(body: &Value) -> String {
         .filter(|message| message["role"] == "system")
         .map(|message| message["content"].to_string())
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_diagnostics_and_user_cancellation_have_distinct_run_outcomes() {
+    let env = credential_env::EnvGuard::isolated();
+    let errors = ["connection interrupted", "connection refused"];
+    let fixture = Fixture::new(
+        &env,
+        vec![
+            json!({"error":{"message": errors[0]}}),
+            json!({"error":{"message": errors[1]}}),
+            json!({"wait_for_cancel": true}),
+        ],
+    )
+    .await;
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let daemon = Arc::new(Daemon::new(fixture.paths.clone()).unwrap());
+    for message in errors {
+        let session = store.create_session(None).unwrap().id;
+        let ack = send(&daemon, &session, "Private provider failure fixture").await;
+        let run_id = ack["run_id"].as_str().unwrap();
+        finish(&daemon, &session).await;
+        assert_eq!(store.run_status(run_id).unwrap().as_deref(), Some("paused"));
+        assert_eq!(
+            store.run_error(run_id).unwrap().unwrap(),
+            format!("provider error: error (unknown): {message}")
+        );
+    }
+
+    let session = store.create_session(None).unwrap().id;
+    let ack = send(&daemon, &session, "Private cancellation fixture").await;
+    let run_id = ack["run_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.seen.lock().unwrap().len() < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("provider did not receive the Run to cancel");
+    assert_eq!(
+        daemon
+            .handle(Request::CancelRunId {
+                run_id: run_id.into()
+            })
+            .await
+            .unwrap()["interrupted"],
+        true,
+    );
+    finish(&daemon, &session).await;
+    assert_eq!(
+        store.run_status(run_id).unwrap().as_deref(),
+        Some("interrupted")
+    );
+    assert_eq!(
+        store.run_error(run_id).unwrap().as_deref(),
+        Some("interrupted by you")
+    );
+    daemon.handle(Request::Shutdown).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
