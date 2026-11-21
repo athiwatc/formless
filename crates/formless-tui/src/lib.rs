@@ -12312,6 +12312,13 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    draw_app_frame(f, app);
+    // Permission keys are handled before every view, so the prompt is drawn
+    // over every view, including ones that return early.
+    app.topic.draw_permission_overlay(f, app.color);
+}
+
+fn draw_app_frame(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
     app.list_wheel_region.set(None);
@@ -12480,7 +12487,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
-    app.topic.draw_permission_overlay(f, app.color);
     // Dismissing a modal in an input burst must wait for an unobscured
     // frame before the list can receive wheel events.
     if app.list_wheel_blocked() {
