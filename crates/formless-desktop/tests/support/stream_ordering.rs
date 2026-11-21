@@ -144,6 +144,75 @@ fn app(route: axum::routing::MethodRouter) -> axum::Router {
         .route("/messages", route)
 }
 
+pub(super) async fn production_live_stream() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-production-stream-key");
+    let start = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let fixture = Fixture::start(app(axum::routing::post({
+        let start = start.clone();
+        let finish = finish.clone();
+        move || {
+            let start = start.clone();
+            let finish = finish.clone();
+            async move {
+                start.notified().await;
+                gated_response(
+                    encode(&[
+                        json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Private reasoning ไทย"}}),
+                        json!({"type":"content_block_stop","index":0}),
+                        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+                        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Live answer 😀"}}),
+                    ]),
+                    Some(encode(&[
+                        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":" complete"}}),
+                        json!({"type":"content_block_stop","index":1}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}),
+                        json!({"type":"message_stop"}),
+                    ])), finish,
+                )
+            }
+        }
+    })), 0).await;
+    let client = Client::start(fixture.endpoint.clone());
+    until(&client, "production-connected", |update| {
+        matches!(update, Update::Connection { ready: true, .. })
+    })
+    .await;
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    until(&client, "production-baseline", |update| {
+        matches!(update, Update::Snapshot { generation: 1, .. })
+    })
+    .await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    until(
+        &client,
+        "production-running",
+        |update| matches!(update,Update::Snapshot{snapshot,..} if snapshot.running),
+    )
+    .await;
+    start.notify_one();
+    until(&client,"production-live-before-persist",|update|matches!(update,Update::LiveOverlay{generation:1,view,..} if view.answer=="Live answer 😀" && view.reasoning=="Private reasoning ไทย")).await;
+    let stored = snapshot(&mut observer, &fixture.session).await;
+    assert!(
+        assistant_messages(&stored).is_empty(),
+        "preview must precede canonical persistence"
+    );
+    finish.notify_one();
+    until(&client,"production-canonical-replacement",|update|matches!(update,Update::Snapshot{snapshot,..} if snapshot.blocks.iter().filter(|block|block.markdown()=="Live answer 😀 complete").count()==1)).await;
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
 fn assistant_messages(snapshot: &Value) -> Vec<&Value> {
     snapshot["messages"]
         .as_array()

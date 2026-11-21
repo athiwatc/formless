@@ -597,27 +597,43 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     } else {
         "Comments use server-derived path:line context; idle comments do not start a Run.".into()
     };
-    let footer = if let Some(comment) = &app.hunk_review.comment {
-        format!(
-            "Comment on selected hunk · Enter send · Shift+Enter newline · Esc back\n{}{}",
-            hunk_view::display_text(&comment.expanded()),
-            app.hunk_review
-                .error
-                .as_ref()
-                .map(|error| format!("\nServer: {}", hunk_view::display_text(error)))
-                .unwrap_or_else(|| if app.hunk_review.busy {
-                    "\nSaving comment…".into()
-                } else {
-                    String::new()
-                })
-        )
+    if let Some(comment) = &app.hunk_review.comment {
+        let panel = ui::panel(
+            " Comment · Enter send · Shift+Enter newline · Esc back ",
+            app.color,
+            Color::Yellow,
+        );
+        let mut editor = panel.inner(rows[2]);
+        f.render_widget(panel, rows[2]);
+        let notice = app
+            .hunk_review
+            .error
+            .as_ref()
+            .map(|error| format!("Server: {}", hunk_view::display_text(error)))
+            .or_else(|| app.hunk_review.busy.then(|| "Saving comment…".into()));
+        if let Some(notice) = notice.filter(|_| editor.height > 0) {
+            editor.height -= 1;
+            let status = Rect::new(editor.x, editor.bottom(), editor.width, 1);
+            f.render_widget(Paragraph::new(notice), status);
+        }
+        if !editor.is_empty() {
+            let (lines, (row, col)) =
+                editor_viewport::comment(comment, editor.width.into(), editor.height.into());
+            f.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>()),
+                editor,
+            );
+            if !app.hunk_review.busy {
+                f.set_cursor_position((editor.x + col as u16, editor.y + row as u16));
+            }
+        }
     } else {
-        format!("n/p hunk · N/P pending · a keep · r reject · u undo · c comment · f files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
+        let footer = format!("n/p hunk · N/P pending · a keep · r reject · u undo · c comment · f files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
             if is_tool { " · Ctrl+S normal save" } else { "" },
-            status)
-    };
-    f.render_widget(
-        Paragraph::new(footer).block(ui::panel(" Review keys ", app.color, Color::Yellow)),
-        rows[2],
-    );
+            status);
+        f.render_widget(
+            Paragraph::new(footer).block(ui::panel(" Review keys ", app.color, Color::Yellow)),
+            rows[2],
+        );
+    }
 }

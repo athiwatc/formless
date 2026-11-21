@@ -4,6 +4,7 @@
 //! [`fixture`] carry no GUI dependency. [`shell`] is the GPUI Kit view over them and is
 //! only built with the `gui` feature.
 
+pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod comparison;
@@ -11,6 +12,7 @@ pub mod directory;
 pub mod fixture;
 pub mod forecast;
 pub mod full_view;
+pub mod live_overlay;
 pub mod memory;
 pub mod model;
 pub mod pages;
@@ -27,6 +29,8 @@ pub mod shell;
 pub mod snapshot_guard;
 #[cfg(feature = "thai-breaks")]
 pub mod thai;
+#[cfg(feature = "gui")]
+pub mod theme;
 pub mod timeline;
 pub mod transcript;
 

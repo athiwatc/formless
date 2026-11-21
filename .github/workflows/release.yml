@@ -129,15 +129,27 @@ jobs:
         if: always()
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
-  # The Linux archive, .deb and .rpm (packaging/README.md), built on Debian
-  # bullseye so they run on glibc 2.31 and newer (Debian 11+, Ubuntu 20.04+,
-  # RHEL/Rocky 9+), not on whatever ubuntu-latest ships.
+  # Linux archives and x86_64 native packages use Debian bullseye for
+  # a glibc 2.31 floor (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+).
   linux:
     timeout-minutes: 60
     needs: version-check
-    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: [self-hosted, Linux, X64]
+            target: x86_64-unknown-linux-gnu
+            artifact: formless-linux
+            packages: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: formless-linux-arm64
+            packages: false
+    runs-on: ${{ matrix.os }}
     container: rust:1-bullseye
     env:
+      FORMLESS_RELEASE_TARGET: ${{ matrix.target }}
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
@@ -175,18 +187,23 @@ jobs:
         run: bash scripts/ci-storage-budget.sh snapshot release-built
       - run: target/release/formless man > target/formless.1
       - name: Generate package shell completions
+        if: matrix.packages
         run: sh scripts/generate-package-completions.sh target/release/formless target/completions
       - name: Archive
         shell: bash
         run: |
-          name="formless-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$FORMLESS_RELEASE_TARGET"
+          name="formless-${GITHUB_REF_NAME}-${FORMLESS_RELEASE_TARGET}"
           mkdir -p dist "$name"
           cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
           tar -czf "dist/$name.tar.gz" "$name"
       - name: Install package-building tools with private intermediates
+        if: matrix.packages
         shell: bash
         run: bash scripts/ci-storage-budget.sh install-package-tools
       - name: Packages
+        if: matrix.packages
         shell: bash
         env:
           PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
@@ -212,18 +229,33 @@ jobs:
           else
             cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           fi
-          cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
-          dpkg -I ./*.deb | sed -n '/Depends/p'
+          dpkg -I dist/*.deb | sed -n '/Depends/p'
+      - name: Checksum release files
+        shell: bash
+        working-directory: dist
+        run: for f in *; do sha256sum "$f" > "$f.sha256"; done
+      - name: Install and run the ARM64 archive
+        if: runner.arch == 'ARM64' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          fixtures="$(mktemp -d "$RUNNER_TEMP/formless-arm64.XXXXXX")"
+          trap 'rm -rf -- "$fixtures"' EXIT
+          mirror="$fixtures/releases/$GITHUB_REF_NAME"
+          mkdir -p "$mirror"
+          cp dist/*.tar.gz dist/*.tar.gz.sha256 "$mirror/"
+          PREFIX="$fixtures/install" FORMLESS_VERSION="$GITHUB_REF_NAME" \
+            FORMLESS_RELEASES_URL="file://$fixtures/releases" sh scripts/install.sh
+          "$fixtures/install/bin/formless" --version
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: formless-linux
+          name: ${{ matrix.artifact }}
           path: dist/*
+          if-no-files-found: error
       - name: Final storage (including failed phases)
         if: always()
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
-  # Install each package in a clean system and run it.
       - name: Restore runner ownership of generated files
         if: always()
         shell: bash
@@ -243,6 +275,7 @@ jobs:
             esac
           done
 
+  # Install each x86_64 native package in a clean system and run it.
   linux-install-test:
     timeout-minutes: 30
     needs: linux

@@ -84,7 +84,9 @@ impl PathPolicy {
         if from.is_dir()
             && (self.classify(raw_from, from)? != PathDecision::Ordinary
                 || directory_namespace_prefix(raw_from)
-                || directory_namespace_prefix(from))
+                || directory_namespace_prefix(from)
+                || ((in_pulumi_directory(raw_from) || in_pulumi_directory(from))
+                    && !in_pulumi_directory(to)))
         {
             // A directory consent covers only that directory's listing or
             // metadata. It cannot authorize declassifying its descendants.
@@ -218,6 +220,11 @@ const DIRECTORY_SEQUENCES: &[&[&str]] = &[
     &["etc", "ssl", "private"],
 ];
 
+fn in_pulumi_directory(path: &Path) -> bool {
+    path.components()
+        .any(|part| matches!(part, Component::Normal(name) if credential_name(name) == ".pulumi"))
+}
+
 /// Removing a prefix of a recognized sequence also removes the descendants'
 /// classification: Library -> Ordinary would wash Library/Keychains/files.
 /// This deliberately rejects such directory names even if currently empty;
@@ -267,6 +274,9 @@ pub fn is_env_template_file(path: &Path) -> bool {
 }
 
 fn builtin(path: &Path) -> Option<&'static str> {
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("Pulumi credentials file");
+    }
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
     }
@@ -284,13 +294,17 @@ fn builtin(path: &Path) -> Option<&'static str> {
         if matches!(
             name.as_str(),
             ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
-        ) {
+        ) || (name == "gcloud" && (index + 1 < parts.len() || path.is_dir()))
+        {
             return Some("credential directory");
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
+            || name.ends_with(".p8")
             || name.ends_with(".pem")
             || name.ends_with(".ppk")
             || name.ends_with(".key")
+            || name.ends_with(".jks")
+            || name.ends_with(".keystore")
         {
             return Some("credential-shaped filename");
         }
@@ -343,7 +357,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "relay_secret"
             | ".netrc"
             | "_netrc"
+            | ".htpasswd"
             | ".git-credentials"
+            | "rclone.conf"
+            | ".rclone.conf"
+            | ".yarnrc"
+            | ".yarnrc.yml"
             | ".pgpass"
             | "pgpass.conf"
             | "credentials.tfrc.json"
@@ -352,6 +371,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
     ) || name == "credentials.toml"
         || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
+        || name.ends_with(".kdbx")
     {
         return Some("credential store file");
     }
@@ -394,6 +414,14 @@ mod tests {
             policy.classify(&project, &project).unwrap(),
             PathDecision::Ordinary
         );
+        for relative in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
         let note = root.join("project/ppk-notes.txt");
         assert_eq!(
             policy.classify(&note, &note).unwrap(),
@@ -411,11 +439,15 @@ mod tests {
             "Microsoft/Credentials/store",
             ".env",
             ".env.local",
+            ".yarnrc",
+            "project/.YARNRC.YML",
             "server.pem",
             "server.ppk",
             "identity.PPK",
             "server.key",
             ".bash_history",
+            "www/.htpasswd",
+            "site/.HTPASSWD",
             "fish_history",
             ".PSQL_HISTORY",
             "psql_history",
@@ -435,6 +467,82 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pulumi_credential_reads_require_consent_without_covering_the_whole_directory() {
+        let root = std::env::temp_dir().join(format!("fl-pulumi-{}", uuid::Uuid::new_v4()));
+        let directory = root.join(".PuLuMi");
+        std::fs::create_dir_all(&directory).unwrap();
+        let policy = PathPolicy::default();
+        let credential = directory.join("credentials.json");
+        for (raw, resolved) in [
+            (&credential, &credential),
+            (&root.join("alias"), &credential),
+        ] {
+            assert_eq!(
+                policy.classify(raw, resolved).unwrap(),
+                PathDecision::Sensitive("Pulumi credentials file".into())
+            );
+        }
+        for ordinary in [
+            &directory,
+            &directory.join("stacks/dev.json"),
+            &root.join("credentials.json"),
+        ] {
+            assert_eq!(
+                policy.classify(ordinary, ordinary).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+        let relocation = policy.relocation_allowed(&directory, &directory, &root.join("ordinary"));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!relocation.unwrap());
+    }
+
+    #[test]
+    fn apache_password_file_checks_both_path_spellings_and_requires_exact_name() {
+        let root = std::env::temp_dir().join("project");
+        let policy = PathPolicy::default();
+        let secret = root.join(".HTPASSWD");
+        let alias = root.join("alias.txt");
+        for (requested, resolved) in [(&alias, &secret), (&secret, &alias)] {
+            assert!(matches!(
+                policy.classify(requested, resolved).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for name in ["htpasswd", "htpasswd.txt", ".htpasswd.bak"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+    #[test]
+    fn keepass_databases_are_sensitive_by_suffix() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for name in ["passwords.kdbx", "db.KDBX"] {
+            let path = root.join(name);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["db.kdbx.lock", "notes.txt"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn composer_auth_file_is_classified_before_ordinary_config_files() {
         let root = std::env::temp_dir().join("formless-project");
@@ -456,6 +564,66 @@ mod tests {
             assert_eq!(
                 policy.classify(&path, &path).unwrap(),
                 PathDecision::Ordinary
+            );
+        }
+    }
+
+    #[test]
+    fn protects_rclone_config_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".config/rclone/rclone.conf",
+            ".rclone.conf",
+            "AppData/Roaming/rclone/RCLONE.CONF",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            ".config/rclone/notes.txt",
+            ".config/rclone/rclone.conf.example",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn gcloud_paths_require_credential_consent() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for name in [
+            ".config/gcloud/application_default_credentials.json",
+            "AppData/Roaming/GCloud/application_default_credentials.json",
+        ] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Sensitive("credential directory".into()),
+                "{name}"
+            );
+        }
+        for name in [
+            "application_default_credentials.json",
+            "bin/gcloud",
+            "notes.txt",
+        ] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
             );
         }
     }
