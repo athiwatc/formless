@@ -45,6 +45,7 @@ hook=r'''
   };
   window.__fixture={
     setup(){ $('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='settings';S.daemonOnline=true;
+      S.ws={readyState:1};S.channel={local:true};S.local=true;
       S.settings=structuredClone(fixtureData);S.providers={providers:[],roles:{}};renderChrome();renderSettings();},
     pending(){return fixturePending.length;},
     save(remove=false){const p=fixturePending.shift();fixtureData.values[p.req.key]=p.req.value;if(remove)delete fixtureData.docs[p.req.key];p.resolve({applies:'now'});}

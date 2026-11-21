@@ -25,16 +25,8 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Network activity can include requests to
-   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
-   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
-   Naming and auto-download are enabled by default. When both are enabled
-   in a build with embedded naming, an eligible Session can trigger a
-   download of its missing configured catalogue model and tokenizer from
-   Hugging Face. `naming.auto_download = false` disables
-   automatic naming downloads; `naming.enabled = false` disables automatic
-   naming. These settings do not block explicit `formless naming pull`.
-   There is no automatic update checker.
+5. **Local-first.** The daemon stores Sessions and Tools locally.
+   See [network activity, naming controls and telemetry](#15-privacy-and-data-lifecycle).
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -442,12 +434,15 @@ without redesign.
   accepted wherever a model id is (`/model fast`, `--model`, Roles,
   candidates, fallbacks) and resolved at use, so changing it moves
   everything that names it. The pickers list aliases first.
-- **Missing models.** At start and then daily the daemon checks the
-  configured models (default, fallbacks, routing lists, Roles and their
-  candidates) against each endpoint's `/models` and notes the ones no
-  longer offered ("pick others with /model"); `ListModels.missing` and
-  `Status.missing_models` carry them. An endpoint that lists nothing is
-  not counted against.
+- **Missing models.** The daemon checks each provider's configured default,
+  fallbacks, routing models and Role candidates against `/models` once every
+  24 hours, saving the last check and its evidence per profile. A model is
+  flagged after two consecutive complete listings omit it. Known aliases and
+  dated snapshots count as matches. Empty, partial, failed and Azure
+  deployment listings cannot add a warning. `ListModels.missing` and
+  `Status.missing_models` describe the provider, model and configuration
+  locations. Status also shows the check time and reasons for skipped checks.
+  `formless providers dismiss-warning PROVIDER MODEL` hides one warning.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via
@@ -491,7 +486,9 @@ an empty listing just asks for one.
   providers test NAME --model M`) sends a short prompt and the probe tool
   call, and reports the time to the first token and to the end, whether
   the answer streamed, whether reasoning streamed, and whether tool calls
-  work (natively, or only through the prompt-based fallback). Results are
+  work (natively, or only through the prompt-based fallback). A test fails
+  when a comparable response model identifies a different model. The result
+  records the reported identity in `served_model`. Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
   pickers (`✓ tested` / `✗ test failed`; temporary failures name the manual
   retry action). Results include a backward-compatible `transient` flag for
@@ -2452,8 +2449,11 @@ are unchanged.
 - **From a URL:** `formless tools import <https-url>` and the web's
   "Import URL" take a link instead of a file.
   - **What counts as a link:** an https URL to a bundle, a GitHub file page
-    (`github.com/…/blob/…`, read from its raw file), or a gist (the first
-    of its files that is a bundle, through the GitHub API). Anything not
+    (`github.com/…/blob/…`, read from its raw file), or a gist. Raw gist
+    links fetch the linked file directly. Gist pages use the GitHub API
+    for the linked revision and use the file selected by a `#file-…`
+    anchor when supplied. Without a file anchor the preview selects a
+    bundle from the requested revision. Anything not
     https, larger than 2 MB, or not a `formless.tool/1` or
     `formless.tools/1` bundle is refused.
   - **Fetched by the daemon** (`FetchToolBundle {url}` → `{source, file,
@@ -3037,10 +3037,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Before contacting the candidate-generation provider, freeze a **server-owned
   replay manifest** from recent terminal success/failure Invocations. Selection
   is independent of outcome: there is no balancing or oversampling of failures.
-  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan at
-  most four times that many recent records, at most 2,048, with at most 256 KiB
-  per raw input and an 8 MiB manifest. Invalid/oversized inputs and samples
-  outside the bounded pool are counted as exclusions, never silently claimed
+  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan
+  four times that many recent records, then continue if the pool is short of
+  distinct inputs. Stop at 8,192 terminal records or 32 MiB of additional input,
+  with at most 256 KiB per raw input and an 8 MiB manifest. Invalid or oversized
+  inputs and samples outside the bounded pool are counted as exclusions and never claimed
   as tested. The snapshot records source Invocation IDs, canonical input
   digests, selection bounds and partitions.
 - Group semantically identical JSON inputs before splitting, ignoring object
@@ -3604,7 +3605,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   `/storage`, web Settings → Storage → Disk use) lists the database (and
   roughly what fills it: messages, Invocation logs, Tool versions, file
   snapshots), artifacts, daemon and MCP logs, skills and backups, with the
-  data folder's total.
+  data folder's total. The report reuses measurements where path and category
+  rules agree. Concurrent changes can affect counts within one report.
 - **Clean-up.** `Gc {dry_run}` (`formless gc [--dry-run]`, TUI `/gc` then
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` payload beyond `run_files.*`
@@ -3685,7 +3687,11 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   authorize a host-file read.
   - TUI: a tool result that references an artifact shows `/open <id>`,
     and `/open` (the newest) or `/open <id-prefix>` shows a full-screen
-    pager (↑↓, PgUp/PgDn, g/G, Esc).
+    pager (↑↓, PgUp/PgDn, g/G, Esc). In text pagers, `/` or Ctrl+F edits a
+    search query and Enter jumps to the first matching line. `n` and `N`
+    cycle through matching lines. Enter and Shift+Enter also cycle while
+    the submitted query is shown. Esc while editing restores the previous
+    query. Esc after editing closes the pager.
   - Web: the result gets an "Open full output" button that opens a viewer
     with "Load more" and Download, which fetches the rest and saves it as
     a file.
@@ -3708,12 +3714,15 @@ refresh a cache, nightly cleanup.
     leading-wildcard flag. For example, `0 9 */2 * 1` runs on Mondays
     with odd day-of-month numbers, rather than every 48 hours. Invalid field
     values and range endpoints identify their field in both entry points.
+    A repeated local minute during a clock change can match at both actual
+    instants. Cron skips local minutes that the clock passes over.
     `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    at 8pm", "every monday morning" (09:00), and
+    "yearly"/"annually"/"every year at 9am" (January 1).
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron. Minute and hour
@@ -3780,6 +3789,9 @@ refresh a cache, nightly cleanup.
   --to-file PATH --webhook URL`) sends the answer when the firing's Run
   ends: a desktop notification, a Markdown entry appended to a file,
   and/or a JSON POST (`job_id, prompt, status, answer, session_id`).
+  Desktop delivery runs off the daemon executor and gives the notifier
+  five seconds to submit the message. On Windows, Jobs and Tool notifications
+  use the BurntToast module in Windows PowerShell under an interactive login.
   These are targets the user configured, so they need no approval; the
   results go in the history and the audit log (`job.deliver`). For other
   channels (email, chat) point a webhook at them, or have the prompt use
@@ -4071,7 +4083,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   folded in. `[`/`]` on an empty input focus the previous/next call and
   scroll it into view. `[`/`]` also stop on messages with text (yours
   and the answers). While a call is focused, Enter expands or collapses
-  it, and `z`/`Z` expand or collapse all calls. On a focused message or
+  its preview, F6 opens its full stored input and available result, and
+  `z`/`Z` expand or collapse all calls. Esc closes the pager and returns
+  to the same call. On a focused message or
   call, `c` copies its text and `C` copies it as Markdown (a call as its
   name, input and result in fences). Esc or typing leaves the focus.
   `/copy N` copies the Nth message from the bottom.
@@ -4080,8 +4094,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   discarded, the first Enter asks and a second confirms, and Esc cancels
   the edit. `f` forks a new Session with everything before that message
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
-  pretty-printed and highlighted when JSON (capped at a few hundred lines;
-  `/open` shows stored outputs in full).
+  pretty-printed and highlighted when JSON (input and ordinary result
+  previews are capped). The full call pager preserves the stored text and
+  shows control characters as visible escapes.
 - **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
   `/vim [on|off]`, enables modal editing in the composer and internal Tool,
   module, schema, description and run-input editors. The setting persists;
@@ -5295,7 +5310,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
-| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE`, `--overwrite` | Write a portable setup bundle, optionally including Session transcripts. To replace a file, pass `--overwrite` with `--output`. |
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
@@ -5326,8 +5341,15 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
-| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human UTC day rows mark a truncated cutoff day. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`providers test NAME [--model MODEL] [--json]` lists the available model IDs
+or reports a model probe. JSON emits one object with the known listing or
+probe fields, including recorded usage when present. A completed model probe
+prints its report before returning exit 0 for success or 1 for a negative
+verdict. An empty model list still exits 0. Usage errors exit 2 and other
+request failures exit 1.
 
 `formless prices list [--provider NAME] [--json]` reads the configuration file
 and defaults. Rates are USD per million tokens. It shows stored entries and
@@ -5697,7 +5719,7 @@ previous headless Run's Session.
   - Responses carry the same CSP as the hosted relay.
   - **Reconnecting:** when a connected page loses the daemon, it keeps
     retrying with backoff. The connection pill counts down ("daemon
-    offline · retry in Ns") and a tap retries at once. After 3 failed
+    offline · retry in Ns"). Select **Retry now** to retry at once. After 3 failed
     tries it notes that a restarted daemon needs a new `formless web`
     link, because session cookies don't survive a restart. Pasting a new
     link into an open tab signs in with it. Relay mode uses the same
@@ -5739,8 +5761,13 @@ previous headless Run's Session.
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
   `--plain`/`-c`/`--new` only go with starting the TUI. `relay enable`
   keeps the configured `relay.url` unless `--url` is given. `tools run`
-  exits from the daemon's `ok`, not the result's wording. `formless man`
-  documents every subcommand's options, two levels deep.
+  exits from the daemon's `ok` when present. Supply an inline
+  JSON object with `--input JSON` or read one from a UTF-8 regular file or
+  stdin with `--input-file FILE|-` (1 MiB maximum). The flags are mutually
+  exclusive and the default input is `{}`. Invalid input exits 2 before
+  profile setup or daemon dispatch. `tools run --json` prints one complete
+  daemon result, including dry-run effects and logs. Request errors go
+  to stderr. `formless man` documents every subcommand's options, two levels deep.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.
 
@@ -6249,10 +6276,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 ## 15. Privacy and data lifecycle
 
 - **Zero telemetry.** No analytics, no automatic update checks, no crash
-  reporting. Outbound traffic goes only to the user's configured provider
-  endpoint (sessions, optimiser, compaction), the user-enabled Relay
-  (ciphertext only, §12), and explicit user-run commands — always with
-  redacted secrets in optimiser paths (§8.3).
+  reporting.
+- **Network activity.** Examples include configured provider calls for
+  Sessions, optimisation and Compaction, connections to a
+  [user-enabled Relay](README.md#37-browser-access-via-the-relay-v2) and
+  explicit commands such as `formless update check`. Optimiser paths redact
+  secrets (§8.3). In builds with embedded model support, naming an untitled
+  or provisionally named Session with suitable user text can download weights
+  or a tokenizer when the selected [catalogue model](README.md#local-naming-models)
+  needs them. Automatic naming and downloads are enabled by default. Set
+  `naming.auto_download = false` to disable automatic downloads or
+  `naming.enabled = false` to disable automatic naming.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
@@ -6282,7 +6316,9 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   command instead) or on Windows (a running program can't delete itself:
   it says to). `formless reset` deletes the same secrets.
 - **Moving to a new machine.** `formless export-all [--sessions] [-o
-  FILE]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600):
+  FILE [--overwrite]]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600).
+  The default name includes local hours, minutes, and seconds. Existing
+  destinations require `--overwrite` with an explicit output path. The bundle includes
   every active registry Tool (MCP tools come back with their server), the
   shared modules, Skills, memories, recurring jobs and the config
   (providers, Roles, MCP servers, settings) with every value that can
@@ -6797,15 +6833,15 @@ are addressed separately (#889).
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
 an active Run query exits 0, and cancel exits 0 when its request succeeds.
-Existing `runs --limit N --json` remains a list (default limit 20).
+`runs --limit N --json` lists stored Runs (default limit 20). An explicit
+`--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
 Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
 returned stalled/abandoned flags and optional progress fraction/label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
-Outer `runs --json running` is also supported. An explicitly supplied
-`--limit` conflicts with this unbounded snapshot and fails before connection.
+Outer `runs --json running` is also supported.
 There is no polling or Invocation control action.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
@@ -6871,17 +6907,24 @@ handles. Cross-volume, unknown identity/security, untracked aliases, unsupported
 filesystems or uncertain I/O refuse mutations. Every native hard link waived by
 review is accounted for by a verified store manifest and exact object identity;
 an extra public alias is never treated as an internal retention link. The store
-admits at most 64 manifests and 32 MiB of serialized immutable receipts plus
-reserved bounded object bytes. Seven-day cleanup skips live review leases and
-uses verified original handles, never recursive or database-path deletion.
+admits at most 64 logical records and 32 MiB of serialized receipts and
+retained object bytes. A private missing-state receipt reserves one slot and
+4 KiB before the Tool runs. Reject can use that slot when the immutable
+created-image receipt and retained object fit the remaining byte budget.
+Existing-file hard links reserve their full bounded object allowance.
+Seven-day cleanup skips live review leases and uses verified original handles.
 The 32 MiB limit is an admission budget for serialized immutable images and
 reserved retained bytes, not an instantaneous OS disk quota. Later writes to a
 shared object and already-open handles can retain additional bytes. Inventory
 charges the actual observed size without reading an oversized body; admission
 refuses excess use. Cleanup can reclaim an inactive verified retained alias as
 soon as it becomes oversized, without waiting seven days or touching its public
-name. Active Run/review leases still protect their owned objects. Unknown entries
-fail closed rather than counting as zero or supplying deletion authority.
+name. Active Run/review leases still protect their owned objects.
+Receipts publish after a private staging file has been flushed. Recovery can
+remove verified private staging files and legacy truncated receipts with
+absent objects. Other corrupt token entries remain charged to the store for
+manual recovery. Affected tokens cannot authorize review or deletion, and
+verified tokens can still expire. Unknown filenames fail closed.
 Already-deleted legacy files without a captured original object remain read-only.
 
 

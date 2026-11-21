@@ -4,6 +4,7 @@
 //! prompts answered on the next line.
 
 use crate::client::DaemonClient;
+use crate::text::escape_approval_controls;
 use anyhow::Result;
 use formless_core::{Config, Paths};
 use formless_protocol::*;
@@ -852,6 +853,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
             } else {
                 format!("{what}\n{evidence}")
             };
+            let what = escape_approval_controls(&what);
             format!(
                 "{}Approval needed. {what}. Type y to always allow, o for this once, s for this Session, h for an hour, or n to deny.",
                 end_stream(streaming)
@@ -860,8 +862,8 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
         Event::PromotionApprovalRequested {
             tool_name, reason, ..
         } => format!(
-            "{}Promotion of {tool_name} needs approval: {reason}. Type y to approve or n to deny.",
-            end_stream(streaming)
+            "{}Promotion of {} needs approval: {reason}. Type y to approve or n to deny.",
+            end_stream(streaming), escape_approval_controls(tool_name)
         ),
         Event::ApprovalClosed { .. } => format!("{}Approval prompt closed.", end_stream(streaming)),
         Event::PromotionApprovalResolved { .. } => {
@@ -1791,12 +1793,12 @@ mod tests {
             ..
         } = &mut sensitive
         {
-            *capabilities = vec!["fs:read-sensitive:/private/project/token.json".into()];
-            *detail = Some("Pinned reader v2 requests credential access".into());
+            *capabilities = vec!["fs:read-sensitive:/private/project/token\u{200b}.json".into()];
+            *detail = Some("Pinned reader v2 requests credential access\u{e0061}".into());
         }
         let text = format_event(&sensitive, &mut streaming, "").unwrap();
-        assert!(text.contains("Pinned reader v2 requests credential access"));
-        assert!(text.contains("fs:read-sensitive:/private/project/token.json"));
+        assert!(text.contains("Pinned reader v2 requests credential access⟨U+E0061⟩"));
+        assert!(text.contains("fs:read-sensitive:/private/project/token⟨U+200B⟩.json"));
         assert!(text.contains("exact approved path identity only, not descendants"));
         assert!(text.contains("may flow to the model provider"));
         let no_box_drawing = |s: &str| !s.chars().any(|c| ('\u{2500}'..='\u{257f}').contains(&c));
