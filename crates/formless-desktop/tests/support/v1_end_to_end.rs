@@ -192,16 +192,23 @@ impl Fixture {
         }
     }
     fn send(&self) -> String {
-        let value = self
-            .runtime
-            .block_on(self.daemon.handle(Request::SendMessage {
-                session_id: self.session.clone(),
-                content: "Private v1 answer".into(),
-                mode: SendMode::Send,
-                client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
-            }))
-            .unwrap();
-        value["run_id"].as_str().expect("Run identity").to_owned()
+        self.runtime.block_on(self.send_async()).unwrap()
+    }
+    fn send_async(&self) -> tokio::task::JoinHandle<String> {
+        let daemon = self.daemon.clone();
+        let session_id = self.session.clone();
+        self.runtime.spawn(async move {
+            let value = daemon
+                .handle(Request::SendMessage {
+                    session_id,
+                    content: "Private v1 answer".into(),
+                    mode: SendMode::Send,
+                    client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+                })
+                .await
+                .unwrap();
+            value["run_id"].as_str().expect("Run identity").to_owned()
+        })
     }
     fn snapshot(&self) -> Value {
         self.runtime
@@ -723,7 +730,9 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
             }
             assert!(
                 Instant::now() < deadline,
-                "model save receipt for {field}={value:?}: {notice:?}"
+                "model save receipt for {field}={value:?}: {notice:?}; connection={}; stored model={}",
+                step(cx, h, |_, cx| shell.read(cx).client_status_notice().to_string()),
+                f.snapshot()["session"]["model"]
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -737,10 +746,25 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         "auto-test disabled; saving must not start work"
     );
     step(cx, h, |window, cx| window.click("session-edit-cancel", cx));
-    let _ = f.send();
-    f.wait("role resolved to provider model", || {
-        f.models.lock().unwrap().len() == 1
-    });
+    // Starting a Run and waiting for its provider must not stall the actual
+    // desktop consumer. Its legacy update queue is bounded; under CI load a
+    // blocking fixture wait could disconnect it just before the metadata save.
+    let sending = f.send_async();
+    until(
+        cx,
+        h,
+        &shell,
+        "role Run observed before mid-Run save",
+        |s, _| {
+            sending.is_finished()
+                && f.models.lock().unwrap().len() == 1
+                && s.sidebar().rows().iter().any(|row| {
+                    row.id == f.session
+                        && row.run_state == formless_desktop::model::RunState::Running
+                })
+        },
+    );
+    f.runtime.block_on(sending).unwrap();
     assert_eq!(f.models.lock().unwrap()[0], "v1-test");
     open_form(cx);
     save(cx, "session-edit-model", "v1-other-test");
@@ -756,10 +780,15 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         s.last_block_preview() == "A prefix before attachment A final 😀"
     });
     f.wait("first model Run idle", || f.snapshot()["running"] == false);
-    let _ = f.send();
-    f.wait("next Run uses saved model", || {
-        f.models.lock().unwrap().len() == 2
+    let sending = f.send_async();
+    until(cx, h, &shell, "next Run uses saved model", |s, _| {
+        sending.is_finished()
+            && f.models.lock().unwrap().len() == 2
+            && s.sidebar().rows().iter().any(|row| {
+                row.id == f.session && row.run_state == formless_desktop::model::RunState::Running
+            })
     });
+    f.runtime.block_on(sending).unwrap();
     assert_eq!(f.models.lock().unwrap()[1], "v1-other-test");
     f.extra.notify_one();
     f.complete[1].notify_one();
