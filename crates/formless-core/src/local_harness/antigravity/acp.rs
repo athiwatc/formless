@@ -10,12 +10,15 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{ChildStdin, ChildStdout, Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use formless_runtime::process_group::SupervisedProcess;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use super::super::{HarnessRequest, HarnessResult, HarnessRole};
 
@@ -23,6 +26,13 @@ const PROTOCOL_VERSION: u64 = 1;
 /// Oldest released `agy` whose ACP negotiation has been observed live.
 pub const MIN_AGY_VERSION: (u64, u64, u64) = (1, 5, 14);
 const JSON_RPC_AUTH_REQUIRED: i64 = -32000;
+const CANCELLED: &str = "The Antigravity run was cancelled.";
+const POLL: Duration = Duration::from_millis(50);
+/// How long Antigravity may take to end a turn after `session/cancel` before it is killed.
+#[cfg(not(test))]
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CANCEL_GRACE: Duration = Duration::from_millis(200);
 const WRITE_TOOL_KINDS: &[&str] = &["edit", "delete", "move", "execute"];
 
 /// A `session/request_permission` from Antigravity, passed through to the user.
@@ -46,13 +56,18 @@ impl PermissionHandler for RejectAll {
 }
 
 /// Runs one prompt in a new Antigravity ACP session with the Formless bridge attached.
+///
+/// When `cancel` fires during the turn, Formless sends ACP `session/cancel`, answers any
+/// further approval request as cancelled, and returns an error once the turn ends or after
+/// a short grace period. `agy` and every process it started are killed when this returns.
 pub fn run(
     request: &HarnessRequest,
     permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
     let mut agent = AgentProcess::spawn(request)?;
     let (reader, writer) = agent.pipes()?;
-    drive(reader, writer, request, permissions, true)
+    drive(reader, writer, request, permissions, cancel, true)
 }
 
 /// Negotiates ACP and opens a session with the Formless bridge attached, without prompting.
@@ -60,7 +75,15 @@ pub fn run(
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
     let mut agent = AgentProcess::spawn(request)?;
     let (reader, writer) = agent.pipes()?;
-    drive(reader, writer, request, &mut RejectAll, false).map(|result| {
+    drive(
+        reader,
+        writer,
+        request,
+        &mut RejectAll,
+        &CancellationToken::new(),
+        false,
+    )
+    .map(|result| {
         result
             .session_id
             .expect("opened sessions always have an id")
@@ -152,17 +175,21 @@ impl AgentProcess {
     }
 }
 
-pub(super) fn drive<R: BufRead, W: Write>(
+pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     reader: R,
     writer: W,
     request: &HarnessRequest,
     permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
     prompt: bool,
 ) -> Result<HarnessResult> {
     validate(request)?;
     let mut rpc = Rpc {
-        reader,
+        lines: read_lines(reader),
         writer,
+        cancel: cancel.clone(),
+        prompting: false,
+        cancel_deadline: None,
         next_id: 0,
         events: Vec::new(),
         message: String::new(),
@@ -257,6 +284,7 @@ pub(super) fn drive<R: BufRead, W: Write>(
         )?
         .map_err(|code| anyhow!("Antigravity prompt turn failed (JSON-RPC error {code})."))?;
     match turn.get("stopReason").and_then(Value::as_str) {
+        _ if rpc.cancel.is_cancelled() => bail!(CANCELLED),
         Some("end_turn") => {}
         Some(reason @ ("max_tokens" | "max_turn_requests" | "refusal" | "cancelled")) => {
             bail!("Antigravity ended the turn without completing it (stopReason {reason}).")
@@ -345,9 +373,35 @@ fn reject_option(options: &[Value]) -> Option<String> {
         .map(str::to_owned)
 }
 
-struct Rpc<R, W> {
-    reader: R,
+/// Reads agent lines on a thread so the client can notice cancellation while waiting.
+fn read_lines<R: BufRead + Send + 'static>(
+    mut reader: R,
+) -> mpsc::Receiver<std::io::Result<String>> {
+    let (sender, lines) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if sender.send(Ok(line)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                break;
+            }
+        }
+    });
+    lines
+}
+
+struct Rpc<W> {
+    lines: mpsc::Receiver<std::io::Result<String>>,
     writer: W,
+    cancel: CancellationToken,
+    prompting: bool,
+    cancel_deadline: Option<Instant>,
     next_id: u64,
     events: Vec<Value>,
     message: String,
@@ -355,7 +409,7 @@ struct Rpc<R, W> {
     role: HarnessRole,
 }
 
-impl<R: BufRead, W: Write> Rpc<R, W> {
+impl<W: Write> Rpc<W> {
     fn send(&mut self, message: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(message)?;
         line.push(b'\n');
@@ -390,20 +444,25 @@ impl<R: BufRead, W: Write> Rpc<R, W> {
         params: Value,
         permissions: &mut dyn PermissionHandler,
     ) -> Result<std::result::Result<Value, i64>> {
+        if self.cancel.is_cancelled() {
+            bail!(CANCELLED);
+        }
         self.next_id += 1;
         let id = self.next_id;
+        self.prompting = method == "session/prompt";
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        let mut line = String::new();
         loop {
-            line.clear();
-            if self
-                .reader
-                .read_line(&mut line)
-                .context("failed to read from agy acp")?
-                == 0
-            {
-                bail!("agy acp exited before answering {method}.");
-            }
+            self.check_cancel()?;
+            let line = match self.lines.recv_timeout(POLL) {
+                Ok(line) => line.context("failed to read from agy acp")?,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) if self.cancel.is_cancelled() => {
+                    bail!(CANCELLED)
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("agy acp exited before answering {method}.")
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -445,6 +504,29 @@ impl<R: BufRead, W: Write> Rpc<R, W> {
         }
     }
 
+    /// Asks Antigravity to end the turn once cancelled, and gives up after the grace period.
+    fn check_cancel(&mut self) -> Result<()> {
+        if !self.cancel.is_cancelled() {
+            return Ok(());
+        }
+        let Some(session_id) = self.session_id.clone().filter(|_| self.prompting) else {
+            bail!(CANCELLED);
+        };
+        match self.cancel_deadline {
+            None => {
+                self.send(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id}
+                }))?;
+                self.cancel_deadline = Some(Instant::now() + CANCEL_GRACE);
+            }
+            Some(deadline) if Instant::now() >= deadline => bail!(CANCELLED),
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
     fn record_update(&mut self, message: Value) -> Result<()> {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         if let Some(session_id) = &self.session_id {
@@ -482,7 +564,9 @@ impl<R: BufRead, W: Write> Rpc<R, W> {
             .get("kind")
             .and_then(Value::as_str)
             .is_some_and(|kind| WRITE_TOOL_KINDS.contains(&kind));
-        let choice = if self.role == HarnessRole::Review && is_write {
+        let choice = if self.cancel.is_cancelled() {
+            None
+        } else if self.role == HarnessRole::Review && is_write {
             reject_option(options)
         } else {
             permissions
@@ -569,7 +653,14 @@ mod tests {
     ) -> (Result<HarnessResult>, Vec<Value>) {
         let input = lines.join("\n") + "\n";
         let mut written = Vec::new();
-        let result = drive(Cursor::new(input), &mut written, request, permissions, true);
+        let result = drive(
+            Cursor::new(input),
+            &mut written,
+            request,
+            permissions,
+            &CancellationToken::new(),
+            true,
+        );
         let sent = String::from_utf8(written)
             .unwrap()
             .lines()
@@ -794,6 +885,115 @@ mod tests {
         assert_eq!(sent[3]["error"]["code"], -32601);
     }
 
+    /// Cancels the run when asked for its first approval, then declines it.
+    struct CancelOnAsk(CancellationToken);
+
+    impl PermissionHandler for CancelOnAsk {
+        fn decide(&mut self, _: &PermissionRequest<'_>) -> Option<String> {
+            self.0.cancel();
+            Some("allow".into())
+        }
+    }
+
+    fn drive_cancellable(
+        lines: &[String],
+        permissions: &mut dyn PermissionHandler,
+        cancel: &CancellationToken,
+        keep_open: bool,
+    ) -> (Result<HarnessResult>, Vec<Value>) {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+        for line in lines {
+            sender.send(format!("{line}\n").into_bytes()).unwrap();
+        }
+        if !keep_open {
+            drop(sender);
+        } else {
+            std::mem::forget(sender);
+        }
+        struct Channel(mpsc::Receiver<Vec<u8>>, Vec<u8>);
+        impl std::io::Read for Channel {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.1.is_empty() {
+                    match self.0.recv() {
+                        Ok(bytes) => self.1 = bytes,
+                        Err(_) => return Ok(0),
+                    }
+                }
+                let n = buf.len().min(self.1.len());
+                buf[..n].copy_from_slice(&self.1[..n]);
+                self.1.drain(..n);
+                Ok(n)
+            }
+        }
+        let mut written = Vec::new();
+        let result = drive(
+            std::io::BufReader::new(Channel(receiver, Vec::new())),
+            &mut written,
+            &request(HarnessRole::Build),
+            permissions,
+            cancel,
+            true,
+        );
+        let sent = String::from_utf8(written)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (result, sent)
+    }
+
+    #[test]
+    fn cancelling_a_turn_sends_session_cancel_and_declines_approvals() {
+        let cancel = CancellationToken::new();
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            permission(90, "read"),
+            permission(91, "read"),
+            stop(3, "cancelled"),
+        ];
+        let mut handler = CancelOnAsk(cancel.clone());
+        let (result, sent) = drive_cancellable(&lines, &mut handler, &cancel, false);
+        assert_eq!(result.unwrap_err().to_string(), CANCELLED);
+        let cancels: Vec<_> = sent
+            .iter()
+            .filter(|message| message["method"] == "session/cancel")
+            .collect();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0]["params"]["sessionId"], "sess-1");
+        assert!(cancels[0].get("id").is_none());
+        let answer = sent.iter().find(|message| message["id"] == 91).unwrap();
+        assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn cancelled_turn_that_never_ends_gives_up_after_the_grace_period() {
+        let cancel = CancellationToken::new();
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            permission(90, "read"),
+        ];
+        let started = Instant::now();
+        let mut handler = CancelOnAsk(cancel.clone());
+        let (result, sent) = drive_cancellable(&lines, &mut handler, &cancel, true);
+        assert_eq!(result.unwrap_err().to_string(), CANCELLED);
+        assert!(started.elapsed() >= CANCEL_GRACE);
+        assert!(sent
+            .iter()
+            .any(|message| message["method"] == "session/cancel"));
+    }
+
+    #[test]
+    fn cancelling_before_the_turn_stops_without_prompting() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (result, sent) =
+            drive_cancellable(&[LIVE_INITIALIZE.into()], &mut RejectAll, &cancel, true);
+        assert_eq!(result.unwrap_err().to_string(), CANCELLED);
+        assert!(sent.is_empty());
+    }
+
     #[test]
     fn capability_stays_out_of_agy_environment() {
         let request = request(HarnessRole::Build);
@@ -843,9 +1043,20 @@ mod tests {
         request.environment =
             BTreeMap::from([("FORMLESS_TOPIC_CAPABILITY".into(), "live-cap".into())]);
 
-        let outcome = open_session(&request);
+        let mut agent = AgentProcess::spawn(&request).unwrap();
+        let (reader, writer) = agent.pipes().unwrap();
+        let outcome = drive(
+            reader,
+            writer,
+            &request,
+            &mut RejectAll,
+            &CancellationToken::new(),
+            false,
+        )
+        .map(|result| result.session_id.unwrap());
         std::thread::sleep(std::time::Duration::from_secs(5));
         let started = marker.exists();
+        drop(agent);
         let _ = std::fs::remove_dir_all(&workspace);
         match outcome {
             Ok(session_id) => {
