@@ -160,7 +160,7 @@ enum Cmd {
     },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
     #[command(
-        after_help = "Examples:\n  formless config path\n  formless config get provider.model\n  formless config get provider.model --json"
+        after_help = "Examples:\n  formless config path\n  formless config list --filter limits\n  formless config list --json\n  formless config get provider.model\n  formless config get provider.model --json"
     )]
     Config {
         #[command(subcommand)]
@@ -1990,7 +1990,9 @@ fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run_cli(cli) {
-        eprintln!("error: {e:#}");
+        if !e.is::<DoctorProblems>() {
+            eprintln!("error: {e:#}");
+        }
         std::process::exit(exit_code(&e));
     }
 }
@@ -2134,16 +2136,20 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
-            Some(
-                std::fs::read_to_string(paths.last_run_session_file())?
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            session.clone()
-        };
-        let session = if let Some(wanted) = session {
-            validate_session_selector(&wanted)?;
+            let id = read_last_run_session_id(&paths).map_err(usage)?;
+            if live {
+                Some(check_last_run_session(&paths, id).map_err(usage)?)
+            } else {
+                let missing = || usage(missing_last_run_session(&id));
+                let store =
+                    formless_core::Store::open_forecast_snapshot(&paths)?.ok_or_else(missing)?;
+                if store.get_session(&id)?.is_none() {
+                    return Err(missing());
+                }
+                Some(id)
+            }
+        } else if let Some(wanted) = session.as_deref() {
+            validate_session_selector(wanted)?;
             let sessions: Vec<SessionInfo> = if live {
                 serde_json::from_value(formless_tui::client::request_once(
                     &paths,
@@ -2156,7 +2162,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             };
             let matches: Vec<_> = sessions
                 .into_iter()
-                .filter(|s| s.id == wanted || s.id.starts_with(&wanted) || s.name == wanted)
+                .filter(|s| s.id == wanted || s.id.starts_with(wanted) || s.name == wanted)
                 .collect();
             if matches.len() != 1 {
                 return Err(usage("forecast Session is missing or ambiguous"));
@@ -2359,11 +2365,19 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             restore_drill: true,
             ..
         }) => run_restore_drill(&paths, None),
-        Some(Cmd::Doctor { json: true, .. }) => {
-            println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
+        Some(Cmd::Doctor { json, fix, .. }) => {
+            let healthy = if json {
+                let report = doctor_json(&paths)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                report["problems"].as_array().is_some_and(Vec::is_empty)
+            } else {
+                doctor(paths, fix)?
+            };
+            if !healthy {
+                return Err(DoctorProblems.into());
+            }
             Ok(())
         }
-        Some(Cmd::Doctor { fix, .. }) => doctor(paths, fix),
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
@@ -3412,6 +3426,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
         }
     }
     if let Ok(cfg) = Config::load(paths) {
+        out.extend(
+            formless_core::routing_policy::routing_subset_warnings(&cfg.provider)
+                .into_iter()
+                .map(|what| Problem {
+                    what,
+                    next: None,
+                    fix: None,
+                }),
+        );
         if cfg.relay.enabled {
             if let Err(e) = cfg.relay.check() {
                 out.push(Problem {
@@ -3494,9 +3517,19 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     {
         use std::os::unix::fs::PermissionsExt;
         // Every secret file, named secrets included (#849).
+        let config_backups = std::fs::read_dir(&paths.config_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry.file_name().to_string_lossy().ends_with(".toml.bak")
+            })
+            .map(|entry| entry.path());
         let open: Vec<std::path::PathBuf> = formless_core::config::secret_files(paths)
             .into_iter()
             .chain([paths.config_file()])
+            .chain(config_backups)
             .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
             .collect();
         if !open.is_empty() {
@@ -3548,11 +3581,23 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
     }
 }
 
-fn doctor(paths: Paths, fix: bool) -> Result<()> {
+/// Doctor already wrote the full diagnostic report before returning this verdict.
+#[derive(Debug)]
+struct DoctorProblems;
+
+impl std::fmt::Display for DoctorProblems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor found unresolved diagnostic problems")
+    }
+}
+
+impl std::error::Error for DoctorProblems {}
+
+fn doctor(paths: Paths, fix: bool) -> Result<bool> {
     let problems = doctor_report(&paths, false)?;
     if problems.is_empty() {
         println!("\nno problems found");
-        return Ok(());
+        return Ok(true);
     }
     println!("\n{} problem(s):", problems.len());
     for p in &problems {
@@ -3572,10 +3617,10 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
                 fixes.len()
             );
         }
-        return Ok(());
+        return Ok(false);
     }
     if fixes.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     println!("\nfixing:");
     for f in fixes {
@@ -3598,7 +3643,7 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(left.is_empty())
 }
 
 /// Secrets out of text meant for others: bearer tokens, API keys, pairing
@@ -3619,14 +3664,42 @@ fn redact(text: &str) -> String {
         .map(|(re, to)| (regex::Regex::new(re).expect("redaction rule"), to))
         .collect()
     });
-    let mut out = text.to_string();
+    let native =
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().as_os_str().to_os_string());
+    let homes = [
+        native,
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOME"),
+    ];
+    let mut out = redact_report_home_paths(
+        text,
+        homes.iter().flatten().map(|home| home.to_string_lossy()),
+    );
     for (re, to) in rules {
         out = re.replace_all(&out, *to).into_owned();
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        out = out.replace(&*home.to_string_lossy(), "~");
-    }
     out
+}
+
+fn redact_report_home_paths<'a>(
+    text: &str,
+    homes: impl IntoIterator<Item = std::borrow::Cow<'a, str>>,
+) -> String {
+    let mut spellings = Vec::new();
+    for home in homes.into_iter().filter(|home| !home.is_empty()) {
+        // JSON escapes native separators before the report is redacted.
+        let escaped = serde_json::Value::String(home.to_string()).to_string();
+        spellings.push(escaped[1..escaped.len() - 1].to_owned());
+        if home.contains('\\') {
+            spellings.push(home.replace('\\', "/"));
+        }
+        spellings.push(home.into_owned());
+    }
+    spellings.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    spellings.dedup();
+    spellings
+        .into_iter()
+        .fold(text.to_owned(), |out, spelling| out.replace(&spelling, "~"))
 }
 
 /// `doctor --json`: the facts and problems, redacted.
@@ -4339,8 +4412,12 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
 fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a duration (like 90s, 10m or 1h30m)");
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(std::time::Duration::from_secs(secs));
+    let too_long = || format!("duration '{s}' is too long");
+    match s.parse::<u64>() {
+        Ok(0) => return Err(bad()),
+        Ok(secs) => return Ok(std::time::Duration::from_secs(secs)),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => return Err(too_long()),
+        Err(_) => {}
     }
     let (mut total, mut num) = (0u64, String::new());
     for c in s.chars() {
@@ -4348,7 +4425,10 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
             num.push(c);
             continue;
         }
-        let n: u64 = num.parse().map_err(|_| bad())?;
+        let n = num.parse::<u64>().map_err(|e| match e.kind() {
+            std::num::IntErrorKind::PosOverflow => too_long(),
+            _ => bad(),
+        })?;
         num.clear();
         let unit = match c {
             's' => 1,
@@ -4360,7 +4440,7 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         total = n
             .checked_mul(unit)
             .and_then(|part| total.checked_add(part))
-            .ok_or_else(bad)?;
+            .ok_or_else(too_long)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
@@ -4477,20 +4557,32 @@ fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec
 }
 
 /// The Session the last `formless run` used, if it still exists.
-fn last_run_session(paths: &Paths) -> Result<String, String> {
-    let id = std::fs::read_to_string(paths.last_run_session_file())
+fn read_last_run_session_id(paths: &Paths) -> Result<String, String> {
+    std::fs::read_to_string(paths.last_run_session_file())
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or("no earlier `formless run` Session to continue; run once without --continue")?;
-    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+        .ok_or_else(|| {
+            "no earlier `formless run` Session to continue; run once without --continue".into()
+        })
+}
+
+fn missing_last_run_session(id: &str) -> String {
+    format!("the last `formless run` Session ({id}) no longer exists; run once without --continue")
+}
+
+fn check_last_run_session(paths: &Paths, id: String) -> Result<String, String> {
     match formless_tui::client::request_once(paths, Request::GetSession { id: id.clone() }) {
         Ok(_) => Ok(id),
         Err(e) if !e.to_string().contains("session not found") => Err(format!("{e:#}")),
-        Err(_) => Err(format!(
-            "the last `formless run` Session ({id}) no longer exists; run once without --continue"
-        )),
+        Err(_) => Err(missing_last_run_session(&id)),
     }
+}
+
+fn last_run_session(paths: &Paths) -> Result<String, String> {
+    let id = read_last_run_session_id(paths)?;
+    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+    check_last_run_session(paths, id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4567,23 +4659,28 @@ fn run_headless(
             let id = client.send(Request::CreateSession {
                 name: Some("headless".into()),
             });
-            let mut found = None;
-            while found.is_none() {
+            loop {
                 match rx.recv() {
                     Ok(ServerMessage::Response {
                         id: rid,
-                        ok: true,
+                        ok,
                         result,
-                        ..
+                        error,
                     }) if rid == id => {
+                        if !ok {
+                            let error = error
+                                .as_deref()
+                                .unwrap_or("the daemon could not create a Session");
+                            eprintln!("error: {error}");
+                            return Ok(2);
+                        }
                         let s: SessionInfo = serde_json::from_value(result.unwrap_or_default())?;
-                        found = Some(s.id);
+                        break s.id;
                     }
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::anyhow!("daemon closed: {e}")),
                 }
             }
-            found.unwrap()
         }
     };
     let _ = std::fs::write(paths.last_run_session_file(), &session_id);
@@ -5459,19 +5556,8 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
     let url = r["url"].as_str().unwrap_or_default().to_string();
     println!("Web UI on 127.0.0.1:{} (this link works once):", r["port"]);
     println!("{url}");
-    if !no_open {
-        let opener = if cfg!(target_os = "macos") {
-            std::process::Command::new("open").arg(&url).status()
-        } else if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .status()
-        } else {
-            std::process::Command::new("xdg-open").arg(&url).status()
-        };
-        if opener.map(|s| !s.success()).unwrap_or(true) {
-            println!("(could not open a browser; open the link above)");
-        }
+    if !no_open && !formless_core::docs::open_url(&url) {
+        println!("(could not open a browser; open the link above)");
     }
     Ok(())
 }
@@ -6223,6 +6309,15 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
 enum ConfigAction {
     /// Print where config.toml is
     Path,
+    /// List documented settings as loaded by this CLI, including defaults
+    List {
+        /// Match part of a dotted setting name, for example limits
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+        /// Print the local settings catalog as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a locally loaded setting (with FORMLESS_* overrides applied)
     Get {
         /// Dotted setting name, for example provider.model
@@ -6260,10 +6355,49 @@ fn config_get_output(value: &serde_json::Value, json: bool) -> serde_json::Resul
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
+        ConfigAction::List { filter, json } => {
+            let config = Config::load(&paths)?;
+            formless_core::secrets::set_patterns(&config.security.secret_patterns);
+            let report = config.local_settings(filter.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!("Local configuration (file and environment overrides)");
+            let mut table = Table::new(&["KEY", "EFFECTIVE", "DEFAULT", "SETTABLE", "DESCRIPTION"]);
+            for (key, row) in report["settings"].as_object().into_iter().flatten() {
+                let effective = match row["effective_kind"].as_str() {
+                    Some("redacted") => "[redacted]".to_owned(),
+                    Some("missing") => "(missing)".to_owned(),
+                    _ => serde_json::to_string(&row["effective"])?,
+                };
+                let default = if row["default_kind"] == "documentation" {
+                    format!(
+                        "{} (documented)",
+                        row["default_documentation"].as_str().unwrap_or_default()
+                    )
+                } else {
+                    serde_json::to_string(&row["default"])?
+                };
+                let effective = if row["changed"] == true {
+                    format!("{effective} (changed)")
+                } else {
+                    effective
+                };
+                table.row(vec![
+                    t(key, Tone::Strong),
+                    c(comparison_terminal_text(&effective)),
+                    c(comparison_terminal_text(&default)),
+                    c(if row["settable"] == true { "yes" } else { "no" }),
+                    c(row["description"].as_str().unwrap_or_default()),
+                ]);
+            }
+            table.print();
+        }
         ConfigAction::Get { key, json } => match Config::load(&paths)?.setting_value(&key)? {
             Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
-                eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                eprintln!("no setting '{key}' (see `formless config list` or SPEC §13)");
                 std::process::exit(2);
             }
         },
@@ -6287,6 +6421,11 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
             };
             formless_core::daemon::ensure_daemon(&paths)?;
             let r = formless_tui::client::request_once(&paths, request)?;
+            if let Some(warnings) = r["routing_warnings"].as_array() {
+                for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+                    eprintln!("warning: {warning}");
+                }
+            }
             if r["applies"] == "env_override" {
                 println!(
                     "saved {key} = {value}; daemon uses {} from {} (environment override)",
@@ -6345,9 +6484,19 @@ fn config_edit(paths: &Paths) -> Result<()> {
             let _ = std::fs::remove_file(&draft);
             anyhow::bail!("the editor exited with {status}; config.toml unchanged");
         }
-        match Config::load_from(&draft) {
-            Ok(_) => {
-                std::fs::rename(&draft, &file)?;
+        let edited =
+            std::fs::read_to_string(&draft).with_context(|| format!("read {}", draft.display()));
+        match edited.and_then(|text| Config::load_from_text(&text, &draft).map(|_| text)) {
+            Ok(text) => {
+                formless_core::config::write_atomic(&file, text.as_bytes())?;
+                if let Err(error) = std::fs::remove_file(&draft) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "could not remove the saved draft {}: {error}",
+                            draft.display()
+                        );
+                    }
+                }
                 println!(
                     "saved {} (the daemon picks it up on its next read)",
                     file.display()
@@ -8327,8 +8476,10 @@ fn logs_cmd(
     jsonl: bool,
 ) -> Result<()> {
     let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
-    let cutoff =
-        since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap_or_default());
+    let cutoff = since.and_then(|d| {
+        let delta = chrono::Duration::from_std(d).ok()?;
+        chrono::Utc::now().checked_sub_signed(delta)
+    });
     let keep = |e: &LogEntry| {
         e.level <= max_level
             && match (cutoff, e.at) {
@@ -9933,6 +10084,41 @@ mod tests {
     }
 
     #[test]
+    fn reports_redact_native_home_and_shell_spellings_in_text_and_json() {
+        use std::borrow::Cow;
+        let homes = [
+            r"C:\Users\Example Person",
+            "/c/Users/Example Person",
+            "/home/fixture",
+        ];
+        let input = serde_json::json!({
+            "native": r"C:\Users\Example Person\AppData\Formless",
+            "native_slashes": "C:/Users/Example Person/AppData/Formless",
+            "shell": "/c/Users/Example Person/.config/formless",
+            "unix": "/home/fixture/.local/share/formless",
+            "ordinary": r"C:\Work\Formless",
+        });
+        let masked = redact_report_home_paths(&input.to_string(), homes.map(Cow::Borrowed));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&masked).unwrap(),
+            serde_json::json!({
+                "native": r"~\AppData\Formless",
+                "native_slashes": "~/AppData/Formless",
+                "shell": "~/.config/formless",
+                "unix": "~/.local/share/formless",
+                "ordinary": r"C:\Work\Formless",
+            })
+        );
+        assert_eq!(
+            redact_report_home_paths(
+                r"log at C:\Users\Example Person\logs",
+                homes.map(Cow::Borrowed)
+            ),
+            r"log at ~\logs"
+        );
+    }
+
+    #[test]
     fn log_lines_group_into_entries_with_levels() {
         let text = "2026-10-23T10:00:00.1Z  INFO formless_core::daemon: listening\n\
                     2026-10-23T10:00:01.2Z  WARN formless_core::daemon: MCP server 'x': failed\n\
@@ -9956,6 +10142,17 @@ mod tests {
         assert_eq!(d("10m"), Ok(600));
         assert_eq!(d("1h30m"), Ok(5400));
         assert!(d("10x").is_err() && d("m").is_err() && d("1h3").is_err() && d("0s").is_err());
+        assert!(d("0").unwrap_err().contains("is not a duration"));
+        for too_long in [
+            "18446744073709551616",
+            "5124095576030432h",
+            "18446744073709551615s1s",
+        ] {
+            assert!(
+                d(too_long).unwrap_err().contains("is too long"),
+                "{too_long}"
+            );
+        }
         assert_eq!(
             format_duration(std::time::Duration::from_secs(5400)),
             "1h30m"
