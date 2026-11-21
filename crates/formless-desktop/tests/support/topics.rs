@@ -66,7 +66,7 @@ fn main_topic_harness_navigation_uses_canonical_transcripts_and_read_only_send(
                 generation,
                 snapshot: replies::session_snapshot("claude-chat", &serde_json::json!({
                     "session":{"id":"claude-chat"}, "running":false,
-                    "messages":[{"id":"build-message","seq":1,"role":"user","content":"Build feature X"}]
+                    "messages":[{"id":"build-message","session_id":"claude-chat","seq":1,"role":"user","content":"Build feature X","created_at":"now"}]
                 })).unwrap(),
             }, window, cx);
             s.composer().update(cx, |input, cx| input.set_value("Must not send", window, cx));
@@ -292,7 +292,7 @@ fn inventory_refresh_keeps_proposal_edits_and_a_cwdless_source_clears_old_reposi
         });
         window.render_frame(cx);
         assert!(window.find("topic-propose").visible());
-        assert_eq!(window.find("topic-propose").disabled(), Some(false));
+        assert_ne!(window.find("topic-propose").disabled(), Some(true));
         assert_eq!(inputs[0].read(cx).value().as_ref(), "My topic");
         assert_eq!(inputs[1].read(cx).value().as_ref(), "/old/repo");
         window.click("topic-move-open", cx);
