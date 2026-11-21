@@ -243,10 +243,13 @@ mod tests {
             lines: (0..200).map(|i| i.to_string()).collect(),
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
         key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
-        assert!(app.pager.as_ref().unwrap().top > 0);
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.pager.as_ref().unwrap().top, 10);
         assert_eq!(app.tool_idx, 7);
         app.pager = None;
         app.model_overlay = Some(ModelOverlay {

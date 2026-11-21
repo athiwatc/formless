@@ -61,8 +61,11 @@ chmod 755 "$root/bin/formless"
             &dir.join("mock-formless"),
             r#"#!/bin/sh
 printf '%s %s\n' "$1" "${2:-}" >> "$BINARY_CALLS"
-[ "$1" = completions ] || exit 84
-printf '# fixture completion\n'
+case "$1" in
+  man) printf '.TH FORMLESS 1\n' ;;
+  completions) printf '# fixture completion\n' ;;
+  *) exit 84 ;;
+esac
 "#,
         );
         Self {
@@ -111,7 +114,7 @@ printf '# fixture completion\n'
         let calls = std::fs::read_to_string(self.dir.join("binary-calls")).unwrap();
         assert!(calls.lines().all(|line| matches!(
             line,
-            "completions bash" | "completions zsh" | "completions fish"
+            "man " | "completions bash" | "completions zsh" | "completions fish"
         )));
         assert!(!std::fs::read_to_string(self.dir.join("install-calls"))
             .unwrap()

@@ -101,15 +101,21 @@ pub fn supports_thinking(model: &str) -> bool {
 /// `data:image/png;base64,…` or an http(s) URL → an image block; an
 /// image the API would reject (type or size) → why it was left out.
 fn image_block(url: &str) -> Result<Value, String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
+    let (scheme, body) = url.split_once(':').unwrap_or_default();
+    if (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && body.starts_with("//")
+    {
         return Ok(json!({"type": "image", "source": {"type": "url", "url": url}}));
     }
-    let Some((media, data)) = url
-        .strip_prefix("data:")
-        .and_then(|r| r.split_once(";base64,"))
-    else {
-        return Err("image not sent: not an inline image or http(s) URL".into());
-    };
+    let invalid = || "image not sent: not an inline image or http(s) URL".to_string();
+    if !scheme.eq_ignore_ascii_case("data") {
+        return Err(invalid());
+    }
+    let (metadata, data) = body.split_once(',').ok_or_else(invalid)?;
+    let (media, encoding) = metadata.rsplit_once(';').ok_or_else(invalid)?;
+    if !encoding.eq_ignore_ascii_case("base64") {
+        return Err(invalid());
+    }
     let media = media.to_ascii_lowercase();
     if !IMAGE_TYPES.contains(&media.as_str()) {
         return Err(format!(
@@ -894,6 +900,34 @@ mod tests {
             skipped_images(&[json!({"role": "user", "content": parts})]).len(),
             2
         );
+    }
+
+    #[test]
+    fn image_schemes_and_base64_marker_are_ascii_case_insensitive() {
+        let urls = [
+            "HTTPS://example.com/Diagram.PNG",
+            "Http://example.org/A.png",
+        ];
+        let parts = json!([
+            {"type": "image_url", "image_url": {"url": urls[0]}},
+            {"type": "image_url", "image_url": urls[1]},
+            {"type": "image_url", "image_url": {"url": "DATA:image/png;base64,aAbB+/0="}},
+            {"type": "image_url", "image_url": {"url": "data:IMAGE/PNG;BASE64,aAbB+/0="}},
+            {"type": "image_url", "image_url": {"url": "DATA:image/svg+xml;BASE64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "DATA:image/png,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "HTTPS:example.org/A.png"}},
+        ]);
+        let blocks = content_blocks(&parts);
+        for (block, url) in blocks.iter().zip(urls) {
+            assert_eq!(block["source"], json!({"type": "url", "url": url}));
+        }
+        for block in &blocks[2..4] {
+            assert_eq!(
+                block["source"],
+                json!({"type": "base64", "media_type": "image/png", "data": "aAbB+/0="})
+            );
+        }
+        assert!(blocks[4..].iter().all(|block| block["type"] == "text"));
     }
 
     #[test]

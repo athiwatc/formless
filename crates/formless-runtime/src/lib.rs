@@ -6,6 +6,7 @@ pub mod caps;
 mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
+pub mod process_group;
 mod processes;
 mod read_size;
 use read_size::ReadSize;
@@ -190,6 +191,14 @@ impl FetchTimeouts {
             total_ms: FETCH_TIMEOUT_MS.load(Ordering::Relaxed),
         }
     }
+
+    fn settings(self) -> String {
+        format!(
+            "tools.fetch_connect_timeout_secs={}s, tools.fetch_timeout_secs={}s",
+            self.connect_ms as f64 / 1_000.0,
+            self.total_ms as f64 / 1_000.0
+        )
+    }
 }
 
 /// Set the native caps: `tools.max_read_bytes`,
@@ -323,9 +332,105 @@ impl std::error::Error for ExecError {}
 /// An open streamed HTTP body (`fetchChunks`).
 struct Stream {
     resp: reqwest::blocking::Response,
+    timeouts: FetchTimeouts,
     enc: Enc,
-    /// Bytes read but not yet handed out (an incomplete UTF-8 sequence).
-    carry: Vec<u8>,
+    scratch: Vec<u8>,
+    /// Incomplete UTF-8 bytes at the beginning of scratch.
+    buffered: usize,
+    terminal_error: Option<String>,
+}
+
+impl Stream {
+    fn read_chunk(&mut self, size: usize) -> Result<(Value, bool), String> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        self.scratch.resize(size, 0);
+        let mut used = self.buffered;
+        loop {
+            let eof = match self.resp.read(&mut self.scratch[used..]) {
+                Ok(0) => true,
+                Ok(count) => {
+                    used += count;
+                    false
+                }
+                Err(error) => {
+                    let error = fetch_error(&error, self.timeouts, "reading response body");
+                    self.terminal_error = Some(error.clone());
+                    if used == 0 {
+                        return Err(error);
+                    }
+                    // Deliver the incomplete text using the same lossy policy
+                    // as EOF. The next read still reports the terminal error.
+                    self.buffered = 0;
+                    return Ok((encode(&self.scratch[..used], self.enc), false));
+                }
+            };
+            let mut cut = used;
+            if self.enc == Enc::Text && !eof {
+                let possible = utf8_cut(&self.scratch[..used]);
+                if std::str::from_utf8(&self.scratch[possible..used])
+                    .is_err_and(|error| error.error_len().is_none())
+                {
+                    cut = possible;
+                }
+            }
+            if cut != 0 || eof {
+                let data = encode(&self.scratch[..cut], self.enc);
+                self.scratch.copy_within(cut..used, 0);
+                self.buffered = used - cut;
+                return Ok((data, eof));
+            }
+            // Read again only when none of the bytes can yet be delivered.
+            // A valid UTF-8 carry is at most three bytes and size is at least four.
+        }
+    }
+}
+
+#[derive(Default)]
+struct LogBuffer {
+    lines: Vec<String>,
+    bytes: usize,
+    limit_reached: Option<usize>,
+    omitted_effects: usize,
+}
+
+impl LogBuffer {
+    fn push(&mut self, message: &str, dry_run_effect: bool, cap: usize) {
+        let prefix = if dry_run_effect {
+            "[dry run] would "
+        } else {
+            ""
+        };
+        // Empty lines still occupy a slot in the buffer.
+        let bytes = (prefix.len() + message.len()).max(1);
+        if self.limit_reached.is_some() || bytes > cap.saturating_sub(self.bytes) {
+            self.limit_reached.get_or_insert(cap);
+            self.omitted_effects = self
+                .omitted_effects
+                .saturating_add(usize::from(dry_run_effect));
+            return;
+        }
+        self.lines.push(format!("{prefix}{message}"));
+        self.bytes += bytes;
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        if let Some(cap) = self.limit_reached {
+            let mut marker = format!(
+                "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+            );
+            if self.omitted_effects > 0 {
+                marker.push_str(&format!(
+                    " [dry run] {} further would-be effects omitted",
+                    self.omitted_effects
+                ));
+            }
+            lines.push(marker);
+        }
+        lines
+    }
 }
 
 struct State {
@@ -333,7 +438,7 @@ struct State {
     caps: Capabilities,
     mode: HostMode,
     ops: Arc<dyn HostOps>,
-    logs: Mutex<Vec<String>>,
+    logs: Mutex<LogBuffer>,
     /// Smoke/Replay write overlay: discarded writes stay readable within
     /// the same run so write-then-read tools work (§8.4).
     overlay: Overlay,
@@ -901,7 +1006,7 @@ fn http_client(timeouts: FetchTimeouts) -> Result<reqwest::blocking::Client, Str
     }
     let client = client_builder(timeouts)
         .build()
-        .map_err(|e| fetch_error(&e))?;
+        .map_err(|e| fetch_error(&e, timeouts, "building HTTP client"))?;
     *slot = Some((timeouts, client.clone()));
     Ok(client)
 }
@@ -961,9 +1066,13 @@ fn cancellable_work<T: Send + 'static>(
     }
 }
 
-/// Preserve the error chain and distinguish deadline expiry from connection
-/// failure, including reqwest timeout errors wrapped in a body's io::Error.
-fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
+/// Report the request's configured budgets without guessing which timer
+/// expired. A timeout may be wrapped in the response body's io::Error.
+fn fetch_error(
+    error: &(dyn std::error::Error + 'static),
+    timeouts: FetchTimeouts,
+    phase: &str,
+) -> String {
     let mut timeout = false;
     let mut connect = false;
     let mut parts = Vec::new();
@@ -975,6 +1084,12 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
         }
         if let Some(e) = e.downcast_ref::<std::io::Error>() {
             timeout |= e.kind() == std::io::ErrorKind::TimedOut;
+            // A custom I/O error's source() skips the wrapped error itself.
+            // Inspect it directly to retain its type without repeating its Display.
+            if let Some(inner) = e.get_ref() {
+                next = Some(inner);
+                continue;
+            }
         }
         parts.push(e.to_string());
         next = e.source();
@@ -986,7 +1101,11 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
     } else {
         "fetch failed"
     };
-    format!("{kind}: {}", parts.join(": "))
+    let mut message = format!("{kind}: {}", parts.join(": "));
+    if timeout || connect {
+        message.push_str(&format!(" ({phase}, configured {})", timeouts.settings()));
+    }
+    message
 }
 
 /// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
@@ -994,7 +1113,10 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
 /// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
 /// bodiless GET, and credentials are not sent on to another host.
 fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
-    send_request_with_resolver(req, &dns::resolve)
+    let timeouts = req.timeouts;
+    send_request_with_resolver(req, &|host, port, deadline| {
+        dns::resolve(host, port, deadline, timeouts)
+    })
 }
 
 fn send_request_with_resolver(
@@ -1035,7 +1157,10 @@ fn send_request_with_dependencies(
         let client = client_for(&req.url, &pinned, req.timeouts)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err("fetch timed out: tools.fetch_timeout_secs total deadline expired".into());
+            return Err(format!(
+                "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget {}s)",
+                req.timeouts.total_ms as f64 / 1_000.0
+            ));
         }
         // Request-level timeout is forwarded to async reqwest and stays active
         // through the whole body, even when a peer trickles bytes forever.
@@ -1048,7 +1173,9 @@ fn send_request_with_dependencies(
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        let resp = builder.send().map_err(|e| fetch_error(&e))?;
+        let resp = builder
+            .send()
+            .map_err(|e| fetch_error(&e, req.timeouts, "sending request"))?;
         let status = resp.status().as_u16();
         let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
         let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location)
@@ -1238,11 +1365,16 @@ fn modified_ms(m: &std::fs::Metadata) -> Option<u64> {
 }
 
 impl State {
+    fn append_log(&self, message: &str, dry_run_effect: bool) {
+        if let Ok(mut logs) = self.logs.lock() {
+            let cap = usize::try_from(MAX_LOG_BYTES.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+            logs.push(message, dry_run_effect, cap);
+        }
+    }
+
     /// A dry run's would-be effect, kept in the logs (SPEC §10.4).
     fn would(&self, what: String) {
-        if let Ok(mut g) = self.logs.lock() {
-            g.push(format!("[dry run] would {what}"));
-        }
+        self.append_log(&what, true);
     }
 
     /// Smoke-mode stub: remember that the Tool has seen fake data.
@@ -1255,16 +1387,7 @@ impl State {
         match op {
             "log" => {
                 if let Some(m) = a["msg"].as_str() {
-                    if let Ok(mut g) = self.logs.lock() {
-                        // Past the cap, lines are dropped, once said (#604).
-                        let used: usize = g.iter().map(String::len).sum();
-                        let cap = MAX_LOG_BYTES.load(Ordering::Relaxed) as usize;
-                        if used + m.len() <= cap {
-                            g.push(m.to_string());
-                        } else if g.last().is_none_or(|l| !l.starts_with("[log limit")) {
-                            g.push(format!("[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"));
-                        }
-                    }
+                    self.append_log(m, false);
                 }
                 Ok(Value::Null)
             }
@@ -1559,11 +1682,11 @@ impl State {
             "fs_read" => {
                 let enc = enc_of(&a["encoding"])?;
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
-                        return Ok(encode(&bytes, enc));
-                    }
+                match self.overlay_read(&p, |bytes| {
+                    check_read_size(ReadSize::Exact(bytes.len() as u64))?;
+                    Ok(encode(bytes, enc))
+                }) {
+                    Some(Some(encoded)) => return encoded,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
                 }
@@ -1586,7 +1709,7 @@ impl State {
                     // Capability must still be declared; the write lands in
                     // the overlay (readable this run, never on disk) (§8.4).
                     let mut full = if append {
-                        match self.overlay_get(&p) {
+                        match self.overlay_read(&p, <[u8]>::to_vec) {
                             Some(prev) => prev.unwrap_or_default(),
                             None if p.exists() => read_capped(&p)?,
                             None => Vec::new(),
@@ -1626,16 +1749,16 @@ impl State {
             }
             "fs_exists" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                Ok(json!(match self.overlay_get(&p) {
+                Ok(json!(match self.overlay_read(&p, |_| ()) {
                     Some(v) => v.is_some(),
                     None => p.exists(),
                 }))
             }
             "fs_stat" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(b)) => {
-                        return Ok(json!({"type": "file", "size": b.len(), "modified_ms": null}))
+                match self.overlay_read(&p, <[u8]>::len) {
+                    Some(Some(size)) => {
+                        return Ok(json!({"type": "file", "size": size, "modified_ms": null}))
                     }
                     Some(None) => return Ok(Value::Null),
                     None => {}
@@ -1719,7 +1842,7 @@ impl State {
                 }
 
                 if self.mode.is_overlay() {
-                    let bytes = match self.overlay_get(&from) {
+                    let bytes = match self.overlay_read(&from, <[u8]>::to_vec) {
                         Some(Some(b)) => b,
                         Some(None) => return Err(format!("not found: {}", from.display())),
                         None if from.is_dir() => {
@@ -1750,12 +1873,13 @@ impl State {
                 let offset = a["offset"].as_u64().unwrap_or(0);
                 let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
                 self.guard_read(a["path"].as_str().unwrap_or_default(), &p, "file chunk")?;
-                let (buf, total) = match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        let start = (offset as usize).min(bytes.len());
-                        let end = (start + size).min(bytes.len());
-                        (bytes[start..end].to_vec(), bytes.len() as u64)
-                    }
+                let overlay_chunk = self.overlay_read(&p, |bytes| {
+                    let start = offset.min(bytes.len() as u64) as usize;
+                    let end = (start + size).min(bytes.len());
+                    (bytes[start..end].to_vec(), bytes.len() as u64)
+                });
+                let (buf, total) = match overlay_chunk {
+                    Some(Some(chunk)) => chunk,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
                         let mut f =
@@ -1783,18 +1907,20 @@ impl State {
         }
     }
 
-    /// Overlay entry for `p`: `Some(None)` if it or an ancestor was removed.
-    fn overlay_get(&self, p: &Path) -> Option<Option<Vec<u8>>> {
+    /// Inspect an exact overlay entry while holding the lock. A removed entry
+    /// or ancestor returns `Some(None)`. The callback only reads the borrowed
+    /// bytes and must perform no filesystem access or reacquire the overlay.
+    fn overlay_read<T>(&self, path: &Path, inspect: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
         if !self.mode.is_overlay() {
             return None;
         }
-        let g = self.overlay.lock().ok()?;
-        if let Some(v) = g.get(&p.to_string_lossy().to_string()) {
-            return Some(v.clone());
+        let overlay = self.overlay.lock().ok()?;
+        if let Some(entry) = overlay.get(path.to_string_lossy().as_ref()) {
+            return Some(entry.as_deref().map(inspect));
         }
-        p.ancestors()
+        path.ancestors()
             .skip(1)
-            .any(|a| matches!(g.get(&a.to_string_lossy().to_string()), Some(None)))
+            .any(|ancestor| matches!(overlay.get(ancestor.to_string_lossy().as_ref()), Some(None)))
             .then_some(None)
     }
 
@@ -1808,7 +1934,7 @@ impl State {
         let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
         let details = a["details"].as_bool().unwrap_or(false);
         let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
-        if self.overlay_get(&p) != Some(None) {
+        if self.overlay_read(&p, |_| ()) != Some(None) {
             if let Some(rd) =
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
@@ -2078,6 +2204,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let ops = self.ops.clone();
         let (mut meta, bytes) = self.cancellable(move || {
             let mut resp = send_request(req)?;
@@ -2099,7 +2226,7 @@ impl State {
             (&mut resp)
                 .take(cap + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|e| fetch_error(&e))?;
+                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
@@ -2127,6 +2254,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
         if let Some(url) = meta["url"].as_str() {
@@ -2137,8 +2265,11 @@ impl State {
             id,
             Stream {
                 resp,
+                timeouts,
                 enc,
-                carry: Vec::new(),
+                scratch: Vec::new(),
+                buffered: 0,
+                terminal_error: None,
             },
         );
         meta["id"] = json!(id);
@@ -2154,37 +2285,16 @@ impl State {
             // Smoke stub (id 0) or an already-closed stream: empty body.
             return Ok(json!({"data": "", "eof": true}));
         };
-        let (mut s, read) = self.cancellable(move || {
-            let mut buf = std::mem::take(&mut s.carry);
-            let mut eof = false;
-            while buf.len() < size {
-                let mut chunk = vec![0u8; size - buf.len()];
-                let n = match s.resp.read(&mut chunk) {
-                    Ok(n) => n,
-                    Err(e) => return Ok((s, Err(fetch_error(&e)))),
-                };
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Ok((s, Ok((buf, eof))))
+        let (s, read) = self.cancellable(move || {
+            let read = s.read_chunk(size);
+            Ok((s, read))
         })?;
-        let (mut buf, eof) = match read {
-            Ok(r) => r,
-            Err(e) => {
-                self.streams.locked().insert(id, s);
-                return Err(e);
-            }
-        };
-        if s.enc == Enc::Text && !eof {
-            let cut = utf8_cut(&buf).max(1);
-            s.carry = buf.split_off(cut);
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err("interrupted".into());
         }
-        let out = json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()});
         self.streams.locked().insert(id, s);
-        Ok(out)
+        let (data, eof) = read?;
+        Ok(json!({"data": data, "eof": eof}))
     }
 
     fn process_start(&self, a: &Value) -> Result<Option<processes::Process>, String> {
@@ -2769,51 +2879,133 @@ fn run_capture_impl(
     stdin_text: Option<&str>,
     detailed: bool,
 ) -> Result<String, String> {
-    use std::io::Write;
-    // All stdin-bearing callers are clipboard writes. Protect their errors
-    // on every platform, including the legacy non-detailed helper path.
-    let protected_diagnostics = detailed || stdin_text.is_some();
-    let mut child = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if protected_diagnostics {
-                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
-            } else {
-                format!("{cmd}: {e}")
-            }
-        })?;
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-    }
-    let out = child.wait_with_output().map_err(|e| {
-        if protected_diagnostics {
-            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
-        } else {
-            e.to_string()
-        }
-    })?;
-    if !out.status.success() {
-        if protected_diagnostics {
-            return Err(clipboard_diagnostics::failure(
-                cmd,
-                &format!("exited unsuccessfully ({})", out.status),
-                &String::from_utf8_lossy(&out.stderr),
-                stdin_text,
-            ));
-        }
-        return Err(format!(
-            "{cmd} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    run_capture_until(
+        cmd,
+        args,
+        stdin_text,
+        detailed,
+        std::time::Duration::from_secs(2),
+    )
 }
+
+fn run_capture_until(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // and avoid retaining pipes from the background clipboard owner.
+    let protected_diagnostics = detailed || stdin_text.is_some();
+    let write = stdin_text.is_some();
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if write {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let program = cmd.to_owned();
+    let input = stdin_text.map(|text| text.as_bytes().to_vec());
+    std::thread::Builder::new()
+        .name("formless-system-helper".into())
+        .spawn(move || {
+            let failure = |kind: &str, detail: &str| {
+                if protected_diagnostics {
+                    clipboard_diagnostics::failure(&program, kind, detail, write.then_some(""))
+                } else {
+                    format!("{program}: {kind}: {detail}")
+                }
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| failure("could not start helper runtime", &error.to_string()))?;
+            runtime.block_on(async {
+                let mut child = tokio::process::Command::from(command)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| failure("could not spawn", &error.to_string()))?;
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let send = async {
+                    match (stdin, input) {
+                        (Some(mut pipe), Some(input)) => pipe.write_all(&input).await,
+                        _ => Ok(()),
+                    }
+                };
+                async fn read(
+                    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+                ) -> std::io::Result<Vec<u8>> {
+                    let mut bytes = Vec::new();
+                    if let Some(mut pipe) = pipe {
+                        pipe.read_to_end(&mut bytes).await?;
+                    }
+                    Ok(bytes)
+                }
+                let result = tokio::time::timeout(timeout, async {
+                    let (sent, stdout, stderr) = tokio::join!(send, read(stdout), read(stderr));
+                    let status = child.wait().await?;
+                    Ok::<_, std::io::Error>((status, sent, stdout?, stderr?))
+                })
+                .await;
+                let (status, sent, stdout, stderr) = match result {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => return Err(failure("could not wait", &error.to_string())),
+                    Err(_) => {
+                        #[cfg(unix)]
+                        if let Some(pid) = child.id() {
+                            // The leader is still owned until wait succeeds.
+                            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                        }
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            child.kill(),
+                        )
+                        .await;
+                        return Err(format!("{program}: timed out"));
+                    }
+                };
+                if !status.success() {
+                    let detail = String::from_utf8_lossy(&stderr);
+                    return if protected_diagnostics {
+                        Err(failure(
+                            &format!("exited unsuccessfully ({status})"),
+                            &detail,
+                        ))
+                    } else {
+                        Err(format!("{program} failed: {}", detail.trim()))
+                    };
+                }
+                sent.map_err(|error| failure("could not write stdin", &error.to_string()))?;
+                Ok(String::from_utf8_lossy(&stdout).into_owned())
+            })
+        })
+        .map_err(|error| format!("{cmd}: could not start helper worker: {error}"))?
+        .join()
+        .map_err(|_| format!("{cmd}: helper worker failed"))?
+}
+
+#[cfg(windows)]
+const POWERSHELL_CLIPBOARD_WRITE: &str =
+    "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
+     Set-Clipboard -Value ([Console]::In.ReadToEnd()) -ErrorAction Stop";
 
 fn clipboard_read() -> Result<String, String> {
     #[cfg(target_os = "macos")]
@@ -2848,7 +3040,12 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     {
         run_capture(
             "powershell",
-            &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                POWERSHELL_CLIPBOARD_WRITE,
+            ],
             Some(text),
         )
         .map(|_| ())
@@ -3201,7 +3398,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         caps: req.caps.clone(),
         mode: req.mode,
         ops,
-        logs: Mutex::new(Vec::new()),
+        logs: Mutex::new(LogBuffer::default()),
         overlay: req.overlay.clone().unwrap_or_else(new_overlay),
         modules: req.modules.clone(),
         streams: Mutex::new(HashMap::new()),
@@ -3228,7 +3425,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let err = |e: &dyn std::fmt::Display| {
         let mut x = classify(&e.to_string(), cancelled.load(Ordering::SeqCst));
         x.after_stub = state.stubbed.load(Ordering::SeqCst);
-        x.logs = state.logs.lock().map(|l| l.clone()).unwrap_or_default();
+        x.logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;
@@ -3401,7 +3598,6 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         return Err(error);
     }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
-    let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
         let mut error = err(&parsed["error"].as_str().unwrap_or("tool error"));
         error.nested = serde_json::from_value(parsed["nested"].clone()).ok();
@@ -3413,6 +3609,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             "tool returned an error result (throw instead of returning {{error}}): {msg}"
         )));
     }
+    let logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
     Ok(ExecOutcome { output, logs })
 }
 
@@ -3424,6 +3621,28 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_buffer_counts_empty_lines_and_retains_tool_text() {
+        let mut logs = LogBuffer::default();
+        let tool_text = "[log limit from Tool output]";
+        let cap = tool_text.len() + 1;
+        logs.push(tool_text, false, cap);
+        logs.push("", false, cap);
+        logs.push("", false, cap);
+        logs.push("later", false, cap);
+
+        assert_eq!(
+            logs.snapshot(),
+            [
+                tool_text.to_owned(),
+                String::new(),
+                format!(
+                    "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+                ),
+            ],
+        );
+    }
 
     #[test]
     fn whole_read_limit_errors_distinguish_exact_byte_counts() {
@@ -3483,7 +3702,7 @@ mod tests {
             url,
             scope,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
-            &dns::resolve,
+            &|host, port, deadline| dns::resolve(host, port, deadline, FetchTimeouts::configured()),
         )
     }
 
@@ -3531,6 +3750,70 @@ mod tests {
         fn progress(&self, fraction: Option<f64>, label: &str) {
             self.0.locked().push((fraction, label.to_string()));
         }
+    }
+
+    #[test]
+    fn quickjs_prelude_installs_the_documented_globals() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let names = || -> Vec<String> {
+                let json: String = ctx
+                    .eval("JSON.stringify(Reflect.ownKeys(globalThis).map(String))")
+                    .unwrap();
+                serde_json::from_str(&json).unwrap()
+            };
+            let before = names();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            let mut installed = names();
+            installed.retain(|key| !before.contains(key));
+            installed.sort();
+
+            // Keep the public additions in sync with SPEC §7.5 and the
+            // bootstrap's host_api_doc. The __ names are internal helpers.
+            assert_eq!(
+                installed,
+                [
+                    "__addTimer",
+                    "__call",
+                    "__fmt",
+                    "__formatValue",
+                    "__moduleCache",
+                    "__nonnegativeSafeInteger",
+                    "__processReq",
+                    "__progressLabel",
+                    "__req",
+                    "__res",
+                    "__runTimers",
+                    "__settleCall",
+                    "agents",
+                    "clearInterval",
+                    "clearTimeout",
+                    "clipboard",
+                    "console",
+                    "cryptoRandom",
+                    "emit",
+                    "env",
+                    "fetch",
+                    "fetchChunks",
+                    "fs",
+                    "harness",
+                    "llm",
+                    "modules",
+                    "notifications",
+                    "notify",
+                    "process",
+                    "progress",
+                    "randomBytes",
+                    "requireModule",
+                    "setInterval",
+                    "setTimeout",
+                    "sleep",
+                    "store",
+                    "tools",
+                ]
+            );
+        });
     }
 
     #[test]
@@ -4569,6 +4852,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "aa").unwrap();
         std::fs::write(root.join("b.txt"), "bbb").unwrap();
         std::fs::create_dir(root.join("目录")).unwrap();
+        std::fs::write(root.join("目录/disk.txt"), "hidden on disk").unwrap();
         let request = |code: &str, mode| {
             let mut req = live(code);
             req.mode = mode;
@@ -4609,6 +4893,38 @@ mod tests {
                 out,
                 json!({"before":[],"after":["made"],"details":[{"name":"made","type":"file","size":3}]})
             );
+            let content = "fixture ไทย 日本語\n".repeat(9000);
+            let mut stream = request(
+                r#"function run(i) {
+                    const dir = i.root + '/目录';
+                    fs.remove(dir, {recursive:true});
+                    const hidden = dir + '/disk.txt';
+                    const path = dir + '/overlay.txt';
+                    fs.write(path, i.content);
+                    const chunks = [];
+                    fs.readChunks(path, 65536, chunk => chunks.push(chunk));
+                    return {
+                        content: chunks.join(''), chunks: chunks.length,
+                        exists: fs.exists(path), stat: fs.stat(path),
+                        hidden: fs.exists(hidden), hiddenStat: fs.stat(hidden),
+                        diskFallback: fs.read(i.root + '/b.txt'),
+                    };
+                }"#,
+                mode,
+            );
+            stream.input["content"] = json!(content);
+            let result = execute(&stream, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(result["content"], content);
+            assert!(result["chunks"].as_u64().unwrap() > 1);
+            assert_eq!(result["exists"], true);
+            assert_eq!(
+                result["stat"],
+                json!({"type":"file","size":content.len(),"modified_ms":null})
+            );
+            assert_eq!(result["hidden"], false);
+            assert_eq!(result["hiddenStat"], Value::Null);
+            assert_eq!(result["diskFallback"], "bbb");
+            assert!(!root.join("目录/overlay.txt").exists());
         }
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "aa");
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb");
@@ -4745,6 +5061,32 @@ mod tests {
         assert_eq!(out.output, json!(7));
     }
 
+    #[test]
+    fn fetch_errors_keep_the_kind_of_wrapped_io_errors() {
+        let timeouts = FetchTimeouts {
+            connect_ms: 1_000,
+            total_ms: 1_200,
+        };
+        let phase = "reading response body";
+        let timeout = std::io::Error::other(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "fixture deadline",
+        )));
+        assert_eq!(
+            fetch_error(&timeout, timeouts, phase),
+            "fetch timed out: fixture deadline (reading response body, configured tools.fetch_connect_timeout_secs=1s, tools.fetch_timeout_secs=1.2s)"
+        );
+
+        let eof = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "operation timed out",
+        ));
+        assert_eq!(
+            fetch_error(&eof, timeouts, phase),
+            "fetch failed: operation timed out"
+        );
+    }
+
     /// The peer remains connected until the request's own deadline closes it.
     /// Both literal-IP (shared client) and hostname (pinned client) paths run.
     #[test]
@@ -4753,6 +5095,7 @@ mod tests {
             for body in [false, true] {
                 let (addr, accepted, server) = stalled_http_peer(body, false);
                 let req = timeout_request(host, addr, 150);
+                let timeouts = req.timeouts;
                 let client = prepared_timeout_client(&req, addr);
                 let started = std::time::Instant::now();
                 let result =
@@ -4760,7 +5103,7 @@ mod tests {
                         let mut bytes = Vec::new();
                         response
                             .read_to_end(&mut bytes)
-                            .map_err(|e| fetch_error(&e))?;
+                            .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                         Ok(())
                     });
                 accepted
@@ -4771,12 +5114,24 @@ mod tests {
                     error.starts_with("fetch timed out:"),
                     "{host}, body={body}: {error}"
                 );
+                assert!(
+                    error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+                    "{error}"
+                );
+                assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+                let phase = if body {
+                    "reading response body"
+                } else {
+                    "sending request"
+                };
+                assert!(error.contains(phase), "{error}");
                 assert!(started.elapsed() < std::time::Duration::from_secs(2));
                 server.join().unwrap();
             }
         }
         let (addr, accepted, server) = stalled_http_peer(true, true);
         let req = timeout_request("127.0.0.1", addr, 150);
+        let timeouts = req.timeouts;
         let client = prepared_timeout_client(&req, addr);
         let started = std::time::Instant::now();
         let mut response = send_prepared_timeout_request(req, addr, &client).unwrap();
@@ -4785,7 +5140,7 @@ mod tests {
             .unwrap();
         let error = response.read_to_end(&mut Vec::new()).unwrap_err();
         assert!(
-            fetch_error(&error).starts_with("fetch timed out:"),
+            fetch_error(&error, timeouts, "reading response body").starts_with("fetch timed out:"),
             "{error}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -4800,6 +5155,31 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.starts_with("fetch connection failed:"), "{error}");
+        assert!(
+            error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+            "{error}"
+        );
+        assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+    }
+
+    #[test]
+    fn explicit_total_deadline_reports_the_request_budget() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let req = timeout_request("127.0.0.1", addr, 1);
+        let client = prepared_timeout_client(&req, addr);
+        let error = send_request_with_dependencies(
+            req,
+            &|_, _, _| unreachable!("literal address never uses DNS"),
+            &|_, _, _| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(client.clone())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget 0.001s)"
+        );
     }
 
     #[test]
@@ -4807,6 +5187,7 @@ mod tests {
         for body in [false, true] {
             let (addr, accepted, server) = stalled_http_peer(body, false);
             let req = timeout_request("127.0.0.1", addr, 200);
+            let timeouts = req.timeouts;
             let client = prepared_timeout_client(&req, addr);
             let cancel = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
@@ -4817,7 +5198,7 @@ mod tests {
                         |mut response| {
                             response
                                 .read_to_end(&mut Vec::new())
-                                .map_err(|e| fetch_error(&e))?;
+                                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                             Ok(())
                         },
                     );

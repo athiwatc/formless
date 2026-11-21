@@ -94,18 +94,45 @@ fn transient_diagnostic(clause: &str) -> bool {
 }
 
 fn status(raw: &str) -> Option<u16> {
-    // A displayed HTTP status starts an error clause: a bare status, an
-    // anyhow/provider context after ':', or reqwest's parenthesized status.
-    // Do not scan arbitrary digit runs: parser coordinates (and URL ports,
-    // sizes, request IDs, etc.) are diagnostic data, not HTTP evidence.
-    raw.split([':', '(', '\n']).find_map(|clause| {
-        let word = clause.split_ascii_whitespace().next()?;
-        let code = word.trim_end_matches(')');
-        if code.len() != 3 {
-            return None;
+    // Anyhow formats an error chain with ": ". Preserve its known HTTP
+    // contexts without interpreting a URL's port or an arbitrary body field
+    // as a status. Reqwest adds its own label before a parenthesized status.
+    let mut expects_status = true;
+    for clause in raw.lines().flat_map(|line| line.split(": ")) {
+        let clause = clause.trim();
+        if expects_status {
+            if let Some(code) = leading_status(clause) {
+                return Some(code);
+            }
         }
-        code.parse::<u16>().ok().filter(|s| (400..600).contains(s))
-    })
+        for label in [
+            "HTTP status client error (",
+            "HTTP status server error (",
+            "HTTP status error (",
+        ] {
+            if let Some(code) = clause.strip_prefix(label).and_then(leading_status) {
+                return Some(code);
+            }
+        }
+        let label = clause.trim_end_matches(':');
+        expects_status = matches!(
+            label,
+            "provider error" | "provider request failed after retries" | "GET /models failed"
+        ) || label.starts_with("POST /") && label.ends_with(" failed")
+            || label.ends_with("; initial authentication failure");
+    }
+    None
+}
+
+fn leading_status(clause: &str) -> Option<u16> {
+    let word = clause
+        .trim_start()
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, ':' | ')'))
+        .next()?;
+    if word.len() != 3 {
+        return None;
+    }
+    word.parse::<u16>().ok().filter(|s| (400..600).contains(s))
 }
 
 /// `(retry after 30s)` as added by the provider client.
@@ -417,10 +444,26 @@ mod tests {
             "provider error: request id 429 failed validation",
             "response size 500 bytes was invalid",
             "error sending request for url (https://private.invalid:503/v1)",
+            "error sending request for url (https://private.invalid:503)",
+            "provider request failed after retries: model llama3.1:405b: circuit breaker is open",
+            "provider request failed after retries: model namespaced:503: circuit breaker is open",
+            "provider error: request rejected: field value: 429 items",
         ] {
             assert_eq!(status(raw), None, "{raw}");
         }
         assert_eq!(status("HTTP status error (503)"), Some(503));
+    }
+
+    #[test]
+    fn retry_and_explanation_ignore_addresses_and_model_suffixes() {
+        let context = ctx("http://private.invalid:443/v1");
+        let unreachable = "provider request failed after retries: error sending request for url (http://private.invalid:443): connection refused";
+        assert!(is_transient(unreachable));
+        assert_eq!(explain(unreachable, &context).category, "unreachable");
+        let breaker =
+            "provider request failed after retries: model namespaced:503: circuit breaker is open";
+        assert!(!is_transient(breaker));
+        assert_eq!(explain(breaker, &context).category, "other");
     }
 
     #[test]
@@ -442,12 +485,32 @@ mod tests {
                 format!("provider error: {status_text}: {{}}"),
                 format!("provider request failed after retries: {status_text}"),
                 format!("POST /chat/completions failed: {status_text}"),
+                format!("outer context: provider error: {status_text} (retry after 2s): {{}}"),
                 format!("outer context: HTTP status error ({status_text}) for url (https://private.invalid/v1)"),
+                format!("outer context: HTTP status client error ({status_text}) for url (https://private.invalid:443)"),
+                format!("outer context: HTTP status server error ({status_text}) for url (https://private.invalid:503)"),
                 format!("provider error: {status_text}: structured output is not one complete JSON value (parser: syntax, line 429, column 503)"),
             ] {
                 assert_eq!(explain(&raw, &context).category, category, "{raw}");
                 assert_eq!(is_transient(&raw), transient, "{raw}");
             }
+        }
+    }
+
+    #[test]
+    fn model_listing_errors_keep_their_existing_verdicts() {
+        let context = ctx("https://private.invalid/v1");
+        for (status_text, category, transient) in [
+            ("403 Forbidden", "auth", false),
+            ("404 Not Found", "model", false),
+            ("429 Too Many Requests", "rate_limit", true),
+            ("503 Service Unavailable", "server", true),
+        ] {
+            let raw = format!("GET /models failed: {status_text}: unavailable");
+            let code = status_text.split_once(' ').unwrap().0.parse().unwrap();
+            assert_eq!(status(&raw), Some(code), "{raw}");
+            assert_eq!(explain(&raw, &context).category, category, "{raw}");
+            assert_eq!(is_transient(&raw), transient, "{raw}");
         }
     }
 
