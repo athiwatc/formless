@@ -348,8 +348,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             .await
         }
     };
-    for bad in [".ssh/id_rsa", ".env", ".env:4", "../outside.txt"] {
-    for bad in denied {
+    for bad in denied.iter().copied().chain([".env:4"]) {
         let e = attach(bad).await.unwrap_err().to_string();
         assert!(e.contains("credential"), "{bad}: {e}");
     }
