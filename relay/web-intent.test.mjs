@@ -193,7 +193,7 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
 });
 test('line citations queue files for review and report missing citations', async () => {
   const notes = [], calls = [];
-  const c = setup(['submit', 'mentionsIn'], {
+  const c = setup(['submit', 'mentionMatches', 'mentionsIn'], {
     isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
     note: (message, failed) => notes.push({ message, failed }),
     request: async (request) => {
