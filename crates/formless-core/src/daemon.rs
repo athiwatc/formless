@@ -928,6 +928,7 @@ pub struct Daemon {
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
+    topic_activity: tokio::sync::Notify,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1175,6 +1176,7 @@ impl Daemon {
             topic_questions: StdMutex::new(HashMap::new()),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
+            topic_activity: tokio::sync::Notify::new(),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -2100,8 +2102,46 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::RecoverTopic { recovery } => {
-                let topic = self.with_store(|st| st.recover_topic(&recovery.topic_id))?;
-                self.close_topic_interactions(&recovery.topic_id, None);
+                let topic = {
+                    let _launch = self.topic_launch.locked();
+                    let topic = self
+                        .with_reader(|st| st.get_topic(&recovery.topic_id))?
+                        .context("topic not found")?;
+                    for ((id, _), cancel) in self.topic_steps.locked().iter() {
+                        if id == &topic.id {
+                            cancel.cancel();
+                        }
+                    }
+                    if let Some(session) = &topic.topic_session_id {
+                        if let Some(run) = self.runs.locked().get(session) {
+                            run.cancel_flag.store(true, Ordering::SeqCst);
+                            run.cancel.cancel();
+                        }
+                    }
+                    self.close_topic_interactions(&topic.id, None);
+                    self.with_store(|st| st.recover_topic(&topic.id))?
+                };
+                if let Some(session) = &topic.topic_session_id {
+                    self.stop_one_session_work(session).await?;
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let notified = self.topic_activity.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if !self
+                            .topic_steps
+                            .locked()
+                            .keys()
+                            .any(|(id, _)| id == &topic.id)
+                        {
+                            break;
+                        }
+                        notified.await;
+                    }
+                })
+                .await
+                .context("topic recovery is recorded, but harness cleanup is still pending")?;
                 self.broadcast(Event::TopicChanged {
                     topic_id: topic.id.clone(),
                 });

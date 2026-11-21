@@ -321,7 +321,13 @@ async fn topic_orchestrator_fixture_duplicate_cancel_kills_cli_and_prevents_late
             .run_topic_step(&s, &a, &CancellationToken::new())
             .await
     });
-    wait_until(|| f.root.join("pid").exists()).await;
+    wait_until(|| {
+        std::fs::read_to_string(f.root.join("pid"))
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .is_some()
+    })
+    .await;
     assert!(f
         .daemon()
         .run_topic_step(&session, &args, &CancellationToken::new())
@@ -498,6 +504,78 @@ async fn topic_orchestrator_fixture_start_failure_retry_move_once_and_restart_re
         .unwrap()
         .iter()
         .any(|m| m.content.contains("Daemon restarted")));
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_recover_stops_live_harness_before_retry() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "hold");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    let daemon = f.daemon().clone();
+    let s = session.clone();
+    let a = args.clone();
+    let task = tokio::spawn(async move {
+        daemon
+            .run_topic_step(&s, &a, &CancellationToken::new())
+            .await
+    });
+    wait_until(|| {
+        std::fs::read_to_string(f.root.join("pid"))
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .is_some()
+    })
+    .await;
+    let pid: i32 = std::fs::read_to_string(f.root.join("pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.daemon()
+        .handle(Request::RecoverTopic {
+            recovery: TopicRecoveryRequest {
+                topic_id: topic.id.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        state(&f, &topic.id).attempts[0].status,
+        TopicAttemptStatus::Abandoned
+    );
+    f.daemon()
+        .handle(Request::RetryTopicFeature {
+            retry: TopicFeatureRetryRequest {
+                topic_id: topic.id.clone(),
+                feature_id: topic.features[0].id.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    env.set("TOPIC_FIXTURE_MODE", "done");
+    let result = f
+        .daemon()
+        .run_topic_step(&session, &args, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(state(&f, &topic.id).attempts.len(), 2);
 }
 
 #[tokio::test]
