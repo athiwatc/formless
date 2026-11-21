@@ -2668,6 +2668,7 @@ async fn retry_reruns_the_last_message_on_another_model() {
     let first = c.run_to_finish().await;
     c.send(Request::RetryRun {
         session_id: id.clone(),
+        expected_run_id: None,
         model: Some("other".into()),
         keep_original: true,
     })
@@ -2679,6 +2680,7 @@ async fn retry_reruns_the_last_message_on_another_model() {
     // The Session's own model is unchanged: the next Run uses it again.
     c.send(Request::RetryRun {
         session_id: id.clone(),
+        expected_run_id: None,
         model: None,
         keep_original: false,
     })
@@ -3152,36 +3154,60 @@ async fn compare_runs_each_model_in_a_fork_and_reports_both() {
         })
         .await;
     assert!(bad.is_err(), "needs two models");
-    c.send(Request::CompareModels {
+    let compare = |prompt| Request::CompareModels {
         session_id: id.clone(),
         models: vec!["alpha".into(), "beta".into()],
-        prompt: Some("which is best?".into()),
-    })
-    .await;
-    let results = loop {
-        let line = tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .unwrap();
-        if let Ok(ServerMessage::Event(Event::ComparisonReady {
-            session_id,
-            results,
-            ..
-        })) = serde_json::from_str::<ServerMessage>(&line)
-        {
-            assert_eq!(session_id, id);
-            break results;
-        }
+        prompt,
     };
-    assert_eq!(results.len(), 2);
-    let get = |m: &str| results.iter().find(|r| r.model == m).unwrap().clone();
-    assert_eq!(get("alpha").answer, "answer from alpha");
-    assert_eq!(get("beta").answer, "answer from beta");
-    assert_ne!(get("alpha").session_id, id, "each in its own fork");
-    // The original Session is untouched.
-    let msgs = c.rpc(Request::GetSession { id: id.clone() }).await["messages"].clone();
-    assert_eq!(msgs.as_array().unwrap().len(), 0, "{msgs}");
+    let missing = c.rpc_result(compare(None)).await.unwrap_err();
+    assert!(missing.contains("nothing to compare"), "{missing}");
+
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    for prompt in [Some("which is best?".to_owned()), None] {
+        let expected = if let Some(text) = &prompt {
+            text.clone()
+        } else {
+            store.append_message(&id, "user", "older question").unwrap();
+            store.append_message(&id, "user", "").unwrap();
+            store
+                .append_message(&id, "assistant", "after latest user")
+                .unwrap();
+            String::new()
+        };
+        let original = serde_json::to_value(store.list_messages(&id).unwrap()).unwrap();
+        c.send(compare(prompt)).await;
+        let results = loop {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(30), c.lines.next_line())
+                    .await
+                    .expect("timed out")
+                    .unwrap()
+                    .unwrap();
+            if let Ok(ServerMessage::Event(Event::ComparisonReady {
+                session_id,
+                results,
+                ..
+            })) = serde_json::from_str::<ServerMessage>(&line)
+            {
+                assert_eq!(session_id, id);
+                break results;
+            }
+        };
+        assert_eq!(results.len(), 2);
+        for model in ["alpha", "beta"] {
+            let result = results.iter().find(|r| r.model == model).unwrap();
+            assert_eq!(result.answer, format!("answer from {model}"));
+            assert_ne!(result.session_id, id, "each in its own fork");
+            let messages = store.list_messages(&result.session_id).unwrap();
+            let users: Vec<_> = messages.iter().filter(|m| m.role == "user").collect();
+            assert_eq!(users.last().unwrap().content, expected);
+            assert!(!messages.iter().any(|m| m.content == "after latest user"));
+        }
+        assert_eq!(
+            serde_json::to_value(store.list_messages(&id).unwrap()).unwrap(),
+            original
+        );
+    }
     server.abort();
 }
 

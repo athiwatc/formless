@@ -17,6 +17,11 @@ fn incompatible_runs_options_exit_before_creating_a_profile_or_connecting() {
     let cases: &[(&[&str], &str)] = &[
         (&["runs", "--limit", "20", "running"], "--limit applies"),
         (&["runs", "--limit", "0", "running"], "--limit applies"),
+        (&["runs", "--limit", "20", "show", "id"], "--limit applies"),
+        (
+            &["runs", "--limit", "20", "cancel", "id"],
+            "--limit applies",
+        ),
         (
             &["runs", "--session", "X", "running"],
             "apply only to the Runs list",
