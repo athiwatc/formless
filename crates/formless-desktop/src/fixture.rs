@@ -249,6 +249,8 @@ pub fn run_forecast(
 pub fn user_question(session: &str) -> formless_protocol::Event {
     use formless_protocol::{Question, QuestionOption};
     formless_protocol::Event::UserQuestion {
+        topic_id: None,
+        attempt_id: None,
         question_id: "native-question".into(),
         session_id: session.into(),
         question: String::new(),

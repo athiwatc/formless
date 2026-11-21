@@ -4118,6 +4118,8 @@ mod tests {
 
     fn question(id: &str) -> formless_protocol::Event {
         Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: id.into(),
             session_id: "a".into(),
             question: "Which option ไทย?".into(),
