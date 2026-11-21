@@ -271,19 +271,16 @@ impl Connection {
         if cfg.command.is_empty() {
             return Err(anyhow!("MCP server '{name}' has no command"));
         }
-        let log_dir = paths.data_dir.join("mcp");
-        std::fs::create_dir_all(&log_dir)?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join(format!("{name}.log")))?;
+        let log_path = crate::mcp_log::path(paths, name);
+        std::fs::create_dir_all(paths.data_dir.join("mcp"))?;
+        let log = crate::mcp_log::open(&log_path)?;
         let mut cmd = tokio::process::Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .env_clear()
             .envs(server_env(cfg))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(log)
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if let Some(dir) = &cfg.cwd {
             cmd.current_dir(dir);
@@ -295,6 +292,12 @@ impl Connection {
             .with_context(|| format!("start MCP server '{name}' ({})", cfg.command))?;
         let stdin = child.stdin.take().context("server stdin")?;
         let stdout = child.stdout.take().context("server stdout")?;
+        let stderr = child.stderr.take().context("server stderr")?;
+        tokio::spawn(async move {
+            if let Err(error) = crate::mcp_log::capture(stderr, log).await {
+                tracing::warn!(path = %log_path.display(), %error, "capture MCP stderr");
+            }
+        });
         let (pending, alive, changed): (Pending, _, _) = (
             Default::default(),
             Arc::new(AtomicBool::new(true)),

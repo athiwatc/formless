@@ -76,7 +76,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 57] = [
+    const STATES: [State; 59] = [
         state("slash-popup-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("slash-popup-dark", 1440., 900., DARK, 100, None, WHOLE),
         state(
@@ -96,6 +96,24 @@ mod render {
             200,
             None,
             REFLOWED,
+        ),
+        state(
+            "queue-wide-light",
+            1440.,
+            940.,
+            LIGHT,
+            100,
+            Some("open-message-queue"),
+            WHOLE,
+        ),
+        state(
+            "queue-narrow-dark",
+            800.,
+            940.,
+            DARK,
+            100,
+            Some("open-message-queue"),
+            WHOLE,
         ),
         state(
             "session-usage-light",
@@ -997,7 +1015,7 @@ mod render {
                         for _ in 0..3 { window.render_frame(cx);window.simulate_next_frame(cx); }
                         window.click("open-question-native-question",cx);window.render_frame(cx);
                     }
-                } else if matches!(control, "open-run-recovery" | "open-run-forecast") {
+                } else if matches!(control, "open-run-recovery" | "open-run-forecast" | "open-message-queue") {
                     use formless_desktop::client::Update;
                     let sessions = fixture::sessions(3);
                     shell.update(cx, |shell, cx| {
@@ -1013,7 +1031,8 @@ mod render {
                     window.click(shell::session_row_id(&sessions[0].id), cx);
                     let generation = shell.read(cx).client_generation();
                     let snapshot = formless_desktop::replies::session_snapshot(&sessions[0].id,
-                        &serde_json::json!({"session":{"id":sessions[0].id},"running":false,"messages":[],
+                        &serde_json::json!({"session":{"id":sessions[0].id},"running":control == "open-message-queue","messages":[],
+                            "queued_items": if control == "open-message-queue" { serde_json::json!([{"id":1,"content":"Summarize the implementation and remaining checks.","revision":0},{"id":2,"content":"Then review keyboard navigation and responsive layout. ไทย 😀","revision":1}]) } else { serde_json::Value::Null },
                             "unfinished_run": if control == "open-run-recovery" { serde_json::json!({"run_id":"interrupted-run","status":"interrupted","error":"The provider request was stopped."}) } else { serde_json::Value::Null }})).unwrap();
                     shell.update(cx, |shell, cx| {
                         shell.apply_client_update(Update::Snapshot { generation, snapshot }, window, cx);
@@ -1873,6 +1892,7 @@ mod render {
                 && control != "open-archived-directory"
                 && control != "open-run-recovery"
                 && control != "open-run-forecast"
+                && control != "open-message-queue"
                 && !control.starts_with("open-profile-questions")
             {
                 // The overlay panel is inside the window, edge to edge at
@@ -1896,7 +1916,36 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
+            if control == "open-message-queue" {
+                capture(&mut cx, "");
+                cx.update_window(any, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert!(window.try_find("message-queue").is_some());
+                    if width / (f32::from(percent) / 100.)
+                        < formless_desktop::model::tokens::THREE_PANE_MIN
+                    {
+                        assert!(window.try_find(("queue-text", 0usize)).is_none());
+                        window.click("queue-toggle", cx);
+                        window.render_frame(cx);
+                        shell.update(cx, |s, cx| {
+                            s.focus_section(PageSection::Composer, window, cx)
+                        });
+                    }
+                    assert!(window
+                        .find(("queue-text", 0usize))
+                        .value()
+                        .unwrap()
+                        .contains("Summarize"));
+                })
+                .unwrap();
+                if width / (f32::from(percent) / 100.)
+                    < formless_desktop::model::tokens::THREE_PANE_MIN
+                {
+                    capture(&mut cx, "-expanded");
+                }
+            }
             if control != "open-session-usage"
+                && control != "open-message-queue"
                 && control != "open-session-edit"
                 && control != "open-profile-search"
                 && control != "open-session-archive"

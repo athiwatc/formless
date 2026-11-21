@@ -38,5 +38,7 @@ pub fn apply(cx: &mut App) {
         c.list_active = c.accent;
         c.list_active_border = c.primary;
         c.selection = c.primary.alpha(0.25);
+        c.table_head = c.muted;
+        c.table_head_foreground = c.foreground;
     });
 }

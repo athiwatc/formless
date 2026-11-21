@@ -157,6 +157,70 @@ fn slash_errors_keep_the_draft_and_never_send(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn slash_literal_escape_prefills_the_native_queue_review(cx: &mut TestAppContext) {
+    for (text, expected) in [("follow-up", "follow-up"), ("//literal", "/literal")] {
+        let (handle, shell) = open(cx, WIDE, 0, 0);
+        let sessions = daemon_view(cx, handle, &shell);
+        let session = &sessions[0].id;
+        let value = json!({"session":{"id":session},"running":true,
+            "latest_run":{"session_id":session,"run_id":"r","status":"running"},
+            "messages":[],"queued_items":[]});
+        step(cx, handle, |window, cx| {
+            select(&shell, session, window, cx);
+            let generation = shell.read(cx).client_generation();
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::Snapshot {
+                        generation,
+                        snapshot: replies::session_snapshot(session, &value).unwrap(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            draft(&shell, text, window, cx);
+        });
+        cx.run_until_parked();
+        step(cx, handle, |window, cx| {
+            shell.update(cx, |s, cx| {
+                s.run_command(Command::SendSecondary, window, cx);
+            });
+            let commands = shell.update(cx, |s, _| s.take_client_commands());
+            let (owner, operation) = commands
+                .into_iter()
+                .find_map(|c| match c {
+                    Wire::ReadRunAction { owner, operation } => Some((owner, operation)),
+                    _ => None,
+                })
+                .expect("queue opens the native canonical review");
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::RunActionTarget {
+                        owner,
+                        operation,
+                        result: Ok(Target::decode(session, &value).unwrap()),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).draft(cx).as_ref(), text);
+            window.click("run-action-prepare", cx);
+            let commands = shell.update(cx, |s, _| s.take_client_commands());
+            assert!(commands
+                .iter()
+                .any(|c| matches!(c, Wire::PrepareRunAction(d)
+                if d.action.kind == Kind::Queue(formless_desktop::message_queue::Operation::Enqueue)
+                    && d.action.text == expected)));
+            assert!(!commands
+                .iter()
+                .any(|c| matches!(c, Wire::CommitRunAction(_))));
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn slash_compact_prefills_the_existing_canonical_review(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, handle, &shell);

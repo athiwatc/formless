@@ -295,6 +295,7 @@
       "Recent retained calls": "การเรียกใช้ล่าสุดที่เก็บไว้", "Succeeded": "สำเร็จ", "Failed": "ล้มเหลว",
       "Recent sample trend": "แนวโน้มตัวอย่างล่าสุด", "up": "เพิ่มขึ้น", "down": "ลดลง", "no arrow": "ไม่มีลูกศร",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
+      "Turn started": "เริ่มรอบการสนทนา",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
       "Queued for after this Run": "รอส่งหลังงานนี้",
@@ -371,6 +372,30 @@
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
     return Number.isFinite(t) ? uiFormat(new Date(t), { hour: "2-digit", minute: "2-digit" }) : "";
+  }
+  function turnTimestamp(ts, today) {
+    if (typeof ts !== "number") {
+      // Stored times use RFC 3339. Guard against Date treating incomplete
+      // strings as dates or rolling an impossible day into the next month.
+      const parts = typeof ts === "string" && /^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/i.exec(ts);
+      if (!parts) return null;
+      const [year, month, day, hour, minute, second] = parts.slice(1).map(Number);
+      if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return null;
+      const monthEnd = new Date(0);
+      monthEnd.setUTCFullYear(year, month, 0);
+      if (day > monthEnd.getUTCDate()) return null;
+    }
+    const date = new Date(ts);
+    const year = date.getUTCFullYear();
+    if (!Number.isFinite(year) || year < 1 || year > 9999) return null;
+    const clockOptions = { hour: "2-digit", minute: "2-digit" };
+    const visible = uiFormat(date, date.toDateString() === today
+      ? clockOptions : { ...clockOptions, year: "numeric", month: "short", day: "numeric" });
+    const full = tr("Turn started") + " " + uiFormat(date, {
+      ...clockOptions, year: "numeric", month: "long", day: "numeric", second: "2-digit", timeZoneName: "shortOffset",
+    });
+    return h("time", { datetime: date.toISOString() },
+      h("span", { "aria-hidden": "true" }, visible), h("span", { class: "sr-only" }, full));
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
@@ -489,15 +514,41 @@
       const windowsHome = /^[a-z]:\//.test(path) && (parts.length === 1 || (parts[1] === "users" && parts.length <= 3));
       if (p === "" || p === "~" || home || windowsHome) return "writing anywhere in your files";
     }
+    if (cap.startsWith("process:")) {
+      // Match the protocol's executable and first-argument split, including
+      // Windows drive-letter paths and optional scopes.
+      const grant = cap.slice(8);
+      const separator = grant.lastIndexOf(":");
+      const scope = grant.slice(separator + 1);
+      const executable = separator > 1 && scope && !/[\\/]/.test(scope)
+        ? grant.slice(0, separator) : grant;
+      const base = executable.split(/[\\/]/).pop()
+        .replace(/[A-Z]/g, (letter) => letter.toLowerCase()).replace(/(?:\.exe)+$/, "");
+      const stem = base.replace(/[0-9.]+$/, "");
+      if (["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "mksh", "ash", "cmd", "powershell", "pwsh", "osascript", "env", "xargs", "sudo", "doas", "pkexec", "su", "runuser", "nodejs"].includes(base)
+          || ["python", "pythonw", "py", "pyw", "node", "deno", "bun", "perl", "ruby", "php", "lua", "tclsh"].includes(stem)) {
+        return "an interpreter or shell: it can run any program, like bare process";
+      }
+      if (["curl", "wget", "ssh", "scp", "rsync", "nc", "ncat"].includes(base)) {
+        return "it can reach any host and write files, like net plus fs:write";
+      }
+      if (base === "git") return "git runs hooks and settings from the repository it works in, even for read-only sub-commands";
+      if (base === "find") return "find can run any program (-exec)";
+      if (base === "tar") return "tar can run any program (--to-command) and write anywhere";
+      if (["make", "cmake", "ninja"].includes(base)) return "a build tool runs whatever the build files say";
+    }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
       const credentialKey = k.endsWith("_PWD") || (!schemaRole && k.split("_").includes("KEY")) ||
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
+      const credentialPart = k !== "SSH_AUTH_SOCK" && k.split(/[^A-Z0-9]+/).some((part) =>
+        ["TOKEN", "TOKENS", "SECRET", "SECRETS", "PASSWORD", "PASSWORDS", "PASSWD",
+          "CREDENTIAL", "CREDENTIALS", "PRIVATE", "AUTH", "AUTHORIZATION"].includes(part));
       if (credentialKey || k.endsWith("_PAT") ||
           ["DATABASE_URL", "REDIS_URL", "MONGODB_URI"].includes(k) ||
-          ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
+          credentialPart) {
         return "a secret from your environment";
       }
     }
@@ -519,6 +570,7 @@
         (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
+    if (seg.some((part) => part.toLowerCase() === ".azure")) return [true, "holds cloud credentials"];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
     const pulumiWindowsPath = /^(?:[a-z]:|\\\\)/i.test(path);
     const pulumiPath = (pulumiWindowsPath ? path.split(/[\\/]+/) : seg)
@@ -753,6 +805,9 @@
   function composerEnterSends() {
     return typeof S.enterSends === "boolean" ? S.enterSends : !inputTouchMode();
   }
+  function enterModeHint(enterSends) {
+    return enterSends ? "Enter: sends" : "Enter: newline";
+  }
   function updateEnterSendsControl() {
     const input = $("enter-sends");
     if (input) input.checked = composerEnterSends();
@@ -821,16 +876,15 @@
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
     syncSidebar();
     const conn = $("conn");
-    conn.title = "";
-    conn.onclick = null;
+    const retry = $("conn-retry");
+    if (!S.reconnect && document.activeElement === retry) focusReturn($("notes-btn"));
+    retry.hidden = !S.reconnect;
     const localConnected = S.local && S.ws?.readyState === 1 && S.daemonOnline;
     if (S.reconnect) {
       // Visible backoff with a manual retry (SPEC §12).
       const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
-      conn.className = "pill off clickable";
+      conn.className = "pill off";
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
-      conn.title = "Retry now";
-      conn.onclick = retryNow;
     } else if (!navigator.onLine && !localConnected) {
       conn.className = "pill off";
       conn.textContent = "offline · daemon unreachable";
@@ -897,7 +951,10 @@
     if (popover) { popover.remove(); popover = null; }
     popoverTrigger = null;
     // Keep the expanded trigger visible until focus-within takes over.
-    if (restore) focusReturn(trigger);
+    if (restore) {
+      focusReturn(trigger);
+      if (document.activeElement === trigger) revealSessionControl(trigger);
+    }
     if (trigger) {
       trigger.removeAttribute("aria-expanded");
       trigger.removeAttribute("aria-controls");
@@ -910,13 +967,20 @@
       open(e.key === "ArrowUp");
     }
   }
-  /** Measure after insertion: rem-based menus can be taller than the viewport. */
-  function placePopover(btn, alignRight = false, focusLast = false) {
+  function anchorPopover(btn) {
+    if (popoverTrigger && popoverTrigger !== btn) {
+      popoverTrigger.removeAttribute("aria-expanded");
+      popoverTrigger.removeAttribute("aria-controls");
+    }
     popoverTrigger = btn;
     btn.setAttribute("aria-haspopup", "menu");
     btn.setAttribute("aria-expanded", "true");
     btn.setAttribute("aria-controls", "action-menu");
     popover.id = "action-menu";
+  }
+  /** Measure after insertion: rem-based menus can be taller than the viewport. */
+  function placePopover(btn, alignRight = false, focusLast = false) {
+    anchorPopover(btn);
     const items = [...popover.querySelectorAll("button")];
     for (const item of items) { item.setAttribute("role", "menuitem"); item.tabIndex = -1; }
     const available = () => items.filter((item) => !item.disabled && !item.hidden);
@@ -1017,9 +1081,13 @@
       else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
+  function revealSessionControl(control) {
+    const list = $("sessions");
+    if (list.contains(control) && focusVisible(control)) revealViewportControl(control, list, safeViewportBounds());
+  }
   function positionPopover() {
     if (!popover) return;
-    if (!popoverTrigger?.isConnected || !popoverTrigger.getClientRects().length) return closePopover();
+    if (!focusVisible(popoverTrigger)) return closePopover();
     const gap = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16) * .5;
     const bounds = safeViewportBounds(gap);
     popover.style.minWidth = "0";
@@ -1193,23 +1261,27 @@
     if (!r) return;
     const i = S.sessions.findIndex((x) => x.id === r.id);
     if (i >= 0) S.sessions[i] = r;
-    S.sessions.sort((a, b) => (b.pinned - a.pinned) || b.updated_at.localeCompare(a.updated_at));
     renderSessions();
   }
   function sessionMenu(btn, s, focusLast = false) {
     closePopover();
-    btn.setAttribute("aria-expanded", "true");
+    const action = (label, run, attrs = {}) => h("button", { type: "button", ...attrs, onclick: () => {
+      const current = S.sessions.find((session) => session.id === s.id);
+      closePopover();
+      if (current) run(current);
+    } }, label);
     popover = h("div", { class: "popover", role: "menu", "aria-label": "Session actions" },
-      h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
-      h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
-      h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
-      h("button", { type: "button", onclick: () => { closePopover(); suggestName(s); } }, "Suggest name"),
-      h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
-      h("button", { type: "button", onclick: () => { closePopover(); editInstructions(s); } }, "Instructions…"),
-      h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
-      h("button", { type: "button", title: S.local ? "" : "The link includes the pairing key", onclick: () => { closePopover(); copySessionLink(s); } }, S.local ? "Copy link" : "Copy link (has the key)"),
-      h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
-      h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
+      action(s.pinned ? "Unpin" : "Pin", pinSession, { "data-session-action": "pin" }),
+      action(s.archived ? "Unarchive" : "Archive", archiveSession, { "data-session-action": "archive" }),
+      action("Rename", renameSession),
+      action("Suggest name", suggestName),
+      action("Tags…", tagSession),
+      action("Instructions…", editInstructions),
+      action("Fork", (session) => forkSession(session.id)),
+      action(S.local ? "Copy link" : "Copy link (has the key)", copySessionLink,
+        { title: S.local ? "" : "The link includes the pairing key" }),
+      action("Export…", (session) => pickExport(session.id)),
+      action("Delete", deleteSession, { class: "danger" }));
     placePopover(btn, false, focusLast);
   }
 
@@ -1266,27 +1338,47 @@
   function pollRunning() {
     if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
   }
+  function runningRow(i, row) {
+    if (!row) {
+      row = h("div", { class: "running-item" });
+      row.append(
+        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(row.invocation.session_id) }),
+        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "cancel_invocation", handle: invocation.handle }, "Cancelled " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Cancel"),
+        h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "abandon_invocation", handle: invocation.handle }, "Abandoned " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Abandon"));
+    }
+    row.invocation = i;
+    for (const [index, action] of ["open", "cancel", "abandon"].entries()) {
+      row.children[index].dataset.runningAction = action;
+      row.children[index].dataset.runningHandle = String(i.handle);
+    }
+    row.classList.toggle("stalled", !!i.stalled);
+    const session = S.sessions.find((x) => x.id === i.session_id);
+    row.firstElementChild.replaceChildren(h("strong", null, i.tool_name),
+      " · " + recordedDuration(i.elapsed_ms) + (session ? " · " + session.name : "") +
+      (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : ""));
+    row.lastElementChild.hidden = !!i.abandoned;
+    return row;
+  }
   function renderRunning(list) {
     const box = $("running");
     const focused = document.activeElement;
-    const previous = box.contains(focused) ? focused.dataset : null;
-    const controls = [];
-    const control = (action, i, attrs, ...children) => {
-      const button = h("button", { type: "button", "data-running-action": action, "data-running-handle": i.handle, ...attrs }, ...children);
-      if (previous?.runningAction === action && previous.runningHandle === String(i.handle)) controls.push(button);
-      return button;
-    };
+    const focusedRow = focused?.closest("#running .running-item");
+    const previous = new Map([...box.children].filter(node => node.invocation).map(row => [row.invocation.handle, row]));
+    const rows = list.map(i => runningRow(i, previous.get(i.handle)));
+    const heading = box.firstElementChild?.tagName === "H4" ? box.firstElementChild : h("h4", null, "Running tools");
+    reconcileChildren(box, rows.length ? [heading, ...rows] : rows);
     box.classList.toggle("hidden", !list.length);
-    box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
-      const s = S.sessions.find((x) => x.id === i.session_id);
-      return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + recordedDuration(i.elapsed_ms) + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
-        i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
-    }));
-    if (focusVisible(controls[0])) controls[0].focus({ preventScroll: true });
+    if (focusedRow && (document.activeElement !== focused || !focusVisible(focused))) {
+      const target = focusVisible(focused) ? focused
+        : focusedRow.isConnected ? focusedRow.firstElementChild : $("new-session");
+      focusReturn(target);
+    }
   }
   setInterval(pollRunning, 2000);
   document.addEventListener("visibilitychange", syncRunningExposure);
@@ -1417,8 +1509,9 @@
   }
   function branchSummaryReviewText(basis, preview) {
     const usage = preview.usage, projection = preview.projection;
-    const lines = ["Source: " + basis.source_name + " (" + preview.source_id + ")", "Target: " + basis.target_name + " (" + preview.target_id + ")",
-      "Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown"),
+    const lines = [approvalText("Source: " + basis.source_name + " (" + preview.source_id + ")"),
+      approvalText("Target: " + basis.target_name + " (" + preview.target_id + ")"),
+      approvalText("Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown")),
       "Reported usage: " + usage.reported_prompt_tokens + " input / " + usage.reported_completion_tokens + " output tokens · " + usage.reported_cached_tokens + " cached / " + usage.reported_cache_write_tokens + " cache-write · " + usage.reported_requests + "/" + usage.requests + " requests reported",
       usage.usage_complete ? "Usage coverage: complete" : "Usage coverage: incomplete or unknown; missing usage is not zero",
       usage.cost != null ? "Recorded cost: " + uiMoney(usage.cost, 6) : "Total cost: unknown · priced subtotal only: " + uiMoney(usage.priced_cost_subtotal, 6),
@@ -1426,7 +1519,7 @@
     if (projection.metadata_omitted) lines.push("Source metadata omitted from generation.");
     if (projection.attachment_bodies_omitted) lines.push("Attachment bodies omitted from generation.");
     if (usage.estimated_requests) lines.push(usage.estimated_requests + " request prices estimated from local prices");
-    if ((usage.unpriced || []).length) lines.push("Unpriced: " + usage.unpriced.join(", "));
+    if ((usage.unpriced || []).length) lines.push("Unpriced: " + approvalText(usage.unpriced.join(", ")));
     lines.push(...(preview.warnings || []).map(warning => "Note: " + warning),
       "Insert appends one note to the target Session; it does not merge transcripts or start a Run.", "Exact candidate note (data):", "", preview.candidate);
     return lines.join("\n");
@@ -1455,7 +1548,7 @@
     if (basis.source_id !== source || basis.target_id !== stamp.target || !basis.source_revision || !basis.target_revision) {
       preparing = false; invalidateBranchSummary(); return note("Branch summary basis did not match the requested source and target.", true);
     }
-    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model + ". Started generation may finish and record usage after review is closed.";
+    pendingBody.textContent = approvalText("Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model) + ". Started generation may finish and record usage after review is closed.";
     const result = await act({ type: "prepare_branch_summary", source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision }, null, 120000);
     preparing = false;
     cancelAsk(stamp.generateTag);
@@ -1480,11 +1573,50 @@
     note(applied.already_applied ? "This summary note was already inserted; no duplicate was added." : "Inserted one branch summary note; no Run was started.");
   }
 
+  function compareSessions(a, b) {
+    // Match the daemon's ORDER BY archived, pinned DESC, updated_at DESC.
+    const group = Number(!!a.archived) - Number(!!b.archived) || Number(!!b.pinned) - Number(!!a.pinned);
+    if (group) return group;
+    const first = a.updated_at ?? "", second = b.updated_at ?? "";
+    return first < second ? 1 : first > second ? -1 : 0;
+  }
+  function renderSessionBulkBar() {
+    const list = $("sessions"), existing = list.querySelector(".bulk-bar");
+    if (!S.marked.size) {
+      existing?.remove();
+      return;
+    }
+    const ids = [...S.marked];
+    const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
+    const bar = h("li", { class: "bulk-bar" },
+      h("span", { class: "muted" }, ids.length + " selected"),
+      btn("Archive", () => bulkSessions("archive", ids)),
+      btn("Export", () => bulkSessions("export", ids)),
+      btn("Tag", () => bulkSessions("tag", ids)),
+      btn("Delete", () => bulkSessions("delete", ids), "danger"),
+      btn("Clear", () => { S.marked.clear(); renderSessions(); }));
+    if (existing) existing.replaceWith(bar);
+    else (list.querySelector(".tag-chips") || list.firstElementChild).after(bar);
+  }
+  function updateSessionTimes() {
+    for (const item of $("sessions").querySelectorAll("[data-session-id]")) {
+      // Some Run events update S.running before a fresh Session summary.
+      if (S.running.has(item.dataset.sessionId) !== !!item.querySelector(".session-open > .running")) {
+        renderSessions();
+        return;
+      }
+      const stamp = item.querySelector(".when");
+      const text = relTime(stamp.dataset.updatedAt);
+      if (stamp.textContent !== text) stamp.textContent = text;
+    }
+  }
   function renderSessions() {
     const list = $("sessions");
     const focused = document.activeElement;
     const focusedRow = focused?.closest("#sessions [data-session-id]");
     const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
+    const menuSession = popoverTrigger?.closest("#sessions [data-session-id]")?.dataset.sessionId;
+    let replacementMenu = null, replacementFocus = null;
     list.replaceChildren();
     S.marked = S.marked || new Set();
     if (S.marked.size) {
@@ -1494,8 +1626,10 @@
     }
     if (!S.sessions.length) {
       list.append(h("li", { class: "muted", style: "padding:0.5rem" }, "No sessions yet."));
+      if (menuSession) closePopover();
       return;
     }
+    S.sessions.sort(compareSessions);
     list.append(h("li", null, h("button", { type: "button", class: "btn small", "aria-pressed": String(!!S.sessionTree), onclick: () => { S.sessionTree = !S.sessionTree; renderSessions(); } }, S.sessionTree ? "Tree on" : "Tree off")));
     // Tag chips filter the list (SPEC §10.4).
     const tags = [...new Set(S.sessions.flatMap((s) => s.tags || []))].sort();
@@ -1505,18 +1639,7 @@
         h("button", { type: "button", class: "chip-btn" + (S.tagFilter === t ? " on" : ""), "aria-pressed": String(S.tagFilter === t),
           onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
     }
-    // Bulk actions on checked Sessions (SPEC §10.4).
-    if (S.marked.size) {
-      const ids = [...S.marked];
-      const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
-      list.append(h("li", { class: "bulk-bar" },
-        h("span", { class: "muted" }, ids.length + " selected"),
-        btn("Archive", () => bulkSessions("archive", ids)),
-        btn("Export", () => bulkSessions("export", ids)),
-        btn("Tag", () => bulkSessions("tag", ids)),
-        btn("Delete", () => bulkSessions("delete", ids), "danger"),
-        btn("Clear", () => { S.marked.clear(); renderSessions(); })));
-    }
+    renderSessionBulkBar();
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
@@ -1538,7 +1661,7 @@
           "data-session-id": s.id,
         },
         h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessionBulkBar(); } }),
         h("button", { class: "session-open", type: "button", "aria-label": s.name,
           "aria-current": s.id === S.current ? "true" : null, "aria-describedby": state ? stateId : null,
           onclick: () => openSession(s.id) },
@@ -1547,14 +1670,12 @@
           h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
             row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
             s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-          h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
+          h("span", { class: "when", "data-updated-at": s.updated_at,
+            title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
         state ? h("span", { id: stateId, class: "sr-only" }, state) : null, menu);
         list.append(item);
-        if (focusedRow?.dataset.sessionId === s.id && focusedControl) {
-          const control = item.querySelector("." + focusedControl);
-          if (focusedControl === "menu" && !focusVisible(control)) item.querySelector(".session-open").focus({ preventScroll: true });
-          control.focus({ preventScroll: true });
-        }
+        if (focusedRow?.dataset.sessionId === s.id && focusedControl) replacementFocus = item;
+        if (menuSession === s.id) replacementMenu = { menu, session: s };
       }
     };
     appendRows(active);
@@ -1564,6 +1685,22 @@
         onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); S.showArchived = !S.showArchived; renderSessions(); } } },
       (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
       if (S.showArchived) appendRows(archived);
+    }
+    if (replacementMenu) {
+      const { menu, session } = replacementMenu;
+      anchorPopover(menu);
+      const pin = popover.querySelector('[data-session-action="pin"]'), archive = popover.querySelector('[data-session-action="archive"]');
+      const pinLabel = session.pinned ? "Unpin" : "Pin", archiveLabel = session.archived ? "Unarchive" : "Archive";
+      if (pin.textContent !== pinLabel) pin.textContent = pinLabel;
+      if (archive.textContent !== archiveLabel) archive.textContent = archiveLabel;
+      revealSessionControl(menu);
+      positionPopover();
+    } else if (menuSession) closePopover();
+    if (replacementFocus) {
+      const control = replacementFocus.querySelector("." + focusedControl);
+      if (focusedControl === "menu" && !focusVisible(control)) replacementFocus.querySelector(".session-open").focus({ preventScroll: true });
+      control.focus({ preventScroll: true });
+      revealSessionControl(document.activeElement);
     }
   }
 
@@ -1646,13 +1783,52 @@
     /~~(?=\S)([\s\S]*?\S)~~/.source, // 5 strike
     /\*(?=[^\s*])((?:\\[\s\S]|[^*\\]|\*\*[^*]+\*\*)*?(?:\\\S|[^\\\s*]))\*/.source, // 6 em
     /(?<![\w\\])_(?=[^\s_])([^_]*?[^\s_])_(?!\w)/.source, // 7 em
-    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 8,9 image
-    /\[((?:[^\]\\]|\\.)+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 10,11 link
-    /<((?:[hH][tT][tT][pP][sS]?:\/\/|[mM][aA][iI][lL][tT][oO]:)[^>\s]+)>/.source, // 12 autolink
-    /([hH][tT][tT][pP][sS]?:\/\/[^\s<]*[^\s<.,:;"')\]!?*_~])/.source, // 13 bare url
-    /\$(?=\S)([^$\n]*?\S)\$(?!\d)/.source, // 14 math
-    /\\([\\`*_{}\[\]()#+\-.!~|$<>])/.source, // 15 escape
+    /!\[([^\]]*)\]\(/.source, // 8 image label
+    /\[((?:[^\]\\]|\\.)+)\]\(/.source, // 9 link label
+    /<((?:[hH][tT][tT][pP][sS]?:\/\/|[mM][aA][iI][lL][tT][oO]:)[^>\s]+)>/.source, // 10 autolink
+    /([hH][tT][tT][pP][sS]?:\/\/[^\s<]*[^\s<.,:;"'!?*_~])/.source, // 11 bare url
+    /\$(?=\S)([^$\n]*?\S)\$(?!\d)/.source, // 12 math
+    /\\([\\`*_{}\[\]()#+\-.!~|$<>])/.source, // 13 escape
   ].join("|"), "g");
+
+  function inlineDestination(text, start) {
+    let end = start, depth = 0;
+    for (; end < text.length; end++) {
+      const c = text[end], next = text[end + 1];
+      if (/\s/.test(c)) break;
+      if (c === "\\" && next !== undefined && "()\\".includes(next)) {
+        end++;
+      } else if (c === "(") {
+        depth++;
+      } else if (c === ")") {
+        if (depth === 0) break;
+        depth--;
+      }
+    }
+    if (end === start || depth !== 0) return null;
+    const closing = text[end] === ")" ? ")" : /^\s+"[^"]*"\)/.exec(text.slice(end))?.[0];
+    if (!closing) return null;
+    const url = text.slice(start, end).replace(/\\([()\\])/g, "$1");
+    return { url, end: end + closing.length };
+  }
+
+  function bareUrlEnd(url) {
+    let parens = 0, brackets = 0, end = url.length;
+    for (const c of url) {
+      if (c === "(") parens++;
+      else if (c === ")") parens--;
+      else if (c === "[") brackets++;
+      else if (c === "]") brackets--;
+    }
+    for (; end > 0; end--) {
+      const c = url[end - 1];
+      if (c === ")" && parens < 0) parens++;
+      else if (c === "]" && brackets < 0) brackets++;
+      else if (!".,:;\"'!?*_~".includes(c)) break;
+    }
+    return end;
+  }
+
   function link(url, kids) {
     if (!SAFE_URL.test(url)) return kids;
     return h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, kids);
@@ -1672,14 +1848,31 @@
       else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4], depth + 1)));
       else if (m[5] != null) out.push(h("del", null, inline(m[5], depth + 1)));
       else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7], depth + 1)));
-      // Remote images are blocked by the CSP (img-src 'self' data:), so an
-      // image is shown as a labelled link instead.
-      else if (m[9] != null) out.push(link(m[9], h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))));
-      else if (m[11] != null) out.push(link(m[11], inline(m[10], depth + 1)));
-      else if (m[12] != null) out.push(link(m[12], m[12].replace(/^mailto:/i, "")));
-      else if (m[13] != null) out.push(link(m[13], m[13]));
-      else if (m[14] != null) out.push(h("span", { class: "math" }, m[14]));
-      else if (m[15] != null) out.push(m[15]);
+      else if (m[8] != null || m[9] != null) {
+        const dest = inlineDestination(text, re.lastIndex);
+        if (!dest) {
+          // Resume after the first literal character of a malformed prefix.
+          out.push(text[m.index]);
+          re.lastIndex = m.index + 1;
+        } else {
+          re.lastIndex = dest.end;
+          // Remote images use a labelled link because of the image CSP.
+          const kids = m[8] != null ? h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))
+            : inline(m[9], depth + 1);
+          out.push(link(dest.url, kids));
+        }
+      } else if (m[10] != null) out.push(link(m[10], m[10].replace(/^mailto:/i, "")));
+      else if (m[11] != null) {
+        const end = bareUrlEnd(m[11]);
+        if (end > m[11].indexOf("://") + 3) {
+          const url = m[11].slice(0, end);
+          out.push(link(url, url));
+          re.lastIndex = m.index + end;
+        } else {
+          out.push(m[11]);
+        }
+      } else if (m[12] != null) out.push(h("span", { class: "math" }, m[12]));
+      else if (m[13] != null) out.push(m[13]);
       last = re.lastIndex;
     }
     if (last < text.length) out.push(text.slice(last));
@@ -1688,6 +1881,96 @@
 
   // Tiny tokenizer-highlighter, mirroring the TUI's (crates/formless-tui/src/highlight.rs).
   const W = (s) => new Set(s.split(" "));
+  const JS_REGEX_KEYWORDS = W("await case delete do else extends in instanceof new of return throw typeof void yield");
+  const JS_CONTEXTUAL_REGEX_KEYWORDS = W("await of yield");
+  const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
+  const JS_LINE_END = /[\n\r\u2028\u2029]/;
+
+  function jsxClosingTagEnd(code, start) {
+    const closingTag = /(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*)?\s*>/uy;
+    closingTag.lastIndex = start + 1;
+    if (!closingTag.test(code)) return start;
+    const end = closingTag.lastIndex;
+    // After a JSX tag, division needs a right operand. A member dot
+    // or expression terminator instead permits a regex comparison.
+    const regexSuffix = /^[dgimsuvy]*(?:\.(?![0-9])|\s*(?:[;,)\]}]|$))/;
+    return code[end] === "/" && regexSuffix.test(code.slice(end + 1)) ? start : end;
+  }
+
+  function jsRegexEnd(code, start, state, lang) {
+    const tokenEnd = (at) => {
+      while (at > 0) {
+        const commentStart = state.comments.get(at);
+        if (commentStart !== undefined) at = commentStart;
+        else if (/\s/.test(code[at - 1])) at--;
+        else break;
+      }
+      return at;
+    };
+    const before = tokenEnd(start);
+    const last = code[before - 1];
+    // A closing brace or postfix operator can end a division operand.
+    if (before === state.jsxTagEnd || last === "}" || code.slice(Math.max(0, before - 2), before) === "++" ||
+        code.slice(Math.max(0, before - 2), before) === "--") return start;
+    let keyword = "";
+    if (before > 0 && !"=(,:[!&|?{;+-*%<>~^".includes(last)) {
+      let wordStart = before;
+      while (wordStart > 0 && JS_IDENT_CONTINUE.test(code[wordStart - 1])) wordStart--;
+      keyword = code.slice(wordStart, before);
+      const prefix = tokenEnd(wordStart);
+      const previous = code[prefix - 1];
+      const member = previous === "#" || (previous === "." && !code.startsWith("...", prefix - 3));
+      const splitSurrogate = /[\udc00-\udfff]/.test(code[wordStart - 1] ?? "");
+      if (!JS_REGEX_KEYWORDS.has(keyword) || member || splitSurrogate) return start;
+    }
+    const contextual = JS_CONTEXTUAL_REGEX_KEYWORDS.has(keyword);
+    let inClass = false;
+    for (let end = start + 1; end < code.length; end++) {
+      const c = code[end];
+      if (JS_LINE_END.test(c)) break;
+      if (c === "\\") {
+        end++;
+        if (end === code.length || JS_LINE_END.test(code[end])) break;
+      } else if (c === "[") inClass = true;
+      else if (c === "]") inClass = false;
+      else if (c === "/" && !inClass) {
+        // A guessed closer after a contextual identifier can instead open
+        // a real comment after the first divisor.
+        if (contextual) {
+          const adjacentComment = code.startsWith("//", end + 1) ||
+            (code.startsWith("/*", end + 1) && code.indexOf("*/", end + 3) >= 0);
+          if (!adjacentComment && (code[end + 1] === "/" ||
+              (code[end + 1] === "*" && code.indexOf("*/", end + 2) >= 0))) return start;
+        }
+        end++;
+        while (end < code.length && /[a-z]/i.test(code[end])) {
+          if (!"dgimsuvy".includes(code[end])) return start;
+          end++;
+        }
+        if (contextual) {
+          let next = end;
+          for (;;) {
+            while (next < code.length && /\s/.test(code[next]) && !JS_LINE_END.test(code[next])) next++;
+            if (!code.startsWith("/*", next)) break;
+            const close = code.indexOf("*/", next + 2);
+            if (close < 0 || JS_LINE_END.test(code.slice(next, close))) return end;
+            next = close + 2;
+          }
+          let wordEnd = next;
+          while (wordEnd < code.length && JS_IDENT_CONTINUE.test(code[wordEnd])) wordEnd++;
+          const word = code.slice(next, wordEnd);
+          const typescript = lang === "ts" || lang === "tsx" || lang === "typescript";
+          if (word && word !== "in" && word !== "instanceof" &&
+              !(typescript && (word === "as" || word === "satisfies"))) return start;
+          if (code[next] === "'" || code[next] === '"') return start;
+        }
+        return end;
+      }
+    }
+    return start;
+  }
+
+
   const HL = {
     rust: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct trait type unsafe use where while"), lit: W("true false self Self None Some Ok Err super") },
     js: { lc: ["//"], bc: ["/*", "*/"], q: "\"'`", kw: W("as async await break case catch class const continue debugger default delete do else enum export extends finally for from function if implements import in instanceof interface let new of private protected public readonly return static switch throw try type typeof var void while with yield"), lit: W("true false null undefined NaN this super") },
@@ -1719,6 +2002,219 @@
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", less: "scss",
   };
+  const SHELL_ANSI_ESCAPES = {
+    a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
+    "\\": "\\", "'": "'", '"': '"', "?": "?",
+  };
+  function shellCommentState(code, lang) {
+    // Track shell words that can contain punctuation from command separators.
+    const contexts = [];
+    const hereDocs = [];
+    let hereDocIndex = 0;
+    let inHereDoc = false;
+    let lineBoundary = true;
+    let regexDepth = 0;
+    const ansiQuotes = lang === "bash" || lang === "zsh";
+    const context = () => contexts.at(-1) ?? "command";
+    const replace = (mode) => { contexts[contexts.length - 1] = mode; };
+    const escaped = (at) => {
+      let start = at;
+      while (start > 0 && code[start - 1] === "\\") start--;
+      return (at - start) % 2 !== 0;
+    };
+    const commandPosition = (at) => {
+      let end = at - 1;
+      while (end >= 0 && code[end] !== "\n") {
+        if (/\s/.test(code[end])) {
+          end--;
+          continue;
+        }
+        if (";|&({)".includes(code[end])) return !escaped(end);
+        let start = end;
+        while (start > 0 && !/[\s;|&({)]/.test(code[start - 1])) start--;
+        if (!/^(if|elif|then|else|do|while|until|!|time)$/.test(code.slice(start, end + 1))) return false;
+        end = start - 1;
+      }
+      return lineBoundary;
+    };
+    const track = (at) => {
+      const current = code[at], previous = code[at - 1], next = code[at + 1];
+      const mode = context();
+      if ((current === "\\" && mode !== "regex-start") || escaped(at)) return;
+      if (mode === "regex-start") {
+        if (!/\s/.test(current)) {
+          regexDepth = Number(current === "(");
+          replace("regex");
+        }
+      } else if (mode === "regex") {
+        if (current === "(") regexDepth++;
+        else if (current === ")") regexDepth = Math.max(0, regexDepth - 1);
+        else if (!regexDepth && /\s/.test(current)) replace("condition");
+      } else if (mode === "condition" && current === "~" && previous === "=" &&
+                 (!code[at - 2] || /\s/.test(code[at - 2]))) {
+        replace("regex-start");
+      } else if (mode === "condition" && current === "]" && next === "]" &&
+                 (!previous || /\s/.test(previous)) && (!code[at + 2] || /[\s;|&)]/.test(code[at + 2]))) {
+        contexts.pop();
+      } else if ((mode === "parameter" && current === "}") ||
+                 ((mode === "pattern" || mode === "command") && current === ")")) {
+        contexts.pop();
+      } else if ((mode === "case-pattern" || mode === "case-pattern-alternative") && current === ")") {
+        replace("case-body");
+      } else if (mode === "case-body" && previous === ";" &&
+                 ((current === ";" && next !== "&") || current === "&")) {
+        replace("case-pattern");
+      } else if (current === "{" && previous === "$" && !escaped(at - 1)) {
+        contexts.push("parameter");
+      } else if (current === "(" && (mode === "pattern" || (previous && "@!?+*$".includes(previous) && !escaped(at - 1)))) {
+        contexts.push(mode !== "pattern" && previous === "$" && next !== "(" ? "command" : "pattern");
+      } else if (mode === "case-pattern" && "(|".includes(current)) {
+        replace("case-pattern-alternative");
+      } else if (current === "(" && (mode === "command" || mode === "case-body")) {
+        contexts.push(next === "(" ? "pattern" : "command");
+      } else if (current === "[" && next === "[" && (mode === "command" || mode === "case-body") &&
+                 (!previous || /[\s;|&(]/.test(previous)) && (!code[at + 2] || /\s/.test(code[at + 2])) &&
+                 commandPosition(at)) {
+        contexts.push("condition");
+      }
+    };
+    const trackWord = (at, word) => {
+      if (lang === "fish" || !["case", "in", "esac"].includes(word)) return;
+      const previous = code[at - 1], next = code[at + word.length];
+      if ((previous && !/[\s;|&({)]/.test(previous)) ||
+          (next && !/[\s;|&()]/.test(next)) || escaped(at - 1)) return;
+      const mode = context();
+      if ((mode === "command" || mode === "case-body") && word === "case" && commandPosition(at)) {
+        contexts.push("case-header");
+      } else if (mode === "case-header" && word === "in") {
+        replace("case-pattern");
+      } else if ((mode === "case-pattern" && word === "esac") ||
+                 (mode === "case-body" && word === "esac" && commandPosition(at))) {
+        contexts.pop();
+      }
+    };
+    const comment = (at) => {
+      const mode = context();
+      if (mode === "parameter" || mode === "pattern" || mode === "regex") return false;
+      const previous = code[at - 1], before = code[at - 2];
+      if (at === 0 || previous === "\n") return lineBoundary;
+      let separator = false;
+      if (mode === "command" || mode === "case-body") separator = ";|&(".includes(previous);
+      else if (mode === "case-pattern" || mode === "case-pattern-alternative") {
+        separator = "|(".includes(previous) || before === ";" && ";&".includes(previous);
+      }
+      else if (mode === "condition" || mode === "regex-start") {
+        separator = before === previous && "|&".includes(previous) && !escaped(at - 2);
+      }
+      return (/\s/.test(previous) || separator) && !escaped(at - 1);
+    };
+    const endLine = (at, endedByComment) => {
+      if (code[at - 1] === "\r") at--;
+      const continued = !endedByComment && escaped(at);
+      lineBoundary = !continued || comment(at - 1);
+      if (!continued) {
+        if (context() === "regex" && !regexDepth) replace("condition");
+        inHereDoc = hereDocIndex < hereDocs.length;
+      }
+    };
+    const ansiEscape = (at) => {
+      const c = code[at];
+      if (!c || c === "\n" || c === "\r") return null;
+      if (Object.hasOwn(SHELL_ANSI_ESCAPES, c)) return [SHELL_ANSI_ESCAPES[c], at + 1];
+      if (c === "c") {
+        const control = code[at + 1];
+        if (!control || control === "\n" || control === "\r" || control.charCodeAt(0) > 127) return null;
+        return [String.fromCharCode(control.toUpperCase().charCodeAt(0) ^ 0x40), at + 2];
+      }
+      const octal = /[0-7]/.test(c);
+      const start = at + Number(!octal);
+      const size = ({ x: 2, u: 4, U: 8 })[c];
+      const digits = octal ? code.slice(start, start + 3).match(/^[0-7]+/) :
+        size ? code.slice(start, start + size).match(/^[0-9a-f]+/i) : null;
+      if (!digits) return ["\\", at];
+      const value = parseInt(digits[0], octal ? 8 : 16);
+      if (octal || c === "x") return [value % 256, start + digits[0].length];
+      if (value > 0x10ffff || value >= 0xd800 && value <= 0xdfff) return null;
+      return [String.fromCodePoint(value), start + digits[0].length];
+    };
+    const hereDoc = (at) => {
+      if (lang === "fish" || !["command", "case-body"].includes(context()) || escaped(at) ||
+          code[at + 1] !== "<" || code[at + 2] === "<" ||
+          (code[at - 1] === "<" && !escaped(at - 1))) return at;
+      let end = at + 2;
+      const stripTabs = code[end] === "-";
+      if (stripTabs) end++;
+      while (code[end] === " " || code[end] === "\t") end++;
+      const start = end;
+      const bytes = [];
+      const encoder = new TextEncoder();
+      const append = (content) => {
+        if (typeof content === "number") bytes.push(content);
+        else bytes.push(...encoder.encode(content));
+      };
+      let quote = "";
+      let quoted = false, ansiQuote = false;
+      if (code[end] === "#") return at;
+      while (end < code.length && code[end] !== "\n") {
+        const c = String.fromCodePoint(code.codePointAt(end));
+        if (!quote && /[\s;|&()<>]/.test(c)) break;
+        end += c.length;
+        if (quote === c) {
+          quote = "";
+          ansiQuote = false;
+        } else if (!quote && c === "$" && (ansiQuotes && code[end] === "'" || lang === "bash" && code[end] === '"')) {
+          quote = code[end++];
+          quoted = true;
+          ansiQuote = quote === "'";
+        } else if (!quote && "\"'".includes(c)) {
+          quote = c;
+          quoted = true;
+        } else if (c === "\\" && ansiQuote) {
+          const escapedChar = ansiEscape(end);
+          if (!escapedChar) return at;
+          append(escapedChar[0]);
+          end = escapedChar[1];
+        } else if (c === "\\" && quote !== "'" && (!quote || /[\\"$`]/.test(code[end] ?? ""))) {
+          if (end === code.length || code[end] === "\n") return at;
+          const escapedChar = String.fromCodePoint(code.codePointAt(end));
+          append(escapedChar);
+          end += escapedChar.length;
+          quoted = true;
+        } else append(c);
+      }
+      if (end === start || quote || bytes.includes(0)) return at;
+      let delimiter;
+      try {
+        delimiter = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes));
+      } catch {
+        return at;
+      }
+      hereDocs.push({ delimiter, stripTabs, quoted, continued: "" });
+      return end;
+    };
+    const literalLine = (at) => {
+      if (!inHereDoc) return null;
+      const next = code.indexOf("\n", at);
+      const end = next < 0 ? code.length : next;
+      const doc = hereDocs[hereDocIndex];
+      const contentEnd = end - Number(code[end - 1] === "\r");
+      if (!doc.quoted && escaped(contentEnd)) {
+        doc.continued += code.slice(at, contentEnd - 1);
+        return end;
+      }
+      const line = doc.continued + code.slice(at, contentEnd);
+      if ((doc.stripTabs ? line.replace(/^\t+/, "") : line) === doc.delimiter) {
+        hereDocIndex++;
+        if (hereDocIndex === hereDocs.length) {
+          hereDocIndex = hereDocs.length = 0;
+          inHereDoc = false;
+        }
+      } else doc.continued = "";
+      return end;
+    };
+    return { track, trackWord, comment, endLine, hereDoc, literalLine, escaped, ansiQuotes };
+  }
+
   function powershellQuoteEnd(code, from, quote) {
     for (let i = from; i < code.length; i++) {
       const c = code[i];
@@ -1738,6 +2234,10 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const shell = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang)
+      ? shellCommentState(code, lang) : null;
+    const kotlin = lang === "kotlin" || lang === "kt";
+    const js = L === HL.js ? { comments: new Map(), jsxTagEnd: -1 } : null;
     const toml = lang === "toml";
     const php = L === HL.php;
     const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
@@ -1753,8 +2253,18 @@
     let yamlScalar = null;
     let i = 0;
     let lineStart = true;
+    let endedByComment = false;
     const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
     while (i < code.length) {
+      if (lineStart && shell) {
+        const end = shell.literalLine(i);
+        if (end !== null) {
+          const next = end + Number(end < code.length);
+          plain += code.slice(i, next);
+          i = next;
+          continue;
+        }
+      }
       const c = code[i];
       if (L === HL.js && (c === "." || /\d/.test(c))) {
         lineStart = false;
@@ -1808,9 +2318,14 @@
         }
       }
       lineStart = c === "\n";
+      if (lineStart && shell) {
+        shell.endLine(i, endedByComment);
+        endedByComment = false;
+      }
       if (L.bc && code.startsWith(L.bc[0], i)) {
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1833,16 +2348,42 @@
         continue;
       }
       const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
-        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]));
+        (shell ? shell.comment(i) : L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1])));
       if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
           (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
         const lineEnd = end < 0 ? code.length : end;
         const tag = php ? code.slice(i, lineEnd).indexOf("?>") : -1;
         const stop = tag < 0 ? lineEnd : i + tag;
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
+        endedByComment = true;
         continue;
+      }
+      if (shell && c !== "\n") {
+        const end = c === "<" ? shell.hereDoc(i) : i;
+        if (end !== i) {
+          plain += code.slice(i, end);
+          i = end;
+          continue;
+        }
+        shell.track(i);
+      }
+      const prevWord = i > 0 && word.test(code[i - 1]);
+      if (L === HL.rust && !prevWord &&
+          (c === "r" || ((c === "b" || c === "c") && code[i + 1] === "r"))) {
+        const prefixEnd = i + (c === "r" ? 1 : 2);
+        let opener = prefixEnd;
+        while (code[opener] === "#") opener++;
+        if (code[opener] === '"') {
+          const delimiter = '"' + code.slice(prefixEnd, opener);
+          const end = code.indexOf(delimiter, opener + 1);
+          const stop = end < 0 ? code.length : end + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
       }
       if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
         const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
@@ -1855,18 +2396,24 @@
           continue;
         }
       }
-      if (L.q.includes(c)) {
-        const multiline = toml && code.startsWith(c.repeat(3), i);
-        const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
+      if (L.q.includes(c) && (!shell || !shell.escaped(i))) {
+        const triple = (toml || L === HL.py || (c === '"' && (lang === "java" || kotlin))) &&
+          code.startsWith(c.repeat(3), i);
+        const delimiter = triple ? c.repeat(3) : c;
+        const multiline = shell || triple || c === "`" || L.mysqlComments;
+        const ansiQuote = shell && (shell.ansiQuotes || shellLiteralQuotes) &&
+          c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
+        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) &&
+          !(toml && c === "'") && !(L.mysqlComments && c === "`") &&
+          !(shell && lang !== "fish" && c === "'" && !ansiQuote);
         let j = i + delimiter.length;
-        while (j < code.length && !code.startsWith(delimiter, j) &&
-            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
-          j += code[j] === "\\" && escapes ? 2 : 1;
+        while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
+          j += escapes && code[j] === "\\" ? 2 : 1;
         }
         let stop = Math.min(j + delimiter.length, code.length);
-        // Include up to two quotes immediately before the TOML closing delimiter.
-        if (multiline) {
+        // Kotlin includes any content quotes adjacent to the raw closer.
+        if (kotlin && triple) while (code[stop] === '"') stop++;
+        if (toml && triple) {
           const trailing = stop + 2;
           while (stop < trailing && code[stop] === c) stop++;
         }
@@ -1874,12 +2421,27 @@
         i = stop;
         continue;
       }
-      const prevWord = i > 0 && word.test(code[i - 1]);
       if (/\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
-        tok("tok-num", m[0]);
-        i += m[0].length;
+        // A raw literal can start immediately after a Rust range operator.
+        const range = L === HL.rust ? m[0].indexOf("..") : -1;
+        const number = range < 0 ? m[0] : m[0].slice(0, range);
+        tok("tok-num", number);
+        i += number.length;
         continue;
+      }
+      if (c === "/" && js) {
+        const tag = (lang === "jsx" || lang === "tsx") && code[i - 1] === "<"
+          ? jsxClosingTagEnd(code, i) : i;
+        if (tag !== i) js.jsxTagEnd = tag;
+        else {
+          const stop = jsRegexEnd(code, i, js, lang);
+          if (stop !== i) {
+            tok("tok-str", code.slice(i, stop));
+            i = stop;
+            continue;
+          }
+        }
       }
       if (L.tags && c === "<") {
         const m = code.slice(i).match(/^<\/?[\w:-]+/);
@@ -1888,6 +2450,7 @@
       if (/[\p{L}_$]/u.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\p{L}\p{N}_$]+/u);
         const w = m[0];
+        shell?.trackWord(i, w);
         const k = L.ci ? w.toLowerCase() : w;
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;
@@ -2759,13 +3322,17 @@
   function storedSessionModel(session) {
     return session?.model || S.settings?.provider?.model || "";
   }
+  let modelPickerSequence = 0;
   async function openModelPicker(onPick) {
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
     const model = storedSessionModel(session);
     const efforts = ["", "low", "medium", "high"];
-    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
-    const list = h("ul", { class: "picker-list", role: "listbox" });
+    // The scrollable results are navigated from the input, including in
+    // browsers that otherwise add scroll containers to the Tab order.
+    const list = h("ul", { id: "model-picker-" + ++modelPickerSequence, class: "picker-list", role: "listbox", "aria-label": "Models", tabindex: -1, hidden: true });
+    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false",
+      role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
     effort.value = (session && session.reasoning_effort) || "";
@@ -2793,7 +3360,7 @@
       matches = items.map((item, n) => ({ item, n, m: fuzzyMatch(q, item.id) }))
         .filter((x) => x.m)
         .sort((a, b) => (q.trim() ? b.m[0] - a.m[0] : 0) || a.n - b.n)
-        .map((x) => ({ item: x.item, pos: new Set(x.m[1]) }));
+        .map((x) => ({ item: x.item, optionId: list.id + "-option-" + x.n, pos: new Set(x.m[1]) }));
       sel = Math.min(sel, Math.max(0, matches.length - 1));
       const sources = multiSource();
       // At most 200 rows, in a window that keeps the selection.
@@ -2801,17 +3368,25 @@
       list.replaceChildren(...matches.slice(first, first + 200).map((x, n) => {
         const i = first + n;
         const id = [...x.item.id].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
-        const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
+        const li = h("li", { id: x.optionId, role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null,
+          "aria-posinset": i + 1, "aria-setsize": matches.length },
           h("span", { class: "picker-id" }, id),
           x.item.recent ? h("span", { class: "picker-tag" }, "recent") : null,
           sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null,
           modelDetail(meta[x.item.id], tests[x.item.id]) ? h("span", { class: "muted" }, modelDetail(meta[x.item.id], tests[x.item.id])) : null);
-        li.onclick = () => { sel = i; draw(); };
+        li.onclick = () => { sel = i; draw(); input.focus({ preventScroll: true }); };
         li.ondblclick = () => { sel = i; finish(false); };
         return li;
       }));
       const selNode = list.children[sel - first];
-      if (selNode) selNode.scrollIntoView({ block: "nearest" });
+      list.hidden = !matches.length;
+      input.setAttribute("aria-expanded", String(!list.hidden));
+      if (selNode) {
+        input.setAttribute("aria-activedescendant", selNode.id);
+        selNode.scrollIntoView({ block: "nearest" });
+      } else {
+        input.removeAttribute("aria-activedescendant");
+      }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
       const accepted = (meta[choice()] || {}).efforts;
       const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
@@ -3059,6 +3634,10 @@
       const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
       const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
       const active = new Set(), messageIds = new Set();
+      // Recompute the display context on normal renders, including local
+      // midnight and timezone changes, without touching stable turn nodes.
+      const today = new Date().toDateString();
+      const timeContext = [uiLocale(), today, Intl.DateTimeFormat().resolvedOptions().timeZone].join("|");
       let turn = null, group = null;
       const open = (role, when, msg) => {
         const g = speaker(role);
@@ -3069,7 +3648,7 @@
         turn = historyRender.turns.get(key);
         if (!turn) {
           const who = h("div", { class: "who " + g }, WHO[g]);
-          const time = h("time");
+          const time = h("span");
           who.append(time);
           const body = h("div");
           turn = { el: h("div", { class: "turn " + g, "data-turn-id": currentMessage.id }, who, body), who, time, body, edit: null, decorations: null, decorationKey: null };
@@ -3077,9 +3656,13 @@
         }
         turn.items = [];
         turn.message = currentMessage;
-        const stamp = when ? clock(when) : "";
-        if (turn.time.textContent !== stamp) turn.time.textContent = stamp;
-        turn.time.hidden = !when;
+        if (turn.when !== when || turn.timeContext !== timeContext) {
+          const stamp = turnTimestamp(when, today);
+          turn.time.replaceChildren(...(stamp ? [stamp] : []));
+          turn.time.hidden = !stamp;
+          turn.when = when;
+          turn.timeContext = timeContext;
+        }
         const editable = msg && msg === lastUser && !isRunning();
         if (editable && !turn.edit) {
           const entry = turn;
@@ -3208,6 +3791,9 @@
     if (await act({type:"resume_run",session_id:sid})) { S.unfinished = null; renderRunBanner(); }
   }
 
+  function welcomeEnterHint(enterSends) {
+    return enterModeHint(enterSends) + (enterSends ? "" : " · Use the " + tr("Send") + " button");
+  }
   function welcome() {
     // The same examples as the TUI's empty Session (1–4 there).
     const examples = [
@@ -3220,7 +3806,8 @@
       h("h2", null, h("span", { class: "mark" }, "◇ "), "Formless"),
       h("p", { class: "muted" }, "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it."),
       h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; $("input").focus(); autosize(); } }, ex))),
-      h("p", { class: "muted" }, "Enter sends · /help commands · /model switch model · @ reference a file"));
+      h("p", { class: "muted" }, h("span", { class: "welcome-enter-hint" }, welcomeEnterHint(composerEnterSends())),
+        " · /help commands · /model switch model · @ reference a file"));
   }
 
   function runningTool(name, invocationId = null, depth = null, handle = null) {
@@ -4147,9 +4734,14 @@
     $("stop-btn").textContent = tr("Stop");
     $("input").placeholder = tr(running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…");
     const enterSends = composerEnterSends();
+    const welcomeHint = historyRender.welcome?.querySelector(".welcome-enter-hint");
+    if (welcomeHint) {
+      const hint = welcomeEnterHint(enterSends);
+      if (welcomeHint.textContent !== hint) welcomeHint.textContent = hint;
+    }
     $("input").setAttribute("enterkeyhint", enterSends ? "send" : "enter");
     $("compose-hint").replaceChildren(
-      h("span", { class: "compose-enter-pref", title: "Enter sends: " + (enterSends ? "on" : "off") + " · This browser Settings" }, enterSends ? "Enter: sends · Settings" : "Enter: newline · Settings"),
+      h("span", { class: "compose-enter-pref", title: "Enter sends: " + (enterSends ? "on" : "off") + " · This browser Settings" }, enterModeHint(enterSends) + " · Settings"),
       h("span", { class: "compose-key-help" }, " · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts"));
     const mode = $("compose-mode");
     mode.replaceChildren();
@@ -4194,9 +4786,12 @@
     // Context fill (SPEC §10.6): amber above 70%, red above 90%.
     const fill = S.contextFill && S.contextFill[S.current];
     const pct = fill && fill.size > 0 && fill.used > 0 ? Math.floor(fill.used * 100 / fill.size) : null;
-    $("status-context").classList.toggle("hidden", pct == null);
-    $("status-context").textContent = pct == null ? "" : " │ ctx " + pct + "%";
-    $("status-context").className = "clickable " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted") + (pct == null ? " hidden" : "");
+    const contextButton = $("status-context");
+    if (pct == null && document.activeElement === contextButton) focusReturn(modelButton);
+    contextButton.hidden = pct == null;
+    contextButton.textContent = pct == null ? "" : " │ ctx " + pct + "%";
+    contextButton.setAttribute("aria-label", pct == null ? "Context window" : "Context window (" + pct + "% used)");
+    contextButton.className = "linkish " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted");
     const waiting = S.approvals.length;
     const asking = S.pendingQuestion && !S.questionOpen ? 1 : 0;
     $("status-approvals").classList.toggle("hidden", !waiting && !asking);
@@ -4287,8 +4882,8 @@
       if (c.kind === "folder") return "folder " + name + "/";
       return (c.kind === "repo" ? "whole repo " : "project ") + c.path + (c.label ? " (" + c.label + ")" : "");
     };
-    const sel = h("select", { "aria-label": "Grant scope for " + cap },
-      opt.choices.map((c, i) => h("option", { value: String(i) }, label(c))));
+    const sel = h("select", { "aria-label": "Grant scope for " + approvalText(cap) },
+      opt.choices.map((c, i) => h("option", { value: String(i) }, approvalText(label(c)))));
     sel.value = String(req.picks[cap] || 0);
     sel.onchange = () => { req.picks[cap] = Number(sel.value); };
     return h("div", { class: "muted path-note" }, "Grant: ", sel, " (for Always, Session or Hour; Once allows just this call)");
@@ -4306,10 +4901,18 @@
    * are written out as `⟨U+202E⟩`, never obeyed, so `report\u202Efdp.exe`
    * can't pass for `reportexe.pdf` (#791). */
   const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+  const APPROVAL_CONTROLS = /[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
+  function visibleCodePoint(c) {
+    return "⟨U+" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩";
+  }
+  // Exact values in a decision show invisible formatting. Prose uses showBidi.
+  function approvalText(value) {
+    return String(value ?? "").replace(APPROVAL_CONTROLS, visibleCodePoint);
+  }
   function showBidi(root) {
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, (c) => "⟨U+" + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩");
+      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, visibleCodePoint);
       BIDI.lastIndex = 0;
     }
   }
@@ -4317,22 +4920,26 @@
     if (!context) return null;
     const call = context.call;
     return h("div", { class: "approval-context" },
-      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + warning)),
+      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + approvalText(warning))),
       (context.sources || []).length ? h("section", { class: "attention source-taint" },
         h("strong", null, "This Run read external content:"),
-        h("ul", null, context.sources.map(source => h("li", null, source.tool + " (" + source.kind + "): " + source.origin)))) : null,
+        h("ul", null, context.sources.map(source => h("li", null, approvalText(source.tool + " (" + source.kind + "): " + source.origin))))) : null,
       call ? h("details", { open: true, class: "call-preview" }, h("summary", null, "Resolved call arguments (redacted)"),
-        (call.urls || []).map(url => h("div", null, h("strong", null, url.method || "Method unresolved"), " ", h("code", null, url.url),
+        (call.urls || []).map(url => h("div", null, h("strong", null, approvalText(url.method || "Method unresolved")), " ", h("code", null, approvalText(url.url)),
           url.body_bytes != null ? h("p", null, "Supplied body: " + url.body_bytes + " bytes") : null,
-          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + url.body_preview) : null)),
-        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, path))),
-        h("pre", null, JSON.stringify(call.arguments, null, 2)),
+          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + approvalText(url.body_preview)) : null)),
+        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, approvalText(path)))),
+        h("pre", null, approvalText(JSON.stringify(call.arguments, null, 2))),
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
+    const alert = $("modal-confirm");
+    const confirmation = req?.broadConfirm && !S.approvalLater
+      ? "This grants broad access. Press the same button (or key) again to confirm, or allow it once." : "";
+    if (alert.textContent !== confirmation) alert.textContent = confirmation;
     $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
@@ -4347,7 +4954,6 @@
       // The first approval ever: what this is and how to undo it (#394).
       !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
         "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
-      req.broadConfirm ? h("p", { class: "error broad-confirm" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -4355,14 +4961,14 @@
           const answered = ((S.batchAnswers || {})[req.batch.batch_id] || {})[i + 1];
           const now = i + 1 === req.batch.index;
           return h("li", { class: now ? "now" : "muted" },
-            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, c.tool_name), " ",
-            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, cap)));
+            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, approvalText(c.tool_name)), " ",
+            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, approvalText(cap))));
         }))) : null,
       // What it does in plain words: AI-written, so labelled (SPEC §10.3).
       req.summary && (!req.detail || req.tool_id) ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
-      req.detail ? h("p", { class: "detail-text" }, req.detail) : null,
-      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
-          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + req.tool_name + ")") : null,
+      req.detail ? h("p", { class: "detail-text" }, approvalText(req.detail)) : null,
+      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, approvalText(toolTitleByName(req.tool_name) || req.tool_name)),
+          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + approvalText(req.tool_name) + ")") : null,
           req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:") : null,
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
@@ -4370,12 +4976,12 @@
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
-            ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
-            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
-              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
+            ? h("li", { class: "muted" }, h("span", { class: "tag" }, approvalText(c)), " already allowed")
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, approvalText(c)), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
+              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + approvalText(n[1])) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
               scopePicker(req, c))),
         req.detail && !req.tool_id ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
-      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
+      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, approvalText(req.code))) : null,
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
@@ -4650,12 +5256,12 @@
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (!head || head.deciding) return;
-    if (approved && head && head.kind !== "promotion" && scope !== "once") {
-      const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
-      if (broad.length && head.broadConfirm !== (scope || "always")) {
+    if (approved && head.kind !== "promotion" && scope !== "once") {
+      const broad = (head.capabilities || []).some((c) => !(head.already || []).includes(c) && isBroad(c));
+      if (broad && head.broadConfirm !== (scope || "always")) {
         head.broadConfirm = scope || "always";
         renderApproval();
-        toast("Broad access (" + broad.join(", ") + "): press again to grant it", true);
+        $("modal-confirm").scrollIntoView({ block: "nearest" });
         return;
       }
     }
@@ -4696,6 +5302,7 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
+  $("conn-retry").onclick = () => retryNow();
   for (const id of ["tools-filter", "tools-quick"]) $(id).addEventListener("input", () => renderToolsTable());
   // The Sort menu picks a column in its natural order.
   $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderToolsTable(); });
@@ -6358,14 +6965,34 @@
     const [m, hr, dom, mon, dow] = f;
     const step = m.match(/^\*\/(\d+)$/);
     if (step && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every " + step[1] + " minutes";
+    const hourStep = hr.match(/^\*\/(\d+)$/);
+    if (hourStep && /^\d+$/.test(m) && dom === "*" && mon === "*" && dow === "*") {
+      const hours = Number(hourStep[1]), minute = Number(m);
+      if (hours < 1 || hours > 0xffffffff || minute > 59) return e;
+      const mm = String(minute).padStart(2, "0");
+      if (hours === 1) return minute === 0 ? "every hour" : "every hour at minute " + mm;
+      if (hours >= 24) return "every day at 0:" + mm;
+      const interval = "every " + hours + " hours";
+      if (24 % hours !== 0) return interval + " starting at 0:" + mm + " each day";
+      return minute === 0 ? interval : interval + " at minute " + mm;
+    }
     if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return Number(m) === 0 ? "every hour" : "every hour at minute " + m.padStart(2, "0");
     if (!/^\d+$/.test(m) || !/^\d+$/.test(hr)) return e;
     const time = hr + ":" + m.padStart(2, "0");
     if (dom === "1" && mon === "1" && dow === "*") return "every year on January 1 at " + time;
     if (mon !== "*") return e;
     if (dom === "*" && dow === "*") return "every day at " + time;
-    if (dom === "*" && dow === "1-5") return "every weekday at " + time;
-    if (dom === "*" && /^[0-7](,[0-7])*$/.test(dow)) return "every " + dow.split(",").map((d) => DAYS[Number(d) % 7]).join(", ") + " at " + time;
+    if (dom === "*" && Number(m) <= 59 && Number(hr) <= 23) {
+      const numericDays = dow.replace(/\b[a-z]{3}\b/gi, (day) => {
+        const index = DAYS.findIndex((name) => name.slice(0, 3).toLowerCase() === day.toLowerCase());
+        return index < 0 ? day : String(index);
+      });
+      if (numericDays === "1-5") return "every weekday at " + time;
+      if (/^[0-7](,[0-7])*$/.test(numericDays)) {
+        const days = new Set(numericDays.split(",").map((d) => DAYS[Number(d) % 7]));
+        return "every " + [...days].join(", ") + " at " + time;
+      }
+    }
     if (/^\d+$/.test(dom) && dow === "*") return "on day " + dom + " of each month at " + time;
     return e;
   }
@@ -6464,27 +7091,88 @@
     } });
     if (saved) { toast("Saved role " + name.value.trim()); refreshSettings(); }
   }
-  async function refreshSettings() {
-    const auditWS = S.ws, auditChannel = S.channel;
-    S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
-    S.providers = (await request({ type: "list_providers" }).catch(() => null)) || { providers: [], roles: {} };
-    S.harness = (await request({ type: "list_harness_changes" }).catch(() => null)) || [];
-    S.relayClients = (await request({ type: "list_relay_clients" }).catch(() => null)) || [];
-    S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
-    await refreshDescriptionReviews();
-    S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
-    S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
-    if (auditWS === S.ws && auditChannel === S.channel) await loadAudit(false, true);
-    try {
-      S.settings = await request({ type: "get_settings" });
-    } catch (e) {
-      S.settings = { error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here." };
+  const settingsLists = {
+    mcpServers: "list_mcp_servers",
+    providers: "list_providers",
+    harness: "list_harness_changes",
+    relayClients: "list_relay_clients",
+    skills: "list_skills",
+    memories: "list_memories",
+    jobs: "list_jobs",
+  };
+  const settingsBackground = ["settings", "status", "descriptionReviews"];
+  const settingsDomains = [...settingsBackground, ...Object.keys(settingsLists), "audit"];
+  let settingsRefresh = null;
+  function settingsConnectionReady() {
+    return S.ws?.readyState === 1 && !!S.channel && (S.local || S.relayReady);
+  }
+  function isSettingsConnection(connection) {
+    return settingsConnectionReady() && connection?.ws === S.ws && connection?.channel === S.channel;
+  }
+  function refreshSettings() {
+    return requestSettingsRefresh(settingsDomains);
+  }
+  function requestSettingsRefresh(domains) {
+    if (!settingsConnectionReady()) return Promise.resolve();
+    if (!isSettingsConnection(settingsRefresh)) {
+      settingsRefresh = { ws: S.ws, channel: S.channel, dirty: new Set(), pending: null };
     }
-    applyMotion();
-    const languageChanged = applyLanguage();
-    S.status = await act({ type: "status" });
-    if (languageChanged) renderAll();
-    else { renderView(); renderStatus(); }
+    const refresh = settingsRefresh;
+    for (const domain of domains) refresh.dirty.add(domain);
+    // Collect arrivals in the same turn before choosing the first request.
+    refresh.pending ||= Promise.resolve().then(() => drainSettingsRefresh(refresh));
+    return refresh.pending;
+  }
+  async function drainSettingsRefresh(refresh) {
+    const allowed = (domain) => settingsBackground.includes(domain)
+      || (S.view === "settings" && !$("app").classList.contains("hidden"));
+    try {
+      while (isSettingsConnection(refresh)) {
+        const batch = settingsDomains.filter(domain => allowed(domain) && refresh.dirty.has(domain));
+        if (!batch.length) return;
+        for (const domain of batch) {
+          if (!allowed(domain)) continue;
+          // Invalidate again only if a trigger arrives after this fetch starts.
+          refresh.dirty.delete(domain);
+          await loadSettingsDomain(domain, refresh);
+          if (!isSettingsConnection(refresh)) return;
+        }
+        renderView();
+        renderStatus();
+      }
+    } finally {
+      refresh.pending = null;
+    }
+  }
+  async function loadSettingsDomain(domain, connection) {
+    switch (domain) {
+      case "settings": {
+        const settings = await request({ type: "get_settings" }).catch(e => ({
+          error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here.",
+        }));
+        if (!isSettingsConnection(connection)) return;
+        S.settings = settings;
+        applyMotion();
+        if (applyLanguage()) renderAll();
+        break;
+      }
+      case "status": {
+        const status = await act({ type: "status" });
+        if (isSettingsConnection(connection)) S.status = status;
+        break;
+      }
+      case "descriptionReviews":
+        await refreshDescriptionReviews();
+        break;
+      case "audit":
+        await loadAudit(false, true);
+        break;
+      default: {
+        const list = await request({ type: settingsLists[domain] }).catch(() => null);
+        if (isSettingsConnection(connection)) S[domain] = list || (domain === "providers" ? { providers: [], roles: {} } : []);
+        break;
+      }
+    }
   }
   // "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
   function usageText(u) {
@@ -7415,16 +8103,20 @@
 
   // Read CSS visibility so viewport and container-query layouts agree.
   let sidebarLastFocus = null;
+  function sidebarVisible(sidebar) {
+    return !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+  }
   function syncSidebar() {
     const sidebar = $("sidebar"), menu = $("menu-btn");
-    const visible = !!(sidebar.getClientRects().length
-      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+    const visible = sidebarVisible(sidebar);
     menu.setAttribute("aria-expanded", String(visible));
     syncRunningExposure();
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
     else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
+    syncRunningExposure(visible);
   }
   function setSidebar(open, { focus = false } = {}) {
     $("sidebar").classList.toggle("open", open);
@@ -7494,6 +8186,7 @@
     }
   }
   document.addEventListener("visibilitychange", () => {
+    syncRunningExposure();
     if (!document.hidden) { unseen = 0; document.title = baseTitle; }
   });
   /** Ask once, from a user gesture (sending a message). */
@@ -7764,7 +8457,6 @@
       case "session_updated": {
         const i = S.sessions.findIndex((s) => s.id === ev.session.id);
         if (i >= 0) S.sessions[i] = ev.session; else S.sessions.unshift(ev.session);
-        S.sessions.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
         renderSessions();
         scheduleEventRender({ composer: true });
         break;
@@ -7858,11 +8550,19 @@
         break;
       }
       case "settings_changed":
-      case "mcp_servers_changed":
-      case "skills_changed":
-      case "memory_updated":
-      case "jobs_changed":
         refreshSettings();
+        break;
+      case "mcp_servers_changed":
+        requestSettingsRefresh([...settingsBackground, "mcpServers", "harness", "audit"]);
+        break;
+      case "skills_changed":
+        requestSettingsRefresh([...settingsBackground, "skills", "harness", "audit"]);
+        break;
+      case "memory_updated":
+        requestSettingsRefresh([...settingsBackground, "memories", "harness", "audit"]);
+        break;
+      case "jobs_changed":
+        requestSettingsRefresh([...settingsBackground, "jobs", "harness", "audit"]);
         break;
       case "subagent_started":
         if (here) {
@@ -8212,23 +8912,26 @@
     };
   }
 
-  // Reconnect after S.backoff, visibly: the pill counts down and a tap
-  // retries at once.
+  // Reconnect after S.backoff, with a countdown and a manual retry.
   function scheduleReconnect(fn) {
     clearTimeout(S.reconnect && S.reconnect.timer);
     // Full jitter, so tabs that lost the relay together don't return in waves.
     const delay = 250 + Math.floor(Math.random() * (S.backoff - 250));
-    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
+    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(retryNow, delay) };
     S.backoff = Math.min(S.backoff * 2, 15000);
     renderChrome();
   }
   function retryNow() {
     if (!S.reconnect) return;
     const fn = S.reconnect.fn;
+    cancelReconnect();
+    fn();
+  }
+  function cancelReconnect() {
+    if (!S.reconnect) return;
     clearTimeout(S.reconnect.timer);
     S.reconnect = null;
     renderChrome();
-    fn();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
   // A heartbeat, so the daemon can tell a vanished browser from an idle
@@ -8244,8 +8947,7 @@
     if (S.forgetting) return;
     S.forgetting = true;
     S.userClosed = true;
-    clearTimeout(S.reconnect?.timer);
-    S.reconnect = null;
+    cancelReconnect();
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
     let warning = "";
     try {
@@ -8493,7 +9195,15 @@
       return;
     }
     const modalOpen = layer?.node === $("modal-backdrop");
+    if (modalOpen && e.repeat && e.key === "Enter") {
+      e.preventDefault();
+      return;
+    }
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.repeat && ["y", "o", "s", "1", "n", "N"].includes(e.key)) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
@@ -8522,8 +9232,8 @@
   setInterval(() => {
     if (isRunning() || S.liveTools.some((t) => t.status === "running")) updateElapsedTimers();
   }, 1000);
-  // Relative times drift; refresh the sidebar each minute.
-  setInterval(renderSessions, 60000);
+  // Update relative times without replacing the Session controls.
+  setInterval(updateSessionTimes, 60000);
 
   // A new `formless web` link pasted into an open tab only changes the
   // fragment: sign in with it instead of ignoring it.
@@ -8563,10 +9273,9 @@
     if (!document.querySelector('meta[name="formless-local"]') || !frag.local) return;
     S.linkedSession = frag.s || null;
     const token = frag.local;
-    clearTimeout(S.reconnect && S.reconnect.timer);
-    S.reconnect = null;
     const old = S.ws;
     S.ws = null;
+    cancelReconnect();
     if (old) old.close();
     connectLocal(token);
   });

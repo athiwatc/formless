@@ -45,6 +45,127 @@ fn open_action(
 }
 
 #[gpui_kit::test]
+fn queue_panel_gates_inventory_revision_and_uses_reviewed_actions(cx: &mut TestAppContext) {
+    use formless_desktop::message_queue::Operation;
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let session = &sessions[0].id;
+        select(&shell, session, window, cx);
+        window.render_frame(cx);
+        assert!(window.try_find("message-queue").is_none());
+        let mut v = value(session, true);
+        v["queued_items"] = json!([{"id":1,"content":"First follow-up 😀","revision":4},{"id":2,"content":"Old peer item"}]);
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(session, &v).unwrap(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-secondary").label(), Some("Queue"));
+        assert!(window
+            .find(("queue-text", 0usize))
+            .value()
+            .unwrap()
+            .contains("First follow-up"));
+        assert_eq!(window.find(("queue-up", 0usize)).disabled(), Some(true));
+        assert_eq!(window.find(("queue-edit", 1usize)).disabled(), Some(true));
+        window.click(("queue-edit", 0usize), cx);
+        let (owner, operation) = shell
+            .update(cx, |s, _| s.take_client_commands())
+            .into_iter()
+            .find_map(|c| {
+                if let Wire::ReadRunAction { owner, operation } = c {
+                    Some((owner, operation))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::RunActionTarget {
+                    owner,
+                    operation,
+                    result: Ok(Target::decode(session, &v).unwrap()),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click("run-action-prepare", cx);
+        let d = shell
+            .update(cx, |s, _| s.take_client_commands())
+            .into_iter()
+            .find_map(|c| {
+                if let Wire::PrepareRunAction(d) = c {
+                    Some(d)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(d.action.kind, Kind::Queue(Operation::Edit(1)));
+        assert_eq!(d.action.text, "First follow-up 😀");
+        window.click("run-action-close", cx);
+        window.render_frame(cx);
+        window.click("queue-toggle", cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("queue-text", 0usize)).is_none());
+        shell.update(cx, |s, cx| {
+            s.run_command(Command::MessageQueue, window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find(("queue-text", 0usize)).is_some());
+        v["queued_items"] = json!([]);
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(session, &v).unwrap(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("queue-empty").is_some());
+        v["running"] = json!(false);
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(session, &v).unwrap(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("composer-secondary").is_none());
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("message-queue").is_none());
+    });
+}
+
+#[gpui_kit::test]
 fn cwd_review_shows_the_frozen_destination_and_original_typed_path(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, handle, &shell);
@@ -181,6 +302,7 @@ fn every_run_action_control_reviews_exact_target_and_requires_explicit_confirmat
                 .any(|c| matches!(c,Wire::CommitRunAction(op) if *op == operation)));
             assert!(d.before_write());
             let receipt = match kind {
+                Kind::Queue(_) => unreachable!(),
                 Kind::Edit => {
                     json!({"session_id":d.action.owner.session,"id":"last-user","content":d.action.text})
                 }

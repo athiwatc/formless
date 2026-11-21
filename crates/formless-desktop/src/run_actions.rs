@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 pub const MAX_TEXT: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
+    Queue(crate::message_queue::Operation),
     Edit,
     Retry,
     Good,
@@ -28,6 +29,7 @@ impl Kind {
     ];
     pub fn label(self) -> &'static str {
         match self {
+            Self::Queue(op) => op.label(),
             Self::Edit => "Edit last user message",
             Self::Retry => "Retry last run",
             Self::Good => "Thumbs up",
@@ -40,6 +42,8 @@ impl Kind {
     }
     pub fn help(self) -> &'static str {
         match self {
+        Self::Queue(crate::message_queue::Operation::Enqueue) => "Text only; attachments are not supported. Waits for the current Run, but may start a new Run immediately if the current one ends first. Review the forecast and explicitly confirm. Deferred work is re-estimated by the daemon; it may be held for cost confirmation. Never replayed after a disconnect.",
+        Self::Queue(_) => "Changes the reviewed queue item only. Edits are revision-checked by the daemon. Remove cancels this queued follow-up, not the active Run. Queue changes may race with automatic dispatch; nothing is replayed after disconnect.",
         Self::Edit => "Replaces the last user message and removes everything after it. Starts provider work after forecast consent. The composer draft is kept.",
         Self::Retry => "Re-runs the last user message. The original answer is preserved in a fork. Optional alternate model applies to this Run only. Starts provider work after forecast consent.",
         Self::Compact => "Invokes the provider to summarize this Session. No compaction cost estimate is available. Replaces history in the context with a checkpoint; persisted messages remain. Optional focus below.",
@@ -51,6 +55,7 @@ impl Kind {
     }
     pub fn input_label(self) -> &'static str {
         match self {
+            Self::Queue(_) => "Queued message text",
             Self::Edit => "Replacement user message",
             Self::Retry => "Alternate model (empty uses current model)",
             Self::Compact => "Compaction focus (optional)",
@@ -80,6 +85,7 @@ impl DeleteUndo {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
+    pub queue: Option<Vec<crate::message_queue::Item>>,
     pub compacting: bool,
     pub user_oversized: bool,
     pub session: String,
@@ -132,6 +138,7 @@ impl Target {
             return Err(bad.into());
         }
         Ok(Self {
+            queue: crate::message_queue::decode(value.get("queued_items")),
             compacting: false,
             user_oversized,
             session: session.into(),
@@ -145,6 +152,20 @@ impl Target {
     }
     pub fn allowed(&self, kind: Kind) -> bool {
         match kind {
+            Kind::Queue(op) => self.queue.as_ref().is_some_and(|items| match op {
+                crate::message_queue::Operation::Enqueue => self.running && !self.compacting,
+                crate::message_queue::Operation::Edit(id) => {
+                    items.iter().any(|i| i.id == id && i.revision.is_some())
+                }
+                crate::message_queue::Operation::Up(id) => {
+                    items.iter().position(|i| i.id == id).is_some_and(|p| p > 0)
+                }
+                crate::message_queue::Operation::Down(id) => items
+                    .iter()
+                    .position(|i| i.id == id)
+                    .is_some_and(|p| p + 1 < items.len()),
+                crate::message_queue::Operation::Remove(id) => items.iter().any(|i| i.id == id),
+            }),
             Kind::ProviderRetry => self.running && self.run.is_some(),
             Kind::Edit => {
                 !self.user_oversized && !self.compacting && !self.running && self.user.is_some()
@@ -222,13 +243,27 @@ impl Action {
             && self.owner.session == self.target.session
             && self.target.allowed(self.kind)
             && self.text.len() <= MAX_TEXT
-            && (self.kind != Kind::Edit || !self.text.trim().is_empty())
+            && (!matches!(
+                self.kind,
+                Kind::Edit
+                    | Kind::Queue(
+                        crate::message_queue::Operation::Enqueue
+                            | crate::message_queue::Operation::Edit(_)
+                    )
+            ) || !self.text.trim().is_empty())
             && (self.kind != Kind::Cwd || !self.text.chars().any(char::is_control))
     }
     pub fn forecast(&self) -> Option<ForecastInput> {
-        matches!(self.kind, Kind::Edit | Kind::Retry).then(|| ForecastInput {
+        matches!(
+            self.kind,
+            Kind::Edit | Kind::Retry | Kind::Queue(crate::message_queue::Operation::Enqueue)
+        )
+        .then(|| ForecastInput {
             session_id: Some(self.owner.session.clone()),
-            draft: if self.kind == Kind::Edit {
+            draft: if matches!(
+                self.kind,
+                Kind::Edit | Kind::Queue(crate::message_queue::Operation::Enqueue)
+            ) {
                 self.text.clone()
             } else {
                 String::new()
@@ -250,6 +285,40 @@ impl Action {
     pub fn request(&self) -> Request {
         let session_id = self.owner.session.clone();
         match self.kind {
+            Kind::Queue(op) => match op {
+                crate::message_queue::Operation::Enqueue => Request::SendMessage {
+                    session_id,
+                    content: self.text.clone(),
+                    mode: formless_protocol::SendMode::Queue,
+                    client_msg_id: Some(self.operation.to_string()),
+                },
+                crate::message_queue::Operation::Edit(id) => Request::EditQueuedIfCurrent {
+                    session_id,
+                    id,
+                    revision: self
+                        .target
+                        .queue
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .find(|i| i.id == id)
+                        .unwrap()
+                        .revision
+                        .unwrap(),
+                    content: self.text.clone(),
+                },
+                crate::message_queue::Operation::Up(id)
+                | crate::message_queue::Operation::Down(id) => Request::MoveQueued {
+                    session_id,
+                    id,
+                    up: matches!(op, crate::message_queue::Operation::Up(_)),
+                },
+                crate::message_queue::Operation::Remove(id) => Request::EditQueued {
+                    session_id,
+                    id,
+                    content: None,
+                },
+            },
             Kind::Edit => Request::EditMessage {
                 session_id,
                 message_id: self.target.user.as_ref().unwrap().0.clone(),
@@ -412,6 +481,21 @@ impl Dispatch {
 }
 fn receipt(a: &Action, v: &Value) -> bool {
     match a.kind {
+        Kind::Queue(op) => match op {
+            crate::message_queue::Operation::Enqueue => {
+                (v["queued"] == true
+                    && v.get("started").is_none_or(|v| v == false)
+                    && v.get("steered").is_none_or(|v| v == false))
+                    || (v["started"] == true
+                        && v.get("queued").is_none_or(|v| v == false)
+                        && v.get("steered").is_none_or(|v| v == false)
+                        && v["run_id"].as_str().is_some_and(identity))
+            }
+            crate::message_queue::Operation::Up(_) | crate::message_queue::Operation::Down(_) => v
+                .get("id")
+                .is_some_and(|id| id.is_null() || id.as_i64().is_some_and(|id| id > 0)),
+            _ => v["ok"] == true,
+        },
         Kind::Edit => {
             v["session_id"] == a.owner.session
                 && v["id"].as_str() == a.target.user.as_ref().map(|u| u.0.as_str())

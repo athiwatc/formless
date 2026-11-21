@@ -689,6 +689,8 @@ mod pipeline_daemon_tests;
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
 
+#[path = "model_listing_health.rs"]
+mod model_listing_health;
 #[path = "reviewed_send.rs"]
 mod reviewed_send;
 #[cfg(test)]
@@ -820,8 +822,8 @@ pub struct Daemon {
     routing_log: StdMutex<std::collections::VecDeque<Value>>,
     model_test_cache: Arc<crate::model_test_cache::ModelTestCache>,
     routing_recorder: Arc<crate::routing_recorder::Recorder>,
-    /// Configured models the endpoints no longer list (SPEC §4.2).
-    missing_models: StdMutex<Vec<String>>,
+    /// Persistent evidence for configured model listings (SPEC §4.2).
+    model_listing_health: StdMutex<model_listing_health::State>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
@@ -1047,6 +1049,11 @@ impl Daemon {
         let model_test_cache = Arc::new(crate::model_test_cache::ModelTestCache::new(
             paths.data_dir.join("model_tests.json"),
         ));
+        let model_listing_health =
+            model_listing_health::State::load(&paths).unwrap_or_else(|error| {
+                tracing::warn!("could not read model listing state: {error:#}");
+                Default::default()
+            });
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -1097,7 +1104,7 @@ impl Daemon {
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             routing_recorder: Arc::new(crate::routing_recorder::Recorder::default()),
-            missing_models: StdMutex::new(Vec::new()),
+            model_listing_health: StdMutex::new(model_listing_health),
             step_sessions: StdMutex::new(Default::default()),
             step_waiters: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
@@ -1848,9 +1855,13 @@ impl Daemon {
                         |s| json!({"conn": s.conn, "queued": s.tx.max_capacity() - s.tx.capacity()})
                     )
                     .collect::<Vec<_>>());
+                let (missing, model_checked_at, model_checks_skipped) =
+                    self.model_listing_health.locked().report();
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
-                    "missing_models": *self.missing_models.locked(),
+                    "missing_models": missing,
+                    "model_listing_checked_at": model_checked_at,
+                    "model_listing_checks_skipped": model_checks_skipped,
                     "proxy": self.config().ok().and_then(|c| crate::provider::proxy_in_use(&c.provider)),
                     "resources": resources,
                     "protocol": PROTOCOL_VERSION,
@@ -1881,6 +1892,9 @@ impl Daemon {
                     token.cancel();
                 });
                 Ok(json!({"shutting_down": true}))
+            }
+            Request::DismissMissingModel { provider, model } => {
+                self.dismiss_missing_model(&provider, &model)
             }
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,
@@ -3492,7 +3506,7 @@ impl Daemon {
                     "meta": meta,
                     "tests": tests,
                     "aliases": cfg.provider.aliases,
-                    "missing": *self.missing_models.locked(),
+                    "missing": self.model_listing_health.locked().warnings(),
                     "roles": roles,
                     "recent": recent,
                     "current": {"model": cfg.provider.model,
@@ -4014,14 +4028,15 @@ impl Daemon {
                         "no MCP server '{name}'"
                     ))));
                 }
-                let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
-                let text = std::fs::read(&file)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let all: Vec<&str> = text.lines().collect();
-                let n = lines.unwrap_or(50).clamp(1, 1000);
+                let file = crate::mcp_log::path(&self.paths, &name);
+                let log = file.clone();
+                let lines = lines.unwrap_or(50).clamp(1, 1000);
+                let recent =
+                    tokio::task::spawn_blocking(move || crate::mcp_log::read_lines(&log, lines))
+                        .await?
+                        .unwrap_or_default();
                 let server = &cfg.mcp.servers[&name];
-                let tail = all[all.len().saturating_sub(n)..]
+                let tail = recent
                     .iter()
                     .map(|line| crate::mcp_catalog::redact_server_text(server, line))
                     .collect::<Vec<_>>();
@@ -9755,8 +9770,7 @@ impl Daemon {
     ) -> Result<crate::provider::ModelTest> {
         let policy = crate::probe_policy::ProbePolicy::default();
         let p = policy.run(self.provider_named(cfg, provider)).await??;
-        let model = p.settings().resolve_alias(model);
-        let t = p.test_model_scoped(&model, policy).await;
+        let t = p.test_model_scoped(model, policy).await;
         self.remember_model_test(&p.settings().base_url, &t)
             .context("model test completed, but its result could not be saved")?;
         Ok(t)
@@ -9813,76 +9827,6 @@ impl Daemon {
                 Ok(_) => {}
             }
         }))
-    }
-
-    /// Configured models (default, fallbacks, routing, Roles) missing from
-    /// their endpoint's `/models`, checked at start and daily (SPEC §4.2).
-    async fn check_models_loop(self: Arc<Self>) {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if let Ok(cfg) = self.config() {
-                let missing = self.missing_configured_models(&cfg).await;
-                if !missing.is_empty() && *self.missing_models.locked() != missing {
-                    self.broadcast(Event::Note {
-                        session_id: None,
-                        text: format!(
-                            "These configured models are no longer offered by their endpoint: {}. Pick others with /model or in Settings.",
-                            missing.join(", ")
-                        ),
-                    });
-                }
-                *self.missing_models.locked() = missing;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
-        }
-    }
-
-    async fn missing_configured_models(&self, cfg: &Config) -> Vec<String> {
-        let mut wanted: Vec<(Option<String>, String)> = Vec::new();
-        let p = &cfg.provider;
-        for m in std::iter::once(&p.model)
-            .chain(&p.fallback_models)
-            .chain(&p.routing_models)
-            .chain(&p.routing_fast_models)
-            .chain(&p.routing_strong_models)
-        {
-            wanted.push((None, p.resolve_alias(m)));
-        }
-        for r in cfg.roles.values() {
-            let Ok(pc) = cfg.provider_cfg(r.provider.as_deref()) else {
-                continue;
-            };
-            for m in std::iter::once(&r.model).chain(&r.candidates) {
-                wanted.push((r.provider.clone(), pc.resolve_alias(m)));
-            }
-        }
-        wanted.retain(|(_, m)| {
-            !m.is_empty() && !ProviderCfg::is_auto_model(m) && !m.starts_with("role:")
-        });
-        let mut missing = Vec::new();
-        let mut listed: HashMap<Option<String>, Option<Vec<String>>> = HashMap::new();
-        for (prov, m) in wanted {
-            if !listed.contains_key(&prov) {
-                let models = match self.provider_named(cfg, prov.as_deref()).await {
-                    Ok(pv) => {
-                        tokio::time::timeout(std::time::Duration::from_secs(15), pv.list_models())
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok())
-                            .filter(|l| !l.is_empty())
-                    }
-                    Err(_) => None,
-                };
-                listed.insert(prov.clone(), models);
-            }
-            // An endpoint that lists nothing (or failed) proves nothing.
-            if let Some(Some(list)) = listed.get(&prov) {
-                if !list.iter().any(|x| x == &m) && !missing.contains(&m) {
-                    missing.push(m);
-                }
-            }
-        }
-        missing
     }
 
     pub(crate) fn record_model_outcome(&self, model: &str, ok: bool, started: std::time::Instant) {
@@ -15715,6 +15659,16 @@ impl Daemon {
     /// keeping `daemon.backups_keep` (SPEC §9.6).
     async fn backup_loop(self: Arc<Self>) {
         loop {
+            let paths = self.paths.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::mcp_log::compact_logs(&paths, crate::mcp_log::MAX_BYTES, false)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "compact MCP logs"),
+                Err(error) => tracing::warn!(%error, "MCP log maintenance worker failed"),
+            }
             if let Ok(cfg) = self.config() {
                 let keep = cfg.daemon.backups_keep;
                 let due = crate::housekeeping::last_backup(&self.paths).is_none_or(|(_, at)| {
@@ -17424,6 +17378,7 @@ pub fn resolve_mime(claimed: Option<&str>, name: &str, bytes: &[u8]) -> String {
 pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
     (".ssh", "an SSH folder"),
     (".aws", "AWS credentials"),
+    (".azure", "Azure CLI credentials"),
     (".gnupg", "GnuPG keys"),
     (".kube", "Kubernetes config"),
     (".docker", "Docker credentials"),
@@ -17438,9 +17393,17 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
     }
+    let mut under_config = false;
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
-        if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
+        if p.eq_ignore_ascii_case("GitHub CLI") || (under_config && p.eq_ignore_ascii_case("gh")) {
+            return Some("GitHub CLI credentials");
+        }
+        under_config = p.eq_ignore_ascii_case(".config");
+        if let Some((_, why)) = CREDENTIAL_DIRS
+            .iter()
+            .find(|(d, _)| *d == p || (*d == ".azure" && p.eq_ignore_ascii_case(d)))
+        {
             return Some(why);
         }
     }
@@ -17468,6 +17431,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".htpasswd",
         ".npmrc",
         ".pypirc",
+        ".s3cfg",
+        ".boto",
+        ".vault-token",
         "rclone.conf",
         ".rclone.conf",
         ".yarnrc",

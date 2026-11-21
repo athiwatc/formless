@@ -1059,6 +1059,13 @@ enum ProvidersAction {
         #[arg(long)]
         json: bool,
     },
+    /// Dismiss one configured model warning for this profile
+    DismissWarning {
+        /// Configured provider name, including default
+        provider: String,
+        /// Model ID shown by the warning
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1385,7 +1392,7 @@ enum McpAction {
 
 #[derive(Subcommand)]
 enum NamingAction {
-    /// Show the configured model and whether it is installed
+    /// Show the configured model and the files in the naming cache
     Status {
         /// One JSON object
         #[arg(long)]
@@ -1396,6 +1403,15 @@ enum NamingAction {
         /// Model ID to download; omit to use the configured model
         #[arg(value_parser = NamingModelParser::new())]
         model: Option<String>,
+    },
+    /// Remove cached weights, tokenizers, and partial downloads
+    Remove {
+        /// Model ID to remove; omit to use the configured model
+        #[arg(value_parser = NamingModelParser::new(), conflicts_with = "all")]
+        model: Option<String>,
+        /// Remove the files for all naming models
+        #[arg(long)]
+        all: bool,
     },
     /// Print the title the namer would give a first message
     Test {
@@ -2883,9 +2899,11 @@ fn upgrade_command_for_exe(exe: &str) -> &'static str {
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh";
 const INSTALL_COMMAND: &str = concat!(
+    "sh -c 'install_tmp=$(mktemp -d \"${TMPDIR:-/tmp}/formless-install.XXXXXXXXXX\") || exit; ",
+    "cleanup() { rm -f \"$install_tmp/install.sh\"; rmdir \"$install_tmp\"; }; trap cleanup EXIT; ",
     "curl -fsSL ",
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
-    " -o /tmp/formless-install.sh && sh /tmp/formless-install.sh"
+    " -o \"$install_tmp/install.sh\" && sh \"$install_tmp/install.sh\"'"
 );
 
 /// `formless update`: what's newer than this build and what changed in
@@ -7311,6 +7329,14 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             daemon(Request::RemoveProvider { name: name.clone() })?;
             println!("removed {name}");
         }
+        ProvidersAction::DismissWarning { provider, model } => {
+            let r = daemon(Request::DismissMissingModel { provider, model })?;
+            if r["dismissed"] == true {
+                println!("Model warning dismissed.");
+            } else {
+                println!("No active warning matched that provider and model.");
+            }
+        }
         ProvidersAction::Test {
             name,
             model: Some(model),
@@ -8203,6 +8229,17 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
     match action {
         NamingAction::Status { json: true } => {
             let spec = cfg.naming.spec();
+            let cached = namer::cached_models(&paths)?
+                .into_iter()
+                .map(|model| {
+                    serde_json::json!({
+                        "id": model.id,
+                        "bytes": model.bytes,
+                        "installed": model.installed,
+                        "configured": spec.is_some_and(|spec| spec.id == model.id),
+                    })
+                })
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -8211,6 +8248,7 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
                     "installed": spec.is_some_and(|s| s.installed(&paths)),
                     "status": naming_model_status(&paths, &cfg),
                     "models_dir": namer::models_dir(&paths).display().to_string(),
+                    "cached": cached,
                     "available": namer::MODELS
                         .iter()
                         .map(|m| serde_json::json!({"id": m.id, "bytes": m.gguf_bytes}))
@@ -8230,26 +8268,80 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            let cached = namer::cached_models(&paths)?;
+            if cached.is_empty() {
+                println!("cache:      empty");
+            }
+            let selected = cfg.naming.spec();
+            for model in cached {
+                let selection = if selected.is_some_and(|spec| spec.id == model.id) {
+                    "configured"
+                } else {
+                    "unselected"
+                };
+                let state = if model.installed {
+                    "installed"
+                } else {
+                    "partial"
+                };
+                println!(
+                    "cached:     {} ({} bytes, {selection}, {state})",
+                    model.id, model.bytes
+                );
+            }
         }
         NamingAction::Pull { model } => {
             let id = model.unwrap_or_else(|| cfg.naming.model.clone());
             let spec = namer::spec(&id).with_context(|| format!("unknown naming model '{id}'"))?;
             if spec.installed(&paths) {
                 println!("{} already installed", spec.id);
-                return Ok(());
+            } else {
+                println!(
+                    "downloading {} ({} MB)…",
+                    spec.id,
+                    spec.gguf_bytes / 1_000_000
+                );
+                tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
+                println!("installed {}", spec.gguf_path(&paths).display());
             }
-            println!(
-                "downloading {} ({} MB)…",
-                spec.id,
-                spec.gguf_bytes / 1_000_000
-            );
-            tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
-            println!("installed {}", spec.gguf_path(&paths).display());
             if !id.eq_ignore_ascii_case(&cfg.naming.model) {
                 println!(
                     "set `[naming] model = \"{}\"` in config.toml to use it",
                     spec.id
                 );
+                if let Some(previous) = cfg
+                    .naming
+                    .spec()
+                    .filter(|previous| previous.installed(&paths))
+                {
+                    println!("{} remains cached. Reclaim its disk space with `formless naming remove {}`.", previous.id, previous.id);
+                }
+            }
+        }
+        NamingAction::Remove { model, all } => {
+            let selected = if all {
+                None
+            } else {
+                let id = model.unwrap_or_else(|| cfg.naming.model.clone());
+                Some(namer::spec(&id).with_context(|| format!("unknown naming model '{id}'"))?)
+            };
+            let models = selected
+                .as_ref()
+                .map_or(namer::MODELS, std::slice::from_ref);
+            let removed = namer::remove_cached_models(&paths, models)?;
+            println!(
+                "Removed {} naming cache file(s) totaling {} bytes.",
+                removed.files, removed.bytes
+            );
+            if removed.files > 0
+                && cfg.naming.enabled
+                && cfg.naming.auto_download
+                && cfg
+                    .naming
+                    .spec()
+                    .is_some_and(|configured| models.iter().any(|spec| spec.id == configured.id))
+            {
+                println!("The configured model can download again. Set `[naming] auto_download = false` to keep it removed.");
             }
         }
         NamingAction::Test { text } => {
@@ -10306,6 +10398,64 @@ mod tests {
             !cmd.contains("| sh"),
             "a failed download must not be piped into sh: {cmd}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_download_uses_a_private_temporary_path_and_runs_only_on_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fl-install-{}-{stamp}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let tools = root.join("bin");
+        let temporary = root.join("temporary downloads");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&temporary).unwrap();
+        let fake_curl = tools.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+while [ "$#" -gt 1 ] && [ "$1" != "-o" ]; do shift; done
+[ "$1" = "-o" ] || exit 2
+printf '%s\n' "$2" > "$FORMLESS_FIXTURE_INSTALL_TARGET"
+printf '%s\n' 'printf "ran\n" > "$FORMLESS_FIXTURE_INSTALL_MARKER"' > "$2"
+exit "$FORMLESS_FIXTURE_CURL_STATUS"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths([tools, "/usr/bin".into(), "/bin".into()]).unwrap();
+        let target = root.join("target");
+        let marker = root.join("executed");
+        let mut downloads = Vec::new();
+        for (curl_status, installed) in [("19", false), ("0", true)] {
+            let result = std::process::Command::new("sh")
+                .args(["-c", super::INSTALL_COMMAND])
+                .env("PATH", &path)
+                .env("TMPDIR", &temporary)
+                .env("FORMLESS_FIXTURE_INSTALL_TARGET", &target)
+                .env("FORMLESS_FIXTURE_INSTALL_MARKER", &marker)
+                .env("FORMLESS_FIXTURE_CURL_STATUS", curl_status)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.success(), installed, "{result:?}");
+            assert_eq!(marker.exists(), installed);
+            let downloaded =
+                std::path::PathBuf::from(std::fs::read_to_string(&target).unwrap().trim());
+            assert!(downloaded.starts_with(&temporary));
+            assert!(!downloaded.parent().unwrap().exists());
+            downloads.push(downloaded);
+        }
+        assert_ne!(downloads[0], downloads[1]);
     }
 
     #[test]

@@ -305,6 +305,46 @@ POINTER_INIT=r'''(() => {
 })();'''
 
 
+def welcome_enter_checks(page, label):
+    page.evaluate("""() => {
+        const fixture = __mobile815;
+        fixture.S.messages = [];
+        fixture.S.running.clear();
+        fixture.S.streaming = '';
+        fixture.setEnterSends(null);
+        __pointerInput.set(true, true);
+        fixture.renderAll();
+    }""")
+    welcome = page.locator(".welcome")
+    compose_hint = page.locator(".compose-enter-pref")
+    check("Enter: newline" in welcome.inner_text() and "Send button" in welcome.inner_text(),
+          label + " an empty Session explains the coarse default and Send button")
+    check("Enter: newline" in compose_hint.inner_text(), label + " composer agrees with welcome")
+
+    field = page.locator("#input")
+    field.fill("Unsent draft")
+    example = welcome.locator(".examples button").first
+    example.focus()
+    page.evaluate("window.__savedWelcomeExample = document.activeElement")
+    page.evaluate("__mobile815.setEnterSends(true)")
+    check("Enter: sends" in welcome.inner_text() and "Enter: sends" in compose_hint.inner_text(),
+          label + " cached welcome updates for explicit send")
+    page.evaluate("() => { __pointerInput.set(false, true); __pointerInput.set(true, true); }")
+    check("Enter: sends" in welcome.inner_text(), label + " pointer changes respect explicit send")
+    page.evaluate("__mobile815.setEnterSends(false); __pointerInput.set(false, true)")
+    check("Enter: newline" in welcome.inner_text(), label + " fine pointer respects explicit newline")
+    page.evaluate("__mobile815.setEnterSends(null)")
+    check("Enter: sends" in welcome.inner_text(), label + " reset restores fine-pointer send")
+    page.evaluate("__pointerInput.set(true, true)")
+    check("Enter: newline" in welcome.inner_text(), label + " cached welcome follows unset pointer default")
+    check(example.evaluate("(el) => el === window.__savedWelcomeExample && el === document.activeElement"),
+          label + " welcome keeps the same focused example")
+    check(field.input_value() == "Unsent draft", label + " preference changes preserve the draft")
+    page.evaluate("__mobile815.S.current = null; __mobile815.renderHistory()")
+    check("Enter: newline" in welcome.inner_text() and "Send button" in welcome.inner_text(),
+          label + " welcome with no Session also explains newlines")
+
+
 def hybrid_checks(browser,name,url):
     context=browser.new_context(viewport={'width':1280,'height':900},has_touch=False,reduced_motion='reduce',service_workers='block')
     context.add_init_script(INIT);context.add_init_script(POINTER_INIT);context.route('**/app.js',expose_script)
@@ -339,6 +379,8 @@ def hybrid_checks(browser,name,url):
     check(page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')>=16,name+' primary coarse floor does not depend on any-pointer')
     page.evaluate('__pointerInput.set(false,true)')
     check(page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')==fine_size,name+' return to fine restores desktop font size exactly')
+    page.evaluate("__mobile815.S.view = 'chat'; __mobile815.renderAll()")
+    welcome_enter_checks(page, name)
     check(not errors,name+' hybrid/pointer/reload no page errors: '+repr(errors));context.close()
 
 

@@ -434,12 +434,15 @@ without redesign.
   accepted wherever a model id is (`/model fast`, `--model`, Roles,
   candidates, fallbacks) and resolved at use, so changing it moves
   everything that names it. The pickers list aliases first.
-- **Missing models.** At start and then daily the daemon checks the
-  configured models (default, fallbacks, routing lists, Roles and their
-  candidates) against each endpoint's `/models` and notes the ones no
-  longer offered ("pick others with /model"); `ListModels.missing` and
-  `Status.missing_models` carry them. An endpoint that lists nothing is
-  not counted against.
+- **Missing models.** The daemon checks each provider's configured default,
+  fallbacks, routing models and Role candidates against `/models` once every
+  24 hours, saving the last check and its evidence per profile. A model is
+  flagged after two consecutive complete listings omit it. Known aliases and
+  dated snapshots count as matches. Empty, partial, failed and Azure
+  deployment listings cannot add a warning. `ListModels.missing` and
+  `Status.missing_models` describe the provider, model and configuration
+  locations. Status also shows the check time and reasons for skipped checks.
+  `formless providers dismiss-warning PROVIDER MODEL` hides one warning.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via
@@ -483,7 +486,9 @@ an empty listing just asks for one.
   providers test NAME --model M`) sends a short prompt and the probe tool
   call, and reports the time to the first token and to the end, whether
   the answer streamed, whether reasoning streamed, and whether tool calls
-  work (natively, or only through the prompt-based fallback). Results are
+  work (natively, or only through the prompt-based fallback). A test fails
+  when a comparable response model identifies a different model. The result
+  records the reported identity in `served_model`. Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
   pickers (`✓ tested` / `✗ test failed`; temporary failures name the manual
   retry action). Results include a backward-compatible `transient` flag for
@@ -2505,7 +2510,10 @@ None ship by default (principle 1).
   group with a minimal environment (as `process.run`, §7.4), speaks
   newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`),
   answers the server's `ping`, and writes its stderr to
-  `<data>/mcp/<name>.log`. Servers start on first use, stop after
+  `<data>/mcp/<name>.log`. Before a write would exceed 2 MB, the daemon
+  keeps up to the last 1 MB from a line boundary. Hourly maintenance compacts
+  older oversized logs, which `formless storage` also reports. Log views read up
+  to the final 1 MB. Servers start on first use, stop after
   `idle_secs` without calls, and a crashed server is simply started again
   on the next call (the failed call is a failed Invocation, never a hung
   Run). Cancelling an Invocation sends `notifications/cancelled`.
@@ -3796,7 +3804,8 @@ refresh a cache, nightly cleanup.
   ends: a desktop notification, a Markdown entry appended to a file,
   and/or a JSON POST (`job_id, prompt, status, answer, session_id`).
   Desktop delivery runs off the daemon executor and gives the notifier
-  five seconds to submit the message.
+  five seconds to submit the message. On Windows, Jobs and Tool notifications
+  use the BurntToast module in Windows PowerShell under an interactive login.
   These are targets the user configured, so they need no approval; the
   results go in the history and the audit log (`job.deliver`). For other
   channels (email, chat) point a webhook at them, or have the prompt use
@@ -4435,6 +4444,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Naming cache.** `formless naming status` lists each cached model and
+  its file sizes, marking the configured model. `formless naming remove
+  [MODEL]` removes weights, the tokenizer and partial downloads for one
+  model. `formless naming remove --all` removes those files for every
+  supported naming model. Removal respects the same lock as downloads and
+  model loading. Automatic downloads can fetch the configured model again
+  unless `naming.auto_download` is disabled.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
@@ -5728,7 +5744,7 @@ previous headless Run's Session.
   - Responses carry the same CSP as the hosted relay.
   - **Reconnecting:** when a connected page loses the daemon, it keeps
     retrying with backoff. The connection pill counts down ("daemon
-    offline · retry in Ns") and a tap retries at once. After 3 failed
+    offline · retry in Ns"). Select **Retry now** to retry at once. After 3 failed
     tries it notes that a restarted daemon needs a new `formless web`
     link, because session cookies don't survive a restart. Pasting a new
     link into an open tab signs in with it. Relay mode uses the same
@@ -6646,9 +6662,21 @@ under `crates/*/src` against README or SPEC, including test-only references.
 `FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+
+`FORMLESS_BIN` supplies a fallback CLI path when the desktop app starts its
+daemon. Lookup tries a sibling CLI first, then this nonempty path, then PATH.
+
+`FORMLESS_NOTIFICATION_TITLE` and `FORMLESS_NOTIFICATION_BODY` are internal
+Windows desktop-notification helper inputs, not user configuration overrides.
+Formless sets them on its PowerShell child to pass the notification title and
+body as data rather than interpolating them into the script. The helper passes
+nonempty text to BurntToast, falling back to `Formless` if both are empty.
+
 Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
+`FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
