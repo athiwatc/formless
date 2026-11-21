@@ -143,6 +143,9 @@ without redesign.
   model-calibrated prompt estimator, including Tool schemas and images; an
   unresolved auto choice conservatively uses the largest candidate estimate. No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
+  An unmatched subset entry appears in configuration diagnostics. If the
+  entire subset is unmatched, auto-routing uses the first configured
+  candidate and explains the fallback in `/routing`.
   **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
   daemon start. A `primary` role is created with `model = "auto"` and the
   former routing pool as `candidates`, `provider.model` becomes
@@ -454,9 +457,10 @@ without redesign.
   of `Authorization: Bearer`, and `extra_headers` as before. The provider
   form (TUI Settings → Providers) has these as advanced fields and
   `formless providers add` takes `--header K=V`, `--query k=v`,
-  `--key-header H`. `--azure-resource R --azure-deployment D
-  [--api-version V]` builds Azure OpenAI's deployment URL, `api-version`
-  and the `api-key` header.
+  `--key-header H`. `--azure-resource R --azure-deployment D` accepts
+  a resource name, an Azure host, or an HTTPS endpoint. It configures
+  `/openai/v1` with the deployment as the model and the `api-key` header.
+  Supplying `--api-version V` selects the dated deployment-scoped API.
 - **Proxy.** `provider.proxy` sends the daemon's HTTP traffic (provider,
   relay, fetch) through that proxy, from daemon start; otherwise
   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` apply as usual. `formless
@@ -2180,6 +2184,10 @@ pattern (§4.4).
     memory) require `net`. They support HTTP(S) and check the scope on each
     redirect. The configured connection and total deadlines apply to both
     APIs, with one total budget for redirects and body reads (§13).
+    For fetchChunks, size is a maximum. The callback receives available data
+    as each chunk is read. At the end of a stream, incomplete UTF-8 is decoded
+    with replacement characters. A terminal read error is thrown after any
+    available data has been delivered.
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -2248,8 +2256,9 @@ pattern (§4.4).
     state records the latest sanitized tuple independently of emission.
     `ToolProgress {invocation_id?, tool_name, depth, fraction, label}` is emitted
     at most once per 200 ms per execution, with no label-change or completion
-    exception; unchanged emitted tuples are suppressed. Only strict fractional
-    advancement counts as work for stall detection (§6.1).
+    exception. The daemon publishes the latest changed tuple when the interval
+    ends if the execution is still active. Unchanged tuples are suppressed.
+    Only strict fractional advancement counts as work for stall detection (§6.1).
     Tool start/progress/finish and pending/completed/stalled/activity events share
     one additive execution ID. Registry IDs are allocated before pending handoff
     and match the stored Invocation, even with a zero-second pending threshold.
@@ -3280,9 +3289,12 @@ such as `read_file`, `read_text_file` and `file_read`.
   are also refused because its command parser cannot represent them; this
   restriction does not apply to data, config or log paths.
   The service runs `formless daemon serve --stay`, which prevents idle exit
-  while the daemon is running. Scheduled delivery still depends on host,
-  daemon and network availability; logout, sleep, shutdown or reboot without
-  login can prevent it (Linux lifecycle guidance: [#1406](https://github.com/athiwatc/formless/issues/1406)). `uninstall-service` unloads and removes it; `formless doctor`
+  while the daemon is running. On Linux, installation and dry-run output
+  report whether systemd user lingering is enabled. To start before login
+  and continue after logout on a headless host, run
+  `loginctl enable-linger "$(id -u)"` separately. Scheduled delivery still
+  depends on host, daemon and network availability. `uninstall-service`
+  unloads and removes it. `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.
 - **Back-pressure (#605).** A request line over 32 MB closes the
   connection while it is being read (nothing larger is buffered). Each
@@ -3704,7 +3716,9 @@ refresh a cache, nightly cleanup.
     at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
-    unsupported. Natural schedules are stored as cron.
+    unsupported. Natural schedules are stored as cron. Minute and hour
+    intervals must divide 60 minutes or 24 hours evenly. Use explicit cron
+    to schedule uneven gaps at particular clock times.
     `PreviewSchedule {schedule}` returns the cron and up to three projected
     recurring times from the daemon's current local time. `jobs add` prints
     them after creation. `formless jobs preview SCHEDULE [--json]` requests
@@ -4812,12 +4826,17 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
   highest required single-digit position and whether `$ARGUMENTS` occurs, using
   the same token rules as expansion. TUI/plain help, the TUI picker and CLI
-  metadata listings show `<arg1> … <argN>` and optional `[arguments…]` hints;
-  `commands list --json` exposes `max_position` and `uses_arguments` without
-  exposing template bodies. Names are 1–64 lowercase
+  metadata listings show a supplied `argument-hint` or derive
+  `<arg1> … <argN>` and `[arguments…]` from the placeholders.
+  `commands list --json` exposes `argument_hint`, `max_position`, and
+  `uses_arguments`. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
-  frontmatter accepts only a nonempty `description` string (plain, quoted or
-  block text). The key may have leading spaces or tabs; block content must be
+  frontmatter requires a nonempty `description` string (plain, quoted or
+  block text) and accepts an optional plain or quoted `argument-hint` string.
+  Each is limited to 512 bytes and screened for single-line display.
+  Other well-formed string keys produce a warning and have no effect on
+  template expansion or permissions. Keys may have leading spaces or tabs.
+  Block content must be
   indented more deeply than its key, so sibling keys remain subject to validation.
   Malformed templates are excluded with a stable diagnostic, never executed.
   Valid project templates override global templates. Built-in slash roots always win, including their subcommands; `/help` groups custom commands
@@ -4949,6 +4968,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   it and a double-click opens it (as Enter), and clicking a tool call's
   header in the chat expands or collapses it. Each frame records its
   clickable regions, list rows from the widgets' own scroll offsets.
+  The wheel over an active Sessions, Tools or Proposals list moves the
+  selection by up to three filtered items without activating a row.
 
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
@@ -5267,7 +5288,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless chat` | `--session ID` or `--new` | Line-mode chat with streamed answers and inline questions. |
 | `formless commands` | `list` | List local user-defined slash-command metadata without starting a daemon. |
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
-| `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
+| `formless config` | `path`, `list`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
@@ -5283,7 +5304,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
-| `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
+| `formless prices` | `import`, `list` | Import a model-price catalog or inspect prices and configured model references offline. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
 | `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
@@ -5304,6 +5325,14 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless prices list [--provider NAME] [--json]` reads the configuration file
+and defaults. Rates are USD per million tokens. It shows stored entries and
+the effective stored-price match for each configured provider model, fallback
+model, and explicit Role model. It skips automatic routing and leaves model
+references as configured. Environment overrides and historical usage are
+outside this view. A provider's reported cost takes precedence over the
+stored fallback estimate. Use `--provider default` to select `[provider]`.
 
 `mcp test NAME [--json]` restarts the server and prints the full report before
 returning its verdict: exit 0 for a successful reply (including zero tools),
@@ -5505,6 +5534,12 @@ previous headless Run's Session.
   usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
+  - `list [--filter TEXT] [--json]` reads documented settings from the local
+    profile and environment, with descriptions, defaults and settable status.
+    The optional filter matches dotted key names. The result marks changed
+    values and distinguishes null, empty and missing values from defaults
+    explained only in documentation. Credentials and other sensitive values
+    are excluded or masked. The command works before a daemon starts.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
     an unknown key exits 2.
   - `set KEY VALUE` goes through the settings API, so it's validated against
@@ -5515,8 +5550,9 @@ previous headless Run's Session.
     supplied entries replace their whole value, null entries are removed,
     and siblings survive. `--replace` uses `SetSetting` for whole-map
     replacement; `--replace '{}'` clears. Lists remain replace-only.
-  - `edit` opens a copy in `$VISUAL`/`$EDITOR` (run through `sh -c`, so
-    arguments and quotes work) and replaces config.toml only when the copy
+  - `edit` opens a copy in `VISUAL` or `EDITOR`. On Unix the shell parses
+    the command. On Windows the same argument parser as the TUI handles
+    double-quoted executable paths and arguments. It replaces config.toml only when the copy
     parses. Otherwise it shows the error and, on a terminal, offers to edit
     again; the file is never left half-written.
 - `formless sessions` manages Sessions with the same protocol requests as
@@ -5594,7 +5630,10 @@ previous headless Run's Session.
 
   `--output-file PATH` leaves stdout empty and writes the selected completed
   output through a bounded private temporary file adjacent to PATH, followed
-  by an atomic replacement. Progress and errors remain on stderr. Invalid
+  by an atomic replacement. After writing and flushing the complete result,
+  the temporary file takes the destination's Unix access bits and group or
+  Windows DACL when a destination exists. New result files stay owner-only.
+  Progress and errors remain on stderr. Invalid
   schema output, a failed/paused/interrupted Run, timeout, output-size overflow
   or a write failure never replaces an existing destination with partial
   output. Selected output is limited to 8 MiB. No output destination is opened
@@ -6844,9 +6883,12 @@ Already-deleted legacy files without a captured original object remain read-only
 ### Colour-independent meaning (§10.6, #635)
 
 `tui.theme = "colorblind"` is available through Settings and `config set`.
-Its shared TUI/CLI status palette uses sky blue `#56B4E9` for good, yellow
-`#F0E442` for warning, and orange `#E69F00` for bad. Diff additions use blue
-and removals orange. Every added/removed diff retains a bold `+`/`-` gutter
+The TUI and CLI select a shared status palette for the detected terminal
+background. On dark backgrounds it uses sky blue `#56B4E9`, yellow
+`#F0E442`, and orange `#E69F00` for good, warning, and bad. On light
+backgrounds it uses blue `#0064A0`, amber `#7B5300`, and vermilion
+`#AA370A`. Diff additions use blue and removals orange.
+Every added/removed diff retains a bold `+`/`-` gutter
 by default, including when colour is disabled. Hunk line numbers, changed-word
 underlining and newline labels remain intact.
 

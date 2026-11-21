@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/plain_cli_fixture_workers.rs"]
+mod plain_cli_fixture_workers;
 #[path = "support/unix_fixture_io.rs"]
 mod unix_fixture_io;
 use formless_core::Paths;
@@ -96,16 +98,7 @@ impl Fixture {
         let invocation_error = Arc::new(AtomicBool::new(false));
         let fail_invocations = invocation_error.clone();
         let thread = std::thread::spawn(move || {
-            while !stopped.load(Ordering::SeqCst) {
-                let (socket, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(e) => panic!("{e}"),
-                };
-                connected.fetch_add(1, Ordering::SeqCst);
+            let serve = |socket| {
                 let mut socket = FixtureStream::new(
                     socket,
                     stopped.clone(),
@@ -181,6 +174,15 @@ impl Fixture {
                             detail_tool("tool-missing-current", "reader-missing", 99)
                         ]),
                         Request::GetTool { id } if tool_details => detail_report(id),
+                        Request::ListToolMetrics { since: None } if tool_details => {
+                            tool_success_rate_rows()
+                        }
+                        Request::ListBuiltinStats { since: None }
+                        | Request::ListModelStats { since: None }
+                            if tool_details =>
+                        {
+                            json!([])
+                        }
                         Request::ListTools => tool_rows.clone(),
                         Request::ExportTool { id } => {
                             assert_eq!(id, "full-tool-id");
@@ -351,7 +353,8 @@ impl Fixture {
                     }
                     line.clear();
                 }
-            }
+            };
+            plain_cli_fixture_workers::serve(&listener, &stopped, &connected, serve);
         });
         Self {
             root,
@@ -1465,10 +1468,91 @@ fn detail_report(id: &str) -> Value {
         "tool-missing-current" => ("reader-missing", 99),
         _ => ("reader", 1),
     };
+    let metrics = match id {
+        "tool-newline" => fixture_tool_metrics(199, 1, Some(0.995)),
+        "tool-no-newline" => fixture_tool_metrics(9999, 1, Some(0.9999)),
+        _ => fixture_tool_metrics(4, 0, Some(1.0)),
+    };
     json!({"tool":detail_tool(id,name,current),"versions":[
         {"version":2,"author":"agent","created_at":"second","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source ไทย"},
         {"version":1,"author":"user","created_at":"first","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source 日本語\n"}
-    ],"metrics":formless_protocol::ToolMetricsInfo::default(),"recent_calls":[{"id":"call-one","version":1,"status":"failed","input":"PrivateCallInputSentinel","output":"PrivateCallOutputSentinel","error":"fixture call failed","duration_ms":12,"created_at":"call-time"}]})
+    ],"metrics":metrics,"recent_calls":[{"id":"call-one","version":1,"status":"failed","input":"PrivateCallInputSentinel","output":"PrivateCallOutputSentinel","error":"fixture call failed","duration_ms":12,"created_at":"call-time"}]})
+}
+
+fn fixture_tool_metrics(
+    success: i64,
+    failure: i64,
+    success_rate: Option<f64>,
+) -> formless_protocol::ToolMetricsInfo {
+    formless_protocol::ToolMetricsInfo {
+        total: success + failure,
+        success,
+        failure,
+        success_rate,
+        ..Default::default()
+    }
+}
+
+fn tool_success_rate_rows() -> Value {
+    json!([
+        {"tool_id":"unknown","invocations":0,"success_rate":null},
+        {"tool_id":"zero","invocations":3,"success_rate":0.0},
+        {"tool_id":"fraction","invocations":3,"success_rate":2.0 / 3.0},
+        {"tool_id":"near","invocations":200,"success_rate":0.995},
+        {"tool_id":"rare","invocations":10000,"success_rate":0.9999},
+        {"tool_id":"perfect","invocations":4,"success_rate":1.0},
+    ])
+}
+
+#[test]
+fn shipped_tool_detail_success_rate_labels_leave_json_numeric() {
+    let fixture = Fixture::with_tool_details(true);
+    for (name, rate, label) in [
+        ("reader", 0.995, ">99%"),
+        ("reader-no-newline", 0.9999, ">99%"),
+        ("reader-missing", 1.0, "100%"),
+    ] {
+        let json: Value = serde_json::from_str(&successful_text(
+            fixture.run(&["tools", "show", name, "--json"]),
+        ))
+        .unwrap();
+        assert_eq!(json["metrics"]["success_rate"], serde_json::json!(rate));
+        let text = successful_text(fixture.run(&["tools", "show", name]));
+        let calls = text
+            .lines()
+            .find(|line| line.starts_with("calls:"))
+            .unwrap();
+        assert!(
+            calls.contains(&format!("· success {label} · p50 ")),
+            "{calls}"
+        );
+    }
+}
+
+#[test]
+fn shipped_metrics_success_rate_labels_leave_json_numeric() {
+    let fixture = Fixture::with_tool_details(true);
+    let json: Value =
+        serde_json::from_str(&successful_text(fixture.run(&["metrics", "--json"]))).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"models":[],"tools":tool_success_rate_rows(),"builtins":[]})
+    );
+    let text = successful_text(fixture.run(&["metrics"]));
+    for (id, expected) in [
+        ("unknown", "-"),
+        ("zero", "0%"),
+        ("fraction", "67%"),
+        ("near", ">99%"),
+        ("rare", ">99%"),
+        ("perfect", "100%"),
+    ] {
+        let row = text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id))
+            .unwrap();
+        assert_eq!(row.split_whitespace().last(), Some(expected), "{row}");
+    }
 }
 
 #[test]

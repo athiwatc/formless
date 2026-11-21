@@ -1,8 +1,10 @@
 mod branch_summary;
 pub mod client;
+mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;
@@ -835,7 +837,7 @@ impl Wizard {
         // Remember previous startup options: a saved config starts at the
         // API-key step (Esc returns to the URL), with model/effort restored.
         let has_saved = !cfg.provider.base_url.trim().is_empty();
-        let preset = formless_core::presets::for_url(&cfg.provider.base_url);
+        let preset = formless_core::presets::for_provider(&cfg.provider);
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
@@ -1121,6 +1123,14 @@ impl Wizard {
         self.status = status;
     }
 
+    fn apply_provider_endpoint(&self, provider: &mut formless_core::config::ProviderCfg) {
+        provider.base_url = self.base_url.trim().to_string();
+        provider.preset = self.preset.map(|preset| preset.id.to_string());
+        if let Some(preset) = self.preset {
+            provider.api_style = preset.api_style.to_string();
+        }
+    }
+
     /// List the endpoint's models in the background (`FetchModels`).
     fn fetch_models(&mut self) {
         if !self.normalize_key() {
@@ -1131,12 +1141,10 @@ impl Wizard {
         let generation = self.generation;
         self.step = WizardStep::FetchModels;
         self.status = format!("Fetching models from {}…", self.base_url.trim());
-        let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
-        cfg.provider.base_url = self.base_url.trim().to_string();
-        if let Some(p) = self.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
-        let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
+        let tx = self.job_tx.clone();
+        let mut pcfg = formless_core::config::ProviderCfg::default();
+        self.apply_provider_endpoint(&mut pcfg);
+        let key = self.api_key.clone();
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
                 generation,
@@ -1167,10 +1175,16 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
-        let endpoint = self
-            .local_offer_for(p.id)
-            .map(|offer| offer.base_url.clone())
-            .unwrap_or_else(|| p.base_url.to_string());
+        let endpoint = if p.local
+            && self.preset.is_some_and(|old| old.id == p.id)
+            && !self.base_url.trim().is_empty()
+        {
+            self.base_url.trim().to_string()
+        } else {
+            self.local_offer_for(p.id)
+                .map(|offer| offer.base_url.clone())
+                .unwrap_or_else(|| p.base_url.to_string())
+        };
         if self.preset.map(|old| old.id) != Some(p.id)
             || self.credential_endpoint != endpoint.trim()
         {
@@ -1706,6 +1720,7 @@ struct App {
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
     inbox: Option<mpsc::Receiver<ServerMessage>>,
+    clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
     session_idx: usize,
     session_filter: lists::ListFilter,
@@ -2017,6 +2032,8 @@ struct App {
     /// Clickable regions of the last frame (SPEC §10.5), and the last
     /// click for double-click detection.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// The visible list panel in the last frame, if it can show a selectable row.
+    list_wheel_region: std::cell::Cell<Option<(View, Rect)>>,
     draft_hits: std::cell::RefCell<Vec<(Rect, usize)>>,
     selecting_draft: bool,
     last_click: Option<(Click, Instant)>,
@@ -2093,6 +2110,7 @@ impl App {
             view: View::Chat,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -2278,6 +2296,7 @@ impl App {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -3963,6 +3982,13 @@ impl App {
                             }
                         }
                         Pending::SaveSetting => {
+                            if let Some(warnings) = result["routing_warnings"].as_array() {
+                                self.notes.extend(
+                                    warnings
+                                        .iter()
+                                        .filter_map(|warning| warning.as_str().map(str::to_owned)),
+                                );
+                            }
                             if let Some(key) = self.settings_saving.take() {
                                 self.notes.push(format!(
                                     "saved {key} = {} (used from the next Run)",
@@ -5124,6 +5150,11 @@ impl App {
 
     fn invalidate_rollback_viewport(&self) {
         self.rollback_visible_version.set(None);
+    }
+
+    fn resized(&self) {
+        self.invalidate_rollback_viewport();
+        self.list_wheel_region.set(None);
     }
 
     fn rollback_key(&mut self, key: KeyEvent) {
@@ -6796,6 +6827,7 @@ impl App {
                     Pending::RetryRun,
                     Request::RetryRun {
                         session_id,
+                        expected_run_id: None,
                         model,
                         keep_original,
                     },
@@ -8840,10 +8872,7 @@ impl App {
             w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
             return Ok(());
         }
-        cfg.provider.base_url = w.base_url.trim().to_string();
-        if let Some(p) = w.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
+        w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
         if w.prompt_fallback {
@@ -9076,13 +9105,8 @@ impl App {
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
-                    let pcfg = formless_core::config::ProviderCfg {
-                        base_url: w.base_url.trim().to_string(),
-                        api_style: w
-                            .preset
-                            .map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
-                        ..Default::default()
-                    };
+                    let mut pcfg = formless_core::config::ProviderCfg::default();
+                    w.apply_provider_endpoint(&mut pcfg);
                     let (key2, model) = (w.api_key.clone(), w.model());
                     std::thread::spawn(move || {
                         let _ = tx.send(WizardJob::Probe(
@@ -9167,8 +9191,13 @@ impl App {
         if self.editor.is_some() {
             return;
         }
-        if self.view != View::Chat && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
+        if self.view != View::Chat {
+            match m.kind {
+                MouseEventKind::ScrollUp => return self.wheel_list(m.column, m.row, false),
+                MouseEventKind::ScrollDown => return self.wheel_list(m.column, m.row, true),
+                MouseEventKind::Down(MouseButton::Left) => {}
+                _ => return,
+            }
         }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(3),
@@ -9196,6 +9225,51 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn list_wheel_blocked(&self) -> bool {
+        self.renaming.is_some()
+            || !self.approvals.is_empty()
+            || !self.promotions.is_empty()
+            || self.rollback_pick.is_some()
+            || self.model_overlay.is_some()
+            || self.forecast.modal.is_some()
+            || self.quit_confirm
+            || self.switcher.is_some()
+            || self.pager.is_some()
+            || self.external_edit.awaiting_confirmation()
+    }
+
+    fn record_list_wheel_region(&self, view: View, area: Rect, rows: usize) {
+        self.list_wheel_region
+            .set((rows > 0 && area.width > 2).then_some((view, area)));
+    }
+
+    fn wheel_list(&mut self, column: u16, row: u16, down: bool) {
+        let Some((view, area)) = self.list_wheel_region.get() else {
+            return;
+        };
+        // A modal may have opened since the last paint.
+        if view != self.view
+            || !(area.x..area.right()).contains(&column)
+            || !(area.y..area.bottom()).contains(&row)
+            || self.list_wheel_blocked()
+        {
+            return;
+        }
+        let (len, index) = match view {
+            View::Sessions => (self.visible_sessions().len(), &mut self.session_idx),
+            View::Tools => (self.visible_tools().len(), &mut self.tool_idx),
+            View::Proposals => (self.visible_proposals().len(), &mut self.proposal_idx),
+            _ => return,
+        };
+        let last = len.saturating_sub(1);
+        let current = (*index).min(last);
+        *index = if down {
+            current.saturating_add(3).min(last)
+        } else {
+            current.saturating_sub(3)
+        };
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
@@ -11774,6 +11848,7 @@ impl App {
 fn draw(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
+    app.list_wheel_region.set(None);
     app.draft_hits.borrow_mut().clear();
     if let Some(rename) = &app.renaming {
         rename.clear_hits();
@@ -11917,6 +11992,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
+    // Dismissing a modal in an input burst must wait for an unobscured
+    // frame before the list can receive wheel events.
+    if app.list_wheel_blocked() {
+        app.list_wheel_region.set(None);
+    }
     if let Some(target) = rollback.filter(|target| target.is_visible(f.buffer_mut())) {
         app.rollback_visible_version.set(Some(target.version));
     }
@@ -15702,13 +15782,23 @@ impl App {
     /// system clipboard too.
     fn copy_text(&mut self, text: &str, what: &str) {
         let mut out = stdout();
-        let _ = out.write_all(osc52(text).as_bytes());
-        let _ = out.flush();
-        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
-            let _ = formless_runtime::clipboard_write(text);
+        match out
+            .write_all(osc52(text).as_bytes())
+            .and_then(|()| out.flush())
+        {
+            Ok(()) => self.notes.push(format!(
+                "sent {what} to the terminal clipboard ({} chars)",
+                text.chars().count()
+            )),
+            Err(error) => self
+                .notes
+                .push(format!("terminal clipboard write failed: {error}")),
         }
-        self.notes
-            .push(format!("copied {what} ({} chars)", text.chars().count()));
+        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
+            if let Err(error) = self.clipboard_write.submit(text.to_owned()) {
+                self.notes.push(format!("system clipboard: {error}"));
+            }
+        }
     }
 
     /// The queue binding to advertise: one that works in this terminal.
@@ -16853,10 +16943,9 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         &mut state,
     );
     clickable_rows(app, area, 0, state.offset(), count, Click::Session);
-    app.record_list_capacity(
-        View::Sessions,
-        count.min(area.height.saturating_sub(2) as usize),
-    );
+    let rows = count.min(area.height.saturating_sub(2) as usize);
+    app.record_list_capacity(View::Sessions, rows);
+    app.record_list_wheel_region(View::Sessions, area, rows);
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -17646,10 +17735,9 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_proposals();
-    app.record_list_capacity(
-        View::Proposals,
-        visible.len().min(area.height.saturating_sub(3) as usize),
-    );
+    let rows = visible.len().min(area.height.saturating_sub(3) as usize);
+    app.record_list_capacity(View::Proposals, rows);
+    app.record_list_wheel_region(View::Proposals, area, rows);
     let mut title = app.proposal_filter.title(
         "Prompt proposals",
         visible.len(),
@@ -18257,15 +18345,14 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         // Clicks select Tools; headers between them take rows too.
         let top = parts[0].y + 2;
         let height = parts[0].height.saturating_sub(3) as usize;
-        app.record_list_capacity(
-            View::Tools,
-            layout
-                .iter()
-                .skip(state.offset())
-                .take(height)
-                .filter(|row| row.is_ok())
-                .count(),
-        );
+        let rows = layout
+            .iter()
+            .skip(state.offset())
+            .take(height)
+            .filter(|row| row.is_ok())
+            .count();
+        app.record_list_capacity(View::Tools, rows);
+        app.record_list_wheel_region(View::Tools, parts[0], rows);
         for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
             if let Ok(p) = r {
                 clickable(
@@ -19423,7 +19510,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
-pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use theme::{
+    colorblind_rgb, colorblind_rgb_on_background, terminal_has_light_background, tone_marker,
+    SemanticTone,
+};
 pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
@@ -19468,7 +19558,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         && std::env::var_os("COLORFGBG").is_none()
     {
         if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
-            theme::set_kind(theme::kind_for_background(bg));
+            theme::set_background(theme::kind_for_background(bg));
         }
     }
     let mut out = stdout();
@@ -19498,6 +19588,9 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
+            if let Err(error) = app.clipboard_write.poll() {
+                app.notes.push(format!("system clipboard: {error}"));
+            }
             // SettingsChanged may have arrived through any connected client.
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
@@ -19566,7 +19659,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::Paste(text) => app.paste(&text),
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
-                    CtEvent::Resize(_, _) => app.invalidate_rollback_viewport(),
+                    CtEvent::Resize(_, _) => app.resized(),
                 }
                 wait = Duration::ZERO;
                 if started.elapsed() > Duration::from_millis(100) {
@@ -19703,6 +19796,7 @@ mod tests {
             wizard: None,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -19885,6 +19979,7 @@ mod tests {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -25372,7 +25467,10 @@ mod tests {
         assert_eq!(app.call_focus.as_deref(), Some("msg:a2"));
         assert!(render(&mut app, 100, 30).contains("c copy · C copy as Markdown"));
         app.key(key(KeyCode::Char('c')));
-        assert_eq!(app.notes.last().unwrap(), "copied the answer (17 chars)");
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "sent the answer to the terminal clipboard (17 chars)"
+        );
         app.key(key(KeyCode::Char('[')));
         app.key(key(KeyCode::Char('C')));
         assert_eq!(
@@ -26118,6 +26216,170 @@ mod tests {
         assert_eq!(pane_widths(&[]), (22, 26));
         app.slash("panes sideways");
         assert!(app.notes.last().unwrap().starts_with("usage: /panes"));
+    }
+
+    fn list_wheel(app: &mut App, column: u16, row: u16, down: bool) {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.mouse(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn wheel_fixture_sessions(count: usize) -> Vec<SessionInfo> {
+        (0..count)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"),
+                    "name": format!("Session {i}"),
+                    "archived": i % 2 == 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_moves_filtered_sessions_and_reveals_selection_without_opening() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.input_focus = true;
+        assert_eq!(app.visible_sessions().len(), 4);
+        let current = app.current.clone();
+        let pending = app.pending.len();
+        render(&mut app, 100, 9);
+        let region = {
+            let targets = app.click_targets.borrow();
+            assert!(!targets.iter().any(|(_, hit)| hit == &Click::Session(3)));
+            targets
+                .iter()
+                .find_map(|(r, hit)| (hit == &Click::Session(0)).then_some(*r))
+                .unwrap()
+        };
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        render(&mut app, 100, 9);
+        assert!(app
+            .click_targets
+            .borrow()
+            .iter()
+            .any(|(_, hit)| hit == &Click::Session(3)));
+        list_wheel(&mut app, region.x, region.y, false);
+        assert_eq!(app.session_idx, 0);
+        assert_eq!(app.current, current);
+        assert_eq!(app.pending.len(), pending);
+        assert!(app.input_focus);
+    }
+
+    fn wheel_fixture_proposals() -> Vec<PromptProposalInfo> {
+        (0..2)
+            .map(|i| PromptProposalInfo {
+                id: format!("p{i}"),
+                kind: "prompt".into(),
+                content: "synthetic".into(),
+                rationale: String::new(),
+                status: "measured".into(),
+                baseline_score: None,
+                candidate_score: None,
+                eval_total: 0,
+                est_tokens: 0,
+                created_at: String::new(),
+                applied_at: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_clamps_short_and_empty_proposals_without_review() {
+        let mut app = test_app();
+        app.view = View::Proposals;
+        render(&mut app, 100, 16);
+        assert!(app.list_wheel_region.get().is_none());
+        list_wheel(&mut app, 5, 5, true);
+        assert_eq!(app.proposal_idx, 0);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.proposal_idx, 0);
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.proposal_idx, 1);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.proposal_idx, 0);
+        assert!(app.reviewing.is_none());
+        assert!(app.pager.is_none());
+        assert_eq!(app.pending.len(), pending);
+    }
+
+    #[test]
+    fn wheel_rejects_stale_regions_during_modal_view_and_size_changes() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let (column, row) = (area.x + 1, area.y + 2);
+        app.quit_confirm = true;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal opened before redraw");
+        render(&mut app, 100, 16);
+        app.quit_confirm = false;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal dismissed before redraw");
+        render(&mut app, 100, 16);
+        app.view = View::Proposals;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "tab switched before redraw");
+        render(&mut app, 100, 16);
+        app.resized();
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "terminal resized before redraw");
+        render(&mut app, 100, 16);
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 1, "fresh unobscured frame");
+    }
+
+    #[test]
+    fn wheel_ignores_lists_without_room_for_a_rendered_row() {
+        let mut app = test_app();
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        app.tools = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let mut tool = description_fixture_detail().tool;
+                tool.id = name.into();
+                tool.name = name.into();
+                tool
+            })
+            .collect();
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            for (width, height) in [(1, 1), (2, 16), (100, 5)] {
+                render(&mut app, width, height);
+                assert!(
+                    app.list_wheel_region.get().is_none(),
+                    "{view:?} at {width}x{height}"
+                );
+                for row in 0..height {
+                    list_wheel(&mut app, width / 2, row, true);
+                }
+                assert_eq!((app.session_idx, app.tool_idx, app.proposal_idx), (0, 0, 0));
+            }
+        }
     }
 
     #[test]
@@ -28048,6 +28310,16 @@ mod tests {
             screen.contains("▾ fs (1)") && screen.contains("▾ net (1)"),
             "{screen}"
         );
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.tool_idx, 0, "details pane does not move selection");
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        assert!(app.tool_detail.is_none());
+        assert_eq!(app.pending.len(), pending);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.selected_tool().unwrap().name, "read_file");
         // The first Tool (fs) is selected; z folds its group.
         app.key(key('z'));
         let screen = render(&mut app, 140, 30);
