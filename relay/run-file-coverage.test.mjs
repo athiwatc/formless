@@ -12,14 +12,14 @@ const fn = name => {
 function setup() {
   const notes = [], appended = [];
   const h = (tag, props, ...children) => ({ tag, props, children: children.flat(Infinity).filter(x => x != null), addEventListener() {}, focus() {}, remove() {} });
-  const context = vm.createContext({ h, tr: x => x, S: {current:'s'}, note: x => notes.push(x), branchSummaryEvent() {}, notifyFor() {}, renderHistory() {}, renderStatus() {}, renderComposer() {}, renderLive() {},
+  const context = vm.createContext({ h, uiFormat: String, tr: x => x, S: {current:'s'}, note: x => notes.push(x), branchSummaryEvent() {}, notifyFor() {}, renderHistory() {}, renderStatus() {}, renderComposer() {}, renderLive() {},
     confirm: () => true, document: {activeElement:null,body:{append: x => appended.push(x)}},
     // Keep mounting observable for the content/coverage assertions; keyboard
     // focus and inertness use the browser regression suite's real DOM.
     openDialog: node => appended.push(node), closeDialog: node => node.remove(),
     $: () => ({focus(){}}), act: async () => context.reply });
   installEventRenderFixture(context, fn);
-  vm.runInContext(['runFilesCaveat','runFilesText','showRunFiles','recapBlock','onEvent'].map(fn).join('\n'), context);
+  vm.runInContext(['runFilesCaveat','runFilesText','showRunFiles','recordedDuration','recapBlock','onEvent'].map(fn).join('\n'), context);
   return { context, notes, appended };
 }
 function text(node) {

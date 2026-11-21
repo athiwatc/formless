@@ -24,6 +24,7 @@ export function installEventRenderFixture(context, fn) {
   // These fixtures isolate reducer/intent behavior rather than geometry.
   context.withTranscriptLayout ??= update => update();
   context.resetReadingSession ??= () => {};
+  context.renderSessions ??= () => {};
   context.reading ??= { session: null, anchor: null, saved: new Map() };
   vm.runInContext(['readingStreamMatches', 'remapReadingStream', 'commitReadingStream'].map(fn).join('\n'), context);
   context.flushEventRender = () => {

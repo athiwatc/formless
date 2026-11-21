@@ -454,9 +454,6 @@ impl Paths {
         let Some(dir) = sock.parent() else {
             return Ok(());
         };
-        if dir == self.data_dir {
-            return Ok(());
-        }
         if !dir.exists() {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -464,17 +461,19 @@ impl Paths {
                 .create(dir)
                 .with_context(|| format!("create {}", dir.display()))?;
         }
-        let meta = std::fs::symlink_metadata(dir)?;
-        let mine = std::fs::metadata(&self.data_dir)
-            .map(|m| m.uid())
-            .unwrap_or_else(|_| meta.uid());
+        // Data-directory aliases are supported; the fallback runtime directory
+        // must itself be a directory rather than a symlink.
+        let meta = if dir == self.data_dir {
+            std::fs::metadata(dir)?
+        } else {
+            std::fs::symlink_metadata(dir)?
+        };
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let mine = unsafe { libc::geteuid() };
         if !meta.is_dir() || meta.uid() != mine {
             anyhow::bail!(
-                "{} is not a folder owned by you; the data dir path is too long for a unix \
-                 socket ({} bytes), so the socket goes there. Remove it, or use a shorter \
-                 FORMLESS_DATA_DIR",
-                dir.display(),
-                self.data_dir.join("daemon.sock").as_os_str().len()
+                "{} is not a socket directory owned by the effective user",
+                dir.display()
             );
         }
         if meta.permissions().mode() & 0o077 != 0 {
@@ -521,6 +520,28 @@ mod pipe_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_directory_secures_supported_data_alias() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = std::path::Path::new("/tmp").join(format!("fl-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        symlink(base.join("real"), base.join("alias")).unwrap();
+        let paths = Paths::from_dirs(base.join("alias"), base.join("config")).unwrap();
+        std::fs::set_permissions(base.join("real"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        paths.prepare_socket_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(base.join("real"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn a_long_data_dir_gets_a_short_socket_path() {

@@ -190,6 +190,14 @@ impl FetchTimeouts {
             total_ms: FETCH_TIMEOUT_MS.load(Ordering::Relaxed),
         }
     }
+
+    fn settings(self) -> String {
+        format!(
+            "tools.fetch_connect_timeout_secs={}s, tools.fetch_timeout_secs={}s",
+            self.connect_ms as f64 / 1_000.0,
+            self.total_ms as f64 / 1_000.0
+        )
+    }
 }
 
 /// Set the native caps: `tools.max_read_bytes`,
@@ -323,9 +331,56 @@ impl std::error::Error for ExecError {}
 /// An open streamed HTTP body (`fetchChunks`).
 struct Stream {
     resp: reqwest::blocking::Response,
+    timeouts: FetchTimeouts,
     enc: Enc,
     /// Bytes read but not yet handed out (an incomplete UTF-8 sequence).
     carry: Vec<u8>,
+}
+
+#[derive(Default)]
+struct LogBuffer {
+    lines: Vec<String>,
+    bytes: usize,
+    limit_reached: Option<usize>,
+    omitted_effects: usize,
+}
+
+impl LogBuffer {
+    fn push(&mut self, message: &str, dry_run_effect: bool, cap: usize) {
+        let prefix = if dry_run_effect {
+            "[dry run] would "
+        } else {
+            ""
+        };
+        // Empty lines still occupy a slot in the buffer.
+        let bytes = (prefix.len() + message.len()).max(1);
+        if self.limit_reached.is_some() || bytes > cap.saturating_sub(self.bytes) {
+            self.limit_reached.get_or_insert(cap);
+            self.omitted_effects = self
+                .omitted_effects
+                .saturating_add(usize::from(dry_run_effect));
+            return;
+        }
+        self.lines.push(format!("{prefix}{message}"));
+        self.bytes += bytes;
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        if let Some(cap) = self.limit_reached {
+            let mut marker = format!(
+                "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+            );
+            if self.omitted_effects > 0 {
+                marker.push_str(&format!(
+                    " [dry run] {} further would-be effects omitted",
+                    self.omitted_effects
+                ));
+            }
+            lines.push(marker);
+        }
+        lines
+    }
 }
 
 struct State {
@@ -333,7 +388,7 @@ struct State {
     caps: Capabilities,
     mode: HostMode,
     ops: Arc<dyn HostOps>,
-    logs: Mutex<Vec<String>>,
+    logs: Mutex<LogBuffer>,
     /// Smoke/Replay write overlay: discarded writes stay readable within
     /// the same run so write-then-read tools work (§8.4).
     overlay: Overlay,
@@ -901,7 +956,7 @@ fn http_client(timeouts: FetchTimeouts) -> Result<reqwest::blocking::Client, Str
     }
     let client = client_builder(timeouts)
         .build()
-        .map_err(|e| fetch_error(&e))?;
+        .map_err(|e| fetch_error(&e, timeouts, "building HTTP client"))?;
     *slot = Some((timeouts, client.clone()));
     Ok(client)
 }
@@ -961,9 +1016,13 @@ fn cancellable_work<T: Send + 'static>(
     }
 }
 
-/// Preserve the error chain and distinguish deadline expiry from connection
-/// failure, including reqwest timeout errors wrapped in a body's io::Error.
-fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
+/// Report the request's configured budgets without guessing which timer
+/// expired. A timeout may be wrapped in the response body's io::Error.
+fn fetch_error(
+    error: &(dyn std::error::Error + 'static),
+    timeouts: FetchTimeouts,
+    phase: &str,
+) -> String {
     let mut timeout = false;
     let mut connect = false;
     let mut parts = Vec::new();
@@ -975,6 +1034,12 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
         }
         if let Some(e) = e.downcast_ref::<std::io::Error>() {
             timeout |= e.kind() == std::io::ErrorKind::TimedOut;
+            // A custom I/O error's source() skips the wrapped error itself.
+            // Inspect it directly to retain its type without repeating its Display.
+            if let Some(inner) = e.get_ref() {
+                next = Some(inner);
+                continue;
+            }
         }
         parts.push(e.to_string());
         next = e.source();
@@ -986,7 +1051,11 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
     } else {
         "fetch failed"
     };
-    format!("{kind}: {}", parts.join(": "))
+    let mut message = format!("{kind}: {}", parts.join(": "));
+    if timeout || connect {
+        message.push_str(&format!(" ({phase}, configured {})", timeouts.settings()));
+    }
+    message
 }
 
 /// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
@@ -994,7 +1063,10 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
 /// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
 /// bodiless GET, and credentials are not sent on to another host.
 fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
-    send_request_with_resolver(req, &dns::resolve)
+    let timeouts = req.timeouts;
+    send_request_with_resolver(req, &|host, port, deadline| {
+        dns::resolve(host, port, deadline, timeouts)
+    })
 }
 
 fn send_request_with_resolver(
@@ -1035,7 +1107,10 @@ fn send_request_with_dependencies(
         let client = client_for(&req.url, &pinned, req.timeouts)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err("fetch timed out: tools.fetch_timeout_secs total deadline expired".into());
+            return Err(format!(
+                "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget {}s)",
+                req.timeouts.total_ms as f64 / 1_000.0
+            ));
         }
         // Request-level timeout is forwarded to async reqwest and stays active
         // through the whole body, even when a peer trickles bytes forever.
@@ -1048,7 +1123,9 @@ fn send_request_with_dependencies(
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        let resp = builder.send().map_err(|e| fetch_error(&e))?;
+        let resp = builder
+            .send()
+            .map_err(|e| fetch_error(&e, req.timeouts, "sending request"))?;
         let status = resp.status().as_u16();
         let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
         let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location)
@@ -1238,11 +1315,16 @@ fn modified_ms(m: &std::fs::Metadata) -> Option<u64> {
 }
 
 impl State {
+    fn append_log(&self, message: &str, dry_run_effect: bool) {
+        if let Ok(mut logs) = self.logs.lock() {
+            let cap = usize::try_from(MAX_LOG_BYTES.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+            logs.push(message, dry_run_effect, cap);
+        }
+    }
+
     /// A dry run's would-be effect, kept in the logs (SPEC §10.4).
     fn would(&self, what: String) {
-        if let Ok(mut g) = self.logs.lock() {
-            g.push(format!("[dry run] would {what}"));
-        }
+        self.append_log(&what, true);
     }
 
     /// Smoke-mode stub: remember that the Tool has seen fake data.
@@ -1255,16 +1337,7 @@ impl State {
         match op {
             "log" => {
                 if let Some(m) = a["msg"].as_str() {
-                    if let Ok(mut g) = self.logs.lock() {
-                        // Past the cap, lines are dropped, once said (#604).
-                        let used: usize = g.iter().map(String::len).sum();
-                        let cap = MAX_LOG_BYTES.load(Ordering::Relaxed) as usize;
-                        if used + m.len() <= cap {
-                            g.push(m.to_string());
-                        } else if g.last().is_none_or(|l| !l.starts_with("[log limit")) {
-                            g.push(format!("[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"));
-                        }
-                    }
+                    self.append_log(m, false);
                 }
                 Ok(Value::Null)
             }
@@ -2078,6 +2151,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let ops = self.ops.clone();
         let (mut meta, bytes) = self.cancellable(move || {
             let mut resp = send_request(req)?;
@@ -2099,7 +2173,7 @@ impl State {
             (&mut resp)
                 .take(cap + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|e| fetch_error(&e))?;
+                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
@@ -2127,6 +2201,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
         if let Some(url) = meta["url"].as_str() {
@@ -2137,6 +2212,7 @@ impl State {
             id,
             Stream {
                 resp,
+                timeouts,
                 enc,
                 carry: Vec::new(),
             },
@@ -2161,7 +2237,10 @@ impl State {
                 let mut chunk = vec![0u8; size - buf.len()];
                 let n = match s.resp.read(&mut chunk) {
                     Ok(n) => n,
-                    Err(e) => return Ok((s, Err(fetch_error(&e)))),
+                    Err(e) => {
+                        let error = fetch_error(&e, s.timeouts, "reading response body");
+                        return Ok((s, Err(error)));
+                    }
                 };
                 if n == 0 {
                     eof = true;
@@ -3201,7 +3280,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         caps: req.caps.clone(),
         mode: req.mode,
         ops,
-        logs: Mutex::new(Vec::new()),
+        logs: Mutex::new(LogBuffer::default()),
         overlay: req.overlay.clone().unwrap_or_else(new_overlay),
         modules: req.modules.clone(),
         streams: Mutex::new(HashMap::new()),
@@ -3228,7 +3307,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let err = |e: &dyn std::fmt::Display| {
         let mut x = classify(&e.to_string(), cancelled.load(Ordering::SeqCst));
         x.after_stub = state.stubbed.load(Ordering::SeqCst);
-        x.logs = state.logs.lock().map(|l| l.clone()).unwrap_or_default();
+        x.logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;
@@ -3401,7 +3480,6 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         return Err(error);
     }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
-    let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
         let mut error = err(&parsed["error"].as_str().unwrap_or("tool error"));
         error.nested = serde_json::from_value(parsed["nested"].clone()).ok();
@@ -3413,6 +3491,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             "tool returned an error result (throw instead of returning {{error}}): {msg}"
         )));
     }
+    let logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
     Ok(ExecOutcome { output, logs })
 }
 
@@ -3424,6 +3503,28 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_buffer_counts_empty_lines_and_retains_tool_text() {
+        let mut logs = LogBuffer::default();
+        let tool_text = "[log limit from Tool output]";
+        let cap = tool_text.len() + 1;
+        logs.push(tool_text, false, cap);
+        logs.push("", false, cap);
+        logs.push("", false, cap);
+        logs.push("later", false, cap);
+
+        assert_eq!(
+            logs.snapshot(),
+            [
+                tool_text.to_owned(),
+                String::new(),
+                format!(
+                    "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+                ),
+            ],
+        );
+    }
 
     #[test]
     fn whole_read_limit_errors_distinguish_exact_byte_counts() {
@@ -3483,7 +3584,7 @@ mod tests {
             url,
             scope,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
-            &dns::resolve,
+            &|host, port, deadline| dns::resolve(host, port, deadline, FetchTimeouts::configured()),
         )
     }
 
@@ -3531,6 +3632,70 @@ mod tests {
         fn progress(&self, fraction: Option<f64>, label: &str) {
             self.0.locked().push((fraction, label.to_string()));
         }
+    }
+
+    #[test]
+    fn quickjs_prelude_installs_the_documented_globals() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let names = || -> Vec<String> {
+                let json: String = ctx
+                    .eval("JSON.stringify(Reflect.ownKeys(globalThis).map(String))")
+                    .unwrap();
+                serde_json::from_str(&json).unwrap()
+            };
+            let before = names();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            let mut installed = names();
+            installed.retain(|key| !before.contains(key));
+            installed.sort();
+
+            // Keep the public additions in sync with SPEC §7.5 and the
+            // bootstrap's host_api_doc. The __ names are internal helpers.
+            assert_eq!(
+                installed,
+                [
+                    "__addTimer",
+                    "__call",
+                    "__fmt",
+                    "__formatValue",
+                    "__moduleCache",
+                    "__nonnegativeSafeInteger",
+                    "__processReq",
+                    "__progressLabel",
+                    "__req",
+                    "__res",
+                    "__runTimers",
+                    "__settleCall",
+                    "agents",
+                    "clearInterval",
+                    "clearTimeout",
+                    "clipboard",
+                    "console",
+                    "cryptoRandom",
+                    "emit",
+                    "env",
+                    "fetch",
+                    "fetchChunks",
+                    "fs",
+                    "harness",
+                    "llm",
+                    "modules",
+                    "notifications",
+                    "notify",
+                    "process",
+                    "progress",
+                    "randomBytes",
+                    "requireModule",
+                    "setInterval",
+                    "setTimeout",
+                    "sleep",
+                    "store",
+                    "tools",
+                ]
+            );
+        });
     }
 
     #[test]
@@ -4745,6 +4910,32 @@ mod tests {
         assert_eq!(out.output, json!(7));
     }
 
+    #[test]
+    fn fetch_errors_keep_the_kind_of_wrapped_io_errors() {
+        let timeouts = FetchTimeouts {
+            connect_ms: 1_000,
+            total_ms: 1_200,
+        };
+        let phase = "reading response body";
+        let timeout = std::io::Error::other(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "fixture deadline",
+        )));
+        assert_eq!(
+            fetch_error(&timeout, timeouts, phase),
+            "fetch timed out: fixture deadline (reading response body, configured tools.fetch_connect_timeout_secs=1s, tools.fetch_timeout_secs=1.2s)"
+        );
+
+        let eof = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "operation timed out",
+        ));
+        assert_eq!(
+            fetch_error(&eof, timeouts, phase),
+            "fetch failed: operation timed out"
+        );
+    }
+
     /// The peer remains connected until the request's own deadline closes it.
     /// Both literal-IP (shared client) and hostname (pinned client) paths run.
     #[test]
@@ -4753,6 +4944,7 @@ mod tests {
             for body in [false, true] {
                 let (addr, accepted, server) = stalled_http_peer(body, false);
                 let req = timeout_request(host, addr, 150);
+                let timeouts = req.timeouts;
                 let client = prepared_timeout_client(&req, addr);
                 let started = std::time::Instant::now();
                 let result =
@@ -4760,7 +4952,7 @@ mod tests {
                         let mut bytes = Vec::new();
                         response
                             .read_to_end(&mut bytes)
-                            .map_err(|e| fetch_error(&e))?;
+                            .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                         Ok(())
                     });
                 accepted
@@ -4771,12 +4963,24 @@ mod tests {
                     error.starts_with("fetch timed out:"),
                     "{host}, body={body}: {error}"
                 );
+                assert!(
+                    error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+                    "{error}"
+                );
+                assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+                let phase = if body {
+                    "reading response body"
+                } else {
+                    "sending request"
+                };
+                assert!(error.contains(phase), "{error}");
                 assert!(started.elapsed() < std::time::Duration::from_secs(2));
                 server.join().unwrap();
             }
         }
         let (addr, accepted, server) = stalled_http_peer(true, true);
         let req = timeout_request("127.0.0.1", addr, 150);
+        let timeouts = req.timeouts;
         let client = prepared_timeout_client(&req, addr);
         let started = std::time::Instant::now();
         let mut response = send_prepared_timeout_request(req, addr, &client).unwrap();
@@ -4785,7 +4989,7 @@ mod tests {
             .unwrap();
         let error = response.read_to_end(&mut Vec::new()).unwrap_err();
         assert!(
-            fetch_error(&error).starts_with("fetch timed out:"),
+            fetch_error(&error, timeouts, "reading response body").starts_with("fetch timed out:"),
             "{error}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -4800,6 +5004,31 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.starts_with("fetch connection failed:"), "{error}");
+        assert!(
+            error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+            "{error}"
+        );
+        assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+    }
+
+    #[test]
+    fn explicit_total_deadline_reports_the_request_budget() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let req = timeout_request("127.0.0.1", addr, 1);
+        let client = prepared_timeout_client(&req, addr);
+        let error = send_request_with_dependencies(
+            req,
+            &|_, _, _| unreachable!("literal address never uses DNS"),
+            &|_, _, _| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(client.clone())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget 0.001s)"
+        );
     }
 
     #[test]
@@ -4807,6 +5036,7 @@ mod tests {
         for body in [false, true] {
             let (addr, accepted, server) = stalled_http_peer(body, false);
             let req = timeout_request("127.0.0.1", addr, 200);
+            let timeouts = req.timeouts;
             let client = prepared_timeout_client(&req, addr);
             let cancel = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
@@ -4817,7 +5047,7 @@ mod tests {
                         |mut response| {
                             response
                                 .read_to_end(&mut Vec::new())
-                                .map_err(|e| fetch_error(&e))?;
+                                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                             Ok(())
                         },
                     );

@@ -17,7 +17,7 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
 
 hook = r'''
   const calls = [];
-  act = async req => { calls.push(structuredClone(req)); return {}; };
+  request = async req => { calls.push(structuredClone(req)); return {}; };
   refreshSettings = async () => {};
   window.__fixture = { calls, start(effort) {
     $('pair').classList.add('hidden'); $('app').classList.remove('hidden');

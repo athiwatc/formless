@@ -7,14 +7,14 @@ platform app-dirs (SPEC §9.4).
 ## Cutting a release
 
 1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`), and
-   move the `CHANGELOG.md` entries under `## [X.Y.Z] - date`.
+   move the `CHANGELOG.md` entries under `## X.Y.Z - date`.
 2. Run `cargo test --workspace --locked`, and
-   `scripts/release-check.sh vX.Y.Z`.
+   run `scripts/release-check.sh vX.Y.Z` and `scripts/release-notes.sh vX.Y.Z`.
 3. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. `.github/workflows/release.yml` then:
-   - first checks the tag names the Cargo.toml version
-     (`scripts/release-check.sh`) and stops before any build if not, so
-     asset names, `formless --version` and `formless update` agree;
+   - checks before any build that the tag names the Cargo.toml version
+     (`scripts/release-check.sh`) and has a nonempty changelog section
+     (`scripts/release-notes.sh`);
    - builds macOS (arm64/x86_64) and Windows (x86_64) archives with
      SHA-256 files;
    - builds the Linux archive, `.deb` and `.rpm` (`cargo-deb`,
