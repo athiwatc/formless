@@ -222,13 +222,10 @@ pub(crate) fn estimate_store_with_window(
             copy.edit_message(session, edit, &input.draft)?
                 .context("user message not found")?;
         } else if input.retry {
-            let user = copy
-                .list_messages(session)?
-                .into_iter()
-                .rev()
-                .find(|m| m.role == "user")
+            let (id, _, content) = copy
+                .last_user_message(session)?
                 .context("nothing to retry")?;
-            copy.edit_message(session, &user.id, &user.content)?
+            copy.edit_message(session, &id, &content)?
                 .context("user message not found")?;
         } else {
             let (id, status) = copy
@@ -670,24 +667,106 @@ pub fn resume_note(status: &str) -> String {
     format!("The previous run was {status} before it finished. Continue the user's task from where it stopped; do not repeat work already done above.")
 }
 
+fn forecast_count(value: f64) -> String {
+    let rounded = format!("{value:.0}");
+    let digits = rounded.strip_prefix('-').unwrap_or(&rounded);
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return rounded;
+    }
+    let mut grouped = String::new();
+    if rounded.starts_with('-') {
+        grouped.push('-');
+    }
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn forecast_duration(ms: f64) -> String {
+    let millis = ms.round() as u64;
+    if millis > 0 && millis < 1_000 {
+        let fractional = format!("{millis:03}");
+        return format!("0.{}s", fractional.trim_end_matches('0'));
+    }
+    let seconds = millis / 1_000;
+    let mut text = String::new();
+    for (n, unit) in [
+        (seconds / 3600, "h"),
+        (seconds / 60 % 60, "m"),
+        (seconds % 60, "s"),
+    ] {
+        if n > 0 {
+            text.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if text.is_empty() {
+        "0s".into()
+    } else {
+        text
+    }
+}
+
+fn forecast_cost(value: f64) -> String {
+    if value != 0.0 && value.abs() < 0.00005 {
+        format!("${value:.2e}")
+    } else if value != 0.0 && value.abs() < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
+    }
+}
+
 pub fn describe(f: &RunForecast) -> String {
-    let show = |r: &Option<ForecastRange>, unit: &str| {
-        r.as_ref()
-            .map(|r| format!("p50 {:.2} / p90 {:.2} {unit}", r.p50, r.p90))
-            .unwrap_or_else(|| "unknown (no comparable history or price)".into())
+    let show = |range: &Option<ForecastRange>, format: fn(f64) -> String| {
+        range.as_ref().map_or_else(
+            || "unknown (no comparable history or price)".into(),
+            |range| format!("p50 {} / p90 {}", format(range.p50), format(range.p90)),
+        )
     };
-    format!("{}\nSteps: {}\nTokens: {}\nCost: {}\nDuration: {}\nCached fraction: {}\nCompaction probability: {}\n{}",f.hint,show(&f.steps,"steps"),show(&f.tokens,"tokens"),show(&f.cost_usd,"USD"),show(&f.duration_ms,"ms"),show(&f.cached_fraction,""),f.compaction_probability.map_or("unknown".into(),|p|format!("{:.0}%",100.0*p)),f.warnings.join("\n"))
+    let percent = |p| format!("{:.0}%", 100.0 * p);
+    let mut lines = vec![
+        f.hint.clone(),
+        format!("Steps: {}", show(&f.steps, forecast_count)),
+        format!("Tokens: {}", show(&f.tokens, forecast_count)),
+        format!("Cost: {}", show(&f.cost_usd, forecast_cost)),
+        format!("Duration: {}", show(&f.duration_ms, forecast_duration)),
+        format!("Cached fraction: {}", show(&f.cached_fraction, percent)),
+        format!(
+            "Compaction probability: {}",
+            f.compaction_probability
+                .map_or_else(|| "unknown".into(), percent)
+        ),
+    ];
+    lines.extend(f.warnings.iter().cloned());
+    lines.join("\n")
 }
 
 pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
-    let runs = st.run_metrics(2000)?;
+    // The forecast window and its observations come from one read snapshot.
+    st.read_transaction(|st| {
+        let forecasts = st.recorded_forecasts_limited(200)?;
+        let ids: Vec<_> = forecasts.iter().map(|(id, _)| id.as_str()).collect();
+        let facts = st.forecast_metric_inputs(&ids, cfg)?;
+        Ok(render_metrics(forecasts, facts))
+    })
+}
+
+fn render_metrics(
+    forecasts: Vec<(String, RunForecast)>,
+    mut facts: std::collections::HashMap<String, crate::storage::ForecastMetricInput>,
+) -> Value {
     let mut rows = Vec::new();
-    for (id, f) in st.recorded_forecasts_limited(200)? {
-        let Some(run) = runs.iter().find(|r| r.run_id == id) else {
+    for (id, f) in forecasts {
+        let Some(run) = facts.remove(&id) else {
             continue;
         };
-        let (cost, main_peak, _) = st.forecast_usage(&id, cfg)?;
-        let served = st.forecast_models(&id)?;
+        let cost = run.cost;
+        let main_peak = run.main_peak;
+        let served = run.served;
         let quoted_provider = f
             .basis
             .provider_key
@@ -702,7 +781,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             .into_iter()
             .map(|(provider, model)| json!({"provider":provider,"model":model}))
             .collect();
-        let complete = st.forecast_usage_complete(&id)?;
+        let complete = run.complete;
         let actual = (run.prompt_tokens + run.completion_tokens) as f64;
         let finished = run.status == "completed" && complete;
         let error = f
@@ -727,12 +806,67 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
         let comparisons = json!({"steps":comparison(&f.steps,Some(run.steps as f64)),"tokens":comparison(&f.tokens,complete.then_some(actual)),"cost_usd":comparison(&f.cost_usd,cost.filter(|_|complete)),"duration_ms":comparison(&f.duration_ms,Some(run.duration_ms as f64))});
         rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"peak_main_prompt_tokens":main_peak,"served_main":served_main,"basis_match":basis_match,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished && basis_match && main_peak>0}));
     }
-    Ok(json!(rows))
+    json!(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forecast_description_formats_history_and_unknowns_without_blank_lines() {
+        let mut f: RunForecast = serde_json::from_value(json!({
+            "fingerprint": "fixture",
+            "basis": {
+                "provider_key": "fixture", "model": "fixture", "role": "fixture",
+                "session_id": null, "cwd_hash": "fixture", "tools_hash": "fixture",
+                "prompt_tokens": 0
+            },
+            "comparable_runs": 0, "steps": null, "tokens": null,
+            "cost_usd": null, "duration_ms": null, "context_tokens": 0,
+            "context_source": "fixture", "will_compact": false,
+            "compaction_probability": null, "cached_fraction": null,
+            "unpriced": true, "warnings": [], "confirmation_required": false,
+            "hint": "Synthetic forecast"
+        }))
+        .unwrap();
+        assert_eq!(
+            describe(&f),
+            "Synthetic forecast\nSteps: unknown (no comparable history or price)\nTokens: unknown (no comparable history or price)\nCost: unknown (no comparable history or price)\nDuration: unknown (no comparable history or price)\nCached fraction: unknown (no comparable history or price)\nCompaction probability: unknown"
+        );
+
+        let range = |p50, p90| Some(ForecastRange { p50, p90 });
+        f.comparable_runs = 3;
+        f.steps = range(12.0, 31.0);
+        f.tokens = range(48_213.0, 90_551.0);
+        f.cost_usd = range(0.0002, 0.004);
+        f.duration_ms = range(84_211.0, 240_000.0);
+        f.cached_fraction = range(0.42, 0.8);
+        f.compaction_probability = Some(0.1);
+        f.warnings = vec![
+            "First fixture warning".into(),
+            "Second fixture warning".into(),
+        ];
+        let original = serde_json::to_value(&f).unwrap();
+        assert_eq!(
+            describe(&f),
+            "Synthetic forecast\nSteps: p50 12 / p90 31\nTokens: p50 48,213 / p90 90,551\nCost: p50 $0.0002 / p90 $0.0040\nDuration: p50 1m24s / p90 4m\nCached fraction: p50 42% / p90 80%\nCompaction probability: 10%\nFirst fixture warning\nSecond fixture warning"
+        );
+        assert_eq!(serde_json::to_value(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn forecast_human_rounding_preserves_subsecond_and_small_cost_information() {
+        assert_eq!(forecast_count(999.6), "1,000");
+        assert_eq!(forecast_duration(400.0), "0.4s");
+        assert_eq!(forecast_duration(999.49), "0.999s");
+        assert_eq!(forecast_duration(999.5), "1s");
+        assert_eq!(forecast_duration(3_600_000.0), "1h");
+        assert_eq!(forecast_cost(0.0), "$0.00");
+        assert_eq!(forecast_cost(0.000001), "$1.00e-6");
+        assert_eq!(forecast_cost(0.0001), "$0.0001");
+        assert_eq!(forecast_cost(0.3456), "$0.35");
+    }
+
     fn config() -> Config {
         let mut c = Config::default();
         c.provider.model = "model".into();
