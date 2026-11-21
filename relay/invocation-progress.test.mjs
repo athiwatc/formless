@@ -14,14 +14,21 @@ function setup(actualRefresh = false) {
   const doc = { activeElement: null };
   const h = (tag, props, ...children) => ({
     tag, props, children: children.flat(Infinity).filter(x => x != null),
+    classList: { toggle() {} },
+    append(...nodes) { for (const node of nodes) node.parent = this; this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; },
+    get firstElementChild() { return this.children[0]; },
+    get lastElementChild() { return this.children.at(-1); },
+    closest() { return this.parent; },
     dataset: { runningAction: props?.['data-running-action'], runningHandle: props?.['data-running-handle'] },
     focus(options) { assert.equal(options.preventScroll, true); doc.activeElement = this; },
   });
   const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{readyState:1},local:true,conn:1,channel:{}}, h, $:() => box,
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
+    reconcileChildren: (parent, nodes) => parent.replaceChildren(...nodes),
     request: async () => [], document: doc, focusVisible: button => box.contains(button), uiFormat: String, Date});
   installEventRenderFixture(c, fn);
-  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','recordedDuration','renderRunning','onEvent'].map(fn).join('\n'),c);
+  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','recordedDuration','runningRow','renderRunning','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};
 }
@@ -108,10 +115,11 @@ test('a queued event prevents stale refresh and replaced connections cannot over
   assert.equal(c.S.liveTools.length, 0, 'snapshot superseded by queued event must not render');
   c.S.channel = {};
   const current = c.refreshRunning();
-  resolvers[2]([row('b')]); await current;
+  resolvers[2]([row('b', { last_label: 'new connection' })]); await current;
   resolvers[1]([row('a')]); await Promise.resolve(); await Promise.resolve();
   assert.equal(c.S.liveTools.length,1);
   assert.equal(c.S.liveTools[0].invocationId,'b');
+  assert.equal(c.S.liveTools[0].progress.label,'new connection');
 });
 test('pending before start retains handle, progress and stall while start fills exact metadata', () => {
   const {c} = setup();

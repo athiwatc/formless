@@ -13,6 +13,8 @@ import threading
 
 from playwright.sync_api import expect, sync_playwright
 
+from browser_fixture import chromium_executable
+
 ROOT = Path(__file__).resolve().parent
 HOOK = r"""
   const F = window.__interaction = { calls: [], replies: {}, refreshes: 0 };
@@ -569,7 +571,7 @@ def run():
     thread.start()
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(executable_path="/usr/bin/chromium", headless=True)
+            browser = playwright.chromium.launch(executable_path=chromium_executable(playwright), headless=True)
             for name in args.case or CASES:
                 context = browser.new_context(viewport={"width": 1280, "height": 900}, service_workers="block")
                 page = context.new_page()

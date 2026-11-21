@@ -15,8 +15,9 @@ import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, browser_engines, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/workspace/.formless-browsers')
 PASSES = 0
 
 
@@ -102,7 +103,7 @@ def edit_text(page, key, text, expected):
 def run_engine(p, engine, url, artifacts, payload):
     start = PASSES
     artifacts.mkdir(parents=True, exist_ok=True)
-    browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
+    browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
     context = browser.new_context(viewport={'width':1280,'height':900})
     context.route('**/app.js', lambda route: expose(route, payload))
     page = context.new_page()
@@ -111,7 +112,7 @@ def run_engine(p, engine, url, artifacts, payload):
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.goto(url)
     page.wait_for_function('!!window.__settings822')
-    page.evaluate(r'''()=>{const d=__settings822;d.S.view='settings';d.S.channel={};d.S.daemonOnline=true;d.S.local=true;
+    page.evaluate(r'''()=>{const d=__settings822;d.S.view='settings';d.S.ws={readyState:1};d.S.channel={local:true};d.S.daemonOnline=true;d.S.local=true;
       d.S.settings=structuredClone(d.data);d.S.status={secure:true,protocol:1,pid:42,sessions:0};
       document.querySelector('#pair').classList.add('hidden');document.querySelector('#app').classList.remove('hidden');d.renderAll();}''')
     for key in payload['values']:
@@ -174,7 +175,11 @@ def run_engine(p, engine, url, artifacts, payload):
     check(page.evaluate('document.activeElement.getAttribute("aria-label")')=='Edit naming.model',engine+' Escape restores invoking Edit')
     for key,text in [('provider.max_retries','Infinity'),('provider.prices','{broken')]:
         button(page,key).click();page.locator('#ask-input').fill(text);page.get_by_role('button',name='Save',exact=True).click()
+        page.locator('#ask-body [role="alert"]').wait_for()
         check(len(calls(page))==before,engine+' invalid syntax does not submit '+key)
+        check(page.locator('#ask-input').input_value()==text,engine+' invalid syntax retains draft '+key)
+        page.keyboard.press('Escape')
+        check(page.evaluate('document.activeElement.getAttribute("aria-label")')=='Edit '+key,engine+' invalid edit cancellation restores '+key)
     page.evaluate('__settings822.reject=true')
     button(page,'provider.max_retries').click();page.locator('#ask-input').fill('-1');page.get_by_role('button',name='Save',exact=True).click()
     page.wait_for_function('document.querySelector("#toasts").textContent.includes("Fixture daemon rejected this value")')
@@ -210,14 +215,17 @@ def run_engine(p, engine, url, artifacts, payload):
 
 
 def run():
-    artifacts=pathlib.Path(sys.argv[1] if len(sys.argv)>1 else '/tmp/formless-settings-check')
-    payload=json.loads(pathlib.Path(sys.argv[2] if len(sys.argv)>2 else '/workspace/scratch/formless-822-settings-fixture.json').read_text())
+    artifacts=pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else artifact_dir('/tmp/formless-settings-check')
+    fixture_path = sys.argv[2] if len(sys.argv) > 2 else os.environ.get('FORMLESS_SETTINGS_FIXTURE')
+    if not fixture_path:
+        raise SystemExit('Pass the Settings fixture path or set FORMLESS_SETTINGS_FIXTURE.')
+    payload = json.loads(pathlib.Path(fixture_path).read_text())
     artifacts.mkdir(parents=True,exist_ok=True)
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(QuietHandler,directory=str(ROOT/'web')))
     threading.Thread(target=server.serve_forever,daemon=True).start()
     try:
         with sync_playwright() as p:
-            for engine in ['chromium','webkit']:
+            for engine in browser_engines():
                 run_engine(p,engine,f'http://127.0.0.1:{server.server_port}/',artifacts/engine,payload)
     finally:
         server.shutdown()

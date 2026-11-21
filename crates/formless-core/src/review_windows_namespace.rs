@@ -514,6 +514,19 @@ pub(super) fn create_private(directory: &File, leaf: &OsStr) -> io::Result<File>
     )
 }
 
+/// Create a private staging file with the exclusive access required to rename
+/// the exact opened link after its contents have been flushed.
+pub(super) fn create_private_exclusive(directory: &File, leaf: &OsStr) -> io::Result<File> {
+    open_relative(
+        directory,
+        leaf,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+        true,
+        false,
+        0,
+    )
+}
+
 /// Open an existing ordinary file relative to the exact directory HANDLE.
 /// It never creates or truncates; caller chooses the restricted access mask.
 /// Optional audit-security access uses only privileges already available in its token.

@@ -10,6 +10,8 @@ import pathlib
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
 
 
@@ -44,7 +46,7 @@ server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Qui
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+        browser = pw.chromium.launch(executable_path=chromium_executable(pw), headless=True, args=['--no-sandbox'])
         for width, root_size, container in [(390, 16, None), (1280, 32, None), (1280, 16, 600)]:
             page = browser.new_page(viewport={'width': width, 'height': 900})
             page.route('**/app.js*', expose)
