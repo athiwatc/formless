@@ -2000,8 +2000,9 @@ pattern (§4.4).
 - **Tags:** Tools carry topic tags (`git`, `web`, `finance`).
   - **Setting them:** the agent passes `create_tool`'s optional `tags`; a
     new version without tags keeps the old ones. Users use `SetToolTags`:
-    `formless tools tag NAME [TAG…]`, `/tooltag NAME [TAG…]` in the TUI,
-    or the Tags field in the web Tool detail. None given clears them.
+    `formless tools tag NAME TAG…` or `formless tools tag NAME --clear`,
+    `/tooltag NAME [TAG…]` in the TUI, or the Tags field in the web Tool
+    detail. `formless tools tag NAME` reads the existing tags.
   - **Normalised:** lowercase, without `#`, spaces become `-`, only
     letters, digits, `-` and `_`, at most 24 characters each and 8 per
     Tool.
@@ -4552,7 +4553,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached) per UTC day, or with `by` = "model",
+  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -6778,8 +6779,11 @@ the bounded recent Run list. Default/explicit day sends no group key and keeps
 the daemon's oldest-first day order; other groups keep its descending total-token
 order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
-the complete array and null costs. Cost is the daemon's current estimate, not a
+Human tables show cache writes, total tokens (prompt plus completion), and a
+final total row. Cached and cache-write tokens are included in prompt tokens.
+Unknown costs and unavailable cache-write counts display as `-`, including in
+totals that contain an unknown value. JSON preserves the complete row array,
+including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a
 billing guarantee. Session groups use the ID for attribution and display the
 current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
@@ -6818,6 +6822,11 @@ human-detail layout change leaves fetching, metrics and security fields intact.
 The existing GetTool all-version payload remains until protocol selectors
 are addressed separately (#889).
 
+Run inspection includes recorded cache-read, cache-write and reasoning token
+counts. The human `runs show` report derives duration from the stored timestamps,
+shows estimated USD amounts with six decimal places, and formats spend flags
+and unpriced model names for reading.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
@@ -6826,8 +6835,9 @@ an active Run query exits 0, and cancel exits 0 when its request succeeds.
 `--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
-Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
-returned stalled/abandoned flags and optional progress fraction/label.
+Tool/Session identifiers, optional Invocation ID, compact elapsed/silent
+durations for a minute or longer, returned stalled/abandoned flags and
+optional progress as a clamped whole percentage with its label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
 Outer `runs --json running` is also supported.

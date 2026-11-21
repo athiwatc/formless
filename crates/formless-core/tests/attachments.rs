@@ -44,6 +44,17 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn java_keystores_are_credential_paths_by_suffix() {
+    let project = std::env::temp_dir().join("formless-attachment-project");
+    for name in ["release.jks", "debug.KEYSTORE"] {
+        assert!(credential_path(&project.join(name)).is_some(), "{name}");
+    }
+    for name in ["keys.jks.txt", "release.keystore.bak", "notes.txt"] {
+        assert!(credential_path(&project.join(name)).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn detects_terraform_config_in_attachment_paths() {
     for name in [
         ".terraform.d/credentials.tfrc.json",
@@ -78,6 +89,17 @@ fn types_come_from_the_bytes() {
     // SVG is a document, not a vision image.
     let svg = resolve_mime(None, "d.svg", b"<svg onload='x'/>");
     assert!(!formless_core::daemon::is_raster_image(&svg), "{svg}");
+}
+
+#[test]
+fn p8_private_keys_are_credential_paths_by_suffix() {
+    let project = std::env::temp_dir().join("formless-attachment-project");
+    for name in ["AuthKey_fixture.p8", "SigningKey.P8"] {
+        assert!(credential_path(&project.join(name)).is_some(), "{name}");
+    }
+    for name in ["key.p8.txt", "key.p8.bak", "notes.txt"] {
+        assert!(credential_path(&project.join(name)).is_none(), "{name}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -270,6 +292,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
         ".ssh/id_rsa",
         ".ssh/id_ed25519.pub",
         ".env",
+        ".HTPASSWD",
         "keys/ID_DSA",
         "keys/id_rsa.bak",
         "keys/id_ed25519",
@@ -282,6 +305,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     ];
     let allowed = [
         "notes.txt",
+        "htpasswd.txt",
         "keys/id_dsa.pub",
         "keys/id_rsa.pub",
         "keys/id_ed25519.pub",
@@ -340,6 +364,14 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     }
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
+}
+
+#[test]
+fn keepass_database_mentions_use_the_credential_classifier() {
+    let root = std::env::temp_dir().join("formless-project");
+    assert!(credential_path(&root.join("passwords.kdbx")).is_some());
+    assert!(credential_path(&root.join("db.KDBX")).is_some());
+    assert!(credential_path(&root.join("db.kdbx.lock")).is_none());
 }
 
 /// Chunked uploads (#909): checked before any byte, taken in order,
