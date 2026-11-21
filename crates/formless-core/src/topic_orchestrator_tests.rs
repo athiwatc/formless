@@ -9,6 +9,9 @@ fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,socket,pathlib,subprocess,hashlib,time
+if '--version' in sys.argv:print('fixture 1.0');sys.exit()
+if sys.argv[1:]==['auth','status']:print(json.dumps({} if os.environ.get('TOPIC_FIXTURE_AUTH_UNKNOWN') else {'loggedIn':True}));sys.exit()
+if sys.argv[1:]==['login','status']:print('Logged in');sys.exit()
 mode=os.environ.get('TOPIC_FIXTURE_MODE','git')
 if mode=='hold':
     pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
@@ -962,6 +965,384 @@ async fn topic_wait_returns_old_attempt_while_newer_attempt_of_same_feature_runs
         second
     );
 }
+
+#[tokio::test]
+async fn topic_limits_refuse_fourth_retry_require_user_and_allow_explicit_increase() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            f.daemon()
+                .run_topic_step_until_done(&session, &args, &cancel)
+                .await
+                .unwrap()["status"],
+            "succeeded"
+        );
+    }
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Limit reached"));
+    let snapshot = state(&f, &topic.id);
+    assert_eq!(snapshot.attempts.len(), 4);
+    assert_eq!(snapshot.status, TopicStatus::NeedsUser);
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(question["event"], "question");
+    assert_eq!(question["user_only"], true);
+    let id = question["question_id"].as_str().unwrap().to_owned();
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":id,"answers":[{"selected":["Raise limit and continue"]}],"basis":"made up"})).unwrap_err().to_string().contains("user_only"));
+    assert!(f
+        .daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id.clone(),
+            answer: "invalid".into(),
+            answers: vec![]
+        })
+        .await
+        .is_err());
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id,
+            answer: "Raise limit and continue".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).limits.max_retries_per_step, 6);
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Running);
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 5,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .is_err());
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: question["question_id"].as_str().unwrap().into(),
+            answer: "Stop".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 6,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert!(f
+        .daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: "missing".into(),
+            limits: TopicLimits::default()
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_readiness_rejects_missing_harness_and_user_can_approve_one_step_substitute() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    let topic = topic(&f, None, false);
+    let session = topic.topic_session_id.clone().unwrap();
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not ready"));
+    assert!(state(&f, &topic.id).attempts.is_empty());
+    let values = f.daemon().handle(Request::ListHarnesses).await.unwrap();
+    assert_eq!(values.as_array().unwrap().len(), 7);
+    assert_eq!(values[0]["installed"], false);
+    assert_eq!(values[1]["installed"], true);
+    let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"Claude is unavailable"});
+    let daemon = f.daemon().clone();
+    let s = session.clone();
+    let c = cancel.clone();
+    let waiting = tokio::spawn(async move {
+        daemon
+            .request_topic_harness_substitute(&s, &request, &c)
+            .await
+    });
+    wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(question["user_only"], true);
+    let id = question["question_id"].as_str().unwrap().to_owned();
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":id,"answers":[{"selected":["Use Codex"]}],"basis":"No human approved this"})).is_err());
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id,
+            answer: "Use Codex".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.await.unwrap().unwrap()["answer"], "Use Codex");
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert_eq!(state(&f, &topic.id).attempts[0].harness, HarnessKind::Codex);
+    assert!(f.daemon().topic_substitutes.locked().is_empty());
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_substitute_retry_skip_cancel_and_invalid_requests_do_not_authorize_launch() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let request = json!({"feature_id":topic.features[0].id,"step_title":"step","wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"unavailable"});
+    let mut invalid = request.clone();
+    invalid["reason"] = json!("");
+    assert!(f
+        .daemon()
+        .request_topic_harness_substitute(&session, &invalid, &CancellationToken::new())
+        .await
+        .is_err());
+    invalid = request.clone();
+    invalid["substitute"] = invalid["wanted"].clone();
+    assert!(f
+        .daemon()
+        .request_topic_harness_substitute(&session, &invalid, &CancellationToken::new())
+        .await
+        .is_err());
+    for answer in [Some("Sign in and retry"), Some("Skip step"), None] {
+        let daemon = f.daemon().clone();
+        let s = session.clone();
+        let args = request.clone();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let waiting =
+            tokio::spawn(
+                async move { daemon.request_topic_harness_substitute(&s, &args, &c).await },
+            );
+        wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+        let id = f
+            .daemon()
+            .topic_decisions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        if let Some(answer) = answer {
+            f.daemon()
+                .handle(Request::AnswerQuestion {
+                    question_id: id,
+                    answer: answer.into(),
+                    answers: vec![],
+                })
+                .await
+                .unwrap();
+            assert_eq!(waiting.await.unwrap().unwrap()["answer"], answer);
+        } else {
+            cancel.cancel();
+            assert!(waiting.await.unwrap().is_err());
+        }
+        assert!(f.daemon().topic_decisions.locked().is_empty());
+        assert!(f.daemon().topic_substitutes.locked().is_empty());
+    }
+    assert!(state(&f, &topic.id).attempts.is_empty());
+}
+
+#[tokio::test]
+async fn topic_unknown_auth_is_ready() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    env.set("TOPIC_FIXTURE_AUTH_UNKNOWN", "1");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    assert_eq!(
+        crate::local_harness::harness_availability(HarnessKind::Claude, None)
+            .await
+            .signed_in,
+        None
+    );
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[]
+                ),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+}
+
+#[tokio::test]
+async fn topic_terminal_failure_closes_limit_question_and_does_not_block_idle() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| {
+            st.claim_topic_workflow(&topic.id)?;
+            st.set_topic_limits(
+                &topic.id,
+                &TopicLimits {
+                    max_retries_per_step: 0,
+                    max_attempts_per_topic: 0,
+                },
+            )
+        })
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(
+            session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[]
+            ),
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+    assert_eq!(f.daemon().topic_decisions.locked().len(), 1);
+    assert!(f.daemon().topic_work_in_flight());
+    let id = f
+        .daemon()
+        .topic_decisions
+        .locked()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let (tx, mut rx) = mpsc::channel(64);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 981,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    f.daemon()
+        .finish_topic_feature_tool(
+            session,
+            &json!({"feature_id":topic.features[0].id,"reason":"User is stopping this feature"}),
+            false,
+        )
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+    assert!(f.daemon().topic_decisions.locked().is_empty());
+    assert!(!f.daemon().topic_work_in_flight());
+    assert!(!f
+        .daemon()
+        .pending_attention
+        .locked()
+        .iter()
+        .any(|event| matches!(event,Event::UserQuestion{question_id,..} if question_id==&id)));
+    let mut closed = false;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message,ServerMessage::Event(Event::UserQuestionClosed{question_id,answered_by:None}) if question_id==id)
+        {
+            closed = true;
+        }
+    }
+    assert!(closed);
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -1240,6 +1621,8 @@ async fn topic_interrupt_run_stops_live_harness_and_releases_chat() {
 async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_are_step_failures() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
+    let executable = script(&f, &env);
+    env.set("FORMLESS_TOPIC_MUSE_EXE", executable);
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -1278,8 +1661,8 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
             &CancellationToken::new(),
         )
         .await
-        .unwrap();
-    assert_eq!(result["status"], "failed");
+        .unwrap_err();
+    assert!(result.to_string().contains("not ready"));
     assert_eq!(state(&f, &topic.id).status, TopicStatus::Running);
     assert_eq!(
         state(&f, &topic.id).features[0].status,
