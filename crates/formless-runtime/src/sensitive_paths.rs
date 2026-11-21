@@ -329,6 +329,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
+        ".psql_history" | "psql_history" | ".mysql_history"
+    ) {
+        return Some("database client history");
+    }
+    if matches!(
+        name.as_str(),
         "login data"
             | "login data for account"
             | "logins.json"
@@ -347,9 +353,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "relay_secret"
             | ".netrc"
             | "_netrc"
+            | ".htpasswd"
             | ".git-credentials"
             | ".yarnrc"
             | ".yarnrc.yml"
+            | ".pgpass"
+            | "pgpass.conf"
             | "credentials.tfrc.json"
             | ".terraformrc"
             | "terraform.rc"
@@ -430,7 +439,14 @@ mod tests {
             "identity.PPK",
             "server.key",
             ".bash_history",
+            "www/.htpasswd",
+            "site/.HTPASSWD",
             "fish_history",
+            ".PSQL_HISTORY",
+            "psql_history",
+            ".mysql_history",
+            ".pgpass",
+            "postgresql/PGPASS.CONF",
             "Profiles/default/logins.json",
             "Chrome/Profile/Login Data",
         ] {
@@ -475,6 +491,18 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         assert!(!relocation.unwrap());
     }
+    fn apache_password_file_checks_both_path_spellings_and_requires_exact_name() {
+        let root = std::env::temp_dir().join("project");
+        let secret = root.join(".HTPASSWD");
+        let alias = root.join("alias.txt");
+        for (requested, resolved) in [(&alias, &secret), (&secret, &alias)] {
+            assert!(matches!(
+                policy.classify(requested, resolved).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        for name in ["htpasswd", "htpasswd.txt", ".htpasswd.bak"] {
+            let path = root.join(name);
+                policy.classify(&path, &path).unwrap(),
     #[test]
     fn composer_auth_file_is_classified_before_ordinary_config_files() {
         let root = std::env::temp_dir().join("formless-project");

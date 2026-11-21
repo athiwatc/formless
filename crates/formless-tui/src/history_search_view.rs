@@ -87,7 +87,9 @@ mod tests {
                 let before = app.input.searching().map(|(q, i)| (q.to_owned(), i));
                 let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
                 terminal
-                    .draw(|frame| crate::draw_input(frame, Rect::new(0, 0, width, 3), &app, true))
+                    .draw(|frame| {
+                        crate::draw_input(frame, Rect::new(0, 0, width, 3), &app, true, None)
+                    })
                     .unwrap();
                 let shown: String = terminal
                     .backend()
