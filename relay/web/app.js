@@ -816,16 +816,15 @@
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
     syncSidebar();
     const conn = $("conn");
-    conn.title = "";
-    conn.onclick = null;
+    const retry = $("conn-retry");
+    if (!S.reconnect && document.activeElement === retry) focusReturn($("notes-btn"));
+    retry.hidden = !S.reconnect;
     const localConnected = S.local && S.ws?.readyState === 1 && S.daemonOnline;
     if (S.reconnect) {
       // Visible backoff with a manual retry (SPEC §12).
       const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
-      conn.className = "pill off clickable";
+      conn.className = "pill off";
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
-      conn.title = "Retry now";
-      conn.onclick = retryNow;
     } else if (!navigator.onLine && !localConnected) {
       conn.className = "pill off";
       conn.textContent = "offline · daemon unreachable";
@@ -1000,13 +999,16 @@
     try { return measure(); }
     finally { if (hidden) { if (display) node.style.setProperty("display", display, priority); else node.style.removeProperty("display"); node.style.visibility = visibility; } }
   }
-  function revealViewportControl(node, container, bounds) {
+  function revealViewportControl(node, container, bounds, { partial = false } = {}) {
     if (!node || !container || !container.contains(node)) return;
     const rect = node.getBoundingClientRect(), box = container.getBoundingClientRect();
     const top = Math.max(bounds.top, box.top) + 1, bottom = Math.min(bounds.bottom, box.bottom) - 1;
     if (rect.height <= bottom - top) {
       if (rect.top < top) container.scrollTop -= top - rect.top;
       else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
+    } else if (partial) {
+      if (rect.top > top) container.scrollTop += rect.top - top;
+      else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
   function positionPopover() {
@@ -1063,7 +1065,9 @@
     withTranscriptLayout(() => {
       root.setAttribute("data-visual-viewport", "");
       root.toggleAttribute("data-viewport-zoomed", zoomed);
-      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 24);
+      const keyboardShrankViewport = !zoomed && viewport.height < root.clientHeight - fontSize * 3;
+      const shortViewport = viewport.height < fontSize * (zoomed ? 28 : 24);
+      root.toggleAttribute("data-viewport-short", shortViewport || keyboardShrankViewport);
       root.toggleAttribute("data-viewport-composing", composing);
       viewportVariable("--visual-left", viewport.left);
       viewportVariable("--visual-top", viewport.top);
@@ -1108,8 +1112,13 @@
         positionJump(bounds, fontSize);
       }
       positionPopover();
-      const modal = activeDialog()?.node.querySelector(".modal") || document.activeElement?.closest(".pair-card");
-      if (modal) revealViewportControl(document.activeElement, modal, bounds);
+      const focused = document.activeElement;
+      const focusScrollport = activeDialog()?.node.querySelector(".modal") || focused?.closest(".pair-card");
+      if (focusScrollport) revealViewportControl(focused, focusScrollport, bounds);
+      else {
+        const chrome = focused?.closest(".topbar, .statusbar");
+        if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
+      }
     }, { newContent: false });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
@@ -1251,27 +1260,47 @@
   function pollRunning() {
     if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
   }
+  function runningRow(i, row) {
+    if (!row) {
+      row = h("div", { class: "running-item" });
+      row.append(
+        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(row.invocation.session_id) }),
+        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "cancel_invocation", handle: invocation.handle }, "Cancelled " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Cancel"),
+        h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "abandon_invocation", handle: invocation.handle }, "Abandoned " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Abandon"));
+    }
+    row.invocation = i;
+    for (const [index, action] of ["open", "cancel", "abandon"].entries()) {
+      row.children[index].dataset.runningAction = action;
+      row.children[index].dataset.runningHandle = String(i.handle);
+    }
+    row.classList.toggle("stalled", !!i.stalled);
+    const session = S.sessions.find((x) => x.id === i.session_id);
+    row.firstElementChild.replaceChildren(h("strong", null, i.tool_name),
+      " · " + recordedDuration(i.elapsed_ms) + (session ? " · " + session.name : "") +
+      (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : ""));
+    row.lastElementChild.hidden = !!i.abandoned;
+    return row;
+  }
   function renderRunning(list) {
     const box = $("running");
     const focused = document.activeElement;
-    const previous = box.contains(focused) ? focused.dataset : null;
-    const controls = [];
-    const control = (action, i, attrs, ...children) => {
-      const button = h("button", { type: "button", "data-running-action": action, "data-running-handle": i.handle, ...attrs }, ...children);
-      if (previous?.runningAction === action && previous.runningHandle === String(i.handle)) controls.push(button);
-      return button;
-    };
+    const focusedRow = focused?.closest("#running .running-item");
+    const previous = new Map([...box.children].filter(node => node.invocation).map(row => [row.invocation.handle, row]));
+    const rows = list.map(i => runningRow(i, previous.get(i.handle)));
+    const heading = box.firstElementChild?.tagName === "H4" ? box.firstElementChild : h("h4", null, "Running tools");
+    reconcileChildren(box, rows.length ? [heading, ...rows] : rows);
     box.classList.toggle("hidden", !list.length);
-    box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
-      const s = S.sessions.find((x) => x.id === i.session_id);
-      return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + recordedDuration(i.elapsed_ms) + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
-        i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
-    }));
-    if (focusVisible(controls[0])) controls[0].focus({ preventScroll: true });
+    if (focusedRow && (document.activeElement !== focused || !focusVisible(focused))) {
+      const target = focusVisible(focused) ? focused
+        : focusedRow.isConnected ? focusedRow.firstElementChild : $("new-session");
+      focusReturn(target);
+    }
   }
   setInterval(pollRunning, 2000);
   document.addEventListener("visibilitychange", syncRunningExposure);
@@ -2076,7 +2105,9 @@
         if (d.width && d.height) { img.width = d.width; img.height = d.height; }
         img.addEventListener("click", () => box.classList.toggle("zoom"));
         img.addEventListener("load", () => {
-          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+          // The decoded image may already have resized. Keep the reading
+          // anchor captured before that reflow, even after a recent scroll.
+          if (current() && $("transcript").contains(img)) settleReadingLayout();
         }, { once: true });
         update(() => {
           view.replaceChildren(img);
@@ -2666,12 +2697,20 @@
       + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
       + (t.error ? " · " + t.error : "");
   }
+  function storedSessionModel(session) {
+    return session?.model || S.settings?.provider?.model || "";
+  }
+  let modelPickerSequence = 0;
   async function openModelPicker(onPick) {
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
+    const model = storedSessionModel(session);
     const efforts = ["", "low", "medium", "high"];
-    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
-    const list = h("ul", { class: "picker-list", role: "listbox" });
+    // The scrollable results are navigated from the input, including in
+    // browsers that otherwise add scroll containers to the Tab order.
+    const list = h("ul", { id: "model-picker-" + ++modelPickerSequence, class: "picker-list", role: "listbox", "aria-label": "Models", tabindex: -1, hidden: true });
+    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false",
+      role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
     effort.value = (session && session.reasoning_effort) || "";
@@ -2685,6 +2724,7 @@
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
         h("h2", null, title),
+        h("p", { class: "muted picker-current-model" }, model ? "Current selection: " + model : "Current model unavailable"),
         input, list,
         selectionOnly ? null : h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
         h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }),
@@ -2698,7 +2738,7 @@
       matches = items.map((item, n) => ({ item, n, m: fuzzyMatch(q, item.id) }))
         .filter((x) => x.m)
         .sort((a, b) => (q.trim() ? b.m[0] - a.m[0] : 0) || a.n - b.n)
-        .map((x) => ({ item: x.item, pos: new Set(x.m[1]) }));
+        .map((x) => ({ item: x.item, optionId: list.id + "-option-" + x.n, pos: new Set(x.m[1]) }));
       sel = Math.min(sel, Math.max(0, matches.length - 1));
       const sources = multiSource();
       // At most 200 rows, in a window that keeps the selection.
@@ -2706,17 +2746,25 @@
       list.replaceChildren(...matches.slice(first, first + 200).map((x, n) => {
         const i = first + n;
         const id = [...x.item.id].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
-        const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
+        const li = h("li", { id: x.optionId, role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null,
+          "aria-posinset": i + 1, "aria-setsize": matches.length },
           h("span", { class: "picker-id" }, id),
           x.item.recent ? h("span", { class: "picker-tag" }, "recent") : null,
           sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null,
           modelDetail(meta[x.item.id], tests[x.item.id]) ? h("span", { class: "muted" }, modelDetail(meta[x.item.id], tests[x.item.id])) : null);
-        li.onclick = () => { sel = i; draw(); };
+        li.onclick = () => { sel = i; draw(); input.focus({ preventScroll: true }); };
         li.ondblclick = () => { sel = i; finish(false); };
         return li;
       }));
       const selNode = list.children[sel - first];
-      if (selNode) selNode.scrollIntoView({ block: "nearest" });
+      list.hidden = !matches.length;
+      input.setAttribute("aria-expanded", String(!list.hidden));
+      if (selNode) {
+        input.setAttribute("aria-activedescendant", selNode.id);
+        selNode.scrollIntoView({ block: "nearest" });
+      } else {
+        input.removeAttribute("aria-activedescendant");
+      }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
       const accepted = (meta[choice()] || {}).efforts;
       const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
@@ -4085,16 +4133,24 @@
     const others = S.others || [];
     $("status-others").classList.toggle("hidden", !others.length);
     $("status-others").textContent = others.length ? " · also open in " + othersText(others) : "";
-    $("status-model").textContent = (s && s.model) || S.settings?.provider?.model || "";
+    const model = storedSessionModel(s);
+    const modelButton = $("status-model");
+    const modelText = model || "Model unavailable";
+    const modelLabel = model ? "Change model (" + model + ")" : "Model unavailable. Choose model.";
+    if (modelButton.textContent !== modelText) modelButton.textContent = modelText;
+    if (modelButton.getAttribute("aria-label") !== modelLabel) modelButton.setAttribute("aria-label", modelLabel);
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
     $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";
     // Context fill (SPEC §10.6): amber above 70%, red above 90%.
     const fill = S.contextFill && S.contextFill[S.current];
     const pct = fill && fill.size > 0 && fill.used > 0 ? Math.floor(fill.used * 100 / fill.size) : null;
-    $("status-context").classList.toggle("hidden", pct == null);
-    $("status-context").textContent = pct == null ? "" : " │ ctx " + pct + "%";
-    $("status-context").className = "clickable " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted") + (pct == null ? " hidden" : "");
+    const contextButton = $("status-context");
+    if (pct == null && document.activeElement === contextButton) focusReturn(modelButton);
+    contextButton.hidden = pct == null;
+    contextButton.textContent = pct == null ? "" : " │ ctx " + pct + "%";
+    contextButton.setAttribute("aria-label", pct == null ? "Context window" : "Context window (" + pct + "% used)");
+    contextButton.className = "linkish " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted");
     const waiting = S.approvals.length;
     const asking = S.pendingQuestion && !S.questionOpen ? 1 : 0;
     $("status-approvals").classList.toggle("hidden", !waiting && !asking);
@@ -4594,6 +4650,7 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
+  $("conn-retry").onclick = () => retryNow();
   for (const id of ["tools-filter", "tools-quick"]) $(id).addEventListener("input", () => renderToolsTable());
   // The Sort menu picks a column in its natural order.
   $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderToolsTable(); });
@@ -7293,16 +7350,20 @@
 
   // Read CSS visibility so viewport and container-query layouts agree.
   let sidebarLastFocus = null;
+  function sidebarVisible(sidebar) {
+    return !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+  }
   function syncSidebar() {
     const sidebar = $("sidebar"), menu = $("menu-btn");
-    const visible = !!(sidebar.getClientRects().length
-      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+    const visible = sidebarVisible(sidebar);
     menu.setAttribute("aria-expanded", String(visible));
     syncRunningExposure();
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
     else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
+    syncRunningExposure(visible);
   }
   function setSidebar(open, { focus = false } = {}) {
     $("sidebar").classList.toggle("open", open);
@@ -7372,6 +7433,7 @@
     }
   }
   document.addEventListener("visibilitychange", () => {
+    syncRunningExposure();
     if (!document.hidden) { unseen = 0; document.title = baseTitle; }
   });
   /** Ask once, from a user gesture (sending a message). */
@@ -8090,23 +8152,26 @@
     };
   }
 
-  // Reconnect after S.backoff, visibly: the pill counts down and a tap
-  // retries at once.
+  // Reconnect after S.backoff, with a countdown and a manual retry.
   function scheduleReconnect(fn) {
     clearTimeout(S.reconnect && S.reconnect.timer);
     // Full jitter, so tabs that lost the relay together don't return in waves.
     const delay = 250 + Math.floor(Math.random() * (S.backoff - 250));
-    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
+    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(retryNow, delay) };
     S.backoff = Math.min(S.backoff * 2, 15000);
     renderChrome();
   }
   function retryNow() {
     if (!S.reconnect) return;
     const fn = S.reconnect.fn;
+    cancelReconnect();
+    fn();
+  }
+  function cancelReconnect() {
+    if (!S.reconnect) return;
     clearTimeout(S.reconnect.timer);
     S.reconnect = null;
     renderChrome();
-    fn();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
   // A heartbeat, so the daemon can tell a vanished browser from an idle
@@ -8122,8 +8187,7 @@
     if (S.forgetting) return;
     S.forgetting = true;
     S.userClosed = true;
-    clearTimeout(S.reconnect?.timer);
-    S.reconnect = null;
+    cancelReconnect();
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
     let warning = "";
     try {
@@ -8441,10 +8505,9 @@
     if (!document.querySelector('meta[name="formless-local"]') || !frag.local) return;
     S.linkedSession = frag.s || null;
     const token = frag.local;
-    clearTimeout(S.reconnect && S.reconnect.timer);
-    S.reconnect = null;
     const old = S.ws;
     S.ws = null;
+    cancelReconnect();
     if (old) old.close();
     connectLocal(token);
   });

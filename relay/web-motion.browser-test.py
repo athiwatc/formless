@@ -8,14 +8,14 @@ WebKit is engine evidence, not physical Safari/device/assistive-technology proof
 import functools
 import http.server
 import json
-import os
 import pathlib
 import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, browser_engines, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/workspace/.formless-browsers')
 PASSES = 0
 
 
@@ -85,7 +85,7 @@ def settings(page, setting):
 def run_engine(p, engine, url, artifacts):
     start = PASSES
     artifacts.mkdir(parents=True, exist_ok=True)
-    browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
+    browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox']) if engine == 'chromium' else p.webkit.launch(executable_path=p.webkit.executable_path, headless=True)
     context = browser.new_context(viewport={'width':760, 'height':800}, reduced_motion='no-preference')
     context.route('**/app.js', expose)
     page = context.new_page()
@@ -147,12 +147,12 @@ def run_engine(p, engine, url, artifacts):
 
 
 def run():
-    artifacts = pathlib.Path(sys.argv[1] if len(sys.argv)>1 else '/tmp/formless-motion-check')
+    artifacts = pathlib.Path(sys.argv[1]) if len(sys.argv)>1 else artifact_dir('/tmp/formless-motion-check')
     server = http.server.ThreadingHTTPServer(('127.0.0.1',0), functools.partial(QuietHandler,directory=str(ROOT / 'web')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         with sync_playwright() as p:
-            for engine in ['chromium','webkit']:
+            for engine in browser_engines():
                 run_engine(p, engine, f'http://127.0.0.1:{server.server_port}/', artifacts / engine)
         print(f'PASS total: {PASSES}; artifacts: {artifacts}', flush=True)
     finally:

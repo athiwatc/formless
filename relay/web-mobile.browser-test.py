@@ -18,8 +18,9 @@ import pathlib
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT=pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH','/workspace/.formless-browsers')
 PASSES=0
 
 
@@ -309,6 +310,14 @@ def hybrid_checks(browser,name,url):
     context.add_init_script(INIT);context.add_init_script(POINTER_INIT);context.route('**/app.js',expose_script)
     page=context.new_page();page.set_default_timeout(5000);errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('!!__mobile815');fixture(page);page.evaluate('__mobile815.S.running.clear();__mobile815.S.streaming="";__mobile815.setReading(.85);__mobile815.renderAll()')
+    page.set_viewport_size({'width':1280,'height':430})
+    page.evaluate('__mobile815.setReading(1)')
+    page.locator('#input').focus()
+    settle(page)
+    check(page.locator('.topbar').is_visible() and page.locator('.chat-head').is_visible(),
+          name+' short desktop window keeps navigation while composing without a keyboard')
+    page.set_viewport_size({'width':1280,'height':900})
+    page.evaluate('__mobile815.setReading(.85)')
     check(page.evaluate('matchMedia("(any-pointer: coarse)").matches && !matchMedia("(pointer: coarse)").matches'),name+' simulated hybrid has primary fine and secondary coarse')
     fine_size=page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')
     check(fine_size<16 and not page.evaluate('document.documentElement.hasAttribute("data-input-touch")'),name+' hybrid preserves desktop field size at85%: '+str(fine_size))
@@ -427,8 +436,7 @@ def geometry_checks(page,name,out,context):
 
 def run_engine(p,name,url,out):
     start=PASSES;reports=[]
-    chromium_path=os.environ.get('FORMLESS_CHROMIUM_EXECUTABLE') or ('/usr/bin/chromium' if pathlib.Path('/usr/bin/chromium').is_file() else None)
-    browser=p.chromium.launch(executable_path=chromium_path,headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(headless=True)
+    browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(headless=True)
     for coarse in [True,False]:
         context=browser.new_context(viewport={'width':390,'height':844} if coarse else {'width':1280,'height':900},is_mobile=coarse,has_touch=coarse,reduced_motion='reduce',service_workers='block')
         context.add_init_script(INIT);context.route('**/app.js',expose_script)
@@ -451,7 +459,7 @@ def run_engine(p,name,url,out):
 
 
 def run():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('artifacts',nargs='?',default='/tmp/formless-815-browser');parser.add_argument('--browser',choices=['all','chromium','webkit'],default='all')
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('artifacts',nargs='?',default=artifact_dir('/tmp/formless-815-browser'));parser.add_argument('--browser',choices=['all','chromium','webkit'],default=os.environ.get('FORMLESS_BROWSER_TEST_ENGINE','all'))
     args=parser.parse_args();out=pathlib.Path(args.artifacts);out.mkdir(parents=True,exist_ok=True)
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(QuietHandler,directory=str(ROOT/'web')));threading.Thread(target=server.serve_forever,daemon=True).start();reports=[]
     try:

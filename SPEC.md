@@ -5707,7 +5707,7 @@ previous headless Run's Session.
   - Responses carry the same CSP as the hosted relay.
   - **Reconnecting:** when a connected page loses the daemon, it keeps
     retrying with backoff. The connection pill counts down ("daemon
-    offline · retry in Ns") and a tap retries at once. After 3 failed
+    offline · retry in Ns"). Select **Retry now** to retry at once. After 3 failed
     tries it notes that a restarted daemon needs a new `formless web`
     link, because session cookies don't survive a restart. Pasting a new
     link into an open tab signs in with it. Relay mode uses the same

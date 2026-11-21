@@ -1341,10 +1341,14 @@ platforms run native jobs, including Linux runners themselves hosted in Docker.
 CI installs stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
 application data/config and logs use private temporary directories cleaned after
 the job. Test debug artifacts are removed before release compilation to limit disk use.
-The workflow does not deploy or publish a release; release packaging remains in
-`release.yml`. Live external-link checks remain in `docs.yml`; Playwright browser
-checks in `relay/README.md` remain separate manual checks. AUR packaging tests
-run only in the Linux job because they require GNU install.
+Release packaging remains in `release.yml`, and live external-link checks run
+in `docs.yml`. Linux CI also runs every relay Chromium suite and the loopback
+push check. The runner needs Python 3.10+ with venv support, Chromium's shared libraries
+and Poppler tools. CI downloads its pinned Playwright Chromium into the job
+directory and includes screenshots and logs from failed suites in the diagnostic
+artifact. See the [relay browser instructions](relay/README.md#browser-regressions)
+for local runs and WebKit coverage. AUR packaging tests run on Linux because
+they require GNU install.
 
 ```bash
 cargo build --workspace                # debug build of the single binary
