@@ -57,6 +57,7 @@ pub trait InteractionHandler: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct HarnessRequest {
     pub kind: HarnessKind,
     pub acp_agent: Option<String>,

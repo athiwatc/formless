@@ -183,6 +183,112 @@ impl PermissionHandler for Interactions<'_> {
     }
 }
 
+/// A blocking ACP adapter entry point such as `antigravity::run`.
+pub type Adapter =
+    fn(&HarnessRequest, &mut dyn PermissionHandler, &CancellationToken) -> Result<HarnessResult>;
+
+/// Runs `adapter` on a blocking thread while `handler` answers its permission requests,
+/// questions and updates on the caller's task, so `handler` need not be `'static`.
+/// Cancelling `cancel` stops the run; this returns only after the adapter has returned.
+pub async fn run_interactive(
+    adapter: Adapter,
+    request: HarnessRequest,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    let (sender, mut asks) = tokio::sync::mpsc::unbounded_channel();
+    let run_cancel = cancel.child_token();
+    let blocking_cancel = run_cancel.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut job = tokio::task::spawn_blocking(move || {
+        let forward = Forward(sender);
+        let mut interactions = Interactions {
+            handler: &forward,
+            runtime,
+        };
+        adapter(&request, &mut interactions, &blocking_cancel)
+    });
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(ask) = asks.recv() => answer(handler, ask, &run_cancel).await,
+            result = &mut job => break result,
+        }
+    };
+    while let Ok(ask) = asks.try_recv() {
+        answer(handler, ask, &run_cancel).await;
+    }
+    result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?
+}
+
+enum Ask {
+    Permission(
+        HarnessPermissionRequest,
+        tokio::sync::oneshot::Sender<Option<String>>,
+    ),
+    Question(
+        Vec<formless_protocol::Question>,
+        tokio::sync::oneshot::Sender<Option<Vec<formless_protocol::QuestionAnswer>>>,
+    ),
+    Update(HarnessUpdate),
+}
+
+/// A failed update (e.g. the attempt already reported its result) never fails the run.
+async fn answer(handler: &dyn InteractionHandler, ask: Ask, cancel: &CancellationToken) {
+    match ask {
+        Ask::Permission(request, reply) => {
+            let _ = reply.send(handler.request_permission(request, cancel).await);
+        }
+        Ask::Question(questions, reply) => {
+            let _ = reply.send(handler.ask_question(questions, cancel).await);
+        }
+        Ask::Update(update) => {
+            let _ = handler.on_update(update);
+        }
+    }
+}
+
+/// Hands each interaction from the blocking adapter thread to `run_interactive`'s task.
+struct Forward(tokio::sync::mpsc::UnboundedSender<Ask>);
+
+impl InteractionHandler for Forward {
+    fn request_permission<'a>(
+        &'a self,
+        request: HarnessPermissionRequest,
+        cancel: &'a CancellationToken,
+    ) -> super::InteractionFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.0.send(Ask::Permission(request, reply)).ok()?;
+            tokio::select! {
+                answer = answer => answer.ok().flatten(),
+                _ = cancel.cancelled() => None,
+            }
+        })
+    }
+
+    fn ask_question<'a>(
+        &'a self,
+        questions: Vec<formless_protocol::Question>,
+        cancel: &'a CancellationToken,
+    ) -> super::InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+        Box::pin(async move {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.0.send(Ask::Question(questions, reply)).ok()?;
+            tokio::select! {
+                answer = answer => answer.ok().flatten(),
+                _ = cancel.cancelled() => None,
+            }
+        })
+    }
+
+    fn on_update(&self, update: HarnessUpdate) -> Result<()> {
+        self.0
+            .send(Ask::Update(update))
+            .map_err(|_| anyhow!("interaction handler is closed"))
+    }
+}
+
 /// The tool call's `rawInput`, with any vendor `_meta` kept under `_meta`; a non-object
 /// input is wrapped as `{"input": ...}` so the metadata has somewhere to go.
 fn permission_raw_input(tool_call: &Value) -> Option<Value> {
@@ -1578,6 +1684,54 @@ mod tests {
             .ask_question(&json!([{"question": "which?"}]), &CancellationToken::new())
             .unwrap();
         assert_eq!(answers, json!([{"selected": [], "text": "which?"}]));
+    }
+
+    #[tokio::test]
+    async fn run_interactive_survives_rejected_updates() {
+        use crate::local_harness::InteractionFuture;
+        struct Reported;
+        impl InteractionHandler for Reported {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                Box::pin(async { Some("allow".into()) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async { None })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                bail!("attempt already reported")
+            }
+        }
+        fn adapter(
+            request: &HarnessRequest,
+            permissions: &mut dyn PermissionHandler,
+            _: &CancellationToken,
+        ) -> Result<HarnessResult> {
+            let lines = [
+                LIVE_INITIALIZE.into(),
+                SESSION_NEW.into(),
+                permission(90, "execute"),
+                update("done"),
+                stop(3, "end_turn"),
+            ];
+            drive_lines(request, &lines, permissions).0
+        }
+        let result = run_interactive(
+            adapter,
+            request(StepAccess::Write),
+            &Reported,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.message, "done");
     }
 
     #[test]
