@@ -1229,6 +1229,30 @@ mod tests {
     }
 
     #[test]
+    fn topic_controls_accept_a_unique_topic_name() {
+        let mut named = topic("t1", TopicStatus::Approved);
+        named.name = "Accounting".into();
+        let mut twin = topic("t2", TopicStatus::Approved);
+        twin.name = "Books".into();
+        let mut twin2 = topic("t3", TopicStatus::Approved);
+        twin2.name = "Books".into();
+        let (mut app, wire) = connected(vec![named, twin, twin2]);
+        app.topic_slash("topic", "context Accounting on");
+        app.topic_slash("topic", "context Books on");
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("Several topics are named Books"));
+        let requests = wire.topic_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0].request,
+            Request::SetTopicContextAccess { topic_id, .. } if topic_id == "t1"
+        ));
+    }
+
+    #[test]
     fn harness_questions_take_typed_answers() {
         let mut running = topic("t1", TopicStatus::Running);
         running

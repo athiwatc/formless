@@ -1001,9 +1001,15 @@ impl State {
     pub fn control_command(&self, args: &str) -> Option<Result<ControlRequest, String>> {
         let words: Vec<_> = args.split_whitespace().collect();
         let known = |id: &str| {
-            self.topic(id)
-                .map(|topic| topic.id.clone())
-                .ok_or_else(|| format!("No topic named {id}; use /topics."))
+            if let Some(topic) = self.topic(id) {
+                return Ok(topic.id.clone());
+            }
+            let mut named = self.topics.iter().filter(|topic| topic.name == id);
+            match (named.next(), named.next()) {
+                (Some(topic), None) => Ok(topic.id.clone()),
+                (Some(_), Some(_)) => Err(format!("Several topics are named {id}; use its ID.")),
+                (None, _) => Err(format!("No topic named {id}; use /topics.")),
+            }
         };
         let result = match words.as_slice() {
             ["harnesses"] => Ok((None, Request::ListHarnesses, String::new())),
@@ -1444,11 +1450,7 @@ impl State {
             node: Some(Node::Main),
             depth: 0,
             label: "Main Chat".into(),
-            status: self
-                .main
-                .as_ref()
-                .map(|session| session.name.clone())
-                .unwrap_or_default(),
+            status: String::new(),
             section: false,
         }];
         rows.push(TreeRow {
@@ -1618,7 +1620,11 @@ impl State {
                 ListItem::new(Line::from(vec![
                     Span::styled(label, style),
                     Span::styled(
-                        row.status.clone(),
+                        if row.status.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", row.status)
+                        },
                         Style::default().fg(if color {
                             status_color(&row.status)
                         } else {
