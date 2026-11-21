@@ -6629,6 +6629,13 @@ under `crates/*/src` against README or SPEC, including test-only references.
 `FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+
+`FORMLESS_NOTIFICATION_TITLE` and `FORMLESS_NOTIFICATION_BODY` are internal
+Windows desktop-notification helper inputs, not user configuration overrides.
+Formless sets them on its PowerShell child to pass the notification title and
+body as data rather than interpolating them into the script. The helper passes
+nonempty text to BurntToast, falling back to `Formless` if both are empty.
+
 Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
