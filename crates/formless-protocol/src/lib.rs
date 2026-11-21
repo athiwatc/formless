@@ -809,6 +809,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             "gradle" | "gradlew" | "mvn" | "mvnw" => {
                 return Some("Gradle and Maven can execute repository build code")
             }
+            "docker" | "podman" | "nerdctl" => {
+                return Some("a container tool can run programs with host resources")
+            }
             "make" | "cmake" | "ninja" | "npm" | "yarn" | "pnpm" | "cargo" => {
                 return Some("a build tool runs whatever the build files say")
             }
@@ -3992,6 +3995,28 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_container_clis() {
+        for spec in [
+            "process:docker",
+            "process:podman",
+            "process:nerdctl",
+            "process:/usr/bin/docker",
+            "process:podman.exe",
+            "process:docker:run",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:dockerize",
+            "process:podman-helper",
+            "process:nerdctl-doc",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
