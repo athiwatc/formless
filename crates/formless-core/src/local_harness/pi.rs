@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::{validate_request, CommandSpec, HarnessRequest, HarnessResult, HarnessRole};
+use super::{validate_request, CommandSpec, HarnessRequest, HarnessResult, StepAccess};
 
 pub const MCP_CONFIG_ENV: &str = "FORMLESS_PI_MCP_CONFIG";
 const BRIDGE_CUSTOM_TYPE: &str = "formless-pi-bridge";
@@ -17,10 +17,10 @@ const BRIDGE_MESSAGE: &str = "formless-pi-mcp-registered";
 const EXTENSION_NAME: &str = "formless-pi-extension.ts";
 const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
 
-const BUILD_GUIDANCE: &str =
-    "Role: Build. Implement the requested changes in the working directory.";
-const REVIEW_GUIDANCE: &str =
-    "Role: Review. Inspect the requested changes and report findings without modifying files.";
+const WRITE_GUIDANCE: &str =
+    "Access: Write. Implement the requested changes in the working directory.";
+const READ_ONLY_GUIDANCE: &str =
+    "Access: ReadOnly. Inspect the requested changes and report findings without modifying files.";
 
 pub fn stage_extension(attempt_private_dir: &Path) -> Result<PathBuf> {
     if !attempt_private_dir.is_absolute() {
@@ -129,13 +129,13 @@ pub fn command_spec_with_extension(
     }
     args.extend([
         "--append-system-prompt".into(),
-        match request.role {
-            HarnessRole::Build => BUILD_GUIDANCE,
-            HarnessRole::Review => REVIEW_GUIDANCE,
+        match request.access {
+            StepAccess::Write => WRITE_GUIDANCE,
+            StepAccess::ReadOnly => READ_ONLY_GUIDANCE,
         }
         .into(),
     ]);
-    if request.role == HarnessRole::Review {
+    if request.access == StepAccess::ReadOnly {
         args.extend([
             "--tools".into(),
             format!("read,grep,find,ls,mcp__{server_name}__*").into(),
@@ -323,18 +323,19 @@ mod tests {
 
     use super::{
         command_spec, command_spec_with_extension, parse_output, stage_extension,
-        BRIDGE_CUSTOM_TYPE, BRIDGE_MESSAGE, BUILD_GUIDANCE, EXTENSION_NAME, EXTENSION_SOURCE,
-        MCP_CONFIG_ENV, REVIEW_GUIDANCE,
+        BRIDGE_CUSTOM_TYPE, BRIDGE_MESSAGE, EXTENSION_NAME, EXTENSION_SOURCE, MCP_CONFIG_ENV,
+        READ_ONLY_GUIDANCE, WRITE_GUIDANCE,
     };
-    use crate::local_harness::{HarnessKind, HarnessRequest, HarnessRole};
+    use crate::local_harness::{HarnessKind, HarnessRequest, StepAccess};
 
-    fn request(role: HarnessRole) -> HarnessRequest {
+    fn request(access: StepAccess) -> HarnessRequest {
         HarnessRequest {
             kind: HarnessKind::Pi,
+            acp_agent: None,
             model: Some("configured-model".into()),
             cwd: std::env::temp_dir().join("formless repo"),
             prompt: "Make this change".into(),
-            role,
+            access,
             mcp_command: std::env::temp_dir().join("formless mcp"),
             mcp_args: vec!["serve".into(), "--literal $value".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
@@ -469,7 +470,7 @@ mod tests {
     #[test]
     fn command_spec_preserves_literal_arguments_model_cwd_and_environment() {
         let (dir, extension) = staged_extension();
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.prompt = "--literal 'quoted' $HOME\nline next".into();
         request.model = Some("model with spaces".into());
         let spec = command_spec_with_extension(&request, &extension).unwrap();
@@ -495,7 +496,8 @@ mod tests {
         );
         assert_eq!(args[8..10], ["--model", "model with spaces"]);
         assert_eq!(args[10], "--append-system-prompt");
-        assert_eq!(args[11], BUILD_GUIDANCE);
+        assert_eq!(args[11], WRITE_GUIDANCE);
+        assert!(!args.iter().any(|arg| arg == "--tools"));
         let prompt_index = args.len() - 1;
         assert_eq!(args[prompt_index - 1], "--");
         assert_eq!(args[prompt_index], request.prompt);
@@ -522,19 +524,19 @@ mod tests {
     }
 
     #[test]
-    fn review_command_limits_builtin_tools_and_keeps_its_mcp_server() {
+    fn read_only_command_limits_builtin_tools_and_keeps_its_mcp_server() {
         let (dir, extension) = staged_extension();
-        let spec = command_spec_with_extension(&request(HarnessRole::Review), &extension).unwrap();
+        let spec = command_spec_with_extension(&request(StepAccess::ReadOnly), &extension).unwrap();
         let args = spec
             .args
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let role_prompt = args
+        let access_prompt = args
             .iter()
             .position(|arg| arg == "--append-system-prompt")
             .unwrap();
-        assert_eq!(args[role_prompt + 1], REVIEW_GUIDANCE);
+        assert_eq!(args[access_prompt + 1], READ_ONLY_GUIDANCE);
         let tools = args.iter().position(|arg| arg == "--tools").unwrap();
         assert!(args[tools + 1].starts_with("read,grep,find,ls,mcp__formless_"));
         assert!(args[tools + 1].ends_with("__*"));
@@ -544,7 +546,7 @@ mod tests {
     #[test]
     fn command_spec_omits_optional_model_and_uses_default_executable() {
         let (dir, extension) = staged_extension();
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.model = None;
         request.executable = None;
         let spec = command_spec_with_extension(&request, &extension).unwrap();
@@ -563,7 +565,7 @@ mod tests {
             "\n@alice keep the leading newline",
             "Review @alice's parser",
         ] {
-            let mut request = request(HarnessRole::Build);
+            let mut request = request(StepAccess::Write);
             request.prompt = prompt.into();
             let spec = command_spec_with_extension(&request, &extension).unwrap();
             let config: Value = serde_json::from_str(
@@ -586,7 +588,7 @@ mod tests {
 
     #[test]
     fn command_spec_requires_explicit_staged_extension_and_rejects_symlinks() {
-        let request = request(HarnessRole::Build);
+        let request = request(StepAccess::Write);
         assert!(command_spec(&request)
             .unwrap_err()
             .to_string()
@@ -601,6 +603,18 @@ mod tests {
             assert!(command_spec_with_extension(&request, &alias).is_err());
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn command_spec_rejects_acp_agent_for_pi() {
+        let (dir, extension) = staged_extension();
+        let mut request = request(StepAccess::Write);
+        request.acp_agent = Some("configured-agent".into());
+        assert!(command_spec_with_extension(&request, &extension)
+            .unwrap_err()
+            .to_string()
+            .contains("acp_agent"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
