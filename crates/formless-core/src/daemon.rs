@@ -17314,6 +17314,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
         "credentials.tfrc.json",

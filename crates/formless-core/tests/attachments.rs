@@ -270,6 +270,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
         ".ssh/id_rsa",
         ".ssh/id_ed25519.pub",
         ".env",
+        ".HTPASSWD",
         "keys/ID_DSA",
         "keys/id_rsa.bak",
         "keys/id_ed25519",
@@ -282,6 +283,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     ];
     let allowed = [
         "notes.txt",
+        "htpasswd.txt",
         "keys/id_dsa.pub",
         "keys/id_rsa.pub",
         "keys/id_ed25519.pub",
