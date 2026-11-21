@@ -85,6 +85,126 @@ impl Drop for Fixture {
         std::fs::remove_dir_all(&self.root).unwrap();
     }
 }
+
+#[tokio::test]
+async fn explicit_test_never_credits_a_fallback_or_different_served_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_MODEL");
+    env.set("FORMLESS_API_KEY", "loopback-fixture-key");
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let seen = requests.clone();
+    let app = axum::Router::new().route("/chat/completions", axum::routing::post(
+        move |axum::Json(body): axum::Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                let model = body["model"].as_str().unwrap();
+                let stage = if body["stream"] == true { "stream" }
+                    else if body["tools"].as_array().is_some_and(|tools| !tools.is_empty()) { "native" }
+                    else { "prompt" };
+                seen.locked().push((model.to_owned(), stage));
+                if model == "missing" {
+                    return (axum::http::StatusCode::NOT_FOUND, "model missing").into_response();
+                }
+                let reported = if model == format!("wrong-{stage}") { "substitute" } else { model };
+                if stage == "stream" {
+                    let first = json!({"model":reported,"choices":[{"delta":{"content":"o"}}]});
+                    let end = json!({"model":reported,"choices":[{"finish_reason":"stop","delta":{"content":"k"}}]});
+                    return ([("content-type", "text/event-stream")], format!("data: {first}\n\ndata: {end}\n\ndata: [DONE]\n\n")).into_response();
+                }
+                let message = match stage {
+                    "native" if model != "wrong-prompt" => json!({"tool_calls":[{"function":{"name":"probe_ping","arguments":"{}"}}]}),
+                    "prompt" => json!({"content":"<tool_call>{\"name\":\"probe_ping\",\"arguments\":{}}</tool_call>"}),
+                    _ => json!({"content":"inline answer"}),
+                };
+                axum::Json(json!({"model":reported,"choices":[{"message":message}]})).into_response()
+            }
+        }
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    env.set("FORMLESS_BASE_URL", &base);
+    let root = std::env::temp_dir().join(format!("fl-model-identity-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = base.clone();
+    cfg.provider.fallback_models = vec!["substitute".into()];
+    cfg.provider.max_retries = 0;
+    cfg.provider
+        .aliases
+        .insert("alias".into(), "missing".into());
+    cfg.provider
+        .aliases
+        .insert("missing".into(), "substitute".into());
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    daemon
+        .remember_model_test(
+            &base,
+            &crate::provider::ModelTest {
+                model: "missing".into(),
+                ok: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for (selection, model, stages, mismatch) in [
+        ("alias", "missing", &["stream"][..], false),
+        ("wrong-stream", "wrong-stream", &["stream"][..], true),
+        (
+            "wrong-native",
+            "wrong-native",
+            &["stream", "native"][..],
+            true,
+        ),
+        (
+            "wrong-prompt",
+            "wrong-prompt",
+            &["stream", "native", "prompt"][..],
+            true,
+        ),
+    ] {
+        let result = daemon
+            .handle(Request::TestModel {
+                model: selection.into(),
+                provider: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["model"], model, "{result}");
+        assert_eq!(result["ok"], false, "{result}");
+        if mismatch {
+            assert_eq!(result["served_model"], "substitute");
+            assert_eq!(result["tool_calling"], false);
+            assert!(result["first_token_ms"].is_null());
+        } else {
+            assert!(result["served_model"].is_null());
+            assert!(
+                result["error"].as_str().unwrap().contains("404"),
+                "{result}"
+            );
+        }
+        let sent = std::mem::take(&mut *requests.locked());
+        assert!(
+            sent.iter().all(|(sent_model, _)| sent_model == model),
+            "{sent:?}"
+        );
+        assert_eq!(
+            sent.iter().map(|(_, stage)| *stage).collect::<Vec<_>>(),
+            stages
+        );
+        let cache: Value = serde_json::from_slice(
+            &std::fs::read(paths.data_dir.join("model_tests.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cache[format!("{base} {model}")], result);
+    }
+    server.abort();
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn default_model_selection_sends_nothing_but_explicit_test_still_runs() {
     let env = crate::credential_env::EnvGuard::isolated();

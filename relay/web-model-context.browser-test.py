@@ -50,7 +50,7 @@ try:
         for model,(_,expected) in zip(models,cases):
             row=page.locator('.picker-list [role=option]').filter(has=page.locator('.picker-id',has_text=model))
             assert row.locator('.muted').inner_text()==expected,(model,expected,row.inner_text())
-        page.get_by_role('textbox',name='Filter models',exact=True).fill(models[0])
+        page.get_by_role('combobox',name='Filter models',exact=True).fill(models[0])
         page.wait_for_function('document.querySelectorAll(".picker-list [role=option]").length===1')
         assert page.locator('.picker-list .muted').inner_text()==cases[0][1]
         page.get_by_role('button',name='Cancel',exact=True).click()

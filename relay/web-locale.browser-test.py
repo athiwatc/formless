@@ -52,6 +52,8 @@ def snapshot(page):
     return page.evaluate(r'''stamp=>{
       const d=__locale1040,language=d.uiLang(),locale=language==='th'?'th-TH-u-ca-gregory-nu-latn':'en-US-u-ca-gregory-nu-latn';
       const date=new Date(stamp),options={year:'numeric',month:'long',day:'numeric'};
+      const renderedTime={hour:'2-digit',minute:'2-digit'};
+      if(date.toDateString()!==new Date().toDateString())Object.assign(renderedTime,{year:'numeric',month:'short',day:'numeric'});
       const expectedDate=date.toLocaleString(locale,options),year=new Intl.DateTimeFormat(locale,{year:'numeric'}).format(date);
       const option=d.h('option',{value:12345.67},12345.67);
       d.viewportVariable('--locale-machine',12.125);
@@ -60,7 +62,8 @@ def snapshot(page):
         full:d.uiFormat(date),expectedFull:date.toLocaleString(locale),
         clock:d.clock(stamp),expectedClock:date.toLocaleString(locale,{hour:'2-digit',minute:'2-digit'}),
         notes:document.querySelector('#notes time')?.textContent,
-        transcript:document.querySelector('#transcript time')?.textContent,
+        transcript:document.querySelector('#transcript time [aria-hidden="true"]')?.textContent,
+        expectedTranscript:date.toLocaleString(locale,renderedTime),
         number:d.uiFormat(1234567.89),expectedNumber:new Intl.NumberFormat(locale).format(1234567.89),
         money:d.uiMoney(1234.5678,4),expectedMoney:new Intl.NumberFormat(locale,{style:'currency',currency:'USD',minimumFractionDigits:4,maximumFractionDigits:4}).format(1234.5678),
         fixed:d.uiFixed(1234.5,2),expectedFixed:new Intl.NumberFormat(locale,{minimumFractionDigits:2,maximumFractionDigits:2,useGrouping:false}).format(1234.5),
@@ -82,7 +85,7 @@ def assert_locale(page, expected, label):
     check(s['full'] == s['expectedFull'], label+' localized full timestamp')
     check(s['clock'] == s['expectedClock'], label+' localized clock')
     check(s['notes'] == s['expectedClock'], label+' rendered note timestamp refreshed')
-    check(s['transcript'] == s['expectedClock'], label+' rendered transcript timestamp refreshed')
+    check(s['transcript'] == s['expectedTranscript'], label+' rendered transcript timestamp refreshed')
     check(s['number'] == s['expectedNumber'], label+' grouped numeric display')
     check(s['money'] == s['expectedMoney'], label+' localized USD and precision')
     check(s['fixed'] == s['expectedFixed'] and '0.000001' in s['small'], label+' decimals and small prices preserved')
@@ -106,7 +109,8 @@ def run_engine(p, engine, url, out):
         page.wait_for_function('!!window.__locale1040')
         check(page.locator('html').get_attribute('lang') == ('th' if native.startswith('th') else 'en'), engine+' startup language '+native)
         page.evaluate(r'''stamp=>{
-          const d=__locale1040;d.S.view='chat';d.S.current='locale-fixture';d.S.channel={};d.S.daemonOnline=true;
+          const d=__locale1040;d.S.view='chat';d.S.current='locale-fixture';d.S.daemonOnline=true;
+          d.S.ws={readyState:1};d.S.channel={local:true};d.S.local=true;
           d.S.sessions=[{id:'locale-fixture',name:'Locale fixture',updated_at:stamp}];
           d.S.messages=[{id:'locale-message',seq:1,role:'assistant',content:'Raw source 12345.67',created_at:stamp,meta:'{}'}];
           d.S.notes=[{at:Date.parse(stamp),text:'Locale fixture note',err:false}];

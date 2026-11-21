@@ -28,16 +28,23 @@ pub fn path_bytes(p: &Path) -> u64 {
 
 /// The database with its WAL and shared-memory files.
 pub fn db_bytes(paths: &Paths) -> u64 {
+    db_paths(paths).iter().map(|p| path_bytes(p)).sum()
+}
+
+fn db_paths(paths: &Paths) -> [PathBuf; 3] {
     let db = paths.db_file();
-    ["", "-wal", "-shm"]
-        .iter()
-        .map(|s| path_bytes(&PathBuf::from(format!("{}{s}", db.display()))))
-        .sum()
+    ["", "-wal", "-shm"].map(|suffix| PathBuf::from(format!("{}{suffix}", db.display())))
 }
 
 /// Where rotated backups go.
 pub fn backup_dir(paths: &Paths) -> PathBuf {
     paths.data_dir.join("backups")
+}
+
+fn is_migration_backup(path: &Path, prefix: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".bak"))
 }
 
 /// Copies made before schema migrations, newest first.
@@ -46,16 +53,13 @@ pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
     let (Some(dir), Some(name)) = (db.parent(), db.file_name().and_then(|n| n.to_str())) else {
         return Vec::new();
     };
+    let prefix = format!("{name}.v");
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&format!("{name}.v")) && n.ends_with(".bak"))
-        })
+        .filter(|p| is_migration_backup(p, &prefix))
         .collect();
     // Schema prefixes have different widths (v9 sorts after v52). Compare
     // the timestamp after the version instead; malformed legacy names sort
@@ -64,7 +68,7 @@ pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
         let stamp = p
             .file_name()?
             .to_str()?
-            .strip_prefix(&format!("{name}.v"))?
+            .strip_prefix(&prefix)?
             .split_once('-')?
             .1
             .strip_suffix(".bak")?;
@@ -74,32 +78,97 @@ pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
     found
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DiskBytes {
+    total: u64,
+    database: u64,
+    mcp_logs: u64,
+    skills: u64,
+    backups: u64,
+}
+
+/// Reuse counts that have the same semantics in the total and in the buckets.
+/// The filesystem may still change between observations.
+fn disk_bytes(paths: &Paths, mut measure: impl FnMut(&Path) -> u64) -> DiskBytes {
+    let root = &paths.data_dir;
+    let [db, wal, shm] = db_paths(paths);
+    let known = [
+        root.join("mcp"),
+        root.join("skills"),
+        backup_dir(paths),
+        db,
+        wal,
+        shm,
+    ];
+    let mut buckets = [None; 6];
+    let mut migration_bytes = 0;
+    let mut total = 0;
+    let db = paths.db_file();
+    let migration_prefix = db
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.v"));
+
+    // A final symlink counts as a link in the total. A separate bucket
+    // lookup can still follow it as an intermediate component.
+    let entries = std::fs::symlink_metadata(root)
+        .ok()
+        .filter(|metadata| metadata.is_dir())
+        .and_then(|_| std::fs::read_dir(root).ok());
+    if let Some(entries) = entries {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let bytes = measure(&path);
+            total += bytes;
+            if let Some(index) = known.iter().position(|candidate| *candidate == path) {
+                buckets[index] = Some(bytes);
+            }
+            if migration_prefix
+                .as_deref()
+                .is_some_and(|prefix| is_migration_backup(&path, prefix))
+            {
+                migration_bytes += bytes;
+            }
+        }
+    } else {
+        // Preserve independent bucket checks if the root cannot be listed.
+        total = measure(root);
+        migration_bytes = migration_backups(paths)
+            .iter()
+            .map(|path| measure(path))
+            .sum();
+    }
+    let [mcp_logs, skills, copies, db, wal, shm] =
+        std::array::from_fn(|index| buckets[index].unwrap_or_else(|| measure(&known[index])));
+    DiskBytes {
+        total,
+        database: db + wal + shm,
+        mcp_logs,
+        skills,
+        backups: copies + migration_bytes,
+    }
+}
+
 /// Disk use by kind: the database (and roughly what fills it), artifacts,
 /// logs, skills and backups.
 pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
     let (artifact_count, artifact_bytes) = crate::artifacts::usage(store)?;
     let inside = store.content_bytes()?;
     let snapshots = store.run_file_usage()?;
-    let mcp_logs = path_bytes(&paths.data_dir.join("mcp"));
-    let backups = path_bytes(&backup_dir(paths))
-        + migration_backups(paths)
-            .iter()
-            .map(|p| path_bytes(p))
-            .sum::<u64>();
+    let disk = disk_bytes(paths, path_bytes);
     let rows = vec![
-        json!({"kind": "database", "bytes": db_bytes(paths), "detail": "formless.db (with its WAL)"}),
+        json!({"kind": "database", "bytes": disk.database, "detail": "formless.db (with its WAL)"}),
         json!({"kind": "sessions", "bytes": inside["messages"], "detail": "messages, inside the database", "inside_db": true}),
         json!({"kind": "invocation logs", "bytes": inside["invocations"], "detail": "Tool inputs and outputs, inside the database", "inside_db": true}),
         json!({"kind": "tool versions", "bytes": inside["tool_versions"], "detail": "every version's code, inside the database", "inside_db": true}),
         json!({"kind": "file snapshots", "bytes": snapshots.retained_bytes.saturating_add(snapshots.after_state_bytes), "rows": snapshots.rows, "retained_files": snapshots.retained_files, "before_bytes": snapshots.before_bytes, "metadata_bytes": snapshots.metadata_bytes, "after_state_bytes": snapshots.after_state_bytes, "detail": format!("{} recorded paths, {} retained snapshots, inside the database", snapshots.rows, snapshots.retained_files), "inside_db": true}),
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
-        json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + mcp_logs, "detail": "daemon and MCP server logs"}),
-        json!({"kind": "skills", "bytes": path_bytes(&paths.data_dir.join("skills")), "detail": "installed skill files"}),
-        json!({"kind": "backups", "bytes": backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": list_restore_backups(paths), "before_restore_keep": RESTORE_BACKUPS_KEEP}),
+        json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + disk.mcp_logs, "detail": "daemon and MCP server logs"}),
+        json!({"kind": "skills", "bytes": disk.skills, "detail": "installed skill files"}),
+        json!({"kind": "backups", "bytes": disk.backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": list_restore_backups(paths), "before_restore_keep": RESTORE_BACKUPS_KEEP}),
     ];
-    let total = path_bytes(&paths.data_dir);
     Ok(
-        json!({"data_dir": paths.data_dir.display().to_string(), "total_bytes": total, "kinds": rows}),
+        json!({"data_dir": paths.data_dir.display().to_string(), "total_bytes": disk.total, "kinds": rows}),
     )
 }
 
@@ -1244,6 +1313,288 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn legacy_disk_bytes(paths: &Paths, mut measure: impl FnMut(&Path) -> u64) -> DiskBytes {
+        let root = &paths.data_dir;
+        let mcp_logs = measure(&root.join("mcp"));
+        let db = paths.db_file();
+        let name = db.file_name().and_then(|name| name.to_str()).unwrap();
+        let backups = measure(&backup_dir(paths))
+            + std::fs::read_dir(db.parent().unwrap())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(&format!("{name}.v")) && n.ends_with(".bak"))
+                })
+                .map(|path| measure(&path))
+                .sum::<u64>();
+        let database = ["", "-wal", "-shm"]
+            .iter()
+            .map(|suffix| measure(&PathBuf::from(format!("{}{suffix}", db.display()))))
+            .sum();
+        let skills = measure(&root.join("skills"));
+        let total = measure(root);
+        DiskBytes {
+            total,
+            database,
+            mcp_logs,
+            skills,
+            backups,
+        }
+    }
+
+    fn synthetic_file(root: &Path, relative: &str, len: usize) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; len]).unwrap();
+    }
+
+    #[derive(Default, Debug)]
+    struct WalkWork {
+        metadata: usize,
+        listings: usize,
+    }
+
+    impl WalkWork {
+        fn measure(&mut self, path: &Path) -> u64 {
+            self.metadata += 1;
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.listings += 1;
+                    std::fs::read_dir(path)
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .map(|entry| self.measure(&entry.path()))
+                                .sum()
+                        })
+                        .unwrap_or(0)
+                }
+                Ok(metadata) => metadata.len(),
+                Err(_) => 0,
+            }
+        }
+    }
+
+    #[test]
+    fn usage_reuses_each_accounted_subtree_measurement() {
+        let (_fixture, paths) = Fixture::new();
+        let root = &paths.data_dir;
+        for (index, relative) in [
+            "formless.db",
+            "formless.db-wal",
+            "formless.db.v9-malformed.bak/copy",
+            "formless.db.v52-20260101T120000Z.bak",
+            "formless.db.v52-ignored.bak-wal",
+            "unclassified/data",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            synthetic_file(root, relative, index + 1);
+        }
+        for dir in ["mcp", "skills", "backups"] {
+            for i in 0..16 {
+                synthetic_file(root, &format!("{dir}/nested/file-{i}"), i + 1);
+            }
+        }
+        // Include the root metadata/listing done directly by the shared walk,
+        // and the separate migration listing in the previous implementation.
+        let mut old = WalkWork {
+            metadata: 0,
+            listings: 1,
+        };
+        let legacy = legacy_disk_bytes(&paths, |path| old.measure(path));
+        let mut new = WalkWork {
+            metadata: 1,
+            listings: 1,
+        };
+        let mut top_level = std::collections::HashMap::new();
+        let measured = disk_bytes(&paths, |path| {
+            *top_level.entry(path.to_path_buf()).or_insert(0) += 1;
+            new.measure(path)
+        });
+        assert_eq!(measured, legacy);
+        assert_eq!(measured, disk_bytes(&paths, path_bytes));
+        assert!(!top_level.contains_key(root));
+        for entry in std::fs::read_dir(root).unwrap() {
+            assert_eq!(top_level.get(&entry.unwrap().path()), Some(&1));
+        }
+        assert_eq!(top_level.get(&root.join("formless.db-shm")), Some(&1));
+        assert!(new.metadata < old.metadata && new.listings < old.listings);
+        eprintln!("synthetic accounting work: legacy {old:?}, shared {new:?}");
+    }
+
+    #[test]
+    fn usage_preserves_bucket_rows_and_listing_order_on_a_stable_layout() {
+        let (fixture, paths) = Fixture::new();
+        let store = Store::open(&fixture.0.join("synthetic-report.db")).unwrap();
+        let root = &paths.data_dir;
+        for (relative, size) in [
+            ("formless.db", 8),
+            ("formless.db-wal", 3),
+            ("daemon.log", 2),
+            ("daemon.log.1", 3),
+            ("daemon.log.65", 5),
+            ("daemon.log.0", 11),
+            ("daemon.log.fake", 13),
+            ("formless.db.v9-20260101T120000Z.bak", 17),
+            ("formless.db.v52-20251231T120000Z.bak", 19),
+            ("mcp/owned.log", 23),
+            ("backups/before-restore-20260102T120000Z.db", 31),
+            ("backups/before-restore-20260101T120000Z.db", 37),
+        ] {
+            synthetic_file(root, relative, size);
+        }
+        let expected = legacy_disk_bytes(&paths, path_bytes);
+        let report = usage(&paths, &store).unwrap();
+        assert_eq!(report["data_dir"], root.display().to_string());
+        assert_eq!(report["total_bytes"], expected.total);
+        let kinds = report["kinds"].as_array().unwrap();
+        let row = |kind| kinds.iter().find(|row| row["kind"] == kind).unwrap();
+        assert_eq!(row("database")["bytes"], expected.database);
+        assert_eq!(row("logs")["bytes"], 2 + 3 + 5 + expected.mcp_logs);
+        assert_eq!(row("skills")["bytes"], expected.skills);
+        assert_eq!(row("backups")["bytes"], expected.backups);
+        assert_eq!(
+            row("backups")["before_restore"],
+            json!([
+                root.join("backups/before-restore-20260101T120000Z.db"),
+                root.join("backups/before-restore-20260102T120000Z.db"),
+            ])
+        );
+        assert_eq!(
+            migration_backups(&paths),
+            [
+                root.join("formless.db.v9-20260101T120000Z.bak"),
+                root.join("formless.db.v52-20251231T120000Z.bak"),
+            ]
+        );
+        for inside in [
+            "sessions",
+            "invocation logs",
+            "tool versions",
+            "file snapshots",
+        ] {
+            assert_eq!(row(inside)["inside_db"], true);
+        }
+        assert_eq!(row("file snapshots")["bytes"], 0);
+        let missing = Paths {
+            data_dir: root.join("missing"),
+            ..paths
+        };
+        assert_eq!(
+            disk_bytes(&missing, path_bytes),
+            legacy_disk_bytes(&missing, path_bytes)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_preserves_final_links_and_counts_hard_link_names_independently() {
+        use std::os::unix::fs::symlink;
+
+        let (fixture, paths) = Fixture::new();
+        let root = &paths.data_dir;
+        let target = fixture.0.join("link-target");
+        synthetic_file(&target, "large", 4096);
+        symlink(&target, root.join("skills")).unwrap();
+        symlink(target.join("large"), root.join("formless.db.v9-old.bak")).unwrap();
+        symlink(fixture.0.join("missing"), root.join("unclassified")).unwrap();
+        symlink(target.join("large"), root.join("daemon.log")).unwrap();
+        symlink(target.join("large"), root.join("daemon.log.66")).unwrap();
+        synthetic_file(root, "mcp/original", 3);
+        std::fs::hard_link(root.join("mcp/original"), root.join("mcp/second-name")).unwrap();
+        let measured = disk_bytes(&paths, path_bytes);
+        assert_eq!(measured, legacy_disk_bytes(&paths, path_bytes));
+        assert_eq!(crate::logs::log_usage(&paths), 0);
+        assert_eq!(measured.mcp_logs, 6);
+        assert_eq!(
+            measured.skills,
+            std::fs::symlink_metadata(root.join("skills"))
+                .unwrap()
+                .len()
+        );
+
+        let linked_root = fixture.0.join("linked-root");
+        symlink(root, &linked_root).unwrap();
+        let linked = Paths {
+            data_dir: linked_root,
+            ..paths
+        };
+        let measured = disk_bytes(&linked, path_bytes);
+        assert_eq!(measured, legacy_disk_bytes(&linked, path_bytes));
+        assert_eq!(measured.mcp_logs, 6);
+        assert_eq!(
+            measured.total,
+            std::fs::symlink_metadata(&linked.data_dir).unwrap().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_probes_known_paths_when_the_root_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_fixture, paths) = Fixture::new();
+        let root = &paths.data_dir;
+        synthetic_file(root, "mcp/owned.log", 11);
+        synthetic_file(root, "formless.db", 13);
+        synthetic_file(root, "formless.db.v9-hidden.bak", 17);
+        let permissions = std::fs::metadata(root).unwrap().permissions();
+        // Permit traversal to known names but deny directory enumeration.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listing = std::fs::read_dir(root);
+        let measured = disk_bytes(&paths, path_bytes);
+        let legacy = legacy_disk_bytes(&paths, path_bytes);
+        std::fs::set_permissions(root, permissions).unwrap();
+
+        assert_eq!(measured, legacy);
+        if let Err(error) = listing {
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                (
+                    measured.total,
+                    measured.mcp_logs,
+                    measured.database,
+                    measured.backups
+                ),
+                (0, 11, 13, 0)
+            );
+            eprintln!("synthetic denied-listing fallback exercised");
+        } else {
+            // A privileged test process may bypass ordinary permissions.
+            assert_eq!(measured.total, 41);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usage_keeps_database_display_paths_distinct_on_non_utf8_roots() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (fixture, paths) = Fixture::new();
+        let root = fixture
+            .0
+            .join(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        let replacement = fixture.0.join("raw-�");
+        synthetic_file(&root, "formless.db", 4);
+        synthetic_file(&root, "formless.db.v9-test.bak", 3);
+        synthetic_file(&replacement, "formless.db", 6);
+        let raw = Paths {
+            data_dir: root,
+            ..paths
+        };
+        let measured = disk_bytes(&raw, path_bytes);
+        assert_eq!(measured, legacy_disk_bytes(&raw, path_bytes));
+        assert_eq!(measured.total, 7);
+        assert_eq!(measured.database, 6);
+        assert_eq!(measured.backups, 3);
     }
 
     #[test]
