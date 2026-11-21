@@ -90,6 +90,71 @@ fn queued(shell: &Entity<Shell>, cx: &mut App) -> Vec<Operation> {
 }
 
 #[gpui_kit::test]
+fn inventory_preflight_keeps_send_disabled_until_waiting_attachments_finish(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: true,
+                    notice: "Reconnected".into(),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation: shell.client_generation(),
+                    snapshot: replies::session_snapshot(
+                        &id,
+                        &json!({"session":{"id":id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            shell.focus_section(PageSection::Composer, window, cx);
+        });
+        window.input("Send with this file", cx);
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/waiting.txt".into()], cx)
+        });
+        let refresh = queued(&shell, cx).pop().unwrap();
+        assert!(matches!(refresh.intake, Intake::Refresh));
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        complete(&shell, refresh, vec![], window, cx);
+        let staged = queued(&shell, cx).pop().unwrap();
+        assert!(
+            matches!(&staged.intake, Intake::Paths(paths) if paths == &[std::path::PathBuf::from("/waiting.txt")])
+        );
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        complete(
+            &shell,
+            staged,
+            vec![file("waiting", "waiting.txt", "text/plain")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert_ne!(window.find("composer-primary").disabled(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
 fn successful_attach_clears_only_its_earlier_attachment_notice(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     step(cx, handle, |window, cx| {

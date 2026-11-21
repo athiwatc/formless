@@ -102,7 +102,7 @@ pub(super) struct State {
 
 impl State {
     pub(super) fn busy(&self) -> bool {
-        !self.mutations.is_empty()
+        !self.mutations.is_empty() || !self.waiting.is_empty()
     }
 }
 
