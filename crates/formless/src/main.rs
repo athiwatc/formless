@@ -3502,6 +3502,8 @@ enum Fix {
     RemoveStale(Vec<std::path::PathBuf>),
     /// Secret files others can read.
     Chmod600(Vec<std::path::PathBuf>),
+    #[cfg(unix)]
+    MakeDaemonEndpointPrivate,
 }
 
 /// The daemon and file checks `--fix` can act on.
@@ -3598,17 +3600,22 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
             }
         }
     }
-    // A data dir too deep for a unix socket uses a short socket path
-    // instead; that folder must be usable (SPEC §9.1).
     #[cfg(unix)]
-    if paths.socket_path().parent() != Some(paths.data_dir.as_path()) {
-        if let Err(e) = paths.prepare_socket_dir() {
-            out.push(Problem {
-                what: format!("{e:#}"),
-                next: Some("set a shorter FORMLESS_DATA_DIR".into()),
-                fix: None,
-            });
-        }
+    match paths.daemon_endpoint_permissions_need_repair() {
+        Ok(true) => out.push(Problem {
+            what: format!(
+                "the daemon data directory or socket has incorrect permissions ({})",
+                paths.socket_path().display()
+            ),
+            next: Some("formless doctor --fix".into()),
+            fix: Some(Fix::MakeDaemonEndpointPrivate),
+        }),
+        Ok(false) => {}
+        Err(error) => out.push(Problem {
+            what: format!("{error:#}"),
+            next: Some("inspect the daemon data directory and socket ownership".into()),
+            fix: None,
+        }),
     }
     #[cfg(unix)]
     {
@@ -3666,6 +3673,14 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             }
             Ok("removed the stale files".into())
         }
+        #[cfg(unix)]
+        Fix::MakeDaemonEndpointPrivate => {
+            paths
+                .prepare_socket_dir()
+                .and_then(|()| paths.set_daemon_socket_permissions())
+                .map_err(|error| format!("{error:#}"))?;
+            Ok("made the daemon directories (700) and existing socket (600) private".into())
+        }
         Fix::Chmod600(files) => {
             #[cfg(unix)]
             for f in files {
@@ -3676,6 +3691,39 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             Ok("made the secret files private (600)".into())
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_reports_and_repairs_loose_daemon_directory_and_socket_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = std::env::temp_dir().join(format!("fl-doctor-endpoint-{}", std::process::id()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    paths.prepare_socket_dir().unwrap();
+    std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = paths.socket_path();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let problems = doctor_local_problems(&paths);
+    let fix = problems
+        .iter()
+        .find_map(|problem| match &problem.fix {
+            Some(fix @ Fix::MakeDaemonEndpointPrivate) => Some(fix),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o777);
+    apply_fix(&paths, fix).unwrap();
+    assert_eq!(
+        std::fs::metadata(&paths.data_dir).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    assert!(!paths.daemon_endpoint_permissions_need_repair().unwrap());
+    drop(listener);
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Doctor already wrote the full diagnostic report before returning this verdict.

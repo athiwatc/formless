@@ -15844,6 +15844,7 @@ impl Daemon {
     fn claim_listener(&self) -> Result<tokio::net::UnixListener> {
         let sock = self.paths.socket_path();
         self.paths.prepare_socket_dir()?;
+        Paths::daemon_socket_metadata(&sock)?;
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(_) => bail!("a daemon is already running for this data dir"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -15853,17 +15854,20 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let listener = tokio::net::UnixListener::bind(&sock)
             .with_context(|| format!("bind {}", sock.display()))?;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-        let meta = std::fs::symlink_metadata(&sock)?;
-        // SAFETY: geteuid has no preconditions and does not access Rust memory.
-        let uid = unsafe { libc::geteuid() };
-        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
-            bail!("socket ownership or permissions changed during bind");
+        match self.paths.set_daemon_socket_permissions() {
+            Ok(true) => Ok(listener),
+            Ok(false) => bail!(
+                "daemon socket disappeared during startup: {}",
+                sock.display()
+            ),
+            Err(error) => {
+                drop(listener);
+                let _ = std::fs::remove_file(&sock);
+                Err(error)
+            }
         }
-        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -17633,6 +17637,31 @@ mod path_scope_tests {
             "unchanged marker"
         );
         assert!(!paths.config_file().exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_makes_data_directory_and_socket_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!("fl-private-socket-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert!(!paths.daemon_endpoint_permissions_need_repair().unwrap());
+        drop(listener);
+        let _ = std::fs::remove_file(paths.socket_path());
+        drop(daemon);
         std::fs::remove_dir_all(base).unwrap();
     }
 
