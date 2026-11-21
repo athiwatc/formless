@@ -507,7 +507,7 @@ pub(crate) struct SkillSummary {
 /// Columns for [`Store::row_skill`]: the row plus usage metrics.
 const SKILL_COLS: &str = "s.*,
   (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads,
-  (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l WHERE l.skill_id=s.id AND l.run_id IS NOT NULL) AS runs,
+  (SELECT COUNT(DISTINCT NULLIF(l.run_id,'')) FROM skill_loads l WHERE l.skill_id=s.id) AS runs,
   (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l JOIN runs r ON r.id=l.run_id
      WHERE l.skill_id=s.id AND r.status='completed' AND r.followup='') AS runs_completed";
 
@@ -5848,7 +5848,7 @@ impl Store {
              VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, current_version=excluded.current_version,
                enabled=0, source=excluded.source, author=excluded.author, has_scripts=excluded.has_scripts,
-               retired=0, updated_at=excluded.updated_at",
+               retired=0, retire_reason=NULL, updated_at=excluded.updated_at",
             params![uuid::Uuid::new_v4().to_string(), name, description, version, source, author, has_scripts, t],
         )?;
         self.ex(
@@ -5964,10 +5964,10 @@ impl Store {
         )? > 0)
     }
 
-    /// Record that a Session loaded a skill (usage metrics).
+    /// Record a skill load. An empty Run ID represents a manual load.
     pub fn record_skill_load(&self, name: &str, session_id: &str, run_id: &str) -> Result<()> {
         self.ex(
-            "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, ?3, ?4 FROM skills WHERE name=?1",
+            "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, NULLIF(?3,''), ?4 FROM skills WHERE name=?1",
             params![name, session_id, run_id, now()],
         )?;
         Ok(())
