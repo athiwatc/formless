@@ -1734,6 +1734,8 @@
       out.push(h("span", { class: cls }, s));
     };
     const word = /[\p{L}\p{N}_$]/u;
+    const yaml = lang === "yaml" || lang === "yml";
+    let yamlScalar = null;
     let i = 0;
     let lineStart = true;
     const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
@@ -1759,6 +1761,23 @@
           i++;
           continue;
         }
+      }
+      if (yaml && lineStart) {
+        const newline = code.indexOf("\n", i);
+        const end = newline === -1 ? code.length : newline;
+        const line = code.slice(i, end);
+        if (yamlScalar) {
+          const indent = line.length - line.replace(/^ +/, "").length;
+          const blank = !line.trim();
+          if (blank || indent >= (yamlScalar.contentIndent ?? yamlScalar.headerIndent + 1)) {
+            if (!blank) yamlScalar.contentIndent ??= indent;
+            if (line) tok("tok-str", line);
+            if (newline !== -1) plain += "\n";
+            i = newline === -1 ? end : end + 1;
+            continue;
+          }
+        }
+        yamlScalar = yamlScalarHeader(line);
       }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
@@ -1874,6 +1893,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function yamlScalarHeader(line) {
+    let rest = line.replace(/^ +/, "");
+    let headerIndent = line.length - rest.length;
+    while (/^-[ \t]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      rest = rest.replace(/^-[ \t]+/, "");
+    }
+    if (!/^[|>]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      let quote = rest[0] === "'" || rest[0] === '"' ? rest[0] : null;
+      let colon = -1;
+      for (let i = quote ? 1 : 0; i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if ((quote === '"' && c === "\\") || (quote === "'" && c === "'" && rest[i + 1] === "'")) i++;
+          else if (c === quote) quote = null;
+        } else if (c === "#" && (i === 0 || /\s/.test(rest[i - 1]))) {
+          break;
+        } else if (i > 0 && c === ":" && /[ \t]/.test(rest[i + 1] || "")) {
+          colon = i;
+          break;
+        }
+      }
+      if (colon === -1) return null;
+      rest = rest.slice(colon + 1).replace(/^[ \t]+/, "");
+    }
+    const match = /^[|>]([1-9][+-]?|[+-][1-9]?)?(?:[ \t]+(?:#.*)?)?\r?$/.exec(rest);
+    if (!match) return null;
+    const digit = match[1]?.match(/[1-9]/);
+    return { headerIndent, contentIndent: digit ? headerIndent + Number(digit[0]) : null };
   }
 
   function javascriptNumberEnd(code, start) {
