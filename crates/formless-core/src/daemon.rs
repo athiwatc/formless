@@ -17315,6 +17315,9 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
@@ -17335,6 +17338,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".terraformrc",
         "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
     ]
     .contains(&name.as_str())
@@ -17343,6 +17347,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
         || name.ends_with(".p12")
         || name.ends_with(".pfx");
