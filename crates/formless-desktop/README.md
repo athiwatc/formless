@@ -460,7 +460,7 @@ not land in `./target` (which is ignored).
 
 Keys in the shell: F6 / Shift+F6 move between regions, Cmd/Ctrl+B toggles the
 Sessions sidebar, Cmd/Ctrl+Alt+B toggles the Context inspector. Each panel
-docks when the window is wide enough (944 px for Sessions, 1280 px for
+docks when the window is wide enough (760 px for Sessions, 1120 px for
 Context) and otherwise opens as a modal overlay that Escape or a click
 outside dismisses. Cmd/Ctrl with =, - and 0 change the text size between
 100% and 200% and ask the window to grow to fit. Cmd/Ctrl+Shift+P, or the

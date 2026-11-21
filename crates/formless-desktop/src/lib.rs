@@ -29,6 +29,8 @@ pub mod shell;
 pub mod snapshot_guard;
 #[cfg(feature = "thai-breaks")]
 pub mod thai;
+#[cfg(feature = "gui")]
+pub mod theme;
 pub mod timeline;
 pub mod transcript;
 

@@ -54,6 +54,7 @@ use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
 use gpui_kit::base::Root;
+use gpui_kit::component::Theme;
 use gpui_kit::test::{TestInput, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::EntityInputHandler as _;
 use gpui_kit::{
@@ -94,6 +95,64 @@ fn daemon_view(
         });
     });
     sessions
+}
+
+#[gpui_kit::test]
+fn desktop_theme_keeps_primary_tokens_in_sync_in_both_modes(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    step(cx, handle, |window, cx| {
+        for dark in [false, true] {
+            let theme = Theme::global(cx);
+            assert_eq!(theme.is_dark(), dark);
+            assert_eq!(theme.tokens.button_primary.color, theme.primary);
+            assert_eq!(theme.tokens.button_primary_hover.color, theme.primary_hover);
+            shell.update(cx, |shell, cx| {
+                shell.run_command(Command::ToggleTheme, window, cx)
+            });
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn sidebar_empty_state_creates_only_when_connected(cx: &mut TestAppContext) {
+    use formless_desktop::client::{Command as WireCommand, Update};
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("sessions-empty-title").visible());
+        assert_eq!(window.find("sidebar-new-session").disabled(), Some(true));
+        shell.update(cx, |shell, cx| shell.connect_recording_daemon(cx));
+        window.render_frame(cx);
+        assert_eq!(window.find("sidebar-new-session").disabled(), Some(true));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: true,
+                    notice: "Connected".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("sidebar-new-session").disabled(), None);
+        window.click("sidebar-new-session", cx);
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], WireCommand::CreateSession));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("sidebar-new-session").disabled(), Some(true));
+    });
 }
 
 #[gpui_kit::test]
@@ -896,7 +955,7 @@ fn narrowing_hides_the_inspector_until_asked_then_collapses_the_sidebar(cx: &mut
         assert!(window.try_find("region-inspector").is_none());
     });
 
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("region-sidebar").is_none());
@@ -1305,7 +1364,7 @@ fn a_click_on_the_backdrop_dismisses_the_overlay_and_nothing_else(cx: &mut TestA
 #[gpui_kit::test]
 fn the_sessions_toggle_opens_a_modal_sidebar_when_too_narrow_to_dock(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("region-sidebar").is_none());
@@ -1799,7 +1858,7 @@ fn panels_expose_landmark_roles_docked_and_named_dialogs_as_overlays(cx: &mut Te
         assert_eq!(inspector.label(), Some("Context"));
     });
 
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         window.press(TOGGLE_INSPECTOR, cx);
@@ -1878,7 +1937,7 @@ fn dismissing_an_overlay_returns_focus_to_the_control_inside_a_region(cx: &mut T
 #[gpui_kit::test]
 fn focus_falls_back_when_the_originating_control_is_gone(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         // Opened from the composer, then a destination without a composer is
@@ -1896,7 +1955,7 @@ fn focus_falls_back_when_the_originating_control_is_gone(cx: &mut TestAppContext
 #[gpui_kit::test]
 fn a_session_chosen_in_the_overlay_returns_focus_to_the_new_composer(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find_by_label("Message").focused(), Some(true));
@@ -3439,7 +3498,7 @@ fn at_200_percent_in_the_same_window_the_panels_give_way_and_controls_stay_reach
             window.find("region-conversation").bounds().size.width,
             px(1440.)
         );
-        assert_eq!(window.find("header").bounds().size.height, px(88.));
+        assert_eq!(window.find("header").bounds().size.height, px(112.));
 
         // Every control is whole and inside the window, in reading order.
         let viewport = Bounds {
@@ -3485,7 +3544,7 @@ fn at_200_percent_in_the_same_window_the_panels_give_way_and_controls_stay_reach
         let sidebar = window.find("region-sidebar").bounds();
         assert_eq!(sidebar.size.width, px(tokens::SIDEBAR_DEFAULT * 2.));
         let row = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
-        assert_eq!(window.find(row).bounds().size.height, px(88.));
+        assert_eq!(window.find(row).bounds().size.height, px(112.));
         window.press("escape", cx);
         assert_eq!(window.find_by_label("Message").focused(), Some(true));
     });
@@ -4501,13 +4560,13 @@ fn text_size_shortcuts_step_up_to_200_percent_and_reset(cx: &mut TestAppContext)
         }
         // It stops at 200% however often the shortcut is pressed.
         assert_eq!(seen, [100, 125, 150, 175, 200, 200, 200]);
-        assert_eq!(window.find("header").bounds().size.height, px(88.));
+        assert_eq!(window.find("header").bounds().size.height, px(112.));
 
         window.press(&chord("-"), cx);
         assert_eq!(shell.read(cx).text_scale().percent(), 175);
         window.press(&chord("0"), cx);
         assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT);
-        assert_eq!(window.find("header").bounds().size.height, px(44.));
+        assert_eq!(window.find("header").bounds().size.height, px(56.));
         // Back to three panes, with the draft and focus untouched.
         assert!(window.find("region-inspector").visible());
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
@@ -4953,7 +5012,7 @@ fn escape_the_backdrop_and_the_shortcut_close_the_palette_onto_the_control_that_
 #[gpui_kit::test]
 fn f6_stays_in_the_palette_and_a_panel_overlay_gives_way_to_it(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    cx.simulate_window_resize(handle.into(), size(px(720.), px(900.)));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         // A Sessions overlay, opened from the composer.
