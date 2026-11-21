@@ -439,6 +439,62 @@ async fn session_usage_totals_and_priced_cost() {
     assert!(r["total"]["cost"].is_null());
 }
 
+#[tokio::test]
+async fn session_usage_counts_runs_outside_the_global_metrics_window() {
+    use formless_protocol::Request;
+    let root = std::env::temp_dir().join(format!("fl-usage-count-{}", uuid::Uuid::new_v4()));
+    let paths = formless_core::Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut cfg = formless_core::Config::default();
+    cfg.naming.enabled = false;
+    cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
+    cfg.provider.model = "unused".into();
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let other = store.create_session(None).unwrap().id;
+    let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+    conn.execute(
+        "INSERT INTO runs (id, session_id, status, created_at, updated_at) VALUES
+         ('old', ?1, 'completed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+         ('other', ?2, 'completed', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'),
+         ('new', ?1, 'completed', '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z')",
+        [&session, &other],
+    )
+    .unwrap();
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths).unwrap());
+    let first = daemon
+        .handle(Request::SessionUsage {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first["runs"], 2);
+
+    // With 100,001 newer Runs in another Session, the former profile-wide
+    // 100,000-row metrics window excluded the older Run in this Session.
+    conn.execute(
+        "WITH RECURSIVE ids(n) AS (
+             VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<100000
+         )
+         INSERT INTO runs (id, session_id, status, created_at, updated_at)
+         SELECT 'other-' || n, ?1, 'completed', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z'
+         FROM ids",
+        [&other],
+    )
+    .unwrap();
+    let after_backfill = daemon
+        .handle(Request::SessionUsage {
+            session_id: session,
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_backfill, first);
+    drop(daemon);
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn running_invocations_are_listed_abandoned_and_cancelled() {
     use formless_protocol::{InvocationInfo, Request};

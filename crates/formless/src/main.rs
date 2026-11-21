@@ -10,6 +10,7 @@ mod cli_models;
 mod cli_modules;
 mod cli_pipeline;
 mod cli_price_import;
+mod cli_prices;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
@@ -45,6 +46,7 @@ use formless_core::{Config, Paths};
 use formless_protocol::{
     ApprovalScope, Event, Question, QuestionAnswer, Request, SendMode, ServerMessage, SessionInfo,
 };
+use formless_tui::local_timestamp;
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -159,7 +161,7 @@ enum Cmd {
     },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
     #[command(
-        after_help = "Examples:\n  formless config path\n  formless config get provider.model\n  formless config get provider.model --json"
+        after_help = "Examples:\n  formless config path\n  formless config list --filter limits\n  formless config list --json\n  formless config get provider.model\n  formless config get provider.model --json"
     )]
     Config {
         #[command(subcommand)]
@@ -227,7 +229,7 @@ enum Cmd {
     },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
+        after_help = "Examples:\n  formless jobs list\n  formless jobs preview \"every weekday at 9am\"\n  formless jobs history JOB_ID --limit 50 --json"
     )]
     Jobs {
         #[command(subcommand)]
@@ -247,6 +249,9 @@ enum Cmd {
         /// How many of the latest entries to show (default 200; 0 = all)
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
+        /// Print one JSON object per selected entry (snapshot only)
+        #[arg(long, conflicts_with = "follow")]
+        jsonl: bool,
     },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
@@ -303,7 +308,7 @@ enum Cmd {
     },
     /// Model prices for spending limits and cost (provider.prices)
     #[command(
-        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run\n  formless prices list --provider default --json"
     )]
     Prices {
         #[command(subcommand)]
@@ -378,7 +383,7 @@ enum Cmd {
         /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
         /// Continue an existing session by id, or `last` (default: ephemeral)
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         session: Option<String>,
         /// Continue the Session the last `formless run` used (= --session last)
         #[arg(long = "continue", short = 'c', conflicts_with = "session")]
@@ -390,12 +395,14 @@ enum Cmd {
         /// terminal, otherwise tell the agent nobody can answer)
         #[arg(long)]
         answer: Option<String>,
-        /// Emit one JSON event per line (same as --output jsonl-events)
+        /// Emit one JSON event per line (same as --output jsonl-events).
+        /// With --estimate, print one JSON forecast instead.
         #[arg(long, conflicts_with = "output")]
         json: bool,
         /// text: stream the answer and progress; final: only the final
         /// answer on stdout; json: one result object at the end;
-        /// jsonl-events: every event, one per line
+        /// jsonl-events: every event, one per line.
+        /// With --estimate, use text or json to print the forecast.
         #[arg(long, value_enum, default_value = "text")]
         output: RunOutput,
         /// No progress lines ([tool], [approval], …) on stderr; errors still show
@@ -964,6 +971,15 @@ enum PricesAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show stored prices and configured model references without contacting the provider
+    List {
+        /// Show only this provider (use "default" for the default provider)
+        #[arg(long)]
+        provider: Option<String>,
+        /// One JSON value instead of tables
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -981,13 +997,13 @@ enum ProvidersAction {
         /// Provider API base URL; use --preset or Azure options instead when applicable
         #[arg(long, required_unless_present_any = ["preset", "azure_resource"])]
         base_url: Option<String>,
-        /// Azure OpenAI: the resource name (or its https://… endpoint)
+        /// Azure OpenAI resource name, host, or HTTPS endpoint
         #[arg(long, requires = "azure_deployment", conflicts_with_all = ["base_url", "preset"])]
         azure_resource: Option<String>,
         /// Azure OpenAI: the deployment name
         #[arg(long, requires = "azure_resource")]
         azure_deployment: Option<String>,
-        /// Azure OpenAI: the API version (default: the latest known)
+        /// Use the dated Azure deployment route with this API version (default: v1)
         #[arg(long, requires = "azure_resource")]
         api_version: Option<String>,
         /// Extra request header, `Key=Value` (repeatable)
@@ -1101,6 +1117,17 @@ enum JobsAction {
         #[arg(long)]
         webhook: Option<String>,
     },
+    /// Preview projected times for a recurring schedule
+    #[command(
+        long_about = "Preview a recurring schedule (cron or supported plain English). Times are projected from the daemon's current local time. The preview leaves jobs unchanged and is not a guarantee of validation by jobs add or future execution."
+    )]
+    Preview {
+        /// Recurring schedule expression, quoted if it contains spaces
+        schedule: String,
+        /// Print the daemon's cron and next times as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Fire a job now (its schedule is unchanged)
     Run {
         /// Scheduled job ID
@@ -1110,6 +1137,9 @@ enum JobsAction {
     History {
         /// Scheduled job ID
         id: String,
+        /// Maximum number of recent firings to show (1–500)
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -1503,10 +1533,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                 tbl.row(vec![
                     t(d.capability.clone(), Tone::Warn),
                     c(d.tool_name.clone()),
-                    c(d.created_at
-                        .get(..16)
-                        .unwrap_or(&d.created_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&d.created_at).replace('T', " ")),
                     c(if d.denied_by.is_empty() {
                         "-".to_string()
                     } else {
@@ -1529,7 +1556,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
             }
             let when = |t: &Option<String>| {
                 t.as_deref()
-                    .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+                    .map(|s| local_timestamp(s).replace('T', " "))
                     .unwrap_or_else(|| "-".into())
             };
             let mut tbl = Table::new(&[
@@ -1808,6 +1835,9 @@ enum DaemonAction {
         /// JSON even when the daemon isn't running ({"running": false})
         #[arg(long)]
         json: bool,
+        /// Exit successfully when the daemon returns a live process status
+        #[arg(long, conflicts_with = "json")]
+        check: bool,
     },
 }
 
@@ -1979,7 +2009,9 @@ fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run_cli(cli) {
-        eprintln!("error: {e:#}");
+        if !e.is::<DoctorProblems>() {
+            eprintln!("error: {e:#}");
+        }
         std::process::exit(exit_code(&e));
     }
 }
@@ -2106,22 +2138,37 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         attach,
         cwd,
         json,
+        output,
         pipeline,
         ..
     }) = &cli.cmd
     {
+        let forecast_json = match output {
+            RunOutput::Text => *json,
+            RunOutput::Json => true,
+            RunOutput::Final | RunOutput::JsonlEvents => {
+                return Err(usage(
+                    "--estimate does not support --output final or jsonl-events. Use --output text or json.",
+                ));
+            }
+        };
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
-            Some(
-                std::fs::read_to_string(paths.last_run_session_file())?
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            session.clone()
-        };
-        let session = if let Some(wanted) = session {
+            let id = read_last_run_session_id(&paths).map_err(usage)?;
+            if live {
+                Some(check_last_run_session(&paths, id).map_err(usage)?)
+            } else {
+                let missing = || usage(missing_last_run_session(&id));
+                let store =
+                    formless_core::Store::open_forecast_snapshot(&paths)?.ok_or_else(missing)?;
+                if store.get_session(&id)?.is_none() {
+                    return Err(missing());
+                }
+                Some(id)
+            }
+        } else if let Some(wanted) = session.as_deref() {
+            validate_session_selector(wanted)?;
             let sessions: Vec<SessionInfo> = if live {
                 serde_json::from_value(formless_tui::client::request_once(
                     &paths,
@@ -2134,7 +2181,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             };
             let matches: Vec<_> = sessions
                 .into_iter()
-                .filter(|s| s.id == wanted || s.id.starts_with(&wanted) || s.name == wanted)
+                .filter(|s| s.id == wanted || s.id.starts_with(wanted) || s.name == wanted)
                 .collect();
             if matches.len() != 1 {
                 return Err(usage("forecast Session is missing or ambiguous"));
@@ -2223,7 +2270,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         };
         // Only an owned DTO reaches output: private readers and maintenance
         // freezes have dropped, even if stdout is a backpressured pipe.
-        if *json {
+        if forecast_json {
             println!("{}", serde_json::to_string_pretty(&forecast)?);
         } else {
             println!("{}", formless_core::forecast::describe(&forecast));
@@ -2291,15 +2338,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 }
         )
     );
+    let read_only = matches!(
+        cli.cmd,
+        Some(Cmd::Prices {
+            action: PricesAction::List { .. }
+        })
+    );
     let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
-    let _operation = if destructive || serving {
+    let _operation = if destructive || serving || read_only {
         None
     } else {
         Some(formless_core::profile_lock::ProfileLock::hierarchy_shared(
             &paths,
         )?)
     };
-    let paths = if destructive {
+    let paths = if destructive || read_only {
         paths
     } else {
         Paths::resolve(cli.profile.as_deref())?
@@ -2337,11 +2390,19 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             restore_drill: true,
             ..
         }) => run_restore_drill(&paths, None),
-        Some(Cmd::Doctor { json: true, .. }) => {
-            println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
+        Some(Cmd::Doctor { json, fix, .. }) => {
+            let healthy = if json {
+                let report = doctor_json(&paths)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                report["problems"].as_array().is_some_and(Vec::is_empty)
+            } else {
+                doctor(paths, fix)?
+            };
+            if !healthy {
+                return Err(DoctorProblems.into());
+            }
             Ok(())
         }
-        Some(Cmd::Doctor { fix, .. }) => doctor(paths, fix),
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
@@ -2397,7 +2458,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
-        Some(Cmd::Prices { action }) => prices_cmd(paths, action),
+        Some(Cmd::Prices { action }) => match action {
+            PricesAction::Import {
+                provider,
+                all,
+                dry_run,
+            } => prices_import_cmd(paths, provider, all, dry_run),
+            PricesAction::List { provider, json } => {
+                cli_prices::list(&paths, provider.as_deref(), json)
+            }
+        },
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
         Some(Cmd::Logs {
@@ -2405,7 +2475,8 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             level,
             since,
             lines,
-        }) => logs_cmd(&paths, follow, level, since, lines),
+            jsonl,
+        }) => logs_cmd(&paths, follow, level, since, lines, jsonl),
         Some(Cmd::Completions { .. } | Cmd::Man | Cmd::Commands { .. }) => {
             unreachable!("handled before the profile is set up")
         }
@@ -2708,18 +2779,23 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     }
 }
 
-pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
-    let core = tag
-        .trim()
-        .trim_start_matches('v')
-        .split(['-', '+'])
-        .next()?;
-    let mut parts = core.split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-    ))
+pub fn parse_version(tag: &str) -> Option<semver::Version> {
+    let tag = tag.trim().trim_start_matches('v');
+    let (core, suffix) = tag.split_at(tag.find(['-', '+']).unwrap_or(tag.len()));
+    // Older tags may omit the minor or patch number.
+    let fill = match core.split('.').count() {
+        1 => ".0.0",
+        2 => ".0",
+        _ => "",
+    };
+    let mut version = if fill.is_empty() {
+        semver::Version::parse(tag).ok()?
+    } else {
+        semver::Version::parse(&format!("{core}{fill}{suffix}")).ok()?
+    };
+    // SemVer precedence ignores build metadata, including when sorting notes.
+    version.build = semver::BuildMetadata::EMPTY;
+    Some(version)
 }
 
 pub fn compare_versions(current: &str, latest_tag: &str) -> Option<std::cmp::Ordering> {
@@ -2754,10 +2830,14 @@ fn upgrade_command() -> &'static str {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    upgrade_command_for_exe(&exe)
+}
+
+fn upgrade_command_for_exe(exe: &str) -> &'static str {
     if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
         "brew upgrade formless"
     } else if exe.contains("/.cargo/bin/") {
-        "cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked --force"
+        "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
@@ -2976,8 +3056,8 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                         } else {
                             &c.user_agent
                         },
-                        c.first_seen.get(..16).unwrap_or(&c.first_seen),
-                        c.last_seen.get(..16).unwrap_or(&c.last_seen)
+                        local_timestamp(&c.first_seen),
+                        local_timestamp(&c.last_seen)
                     );
                 }
             }
@@ -3018,7 +3098,10 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 || formless_core::service::install(&plan),
             )?;
             println!("installed: {} ({})", plan.file.display(), plan.manager);
-            println!("the daemon now starts at login and stays up, so jobs run on schedule");
+            println!("the daemon is configured to start at login and stay active while the user service manager is running");
+            if let Some(guidance) = formless_core::service::systemd_lingering_guidance(&plan) {
+                println!("{guidance}");
+            }
             println!("remove it: formless daemon uninstall-service");
             Ok(())
         }
@@ -3045,7 +3128,23 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::Restart { force } => {
             formless_tui::client::restart_daemon(&paths, force, |line| println!("{line}"))
         }
-        DaemonAction::Status { json } => {
+        DaemonAction::Status { check: true, .. } => {
+            let status = formless_tui::client::request_once_within(
+                &paths,
+                Request::Status,
+                std::time::Duration::from_secs(5),
+            )
+            .context("daemon status check failed")?;
+            anyhow::ensure!(
+                status["pid"].as_u64().is_some_and(|pid| pid > 0)
+                    && status["version"]
+                        .as_str()
+                        .is_some_and(|version| !version.is_empty()),
+                "daemon status did not identify a live process"
+            );
+            Ok(())
+        }
+        DaemonAction::Status { json, check: false } => {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
                 if json {
@@ -3369,6 +3468,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
         }
     }
     if let Ok(cfg) = Config::load(paths) {
+        out.extend(
+            formless_core::routing_policy::routing_subset_warnings(&cfg.provider)
+                .into_iter()
+                .map(|what| Problem {
+                    what,
+                    next: None,
+                    fix: None,
+                }),
+        );
         if cfg.relay.enabled {
             if let Err(e) = cfg.relay.check() {
                 out.push(Problem {
@@ -3451,9 +3559,19 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
     {
         use std::os::unix::fs::PermissionsExt;
         // Every secret file, named secrets included (#849).
+        let config_backups = std::fs::read_dir(&paths.config_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry.file_name().to_string_lossy().ends_with(".toml.bak")
+            })
+            .map(|entry| entry.path());
         let open: Vec<std::path::PathBuf> = formless_core::config::secret_files(paths)
             .into_iter()
             .chain([paths.config_file()])
+            .chain(config_backups)
             .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0))
             .collect();
         if !open.is_empty() {
@@ -3505,11 +3623,23 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
     }
 }
 
-fn doctor(paths: Paths, fix: bool) -> Result<()> {
+/// Doctor already wrote the full diagnostic report before returning this verdict.
+#[derive(Debug)]
+struct DoctorProblems;
+
+impl std::fmt::Display for DoctorProblems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor found unresolved diagnostic problems")
+    }
+}
+
+impl std::error::Error for DoctorProblems {}
+
+fn doctor(paths: Paths, fix: bool) -> Result<bool> {
     let problems = doctor_report(&paths, false)?;
     if problems.is_empty() {
         println!("\nno problems found");
-        return Ok(());
+        return Ok(true);
     }
     println!("\n{} problem(s):", problems.len());
     for p in &problems {
@@ -3529,10 +3659,10 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
                 fixes.len()
             );
         }
-        return Ok(());
+        return Ok(false);
     }
     if fixes.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     println!("\nfixing:");
     for f in fixes {
@@ -3555,7 +3685,7 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(left.is_empty())
 }
 
 /// Secrets out of text meant for others: bearer tokens, API keys, pairing
@@ -3576,14 +3706,42 @@ fn redact(text: &str) -> String {
         .map(|(re, to)| (regex::Regex::new(re).expect("redaction rule"), to))
         .collect()
     });
-    let mut out = text.to_string();
+    let native =
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().as_os_str().to_os_string());
+    let homes = [
+        native,
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOME"),
+    ];
+    let mut out = redact_report_home_paths(
+        text,
+        homes.iter().flatten().map(|home| home.to_string_lossy()),
+    );
     for (re, to) in rules {
         out = re.replace_all(&out, *to).into_owned();
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        out = out.replace(&*home.to_string_lossy(), "~");
-    }
     out
+}
+
+fn redact_report_home_paths<'a>(
+    text: &str,
+    homes: impl IntoIterator<Item = std::borrow::Cow<'a, str>>,
+) -> String {
+    let mut spellings = Vec::new();
+    for home in homes.into_iter().filter(|home| !home.is_empty()) {
+        // JSON escapes native separators before the report is redacted.
+        let escaped = serde_json::Value::String(home.to_string()).to_string();
+        spellings.push(escaped[1..escaped.len() - 1].to_owned());
+        if home.contains('\\') {
+            spellings.push(home.replace('\\', "/"));
+        }
+        spellings.push(home.into_owned());
+    }
+    spellings.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    spellings.dedup();
+    spellings
+        .into_iter()
+        .fold(text.to_owned(), |out, spelling| out.replace(&spelling, "~"))
 }
 
 /// `doctor --json`: the facts and problems, redacted.
@@ -3856,6 +4014,78 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn doctor_auto_routing(store: &formless_core::Store, cfg: &Config) -> Result<Vec<String>> {
+    let mut lines = vec![format!(
+        "routing:    auto, last {} days of eligible calls",
+        cfg.provider.routing_window_days
+    )];
+    for (task, complex) in [("simple", false), ("complex", true)] {
+        let Some(choice) =
+            store.routing_auto_choice(cfg, formless_core::config::DEFAULT_PROVIDER, complex)?
+        else {
+            lines.push(format!("            {task} task: no candidates"));
+            continue;
+        };
+        let reason = choice.explanation["reason"].as_str().unwrap_or_default();
+        lines.push(format!(
+            "            {task} task: {} ({reason})",
+            choice.model
+        ));
+        for row in choice.explanation["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let model = row["model"].as_str().unwrap_or_default();
+            let samples = row["samples"].as_u64().unwrap_or_default();
+            let rate = row["good_rate"]
+                .as_f64()
+                .map(|rate| format!(", {:.0}% successful", 100.0 * rate))
+                .unwrap_or_default();
+            let cost = row["usd_per_success"]
+                .as_f64()
+                .map(|usd| format!(", ${usd:.6} per success"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "              {model}: {samples} samples{rate}{cost}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_auto_routing_ignores_all_time_counters_and_matches_the_live_selector() {
+    let store = formless_core::Store::open_in_memory().unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.model = "auto".into();
+    cfg.provider.routing_models = vec!["configured-first".into(), "historical-fast".into()];
+    cfg.provider.routing_window_days = 7;
+    for _ in 0..20 {
+        store
+            .record_model_outcome("historical-fast", true, 5)
+            .unwrap();
+    }
+    let lines = doctor_auto_routing(&store, &cfg).unwrap().join("\n");
+    let choice = store
+        .routing_auto_choice(&cfg, formless_core::config::DEFAULT_PROVIDER, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(choice.model, "configured-first");
+    assert!(lines.contains("last 7 days of eligible calls"));
+    let reason = choice.explanation["reason"].as_str().unwrap();
+    assert!(
+        lines.contains(&format!("simple task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(
+        lines.contains(&format!("complex task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(lines.contains("historical-fast: 0 samples"), "{lines}");
+}
+
 fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     // `quiet`: only the problems (for --json and bug reports).
     macro_rules! say {
@@ -4101,28 +4331,14 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         cfg.provider.tool_mode,
         cfg.provider.fallback_models.join(", ")
     );
-    if formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
-        say!(
-            "routing:    auto over [{}]",
-            cfg.provider.routing_candidates().join(", ")
-        );
-        if let Ok(store) = Store::open(&paths.db_file()) {
-            if let Ok(stats) = store.list_model_stats() {
-                let picked = formless_core::routing::select_model(&cfg.provider, &stats, false);
-                say!(
-                    "            simple task now routes to: {}",
-                    picked.as_deref().unwrap_or("(no candidates)")
-                );
-                for st in &stats {
-                    say!(
-                        "            {}: ok={} fail={} total_ms={}",
-                        st.model,
-                        st.successes,
-                        st.failures,
-                        st.total_ms
-                    );
+    if !quiet && formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
+        match Store::open(&paths.db_file()).and_then(|store| doctor_auto_routing(&store, &cfg)) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
             }
+            Err(error) => println!("routing:    preview unavailable ({error:#})"),
         }
     }
     for provider in oauth_provider_statuses(&paths, &cfg) {
@@ -4296,8 +4512,12 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
 fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let s = s.trim();
     let bad = || format!("'{s}' is not a duration (like 90s, 10m or 1h30m)");
-    if let Ok(secs) = s.parse::<u64>() {
-        return Ok(std::time::Duration::from_secs(secs));
+    let too_long = || format!("duration '{s}' is too long");
+    match s.parse::<u64>() {
+        Ok(0) => return Err(bad()),
+        Ok(secs) => return Ok(std::time::Duration::from_secs(secs)),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => return Err(too_long()),
+        Err(_) => {}
     }
     let (mut total, mut num) = (0u64, String::new());
     for c in s.chars() {
@@ -4305,7 +4525,10 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
             num.push(c);
             continue;
         }
-        let n: u64 = num.parse().map_err(|_| bad())?;
+        let n = num.parse::<u64>().map_err(|e| match e.kind() {
+            std::num::IntErrorKind::PosOverflow => too_long(),
+            _ => bad(),
+        })?;
         num.clear();
         let unit = match c {
             's' => 1,
@@ -4317,7 +4540,7 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         total = n
             .checked_mul(unit)
             .and_then(|part| total.checked_add(part))
-            .ok_or_else(bad)?;
+            .ok_or_else(too_long)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
@@ -4434,20 +4657,32 @@ fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec
 }
 
 /// The Session the last `formless run` used, if it still exists.
-fn last_run_session(paths: &Paths) -> Result<String, String> {
-    let id = std::fs::read_to_string(paths.last_run_session_file())
+fn read_last_run_session_id(paths: &Paths) -> Result<String, String> {
+    std::fs::read_to_string(paths.last_run_session_file())
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or("no earlier `formless run` Session to continue; run once without --continue")?;
-    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+        .ok_or_else(|| {
+            "no earlier `formless run` Session to continue; run once without --continue".into()
+        })
+}
+
+fn missing_last_run_session(id: &str) -> String {
+    format!("the last `formless run` Session ({id}) no longer exists; run once without --continue")
+}
+
+fn check_last_run_session(paths: &Paths, id: String) -> Result<String, String> {
     match formless_tui::client::request_once(paths, Request::GetSession { id: id.clone() }) {
         Ok(_) => Ok(id),
         Err(e) if !e.to_string().contains("session not found") => Err(format!("{e:#}")),
-        Err(_) => Err(format!(
-            "the last `formless run` Session ({id}) no longer exists; run once without --continue"
-        )),
+        Err(_) => Err(missing_last_run_session(&id)),
     }
+}
+
+fn last_run_session(paths: &Paths) -> Result<String, String> {
+    let id = read_last_run_session_id(paths)?;
+    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+    check_last_run_session(paths, id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4524,23 +4759,28 @@ fn run_headless(
             let id = client.send(Request::CreateSession {
                 name: Some("headless".into()),
             });
-            let mut found = None;
-            while found.is_none() {
+            loop {
                 match rx.recv() {
                     Ok(ServerMessage::Response {
                         id: rid,
-                        ok: true,
+                        ok,
                         result,
-                        ..
+                        error,
                     }) if rid == id => {
+                        if !ok {
+                            let error = error
+                                .as_deref()
+                                .unwrap_or("the daemon could not create a Session");
+                            eprintln!("error: {error}");
+                            return Ok(2);
+                        }
                         let s: SessionInfo = serde_json::from_value(result.unwrap_or_default())?;
-                        found = Some(s.id);
+                        break s.id;
                     }
                     Ok(_) => {}
                     Err(e) => return Err(anyhow::anyhow!("daemon closed: {e}")),
                 }
             }
-            found.unwrap()
         }
     };
     let _ = std::fs::write(paths.last_run_session_file(), &session_id);
@@ -5416,19 +5656,8 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
     let url = r["url"].as_str().unwrap_or_default().to_string();
     println!("Web UI on 127.0.0.1:{} (this link works once):", r["port"]);
     println!("{url}");
-    if !no_open {
-        let opener = if cfg!(target_os = "macos") {
-            std::process::Command::new("open").arg(&url).status()
-        } else if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", &url])
-                .status()
-        } else {
-            std::process::Command::new("xdg-open").arg(&url).status()
-        };
-        if opener.map(|s| !s.success()).unwrap_or(true) {
-            println!("(could not open a browser; open the link above)");
-        }
+    if !no_open && !formless_core::docs::open_url(&url) {
+        println!("(could not open a browser; open the link above)");
     }
     Ok(())
 }
@@ -5695,6 +5924,7 @@ enum SessionsAction {
     /// Inventory stored sub-agents for a resolved Session
     Subagents {
         /// Session id, unambiguous prefix or name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Preserve the complete daemon sub-agent array as JSON
         #[arg(long)]
@@ -5715,6 +5945,7 @@ enum SessionsAction {
     /// Read recorded Session usage and the current prompt/context estimate
     Usage {
         /// Session selector, using the existing ID/prefix/name resolution
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print both complete daemon reports as one JSON value
         #[arg(long)]
@@ -5723,6 +5954,7 @@ enum SessionsAction {
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Name for the new branch Session
         #[arg(long)]
@@ -5737,8 +5969,10 @@ enum SessionsAction {
     /// Compare stored branch messages and recorded local usage (no model call)
     Compare {
         /// First Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         left: String,
         /// Second Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         right: String,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -5762,6 +5996,7 @@ enum SessionsAction {
     /// Pin a Session using its stored returned state
     Pin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5770,6 +6005,7 @@ enum SessionsAction {
     /// Unpin a Session using its stored returned state
     Unpin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5781,6 +6017,7 @@ enum SessionsAction {
     )]
     Tag {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Replacement tags, passed unchanged to storage; omission only reads
         tags: Vec<String>,
@@ -5794,10 +6031,14 @@ enum SessionsAction {
     /// Show a Session's transcript
     Show {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
         follow: bool,
+        /// Show only the newest N stored messages from the fetched transcript
+        #[arg(long, conflicts_with = "follow")]
+        last: Option<std::num::NonZeroUsize>,
         /// Tagged Event lines, as with run --output jsonl-events
         #[arg(long, requires = "follow")]
         jsonl: bool,
@@ -5808,6 +6049,7 @@ enum SessionsAction {
     /// Show a Run's tracked files and diffs
     Files {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Run ID whose tracked files to inspect; omit for the latest Run
         #[arg(long)]
@@ -5819,6 +6061,7 @@ enum SessionsAction {
     /// Attempt safe restoration of one path or all tracked files
     Rewind {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Tracked path to restore; omit to consider all tracked files
         path: Option<String>,
@@ -5832,6 +6075,7 @@ enum SessionsAction {
     /// Rename a Session
     Rename {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// New display name for the Session
         name: String,
@@ -5839,11 +6083,13 @@ enum SessionsAction {
     /// Delete a Session (restorable for daemon.delete_undo_secs)
     Rm {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring back a Session deleted moments ago (full id)
     Restore {
         /// Full ID of the recently deleted Session
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Import a Session bundle (from `sessions export --format json`)
@@ -5873,17 +6119,20 @@ enum SessionsAction {
     /// Hide a Session from the default list (kept and searchable)
     Archive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring an archived Session back
     Unarchive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Export a Session: the re-importable JSON bundle, or a readable
     /// Markdown or HTML transcript
     Export {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Export format; omit to infer from the output extension, otherwise json
         #[arg(long, value_enum)]
@@ -5905,6 +6154,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             follow: true,
             json,
             jsonl,
+            ..
         } => {
             let code = cli_attach::follow(&paths, &id, json || jsonl)?;
             if code != 0 {
@@ -5994,10 +6244,23 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 cli_session_report::list_table(&shown).print();
             }
         }
-        SessionsAction::Show { id, json, .. } => {
+        SessionsAction::Show { id, last, json, .. } => {
             let s = find_session(&paths, &id)?;
-            let r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let mut r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let truncated = last.and_then(|last| {
+                let messages = r.get_mut("messages")?.as_array_mut()?;
+                let total = messages.len();
+                let count = last.get();
+                if total <= count {
+                    return None;
+                }
+                drop(messages.drain(..total - count));
+                Some((count, total))
+            });
             if json {
+                if let Some((_, total)) = truncated {
+                    r["total_messages"] = serde_json::json!(total);
+                }
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
             }
@@ -6008,7 +6271,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             println!(
                 "{} messages · updated {}{}{}",
                 s.message_count,
-                s.updated_at.get(..16).unwrap_or(&s.updated_at),
+                local_timestamp(&s.updated_at),
                 s.model
                     .as_deref()
                     .map(|m| format!(" · {m}"))
@@ -6018,6 +6281,9 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     .map(|c| format!(" · in {c}"))
                     .unwrap_or_default()
             );
+            if let Some((count, total)) = truncated {
+                println!("Showing last {count} of {total} stored messages.");
+            }
             print!("{}", cli_session_report::metadata(&s));
             let messages: Vec<formless_protocol::MessageInfo> =
                 serde_json::from_value(r["messages"].clone()).unwrap_or_default();
@@ -6029,8 +6295,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     _ => "  note",
                 };
                 if m.role == "tool" {
-                    let first = m.content.lines().next().unwrap_or_default();
-                    println!("{who}: {}", first.chars().take(120).collect::<String>());
+                    println!("{who}: {}", tool_result_preview(&m.content));
                 } else if !m.content.trim().is_empty() {
                     println!("\n{who}:\n{}", m.content.trim_end());
                 }
@@ -6144,6 +6409,15 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
 enum ConfigAction {
     /// Print where config.toml is
     Path,
+    /// List documented settings as loaded by this CLI, including defaults
+    List {
+        /// Match part of a dotted setting name, for example limits
+        #[arg(long, value_name = "TEXT")]
+        filter: Option<String>,
+        /// Print the local settings catalog as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a locally loaded setting (with FORMLESS_* overrides applied)
     Get {
         /// Dotted setting name, for example provider.model
@@ -6181,10 +6455,49 @@ fn config_get_output(value: &serde_json::Value, json: bool) -> serde_json::Resul
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
+        ConfigAction::List { filter, json } => {
+            let config = Config::load(&paths)?;
+            formless_core::secrets::set_patterns(&config.security.secret_patterns);
+            let report = config.local_settings(filter.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!("Local configuration (file and environment overrides)");
+            let mut table = Table::new(&["KEY", "EFFECTIVE", "DEFAULT", "SETTABLE", "DESCRIPTION"]);
+            for (key, row) in report["settings"].as_object().into_iter().flatten() {
+                let effective = match row["effective_kind"].as_str() {
+                    Some("redacted") => "[redacted]".to_owned(),
+                    Some("missing") => "(missing)".to_owned(),
+                    _ => serde_json::to_string(&row["effective"])?,
+                };
+                let default = if row["default_kind"] == "documentation" {
+                    format!(
+                        "{} (documented)",
+                        row["default_documentation"].as_str().unwrap_or_default()
+                    )
+                } else {
+                    serde_json::to_string(&row["default"])?
+                };
+                let effective = if row["changed"] == true {
+                    format!("{effective} (changed)")
+                } else {
+                    effective
+                };
+                table.row(vec![
+                    t(key, Tone::Strong),
+                    c(comparison_terminal_text(&effective)),
+                    c(comparison_terminal_text(&default)),
+                    c(if row["settable"] == true { "yes" } else { "no" }),
+                    c(row["description"].as_str().unwrap_or_default()),
+                ]);
+            }
+            table.print();
+        }
         ConfigAction::Get { key, json } => match Config::load(&paths)?.setting_value(&key)? {
             Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
-                eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                eprintln!("no setting '{key}' (see `formless config list` or SPEC §13)");
                 std::process::exit(2);
             }
         },
@@ -6208,6 +6521,11 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
             };
             formless_core::daemon::ensure_daemon(&paths)?;
             let r = formless_tui::client::request_once(&paths, request)?;
+            if let Some(warnings) = r["routing_warnings"].as_array() {
+                for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+                    eprintln!("warning: {warning}");
+                }
+            }
             if r["applies"] == "env_override" {
                 println!(
                     "saved {key} = {value}; daemon uses {} from {} (environment override)",
@@ -6239,10 +6557,19 @@ fn config_edit(paths: &Paths) -> Result<()> {
         Config::default().save(paths)?;
     }
     let draft = file.with_extension("toml.edit");
-    std::fs::copy(&file, &draft)?;
+    #[cfg(unix)]
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
+    #[cfg(not(unix))]
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "notepad".into());
+    #[cfg(not(unix))]
+    let mut editor_command = windows_config_editor(&editor, &draft)?;
+    std::fs::copy(&file, &draft)?;
     loop {
         // $EDITOR may carry arguments and quotes ("code --wait"): let the
         // shell read it, as git does.
@@ -6254,21 +6581,31 @@ fn config_edit(paths: &Paths) -> Result<()> {
             .arg(&draft)
             .status();
         #[cfg(not(unix))]
-        let status = {
-            let mut words = editor.split_whitespace();
-            std::process::Command::new(words.next().unwrap_or("notepad"))
-                .args(words)
-                .arg(&draft)
-                .status()
-        };
-        let status = status.with_context(|| format!("start editor '{editor}'"))?;
+        let status = editor_command.status();
+        let status = status.with_context(|| {
+            if cfg!(unix) {
+                format!("start editor '{editor}'")
+            } else {
+                format!("start editor '{editor}'. Put double quotes around an executable path containing spaces.")
+            }
+        })?;
         if !status.success() {
             let _ = std::fs::remove_file(&draft);
             anyhow::bail!("the editor exited with {status}; config.toml unchanged");
         }
-        match Config::load_from(&draft) {
-            Ok(_) => {
-                std::fs::rename(&draft, &file)?;
+        let edited =
+            std::fs::read_to_string(&draft).with_context(|| format!("read {}", draft.display()));
+        match edited.and_then(|text| Config::load_from_text(&text, &draft).map(|_| text)) {
+            Ok(text) => {
+                formless_core::config::write_atomic(&file, text.as_bytes())?;
+                if let Err(error) = std::fs::remove_file(&draft) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "could not remove the saved draft {}: {error}",
+                            draft.display()
+                        );
+                    }
+                }
                 println!(
                     "saved {} (the daemon picks it up on its next read)",
                     file.display()
@@ -6295,7 +6632,73 @@ fn config_edit(paths: &Paths) -> Result<()> {
     }
 }
 
-/// The Session with this id or id prefix.
+#[cfg(any(not(unix), test))]
+fn windows_config_editor(editor: &str, draft: &std::path::Path) -> Result<std::process::Command> {
+    let mut command = formless_tui::windows_editor_command(editor)?;
+    command.arg(draft);
+    Ok(command)
+}
+
+#[cfg(test)]
+#[test]
+fn config_edit_windows_argument_parsing_preserves_literal_paths() {
+    use std::path::Path;
+
+    let draft = Path::new(r"C:\Profile Folder\config.toml.edit");
+    let quoted = windows_config_editor(
+        r#""C:\Program Files\Editor\edit.exe" --wait "--name=two words""#,
+        draft,
+    )
+    .unwrap();
+    assert_eq!(quoted.get_program(), r"C:\Program Files\Editor\edit.exe");
+    assert_eq!(
+        quoted.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("--wait"),
+            std::ffi::OsStr::new("--name=two words"),
+            draft.as_os_str(),
+        ]
+    );
+
+    let unquoted = r"C:\Program Files\Editor\edit.exe --wait";
+    let shared = formless_tui::windows_editor_command(unquoted).unwrap();
+    let config = windows_config_editor(unquoted, draft).unwrap();
+    assert_eq!(config.get_program(), shared.get_program());
+    assert!(config
+        .get_args()
+        .eq(shared.get_args().chain([draft.as_os_str()])));
+    assert!(windows_config_editor("\"unclosed", draft).is_err());
+}
+
+/// First-line tool output for the static human Session transcript.
+fn tool_result_preview(content: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    // An initial LF or CRLF ends the displayed line. Anything after that
+    // terminator, including additional blank lines, is omitted content.
+    let (first, omitted_lines) = match content.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), !rest.is_empty()),
+        None => (content, false),
+    };
+    // The visible marker is outside the 120-scalar content budget.
+    let mut remaining = 120;
+    let mut end = 0;
+    for (offset, grapheme) in first.grapheme_indices(true) {
+        let scalars = grapheme.chars().take(remaining + 1).count();
+        if scalars > remaining {
+            break;
+        }
+        remaining -= scalars;
+        end = offset + grapheme.len();
+    }
+    if omitted_lines || end < first.len() {
+        Cow::Owned(format!("{}…", &first[..end]))
+    } else {
+        Cow::Borrowed(first)
+    }
+}
+
 fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String> {
     value
         .parse::<usize>()
@@ -6320,12 +6723,7 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
         return out;
     }
     for hit in hits {
-        // Same boundary-safe stored date/time presentation as other CLI rows.
-        let time = hit
-            .created_at
-            .get(..16)
-            .unwrap_or(&hit.created_at)
-            .replace('T', " ");
+        let time = local_timestamp(&hit.created_at).replace('T', " ");
         let short_id: String = hit.session_id.chars().take(8).collect();
         let _ = writeln!(
             out,
@@ -6349,7 +6747,15 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
     out
 }
 
+fn validate_session_selector(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(usage("Session selector must not be empty"));
+    }
+    Ok(())
+}
+
 fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
         Request::ListSessions,
@@ -6358,6 +6764,7 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
 }
 
 fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     // An exact id, else an id prefix, else a name (SPEC §12, Session selectors).
     if let Some(s) = list.iter().find(|s| s.id == id) {
         return Ok(s.clone());
@@ -6519,12 +6926,12 @@ fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
 
 /// `formless prices import` (#809): the endpoint's own prices, dated, so
 /// dollar limits can count the models in use.
-fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
-    let PricesAction::Import {
-        provider,
-        all,
-        dry_run,
-    } = action;
+fn prices_import_cmd(
+    paths: Paths,
+    provider: Option<String>,
+    all: bool,
+    dry_run: bool,
+) -> Result<()> {
     let live = Config::load(&paths)?;
     let pcfg = live.provider_cfg(provider.as_deref())?;
     let name = provider.clone().unwrap_or_else(|| "default".into());
@@ -6603,8 +7010,10 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
 }
 
 fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
-    formless_core::daemon::ensure_daemon(&paths)?;
-    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    let daemon = |req: Request| {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
     match action {
         ProvidersAction::List { json } => {
             let r = daemon(Request::ListProviders)?;
@@ -6656,17 +7065,33 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             let mut header_map = pairs(&headers, "--header")?;
             let mut query_map = pairs(&query, "--query")?;
             let mut key_header = key_header;
-            // Azure OpenAI: deployment URL, api-version and the api-key header.
+            let mut model = model;
             let azure_base = match (&azure_resource, &azure_deployment) {
-                (Some(r), Some(d)) => {
-                    let (base, q, header) =
-                        formless_core::presets::azure(r, d, api_version.as_deref())?;
-                    query_map.extend(q);
-                    key_header.get_or_insert(header.to_string());
+                (Some(resource), Some(deployment)) => {
+                    let (base, query, header) =
+                        formless_core::presets::azure(resource, deployment, api_version.as_deref())
+                            .map_err(|err| usage(err.to_string()))?;
+                    if api_version.is_none() {
+                        if model
+                            .as_deref()
+                            .is_some_and(|model| model != deployment.trim())
+                        {
+                            return Err(usage(
+                                "--model must match --azure-deployment with Azure v1",
+                            ));
+                        }
+                        if query_map.contains_key("api-version") {
+                            return Err(usage("use --api-version to select the dated Azure API"));
+                        }
+                    }
+                    query_map.extend(query);
+                    key_header.get_or_insert_with(|| header.to_owned());
+                    model.get_or_insert_with(|| deployment.trim().to_owned());
                     Some(base)
                 }
                 _ => None,
             };
+            let use_azure = azure_base.is_some();
             header_map.retain(|k, _| !k.is_empty());
             let preset = match preset.as_deref() {
                 Some(id) => Some(formless_core::presets::find(id).with_context(|| {
@@ -6717,7 +7142,7 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 model,
                 api_key,
                 headers: (!header_map.is_empty()).then_some(header_map),
-                query_params: (!query_map.is_empty()).then_some(query_map),
+                query_params: (use_azure || !query_map.is_empty()).then_some(query_map),
                 api_key_header: key_header,
             })?;
             println!("provider {name} saved; check it with `formless providers test {name}`");
@@ -6826,6 +7251,19 @@ fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
     Ok(())
 }
 
+fn format_job_history_duration(started_at: &str, finished_at: Option<&str>) -> String {
+    let duration = finished_at.and_then(|finished_at| {
+        let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+        let finished = chrono::DateTime::parse_from_rfc3339(finished_at).ok()?;
+        (finished - started).to_std().ok()
+    });
+    match duration {
+        Some(duration) if duration.as_secs() == 0 => format!("{}ms", duration.as_millis()),
+        Some(duration) => format_duration(duration),
+        None => "-".into(),
+    }
+}
+
 fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
@@ -6859,8 +7297,8 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                     c(j["cron"].as_str().unwrap_or("once")),
                     c(j["next_run"]
                         .as_str()
-                        .map(|n| n.get(..16).unwrap_or(n))
-                        .unwrap_or("-")),
+                        .map(local_timestamp)
+                        .unwrap_or_else(|| "-".into())),
                     t(
                         last,
                         if last == "completed" {
@@ -6927,14 +7365,40 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                 eprintln!("warning: {w}");
             }
         }
+        JobsAction::Preview { schedule, json } => {
+            let preview = daemon(Request::PreviewSchedule { schedule })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+                return Ok(());
+            }
+            let cron = preview["cron"]
+                .as_str()
+                .context("schedule preview did not return a cron expression")?;
+            let next = preview["next"]
+                .as_array()
+                .context("schedule preview did not return a list of times")?
+                .iter()
+                .map(|time| time.as_str().context("invalid time in schedule preview"))
+                .collect::<Result<Vec<_>>>()?;
+            println!("Cron: {cron}");
+            if next.is_empty() {
+                println!("No upcoming times were returned.");
+            } else {
+                println!("Projected from the daemon's current local time:");
+                for time in next {
+                    println!("  {time}");
+                }
+            }
+        }
         JobsAction::Run { id } => {
             let r = daemon(Request::RunJobNow { id: id.clone() })?;
             println!("{id}: {}", r["status"].as_str().unwrap_or_default());
         }
-        JobsAction::History { id, json } => {
+        JobsAction::History { id, limit, json } => {
+            let limit = usize::from(limit);
             let runs = daemon(Request::JobRuns {
                 id: id.clone(),
-                limit: None,
+                limit: Some(limit),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&runs)?);
@@ -6944,24 +7408,14 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             if runs.is_empty() {
                 println!("{id} has not run yet");
             }
+            let at_limit = runs.len() == limit;
             let mut tbl = Table::new(&[
                 "STARTED", "TRIGGER", "OUTCOME", "TOOK", "COST", "SESSION", "DETAIL",
             ]);
             for r in runs {
-                let took = r
-                    .finished_at
-                    .as_deref()
-                    .and_then(|f| {
-                        let a = chrono::DateTime::parse_from_rfc3339(&r.started_at).ok()?;
-                        let b = chrono::DateTime::parse_from_rfc3339(f).ok()?;
-                        Some(format!("{}s", (b - a).num_seconds()))
-                    })
-                    .unwrap_or_else(|| "-".into());
+                let took = format_job_history_duration(&r.started_at, r.finished_at.as_deref());
                 tbl.row(vec![
-                    c(r.started_at
-                        .get(..16)
-                        .unwrap_or(&r.started_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&r.started_at).replace('T', " ")),
                     c(r.trigger),
                     t(
                         r.status.clone(),
@@ -6981,6 +7435,13 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             }
             if !tbl.is_empty() {
                 tbl.print();
+            }
+            if at_limit {
+                if limit == 500 {
+                    println!("Showing the maximum of 500 firings. More may exist.");
+                } else {
+                    println!("Showing newest {limit} firings. More may exist. Use --limit to request up to 500.");
+                }
             }
         }
         JobsAction::Enable { id } => {
@@ -8209,10 +8670,13 @@ fn logs_cmd(
     level: Option<String>,
     since: Option<std::time::Duration>,
     lines: usize,
+    jsonl: bool,
 ) -> Result<()> {
     let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
-    let cutoff =
-        since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap_or_default());
+    let cutoff = since.and_then(|d| {
+        let delta = chrono::Duration::from_std(d).ok()?;
+        chrono::Utc::now().checked_sub_signed(delta)
+    });
     let keep = |e: &LogEntry| {
         e.level <= max_level
             && match (cutoff, e.at) {
@@ -8222,7 +8686,12 @@ fn logs_cmd(
             }
     };
     let live = paths.log_file();
-    let summary = log_output::history(paths, lines, &keep, &mut std::io::stdout().lock())?;
+    let format = if jsonl {
+        log_output::Format::Jsonl
+    } else {
+        log_output::Format::Text
+    };
+    let summary = log_output::history(paths, lines, &keep, format, &mut std::io::stdout().lock())?;
     log_truncation_notice(&summary);
     if summary.entries == 0 && !follow {
         eprintln!(
@@ -8261,6 +8730,22 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
         formless_tui::client::request_once(paths, Request::ListTools)?,
     )?;
     cli_tool_lookup::resolve(&tools, name).cloned()
+}
+
+fn tool_detail_calls_line(m: &formless_protocol::ToolMetricsInfo) -> String {
+    format!(
+        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
+        m.total,
+        m.success,
+        m.failure,
+        m.denied,
+        m.success_rate
+            .map(formless_core::success_rate::label)
+            .unwrap_or_else(|| "-".into()),
+        m.p50_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into())
+    )
 }
 
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {
@@ -8309,19 +8794,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     );
     println!("memory:       {} MB", t.memory_mb);
     let m = &d.metrics;
-    println!(
-        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
-        m.total,
-        m.success,
-        m.failure,
-        m.denied,
-        m.success_rate
-            .map(|r| format!("{:.0}%", r * 100.0))
-            .unwrap_or_else(|| "-".into()),
-        m.p50_ms
-            .map(|v| format!("{v:.0}ms"))
-            .unwrap_or_else(|| "-".into())
-    );
+    println!("{}", tool_detail_calls_line(m));
     println!(
         "latency:      p50 {} · p95 {}",
         m.p50_ms
@@ -8897,6 +9370,67 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_detail_calls_use_shared_success_rate_labels() {
+        use super::tool_detail_calls_line;
+
+        for (rate, label) in [
+            (None, "-"),
+            (Some(0.0), "0%"),
+            (Some(2.0 / 3.0), "67%"),
+            (Some(0.995), ">99%"),
+            (Some(0.9999), ">99%"),
+            (Some(1.0), "100%"),
+        ] {
+            let metrics = formless_protocol::ToolMetricsInfo {
+                total: 5,
+                success: 2,
+                failure: 2,
+                denied: 1,
+                success_rate: rate,
+                p50_ms: Some(12.0),
+                ..Default::default()
+            };
+            assert_eq!(
+                tool_detail_calls_line(&metrics),
+                format!("calls:        5 (2 ok, 2 failed, 1 denied) · success {label} · p50 12ms")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_preview_marks_omission_at_complete_grapheme_boundaries() {
+        use super::tool_result_preview;
+
+        for (content, expected) in [
+            ("", ""),
+            ("value", "value"),
+            ("value\n", "value"),
+            ("value\r\n", "value"),
+            ("value\n\n", "value…"),
+            ("value\r\n\r\n", "value…"),
+            ("value\r\nmore", "value…"),
+            ("\nmore", "…"),
+        ] {
+            assert_eq!(tool_result_preview(content), expected);
+        }
+        let exact = "界".repeat(120);
+        assert_eq!(tool_result_preview(&exact), exact);
+        assert_eq!(
+            tool_result_preview(&format!("{exact}x")),
+            format!("{exact}…")
+        );
+        let prefix = "x".repeat(119);
+        for grapheme in ["e\u{301}", "👍🏽", "👩‍💻"] {
+            assert_eq!(
+                tool_result_preview(&format!("{prefix}{grapheme}")),
+                format!("{prefix}…")
+            );
+        }
+        let oversized = format!("e{}", "\u{301}".repeat(120));
+        assert_eq!(tool_result_preview(&oversized), "…");
+    }
+
     #[test]
     fn profile_namespace_parser_refuses_reserved_names_before_running_cli_actions() {
         use clap::Parser;
@@ -9545,6 +10079,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cargo_upgrade_uses_git_package_not_a_checkout_path() {
+        let cmd = super::upgrade_command_for_exe("/home/user/.cargo/bin/formless");
+        let (install, force) = cmd.rsplit_once(' ').expect("Cargo upgrade flag");
+        assert_eq!(force, "--force");
+        assert_eq!(
+            install.split_whitespace().collect::<Vec<_>>(),
+            [
+                "cargo",
+                "install",
+                "--git",
+                "https://github.com/athiwatc/formless",
+                "--locked",
+                "formless-bin",
+            ]
+        );
+        let readme = include_str!("../../../README.md");
+        assert!(readme.contains(&format!("`{install}`")));
+    }
+
     /// Root presentation order is deliberate (#1609), independently of inventory.
     #[test]
     fn root_help_and_man_use_alphabetical_command_order() {
@@ -9690,6 +10244,16 @@ mod tests {
         assert_eq!(tags, ["v0.2.0", "v0.3.0"]);
         assert_eq!(newer[1].1, "New: run --timeout");
         assert!(newer_releases(&releases, "0.3.0").is_empty());
+
+        let final_release = serde_json::json!([
+            {"tag_name": "v0.2.0-rc.2", "prerelease": true, "body": "rc", "html_url": "rc"},
+            {"tag_name": "v0.2.0", "body": "Final release", "html_url": "final"},
+        ]);
+        assert_eq!(
+            newer_releases(&final_release, "0.2.0-rc.1"),
+            [("v0.2.0".into(), "Final release".into(), "final".into())]
+        );
+        assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
     }
 
     #[test]
@@ -9727,6 +10291,41 @@ mod tests {
     }
 
     #[test]
+    fn reports_redact_native_home_and_shell_spellings_in_text_and_json() {
+        use std::borrow::Cow;
+        let homes = [
+            r"C:\Users\Example Person",
+            "/c/Users/Example Person",
+            "/home/fixture",
+        ];
+        let input = serde_json::json!({
+            "native": r"C:\Users\Example Person\AppData\Formless",
+            "native_slashes": "C:/Users/Example Person/AppData/Formless",
+            "shell": "/c/Users/Example Person/.config/formless",
+            "unix": "/home/fixture/.local/share/formless",
+            "ordinary": r"C:\Work\Formless",
+        });
+        let masked = redact_report_home_paths(&input.to_string(), homes.map(Cow::Borrowed));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&masked).unwrap(),
+            serde_json::json!({
+                "native": r"~\AppData\Formless",
+                "native_slashes": "~/AppData/Formless",
+                "shell": "~/.config/formless",
+                "unix": "~/.local/share/formless",
+                "ordinary": r"C:\Work\Formless",
+            })
+        );
+        assert_eq!(
+            redact_report_home_paths(
+                r"log at C:\Users\Example Person\logs",
+                homes.map(Cow::Borrowed)
+            ),
+            r"log at ~\logs"
+        );
+    }
+
+    #[test]
     fn log_lines_group_into_entries_with_levels() {
         let text = "2026-10-23T10:00:00.1Z  INFO formless_core::daemon: listening\n\
                     2026-10-23T10:00:01.2Z  WARN formless_core::daemon: MCP server 'x': failed\n\
@@ -9750,11 +10349,49 @@ mod tests {
         assert_eq!(d("10m"), Ok(600));
         assert_eq!(d("1h30m"), Ok(5400));
         assert!(d("10x").is_err() && d("m").is_err() && d("1h3").is_err() && d("0s").is_err());
+        assert!(d("0").unwrap_err().contains("is not a duration"));
+        for too_long in [
+            "18446744073709551616",
+            "5124095576030432h",
+            "18446744073709551615s1s",
+        ] {
+            assert!(
+                d(too_long).unwrap_err().contains("is too long"),
+                "{too_long}"
+            );
+        }
         assert_eq!(
             format_duration(std::time::Duration::from_secs(5400)),
             "1h30m"
         );
         assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn jobs_history_formats_elapsed_time_and_missing_values() {
+        let started_at = "2026-11-18T10:00:00.123Z";
+        for (finished_at, expected) in [
+            (Some("2026-11-18T10:00:00.579Z"), "456ms"),
+            (Some("2026-11-18T10:00:01.122999999Z"), "999ms"),
+            (Some("2026-11-18T10:00:01.123Z"), "1s"),
+            (Some("2026-11-18T10:00:45.123Z"), "45s"),
+            (Some("2026-11-18T12:30:00.123+01:00"), "1h30m"),
+            (Some(started_at), "0ms"),
+            (Some("2026-11-18T10:00:00.122999999Z"), "-"),
+            (Some("2026-11-18T09:59:57.123Z"), "-"),
+            (Some("not a timestamp"), "-"),
+            (None, "-"),
+        ] {
+            assert_eq!(
+                format_job_history_duration(started_at, finished_at),
+                expected,
+                "{finished_at:?}"
+            );
+        }
+        assert_eq!(
+            format_job_history_duration("not a timestamp", Some(started_at)),
+            "-"
+        );
     }
 
     #[test]
@@ -9837,11 +10474,27 @@ mod tests {
 
     #[test]
     fn version_comparison_handles_tags() {
-        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("0.1"), Some((0, 1, 0)));
+        assert_eq!(parse_version("v1.2.3"), Some(semver::Version::new(1, 2, 3)));
+        assert_eq!(parse_version("0.1"), Some(semver::Version::new(0, 1, 0)));
         assert_eq!(compare_versions("0.1.0", "v0.2.0"), Some(Ordering::Less));
         assert_eq!(compare_versions("1.0.0", "v1.0.0"), Some(Ordering::Equal));
         assert_eq!(compare_versions("2.0.0", "v1.9.9"), Some(Ordering::Greater));
+        assert_eq!(
+            compare_versions("0.2.0-rc.1", "v0.2.0"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0", "v0.2.0-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.2.0-rc.2", "v0.2.0-rc.10"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0+build.5", "v0.2.0"),
+            Some(Ordering::Equal)
+        );
         assert_eq!(parse_version("nope"), None);
     }
 }

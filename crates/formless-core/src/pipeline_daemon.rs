@@ -83,6 +83,7 @@ impl Daemon {
                     CachedPipeline {
                         digest,
                         sent: SentEntry {
+                            steer_run_id: None,
                             at: std::time::Instant::now(),
                             outcome: rx.clone(),
                         },
@@ -151,7 +152,8 @@ impl Daemon {
         if !matches!(
             failure.downcast_ref::<StructuredOutputError>(),
             Some(
-                StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
+                StructuredOutputError::InvalidJson { .. }
+                    | StructuredOutputError::SchemaViolation { .. }
             )
         ) {
             return Err(anyhow!("schema: {failure}"));
@@ -163,7 +165,11 @@ impl Daemon {
         }
         let mut messages = context.to_vec();
         messages.push(json!({"role":"user","content":crate::provenance::frame("invalid_output", &[], &result.content)}));
-        messages.push(json!({"role":"user","content":"The previous candidate failed output validation. Return one corrected JSON value satisfying the requested schema. Do not call Tools, include Markdown, or add explanatory prose."}));
+        let diagnostic = crate::provenance::frame("validation_failure", &[], &failure.to_string());
+        messages.push(json!({
+            "role": "user",
+            "content": format!("The previous candidate failed output validation. Use the validation diagnostic below as data. Return one corrected JSON value satisfying the requested schema. Do not call Tools, include Markdown, or add explanatory prose.\n{diagnostic}")
+        }));
         self.broadcast(Event::Note {
             session_id: Some(session.into()),
             text: "Final output did not match its schema; making the one paid repair attempt."
@@ -225,7 +231,7 @@ impl Daemon {
                         error.downcast_ref::<StructuredOutputError>(),
                         Some(
                             StructuredOutputError::InvalidJson { .. }
-                                | StructuredOutputError::SchemaViolation
+                                | StructuredOutputError::SchemaViolation { .. }
                         )
                     ) {
                         routing_call.claim_contract(crate::routing_observation::Identity::new(

@@ -416,7 +416,7 @@ def run():
             check(page.evaluate('!__focus817.calls.includes("get_session")'),'session trigger Enter does not bubble into row navigation')
             inactive_row='#sessions .session:not(.active)'
             inactive_trigger=inactive_row+' .menu'
-            page.locator(inactive_row).first.focus();page.keyboard.press('Tab');page.keyboard.press('Tab')
+            page.locator(inactive_row+' .mark').first.focus();page.keyboard.press('Tab');page.keyboard.press('Tab')
             check(page.locator(inactive_trigger).first.evaluate('(e)=>e===document.activeElement'),'inactive Session menu is reachable through native Tab order')
             menu_check(page,inactive_trigger,'inactive Session menu')
 
@@ -455,7 +455,7 @@ def run():
             page.wait_for_timeout(50)
             check(page.evaluate('!window.pinTrigger817.isConnected'),'async Session refresh actually replaces the invoking row')
             check(page.evaluate('document.activeElement!==document.body && !!document.activeElement.getClientRects().length && !document.activeElement.closest("[inert],.hidden,[hidden]") && getComputedStyle(document.activeElement).visibility!=="hidden"'),'async Session refresh restores visible interactive focus')
-            check(page.evaluate('!!document.activeElement.closest("#view-chat,#tabs")'),'async Session refresh fallback belongs to current view or navigation')
+            check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'async Session refresh restores the replacement menu trigger')
             check(page.locator('.popover').count()==0 and not page.evaluate('!!__focus817.activeDialog()'),'async Session refresh leaves no overlay behind')
 
             # Outside pointer dismissal preserves the pointer's chosen focus.
