@@ -286,6 +286,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
             || name.ends_with(".pem")
+            || name.ends_with(".ppk")
             || name.ends_with(".key")
         {
             return Some("credential-shaped filename");
@@ -357,6 +358,11 @@ mod tests {
             policy.classify(&project, &project).unwrap(),
             PathDecision::Ordinary
         );
+        let note = root.join("project/ppk-notes.txt");
+        assert_eq!(
+            policy.classify(&note, &note).unwrap(),
+            PathDecision::Ordinary
+        );
         for relative in [
             ".ssh/config",
             ".aws/credentials",
@@ -370,6 +376,8 @@ mod tests {
             ".env",
             ".env.local",
             "server.pem",
+            "server.ppk",
+            "identity.PPK",
             "server.key",
             ".bash_history",
             "fish_history",
