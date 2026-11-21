@@ -204,7 +204,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/backup` | back up the database now |
 | `/docs [topic] [--text]` | open an online guide; terminal --text reads this build's bundled Markdown |
 | `/setup` | the setup wizard again: re-enter the API key, or change provider |
-| `/tour [skip]` | a 2-minute guided first task; `skip` hides the offer |
+| `/tour [skip\|cleanup]` | a guided first task. `skip` hides the offer and `cleanup` archives the tour and retires its sample |
 | `/notes` | every note so far, in the pager |
 | `/vim [on\|off]` | toggle persistent Vim editing in composer and Tool editor |
 | `/help` | all commands and keys (also ? on an empty input) |

@@ -15,6 +15,18 @@
 pub mod net_scope;
 use serde::{Deserialize, Serialize};
 
+/// Substitute positional display placeholders while preserving inserted text.
+pub fn fill_display_template(template: &str, values: &[&str]) -> String {
+    let mut values = values.iter();
+    let mut segments = template.split("{}");
+    let mut text = segments.next().unwrap_or_default().to_string();
+    for segment in segments {
+        text.push_str(values.next().copied().unwrap_or("{}"));
+        text.push_str(segment);
+    }
+    text
+}
+
 /// The newest protocol this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest protocol this build still accepts.
@@ -2028,6 +2040,15 @@ pub enum Request {
     CreateSession {
         name: Option<String>,
     },
+    /// Open a labelled onboarding Session and report whether its sample exists.
+    CreateTourSession,
+    /// Read the status and sample evidence for an exact onboarding Run.
+    GetTourRun {
+        session_id: String,
+        run_id: String,
+    },
+    /// Archive the tour Sessions and retire the unmodified sample Tool.
+    CleanupTour,
     RenameSession {
         id: String,
         name: String,
@@ -3073,6 +3094,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         remember_denial: bool,
     },
+    /// Persist the first approval-help acknowledgement for this profile.
+    AcknowledgeApprovalHelp,
     /// Capabilities the user always denies (`Vec<DenialInfo>`).
     ListDenials,
     /// What the daemon can reach, in one report (SPEC §10.3): grants by
@@ -3428,6 +3451,8 @@ pub enum Event {
     ApprovalClosed {
         approval_id: String,
     },
+    /// The profile has seen the first approval explainer.
+    ApprovalHelpSeen,
     /// An approval was answered, by the client named `by`; the others
     /// close their prompt ("answered in web").
     ApprovalAnswered {
@@ -3651,6 +3676,7 @@ impl Event {
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
             | Event::PromotionApprovalResolved { .. }
+            | Event::ApprovalHelpSeen
             | Event::ApprovalAnswered { .. }
             | Event::ApprovalClosed { .. } => None,
         }

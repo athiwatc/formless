@@ -14,7 +14,9 @@ function fixture(language = 'en', browser = 'en-US') {
     S: { settings: { tui: { language } } }, navigator: { language: browser }, Date,
     document: { documentElement: { lang: 'en' } },
   });
-  vm.runInContext(['uiLang', 'uiLocale', 'uiFormat', 'uiFixed', 'uiMoney', 'applyLanguage', 'clock', 'humanBytes', 'usageText'].map(fn).join('\n'), c);
+  const catalog = source.slice(source.indexOf('  const I18N ='), source.indexOf('  function uiLang()'));
+  vm.runInContext(catalog, c);
+  vm.runInContext(['uiLang', 'tr', 'uiLocale', 'uiFormat', 'uiFixed', 'uiMoney', 'applyLanguage', 'clock', 'humanBytes', 'usageText'].map(fn).join('\n'), c);
   return c;
 }
 
@@ -33,6 +35,22 @@ test('UI locale and HTML language follow explicit, Auto and fallback choices', (
     assert.equal(c.applyLanguage(), true);
     assert.equal(c.document.documentElement.lang, c.uiLang());
   }
+});
+
+test('first approval renders Thai guidance from the catalog and keeps command names literal', () => {
+  const render = fn('renderApproval');
+  const explainer = render.match(/tr\(("First approval\?[^"]+")\)/)?.[1];
+  assert.ok(explainer, 'approval help must render through tr');
+  const english = JSON.parse(explainer);
+  const thai = fixture('th').tr(english);
+  assert.match(thai, /^อนุมัติครั้งแรก/);
+  for (const label of ['Always', 'Allow once', 'This Session', 'Deny']) {
+    const translated = fixture('th').tr(label);
+    assert.notEqual(translated, label);
+    assert.ok(thai.includes(translated), translated);
+  }
+  for (const command of ['/approvals', '/revoke']) assert.ok(thai.includes(command));
+  assert.equal(fixture('en').tr(english), english);
 });
 
 test('English and Thai dates use Gregorian years and Latin digits', () => {

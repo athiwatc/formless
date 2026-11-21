@@ -7,7 +7,7 @@ const source=readFileSync(new URL('./web/app.js',import.meta.url),'utf8');
 const fn=name=>{const start=source.search(new RegExp('  (?:async )?function '+name+'\\('));assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);};
 function setup(){
   const notes=[];
-  const c=vm.createContext({S:{current:'s',running:new Set(['s']),approvals:[],questions:[],liveTools:[]},note:text=>notes.push(text),notifyFor(){},branchSummaryEvent(){},renderApproval(){},renderStatus(){},renderComposer(){},showQuestion(){},cancelAsk(){},toast(){},pickedPaths:()=>({}),isBroad:()=>false,isRunning:()=>true,setActivity(){},prefs:{set(){}},addApproval(ev){if(!c.S.approvals.some(a=>a.id===ev.approval_id))c.S.approvals.push({kind:'tool',id:ev.approval_id});},queueQuestion(){}});
+  const c=vm.createContext({S:{current:'s',running:new Set(['s']),approvals:[],questions:[],liveTools:[]},note:text=>notes.push(text),notifyFor(){},branchSummaryEvent(){},renderApproval(){},renderStatus(){},renderComposer(){},showQuestion(){},cancelAsk(){},toast(){},pickedPaths:()=>({}),isBroad:()=>false,isRunning:()=>true,setActivity(){},approvalHelpSeen:()=>true,addApproval(ev){if(!c.S.approvals.some(a=>a.id===ev.approval_id))c.S.approvals.push({kind:'tool',id:ev.approval_id});},queueQuestion(){}});
   installEventRenderFixture(c, fn);
   vm.runInContext(['onEvent','applySessionLiveState','decide'].map(fn).join('\n'),c);
   return{c,notes};

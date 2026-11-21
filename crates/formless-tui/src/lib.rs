@@ -45,6 +45,7 @@ mod text_history;
 mod theme;
 #[cfg(test)]
 mod toast_preview_tests;
+mod tour;
 mod ui;
 mod user_commands_ui;
 mod vim;
@@ -58,6 +59,7 @@ use crossterm::ExecutableCommand;
 use formless_core::auth::has_provider_credential;
 use formless_core::config::{save_api_key, Config};
 use formless_core::daemon::ensure_daemon;
+use formless_core::onboarding::{load as load_seen, Seen};
 use formless_core::provider::{list_models_blocking, probe_blocking, ProbeResult};
 use formless_core::Paths;
 use formless_protocol::*;
@@ -69,6 +71,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use client::DaemonClient;
+use i18n::{tr, tr_format};
 
 /// Moving indicators, unless `tui.animations` is off or the environment
 /// asks for reduced motion (`REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION`
@@ -256,6 +259,12 @@ enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
+    TourSession,
+    TourRun {
+        session_id: String,
+        run_id: String,
+    },
+    TourCleanup,
     QueuedSave {
         session_id: String,
         edit: QueuedEdit,
@@ -868,12 +877,12 @@ impl Wizard {
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
-                "Saved setup found. Enter a replacement API key, or press Enter to reuse its stored key when available (Esc to choose another provider).".into(),
+                tr("Saved setup found. Enter a replacement API key, or press Enter to reuse its stored key when available (Esc to choose another provider).").into(),
             )
         } else {
             (
                 WizardStep::PickPreset,
-                "Welcome to Formless. Choose your model provider.".into(),
+                tr("Welcome to Formless. Choose your model provider.").into(),
             )
         };
         let preset_idx = preset
@@ -926,7 +935,7 @@ impl Wizard {
         w.profile = paths.profile.clone();
         if !cfg.provider.is_configured() {
             w.setup_hint = formless_core::profile_setup::alternate_setup_hint(paths)
-                .map(|hint| format!("This profile needs setup. {hint}"));
+                .map(|hint| tr_format("This profile needs setup. {}", &[&hint]));
         }
         w
     }
@@ -989,7 +998,7 @@ impl Wizard {
         match d["step"].as_str() {
             Some("base_url") => {
                 self.step = WizardStep::BaseUrl;
-                self.status = "Welcome back. Enter your provider base URL.".into();
+                self.status = tr("Welcome back. Enter your provider base URL.").into();
             }
             Some("api_key" | "model" | "effort") if local => {
                 self.retry_fetch = true;
@@ -997,9 +1006,9 @@ impl Wizard {
             }
             Some("api_key" | "model" | "effort") if !self.base_url.is_empty() => {
                 self.enter_api_key_step();
-                self.status = format!(
+                self.status = tr_format(
                     "Welcome back: you were setting up {}. {}",
-                    self.base_url, self.status
+                    &[&self.base_url, &self.status],
                 );
             }
             _ => {}
@@ -1104,7 +1113,8 @@ impl Wizard {
         self.api_key = self.api_key.trim().to_string();
         if self.api_key.chars().any(char::is_whitespace) {
             self.status =
-                "The API key contains whitespace inside it. Remove it before continuing.".into();
+                tr("The API key contains whitespace inside it. Remove it before continuing.")
+                    .into();
             false
         } else {
             true
@@ -1138,13 +1148,16 @@ impl Wizard {
     fn enter_api_key_step(&mut self) {
         self.hide_key();
         self.step = WizardStep::ApiKey;
-        let mut status = String::from("Enter your API key (stored in the OS keychain).");
+        let mut status = tr("Enter your API key (stored in the OS keychain).").to_string();
         if let Some(p) = self.preset {
             if let Some(url) = p.key_url {
-                status.push_str(&format!(" Get one at {url}"));
+                status.push_str(&tr_format(" Get one at {}", &[url]));
             }
             if let Some((var, _)) = formless_core::presets::env_key(p) {
-                status = format!("Found ${var}: press Enter to use it, or type a different key.");
+                status = tr_format(
+                    "Found ${}: press Enter to use it, or type a different key.",
+                    &[var],
+                );
             }
         }
         self.status = status;
@@ -1167,7 +1180,7 @@ impl Wizard {
         self.invalidate_jobs();
         let generation = self.generation;
         self.step = WizardStep::FetchModels;
-        self.status = format!("Fetching models from {}…", self.base_url.trim());
+        self.status = tr_format("Fetching models from {}…", &[self.base_url.trim()]);
         let tx = self.job_tx.clone();
         let mut pcfg = formless_core::config::ProviderCfg::default();
         self.apply_provider_endpoint(&mut pcfg);
@@ -1199,7 +1212,8 @@ impl Wizard {
             }
             self.preset = None;
             self.step = WizardStep::BaseUrl;
-            self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
+            self.status =
+                tr("Enter your provider base URL (any OpenAI-compatible endpoint).").into();
             return;
         };
         let endpoint = if p.local
@@ -1233,35 +1247,6 @@ impl Wizard {
         }
     }
 }
-
-/// One-time onboarding moments already shown (#393, #394).
-#[derive(Debug, Default, Clone)]
-struct Seen {
-    /// The first-approval explainer.
-    approval_help: bool,
-    /// The tour was offered, and finished or skipped.
-    tour_offered: bool,
-    tour_done: bool,
-}
-
-fn seen_file(paths: &Paths) -> std::path::PathBuf {
-    paths.data_dir.join("tui-seen.json")
-}
-
-fn load_seen(paths: &Paths) -> Seen {
-    let v: serde_json::Value = std::fs::read_to_string(seen_file(paths))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    Seen {
-        approval_help: v["approval_help"] == true,
-        tour_offered: v["tour_offered"] == true,
-        tour_done: v["tour_done"] == true,
-    }
-}
-
-/// The tour's sample task: small, and it makes the agent build a Tool.
-const TOUR_TASK: &str = "Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"";
 
 #[cfg(test)]
 fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
@@ -1822,6 +1807,7 @@ struct App {
     pending_since: HashMap<u64, Instant>,
     /// `Status.secure` of the daemon this TUI is attached to.
     daemon_secure: Option<bool>,
+    shares_approval_help: bool,
     /// What the last `/revoke` named, for its reply.
     revoking: String,
     tools: Vec<ToolInfo>,
@@ -2059,9 +2045,7 @@ struct App {
     pull_status: Option<String>,
     /// One-time onboarding moments, persisted.
     seen: Seen,
-    /// The guided tour's stage while it runs (`/tour`): 1 sent the task,
-    /// 2 the Tool exists, 3 done.
-    tour: Option<u8>,
+    tour: Option<tour::Tour>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
     /// The authoritative Session read required before leaving reconnect mode.
@@ -2134,6 +2118,7 @@ impl App {
 
     fn new(paths: Paths) -> Result<Self> {
         let cfg = Config::load(&paths)?;
+        i18n::set(&cfg.tui.language);
         let chosen = theme::from_config(&cfg.tui.theme, &cfg.tui.colors);
         // Overrides that would be hard to read are used, with a note.
         let theme_warnings = theme::contrast_warnings(&chosen);
@@ -2177,10 +2162,7 @@ impl App {
             vim_input: vim::Vim::default(),
             vim_help: false,
             show_timestamps: cfg.tui.timestamps,
-            animations: {
-                i18n::set(&cfg.tui.language);
-                animations_enabled(cfg.tui.animations)
-            },
+            animations: animations_enabled(cfg.tui.animations),
             hyperlinks: links::enabled(&cfg.tui.hyperlinks),
             model_label: cfg.provider.model.clone(),
             tick: 0,
@@ -2203,6 +2185,7 @@ impl App {
             pending: HashMap::new(),
             pending_since: HashMap::new(),
             daemon_secure: None,
+            shares_approval_help: false,
             revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
@@ -2353,7 +2336,7 @@ impl App {
             last_click: None,
             stream_cache: Default::default(),
         };
-        app.seen = load_seen(&app.paths);
+        app.seen = load_seen(&app.paths).unwrap_or_default();
         if oauth_login_required {
             app.notes
                 .push("OAuth login required: run `formless auth login`.".into());
@@ -2398,6 +2381,7 @@ impl App {
         self.reconnect_request = None;
         self.reconnect_events.clear();
         self.daemon_secure = None;
+        self.shares_approval_help = false;
         self.sends.disconnected();
         self.client = Some(client);
         self.inbox = Some(inbox);
@@ -2461,12 +2445,14 @@ impl App {
         self.hunk_review.clear();
         self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
+        self.tour_send_lost(None);
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
         self.clear_attention();
         self.client = None;
         self.inbox = None;
         self.daemon_secure = None;
+        self.shares_approval_help = false;
         self.pending.clear();
         self.pending_since.clear();
         self.activity = None;
@@ -2617,6 +2603,7 @@ impl App {
                 "reconnected to the daemon after {}",
                 format_elapsed(since.elapsed())
             ));
+            self.refresh_tour();
         }
     }
 
@@ -2889,6 +2876,7 @@ impl App {
                     | Request::PreviewDescriptionBundle { .. }
                     | Request::ContextUsage { .. }
                     | Request::RunMetrics { .. }
+                    | Request::GetTourRun { .. }
                     | Request::SessionUsage { .. }
                     | Request::ListInvocations
                     | Request::Subscribe { .. }
@@ -3002,6 +2990,7 @@ impl App {
             ));
             if matches!(kind, Pending::SendMessage) {
                 self.restore_unsent_draft();
+                self.tour_send_lost(Some(id));
             }
             if matches!(kind, Pending::ReconnectSession) {
                 self.reconnect_read_failed(id);
@@ -3017,8 +3006,12 @@ impl App {
         }
     }
     fn send_chat_message(&mut self, session_id: String, content: String, mode: SendMode) {
+        let is_tour = self.tour_draft_sent(&session_id, &content, &mode);
         if let Some(client) = &self.client {
             let id = self.sends.send(client, session_id, content, mode);
+            if is_tour {
+                self.tour_sending(id);
+            }
             self.pending.insert(id, Pending::SendMessage);
             self.pending_since.insert(id, Instant::now());
         }
@@ -3156,6 +3149,7 @@ impl App {
                     result,
                     error,
                 } => {
+                    self.tour_send_answered(id, ok, result.as_ref());
                     if ok
                         && self.sends.message(id).is_some_and(|(session, text)| {
                             self.restored_send
@@ -3252,6 +3246,9 @@ impl App {
                             if !self.seen.approval_help {
                                 self.seen.approval_help = true;
                                 self.save_seen();
+                                if self.shares_approval_help {
+                                    self.fire(Request::AcknowledgeApprovalHelp);
+                                }
                             }
                             self.notes.push(note.clone());
                             if result
@@ -3373,10 +3370,21 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::TourSession => self.open_tour_reply(result),
+                        Pending::TourRun { session_id, run_id } => {
+                            self.apply_tour_status(&session_id, &run_id, &result);
+                        }
+                        Pending::TourCleanup => self.tour_cleanup_reply(&result),
                         Pending::QueuedSave { .. } => {
                             unreachable!("queued saves are acknowledged above")
                         }
-                        Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
+                        Pending::DaemonMode => {
+                            self.daemon_secure = result["secure"].as_bool();
+                            if let Some(seen) = result["approval_help_seen"].as_bool() {
+                                self.shares_approval_help = true;
+                                self.seen.approval_help |= seen;
+                            }
+                        }
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
@@ -5747,6 +5755,13 @@ impl App {
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
+            if self
+                .tour
+                .as_ref()
+                .is_some_and(|tour| self.is_current(&tour.session_id))
+            {
+                self.notes.push(tr("Tour guidance paused. Return to the Guided tour Session or type /tour to continue.").into());
+            }
             self.cancel_branch_summary();
             self.hunk_review.clear();
         }
@@ -5806,9 +5821,11 @@ impl App {
             self.set_activity("working");
         }
         self.follow_chat_bottom();
+        self.refresh_tour();
     }
 
     fn on_event(&mut self, ev: Event) {
+        self.observe_tour_event(&ev);
         if let Event::RunFinished {
             session_id,
             run_id,
@@ -6210,24 +6227,6 @@ impl App {
                 session_id,
                 run_id,
                 status,
-            } if self.tour.is_some() && self.is_current(&session_id) => {
-                self.tour = None;
-                self.seen.tour_done = true;
-                self.save_seen();
-                self.notes.push(
-                    "Tour 3/3 · Done. Ask for anything: the agent reuses its Tools and builds new ones. /help lists every command and key; Tab switches views."
-                        .into(),
-                );
-                self.on_event(Event::RunFinished {
-                    session_id,
-                    run_id,
-                    status,
-                });
-            }
-            Event::RunFinished {
-                session_id,
-                run_id,
-                status,
             } => {
                 if self.is_current(&session_id)
                     && self.live_run.as_ref().is_some_and(|(id, _)| id != &run_id)
@@ -6388,13 +6387,6 @@ impl App {
                 if !self.is_current(&session_id) {
                     return;
                 }
-                if ok && tool_name == "create_tool" && self.tour == Some(1) {
-                    self.tour = Some(2);
-                    self.notes.push(
-                        "Tour 2/3 · The agent just built a Tool. It's in the Tools view now (Tab to switch views, Esc back): its code, versions and how well it does. Watch it use the Tool next."
-                            .into(),
-                    );
-                }
                 if let Some(call) = self.running_call(
                     &session_id,
                     invocation_id.as_deref(),
@@ -6471,6 +6463,7 @@ impl App {
                         .collect();
                 }
             }
+            Event::ApprovalHelpSeen => self.seen.approval_help = true,
             Event::ApprovalClosed { approval_id } => {
                 let before = self.approvals.len();
                 self.approvals.retain(|a| a.approval_id != approval_id);
@@ -8520,8 +8513,9 @@ impl App {
                 self.tour = None;
                 self.seen.tour_done = true;
                 self.save_seen();
-                self.notes.push("tour skipped; /tour starts it any time".into());
+                self.notes.push(tr("tour skipped; /tour starts it any time").into());
             }
+            "tour cleanup" => self.request(Pending::TourCleanup, Request::CleanupTour),
             "setup" => {
                 // The wizard again, at the key step of the saved provider:
                 // re-enter a key, or Esc back to change provider (§10.1).
@@ -8538,16 +8532,9 @@ impl App {
                 }
             }
             cmd if cmd.starts_with("tour ") => {
-                self.notes.push("usage: /tour starts the guided first task; /tour skip hides the offer".into())
+                self.notes.push(tr("Use /tour to start, /tour skip to hide the offer, and /tour cleanup to archive the tour and retire its sample.").into())
             }
-            "tour" => {
-                self.tour = Some(1);
-                self.input.set(TOUR_TASK);
-                self.notes.push(
-                    "Tour 1/3 · A sample task is in the input. Press Enter: the agent has no Tool for this yet, so it builds one, and keeps it for next time."
-                        .into(),
-                );
-            }
+            "tour" => self.open_tour(),
             "routing" => self.request(Pending::Routing, Request::RoutingDecisions),
             cmd if cmd == "test" || cmd.starts_with("test ") => {
                 let model = cmd["test".len()..].trim().to_string();
@@ -8926,8 +8913,9 @@ impl App {
                 match job {
                     WizardJob::Local(_, discovery) => {
                         w.local_pending = false;
-                        if let Some(hint) = discovery.hint.as_deref() {
-                            w.status = hint.to_string();
+                        let hint = discovery.hint.as_deref().map(i18n::tr_str);
+                        if let Some(hint) = &hint {
+                            w.status = hint.clone();
                         }
                         w.local_offers = discovery.servers;
                         if let Some(offer) = w
@@ -8945,7 +8933,7 @@ impl App {
                             {
                                 w.preset_idx = index;
                                 let offer_text = if w.local_offers.len() == 1 {
-                                    offer.offer()
+                                    offer.offer_with(tr_format)
                                 } else {
                                     let summary = w
                                         .local_offers
@@ -8956,22 +8944,19 @@ impl App {
                                                     .map_or(server.preset_id, |p| {
                                                         p.name.trim_end_matches(" (local)")
                                                     });
-                                            format!(
-                                                "{name} ({} model{})",
-                                                server.models,
-                                                if server.models == 1 { "" } else { "s" }
-                                            )
+                                            format!("{name} ({})", local_model_count(server.models))
                                         })
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     let action = if offer.models == 0 {
-                                        offer.offer()
+                                        offer.offer_with(tr_format)
                                     } else {
-                                        "Press Enter to use the highlighted provider.".to_string()
+                                        tr("Press Enter to use the highlighted provider.")
+                                            .to_string()
                                     };
-                                    format!("Found {summary}. {action}")
+                                    tr_format("Found {}. {}", &[&summary, &action])
                                 };
-                                w.status = match discovery.hint {
+                                w.status = match hint {
                                     Some(hint) => format!("{hint} {offer_text}"),
                                     None => offer_text,
                                 };
@@ -8990,13 +8975,13 @@ impl App {
                             .collect();
                         w.picker.set_items(items, &w.saved_model.clone());
                         w.step = WizardStep::PickModel;
-                        w.status = "Pick a model: type to filter, Up/Down, Enter.".into();
+                        w.status = tr("Pick a model: type to filter, Up/Down, Enter.").into();
                     }
                     WizardJob::Models(_, Err(e)) if w.retry_fetch => {
                         w.step = WizardStep::Failed;
-                        w.status = format!(
-                            "Can't reach {} ({e}). Start the server, then press Enter to retry (Esc for another provider).",
-                            w.base_url.trim()
+                        w.status = tr_format(
+                            "Can't reach {} ({}). Start the server, then press Enter to retry (Esc for another provider).",
+                            &[w.base_url.trim(), &e],
                         );
                     }
                     // Why the listing failed decides what comes next (#744):
@@ -9006,16 +8991,19 @@ impl App {
                         let why = wizard_explain(&e, &w.base_url, "");
                         if why.category == "auth" {
                             w.enter_api_key_step();
-                            w.status = format!("{} Enter it again. ({})", why.message, why.details);
+                            w.status =
+                                tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
                         } else {
                             w.picker = picker::ModelPicker::new(Vec::new());
                             w.picker.query = w.saved_model.clone();
                             w.step = WizardStep::PickModel;
-                            w.status = format!(
+                            w.status = tr_format(
                                 "Could not list models: {}{} Type a model name, then Enter. ({})",
-                                why.message,
-                                why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
-                                why.details
+                                &[
+                                    &why.message,
+                                    &why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
+                                    &why.details,
+                                ],
                             );
                         }
                     }
@@ -9024,7 +9012,8 @@ impl App {
                         w.picker.query = w.saved_model.clone();
                         w.step = WizardStep::PickModel;
                         w.status =
-                            "The endpoint listed no models; type a model name, then Enter.".into();
+                            tr("The endpoint listed no models; type a model name, then Enter.")
+                                .into();
                     }
                     WizardJob::Probe(_, Ok(r)) if r.tool_calling => {
                         w.prompt_fallback = r.prompt_fallback;
@@ -9033,20 +9022,23 @@ impl App {
                     }
                     WizardJob::Probe(_, Ok(_)) => {
                         w.step = WizardStep::Failed;
-                        w.status = "This endpoint/model supports neither native nor prompt-based tool-calling. Press Enter to pick another model.".into();
+                        w.status = tr("This endpoint/model supports neither native nor prompt-based tool-calling. Press Enter to pick another model.").into();
                     }
                     WizardJob::Probe(_, Err(e)) => {
                         let why = wizard_explain(&e, &w.base_url, &w.model());
                         if why.category == "auth" {
                             w.enter_api_key_step();
-                            w.status = format!("{} Enter it again. ({})", why.message, why.details);
+                            w.status =
+                                tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
                         } else {
                             w.step = WizardStep::Failed;
-                            w.status = format!(
+                            w.status = tr_format(
                                 "Probe failed: {}{} Press Enter to pick a model again. ({})",
-                                why.message,
-                                why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
-                                why.details
+                                &[
+                                    &why.message,
+                                    &why.action.map(|a| format!(" {a}.")).unwrap_or_default(),
+                                    &why.details,
+                                ],
                             );
                         }
                     }
@@ -9057,7 +9049,7 @@ impl App {
             if let Err(e) = self.wizard_finish() {
                 if let Some(w) = &mut self.wizard {
                     w.step = WizardStep::Failed;
-                    w.status = format!("Saving config failed: {e}");
+                    w.status = tr_format("Saving config failed: {}", &[&e.to_string()]);
                 }
             }
         }
@@ -9078,7 +9070,7 @@ impl App {
         if key_update == WizardKeyUpdate::ConfirmClear {
             w.confirm_key_change = true;
             w.step = WizardStep::Failed;
-            w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
+            w.status = tr("This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.").into();
             return Ok(());
         }
         w.apply_provider_endpoint(&mut cfg.provider);
@@ -9098,22 +9090,21 @@ impl App {
             self.seen.tour_offered = true;
             self.save_seen();
             self.notes.push(
-                "New here? /tour runs a 2-minute guided first task (/tour skip hides this for good)."
+                tr("New here? /tour runs a 2-minute guided first task (/tour skip hides this for good).")
                     .into(),
             );
         }
         if !w.streaming {
             self.notes.push(
-                "⚠ The endpoint didn't stream its test reply: answers may arrive all at once, and a long one can look stuck until it ends."
+                tr("⚠ The endpoint didn't stream its test reply: answers may arrive all at once, and a long one can look stuck until it ends.")
                     .into(),
             );
         }
         // Say plainly how Tools are trusted (SPEC §10.3).
         self.notes.push(if cfg.security.secure {
-            "Approvals are on: a Tool asks before it uses files, the network or programs.".into()
+            tr("Approvals are on: a Tool asks before it uses files, the network or programs.").into()
         } else {
-            "Tools run without asking (approvals are off). To be asked first, set \
-             security.secure = true in config.toml or start with `formless --secure`."
+            tr("Tools run without asking (approvals are off). To be asked first, set security.secure = true in config.toml or start with `formless --secure`.")
                 .into()
         });
         self.connect_daemon()
@@ -9159,7 +9150,7 @@ impl App {
             self.wizard = None;
             let _ = formless_core::setup_draft::discard(&self.paths);
             self.notes
-                .push("Setup cancelled; your existing setup is unchanged.".into());
+                .push(tr("Setup cancelled; your existing setup is unchanged.").into());
             return;
         }
         if key.code == KeyCode::Enter && self.wizard.as_ref().is_some_and(|w| w.confirm_key_change)
@@ -9170,7 +9161,7 @@ impl App {
             }
             if let Err(e) = self.wizard_finish() {
                 if let Some(w) = &mut self.wizard {
-                    w.status = format!("Saving config failed: {e}");
+                    w.status = tr_format("Saving config failed: {}", &[&e.to_string()]);
                 }
             }
             return;
@@ -9196,31 +9187,31 @@ impl App {
             let local = w.preset.is_some_and(|p| p.local);
             let (step, status) = match w.step {
                 WizardStep::PickPreset => return,
-                WizardStep::BaseUrl => (WizardStep::PickPreset, "Choose your model provider."),
+                WizardStep::BaseUrl => (WizardStep::PickPreset, tr("Choose your model provider.")),
                 WizardStep::ApiKey if w.preset.is_none() => (
                     WizardStep::BaseUrl,
-                    "Enter your provider base URL (any OpenAI-compatible endpoint).",
+                    tr("Enter your provider base URL (any OpenAI-compatible endpoint)."),
                 ),
-                WizardStep::ApiKey => (WizardStep::PickPreset, "Choose your model provider."),
+                WizardStep::ApiKey => (WizardStep::PickPreset, tr("Choose your model provider.")),
                 WizardStep::FetchModels | WizardStep::PickModel | WizardStep::Failed if local => {
-                    (WizardStep::PickPreset, "Choose your model provider.")
+                    (WizardStep::PickPreset, tr("Choose your model provider."))
                 }
                 WizardStep::FetchModels | WizardStep::PickModel => {
                     w.enter_api_key_step();
                     if cancelled {
-                        w.status = format!("Cancelled pending request. {}", w.status);
+                        w.status = tr_format("Cancelled pending request. {}", &[&w.status]);
                     }
                     return;
                 }
-                WizardStep::PickEffort => (WizardStep::PickModel, "Pick a model."),
+                WizardStep::PickEffort => (WizardStep::PickModel, tr("Pick a model.")),
                 WizardStep::Probing | WizardStep::Failed => {
-                    (WizardStep::PickEffort, "Pick reasoning effort.")
+                    (WizardStep::PickEffort, tr("Pick reasoning effort."))
                 }
             };
             w.retry_fetch = false;
             w.step = step;
             w.status = if cancelled {
-                format!("Cancelled pending request. {status}")
+                tr_format("Cancelled pending request. {}", &[status])
             } else {
                 status.into()
             };
@@ -9294,7 +9285,7 @@ impl App {
             WizardStep::PickModel => match key.code {
                 KeyCode::Enter if !w.model().trim().is_empty() => {
                     w.step = WizardStep::PickEffort;
-                    w.status = "Pick reasoning effort.".into();
+                    w.status = tr("Pick reasoning effort.").into();
                 }
                 _ => {
                     w.picker.key(&key);
@@ -9311,7 +9302,8 @@ impl App {
                     w.invalidate_jobs();
                     let generation = w.generation;
                     w.step = WizardStep::Probing;
-                    w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
+                    w.status =
+                        tr("Probing endpoint (connectivity + streaming + tool-calling)…").into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
                     let mut pcfg = formless_core::config::ProviderCfg::default();
@@ -9329,7 +9321,7 @@ impl App {
             WizardStep::Failed if w.retry_fetch && key.code == KeyCode::Enter => w.fetch_models(),
             WizardStep::Failed if key.code == KeyCode::Enter => {
                 w.step = WizardStep::PickModel;
-                w.status = "Pick a model.".into();
+                w.status = tr("Pick a model.").into();
             }
             _ => {}
         }
@@ -10976,18 +10968,13 @@ impl App {
         ));
     }
 
-    /// Remember how a batch's held call was answered, for the list the
-    /// next prompts of that batch show.
-    fn save_seen(&self) {
-        let _ = std::fs::write(
-            seen_file(&self.paths),
-            serde_json::json!({
-                "approval_help": self.seen.approval_help,
-                "tour_offered": self.seen.tour_offered,
-                "tour_done": self.seen.tour_done,
-            })
-            .to_string(),
-        );
+    fn save_seen(&mut self) {
+        match formless_core::onboarding::save(&self.paths, &self.seen) {
+            Ok(merged) => self.seen = merged,
+            Err(error) => self
+                .notes
+                .push(format!("Could not save onboarding preferences ({error})")),
+        }
     }
 
     /// Tools whose code calls this one, from its loaded detail.
@@ -19355,10 +19342,10 @@ fn draw_approval(
     // The first approval ever: what this is and how to undo it (#394).
     if first_time && !promotion {
         for l in [
-            "First approval? Tools run in a sandbox with no access at all; each capability above",
-            "(files, network, programs…) is something this Tool asks to use. y lets it keep using",
-            "them, o allows just this call, s for this Session, n says no. Change your mind any",
-            "time: /approvals lists what you allowed, /revoke takes it back.",
+            tr("First approval? Tools run in a sandbox with no access at all; each capability above"),
+            tr("(files, network, programs…) is something this Tool asks to use. y lets it keep using"),
+            tr("them, o allows just this call, s for this Session, n says no. Change your mind any"),
+            tr("time: /approvals lists what you allowed, /revoke takes it back."),
         ] {
             lines.push(Line::styled(l.to_string(), fg(color, Color::Cyan)));
         }
@@ -19374,7 +19361,7 @@ fn draw_approval(
         Span::raw(if promotion {
             " approve    "
         } else {
-            " always    "
+            tr(" always    ")
         }),
     ];
     if !promotion {
@@ -19382,12 +19369,12 @@ fn draw_approval(
             " o ",
             bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
         ));
-        keys.push(Span::raw(" once    "));
+        keys.push(Span::raw(tr(" once    ")));
         keys.push(Span::styled(
             " s ",
             bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
         ));
-        keys.push(Span::raw(" this Session    "));
+        keys.push(Span::raw(tr(" this Session    ")));
         keys.push(Span::styled(
             " 1 ",
             bold_fg(color, Color::Yellow).add_modifier(Modifier::REVERSED),
@@ -19399,7 +19386,7 @@ fn draw_approval(
             " n ",
             bold_fg(color, Color::Red).add_modifier(Modifier::REVERSED),
         ),
-        Span::raw(" deny  "),
+        Span::raw(tr(" deny  ")),
     ]);
     if !promotion {
         keys.extend([
@@ -20001,13 +19988,22 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocu
 
 mod wizard_layout;
 
+fn local_model_count(count: usize) -> String {
+    let count_value = count.to_string();
+    if count == 1 {
+        tr_format("{} model", &[&count_value])
+    } else {
+        tr_format("{} models", &[&count_value])
+    }
+}
+
 fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     let (step_no, step_name) = match w.step {
-        WizardStep::PickPreset | WizardStep::BaseUrl => (1, "Provider"),
-        WizardStep::ApiKey | WizardStep::FetchModels => (2, "API key"),
-        WizardStep::PickModel => (3, "Model"),
-        WizardStep::PickEffort => (4, "Reasoning effort"),
-        WizardStep::Probing | WizardStep::Failed => (5, "Tool-calling check"),
+        WizardStep::PickPreset | WizardStep::BaseUrl => (1, tr("Provider")),
+        WizardStep::ApiKey | WizardStep::FetchModels => (2, tr("API key")),
+        WizardStep::PickModel => (3, tr("Model")),
+        WizardStep::PickEffort => (4, tr("Reasoning effort")),
+        WizardStep::Probing | WizardStep::Failed => (5, tr("Tool-calling check")),
     };
     let status_style = if w.step == WizardStep::Failed {
         bold_fg(color, Color::Red)
@@ -20028,7 +20024,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         Line::from(vec![
             Span::styled(progress, fg(color, Color::Cyan)),
             Span::styled(
-                format!("   step {step_no} of 5 · {step_name}"),
+                tr_format("   step {} of 5 · {}", &[&step_no.to_string(), step_name]),
                 ui::dim(color),
             ),
         ]),
@@ -20053,7 +20049,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         if budget > 0 {
             let mut rows = wizard_layout::hint_rows(hint, width);
             if rows.len() > budget {
-                let more = wizard_layout::hint_rows("More: formless profiles list", width);
+                let more = wizard_layout::hint_rows(tr("More: formless profiles list"), width);
                 rows.truncate(budget.saturating_sub(more.len()));
                 rows.extend(more.into_iter().take(budget));
             }
@@ -20100,33 +20096,29 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
                 .enumerate()
                 .map(|(i, p)| {
                     let env = formless_core::presets::env_key(p)
-                        .map(|(var, _)| format!("  (${var} found)"))
+                        .map(|(var, _)| tr_format("  (${} found)", &[var]))
                         .unwrap_or_default();
                     let found = w
                         .local_offer_for(p.id)
                         .map(|offer| {
-                            format!(
-                                "  (found: {} model{})",
-                                offer.models,
-                                if offer.models == 1 { "" } else { "s" }
-                            )
+                            tr_format("  (found: {})", &[&local_model_count(offer.models)])
                         })
                         .unwrap_or_default();
                     format!("{}. {}{env}{found}", i + 1, p.name)
                 })
                 .collect();
-            rows.push(format!("{}. Custom URL…", rows.len() + 1));
+            rows.push(format!("{}. {}", rows.len() + 1, tr("Custom URL…")));
             text.extend(pick(rows, w.preset_idx));
         }
-        WizardStep::BaseUrl => text.push(field("Base URL", format!("{}▏", w.base_url))),
+        WizardStep::BaseUrl => text.push(field(tr("Base URL"), format!("{}▏", w.base_url))),
         WizardStep::ApiKey | WizardStep::FetchModels => {
-            text.push(field("Base URL", w.base_url.clone()));
-            text.push(field("API key", format!("{}▏", w.shown_key())));
+            text.push(field(tr("Base URL"), w.base_url.clone()));
+            text.push(field(tr("API key"), format!("{}▏", w.shown_key())));
             text.push(Line::styled(
                 if w.reveal_key {
-                    "          Ctrl+R hide · paste works"
+                    tr("          Ctrl+R hide · paste works")
                 } else {
-                    "          Ctrl+R show · paste works"
+                    tr("          Ctrl+R show · paste works")
                 },
                 ui::dim(color),
             ));
@@ -20135,26 +20127,26 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             text.extend(picker_lines(&w.picker, max_items, color));
         }
         WizardStep::PickEffort => {
-            text.push(field("Model", w.model()));
+            text.push(field(tr("Model"), w.model()));
             text.push(Line::raw(""));
             text.extend(pick(
                 EFFORTS
                     .iter()
-                    .map(|e| e.unwrap_or("default (provider)").to_string())
+                    .map(|e| e.unwrap_or(tr("default (provider)")).to_string())
                     .collect(),
                 w.effort_idx,
             ));
         }
         WizardStep::Probing | WizardStep::Failed => {
-            text.push(field("Model", w.model()));
+            text.push(field(tr("Model"), w.model()));
         }
     }
     text.push(Line::raw(""));
     let footer = Line::styled(
         if w.can_cancel {
-            "Enter continue · Esc back (at Provider: cancel) · Ctrl+C quit"
+            tr("Enter continue · Esc back (at Provider: cancel) · Ctrl+C quit")
         } else {
-            "Enter continue · Esc back · Ctrl+C quit"
+            tr("Enter continue · Esc back · Ctrl+C quit")
         },
         ui::dim(color),
     );
@@ -20162,7 +20154,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         f,
         text,
         footer,
-        format!(" ◇ Formless setup · profile: {} ", w.profile),
+        tr_format(" ◇ Formless setup · profile: {} ", &[&w.profile]),
         color,
     );
 }
@@ -20514,6 +20506,7 @@ mod tests {
             pending: HashMap::new(),
             pending_since: HashMap::new(),
             daemon_secure: None,
+            shares_approval_help: false,
             revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
@@ -22354,6 +22347,31 @@ mod tests {
         let narrow = compare_lines(&results, 40);
         assert!(narrow.iter().any(|l| l == "── beta ──"));
         assert!(!narrow.iter().any(|l| l.contains('│')));
+    }
+
+    #[test]
+    fn thai_onboarding_localizes_wizard_resume_and_preserves_endpoint_text() {
+        i18n::with_lang(i18n::Lang::Th, || {
+            let address = "http://localhost:11434";
+            let mut config = Config::default();
+            config.provider.base_url.clear();
+            let mut wizard = Wizard::new(&config);
+            assert!(wizard.status.contains("ยินดีต้อนรับสู่ Formless"));
+            wizard.resume(&serde_json::json!({"step":"api_key","base_url":address,"custom":true}));
+            assert!(wizard.status.contains("ยินดีต้อนรับกลับมา"));
+            assert!(wizard.status.contains(address));
+
+            let local = formless_core::local_servers::LocalServer {
+                preset_id: "ollama",
+                base_url: address.into(),
+                models: 2,
+            };
+            let offer = local.offer_with(tr_format);
+            assert!(offer.contains(address) && offer.contains("มี 2 โมเดล"));
+            assert!(tour::sample_prompt(false).starts_with("สร้างเครื่องมือ"));
+            assert!(tour::sample_prompt(false).contains("The quick brown fox"));
+            assert_eq!(tr_format("Found {}. {}", &["{}", "ค่า"]), "พบ {} ค่า");
+        });
     }
 
     #[test]

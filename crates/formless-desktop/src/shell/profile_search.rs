@@ -40,7 +40,7 @@ impl Shell {
             })
     }
 
-    fn begin_profile_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn begin_profile_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.finish_profile_composition(window, cx) {
             return;
         }

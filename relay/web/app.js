@@ -113,6 +113,7 @@
     proposals: [],
     settings: null,
     status: null,
+    approvalHelpSeen: undefined,
     notes: [],
     unread: 0,
     showThinking: prefs.get("thinking", true),
@@ -289,6 +290,19 @@
   // shows in English. `tui.language` picks it; `auto` uses the browser's.
   const I18N = {
     th: {
+      "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Allow once covers just this call, This Session covers the current Session, and Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.": "อนุมัติครั้งแรกใช่ไหม เครื่องมือทำงานแยกและไม่มีสิทธิ์เข้าถึงอะไรโดยค่าเริ่มต้น รายการด้านล่างคือสิทธิ์ที่เครื่องมือนี้ขอ เช่น ไฟล์ เครือข่าย หรือโปรแกรม อนุญาตเสมอให้ใช้สิทธิ์ต่อไป อนุญาตครั้งเดียวใช้ได้สำหรับการเรียกนี้ เซสชันนี้ใช้ได้จนจบเซสชัน และปฏิเสธคือไม่อนุญาต ใช้ /approvals เพื่อดูสิทธิ์ที่อนุญาต และ /revoke เพื่อถอนอนุญาต",
+      "Approval required": "ต้องอนุมัติ",
+      "Promotion approval": "อนุมัติการเลื่อนเวอร์ชัน",
+      "Approve": "อนุมัติ",
+      "Always": "อนุญาตเสมอ",
+      "Allow once": "อนุญาตครั้งเดียว",
+      "This Session": "เซสชันนี้",
+      "For 1 hour": "เป็นเวลา 1 ชั่วโมง",
+      "Deny": "ปฏิเสธ",
+      "Always deny": "ปฏิเสธเสมอ",
+      "Later": "ไว้ทีหลัง",
+      "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.": "การอนุญาตมีผลกับเครื่องมือนี้จนกว่าจะขอสิทธิ์เพิ่ม อนุญาตครั้งเดียวมีผลเฉพาะการเรียกนี้",
+      "The new version replaces the current one; rollback stays available.": "เวอร์ชันใหม่จะแทนที่เวอร์ชันปัจจุบัน คุณยังย้อนกลับได้",
       "Send": "ส่ง", "Steer": "ปรับทิศ", "Re-run": "ส่งใหม่", "Stop": "หยุด",
       "Message Formless…": "พิมพ์ข้อความถึง Formless…",
       "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
@@ -4933,6 +4947,26 @@
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
+  function approvalHelpSeen() {
+    return S.approvalHelpSeen === null ? prefs.get("seen.approvalHelp", false) : S.approvalHelpSeen === true;
+  }
+  async function rememberApprovalHelp() {
+    if (S.approvalHelpSeen === undefined) {
+      const status = await request({ type: "status" });
+      if (S.approvalHelpSeen !== true) {
+        S.approvalHelpSeen = typeof status?.approval_help_seen === "boolean" ? status.approval_help_seen : null;
+      }
+    }
+    if (S.approvalHelpSeen === null) {
+      prefs.set("seen.approvalHelp", true);
+      return;
+    }
+    if (!S.approvalHelpSeen) {
+      const result = await request({ type: "acknowledge_approval_help" });
+      if (result?.approval_help_seen !== true) throw new Error("The daemon did not record the preference");
+      S.approvalHelpSeen = true;
+    }
+  }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
@@ -4947,13 +4981,13 @@
       const button = $(id);
       if (button) button.disabled = !!req.deciding;
     }
-    $("modal-title").textContent = promo ? "Promotion approval" : "Approval required";
+    $("modal-title").textContent = tr(promo ? "Promotion approval" : "Approval required");
     document.querySelector("#modal-backdrop .modal").classList.add("alert");
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
       // The first approval ever: what this is and how to undo it (#394).
-      !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
-        "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
+      !promo && !approvalHelpSeen() ? h("p", { class: "first-approval" },
+        tr("First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Allow once covers just this call, This Session covers the current Session, and Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.")) : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -4982,9 +5016,9 @@
               scopePicker(req, c))),
         req.detail && !req.tool_id ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, approvalText(req.code))) : null,
-      h("p", { class: "muted" }, promo
+      h("p", { class: "muted" }, tr(promo
         ? "The new version replaces the current one; rollback stays available."
-        : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
+        : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only."))));
     showBidi(body);
     $("modal-once").classList.toggle("hidden", promo);
     $("modal-session").classList.toggle("hidden", promo);
@@ -4992,7 +5026,15 @@
     // Always-deny remembers a Tool's Capabilities: not offered on other
     // prompts (an MCP server, a harness change) (#764).
     $("modal-deny-always").classList.toggle("hidden", promo || !req.tool_id);
-    $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
+    for (const [id, key, label] of [
+      ["modal-approve", "y", promo ? "Approve" : "Always"],
+      ["modal-once", "o", "Allow once"], ["modal-session", "s", "This Session"],
+      ["modal-hour", "1", "For 1 hour"], ["modal-deny", "n", "Deny"],
+      ["modal-deny-always", "N", "Always deny"],
+    ]) {
+      $(id).replaceChildren(h("kbd", { "aria-hidden": "true" }, key), " " + tr(label));
+    }
+    $("modal-later").textContent = tr("Later");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
     openDialog($("modal-backdrop"), { trigger: focusBefore["modal-backdrop"],
@@ -5266,6 +5308,7 @@
       }
     }
     const req = head;
+    const sawHelp = req.kind !== "promotion" && !approvalHelpSeen();
     req.deciding = true;
     renderApproval();
     let result;
@@ -5294,7 +5337,10 @@
       const answers = (S.batchAnswers = S.batchAnswers || {})[req.batch.batch_id] = S.batchAnswers[req.batch.batch_id] || {};
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
-    prefs.set("seen.approvalHelp", true);
+    if (sawHelp) {
+      try { await rememberApprovalHelp(); }
+      catch (error) { note("Could not save the approval help preference (" + error.message + ")", true); }
+    }
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
@@ -7158,7 +7204,13 @@
       }
       case "status": {
         const status = await act({ type: "status" });
-        if (isSettingsConnection(connection)) S.status = status;
+        if (!isSettingsConnection(connection)) return;
+        const helpWasSeen = approvalHelpSeen();
+        S.status = status;
+        if (S.status && S.approvalHelpSeen !== true) {
+          S.approvalHelpSeen = typeof S.status.approval_help_seen === "boolean" ? S.status.approval_help_seen : null;
+        }
+        if (approvalHelpSeen() !== helpWasSeen) renderApproval();
         break;
       }
       case "descriptionReviews":
@@ -7242,6 +7294,7 @@
       S.sessionLoad = { id: S.current, status: "failed" };
     }
     S.approvals = [];
+    S.approvalHelpSeen = undefined;
     clearQuestions();
     S.running.clear();
     S.activity = null;
@@ -8413,6 +8466,10 @@
           S.others = (ev.clients || []).filter((c) => c.conn !== S.conn);
           scheduleEventRender({ status: true });
         }
+        break;
+      case "approval_help_seen":
+        S.approvalHelpSeen = true;
+        renderApproval();
         break;
       case "approval_closed": {
         const before = S.approvals.length;

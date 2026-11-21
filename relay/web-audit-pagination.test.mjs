@@ -15,18 +15,19 @@ function fixture() {
   const c = vm.createContext({
     S,
     $: () => ({ classList: { contains: () => false } }),
+    prefs: { get: (_key, fallback) => fallback },
     request(req) {
       if (req.type !== 'list_audit') return Promise.resolve([]);
       return new Promise((resolve, reject) => calls.push({ req, resolve, reject }));
     },
     act: async () => ({}),
     refreshDescriptionReviews: async () => {},
-    applyMotion() {}, applyLanguage() {}, renderView() {}, renderStatus() {},
+    applyMotion() {}, applyLanguage() {}, renderView() {}, renderStatus() {}, renderApproval() {},
   });
   vm.runInContext([
     'let auditRequest = null, auditOwner = null;',
     source.slice(source.indexOf('  const settingsLists ='), source.indexOf('  function settingsConnectionReady')),
-    ...['ownsAudit', 'loadAudit', 'settingsConnectionReady', 'isSettingsConnection',
+    ...['approvalHelpSeen', 'ownsAudit', 'loadAudit', 'settingsConnectionReady', 'isSettingsConnection',
       'refreshSettings', 'requestSettingsRefresh', 'drainSettingsRefresh', 'loadSettingsDomain'].map(fn),
   ].join('\n'), c);
   const ids = () => Array.from(S.audit || [], e => e.cursor);

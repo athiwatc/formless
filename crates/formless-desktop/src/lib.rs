@@ -28,6 +28,7 @@ pub mod session_export;
 pub mod session_usage;
 #[cfg(feature = "gui")]
 pub mod shell;
+pub mod slash;
 pub mod snapshot_guard;
 #[cfg(feature = "thai-breaks")]
 pub mod thai;
@@ -35,6 +36,7 @@ pub mod thai;
 pub mod theme;
 pub mod timeline;
 pub mod transcript;
+pub mod transcript_attachments;
 
 pub mod reading_positions;
 

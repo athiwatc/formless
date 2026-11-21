@@ -133,6 +133,21 @@ impl Shell {
             return;
         };
         let status = client.reference_status();
+        if let Status::Finished {
+            action,
+            outcome: Outcome::Removed | Outcome::Unknown,
+        } = &status
+        {
+            if self.client_identity() == Some((action.client, action.connection))
+                && self.sidebar.active_id() == Some(action.session_id.as_str())
+                && self.attachments.reference_operation != Some(action.operation)
+            {
+                self.attachments.reference_operation = Some(action.operation);
+                self.attachments.pending = None;
+                self.attachments.needs_refresh = true;
+                self.invalidate_forecast(cx);
+            }
+        }
         let Some(p) = self.session_editor.as_mut() else {
             return;
         };

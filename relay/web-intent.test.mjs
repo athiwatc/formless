@@ -23,7 +23,7 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, tr: text => text, S: { approvalHelpSeen: true, current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -35,7 +35,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
     const start = source.indexOf('  const BIDI =');
@@ -329,6 +329,36 @@ test('a stale approval response cannot be reported as an accepted denial', async
   c.S.approvals = [{ kind: 'tool', id: 'gone', tool_name: 'reader' }];
   await c.decide(false);
   assert.equal(c.S.approvals.length, 0); assert.equal(notes.some(x => x.startsWith('denied ')), false);
+});
+test('promotion leaves first approval help unseen and a confirmed ordinary decision saves it', async () => {
+  const sent = [], local = [];
+  const c = setup(['decide', 'onEvent'], {
+    request: async (req) => {
+      sent.push(req.type);
+      return req.type === 'acknowledge_approval_help' ? { approval_help_seen: true } : { resolved: true };
+    },
+    prefs: { get: () => false, set: (key) => local.push(key) },
+    renderApproval() {}, renderStatus() {}, note() {}, notifyFor() {},
+    isBroad: () => false, isRunning: () => false, pickedPaths: () => ({}),
+  });
+  c.S.approvalHelpSeen = false;
+  c.S.approvals = [{ kind: 'promotion', id: 'p', tool_name: 'draft' }];
+  await c.decide(true);
+  assert.deepEqual(sent, ['promotion_decision']);
+  assert.equal(c.approvalHelpSeen(), false);
+
+  c.S.approvals = [{ kind: 'tool', id: 'a', tool_name: 'reader' }];
+  await c.decide(true, 'once');
+  assert.deepEqual(sent, ['promotion_decision', 'approval_decision', 'acknowledge_approval_help']);
+  assert.equal(c.approvalHelpSeen(), true);
+  assert.deepEqual(local, []);
+
+  const peer = setup(['onEvent', 'approvalHelpSeen'], {
+    renderApproval() {}, notifyFor() {}, prefs: { get: () => false },
+  });
+  peer.S.approvalHelpSeen = false;
+  peer.onEvent({ type: 'approval_help_seen' });
+  assert.equal(peer.approvalHelpSeen(), true);
 });
 function node(tag, attrs, ...children) {
   const element = { tag, attrs: attrs || {}, children: [], parentNode: null, classList: { add() {} },

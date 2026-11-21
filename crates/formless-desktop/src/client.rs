@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc as queue, watch};
 
+pub mod attachments;
 mod delivery;
 #[cfg(test)]
 mod native_send_tests;
@@ -60,6 +61,7 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    AttachmentStaged(attachments::Outcome),
     DeleteUndo(crate::run_actions::DeleteUndo),
     RunActionTarget {
         owner: crate::run_actions::Owner,
@@ -231,6 +233,7 @@ pub enum Command {
         request: Request,
         label: String,
     },
+    StageAttachments(attachments::Operation),
     UndoDelete(uuid::Uuid),
     ReadRunAction {
         owner: crate::run_actions::Owner,
@@ -657,6 +660,7 @@ impl Client {
                 | Command::ReadSessionDetails { .. }
                 | Command::ReadModelCatalog { .. }
                 | Command::ReadPendingAttachments { .. }
+                | Command::StageAttachments(_)
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
@@ -833,6 +837,7 @@ enum Pending {
         run_job: bool,
         add: Option<(String, String)>,
     },
+    Attachment(Box<attachments::Work>),
     RunReconcile(Box<run_actions::Recovery>),
     RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
@@ -999,6 +1004,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    attachment_conversions: VecDeque<attachments::ClipboardJob>,
     run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
     reconciled_actions: Vec<Action>,
     delete_undo: Option<crate::run_actions::DeleteUndo>,
@@ -1576,6 +1582,7 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::StageAttachments(operation) => self.stage_attachments(operation),
             Command::UndoDelete(operation) => {
                 if let Some(ticket) = self
                     .delete_undo
@@ -1708,6 +1715,7 @@ impl Engine {
             return;
         }
         match command {
+            Command::StageAttachments(_) => unreachable!("handled by attachment dispatcher"),
             Command::UndoDelete(_) => unreachable!("handled by action dispatcher"),
             Command::ReadRunAction { .. }
             | Command::PrepareRunAction(_)
@@ -2302,7 +2310,6 @@ impl Engine {
                     }
                     if *mode == formless_protocol::SendMode::Queue
                         || content != &draft_basis
-                        || content.trim().is_empty()
                         || content.len() > crate::forecast::MAX_REVIEW_DRAFT_BYTES
                     {
                         self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"Queue attachment ownership is unavailable; Send/Steer require the exact draft within the native 64 KiB review limit. Use Formless TUI for Queue or larger messages".into()});
@@ -2670,6 +2677,7 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::Attachment(work) => self.attachment_reply(work, result),
             Pending::RunReconcile(recovery) => self.run_reconciled(*recovery, result),
             Pending::RestoreSession(ticket) => {
                 let acknowledged = response_ok
@@ -3549,9 +3557,15 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let flush_timer = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(flush_timer);
     let mut armed_deadline = None;
+    let mut attachment_conversions = tokio::task::JoinSet::new();
     loop {
         engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
         engine.sync_epoch(epoch.load(Ordering::Acquire));
+        if attachment_conversions.is_empty() {
+            if let Some(job) = engine.attachment_conversions.pop_front() {
+                attachment_conversions.spawn_blocking(move || job.convert());
+            }
+        }
         if *future_attempts {
             delivery.before_io(
                 tx,
@@ -3681,6 +3695,9 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 }
                 None => return Err("Daemon disconnected. Run state is unknown; reconnecting.".into()),
             },
+            Some(converted) = attachment_conversions.join_next(), if !attachment_conversions.is_empty() => {
+                engine.complete_clipboard_conversion(converted.map_err(|error| format!("Clipboard image conversion worker failed: {error}"))?);
+            }
             _ = tick.tick() => {
                 if last_poll.elapsed() >= Duration::from_secs(2) {
                     engine.dirty_session = true;
@@ -4102,6 +4119,74 @@ mod tests {
             serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap(),
         );
         assert!(engine.prepared.is_none());
+    }
+
+    #[test]
+    fn attachment_only_send_reviews_exact_inventory_and_rejects_empty_or_failed_reads() {
+        let attachment = json!({"id":"artifact","name":"image.png","path":"/artifacts/image","mime":"image/png","bytes":3,"future":{"kept":true}});
+        for inventory in [
+            Ok(json!({"session_id":"a","attachments":[attachment.clone()]})),
+            Ok(json!({"session_id":"a","attachments":[]})),
+            Err("inventory unavailable".to_string()),
+        ] {
+            let accepted = inventory
+                .as_ref()
+                .is_ok_and(|value| value["attachments"].as_array().unwrap().len() == 1);
+            let mut engine = ready();
+            engine.active = Some("a".into());
+            engine.command(Command::Review {
+                intent: Intent::SendMessage {
+                    session_id: "a".into(),
+                    content: String::new(),
+                    mode: SendMode::Send,
+                },
+                expected_run_id: None,
+                draft_basis: String::new(),
+                epoch: engine.epoch,
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(matches!(
+                request.request,
+                Request::ListPendingAttachments { .. }
+            ));
+            engine
+                .receive(match inventory {
+                    Ok(value) => ServerMessage::ok(request.id, value),
+                    Err(error) => ServerMessage::err(request.id, error),
+                })
+                .unwrap();
+            if accepted {
+                let request = engine.outgoing.pop_back().unwrap();
+                assert!(matches!(request.request, Request::ForecastRun { .. }));
+                respond(
+                    &mut engine,
+                    request.id,
+                    serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap(),
+                );
+                let prepared = engine
+                    .updates
+                    .iter()
+                    .find_map(|update| match update {
+                        Update::Prepared(prepared) => Some(prepared),
+                        _ => None,
+                    })
+                    .unwrap();
+                let id = prepared.id;
+                assert_eq!(
+                    prepared.attachments.as_ref().unwrap().expected(),
+                    vec![attachment.clone()]
+                );
+                engine.command(Command::ConfirmPrepared(id));
+                engine.command(Command::CommitPrepared(id));
+                assert!(engine.outgoing.iter().any(|request| matches!(&request.request, Request::SendReviewedMessage { content, expected_attachments, .. } if content.is_empty() && expected_attachments == &vec![attachment.clone()])));
+            } else {
+                assert!(engine.outgoing.is_empty());
+                assert!(engine
+                    .updates
+                    .iter()
+                    .any(|update| matches!(update, Update::PreparationFailed { .. })));
+            }
+        }
     }
 
     fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {

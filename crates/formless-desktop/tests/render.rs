@@ -5,6 +5,7 @@
 //! captures as PNG files for a human to look at. Without it the test only
 //! asserts that each state rendered something other than a flat fill, which
 //! is far short of a visual review.
+//! `FORMLESS_DESKTOP_RENDER_FILTER` selects state names containing the value.
 
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -25,7 +26,7 @@ mod render {
     use formless_desktop::timeline::TimelineBlock;
     use gpui_kit::assets::Assets;
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
-    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
     use gpui_kit::{
         point, px, size, AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity,
         Focusable as _, HeadlessAppContext, Pixels, ScrollDelta, Size, Window, WindowBounds,
@@ -76,7 +77,63 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 55] = [
+    const STATES: [State; 63] = [
+        state(
+            "transcript-attachments-normal-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("transcript-attachments"),
+            WHOLE,
+        ),
+        state(
+            "transcript-attachments-narrow-dark",
+            480.,
+            800.,
+            DARK,
+            100,
+            Some("transcript-attachments"),
+            WHOLE,
+        ),
+        state(
+            "attachments-normal-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("stage-attachments"),
+            WHOLE,
+        ),
+        state(
+            "attachments-narrow-dark",
+            480.,
+            800.,
+            DARK,
+            100,
+            Some("stage-attachments"),
+            WHOLE,
+        ),
+        state("slash-popup-light", 1440., 900., LIGHT, 100, None, WHOLE),
+        state("slash-popup-dark", 1440., 900., DARK, 100, None, WHOLE),
+        state(
+            "slash-popup-narrow-light",
+            480.,
+            900.,
+            LIGHT,
+            100,
+            None,
+            REFLOWED,
+        ),
+        state(
+            "slash-popup-narrow-dark-200pct",
+            480.,
+            900.,
+            DARK,
+            200,
+            None,
+            REFLOWED,
+        ),
         state(
             "queue-wide-light",
             1440.,
@@ -758,6 +815,28 @@ mod render {
             captures += 1;
         };
 
+        if name.starts_with("slash-popup-") {
+            cx.update_window(any, |_, window, cx| {
+                window.render_frame(cx);
+                let input = shell.read(cx).composer().clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("/", window, cx);
+                    input.focus(window, cx);
+                });
+                window.render_frame(cx);
+                assert!(window.find("slash-popup").visible());
+                window.press("down", cx);
+                window.render_frame(cx);
+                assert_eq!(window.find("slash-row-1").selected(), Some(true));
+                let popup = window.find("slash-popup").bounds();
+                assert!(popup.left() >= px(0.) && popup.right() <= viewport.width);
+                assert!(popup.bottom() <= window.find_by_label("Message").bounds().top());
+            })
+            .expect("slash popup renders with real fonts");
+            capture(&mut cx, "");
+            return captures;
+        }
+
         // With real fonts, before any overlay is opened over the shell.
         cx.update_window(any, |_, window, cx| {
             window.render_frame(cx);
@@ -1079,6 +1158,52 @@ mod render {
                             )
                             .unwrap();
                         shell.focus_section(PageSection::Conversation, window, cx);
+                    });
+                } else if control == "stage-attachments" || control == "transcript-attachments" {
+                    use formless_desktop::client::{attachments::Outcome, Command as WireCommand, Update};
+                    use formless_desktop::pending_files::Report;
+                    use serde_json::json;
+                    let sessions = fixture::sessions(3);
+                    let id = sessions[0].id.clone();
+                    shell.update(cx, |shell, cx| {
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection { ready: true, notice: "Connected attachment fixture".into() }, window, cx);
+                        shell.apply_client_update(Update::Sessions(sessions), window, cx);
+                    });
+                    window.render_frame(cx);
+                    if window.try_find(shell::session_row_id(&id)).is_none() {
+                        window.click("toggle-sidebar", cx);
+                        window.render_frame(cx);
+                    }
+                    window.click(shell::session_row_id(&id), cx);
+                    shell.update(cx, |shell, cx| {
+                        if control == "transcript-attachments" {
+                            let meta = json!({"attachments":[
+                                {"name":"desktop-composer-design.png","mime":"image/png","bytes":248312},
+                                {"name":"implementation-notes-and-follow-ups.md","mime":"text/markdown","bytes":4301},
+                                {"name":"workspace-reference","reference":true,"bytes":4096},
+                                {"name":"previous-design.png","mime":"image/png","bytes":10872,"expired":true}
+                            ]}).to_string();
+                            shell.apply_client_update(Update::Snapshot { generation:shell.client_generation(), snapshot:formless_desktop::replies::session_snapshot(&id, &json!({"session":{"id":id},"running":false,"messages":[
+                                {"id":"sent-message","session_id":id,"seq":1,"role":"user","content":"Please review the attached design and implementation notes.","created_at":"now","meta":meta}
+                            ]})).unwrap() }, window, cx);
+                            shell.focus_section(PageSection::Conversation, window, cx);
+                            return;
+                        }
+                        shell.apply_client_update(Update::Snapshot { generation: shell.client_generation(), snapshot: formless_desktop::replies::session_snapshot(&id, &json!({"session":{"id":id},"running":false,"messages":[]})).unwrap() }, window, cx);
+                        shell.attach_paths(vec!["/local/desktop-composer-design.png".into(), "/local/implementation-notes-and-follow-ups.md".into(), "/local/test-results.txt".into()], cx);
+                        let (client, connection) = shell.client_identity().unwrap();
+                        for command in shell.take_client_commands() {
+                            if let WireCommand::StageAttachments(operation) = command {
+                                let report = Report::decode(&id, json!({"session_id":id,"attachments":[
+                                    {"id":"image","name":"desktop-composer-design.png","mime":"image/png","bytes":248312,"path":"/artifacts/image"},
+                                    {"id":"notes","name":"implementation-notes-and-follow-ups.md","mime":"text/markdown","bytes":4301,"path":"/artifacts/notes"},
+                                    {"id":"results","name":"test-results.txt","mime":"text/plain","bytes":827,"path":"/artifacts/results"}
+                                ]})).unwrap();
+                                shell.apply_client_update(Update::AttachmentStaged(Outcome { client, connection, operation: operation.id, session_id: id.clone(), errors: vec![], pending: Ok(report) }), window, cx);
+                            }
+                        }
+                        shell.focus_section(PageSection::Composer, window, cx);
                     });
                 } else {
                     window.click(control, cx);
@@ -1957,10 +2082,16 @@ mod render {
 
     pub fn run() {
         let keep = std::env::var("FORMLESS_DESKTOP_RENDER_DIR").ok();
+        let filter = std::env::var("FORMLESS_DESKTOP_RENDER_FILTER").unwrap_or_default();
         let mut sizes = ControlSizes::new();
         let mut captures = 0;
-        let states = STATES.len();
-        for state in STATES {
+        let selected: Vec<_> = STATES
+            .into_iter()
+            .filter(|state| state.name.contains(&filter))
+            .collect();
+        assert!(!selected.is_empty(), "no render states matched");
+        let states = selected.len();
+        for state in selected {
             captures += draw_state(state, keep.as_deref(), &mut sizes);
         }
         println!("render: ok ({states} states, {captures} captures)");

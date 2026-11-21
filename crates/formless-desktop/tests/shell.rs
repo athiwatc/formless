@@ -13,6 +13,9 @@
 #[path = "support/production_overlay.rs"]
 mod production_overlay_tests;
 
+#[path = "support/attachments.rs"]
+mod attachment_tests;
+
 use std::time::{Duration, Instant};
 
 #[path = "support/archive.rs"]
@@ -43,6 +46,8 @@ mod run_inspection_tests;
 mod session_edit_tests;
 #[path = "support/session_fork.rs"]
 mod session_fork_tests;
+#[path = "support/slash.rs"]
+mod slash_tests;
 #[path = "support/usage.rs"]
 mod usage_tests;
 

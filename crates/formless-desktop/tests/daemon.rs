@@ -6,6 +6,7 @@
 mod credential_env;
 
 use formless_core::{Config, Paths};
+use formless_desktop::client::attachments::{Intake, Operation};
 use formless_desktop::client::{Client, Command, Endpoint, Update};
 use formless_desktop::model::{Destination, Intent};
 use formless_protocol::{
@@ -18,6 +19,111 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[path = "support/stream_ordering.rs"]
 mod stream_ordering;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_staging_real_file_refresh_and_detach() {
+    let _env = credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!(
+        "desktop-att-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    ));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut config = Config::default();
+    config.naming.enabled = false;
+    config.skills.auto_create = false;
+    config.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let session_id = daemon
+        .handle(Request::CreateSession {
+            name: Some("Attachment staging".into()),
+        })
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let serving = tokio::spawn(daemon.clone().serve());
+    #[cfg(unix)]
+    let endpoint = Endpoint(paths.socket_path());
+    #[cfg(windows)]
+    let endpoint = Endpoint(paths.pipe_name().into());
+    let client = Client::start(endpoint);
+    until(&client, "attachment connected", |u| {
+        matches!(u, Update::Connection { ready: true, .. })
+    })
+    .await;
+    let file = root.join("attachment.txt");
+    std::fs::write(&file, vec![b'x'; 300_000]).unwrap();
+    let upload = uuid::Uuid::new_v4();
+    client
+        .send(Command::StageAttachments(Operation {
+            id: upload,
+            session_id: session_id.clone(),
+            intake: Intake::Paths(vec![file]),
+        }))
+        .unwrap();
+    until(&client, "attachment staged", |u| match u {
+        Update::AttachmentStaged(outcome) if outcome.operation == upload => {
+            assert_eq!(outcome.session_id, session_id);
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            let report = outcome.pending.unwrap();
+            assert_eq!(report.rows.len(), 1);
+            assert_eq!(report.rows[0].name, "attachment.txt");
+            assert_eq!(report.rows[0].bytes, 300_000);
+            assert!(report.stored_id(0).is_some());
+            assert!(report.stored_id(1).is_none());
+            true
+        }
+        _ => false,
+    })
+    .await;
+    let inventory = daemon
+        .handle(Request::ListPendingAttachments {
+            session_id: session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let artifact = inventory["attachments"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let detach = uuid::Uuid::new_v4();
+    client
+        .send(Command::StageAttachments(Operation {
+            id: detach,
+            session_id: session_id.clone(),
+            intake: Intake::Detach { id: artifact },
+        }))
+        .unwrap();
+    until(&client, "attachment detached", |u| match u {
+        Update::AttachmentStaged(outcome) if outcome.operation == detach => {
+            assert_eq!(outcome.session_id, session_id);
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            let report = outcome.pending.unwrap();
+            assert!(report.rows.is_empty());
+            assert!(report.stored_id(0).is_none());
+            true
+        }
+        _ => false,
+    })
+    .await;
+    assert!(daemon
+        .handle(Request::ListPendingAttachments { session_id })
+        .await
+        .unwrap()["attachments"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    drop(client);
+    daemon.handle(Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_client_displays_provisional_answer_and_reasoning_before_persistence() {
@@ -131,6 +237,11 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::AttachmentStaged(outcome) => format!(
+                    "attachment staging {}: errors={}",
+                    outcome.session_id,
+                    outcome.errors.len()
+                ),
                 Update::RunActionTarget { result, .. } => {
                     format!("action target ok={}", result.is_ok())
                 }

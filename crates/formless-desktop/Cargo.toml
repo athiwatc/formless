@@ -75,6 +75,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"], 
 # are already in the lockfile through formless-protocol.
 serde = "1"
 serde_json = "1"
+base64 = "0.22"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "gif", "webp", "ico", "pnm"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 # Grapheme boundaries, so a restored selection never lands inside a
