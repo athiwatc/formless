@@ -49,7 +49,7 @@ fn normalized_endpoint(base: &str) -> String {
     }
 }
 
-fn display_endpoint(base: &str) -> String {
+pub(crate) fn display_endpoint(base: &str) -> String {
     match reqwest::Url::parse(base) {
         Ok(mut url) => {
             let _ = url.set_username("");

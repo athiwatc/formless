@@ -7,6 +7,9 @@ import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+test('web actions avoid native synchronous prompt and confirm calls', () => {
+  assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ''), /\b(?:prompt|confirm)\s*\(/);
+});
 const fn = (name) => {
   const start = source.search(new RegExp('  (?:async )?function ' + name + '\\('));
   assert.ok(start >= 0, name);
@@ -29,11 +32,29 @@ function setup(names, extras = {}) {
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
+  if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
+    vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
+  }
   const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('wrapped file mentions attach and highlight the same paths without matching email addresses', () => {
+  const c = setup(['mentionMatches', 'mentionsIn', 'withMentions', 'mentionAtCaret'], {
+    h: (tag, attrs, text) => ({ tag, attrs, text }),
+  });
+  const message = 'mail a@b.c, then `@src/main.rs` ([@README.md]) {@Cargo.toml} and @src/main.rs]}>';
+  assert.deepEqual([...c.mentionsIn(message)], ['src/main.rs', 'README.md', 'Cargo.toml']);
+  const parts = c.withMentions(message);
+  assert.equal(parts.map(part => typeof part === 'string' ? part : part.text).join(''), message);
+  assert.equal(parts.filter(part => typeof part === 'object').length, 4);
+  const input = c.$('input');
+  input.value = 'see [@src/';
+  input.selectionStart = input.value.length;
+  assert.equal(c.mentionAtCaret().query, 'src/');
+  assert.equal(c.mentionAtCaret().start, 5);
+});
 test('malformed fragment pairs preserve independently valid pairs and plus signs', () => {
   const c = setup(['hashParams'], { location: { hash: '' } });
   for (const hash of ['#k=%E0%A4%A', '#s=%', '#local=%zz', '#k=abc%&s=valid']) {
@@ -44,6 +65,19 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   }
   c.location.hash = '#k=a+b%3D&s=session';
   assert.equal(c.hashParams().k, 'a+b=');
+});
+
+test('Windows drive roots, home folders and credential paths use native separators', () => {
+  const c = setup(['broadWhy', 'pathNote', 'normalizeApprovalPath']);
+  for (const path of ['C:\\', 'c:/', 'D:\\Users', 'C:\\Users\\Ada', '\\\\?\\C:\\USERS\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), 'writing anywhere in your files', path);
+  }
+  for (const path of ['C:', 'C:Users\\Ada', 'C:\\Users\\Ada\\project', '/work\\Users\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), null, path);
+  }
+  assert.deepEqual(Array.from(c.pathNote('fs:read:C:\\Users\\Ada\\.SSH\\id_rsa', 'C:\\Users\\Ada')), [true, 'holds SSH keys']);
+  assert.deepEqual(Array.from(c.pathNote('fs:read:c:/Users/Ada/project/file', 'C:\\USERS\\Ada\\project\\')), [false, 'inside the working folder']);
+  assert.equal(c.pathNote('fs:read:c:/Users/Ada/project-other/file', 'C:\\Users\\Ada\\project')[0], true);
 });
 test('init and hashchange recover malformed links through pairing guidance', () => {
   for (const kind of ['init', 'hashchange']) {
@@ -157,6 +191,29 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
   assert.equal(c.$('input').value, 'B draft');
   assert.equal(vm.runInContext('attachmentDrafts.A', c), 'please read @file');
 });
+test('line citations queue files for review and report missing citations', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit', 'mentionMatches', 'mentionsIn'], {
+    isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    note: (message, failed) => notes.push({ message, failed }),
+    request: async (request) => {
+      calls.push(request);
+      if (request.path === 'src/main.rs:42:8') return { name: 'main.rs' };
+      throw new Error("no file '" + request.path + "'");
+    },
+  });
+  vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+  const draft = 'Compare @src/main.rs:42:8 with @missing.rs:4 and @someone';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls.map((request) => request.path), ['src/main.rs:42:8', 'missing.rs:4', 'someone']);
+  assert.equal(c.S.chips.A[0].name, 'main.rs');
+  assert.equal(c.$('input').value, draft);
+  assert.deepEqual(notes.filter((entry) => entry.failed).map((entry) => entry.message), [
+    "cannot attach @missing.rs:4: no file 'missing.rs:4'",
+  ]);
+});
+
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
@@ -987,6 +1044,40 @@ test('relay reconnect registers only existing push opt-in on the current authent
   await c.restorePushSubscription(ws);assert.equal(frames.length,1,'no existing opt-in creates no subscription');
 });
 
+test('relay reconnect skips a refused endpoint and a successful manual retry clears the refusal', async () => {
+  const endpoint = 'https://push.example/private';
+  const subscription = { endpoint, toJSON: () => ({ endpoint }) };
+  const frames = [], toasts = [];
+  const socket = () => ({
+    readyState: 1, addEventListener() {}, removeEventListener() {},
+    send: frame => frames.push(JSON.parse(frame)),
+  });
+  const c = setup(['restorePushSubscription', 'registerRelayPush', 'pushRefused'], {
+    navigator: { serviceWorker: { getRegistration: async () => ({
+      pushManager: { getSubscription: async () => subscription },
+    }) } },
+    toast: message => toasts.push(message),
+  });
+  const first = socket(), reconnect = socket();
+  Object.assign(c.S, { ws: first, room: 'room', channel: {}, daemonOnline: true });
+  await c.restorePushSubscription(first);
+  const pending = c.S.pushRegistration.settled;
+  c.pushRefused(first, { operation: 'subscribe', reason: 'invalid' });
+  await pending;
+  assert.equal(c.S.pushRegistration, null);
+  assert.match(toasts[0], /refused/);
+
+  c.S.ws = reconnect;
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 1);
+  c.registerRelayPush(reconnect, subscription, true);
+  assert.equal(frames.length, 2);
+  c.S.pushRegistration.finish(reconnect, 'accepted');
+  assert.equal(c.S.pushRefusal, null);
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 3);
+});
+
 test('Session selection pruning retains filter-hidden IDs and removes missing IDs', () => {
   const list=node('ul');
   const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession(){},sessionMenu(){},bulkSessions(){}});
@@ -1015,4 +1106,13 @@ test('Session selection pruning reads each loaded ID once for a large selection'
   c.renderSessions();
   assert.equal(c.S.marked.size,4000);
   assert.equal(reads,4000,'one loaded-ID index, independent of selected-ID count');
+});
+test('Pulumi credentials get an approval warning only under the Pulumi directory', () => {
+  const c = setup(['pathNote', 'normalizeApprovalPath']);
+  for (const path of ['/work/.PuLuMi/nested/Credentials.json', 'C:\\Users\\fixture\\.pulumi\\credentials.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds Pulumi credentials']);
+  }
+  for (const path of ['/work/credentials.json', '/work/.pulumi/stacks/dev.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [false, 'inside the working folder']);
+  }
 });

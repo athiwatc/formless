@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use formless_protocol::{Event, SessionInfo};
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState, Undo};
 use gpui_kit::component::label::Label;
@@ -158,8 +159,8 @@ const PALETTE_DESCRIPTION: &str = "Modal. Type to search, Up and Down to choose,
 /// property to set, so the behaviour is also stated in words.
 const MODAL_DESCRIPTION: &str =
     "Modal panel. Press Escape to close it and return to where you were.";
-const SESSION_ROW_HEIGHT: f32 = 44.0;
-const HEADER_HEIGHT: f32 = 44.0;
+const SESSION_ROW_HEIGHT: f32 = 56.0;
+const HEADER_HEIGHT: f32 = 56.0;
 const STATUS_HEIGHT: f32 = 28.0;
 /// How far an arrow key scrolls the inspector, at 100% text size.
 const INSPECTOR_LINE: f32 = 40.0;
@@ -756,6 +757,7 @@ pub struct Shell {
     client_snapshot_ready: bool,
     client_generation: u64,
     client_status: String,
+    live_overlay: crate::live_overlay::View,
     client_attention: bool,
     client_questions: crate::questions::State,
     question_panel: Option<questions::Panel>,
@@ -933,6 +935,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::theme::apply(cx);
         let mut sidebar = Sidebar::default();
         sidebar.replace(sessions, running, true);
         sidebar.select_index(0);
@@ -1017,6 +1020,7 @@ impl Shell {
             client_snapshot_ready: false,
             client_generation: 0,
             client_status: String::new(),
+            live_overlay: Default::default(),
             client_attention: false,
             client_questions: crate::questions::State::default(),
             question_panel: None,
@@ -1906,6 +1910,7 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.live_overlay = Default::default();
         self.retire_stream_view(cx);
         self.stream_view_latest = None;
         self.retire_invocations(
@@ -1925,7 +1930,7 @@ impl Shell {
         self.profile_search
             .retire("Profile attachment changed. Search again after connecting.");
         self.session_usage
-            .retire("Profile attachment changed. Read usage after selecting a Session.");
+            .retire("Select a Session to read recorded usage. Reads are never replayed.");
         if let Some(previous) = &self.client {
             previous.cancel_unsent_step();
         }
@@ -2137,6 +2142,7 @@ impl Shell {
     }
 
     fn client_select(&mut self, cx: &mut Context<Self>) {
+        self.live_overlay = Default::default();
         self.session_usage
             .retire("Session changed. Read recorded usage explicitly for the open Session.");
         self.invalidate_forecast(cx);
@@ -2204,6 +2210,7 @@ impl Shell {
             return;
         }
         self.reading_notice = None;
+        self.live_overlay = Default::default();
         let state = if snapshot.running {
             RunState::Running
         } else if snapshot
@@ -2242,8 +2249,16 @@ impl Shell {
         }
         self.client_steerable_run_id = snapshot.steerable_run_id.take();
         if !self.client_snapshot_ready {
-            self.client_status =
-                "Connected · canonical messages · live token streaming unavailable".into();
+            self.client_status = if self
+                .client
+                .as_ref()
+                .is_some_and(Client::future_attempt_validation)
+            {
+                "Connected · canonical messages · live token streaming unavailable"
+            } else {
+                "Connected · canonical history refreshed"
+            }
+            .into();
         }
         self.client_snapshot_ready = true;
         let prefix = self
@@ -2310,21 +2325,45 @@ impl Shell {
                 connection,
                 revision,
             } => self.approval_invalidated(client, connection, revision, cx),
+            ClientUpdate::LiveOverlay {
+                client,
+                connection,
+                generation,
+                session_id,
+                view,
+            } => {
+                if self.client_connected
+                    && generation == self.client_generation
+                    && self.sidebar.active_id() == Some(session_id.as_str())
+                    && self.client.as_ref().is_some_and(|current| {
+                        current.is_ready()
+                            && current.instance() == client
+                            && current.connection() == connection
+                    })
+                {
+                    self.live_overlay = view;
+                    cx.notify();
+                }
+            }
             ClientUpdate::Transcript(batch) => self.apply_stream_batch(batch, window, cx),
             ClientUpdate::Connection { ready, notice } => {
+                let was_connected = self.client_connected;
                 self.client_connected = ready;
                 self.client_status = notice;
                 if ready {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.live_overlay = Default::default();
                     self.client_steps = Default::default();
                     self.client_step_mode = None;
                     self.retire_stream_view(cx);
                     self.retire_invocations("Connection lost. Read Invocations explicitly after reconnecting; no read is replayed.");
                     self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
                     self.reset_comparison("Connection lost. Mark a pair again after reconnecting; no comparison is replayed.");
-                    self.session_usage.retire("Connection lost. Read usage explicitly after reconnecting; nothing was replayed.");
+                    if was_connected {
+                        self.session_usage.retire("Connection lost. Read usage explicitly after reconnecting; nothing was replayed.");
+                    }
                     if let Some(panel) = &mut self.session_editor {
                         panel.export.retire("Connection lost. Request another export after reconnecting; nothing was replayed.");
                     }
@@ -2733,6 +2772,7 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
+        self.live_overlay = Default::default();
         self.stream_view_owner = None;
         self.reading_notice = None;
         self.invalidate_source_view();
@@ -3496,6 +3536,7 @@ impl Shell {
                     ThemeMode::Dark
                 };
                 Theme::change(next, Some(window), cx);
+                crate::theme::apply(cx);
             }
             Command::IncreaseTextSize => {
                 self.set_text_scale_growing_window(self.text_scale.larger(), window, cx)
@@ -4106,6 +4147,7 @@ impl Shell {
             .aria_label(title.clone())
             .flex_1()
             .min_w_0()
+            .font_semibold()
             .truncate()
             .child(title);
         let controls = [
@@ -4142,7 +4184,7 @@ impl Shell {
             let entry = commands::entry(command, &self.commands);
             Button::new(id)
                 .small()
-                .ghost()
+                .outline()
                 .label(entry.label)
                 .tooltip(tooltip(&entry))
                 .track_focus(focus)
@@ -4162,6 +4204,7 @@ impl Shell {
             .flex_shrink_0()
             .px_3()
             .gap_2()
+            .bg(cx.theme().sidebar)
             .border_b_1()
             .border_color(cx.theme().border);
         if reflowed {
@@ -4176,7 +4219,14 @@ impl Shell {
                 .h(self.scaled(HEADER_HEIGHT))
                 .child(profile)
                 .child(title)
-                .children(controls)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .p_1()
+                        .rounded_lg()
+                        .bg(cx.theme().muted)
+                        .children(controls),
+                )
         }
     }
 
@@ -4237,15 +4287,24 @@ impl Shell {
             .border_r_1()
             .border_color(region_border(focused, cx.theme().sidebar_border, cx))
             .child(
-                readable(
-                    "session-count",
-                    format!("Sessions ({})", self.sidebar.rows().len()),
-                )
-                .px_3()
-                .py_2()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground),
+                h_flex().p_2().gap_2().flex_wrap()
+                    .child(readable("session-count", format!("Sessions ({})", self.sidebar.rows().len())).text_xs().flex_1().text_color(cx.theme().muted_foreground))
+                    .child(
+                    Button::new("sidebar-new-session")
+                        .small()
+                        .label("New session")
+                        .accessibility_label("New session")
+                        .primary()
+                        .disabled(self.client.is_none() || !self.client_connected)
+                        .tooltip(if self.client.is_some() { "Create a new Session in this Profile" } else { "Session creation requires a daemon connection" })
+                        .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::CreateSession, cx))),
+                ),
             )
+            .when(self.sidebar.rows().is_empty(), |panel| panel.child(
+                v_flex().p_3().gap_2()
+                    .child(readable("sessions-empty-title", "A fresh start").font_semibold())
+                    .child(readable("sessions-empty-help", if self.client.is_some() { "Create a Session above to start a conversation." } else { "No fixture Sessions. Connect to a daemon to start a conversation." }).text_sm().text_color(cx.theme().muted_foreground)),
+            ))
             .child(
                 div()
                     .id("session-list")
@@ -4320,6 +4379,10 @@ impl Shell {
             .h(self.scaled(SESSION_ROW_HEIGHT))
             .w_full()
             .px_3()
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|row| row.bg(cx.theme().muted))
+            .active(|row| row.bg(cx.theme().accent))
             .justify_center()
             .when(selected, |row| row.bg(cx.theme().accent))
             .when(active, |row| {
@@ -4331,7 +4394,13 @@ impl Shell {
                 this.sidebar.select_id(&session_id);
                 this.activate_selected(window, cx);
             }))
-            .child(div().text_sm().truncate().child(row.title.clone()))
+            .child(
+                div()
+                    .text_sm()
+                    .font_medium()
+                    .truncate()
+                    .child(row.title.clone()),
+            )
             .child(
                 div()
                     .text_xs()
@@ -4356,6 +4425,7 @@ impl Shell {
         let blocks = self.blocks.clone();
         let shell = cx.entity();
         let reading_width = self.scaled(tokens::READING_MAX);
+        let bubble_radius = self.scaled(crate::theme::SURFACE_RADIUS);
         let focused = self.conversation_focus.is_focused(window);
         let revision = self.block_copy_revision();
         let copy_stale = self.transcript_reload_needed().is_some();
@@ -4390,13 +4460,17 @@ impl Shell {
                     .map(|row| if reflowed { row.px_2() } else { row.px_4() })
                     .py_2()
                     .gap_1()
+                    .rounded(bubble_radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(if block.kind == BlockKind::User { cx.theme().accent } else { cx.theme().sidebar })
                     .child(
                         h_flex()
                             .flex_wrap()
                             .gap_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(Label::new(block.kind.label()))
+                            .child(Label::new(block.kind.label()).font_semibold())
                             .child({
                                 let shell = shell.clone();
                                 Button::new(SharedString::from(format!("block-{id}-copy-source")))
@@ -4588,13 +4662,15 @@ impl Shell {
                 readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions or Approvals for one complete supported Tool call; other decisions require Formless TUI.").text_sm().px_2().py_1()
             ))
             .when(self.client.is_some() && !self.client_snapshot_ready, |region| region.child(
-                readable("daemon-session-state", if self.sidebar.active_id().is_none() {
+                v_flex().p_4().gap_2().when(self.sidebar.active_id().is_none(), |view| view.child(
+                    readable("chat-empty-title", "What would you like to work on?").font_semibold()
+                )).child(readable("daemon-session-state", if self.sidebar.active_id().is_none() {
                     "Choose a Session from the sidebar or open Sessions to create one."
                 } else if self.transcript_source == TranscriptSource::NotLoaded {
                     "Loading the selected Session. Sending is unavailable until a canonical snapshot arrives."
                 } else {
                     "This is the last confirmed transcript. Current Run state is unknown; sending is unavailable until this Session reloads."
-                }).text_sm().px_2().py_1()
+                }).text_sm().text_color(cx.theme().muted_foreground))
             ))
             .child(
                 div()
@@ -4609,6 +4685,29 @@ impl Shell {
                     .when(reflowed, |area| area.child(self.wheel_to_page(cx)))
                     .child(timeline),
             )
+            .when(self.live_overlay.visible(), |region| {
+                region.child(
+                    v_flex()
+                        .id("production-live-overlay")
+                        .test_support()
+                        .w_full()
+                        .min_h_0()
+                        .max_h(self.scaled(200.))
+                        .overflow_y_scroll()
+                        .px_2()
+                        .gap_1()
+                        .child(readable("live-overlay-label", "Live preview · provisional since last refresh").text_xs())
+                        .when(self.live_overlay.unavailable, |view| view.child(readable("live-overlay-unavailable", "Live preview unavailable after skipped updates or size limit; reloading persisted history.").text_sm()))
+                        .when(!self.live_overlay.reasoning.is_empty(), |view| view.child(
+                            v_flex().text_color(cx.theme().muted_foreground)
+                                .child(readable("live-reasoning-label", "Reasoning (live preview)").text_xs())
+                                .child(readable("live-reasoning", crate::live_overlay::View::preview(&self.live_overlay.reasoning).to_owned()).text_sm())
+                        ))
+                        .when(!self.live_overlay.answer.is_empty(), |view| view.child(
+                            readable("live-assistant", crate::live_overlay::View::preview(&self.live_overlay.answer).to_owned()).text_sm()
+                        ))
+                )
+            })
             .when(!reflowed, |region| {
                 region.child(self.render_composer(false, cx))
             })
@@ -5703,6 +5802,7 @@ impl Shell {
             .gap_2()
             .border_t_1()
             .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
             .children(self.client_recovery.as_ref().map(|run| {
                 v_flex().id("run-recovery").test_support().role(Role::Group)
                     .aria_label("Run recovery").gap_2()
@@ -5718,7 +5818,7 @@ impl Shell {
                         .child(div().id("abandon-anchor").pt_1().anchor_scroll(Some(self.abandon_anchor.clone())).child(button("run-abandon", Command::AbandonRun, cx).outline().track_focus(&self.abandon_focus))))
             }))
             .child(
-                div().id("composer-input-anchor").key_context("FormlessComposer").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
+                div().id("composer-input-anchor").rounded(self.scaled(crate::theme::SURFACE_RADIUS)).bg(cx.theme().background).key_context("FormlessComposer").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
                     .aria_label("Message")
                     .on_paste({
                         let shell = cx.entity();
@@ -5790,7 +5890,7 @@ impl Shell {
             .track_scroll(&self.inspector_scroll)
             .p_3()
             .gap_3()
-            .child(readable("inspector-title", "Context").text_sm())
+            .child(readable("inspector-title", "Context").font_semibold())
             .child(detail(
                 "inspector-session",
                 "Session",
@@ -5967,7 +6067,6 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let reflowed = reflowed || self.client.is_some() || self.preferences.is_some();
         let intent = if self.client.is_some() {
             if let Some(receipt) = self.mode_notice() {
                 format!("{} · {}", self.client_status, receipt)
@@ -6042,6 +6141,7 @@ impl Shell {
             .flex()
             .flex_shrink_0()
             .px_3()
+            .bg(cx.theme().sidebar)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
