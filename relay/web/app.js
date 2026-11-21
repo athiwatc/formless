@@ -3984,7 +3984,7 @@
           turn.when = when;
           turn.timeContext = timeContext;
         }
-        const editable = msg && msg === lastUser && !isRunning();
+        const editable = msg && msg === lastUser && !isRunning() && !(S.topicsAvailable && currentTopicAttempt());
         if (editable && !turn.edit) {
           const entry = turn;
           turn.edit = h("button", { class: "btn ghost small edit", type: "button", title: "Edit and re-run (/edit)", onclick: () => beginEdit(entry.message) }, "Edit");
