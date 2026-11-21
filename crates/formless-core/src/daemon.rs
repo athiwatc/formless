@@ -44,6 +44,7 @@ const CLIENT_QUEUE: usize = 4096;
 /// Largest request line (an attachment's base64 plus room), enforced while
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
+const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
@@ -685,6 +686,8 @@ mod send_dedupe_tests;
 
 #[path = "reviewed_send.rs"]
 mod reviewed_send;
+#[path = "model_listing_health.rs"]
+mod model_listing_health;
 #[cfg(test)]
 #[path = "reviewed_send_tests.rs"]
 mod reviewed_send_tests;
@@ -814,8 +817,8 @@ pub struct Daemon {
     routing_log: StdMutex<std::collections::VecDeque<Value>>,
     model_test_cache: Arc<crate::model_test_cache::ModelTestCache>,
     routing_recorder: Arc<crate::routing_recorder::Recorder>,
-    /// Configured models the endpoints no longer list (SPEC §4.2).
-    missing_models: StdMutex<Vec<String>>,
+    /// Persistent evidence for configured model listings (SPEC §4.2).
+    model_listing_health: StdMutex<model_listing_health::State>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
@@ -912,9 +915,9 @@ pub struct Daemon {
     naming: Arc<tokio::sync::Semaphore>,
     /// One skill distillation at a time (SPEC §7.10).
     auto_skill: Arc<tokio::sync::Semaphore>,
-    /// Set while (or after a failed) naming-model download, so it is
-    /// attempted once per daemon lifetime.
-    model_download: Arc<AtomicBool>,
+    /// Held by the active model download. A failed attempt records the
+    /// next eligible retry time before releasing the lock.
+    model_download: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     /// Context windows the endpoints' `/models` listings report, per base
     /// URL then model id; a base URL is listed once per daemon (or again
     /// when the model picker lists it).
@@ -1041,6 +1044,10 @@ impl Daemon {
         let model_test_cache = Arc::new(crate::model_test_cache::ModelTestCache::new(
             paths.data_dir.join("model_tests.json"),
         ));
+        let model_listing_health = model_listing_health::State::load(&paths).unwrap_or_else(|error| {
+            tracing::warn!("could not read model listing state: {error:#}");
+            Default::default()
+        });
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -1091,7 +1098,7 @@ impl Daemon {
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             routing_recorder: Arc::new(crate::routing_recorder::Recorder::default()),
-            missing_models: StdMutex::new(Vec::new()),
+            model_listing_health: StdMutex::new(model_listing_health),
             step_sessions: StdMutex::new(Default::default()),
             step_waiters: StdMutex::new(Default::default()),
             run_tool_changes: StdMutex::new(Default::default()),
@@ -1128,7 +1135,7 @@ impl Daemon {
             http,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
-            model_download: Arc::new(AtomicBool::new(false)),
+            model_download: Default::default(),
             model_windows: StdMutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             build: build_id(),
@@ -1842,9 +1849,12 @@ impl Daemon {
                         |s| json!({"conn": s.conn, "queued": s.tx.max_capacity() - s.tx.capacity()})
                     )
                     .collect::<Vec<_>>());
+                let (missing, model_checked_at, model_checks_skipped) = self.model_listing_health.locked().report();
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
-                    "missing_models": *self.missing_models.locked(),
+                    "missing_models": missing,
+                    "model_listing_checked_at": model_checked_at,
+                    "model_listing_checks_skipped": model_checks_skipped,
                     "proxy": self.config().ok().and_then(|c| crate::provider::proxy_in_use(&c.provider)),
                     "resources": resources,
                     "protocol": PROTOCOL_VERSION,
@@ -1876,6 +1886,7 @@ impl Daemon {
                 });
                 Ok(json!({"shutting_down": true}))
             }
+            Request::DismissMissingModel { provider, model } => self.dismiss_missing_model(&provider, &model),
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,
             )?),
@@ -3176,7 +3187,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3219,17 +3230,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -3464,7 +3465,7 @@ impl Daemon {
                     "meta": meta,
                     "tests": tests,
                     "aliases": cfg.provider.aliases,
-                    "missing": *self.missing_models.locked(),
+                    "missing": self.model_listing_health.locked().warnings(),
                     "roles": roles,
                     "recent": recent,
                     "current": {"model": cfg.provider.model,
@@ -6541,7 +6542,10 @@ impl Daemon {
     }
 
     fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
-        if self.model_download.swap(true, Ordering::SeqCst) {
+        let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
+            return;
+        };
+        if retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
             return;
         }
         let this = self.clone();
@@ -6551,21 +6555,25 @@ impl Daemon {
                 spec.id,
                 spec.gguf_bytes / 1_000_000
             );
-            match namer::download(&this.paths, &spec).await {
-                Ok(()) => {
-                    tracing::info!("session-naming model {} installed", spec.id);
-                    this.model_download.store(false, Ordering::SeqCst);
-                    // Sessions titled by the heuristic while it downloaded
-                    // get a real title now (#871).
-                    let ids = this
-                        .with_reader(|st| st.provisionally_named_sessions(100))
-                        .unwrap_or_default();
-                    for id in ids {
-                        this.maybe_name_session(&id);
-                    }
-                }
-                // Stays set: no retry storm on every new Session.
-                Err(e) => tracing::warn!("session-naming model download failed: {e:#}"),
+            let result = tokio::select! {
+                _ = this.shutdown.cancelled() => return,
+                result = namer::download(&this.paths, &spec) => result,
+            };
+            if let Err(e) = result {
+                *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
+                tracing::warn!("session-naming model download failed: {e:#}");
+                return;
+            }
+            *retry_at = None;
+            drop(retry_at);
+            tracing::info!("session-naming model {} installed", spec.id);
+            // Sessions titled by the heuristic while it downloaded
+            // get a real title now (#871).
+            let ids = this
+                .with_reader(|st| st.provisionally_named_sessions(100))
+                .unwrap_or_default();
+            for id in ids {
+                this.maybe_name_session(&id);
             }
         });
     }
@@ -7538,8 +7546,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
@@ -9678,8 +9686,7 @@ impl Daemon {
     ) -> Result<crate::provider::ModelTest> {
         let policy = crate::probe_policy::ProbePolicy::default();
         let p = policy.run(self.provider_named(cfg, provider)).await??;
-        let model = p.settings().resolve_alias(model);
-        let t = p.test_model_scoped(&model, policy).await;
+        let t = p.test_model_scoped(model, policy).await;
         self.remember_model_test(&p.settings().base_url, &t)
             .context("model test completed, but its result could not be saved")?;
         Ok(t)
@@ -9736,76 +9743,6 @@ impl Daemon {
                 Ok(_) => {}
             }
         }))
-    }
-
-    /// Configured models (default, fallbacks, routing, Roles) missing from
-    /// their endpoint's `/models`, checked at start and daily (SPEC §4.2).
-    async fn check_models_loop(self: Arc<Self>) {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if let Ok(cfg) = self.config() {
-                let missing = self.missing_configured_models(&cfg).await;
-                if !missing.is_empty() && *self.missing_models.locked() != missing {
-                    self.broadcast(Event::Note {
-                        session_id: None,
-                        text: format!(
-                            "These configured models are no longer offered by their endpoint: {}. Pick others with /model or in Settings.",
-                            missing.join(", ")
-                        ),
-                    });
-                }
-                *self.missing_models.locked() = missing;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
-        }
-    }
-
-    async fn missing_configured_models(&self, cfg: &Config) -> Vec<String> {
-        let mut wanted: Vec<(Option<String>, String)> = Vec::new();
-        let p = &cfg.provider;
-        for m in std::iter::once(&p.model)
-            .chain(&p.fallback_models)
-            .chain(&p.routing_models)
-            .chain(&p.routing_fast_models)
-            .chain(&p.routing_strong_models)
-        {
-            wanted.push((None, p.resolve_alias(m)));
-        }
-        for r in cfg.roles.values() {
-            let Ok(pc) = cfg.provider_cfg(r.provider.as_deref()) else {
-                continue;
-            };
-            for m in std::iter::once(&r.model).chain(&r.candidates) {
-                wanted.push((r.provider.clone(), pc.resolve_alias(m)));
-            }
-        }
-        wanted.retain(|(_, m)| {
-            !m.is_empty() && !ProviderCfg::is_auto_model(m) && !m.starts_with("role:")
-        });
-        let mut missing = Vec::new();
-        let mut listed: HashMap<Option<String>, Option<Vec<String>>> = HashMap::new();
-        for (prov, m) in wanted {
-            if !listed.contains_key(&prov) {
-                let models = match self.provider_named(cfg, prov.as_deref()).await {
-                    Ok(pv) => {
-                        tokio::time::timeout(std::time::Duration::from_secs(15), pv.list_models())
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok())
-                            .filter(|l| !l.is_empty())
-                    }
-                    Err(_) => None,
-                };
-                listed.insert(prov.clone(), models);
-            }
-            // An endpoint that lists nothing (or failed) proves nothing.
-            if let Some(Some(list)) = listed.get(&prov) {
-                if !list.iter().any(|x| x == &m) && !missing.contains(&m) {
-                    missing.push(m);
-                }
-            }
-        }
-        missing
     }
 
     pub(crate) fn record_model_outcome(&self, model: &str, ok: bool, started: std::time::Instant) {
@@ -15737,6 +15674,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
@@ -17053,14 +16995,36 @@ fn call_failed(text: String) -> String {
     text
 }
 
-/// A stored tool message's meta: which call it answers, and whether it
-/// reports a failure (Anthropic `tool_result.is_error`).
+/// A stored tool message's meta: call identity and explicit outcome.
 pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    let mut meta = json!({"tool_call_id": call_id, "name": name});
-    if is_error {
-        meta["is_error"] = json!(true);
+    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn stored_tool_result_outcome_preserves_provider_projection() {
+    let mut message = formless_protocol::MessageInfo {
+        id: "result".into(),
+        session_id: "session".into(),
+        seq: 1,
+        role: "tool".into(),
+        content: r#"{"ok":false}"#.into(),
+        created_at: String::new(),
+        meta: Some(json!({"tool_call_id": "call", "name": "tool_name"}).to_string()),
+    };
+    let legacy_projection = crate::storage::provider_message(&message);
+    for is_error in [false, true] {
+        let meta = tool_result_meta("call", "tool_name", is_error);
+        let parsed: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
+        message.meta = Some(meta);
+
+        let mut expected = legacy_projection.clone();
+        if is_error {
+            expected["_is_error"] = json!(true);
+        }
+        assert_eq!(crate::storage::provider_message(&message), expected);
     }
-    meta.to_string()
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):
@@ -17259,18 +17223,34 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
         ".npmrc",
@@ -17279,14 +17259,19 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".terraformrc",
         "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
         || name.ends_with(".p12")
         || name.ends_with(".pfx");
@@ -18910,6 +18895,87 @@ mod mcp_approval_redaction_tests {
                 "denied review must not install or start code"
             );
         }
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod model_download_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Instant};
+
+    #[tokio::test]
+    async fn a_failed_naming_model_download_retries_after_cooldown() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::env::temp_dir().join(format!("fl-download-retry-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let weights = b"verified weights";
+        let app = axum::Router::new()
+            .route("/tokenizer", axum::routing::get(|| async { "{}" }))
+            .route(
+                "/weights",
+                axum::routing::get({
+                    let (calls, requested, release) =
+                        (calls.clone(), requested.clone(), release.clone());
+                    move || {
+                        let (requested, release) = (requested.clone(), release.clone());
+                        let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                        async move {
+                            if first {
+                                requested.notify_one();
+                                release.notified().await;
+                                (axum::http::StatusCode::SERVICE_UNAVAILABLE, b"".as_slice())
+                            } else {
+                                (axum::http::StatusCode::OK, weights.as_slice())
+                            }
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = ModelSpec {
+            id: "fixture",
+            tokenizer_url: Box::leak(format!("http://{addr}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(format!("{:x}", Sha256::digest(b"{}")).into_boxed_str()),
+            gguf_url: Box::leak(format!("http://{addr}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(format!("{:x}", Sha256::digest(weights)).into_boxed_str()),
+            gguf_bytes: weights.len() as u64,
+            ..namer::QWEN2_5_0_5B
+        };
+        let wait = Duration::from_secs(5);
+        daemon.spawn_model_download(spec);
+        timeout(wait, requested.notified()).await.unwrap();
+        daemon.spawn_model_download(spec);
+        let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
+        release.notify_one();
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.unwrap() >= earliest_retry);
+        assert!(!spec.installed(&paths));
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Move the retry deadline to the present without a real five-minute wait.
+        *retry_at = Some(Instant::now());
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(spec.installed(&paths));
+        drop(retry_at);
+        server.abort();
         drop(daemon);
         let _ = std::fs::remove_dir_all(base);
     }

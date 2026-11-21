@@ -55,7 +55,10 @@ fn recent_pool_is_bounded_and_not_balanced_by_outcome() {
     }
     let (pool, source_count, _) = st.replay_pool(&tool, 10).unwrap();
     assert_eq!(pool.len(), 10);
-    assert_eq!(source_count, 40, "only the fixed recent window is read");
+    assert_eq!(
+        source_count, 40,
+        "a full pool only reads the ordinary recent window"
+    );
     assert!(
         pool.iter().all(|group| group.item.recorded_success),
         "recent successes are not downsampled to balance failures"
@@ -66,6 +69,89 @@ fn recent_pool_is_bounded_and_not_balanced_by_outcome() {
     assert!(st.create_replay_snapshot(&tool, 1, 513, 50).is_err());
     assert!(st.create_replay_snapshot(&tool, 1, 10, 0).is_err());
 }
+#[test]
+fn duplicate_heavy_history_reaches_older_distinct_inputs_without_bias() {
+    let st = Store::open_in_memory().unwrap();
+    let tool = fixture(&st);
+    for input in 0..100 {
+        record(
+            &st,
+            &tool,
+            &json!({"older": input}).to_string(),
+            input % 2 == 0,
+        );
+    }
+    for input in 0..1000 {
+        record(
+            &st,
+            &tool,
+            &json!({"poll": input % 3}).to_string(),
+            input % 2 == 0,
+        );
+    }
+    let snapshot = st.create_replay_snapshot(&tool, 1, 200, 50).unwrap();
+    assert_eq!(snapshot.source_count, 1100);
+    assert_eq!(snapshot.excluded_count, 0);
+    assert_eq!(snapshot.holdout.len(), 51);
+    assert_eq!(snapshot.generation.len(), 52);
+    let (pool, count, _) = st.replay_pool(&tool, 40).unwrap();
+    assert_eq!(count, 1037);
+    assert_eq!(pool.len(), 40);
+    assert_eq!(pool[3].item.input, r#"{"older":99.0}"#);
+    assert_eq!(pool[39].item.input, r#"{"older":63.0}"#);
+    assert!(pool[..3].iter().all(|group| group.item.recorded_success));
+}
+
+#[test]
+fn duplicate_heavy_scan_stays_bounded_and_uses_the_recency_index() {
+    let st = Store::open_in_memory().unwrap();
+    let tool = fixture(&st);
+    let plan = st
+        .conn
+        .query_row(
+            &format!("EXPLAIN QUERY PLAN {REPLAY_POOL_SQL}"),
+            params![tool, MAX_INPUT as i64, MAX_SCAN_ROWS as i64],
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap();
+    assert!(
+        plan.contains("idx_inv_replay_recent") && !plan.contains("SCAN"),
+        "{plan}"
+    );
+    assert_eq!(
+        st.conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {REPLAY_POOL_SQL}"))
+            .unwrap()
+            .query_map(
+                params![tool, MAX_INPUT as i64, MAX_SCAN_ROWS as i64],
+                |row| { row.get::<_, String>(3) }
+            )
+            .unwrap()
+            .count(),
+        1,
+        "the query does not sort the Tool's history"
+    );
+    record(&st, &tool, &json!({"old": true}).to_string(), true);
+    let fill = |input: &str, count: usize, label: &str| {
+        st.ex(
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<?1)
+             INSERT INTO invocations(id,tool_id,version,status,input,created_at)
+             SELECT ?2 || n, ?3, 1, 'success', ?4, '' FROM seq",
+            params![count as i64, label, tool, input],
+        )
+        .unwrap();
+    };
+    fill("0", MAX_SCAN_ROWS + 1, "repeat-");
+    let (pool, count, excluded) = st.replay_pool(&tool, 2).unwrap();
+    assert_eq!((pool.len(), count, excluded), (1, MAX_SCAN_ROWS, 0));
+
+    let large = format!("\"{}\"", "a".repeat(MAX_INPUT - 2));
+    let additional = MAX_EXTENSION_BYTES / large.len();
+    fill(&large, additional + 9, "large-");
+    let (pool, count, excluded) = st.replay_pool(&tool, 2).unwrap();
+    assert_eq!((pool.len(), count, excluded), (1, additional + 8, 0));
+}
+
 #[test]
 fn canonical_input_groups_do_not_leak_or_inflate_and_split_ignores_outcomes() {
     let st = Store::open_in_memory().unwrap();

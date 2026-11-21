@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_RECORD_BYTES: usize = 3 * 1024 * 1024;
 pub(crate) const MAX_RECORDS: usize = 64;
+const MAX_MARKER_BYTES: usize = 4096;
+const MAX_OBJECT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -156,7 +158,7 @@ impl Manifest {
             .bytes
             .as_ref()
             .context("Cannot retain a missing file object")?;
-        if bytes.len() > (2 * 1024 * 1024usize) {
+        if bytes.len() > MAX_OBJECT_BYTES {
             bail!("Retained before-image exceeds its byte limit");
         }
         let mut record = Self {
@@ -192,11 +194,11 @@ impl Manifest {
         }
         RetainedToken::parse(self.token.id())?;
         self.owner.validate()?;
-        if self.before_base64.len() > (2 * 1024 * 1024usize).div_ceil(3) * 4 {
+        if self.before_base64.len() > MAX_OBJECT_BYTES.div_ceil(3) * 4 {
             bail!("Retained before-image exceeds its encoded limit");
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(&self.before_base64)?;
-        if bytes.len() > (2 * 1024 * 1024usize) {
+        if bytes.len() > MAX_OBJECT_BYTES {
             bail!("Retained before-image exceeds its decoded limit");
         }
         let image = decode_before_metadata(&self.before_metadata, Some(&bytes))?;
@@ -233,10 +235,17 @@ impl Manifest {
         }
         Ok(record)
     }
-    /// Reserve a full bounded mutable object, plus the immutable JSON bytes.
-    /// Hard-link writes by external actors cannot themselves be quota-enforced.
-    fn charge(&self) -> Result<u64> {
-        Ok(self.encode()?.len() as u64 + (2 * 1024 * 1024usize) as u64)
+    /// Reserve the immutable receipt and the payload it retains. Public hard
+    /// links can still grow, so they reserve the full bounded payload.
+    fn charge(&self, actual_bytes: u64) -> Result<u64> {
+        let receipt = self.encode()?.len() as u64;
+        let reserved = match self.kind {
+            RetentionKind::Link => MAX_OBJECT_BYTES,
+            RetentionKind::Move => base64::decoded_len_estimate(self.before_base64.len()),
+        };
+        receipt
+            .checked_add(actual_bytes.max(reserved as u64))
+            .context("Retained receipt and object byte charge overflow")
     }
 }
 
@@ -303,13 +312,13 @@ impl MissingMarker {
     fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
-        if bytes.len() > 4096 {
+        if bytes.len() > MAX_MARKER_BYTES {
             bail!("Missing-capture marker exceeds its byte bound");
         }
         Ok(bytes)
     }
     fn decode(bytes: &[u8], token: &RetainedToken, owner: Option<&RetainedOwner>) -> Result<Self> {
-        if bytes.len() > 4096 {
+        if bytes.len() > MAX_MARKER_BYTES {
             bail!("Missing-capture marker exceeds its byte bound");
         }
         let marker: Self = serde_json::from_slice(bytes)?;
@@ -318,11 +327,6 @@ impl MissingMarker {
             bail!("Missing-capture marker belongs to another snapshot");
         }
         Ok(marker)
-    }
-    /// Reserve the eventual created-image receipt/object BEFORE the Tool runs.
-    /// Upgrading this exact token never needs a second logical store slot.
-    fn charge(&self) -> u64 {
-        MAX_RECORD_BYTES as u64 + (2 * 1024 * 1024usize) as u64 + 4096
     }
 }
 
@@ -397,8 +401,8 @@ mod tests {
     fn manifests_bound_expiry_size_unknown_fields_and_reserved_live_bytes() {
         let record = record();
         assert_eq!(record.expires_at - record.created_at, RETENTION_SECONDS);
-        assert!(record.charge().unwrap() > (2 * 1024 * 1024usize) as u64);
-        assert!(record.charge().unwrap() < MAX_STORE_BYTES);
+        assert!(record.charge(0).unwrap() > MAX_OBJECT_BYTES as u64);
+        assert!(record.charge(0).unwrap() < MAX_STORE_BYTES);
         let mut bad = record.clone();
         bad.expires_at += 1;
         assert!(bad.encode().is_err());
@@ -429,6 +433,18 @@ mod tests {
         assert_eq!(MAX_RECORDS, 64);
     }
     #[test]
+    fn created_image_reserves_its_snapshot_and_observed_object_bytes() {
+        let mut record = record();
+        record.kind = RetentionKind::Move;
+        record.checksum = record.checksum().unwrap();
+        let receipt = record.encode().unwrap().len() as u64;
+        let image = image().bytes.unwrap().len() as u64;
+        assert!(record.charge(0).unwrap() >= receipt + image);
+        assert!(record.charge(0).unwrap() <= receipt + image + 2);
+        assert_eq!(record.charge(10_000).unwrap(), receipt + 10_000);
+    }
+
+    #[test]
     fn serializing_a_locator_does_not_recreate_its_runtime_expiry_lease() {
         let pin = std::sync::Arc::new(());
         let weak = std::sync::Arc::downgrade(&pin);
@@ -448,7 +464,7 @@ mod tests {
         let marker =
             MissingMarker::new(token.clone(), owner(), &ReviewImage::missing(), 123).unwrap();
         assert!(MissingMarker::decode(&marker.encode().unwrap(), &token, Some(&owner())).is_ok());
-        assert!(marker.charge() >= MAX_RECORD_BYTES as u64 + (2 * 1024 * 1024usize) as u64);
+        assert!(marker.encode().unwrap().len() <= MAX_MARKER_BYTES);
         assert!(MissingMarker::new(token.clone(), owner(), &image(), 123).is_err());
         let mut other = owner();
         other.path_digest = "c".repeat(64);
