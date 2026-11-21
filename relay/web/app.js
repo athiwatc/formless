@@ -492,13 +492,15 @@
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
-      const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
+      const credentialKey = k.endsWith("_PWD") || (!schemaRole && k.split("_").includes("KEY")) ||
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
       const credentialPart = k !== "SSH_AUTH_SOCK" && k.split(/[^A-Z0-9]+/).some((part) =>
         ["TOKEN", "TOKENS", "SECRET", "SECRETS", "PASSWORD", "PASSWORDS", "PASSWD",
           "CREDENTIAL", "CREDENTIALS", "PRIVATE", "AUTH", "AUTHORIZATION"].includes(part));
-      if (credentialKey || k.endsWith("_PAT") || credentialPart) {
+      if (credentialKey || k.endsWith("_PAT") ||
+          ["DATABASE_URL", "REDIS_URL", "MONGODB_URI"].includes(k) ||
+          credentialPart) {
         return "a secret from your environment";
       }
     }
@@ -513,9 +515,18 @@
     if (!m) return null;
     const { path, windows } = normalizeApprovalPath(m[2]);
     const seg = path.split("/").filter(Boolean);
+    const windowsPath = /^[a-z]:[\\/]|^\\\\/i.test(path);
+    const composer = (windowsPath ? path.split(/[\\/]/).filter(Boolean) : seg)
+      .slice(-3).map(part => (windowsPath ? part.split(":")[0] : part).toLowerCase());
+    if (composer.at(-1) === "auth.json" && (composer.at(-2) === ".composer" ||
+        (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
+    const pulumiWindowsPath = /^(?:[a-z]:|\\\\)/i.test(path);
+    const pulumiPath = (pulumiWindowsPath ? path.split(/[\\/]+/) : seg)
+      .filter(Boolean).map((part) => (pulumiWindowsPath ? part.split(":", 1)[0] : part).toLowerCase());
+    if (pulumiPath.at(-1) === "credentials.json" && pulumiPath.slice(0, -1).includes(".pulumi")) return [true, "holds Pulumi credentials"];
     if (seg[0] === "etc") return [true, "system configuration"];
     if (!cwd) return null;
     const c = cwd.replace(/\/+$/, "");
@@ -1688,17 +1699,28 @@
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
+  HL.scss = { ...HL.css, lc: ["//"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
-    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", less: "scss",
   };
+  function powershellQuoteEnd(code, from, quote) {
+    for (let i = from; i < code.length; i++) {
+      const c = code[i];
+      if ((quote === '"' && c === "`") || (c === quote && code[i + 1] === quote)) i++;
+      else if (c === quote) return i + 1;
+    }
+    return code.length;
+  }
+
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1709,16 +1731,22 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const toml = lang === "toml";
     const php = L === HL.php;
+    const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
     const out = [];
     let plain = "";
+    const powershell = L === HL.powershell;
     const tok = (cls, s) => {
       if (plain) { out.push(plain); plain = ""; }
       out.push(h("span", { class: cls }, s));
     };
     const word = /[\p{L}\p{N}_$]/u;
+    const yaml = lang === "yaml" || lang === "yml";
+    let yamlScalar = null;
     let i = 0;
     let lineStart = true;
+    const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
     while (i < code.length) {
       const c = code[i];
       if (L === HL.js && (c === "." || /\d/.test(c))) {
@@ -1742,9 +1770,29 @@
           continue;
         }
       }
+      if (yaml && lineStart) {
+        const newline = code.indexOf("\n", i);
+        const end = newline === -1 ? code.length : newline;
+        const line = code.slice(i, end);
+        if (yamlScalar) {
+          const indent = line.length - line.replace(/^ +/, "").length;
+          const blank = !line.trim();
+          if (blank || indent >= (yamlScalar.contentIndent ?? yamlScalar.headerIndent + 1)) {
+            if (!blank) yamlScalar.contentIndent ??= indent;
+            if (line) tok("tok-str", line);
+            if (newline !== -1) plain += "\n";
+            i = newline === -1 ? end : end + 1;
+            continue;
+          }
+        }
+        yamlScalar = yamlScalarHeader(line);
+      }
       if (lineStart && L.key) {
-        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
-        if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
+        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
+        const key = m?.[2].trim();
+        // A multiline TOML array value can start where a key normally would.
+        if (key && !(L.lc || []).some((p) => key.startsWith(p)) &&
+            (!toml || !/^(['"])\1\1/.test(key) && !/[^\t ]/.test(m[3]))) {
           plain += m[1];
           tok("tok-key", m[2]);
           i += m[0].length;
@@ -1760,8 +1808,25 @@
         i = stop;
         continue;
       }
+      if (powershell && c === "@" && (code[i + 1] === '"' || code[i + 1] === "'")) {
+        const newline = code.indexOf("\n", i + 2);
+        const lineEnd = newline === -1 ? code.length : newline;
+        if (!code.slice(i + 2, lineEnd).trim()) {
+          const end = code.indexOf("\n" + code[i + 1] + "@", lineEnd);
+          const stop = end === -1 ? code.length : end + 3;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
+      if (powershell && L.q.includes(c)) {
+        const stop = powershellQuoteEnd(code, i + 1, c);
+        tok("tok-str", code.slice(i, stop));
+        i = stop;
+        continue;
+      }
       const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
-        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]));
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]));
       if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
           (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
@@ -1772,13 +1837,32 @@
         i = stop;
         continue;
       }
-      if (L.q.includes(c)) {
-        let j = i + 1;
-        const multiline = c === "`" || L.mysqlComments;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
-          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+      if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
+        const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
+        if (opener) {
+          const delimiter = opener[0];
+          const closer = code.indexOf(delimiter, i + delimiter.length);
+          const stop = closer === -1 ? code.length : closer + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
         }
-        const stop = Math.min(j + 1, code.length);
+      }
+      if (L.q.includes(c)) {
+        const multiline = toml && code.startsWith(c.repeat(3), i);
+        const delimiter = multiline ? c.repeat(3) : c;
+        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
+        let j = i + delimiter.length;
+        while (j < code.length && !code.startsWith(delimiter, j) &&
+            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
+          j += code[j] === "\\" && escapes ? 2 : 1;
+        }
+        let stop = Math.min(j + delimiter.length, code.length);
+        // Include up to two quotes immediately before the TOML closing delimiter.
+        if (multiline) {
+          const trailing = stop + 2;
+          while (stop < trailing && code[stop] === c) stop++;
+        }
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
@@ -1801,7 +1885,15 @@
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;
         if (cls) tok(cls, w); else plain += w;
+        const previous = code[i - 1];
         i += w.length;
+        if (L === HL.scss && w.toLowerCase() === "url" && code[i] === "(" && previous !== "-") {
+          const url = /^\((?:\\[^\r\n]|[^\\()'"\r\n])*\)/.exec(code.slice(i));
+          if (url) {
+            plain += url[0];
+            i += url[0].length;
+          }
+        }
         continue;
       }
       plain += c;
@@ -1809,6 +1901,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function yamlScalarHeader(line) {
+    let rest = line.replace(/^ +/, "");
+    let headerIndent = line.length - rest.length;
+    while (/^-[ \t]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      rest = rest.replace(/^-[ \t]+/, "");
+    }
+    if (!/^[|>]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      let quote = rest[0] === "'" || rest[0] === '"' ? rest[0] : null;
+      let colon = -1;
+      for (let i = quote ? 1 : 0; i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if ((quote === '"' && c === "\\") || (quote === "'" && c === "'" && rest[i + 1] === "'")) i++;
+          else if (c === quote) quote = null;
+        } else if (c === "#" && (i === 0 || /\s/.test(rest[i - 1]))) {
+          break;
+        } else if (i > 0 && c === ":" && /[ \t]/.test(rest[i + 1] || "")) {
+          colon = i;
+          break;
+        }
+      }
+      if (colon === -1) return null;
+      rest = rest.slice(colon + 1).replace(/^[ \t]+/, "");
+    }
+    const match = /^[|>]([1-9][+-]?|[+-][1-9]?)?(?:[ \t]+(?:#.*)?)?\r?$/.exec(rest);
+    if (!match) return null;
+    const digit = match[1]?.match(/[1-9]/);
+    return { headerIndent, contentIndent: digit ? headerIndent + Number(digit[0]) : null };
   }
 
   function javascriptNumberEnd(code, start) {
@@ -2332,19 +2456,23 @@
       pre.textContent = text;
       sync();
     };
-    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
-      while (end < first.total_chars) {
-        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
-        if (!r) return;
-        text += r.text;
-        end = r.end;
+    const download = h("button", { class: "btn small", type: "button" }, "Download");
+    download.onclick = async () => {
+      download.disabled = true;
+      try {
+        const chunks = [text];
+        let offset = end;
+        while (offset < first.total_chars) {
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          if (!r) return;
+          chunks.push(r.text);
+          offset = r.end;
+        }
+        downloadBlob("artifact-" + id.slice(0, 8) + ".txt", new Blob(chunks, { type: "text/plain" }));
+      } finally {
+        download.disabled = false;
       }
-      pre.textContent = text;
-      sync();
-      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    } }, "Download");
+    };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
@@ -3480,10 +3608,18 @@
     if (!readingVisible()) return null;
     const box = $("transcript"), bounds = visibleReadingBounds();
     const origin = box.getBoundingClientRect().top;
-    const messages = [...box.querySelectorAll("[data-message-id], [data-live-root]")];
-    const visible = messages.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
+    // These are the first four eligible roots in DOM order, not necessarily
+    // inside the viewport. Skip the remaining rectangle reads, but keep the
+    // same lower bound and do not assume the roots are sorted by geometry.
+    const messages = [];
+    for (const node of box.querySelectorAll("[data-message-id], [data-live-root]")) {
+      const r = node.getBoundingClientRect();
+      if (!(r.height && r.bottom > bounds.top + 1)) continue;
+      messages.push(node);
+      if (messages.length === 4) break;
+    }
     const candidates = [];
-    for (const message of visible.slice(0, 4)) {
+    for (const message of messages) {
       const blocks = [...message.querySelectorAll(anchorBlocks)];
       const visibleBlocks = blocks.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
       let block = visibleBlocks[0] || message;
@@ -7179,7 +7315,9 @@
         (S.chips[sid] = S.chips[sid] || []).push(a);
         fresh.push(a.name);
       } catch (e) {
-        if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
+        if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(e.message)) {
+          note("cannot attach @" + path + ": " + e.message, true);
+        }
       }
     }
     if (fresh.length) {

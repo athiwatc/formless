@@ -63,6 +63,35 @@ fn host(policy: PathPolicy, allow: bool) -> Arc<ConsentHost> {
         paths: Mutex::new(Vec::new()),
     })
 }
+
+#[test]
+fn java_keystores_need_exact_consent_for_tool_reads() {
+    let f = Fixture::new();
+    let ops = host(PathPolicy::default(), false);
+    let code = "function run(input) { return fs.read(input.path); }";
+    let mut expected_paths = Vec::new();
+    for name in ["release.jks", "debug.KEYSTORE"] {
+        let path = f.0.join(name);
+        std::fs::write(&path, "private test placeholder").unwrap();
+        assert!(
+            execute(&f.request(code, &path), ops.clone()).is_err(),
+            "{name}"
+        );
+        expected_paths.push(path.canonicalize().unwrap());
+    }
+    for name in ["notes.txt", "keys.jks.txt", "debug.keystore.bak"] {
+        let path = f.0.join(name);
+        std::fs::write(&path, "ordinary test placeholder").unwrap();
+        assert_eq!(
+            execute(&f.request(code, &path), ops.clone())
+                .unwrap()
+                .output,
+            json!("ordinary test placeholder")
+        );
+    }
+    assert_eq!(*ops.paths.locked(), expected_paths);
+}
+
 #[test]
 fn input_bound_project_read_is_quiet_but_credentials_need_exact_consent() {
     let f = Fixture::new();
@@ -104,6 +133,32 @@ fn profile_denial_precedes_consent_and_broad_grants() {
     assert_eq!(std::fs::read_to_string(key).unwrap(), "fixture-secret");
 }
 #[test]
+fn p8_private_key_tool_reads_use_the_credential_gate() {
+    let f = Fixture::new();
+    let key = f.0.join("SigningKey.P8");
+    let notes = f.0.join("key.p8.txt");
+    std::fs::write(&key, "private test placeholder").unwrap();
+    std::fs::write(&notes, "ordinary test placeholder").unwrap();
+    let code = "function run(input) { return fs.read(input.path); }";
+    let request = f.request(code, &key);
+    let declining = host(PathPolicy::default(), false);
+    assert!(execute(&request, declining.clone()).is_err());
+    assert_eq!(*declining.paths.locked(), vec![key.canonicalize().unwrap()]);
+    assert_eq!(
+        execute(&f.request(code, &notes), declining.clone())
+            .unwrap()
+            .output,
+        json!("ordinary test placeholder")
+    );
+    assert_eq!(declining.paths.locked().len(), 1);
+    let mut smoke = request;
+    smoke.mode = HostMode::Smoke;
+    let approving = host(PathPolicy::default(), true);
+    assert!(execute(&smoke, approving.clone()).is_err());
+    assert!(approving.paths.locked().is_empty());
+}
+
+#[test]
 fn rename_cannot_launder_a_credential_when_snapshot_callback_is_noop() {
     let f = Fixture::new();
     let key = f.0.join("private.key");
@@ -130,6 +185,39 @@ fn smoke_and_replay_never_request_or_return_credential_bytes() {
         assert!(execute(&req, ops.clone()).is_err());
         assert!(ops.paths.locked().is_empty());
     }
+}
+
+#[test]
+fn apache_password_file_uses_existing_exact_read_consent() {
+    let f = Fixture::new();
+    let protected = f.0.join(".HTPASSWD");
+    let ordinary = f.0.join(".htpasswd.bak");
+    std::fs::write(&protected, "private test placeholder").unwrap();
+    std::fs::write(&ordinary, "ordinary test placeholder").unwrap();
+    let code = "function run(input) { return fs.read(input.path); }";
+    let declined = host(PathPolicy::default(), false);
+    let protected_read = f.request(code, &protected);
+    assert!(execute(&protected_read, declined.clone()).is_err());
+    assert_eq!(
+        *declined.paths.locked(),
+        vec![protected.canonicalize().unwrap()]
+    );
+    let allowed = host(PathPolicy::default(), true);
+    assert_eq!(
+        execute(&protected_read, allowed.clone()).unwrap().output,
+        json!("private test placeholder")
+    );
+    assert_eq!(
+        *allowed.paths.locked(),
+        vec![protected.canonicalize().unwrap()]
+    );
+    assert_eq!(
+        execute(&f.request(code, &ordinary), declined.clone())
+            .unwrap()
+            .output,
+        json!("ordinary test placeholder")
+    );
+    assert_eq!(declined.paths.locked().len(), 1);
 }
 
 #[test]

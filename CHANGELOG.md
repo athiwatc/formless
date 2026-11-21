@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `formless tools tag NAME` now reads the stored tags. Scripts that clear a
+  Tool's tags must pass `--clear`.
 - Cron day fields now follow Cronie’s leading-wildcard rule, including
   `*/N` and mixed lists beginning with `*`. This changes future computed
   matches and previews for affected existing expressions (for example,

@@ -72,7 +72,7 @@ def write_archive(bundle, executable, archive, epoch):
             info = zipfile.ZipInfo(source.relative_to(bundle.parent).as_posix(), date_time)
             info.create_system = 3
             info.compress_type = zipfile.ZIP_DEFLATED
-            mode = 0o755 if source == executable else 0o644
+            mode = 0o755 if source == executable or source == executable.parent / "formless" else 0o644
             info.external_attr = (stat.S_IFREG | mode) << 16
             with source.open("rb") as contents, target.open(info, "w") as entry:
                 shutil.copyfileobj(contents, entry)
@@ -346,6 +346,20 @@ def package(args):
     if binary is None or not binary.is_file():
         raise ValueError("Cargo did not report the desktop executable")
     verify_shipping_artifacts(metadata, built, root_features)
+    cli_binary = None
+    cli_command = None
+    if platform == "macos":
+        cli_command = ["cargo", "build", "--locked", "-p", "formless-bin", "--bin", "formless", "--message-format=json-render-diagnostics"]
+        if args.profile == "release":
+            cli_command.append("--release")
+        if args.offline:
+            cli_command.append("--offline")
+        for line in run(cli_command, repository).splitlines():
+            event = json.loads(line)
+            if event.get("reason") == "compiler-artifact" and event["target"]["name"] == "formless" and event.get("executable"):
+                cli_binary = Path(event["executable"])
+        if cli_binary is None or not cli_binary.is_file():
+            raise ValueError("Cargo did not produce the native CLI executable")
     ensure_source(repository, commit, dirty)
     with binary.open("rb") as source:
         magic = source.read(4)
@@ -362,12 +376,12 @@ def package(args):
     with tempfile.TemporaryDirectory(prefix="formless-package-", dir=output.parent) as temporary:
         stage = Path(temporary)
         if platform == "macos":
-            bundle = stage / "Formless Development.app"
+            bundle = stage / "Formless.app"
             executable = bundle / "Contents/MacOS/formless-desktop"
             resources = bundle / "Contents/Resources"
             executable.parent.mkdir(parents=True)
             resources.mkdir(parents=True)
-            info = {"CFBundleName": "Formless Development", "CFBundleDisplayName": "Formless Development",
+            info = {"CFBundleName": "Formless", "CFBundleDisplayName": "Formless",
                     "CFBundleIdentifier": "xyz.formless.desktop.development", "CFBundlePackageType": "APPL",
                     "CFBundleExecutable": executable.name, "CFBundleShortVersionString": version,
                     "CFBundleVersion": version.split("-")[0], "NSHighResolutionCapable": True}
@@ -383,6 +397,8 @@ def package(args):
             resources.mkdir()
             executable = bundle / ("formless-desktop.exe" if platform == "windows" else "formless-desktop")
         shutil.copy2(binary, executable)
+        if cli_binary is not None:
+            shutil.copy2(cli_binary, executable.parent / "formless")
         shutil.copyfile(repository / "LICENSE", resources / "LICENSE")
         shutil.copyfile(desktop / "README.md", resources / "README.md")
         upstream = desktop / "notices"
@@ -398,6 +414,9 @@ def package(args):
                       "native_acceptance": False,
                       "shipping_graph": graph,
                       "server_build_artifacts": [],
+                      "cli_binary_sha256": digest(executable.parent / "formless") if cli_binary else None,
+                      "cli_build_command": cli_command,
+                      "cli_notice_review_limitations": "CLI dependency notices are not collected; development use only" if cli_binary else None,
                       "upstream_notice_manifest_sha256": digest(upstream / "UPSTREAM.json") if (upstream / "UPSTREAM.json").is_file() else None,
                       "toolchain_notice_manifest_sha256": toolchain_manifest,
                       "archive_timestamp_source": "git commit time, UTC, normalized to ZIP range/granularity",

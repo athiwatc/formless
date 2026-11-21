@@ -6,6 +6,8 @@ use formless_protocol::{
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -69,6 +71,10 @@ mod attachment_expiry;
 #[path = "recap_storage.rs"]
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
+
+#[path = "forecast_report_storage.rs"]
+mod forecast_report_storage;
+pub(crate) use forecast_report_storage::ForecastMetricInput;
 
 pub struct Store {
     conn: Connection,
@@ -223,9 +229,7 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
 
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
-    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id)
     FROM runs WHERE id=?1";
 const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
 const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
@@ -265,6 +269,90 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
         if start > 0 { "…" } else { "" },
         core,
         if end < chars.len() { "…" } else { "" }
+    )
+}
+
+/// For multi-term searches, fit as many distinct word-prefix matches as
+/// possible into 100 original characters, plus ellipses. Match from the
+/// start of alphanumeric words with the app's accent-insensitive folding.
+/// Combining marks stay with the preceding word. SQLite still decides which
+/// rows match, using its own tokenizer.
+fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
+    const BUDGET: usize = 100;
+    let max_term_bytes = terms.keys().map(String::len).max().unwrap_or(0);
+    let mut counts = vec![0; terms.len()];
+    let mut covered = 0;
+    let mut window: VecDeque<(usize, usize, Vec<usize>)> = VecDeque::new();
+    let mut folded = String::new();
+    let mut best = ((0, Reverse(0), Reverse(0)), 0, 0, 0);
+    let mut word_start = None;
+    let chars = content.char_indices().chain([(content.len(), '\0')]);
+    for (end_char, (end_byte, ch)) in chars.enumerate() {
+        if ch.is_alphanumeric() {
+            word_start.get_or_insert((end_char, end_byte));
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(ch) {
+            continue;
+        }
+        let Some((start_char, start_byte)) = word_start.take() else {
+            continue;
+        };
+        if end_char - start_char > BUDGET {
+            continue;
+        }
+        folded.clear();
+        let mut matched = Vec::new();
+        for key in crate::fuzzy::fold_chars(&content[start_byte..end_byte]) {
+            if folded.len() + key.len_utf8() > max_term_bytes {
+                break;
+            }
+            folded.push(key);
+            if let Some(&id) = terms.get(&folded) {
+                matched.push(id);
+                covered += usize::from(counts[id] == 0);
+                counts[id] += 1;
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        window.push_back((start_char, start_byte, matched));
+        // Remove out-of-budget words and any redundant leading matches to
+        // find the shortest span with this coverage ending at this word.
+        while window.front().is_some_and(|(start, _, ids)| {
+            end_char - start > BUDGET || ids.iter().all(|&id| counts[id] > 1)
+        }) {
+            let (_, _, ids) = window.pop_front().unwrap();
+            for id in ids {
+                counts[id] -= 1;
+                covered -= usize::from(counts[id] == 0);
+            }
+        }
+        if let Some(&(start, from, _)) = window.front() {
+            let width = end_char - start;
+            let score = (covered, Reverse(width), Reverse(start));
+            if score > best.0 {
+                best = (score, from, end_byte, width);
+            }
+        }
+    }
+    let (_, from, to, width) = best;
+    let mut start = from;
+    let mut after = BUDGET - width;
+    for (index, _) in content[..from].char_indices().rev().take(after.min(40)) {
+        start = index;
+        after -= 1;
+    }
+    let end = content[to..]
+        .char_indices()
+        .nth(after)
+        .map_or(content.len(), |(index, _)| to + index);
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        content[start..end].replace('\n', " "),
+        if end < content.len() { "…" } else { "" }
     )
 }
 
@@ -1860,6 +1948,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// Newest transcript sequence without decoding any message bodies.
+    pub(crate) fn last_message_seq(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The same newest user row as reversing a Session transcript, including
+    /// empty content. Compare and retry need its identity, sequence, and text.
+    pub(crate) fn last_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, seq, content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Suggest-name prompt: the latest four nonblank user rows, in transcript
+    /// order. Step through a single SQL snapshot rather than materializing
+    /// unrelated messages or retaining unbounded user text.
+    pub(crate) fn recent_user_naming_input(&self, session_id: &str) -> Result<String> {
+        const LIMIT: usize = 4;
+        const MAX_CHARS: usize = 2000;
+        let mut stmt = self.ps(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let mut recent = Vec::with_capacity(LIMIT);
+        while recent.len() < LIMIT {
+            let Some(row) = rows.next()? else { break };
+            let text = row.get_ref(0)?.as_str()?;
+            if !text.trim().is_empty() {
+                recent.push(text.chars().take(MAX_CHARS).collect::<String>());
+            }
+        }
+        recent.reverse();
+        Ok(recent.join("\n").chars().take(MAX_CHARS).collect())
+    }
+
     /// One Session-scoped message, using the same row/metadata conversion as
     /// transcript reads. Unrelated rows are deliberately not decoded here.
     pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
@@ -2089,33 +2226,30 @@ impl Store {
         if let Some(phrase) = phrase {
             args.push(phrase.into());
         }
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-            ))
-        })?;
-        let needle = query
-            .split(|c: char| !c.is_alphanumeric())
-            .find(|w| !w.is_empty())
-            .unwrap_or(query)
-            .to_lowercase();
+        let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
+        let needle = search_words(query).next().unwrap_or(query).to_lowercase();
+        let mut terms = HashMap::new();
+        for word in search_words(query) {
+            let next = terms.len();
+            terms
+                .entry(crate::fuzzy::fold_chars(word).collect())
+                .or_insert(next);
+        }
         let mut hits = Vec::new();
-        for row in rows {
-            let (session_id, session_name, message_id, seq, role, content, created_at) = row?;
+        while let Some(row) = rows.next()? {
+            let content = row.get_ref(5)?.as_str()?;
             hits.push(SearchHit {
-                session_id,
-                session_name,
-                message_id,
-                seq,
-                role,
-                snippet: make_snippet(&content, &needle),
-                created_at,
+                session_id: row.get(0)?,
+                session_name: row.get(1)?,
+                message_id: row.get(2)?,
+                seq: row.get(3)?,
+                role: row.get(4)?,
+                snippet: if terms.len() > 1 {
+                    multi_term_snippet(content, &terms)
+                } else {
+                    make_snippet(content, &needle)
+                },
+                created_at: row.get(6)?,
             });
         }
         Ok(hits)
@@ -3221,10 +3355,10 @@ impl Store {
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(expected > 0
-            && expected == rows
-            && expected == known
-            && main >= self.run_steps(run_id)?)
+        Ok(
+            forecast_report_storage::covered_requests(expected, rows, known)
+                && main >= self.run_steps(run_id)?,
+        )
     }
 
     /// Check coverage for a branch's allocated Runs in one statement.
@@ -3314,13 +3448,23 @@ impl Store {
     }
 
     fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+        let Some(mut run) = self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
             "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-        }))).optional().map_err(Into::into)
+            "tool_calls":r.get::<_,i64>(9)?
+        }))).optional()? else {
+            return Ok(None);
+        };
+        let usage = self.run_usage(id)?;
+        // Preserve the signed SQLite totals already returned by GetRun.
+        run["prompt_tokens"] = serde_json::json!(usage.prompt_tokens as i64);
+        run["completion_tokens"] = serde_json::json!(usage.completion_tokens as i64);
+        run["cached_tokens"] = serde_json::json!(usage.cached_tokens);
+        run["cache_write_tokens"] = serde_json::json!(usage.cache_write_tokens);
+        run["reasoning_tokens"] = serde_json::json!(usage.reasoning_tokens);
+        Ok(Some(run))
     }
 
     pub fn run_metrics_for(
@@ -7770,14 +7914,15 @@ fn identifier_prefix_phrase(text: &str) -> Option<String> {
     terms.contains(' ').then(|| terms.replace(' ', " + "))
 }
 
+fn search_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 /// An FTS5 query from free text: each word quoted as a prefix term, all
 /// required. None when the text has no word characters.
 pub fn fts_query(text: &str) -> Option<String> {
-    let terms: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{w}\"*"))
-        .collect();
+    let terms: Vec<String> = search_words(text).map(|w| format!("\"{w}\"*")).collect();
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
@@ -8317,6 +8462,107 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}
+
+#[cfg(test)]
+mod narrow_transcript_tests {
+    use super::*;
+
+    fn assert_projection_matches_full(store: &Store, session: &str) {
+        let full = store.list_messages(session).unwrap();
+        assert_eq!(
+            store.last_message_seq(session).unwrap(),
+            full.last().map_or(0, |row| row.seq)
+        );
+        let last_user = full.iter().rev().find(|row| row.role == "user");
+        assert_eq!(
+            store.last_user_message(session).unwrap(),
+            last_user.map(|row| (row.id.clone(), row.seq, row.content.clone()))
+        );
+        let users: Vec<_> = full
+            .iter()
+            .filter(|row| row.role == "user" && !row.content.trim().is_empty())
+            .map(|row| row.content.as_str())
+            .collect();
+        let legacy = users[users.len().saturating_sub(4)..]
+            .join("\n")
+            .chars()
+            .take(2000)
+            .collect::<String>();
+        assert_eq!(store.recent_user_naming_input(session).unwrap(), legacy);
+    }
+
+    #[test]
+    fn narrow_transcript_reads_keep_unicode_cap_and_empty_latest_user() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let other = store.create_session(None).unwrap().id;
+        store
+            .append_message(&other, "user", "not this Session")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+        store
+            .append_message(&session, "assistant", "no user yet")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+
+        let long_user = "ก中".repeat(1800);
+        let long_tool = "unrelated tool output".repeat(120_000);
+        for (role, content) in [
+            ("user", "excluded oldest"),
+            ("assistant", "assistant"),
+            ("user", "oldest kept"),
+            ("user", "\t\n"),
+            ("user", long_user.as_str()),
+            ("tool", long_tool.as_str()),
+            ("user", "third kept"),
+            ("user", "\u{2003}\u{00A0}"),
+            ("user", "fourth kept"),
+            ("user", ""),
+            ("system-note", "last sequence is not the newest user"),
+        ] {
+            store.append_message(&session, role, content).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        let recent = store.recent_user_naming_input(&session).unwrap();
+        assert_eq!(recent.chars().count(), 2000);
+        assert!(recent.starts_with("oldest kept\nก中"));
+        assert!(store
+            .last_user_message(&session)
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
+
+    #[test]
+    fn narrow_transcript_reads_match_equal_sequences_in_both_directions() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        for (id, role, content) in [
+            ("old", "user", "discarded"),
+            ("z", "user", "first kept"),
+            ("y", "user", "second kept"),
+            ("x", "assistant", "ignored"),
+            ("w", "user", "third kept"),
+            ("v", "user", "last kept"),
+            ("u", "user", "\u{2003}"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at) VALUES(?1,?2,1,?3,?4,'fixture')",
+                params![id, session, role, content],
+            ).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        assert_eq!(
+            store.last_user_message(&session).unwrap(),
+            Some(("u".into(), 1, "\u{2003}".into()))
+        );
+        assert_eq!(
+            store.recent_user_naming_input(&session).unwrap(),
+            "first kept\nsecond kept\nthird kept\nlast kept"
+        );
     }
 }
 
