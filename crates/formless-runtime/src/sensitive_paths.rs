@@ -348,6 +348,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "_netrc"
             | ".htpasswd"
             | ".git-credentials"
+            | ".yarnrc"
+            | ".yarnrc.yml"
             | ".pgpass"
             | "pgpass.conf"
             | "credentials.tfrc.json"
@@ -399,6 +401,14 @@ mod tests {
             policy.classify(&project, &project).unwrap(),
             PathDecision::Ordinary
         );
+        for relative in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
         let note = root.join("project/ppk-notes.txt");
         assert_eq!(
             policy.classify(&note, &note).unwrap(),
@@ -416,6 +426,8 @@ mod tests {
             "Microsoft/Credentials/store",
             ".env",
             ".env.local",
+            ".yarnrc",
+            "project/.YARNRC.YML",
             "server.pem",
             "server.ppk",
             "identity.PPK",

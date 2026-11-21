@@ -44,6 +44,16 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn yarn_credentials_are_detected_for_attachment_warnings() {
+    for name in [".yarnrc", "project/.YARNRC.YML"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn java_keystores_are_credential_paths_by_suffix() {
     let project = std::env::temp_dir().join("formless-attachment-project");
     for name in ["release.jks", "debug.KEYSTORE"] {
