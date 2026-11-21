@@ -668,8 +668,8 @@ assert sys.stdin.readline() == ""
         .unwrap()
         .unwrap();
     if let Some(pid) = pid {
-        assert_eq!(result["status"], "failed", "{result}");
-        assert_eq!(result["summary"], "daemon is shutting down");
+        assert_eq!(result["status"], "cancelled", "{result}");
+        assert_eq!(result["summary"], "Muse Code run cancelled");
         wait_until(|| unsafe { libc::kill(pid, 0) } == -1).await;
         return;
     }

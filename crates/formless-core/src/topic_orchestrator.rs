@@ -637,11 +637,7 @@ impl Daemon {
                 bail!("Antigravity adapter not integrated yet; choose Claude or Codex")
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
-            HarnessKind::Muse => tokio::select! {
-                biased;
-                _ = self.shutdown.cancelled() => bail!("daemon is shutting down"),
-                result = local_harness::muse::run(request, handler, cancel) => result,
-            },
+            HarnessKind::Muse => local_harness::muse::run(request, handler, cancel).await,
         }
     }
 
