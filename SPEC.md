@@ -55,6 +55,12 @@ without redesign.
 
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).
   Optional `--profile <name>` runs an additional isolated daemon + data dir.
+- Local Pi harness runs stage their extension in an attempt-private directory.
+  `FORMLESS_PI_MCP_CONFIG` carries per-attempt MCP command metadata and
+  allow-listed environment-variable names; values of those named variables
+  remain in the child environment and are not serialized into this value.
+  `FORMLESS_TOPIC_CAPABILITY` is the per-attempt MCP capability token; it is
+  passed through the selected child environment, never command arguments.
 - Clients: TUI (v1 UI), CLI (§12), and any future frontend. Clients are thin:
   they render streamed events and send intents; they hold no authoritative
   state and can disconnect/reattach without losing work (daemon persists all
