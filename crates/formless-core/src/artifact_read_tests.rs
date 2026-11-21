@@ -529,13 +529,17 @@ fn topic_attachment_provenance_follows_nested_moves_and_topic_forks() {
 async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
-    let proposal = topic_fixture_proposal(&f, None);
+    let mut proposal = topic_fixture_proposal(&f, None);
     let topic = f.daemon().propose_topic_request(&proposal).unwrap();
     let topic = f
         .daemon()
         .with_store(|st| st.approve_topic(&topic.id))
         .unwrap();
-    let session = topic.topic_session_id.unwrap();
+    let parent=topic.topic_session_id.unwrap();
+    proposal.source_session_id=parent.clone();
+    let child=f.daemon().propose_topic_request(&proposal).unwrap();
+    let child=f.daemon().with_store(|st|st.approve_topic(&child.id)).unwrap();
+    let session=child.topic_session_id.unwrap();
     let cancel = CancellationToken::new();
     let flag = Arc::new(AtomicBool::new(false));
     let (steer_tx, _) = mpsc::unbounded_channel();
@@ -557,7 +561,7 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
         observed.cancelled().await;
         daemon.runs.locked().remove(&child);
     });
-    f.daemon().purge_session(&f.session).await.unwrap();
+    f.daemon().purge_session(&parent).await.unwrap();
     stopped.await.unwrap();
     assert!(cancel.is_cancelled());
     assert!(flag.load(Ordering::SeqCst));

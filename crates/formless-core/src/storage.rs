@@ -802,7 +802,14 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 71;
+pub const SCHEMA_VERSION: i64 = 72;
+
+#[path = "topic_schema_v72.rs"]
+mod topic_schema_v72;
+
+#[cfg(test)]
+#[path = "topic_schema_v72_tests.rs"]
+mod topic_schema_v72_tests;
 
 const SCHEMA_V71: &str = "
 CREATE TABLE IF NOT EXISTS profile_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -810,7 +817,7 @@ CREATE TABLE IF NOT EXISTS topics (
  id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
  workspace TEXT,workspace_kind TEXT NOT NULL,
  base_revision TEXT,outline TEXT NOT NULL DEFAULT '[]',
- source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ source_session_id TEXT NOT NULL,
  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,status TEXT NOT NULL,
  redirect_message_id TEXT,rejection_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_topics_status_updated ON topics(status,updated_at DESC);
@@ -936,7 +943,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 69] = [
+const MIGRATIONS: [(i64, MigrationStep); 70] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1269,6 +1276,7 @@ const MIGRATIONS: [(i64, MigrationStep); 69] = [
         Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
     }),
     (71, migrate_v71),
+    (72, topic_schema_v72::migrate),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2044,11 +2052,12 @@ impl Store {
         let descendants = self
             .conn
             .prepare(
-                "WITH RECURSIVE family(id) AS (SELECT id FROM sessions WHERE id=?1 UNION
+                "WITH RECURSIVE family(id) AS (SELECT ?1 UNION
                  SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
-                 WHERE s.session_kind IN ('topic','topic_attempt') UNION
-                 SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
-                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family",
+                 WHERE s.session_kind='topic_attempt' OR EXISTS(
+                   SELECT 1 FROM topics child JOIN topics parent ON child.parent_topic_id=parent.id
+                   WHERE child.topic_session_id=s.id AND parent.topic_session_id=f.id))
+                 SELECT id FROM family",
             )?
             .query_map([id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2061,6 +2070,7 @@ impl Store {
             let descendants=st.topic_session_family(id)?;
             let mut deleted=false;
             for session_id in descendants {
+                st.ex("DELETE FROM topics WHERE source_session_id=?1 AND status IN ('pending_approval','rejected')",params![session_id])?;
                 st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
                 st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
                 st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;
