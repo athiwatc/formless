@@ -692,6 +692,40 @@ mod tests {
             .allowed(Kind::Retry));
     }
     #[test]
+    fn acknowledged_compaction_is_retired_with_its_connection() {
+        let (mut e, ledger, d) = setup(Kind::Compact);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        e.receive(ServerMessage::ok(
+            request.id,
+            json!({"started":true,"up_to":1}),
+        ))
+        .unwrap();
+        assert!(e.compaction_pending("s"));
+        let mut retained = Retained {
+            compacting: e.compacting.clone(),
+            ..Default::default()
+        };
+        drop(e);
+        retained.retire_connection();
+        assert!(matches!(ledger.status(), Status::Applied(_)));
+        let e = Engine {
+            compacting: retained.compacting.clone(),
+            ..Default::default()
+        };
+        assert!(!e.compaction_pending("s"));
+        let target = e.action_target("s", &snapshot()).unwrap();
+        for kind in [Kind::Edit, Kind::Retry, Kind::Compact] {
+            assert!(target.allowed(kind));
+        }
+        retained.retire_connection();
+        assert!(e.outgoing.is_empty());
+    }
+    #[test]
     fn delete_undo_uses_the_receipt_window_exact_session_and_never_replays() {
         let (mut e, _, d) = setup(Kind::Delete);
         review(&mut e, d.clone(), false);

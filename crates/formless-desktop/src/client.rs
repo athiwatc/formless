@@ -3330,6 +3330,14 @@ struct Retained {
     uncertain: HashSet<Action>,
     forks: Arc<session_fork::Ledger>,
 }
+impl Retained {
+    fn retire_connection(&mut self) {
+        self.compacting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
 
 struct ConnectionState<'a> {
     ready: &'a AtomicBool,
@@ -3624,6 +3632,7 @@ async fn worker(
             }
         };
         ready.store(false, Ordering::Release);
+        retained.retire_connection();
         advance_epoch(&epoch);
         advance_epoch(&connection);
         advance_epoch(&stream_epoch);
