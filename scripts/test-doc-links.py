@@ -16,11 +16,11 @@ spec.loader.exec_module(links)
 ROOT = "https://github.com/athiwatc/formless"
 
 
-class NamingModelDocs(unittest.TestCase):
+class LocalNamingModelDocs(unittest.TestCase):
     def test_readme_weights_and_model_ids_match_catalogue(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "crates/formless-core/src/namer.rs").read_text(encoding="utf-8")
-        readme = (root / "README.md").read_text(encoding="utf-8")
+        readme = (root / "docs/architecture.md").read_text(encoding="utf-8")
         catalogue = re.search(r"(?m)^pub const MODELS: &\[ModelSpec\] = &\[([^\]]+)\];$", source)
         self.assertIsNotNone(catalogue, "model catalogue declaration missing")
         weights = {}
@@ -40,7 +40,7 @@ class NamingModelDocs(unittest.TestCase):
             megabytes = Decimal(int(size[1])) / 1_000_000
             weights[model_id[1]] = f"{megabytes:.2f}"
         section = re.search(r"(?ms)^#### Local naming models\n(.*?)(?=^#|\Z)", readme)
-        self.assertIsNotNone(section, "README model table missing")
+        self.assertIsNotNone(section, "Architecture model table missing")
         rows = re.findall(r"(?m)^\| `([^\n`]+)` \| [^|\n]+ \| [^|\n]+ \| (\d+\.\d{2}) MB \|", section[1])
         self.assertEqual(sorted(rows), sorted(weights.items()))
 
@@ -278,7 +278,7 @@ class NamingModelDocs(unittest.TestCase):
     def test_readme_weights_match_naming_catalogue(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "crates/formless-core/src/namer.rs").read_text(encoding="utf-8")
-        readme = (root / "README.md").read_text(encoding="utf-8")
+        readme = (root / "docs/architecture.md").read_text(encoding="utf-8")
         catalogue = re.search(r"^pub const MODELS: &\[ModelSpec\] = &\[([^\]]+)\];$", source, re.M)
         self.assertIsNotNone(catalogue, "No naming model catalogue found")
         expected = {}
@@ -296,12 +296,12 @@ class NamingModelDocs(unittest.TestCase):
             self.assertNotIn(model_id, expected)
             expected[model_id] = int(byte_count.replace("_", ""))
         section = re.search(r"^### Naming model catalogue\n(.*?)(?=^## |\Z)", readme, re.M | re.S)
-        self.assertIsNotNone(section, "No README naming model table found")
+        self.assertIsNotNone(section, "No architecture naming model table found")
         rows = re.findall(
             r"^\| `([^`]+)` \| [^|]+ \| [^|]+ \| ([\d,]+) \|", section.group(1), re.M,
         )
         actual = {model_id: int(byte_count.replace(",", "")) for model_id, byte_count in rows}
-        self.assertEqual(len(rows), len(actual), "Duplicate model IDs in README")
+        self.assertEqual(len(rows), len(actual), "Duplicate model IDs in architecture")
         self.assertTrue(expected, "Expected at least one model")
         self.assertEqual(actual, expected)
 

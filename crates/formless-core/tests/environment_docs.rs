@@ -25,9 +25,10 @@ fn references(dir: &Path, names: &mut BTreeSet<String>, pattern: &regex::Regex) 
 fn every_formless_environment_reference_in_crate_sources_is_documented() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let docs = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         std::fs::read_to_string(root.join("README.md")).unwrap(),
-        std::fs::read_to_string(root.join("SPEC.md")).unwrap()
+        std::fs::read_to_string(root.join("SPEC.md")).unwrap(),
+        std::fs::read_to_string(root.join("docs/usage.md")).unwrap()
     );
     let pattern = regex::Regex::new(r"\bFORMLESS_[A-Z0-9_]+\b").unwrap();
     let mut names = BTreeSet::new();
