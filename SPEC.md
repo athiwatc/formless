@@ -457,9 +457,10 @@ without redesign.
   of `Authorization: Bearer`, and `extra_headers` as before. The provider
   form (TUI Settings → Providers) has these as advanced fields and
   `formless providers add` takes `--header K=V`, `--query k=v`,
-  `--key-header H`. `--azure-resource R --azure-deployment D
-  [--api-version V]` builds Azure OpenAI's deployment URL, `api-version`
-  and the `api-key` header.
+  `--key-header H`. `--azure-resource R --azure-deployment D` accepts
+  a resource name, an Azure host, or an HTTPS endpoint. It configures
+  `/openai/v1` with the deployment as the model and the `api-key` header.
+  Supplying `--api-version V` selects the dated deployment-scoped API.
 - **Proxy.** `provider.proxy` sends the daemon's HTTP traffic (provider,
   relay, fetch) through that proxy, from daemon start; otherwise
   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` apply as usual. `formless

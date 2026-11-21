@@ -987,13 +987,13 @@ enum ProvidersAction {
         /// Provider API base URL; use --preset or Azure options instead when applicable
         #[arg(long, required_unless_present_any = ["preset", "azure_resource"])]
         base_url: Option<String>,
-        /// Azure OpenAI: the resource name (or its https://… endpoint)
+        /// Azure OpenAI resource name, host, or HTTPS endpoint
         #[arg(long, requires = "azure_deployment", conflicts_with_all = ["base_url", "preset"])]
         azure_resource: Option<String>,
         /// Azure OpenAI: the deployment name
         #[arg(long, requires = "azure_resource")]
         azure_deployment: Option<String>,
-        /// Azure OpenAI: the API version (default: the latest known)
+        /// Use the dated Azure deployment route with this API version (default: v1)
         #[arg(long, requires = "azure_resource")]
         api_version: Option<String>,
         /// Extra request header, `Key=Value` (repeatable)
@@ -6918,8 +6918,10 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
 }
 
 fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
-    formless_core::daemon::ensure_daemon(&paths)?;
-    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    let daemon = |req: Request| {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
     match action {
         ProvidersAction::List { json } => {
             let r = daemon(Request::ListProviders)?;
@@ -6971,17 +6973,33 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             let mut header_map = pairs(&headers, "--header")?;
             let mut query_map = pairs(&query, "--query")?;
             let mut key_header = key_header;
-            // Azure OpenAI: deployment URL, api-version and the api-key header.
+            let mut model = model;
             let azure_base = match (&azure_resource, &azure_deployment) {
-                (Some(r), Some(d)) => {
-                    let (base, q, header) =
-                        formless_core::presets::azure(r, d, api_version.as_deref())?;
-                    query_map.extend(q);
-                    key_header.get_or_insert(header.to_string());
+                (Some(resource), Some(deployment)) => {
+                    let (base, query, header) =
+                        formless_core::presets::azure(resource, deployment, api_version.as_deref())
+                            .map_err(|err| usage(err.to_string()))?;
+                    if api_version.is_none() {
+                        if model
+                            .as_deref()
+                            .is_some_and(|model| model != deployment.trim())
+                        {
+                            return Err(usage(
+                                "--model must match --azure-deployment with Azure v1",
+                            ));
+                        }
+                        if query_map.contains_key("api-version") {
+                            return Err(usage("use --api-version to select the dated Azure API"));
+                        }
+                    }
+                    query_map.extend(query);
+                    key_header.get_or_insert_with(|| header.to_owned());
+                    model.get_or_insert_with(|| deployment.trim().to_owned());
                     Some(base)
                 }
                 _ => None,
             };
+            let use_azure = azure_base.is_some();
             header_map.retain(|k, _| !k.is_empty());
             let preset = match preset.as_deref() {
                 Some(id) => Some(formless_core::presets::find(id).with_context(|| {
@@ -7032,7 +7050,7 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 model,
                 api_key,
                 headers: (!header_map.is_empty()).then_some(header_map),
-                query_params: (!query_map.is_empty()).then_some(query_map),
+                query_params: (use_azure || !query_map.is_empty()).then_some(query_map),
                 api_key_header: key_header,
             })?;
             println!("provider {name} saved; check it with `formless providers test {name}`");
