@@ -5630,7 +5630,10 @@ previous headless Run's Session.
 
   `--output-file PATH` leaves stdout empty and writes the selected completed
   output through a bounded private temporary file adjacent to PATH, followed
-  by an atomic replacement. Progress and errors remain on stderr. Invalid
+  by an atomic replacement. After writing and flushing the complete result,
+  the temporary file takes the destination's Unix access bits and group or
+  Windows DACL when a destination exists. New result files stay owner-only.
+  Progress and errors remain on stderr. Invalid
   schema output, a failed/paused/interrupted Run, timeout, output-size overflow
   or a write failure never replaces an existing destination with partial
   output. Selected output is limited to 8 MiB. No output destination is opened
