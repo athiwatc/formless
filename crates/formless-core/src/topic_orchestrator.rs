@@ -346,8 +346,8 @@ impl Daemon {
             topic_id: topic.id.clone(),
         });
         let handler = self.topic_interaction_handler(&attempt.id, &token)?;
-        let execution = self
-            .execute_topic_step(
+        let execution = {
+            let execution = self.execute_topic_step(
                 &topic,
                 feature,
                 &step,
@@ -358,8 +358,15 @@ impl Daemon {
                 &inputs,
                 handler.as_ref(),
                 &step_cancel,
-            )
-            .await;
+            );
+            tokio::pin!(execution);
+            let execution = tokio::select! {
+                biased;
+                _=cancel.cancelled()=>{step_cancel.cancel();execution.await},
+                result=&mut execution=>result,
+            };
+            execution
+        };
         let execution = handler.finish().and(execution);
         let (status, summary, outputs, harness_session) = match execution {
             Ok((result, outputs)) => {

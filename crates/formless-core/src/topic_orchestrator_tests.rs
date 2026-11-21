@@ -488,6 +488,53 @@ async fn topic_shutdown_cancels_live_step_token_and_harness() {
 }
 
 #[tokio::test]
+async fn topic_interrupt_run_stops_live_harness_and_releases_chat() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "hold");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    let server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Codex,
+        false,
+    )
+    .await;
+    f.daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_until(|| {
+        std::fs::read_to_string(f.root.join("pid"))
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .is_some()
+    })
+    .await;
+    let pid: i32 = std::fs::read_to_string(f.root.join("pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    f.daemon()
+        .handle(Request::InterruptRun {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f, &session).await;
+    wait_until(|| unsafe { libc::kill(pid, 0) } == -1).await;
+    assert!(f.daemon().topic_steps.locked().is_empty());
+    assert!(!f.daemon().shutdown.is_cancelled());
+    server.abort();
+}
+
+#[tokio::test]
 async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_are_step_failures() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
