@@ -7234,8 +7234,9 @@ No operation changes the source checkout or moves the user's branch.
 
 Directory Write and ReadOnly steps recursively copy the source into their
 private workspace; a selected Directory input becomes the starting copy.
-Copies skip .git, reject special files and symlinks escaping the source
-tree, and rewrite internal links to stay within the copy. File data copying
+Copies skip .git and reject special files, absolute symlink targets and
+targets escaping the source tree lexically. Relative internal links are
+preserved as-is, including dangling links. File data copying
 runs off the async executor and checks cancellation. The attempt area must
 be outside the source tree to avoid recursive/self-copying. Scratch steps
 get an empty private workspace. Directory Write automatically reports a

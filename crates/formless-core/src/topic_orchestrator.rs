@@ -6,6 +6,8 @@ use std::os::unix::{
     fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     process::CommandExt,
 };
+#[cfg(windows)]
+use std::os::windows::fs::FileTypeExt;
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -106,28 +108,32 @@ fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken)
             let target = target.join(entry.file_name());
             let kind = entry.file_type()?;
             if kind.is_symlink() {
-                let resolved = path.canonicalize()?;
-                let relative = resolved
-                    .strip_prefix(source_root)
-                    .context("directory symlink escapes the source tree")?;
-                let depth = target
+                let link = std::fs::read_link(&path)?;
+                let mut resolved = path
                     .parent()
-                    .context("missing copy parent")?
-                    .strip_prefix(target_root)?
-                    .components()
-                    .count();
-                let mut link = PathBuf::new();
-                for _ in 0..depth {
-                    link.push("..");
+                    .context("missing source parent")?
+                    .to_path_buf();
+                for component in link.components() {
+                    match component {
+                        std::path::Component::Normal(part) => resolved.push(part),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if !resolved.pop() {
+                                bail!("directory symlink escapes the source tree");
+                            }
+                        }
+                        std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                            bail!("directory symlink escapes the source tree: absolute targets are not allowed");
+                        }
+                    }
                 }
-                link.push(relative);
-                if link.as_os_str().is_empty() {
-                    link.push(".");
+                if !resolved.starts_with(source_root) {
+                    bail!("directory symlink escapes the source tree");
                 }
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&link, &target)?;
                 #[cfg(windows)]
-                if resolved.is_dir() {
+                if kind.is_symlink_dir() {
                     std::os::windows::fs::symlink_dir(&link, &target)?;
                 } else {
                     std::os::windows::fs::symlink_file(&link, &target)?;

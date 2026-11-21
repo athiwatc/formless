@@ -66,7 +66,7 @@ if mode in ('directory','directory_read','directory_merge'):
     else:
         assert pathlib.Path('seed.txt').exists()
         pathlib.Path('result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt').write_text(os.getcwd())
-        if pathlib.Path('absolute-link').exists():pathlib.Path('absolute-link').write_text('private copy')
+        if pathlib.Path('internal-link').exists():pathlib.Path('internal-link').write_text('private copy')
 if mode=='directory':
     gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
     gate.with_suffix('.ready').write_text(str(os.getpid()))
@@ -1525,7 +1525,7 @@ async fn topic_directory_writes_are_isolated_and_merge_receives_both_copies() {
     let source = f.root.join("source directory");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("seed.txt"), "source stays unchanged").unwrap();
-    std::os::unix::fs::symlink(source.join("seed.txt"), source.join("absolute-link")).unwrap();
+    std::os::unix::fs::symlink("seed.txt", source.join("internal-link")).unwrap();
     let topic = topic(&f, Some(source.clone()), true);
     assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
     std::fs::create_dir(source.join(".git")).unwrap();
@@ -1559,11 +1559,11 @@ async fn topic_directory_writes_are_isolated_and_merge_receives_both_copies() {
     for workspace in [&a, &b] {
         assert!(!workspace.join(".git").exists());
         assert_eq!(
-            std::fs::read_to_string(workspace.join("absolute-link")).unwrap(),
+            std::fs::read_to_string(workspace.join("internal-link")).unwrap(),
             "private copy"
         );
         assert!(workspace
-            .join("absolute-link")
+            .join("internal-link")
             .canonicalize()
             .unwrap()
             .starts_with(workspace));
@@ -1714,6 +1714,72 @@ async fn topic_directory_read_only_empty_and_symlink_escape_cases() {
     )
     .is_err());
     assert_eq!(std::fs::read_to_string(outside).unwrap(), "not copied");
+}
+
+#[tokio::test]
+async fn topic_directory_preserves_dangling_internal_links_and_rejects_lexical_escapes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    for (name, relative, accepted) in [
+        ("internal", Some("../build/./generated.txt"), true),
+        ("escape", Some("../../missing/generated.txt"), false),
+        ("absolute", None, false),
+    ] {
+        let source = f.root.join(name);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("links")).unwrap();
+        let link = relative
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.join("missing/generated.txt"));
+        std::os::unix::fs::symlink(&link, source.join("links/pending")).unwrap();
+        let topic = topic(&f, Some(source.clone()), false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let copied = attempt_workspace(&f, result["id"].as_str().unwrap()).join("links/pending");
+        if accepted {
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert!(std::fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_link(&copied).unwrap().as_os_str(),
+                link.as_os_str()
+            );
+            assert!(!copied.exists());
+        } else {
+            assert_eq!(result["status"], "failed", "{result}");
+            assert!(result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("symlink escapes"));
+            assert!(std::fs::symlink_metadata(&copied).is_err());
+        }
+        assert_eq!(
+            std::fs::read_link(source.join("links/pending"))
+                .unwrap()
+                .as_os_str(),
+            link.as_os_str()
+        );
+        assert!(!source.join("links/pending").exists());
+    }
 }
 
 #[tokio::test]
