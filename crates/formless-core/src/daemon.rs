@@ -17340,6 +17340,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || private_key_name
+        || name.ends_with(".p8")
         || name.ends_with(".pem")
         || name.ends_with(".ppk")
         || name.ends_with(".key")

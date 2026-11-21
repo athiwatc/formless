@@ -288,6 +288,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
             return Some("credential directory");
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
+            || name.ends_with(".p8")
             || name.ends_with(".pem")
             || name.ends_with(".ppk")
             || name.ends_with(".key")

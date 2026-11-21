@@ -91,6 +91,17 @@ fn types_come_from_the_bytes() {
     assert!(!formless_core::daemon::is_raster_image(&svg), "{svg}");
 }
 
+#[test]
+fn p8_private_keys_are_credential_paths_by_suffix() {
+    let project = std::env::temp_dir().join("formless-attachment-project");
+    for name in ["AuthKey_fixture.p8", "SigningKey.P8"] {
+        assert!(credential_path(&project.join(name)).is_some(), "{name}");
+    }
+    for name in ["key.p8.txt", "key.p8.bak", "notes.txt"] {
+        assert!(credential_path(&project.join(name)).is_none(), "{name}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn names_cannot_break_the_reference_line() {
     let (paths, sid) = setup("name");
