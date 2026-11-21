@@ -74,6 +74,8 @@ def check(page):
         ('OPENAIAPIKEY', 'hour'),
         ('ENCRYPTIONKEY', 'always'),
         ('HMACKEY', 'session'),
+        ('MYSQL_PWD', 'session'),
+        ('db_pwd', 'always'),
         ('PRIMARY_KEY_TOKEN', 'session'),
         ('SSH_AUTH_SOCK', 'hour'),
         ('DATABASE_URL', 'session'),
@@ -100,6 +102,11 @@ def check(page):
     assert labels.all_text_contents() == ['env:AWS_ACCESS_KEY_ID']
     click('once')
     decided('once')
+
+    queue('PWD', 'OLDPWD')
+    assert labels.count() == 0
+    click('always')
+    decided('always')
 
 
 def main():

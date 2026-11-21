@@ -803,7 +803,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "PARTITION_KEY"
         );
         // Preserve warnings for compact credential spellings as well.
-        let credential_key = !schema_role && k.split('_').any(|part| part == "KEY")
+        let credential_key = k.ends_with("_PWD")
+            || !schema_role && k.split('_').any(|part| part == "KEY")
             || [
                 "APIKEY",
                 "ACCESSKEY",
@@ -4240,6 +4241,8 @@ mod tests {
             "fs:write:/home/ada/",
             "fs:write:~",
             "env:GITHUB_TOKEN",
+            "env:MYSQL_PWD",
+            "env:db_pwd",
             "env:OPENAI_API_KEY",
             "env:DB_PASSWORD",
             "env:DATABASE_URL",
@@ -4254,6 +4257,8 @@ mod tests {
             "fs:write:/Users/ada/project",
             "fs:write:/tmp/out",
             "fs:read:/",
+            "env:PWD",
+            "env:OLDPWD",
             "env:HOME",
             "env:LANG",
             "env:PUBLIC_URL",
