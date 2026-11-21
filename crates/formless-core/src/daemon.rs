@@ -3721,6 +3721,7 @@ impl Daemon {
                     prompt: i64,
                     completion: i64,
                     cached: i64,
+                    cache_write: i64,
                     cost: Option<f64>,
                 }
                 let mut out: Vec<UsageBucket> = Vec::new();
@@ -3732,6 +3733,7 @@ impl Daemon {
                             bucket.prompt += p;
                             bucket.completion += c;
                             bucket.cached += cached;
+                            bucket.cache_write += cw;
                             bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
                         None => out.push(UsageBucket {
@@ -3740,12 +3742,15 @@ impl Daemon {
                             prompt: p,
                             completion: c,
                             cached,
+                            cache_write: cw,
                             cost: price,
                         }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
+                    out.sort_by_key(|bucket| {
+                        std::cmp::Reverse(i128::from(bucket.prompt) + i128::from(bucket.completion))
+                    });
                 }
                 Ok(json!(out
                     .into_iter()
@@ -3753,7 +3758,8 @@ impl Daemon {
                         let mut row = json!({
                             "key": bucket.label.as_deref().unwrap_or(&bucket.key),
                             "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
-                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                            "cached_tokens": bucket.cached, "cache_write_tokens": bucket.cache_write,
+                            "cost": bucket.cost,
                         });
                         if bucket.label.is_some() {
                             row["session_id"] = json!(bucket.key);
@@ -4266,6 +4272,8 @@ impl Daemon {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
                         run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
                     }
+                } else {
+                    run["spend_error"] = json!("configuration could not be loaded");
                 }
                 Ok(run)
             }
@@ -17334,11 +17342,15 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || private_key_name
+        || name.ends_with(".p8")
         || name.ends_with(".pem")
         || name.ends_with(".ppk")
         || name.ends_with(".key")
+        || name.ends_with(".jks")
+        || name.ends_with(".keystore")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
     if formless_protocol::is_pulumi_credentials_path(path) {
         return Some("a Pulumi credentials file");
     }
