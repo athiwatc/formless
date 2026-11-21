@@ -6,6 +6,15 @@ use serde_json::{json, Value};
 use crate::storage::Store;
 use formless_protocol::ToolInfo;
 
+pub const TOPIC_RUN_STEP: &str = "topic_run_step";
+pub const TOPIC_ANSWER_QUESTION: &str = "topic_answer_question";
+pub const TOPIC_WAIT: &str = "topic_wait";
+pub const TOPIC_LIST_CONVERSATIONS: &str = "topic_list_conversations";
+pub const TOPIC_READ_CONVERSATION: &str = "topic_read_conversation";
+pub const TOPIC_SEARCH_CONVERSATIONS: &str = "topic_search_conversations";
+pub const TOPIC_COMPLETE_FEATURE: &str = "topic_complete_feature";
+pub const TOPIC_FAIL_FEATURE: &str = "topic_fail_feature";
+
 pub const CREATE_TOOL: &str = "create_tool";
 pub const CREATE_MODULE: &str = "create_module";
 /// Not a built-in any more (sub-agents are the `agent` Capability), but
@@ -39,7 +48,11 @@ pub const UPDATE_PLAN: &str = "update_plan";
 /// Most steps a plan may have, and longest step text.
 pub const MAX_PLAN_ITEMS: usize = 20;
 pub const MAX_PLAN_TEXT: usize = 200;
-pub const RESERVED: [&str; 26] = [
+pub const RESERVED: [&str; 34] = [
+    TOPIC_WAIT,
+    TOPIC_LIST_CONVERSATIONS,
+    TOPIC_READ_CONVERSATION,
+    TOPIC_SEARCH_CONVERSATIONS,
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -66,6 +79,10 @@ pub const RESERVED: [&str; 26] = [
     READ_METRICS,
     RUN_SCRIPT,
     UPDATE_PLAN,
+    TOPIC_RUN_STEP,
+    TOPIC_ANSWER_QUESTION,
+    TOPIC_COMPLETE_FEATURE,
+    TOPIC_FAIL_FEATURE,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -932,8 +949,34 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
 }
 
 /// The built-in tools' definitions, as listed to the model.
+fn topic_step_definition() -> Value {
+    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Launch one independent harness step asynchronously; returns attempt_id and conversation_session_id immediately. Use topic_wait for results and pending interactions. One step per feature may run at a time. Inputs must be exact artifacts from this feature's outputs. Never merge or push.","parameters":{
+        "type":"object","properties":{"feature_id":{"type":"string"},"title":{"type":"string"},"instructions":{"type":"string"},"harness":{"type":"string","enum":["claude","codex","pi","opencode","antigravity","acp","muse"]},"acp_agent":{"type":"string"},"model":{"type":"string"},"access":{"type":"string","enum":["read_only","write"]},"inputs":{"type":"array","items":{"type":"object"}}},
+        "required":["feature_id","title","instructions","harness","access"],"additionalProperties":false}}})
+}
+fn topic_feature_definition(name: &str, field: &str) -> Value {
+    json!({"type":"function","function":{"name":name,"description":"Finish a topic feature explicitly after considering the step results. No merge or push is performed.","parameters":{
+        "type":"object","properties":{"feature_id":{"type":"string"},(field):{"type":"string"}},"required":["feature_id",field],"additionalProperties":false}}})
+}
+fn topic_context_definition(name: &str, field: Option<&str>) -> Value {
+    let parameters = match field {
+        Some(field) => {
+            json!({"type":"object","properties":{(field):{"type":"string"}},"required":[field],"additionalProperties":false})
+        }
+        None => json!({"type":"object","properties":{},"additionalProperties":false}),
+    };
+    json!({"type":"function","function":{"name":name,"description":"Read or search the topic branch's canonical conversations. Other contexts require the user's explicit context-access setting.","parameters":parameters}})
+}
 pub fn builtin_definitions() -> Vec<Value> {
     vec![
+        json!({"type":"function","function":{"name":TOPIC_WAIT,"description":"Wait for the next finished attempt, harness question or informational user-only permission notice. Answer harness questions only with a basis through topic_answer_question. Permissions cannot be decided by the model. With no active work, or after a timeout, returns a status snapshot.","parameters":{"type":"object","properties":{"attempt_ids":{"type":"array","items":{"type":"string"}},"timeout_secs":{"type":"integer","minimum":1,"maximum":600,"default":600}},"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":TOPIC_ANSWER_QUESTION,"description":"Answer a pending harness question using a quote or reference to a user's message or decision as basis. User-only questions and permissions cannot be answered by the model.","parameters":{"type":"object","properties":{"question_id":{"type":"string"},"answers":{"type":"array","items":{"type":"object","properties":{"selected":{"type":"array","items":{"type":"string"}},"text":{"type":"string"}}}},"basis":{"type":"string","minLength":1}},"required":["question_id","answers","basis"],"additionalProperties":false}}}),
+        topic_step_definition(),
+        topic_context_definition(TOPIC_LIST_CONVERSATIONS,None),
+        topic_context_definition(TOPIC_READ_CONVERSATION,Some("session_id")),
+        topic_context_definition(TOPIC_SEARCH_CONVERSATIONS,Some("query")),
+        topic_feature_definition(TOPIC_COMPLETE_FEATURE,"summary"),
+        topic_feature_definition(TOPIC_FAIL_FEATURE,"reason"),
         create_tool_definition(),
         create_module_definition(),
         retire_tool_definition(),
@@ -1212,6 +1255,27 @@ fn definitions(
         .map(|t| t.name.to_lowercase())
         .collect();
     let mut defs = builtin_definitions();
+    if !session_id
+        .map(|id| store.is_topic_orchestrator(id))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        defs.retain(|definition| {
+            !matches!(
+                definition["function"]["name"].as_str(),
+                Some(
+                    TOPIC_RUN_STEP
+                        | TOPIC_WAIT
+                        | TOPIC_ANSWER_QUESTION
+                        | TOPIC_COMPLETE_FEATURE
+                        | TOPIC_FAIL_FEATURE
+                        | TOPIC_LIST_CONVERSATIONS
+                        | TOPIC_READ_CONVERSATION
+                        | TOPIC_SEARCH_CONVERSATIONS
+                )
+            )
+        });
+    }
     let trusted_builtins = defs.len();
     // Read after membership writes, and use keyed lookup only: shown still
     // controls order. A failed batch must not make every snapshot look absent.

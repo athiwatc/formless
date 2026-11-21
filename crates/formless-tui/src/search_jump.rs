@@ -101,6 +101,7 @@ mod tests {
     fn messages() -> Vec<MessageInfo> {
         (0..100)
             .map(|index| MessageInfo {
+                generated_by: None,
                 id: format!("m{index}"),
                 session_id: "search-session".into(),
                 seq: index,

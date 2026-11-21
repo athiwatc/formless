@@ -278,7 +278,41 @@ pub fn reconcile(
 
 /// Delete a Session's artifact files and rows (call before the Session).
 pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
-    let paths = store.session_artifact_paths(session_id)?;
+    let family = store.topic_session_family(session_id)?;
+    let survivors = store
+        .list_topics()?
+        .into_iter()
+        .filter(|topic| {
+            !matches!(
+                topic.status,
+                formless_protocol::TopicStatus::PendingApproval
+                    | formless_protocol::TopicStatus::Rejected
+            )
+        })
+        .filter_map(|topic| topic.topic_session_id)
+        .filter(|session| !family.contains(session))
+        .collect::<Vec<_>>();
+    let mut doomed = Vec::new();
+    let mut retained = std::collections::HashSet::new();
+    for (id, path) in store.session_artifact_records(session_id)? {
+        let mut keep = false;
+        for session in &survivors {
+            if store.topic_artifact_access(&id, session, None, Some(session_id))? {
+                keep = true;
+                break;
+            }
+        }
+        if keep {
+            retained.insert(path);
+        } else {
+            doomed.push((id, path));
+        }
+    }
+    let paths = doomed
+        .iter()
+        .map(|(_, path)| path)
+        .filter(|path| !retained.contains(*path))
+        .collect::<Vec<_>>();
     if !paths.is_empty() {
         let root = verified_root(
             store.artifact_root.as_deref(),
@@ -291,7 +325,44 @@ pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
             remove_verified(&root, path)?;
         }
     }
-    store.delete_session_artifact_rows(session_id)
+    store.delete_artifact_rows(&doomed.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+}
+
+pub(crate) fn remove_retained_for_topic_purge(store: &Store, family: &[String]) -> Result<()> {
+    let sessions = store.artifact_reference_sessions()?;
+    let mut doomed = std::collections::HashSet::new();
+    for (id, owner) in store.orphaned_artifact_records()? {
+        let mut referenced_by_doomed = false;
+        let mut referenced_by_survivor = false;
+        for session in &sessions {
+            if store.session_references_artifact(&id, session, &owner)? {
+                if family.contains(session) {
+                    referenced_by_doomed = true;
+                } else {
+                    referenced_by_survivor = true;
+                }
+            }
+        }
+        if referenced_by_doomed && !referenced_by_survivor {
+            doomed.insert(id);
+        }
+    }
+    let records = store.list_artifacts()?;
+    let retained_paths = records
+        .iter()
+        .filter(|(id, _, _, _)| !doomed.contains(id))
+        .map(|(_, path, _, _)| path)
+        .collect::<std::collections::HashSet<_>>();
+    for (id, path, _, _) in &records {
+        if doomed.contains(id) {
+            if retained_paths.contains(path) {
+                store.delete_artifact_rows(std::slice::from_ref(id))?;
+            } else {
+                remove_record(store, id)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Delete one recorded artifact; metadata from held/imported JSON is never
