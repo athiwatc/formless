@@ -60,8 +60,35 @@ fn main_topic_harness_navigation_uses_canonical_transcripts_and_read_only_send(
         window.click("topic-attempt-build-x", cx);
         window.render_frame(cx);
         assert_eq!(shell.read(cx).sidebar().active_id(), Some("claude-chat"));
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::Snapshot {
+                generation,
+                snapshot: replies::session_snapshot("claude-chat", &serde_json::json!({
+                    "session":{"id":"claude-chat"}, "running":false,
+                    "messages":[{"id":"build-message","seq":1,"role":"user","content":"Build feature X"}]
+                })).unwrap(),
+            }, window, cx);
+            s.composer().update(cx, |input, cx| input.set_value("Must not send", window, cx));
+            s.take_client_commands();
+        });
+        window.render_frame(cx);
         assert_eq!(window.find("composer-primary").disabled(), Some(true));
         assert_eq!(window.find("composer-attach").disabled(), Some(true));
+        shell.update(cx, |s, cx| {
+            let state = s.command_state(window, cx);
+            assert!(!commands::entry(
+                Command::RunAction(formless_desktop::run_actions::Kind::Delete),
+                &state
+            )
+            .enabled());
+            s.run_command(
+                Command::RunAction(formless_desktop::run_actions::Kind::Delete),
+                window,
+                cx,
+            );
+            assert!(s.take_client_commands().is_empty());
+        });
         window.click("topic-main-chat", cx);
         assert_eq!(shell.read(cx).sidebar().active_id(), Some("main"));
     });

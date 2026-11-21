@@ -3493,7 +3493,8 @@ impl Shell {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
             has_history: self.timeline.read(cx).item_count() > 0,
-            can_recover: self.client_connected
+            can_recover: !self.harness_read_only()
+                && self.client_connected
                 && self.client_snapshot_ready
                 && self
                     .client_recovery
@@ -3509,7 +3510,9 @@ impl Shell {
                 && self.mode_disable_action().is_none())
             .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
-            can_edit_session: self.client_connected && self.session_edit_target().is_some(),
+            can_edit_session: !self.harness_read_only()
+                && self.client_connected
+                && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
             composing,
@@ -4529,14 +4532,16 @@ impl Shell {
             .when(!modal, |panel| {
                 inert_while(panel, self.background_inert(window))
             })
-            .key_context(SESSION_LIST_CONTEXT)
+            // Topic buttons use their own native focus/activation. Legacy
+            // session-list arrows must not walk rows that are no longer shown.
+            .when(!self.topic_ui.state.supported, |panel| panel.key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
             .on_action(
                 cx.listener(|this, _: &SelectPreviousSession, _, cx| this.move_selection(-1, cx)),
             )
             .on_action(cx.listener(|this, _: &ActivateSession, window, cx| {
                 this.activate_selected(window, cx)
-            }))
+            })))
             .w(self.panel_width(tokens::SIDEBAR_DEFAULT, window))
             .flex_shrink_0()
             .h_full()

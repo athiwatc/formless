@@ -78,16 +78,18 @@ impl Shell {
         let Some(client) = &self.client else {
             return;
         };
-        let operation = uuid::Uuid::new_v4();
+        let operation = (!matches!(action, Action::Main | Action::List)).then(uuid::Uuid::new_v4);
         let command = ClientCommand::Topic {
             connection: client.connection(),
-            operation: Some(operation),
+            operation,
             action,
         };
         match client.send(command) {
             Ok(()) => {
-                self.topic_ui.state.pending = Some(operation);
-                self.topic_ui.state.notice = Some("Waiting for Formless…".into());
+                if let Some(operation) = operation {
+                    self.topic_ui.state.pending = Some(operation);
+                    self.topic_ui.state.notice = Some("Waiting for Formless…".into());
+                }
             }
             Err(error) => self.topic_ui.state.notice = Some(error.to_string()),
         }
@@ -170,9 +172,20 @@ impl Shell {
         }
     }
 
-    fn open_topic_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_topic_session(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.sidebar.rows().iter().any(|session| session.id == id) {
+            self.topic_ui.state.notice = Some("This conversation is unavailable or archived. Restore archived conversations from Sessions first.".into());
+            cx.notify();
+            return false;
+        }
         self.sidebar.select_id(id);
         self.activate_selected(window, cx);
+        true
     }
 
     fn open_topic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -182,9 +195,17 @@ impl Shell {
             .topics
             .iter()
             .find(|t| t.id == id)
-            .and_then(|t| t.topic_session_id.clone());
+            // Pending proposals have no topic transcript yet. Review them in
+            // their source chat, including when opened from another page.
+            .map(|t| {
+                t.topic_session_id
+                    .clone()
+                    .unwrap_or_else(|| t.source_session_id.clone())
+            });
         if let Some(session) = session {
-            self.open_topic_session(&session, window, cx);
+            if !self.open_topic_session(&session, window, cx) {
+                return;
+            }
         }
         self.topic_ui.state.selected = Some(id.to_string());
         self.topic_ui.proposing = false;
@@ -199,17 +220,15 @@ impl Shell {
         self.topic_ui.source = self.sidebar.active_id().map(str::to_string);
         self.topic_ui.selected.clear();
         self.topic_ui.state.notice = None;
-        if let Some(session) = self
+        let cwd = self
             .client_sessions
             .iter()
             .find(|s| Some(s.id.as_str()) == self.sidebar.active_id())
-        {
-            if let Some(cwd) = &session.cwd {
-                self.topic_ui
-                    .repo
-                    .update(cx, |input, cx| input.set_value(cwd.clone(), window, cx));
-            }
-        }
+            .and_then(|s| s.cwd.clone())
+            .unwrap_or_default();
+        self.topic_ui
+            .repo
+            .update(cx, |input, cx| input.set_value(cwd, window, cx));
         cx.notify();
     }
 

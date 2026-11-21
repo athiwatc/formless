@@ -177,6 +177,7 @@ impl Shell {
         let client = self.client.as_ref()?;
         (self.client_connected
             && client.is_ready()
+            && !self.harness_read_only()
             && self.client_snapshot_ready
             && self.destination == Destination::Chat)
             .then(|| Owner {
