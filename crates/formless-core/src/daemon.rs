@@ -2273,7 +2273,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::DeleteSession { id } => {
-                self.stop_session_work(&id).await;
+                self.stop_session_work(&id).await?;
                 // Hidden now, gone after the undo window (SPEC §5.1).
                 let existed = self.with_store(|st| st.soft_delete_session(&id))?;
                 if existed {
@@ -2290,7 +2290,7 @@ impl Daemon {
                             .with_store(|st| st.session_deleted(&sid))
                             .unwrap_or(false)
                         {
-                            if let Err(error) = this.purge_session(&sid) {
+                            if let Err(error) = this.purge_session(&sid).await {
                                 this.broadcast(Event::Note{session_id:Some(sid.clone()),text:format!("Session cleanup incomplete; artifact records retained: {error:#}")});
                             }
                         }
@@ -5564,7 +5564,31 @@ impl Daemon {
     /// Stop everything still working on a Session before it is deleted:
     /// drop its queued messages, interrupt its Run (and wait for it to
     /// finish writing), and abandon its background invocations.
-    async fn stop_session_work(&self, session_id: &str) {
+    async fn stop_session_work(&self, session_id: &str) -> Result<Vec<String>> {
+        let family = self.with_reader(|st| st.topic_session_family(session_id))?;
+        let topics = self.with_reader(|st| st.list_topics())?;
+        for topic in topics.into_iter().filter(|topic| {
+            topic
+                .topic_session_id
+                .as_ref()
+                .is_some_and(|id| family.contains(id))
+        }) {
+            if matches!(
+                topic.status,
+                TopicStatus::Approved | TopicStatus::Running | TopicStatus::NeedsUser
+            ) {
+                self.with_store(|st| st.cancel_topic(&topic.id))?;
+                self.close_topic_interactions(&topic.id, None);
+                self.broadcast(Event::TopicChanged { topic_id: topic.id });
+            }
+        }
+        for id in &family {
+            self.stop_one_session_work(id).await?;
+        }
+        Ok(family)
+    }
+
+    async fn stop_one_session_work(&self, session_id: &str) -> Result<()> {
         // Session-only approvals end with the Session (SPEC §10.3).
         self.session_grants
             .lock()
@@ -5589,11 +5613,12 @@ impl Daemon {
         }
         for _ in 0..100 {
             if !self.runs.locked().contains_key(session_id) {
-                return;
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         tracing::warn!("run for deleted session {session_id} did not stop within 5s");
+        bail!("run for deleted session {session_id} did not stop; retry deletion")
     }
 
     /// Share the existing per-connection send receipt and detached execution
@@ -10999,10 +11024,15 @@ impl Daemon {
     }
 
     /// Delete a Session for good, with its stored outputs (SPEC §15).
-    fn purge_session(&self, id: &str) -> Result<()> {
-        self.with_store(|st| crate::artifacts::remove_for_session(st, id))?;
+    async fn purge_session(&self, id: &str) -> Result<()> {
+        let family = self.stop_session_work(id).await?;
+        for session in &family {
+            self.with_store(|st| crate::artifacts::remove_for_session(st, session))?;
+        }
         self.with_store(|st| st.delete_session(id))?;
-        self.contexts.locked().remove(id);
+        for session in &family {
+            self.contexts.locked().remove(session);
+        }
         Ok(())
     }
 
@@ -16176,7 +16206,7 @@ impl Daemon {
             .with_store(|st| st.sessions_deleted_before(&cutoff))
             .unwrap_or_default()
         {
-            if let Err(error) = self.purge_session(&id) {
+            if let Err(error) = self.purge_session(&id).await {
                 self.broadcast(Event::Note {
                     session_id: Some(id.clone()),
                     text: format!(

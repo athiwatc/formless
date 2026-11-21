@@ -453,6 +453,49 @@ fn topic_workspace_without_git_executable_is_directory() {
 }
 
 #[tokio::test]
+async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let proposal = topic_fixture_proposal(&f, None);
+    let topic = f.daemon().propose_topic_request(&proposal).unwrap();
+    let topic = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    let cancel = CancellationToken::new();
+    let flag = Arc::new(AtomicBool::new(false));
+    let (steer_tx, _) = mpsc::unbounded_channel();
+    f.daemon().runs.locked().insert(
+        session.clone(),
+        RunCtl {
+            run_id: "descendant-run".into(),
+            cancel: cancel.clone(),
+            cancel_flag: flag.clone(),
+            steer_tx,
+            steering: Arc::new(Default::default()),
+            retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
+        },
+    );
+    let daemon = f.daemon().clone();
+    let observed = cancel.clone();
+    let child = session.clone();
+    let stopped = tokio::spawn(async move {
+        observed.cancelled().await;
+        daemon.runs.locked().remove(&child);
+    });
+    f.daemon().purge_session(&f.session).await.unwrap();
+    stopped.await.unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(flag.load(Ordering::SeqCst));
+    assert!(f
+        .daemon()
+        .with_reader(|st| st.get_session(&session))
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn topic_fixture_workspace_classification_and_unavailable_start() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
