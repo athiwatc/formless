@@ -144,14 +144,23 @@ else:
     def test_successful_stop_without_endpoint_release_retains_profile(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
+            # Nothing can release this fake endpoint. Count every real poll
+            # without sleeping in this one fixture; the delay and signal
+            # fixtures still exercise the real sleep.
+            sleep = root / "sleep"
+            sleep.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$EVAL_ROOT/sleeps"\n')
+            sleep.chmod(0o700)
+            env = self.fixture(root, "stuck")
+            env["PATH"] = str(root) + os.pathsep + env.get("PATH", os.defpath)
             result = subprocess.run([str(SCRIPT), "https://fixture.invalid", "fixture"],
-                                    env=self.fixture(root, "stuck"), capture_output=True, text=True, timeout=20)
+                                    env=env, capture_output=True, text=True, timeout=20)
             data = Path((root / "profile").read_text())
             try:
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("shutdown unverified; retained", result.stderr)
                 self.assertTrue((data / "daemon.lock").exists())
                 self.assertEqual(len((root / "stops").read_text().splitlines()), 2)
+                self.assertEqual((root / "sleeps").read_text().splitlines(), ["0.1"] * 98)
             finally:
                 shutil.rmtree(data.parent)
 

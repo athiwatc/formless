@@ -88,10 +88,12 @@ fn service_urls_use_normalized_scheme_host_and_default_port() {
 fn other_authorities_keep_the_original_direct_url() {
     for url in [
         "https://github.com:8443/ada/tools/blob/main/fetch.json",
-        "https://demo:placeholder@github.com/ada/tools/blob/main/fetch.json",
+        "https://demo:placeholder@github.com:8443/ada/tools/blob/main/fetch.json",
         "https://gist.github.com:8443/ada/0123456789abcdef0123456789abcdef",
         "https://github.com.example.com/ada/tools/blob/main/fetch.json",
         "https://github.com@remote.invalid/ada/tools/blob/main/fetch.json",
+        "https://demo:placeholder@example.com/t.json",
+        "https://demo:placeholder@github.com/ada/tools",
         "HTTPS://Example.COM:443/t.json?case=Kept#fragment",
     ] {
         assert_eq!(
@@ -108,4 +110,23 @@ fn other_authorities_keep_the_original_direct_url() {
     ] {
         assert!(resolve(url).is_err(), "{url}");
     }
+}
+
+#[test]
+fn github_bundle_mapping_drops_userinfo_from_the_destination() {
+    let blob =
+        "https://fixture-user:fixture-secret@github.com/ada/tools/blob/main/dir/fetch.json?plain=1";
+    assert_eq!(
+        resolve(blob).unwrap(),
+        Source::Direct("https://raw.githubusercontent.com/ada/tools/main/dir/fetch.json".into())
+    );
+    let id = "0123456789abcdef0123456789abcdef";
+    for host in ["gist.github.com", "gist.githubusercontent.com"] {
+        let url = format!("https://fixture-user@{host}/ada/{id}");
+        assert_eq!(resolve(&url).unwrap(), Source::Gist(id.into()));
+    }
+    let error = resolve("https://fixture-user:fixture-secret@gist.github.com/ada").unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("no gist id in https://gist.github.com/ada"));
+    assert!(!message.contains("fixture-user") && !message.contains("fixture-secret"));
 }

@@ -5,7 +5,7 @@ use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ops::Range;
 
-pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; u undoes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
+pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; o/O open a line; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/^/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. D and C delete or change to the end of the line, Y yanks the line, and s/S substitute characters or lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; u undoes; p/P paste the private yank register; . repeats the last change. Unsupported commands show a notice. Unsupported character-taking prefixes such as r and f consume their argument. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mode {
     Normal,
@@ -51,10 +51,19 @@ struct Change {
     command: Command,
     edits: Vec<InsertEdit>,
 }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Unsupported {
+    #[default]
+    None,
+    AwaitingArgument,
+    Reported,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Vim {
     pub(crate) mode: Mode,
     pending: String,
+    unsupported: Unsupported,
     register: String,
     register_linewise: bool,
     register_literal: bool,
@@ -63,11 +72,26 @@ pub(crate) struct Vim {
 }
 impl Vim {
     pub(crate) fn label(&self) -> &'static str {
-        if self.mode == Mode::Insert {
-            "INSERT"
-        } else {
-            "NORMAL"
+        match self.mode {
+            Mode::Insert => "INSERT",
+            Mode::Normal if self.unsupported != Unsupported::None => {
+                "NORMAL · unsupported Vim command"
+            }
+            Mode::Normal => "NORMAL",
         }
+    }
+    pub(crate) fn waiting_for_argument(&self) -> bool {
+        self.unsupported == Unsupported::AwaitingArgument
+    }
+    pub(crate) fn cancel_pending_argument(&mut self) {
+        if self.waiting_for_argument() {
+            self.unsupported = Unsupported::None;
+        }
+    }
+    fn await_unsupported_argument(&mut self) -> Outcome {
+        self.pending.clear();
+        self.unsupported = Unsupported::AwaitingArgument;
+        Outcome::Handled
     }
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
@@ -102,6 +126,8 @@ impl Vim {
 
     pub(crate) fn key(&mut self, line: &mut InputLine, key: KeyEvent, surface: Surface) -> Outcome {
         line.modal_expand_pastes();
+        let waiting_for_argument = self.waiting_for_argument();
+        self.unsupported = Unsupported::None;
         if key.code == KeyCode::Esc {
             if self.mode == Mode::Insert {
                 self.mode = Mode::Normal;
@@ -123,7 +149,7 @@ impl Vim {
                 normal_cursor(line);
                 return Outcome::Handled;
             }
-            if !self.pending.is_empty() {
+            if waiting_for_argument || !self.pending.is_empty() {
                 self.pending.clear();
                 return Outcome::Handled;
             }
@@ -137,6 +163,12 @@ impl Vim {
                 self.inserting = None;
             }
             return Outcome::Pass;
+        }
+        // Enter can be a replacement argument. Consuming it also prevents
+        // an unsupported prefix from submitting the composer draft.
+        if waiting_for_argument && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter) {
+            self.unsupported = Unsupported::Reported;
+            return Outcome::Handled;
         }
         if self.mode == Mode::Insert {
             let insertion = match key.code {
@@ -193,6 +225,20 @@ impl Vim {
         if rest.is_empty() {
             return Outcome::Handled;
         }
+        if matches!(
+            rest,
+            "r" | "f" | "t" | "F" | "T" | "m" | "'" | "`" | "\"" | "q" | "@"
+        ) {
+            return self.await_unsupported_argument();
+        }
+        let rest = match rest {
+            "D" => "d$",
+            "C" => "c$",
+            "Y" => "yy",
+            "s" => "cl",
+            "S" => "cc",
+            _ => rest,
+        };
         if rest == "." {
             let override_count = (rest.len() != self.pending.len()).then_some(count);
             self.pending.clear();
@@ -259,6 +305,9 @@ impl Vim {
             if motion.is_empty() || motion == "g" || motion == "i" || motion == "a" {
                 return Outcome::Handled;
             }
+            if matches!(motion, "f" | "F" | "t" | "T" | "'" | "`") {
+                return self.await_unsupported_argument();
+            }
             let cmd = Command::Operator(
                 op,
                 motion.to_string(),
@@ -307,6 +356,8 @@ impl Vim {
         {
             line.set_modal_cursor(target);
             normal_cursor(line);
+        } else {
+            self.unsupported = Unsupported::Reported;
         }
         Outcome::Handled
     }
@@ -320,12 +371,7 @@ impl Vim {
                         }
                     }
                     'I' => {
-                        let mut at = line_start(line, line.cursor_byte());
-                        while at < line_end(line, at)
-                            && cluster(line, at).chars().all(char::is_whitespace)
-                        {
-                            at = next(line, at)
-                        }
+                        let at = first_nonblank(line, line.cursor_byte());
                         line.set_modal_cursor(at);
                     }
                     'A' => line.end(),
@@ -469,6 +515,15 @@ impl Vim {
         }
         true
     }
+}
+
+fn first_nonblank(s: &str, at: usize) -> usize {
+    let mut start = line_start(s, at);
+    let end = line_end(s, start);
+    while start < end && cluster(s, start).chars().all(char::is_whitespace) {
+        start = next(s, start);
+    }
+    start
 }
 
 fn open_line(line: &mut InputLine, kind: char) {
@@ -798,6 +853,7 @@ fn motion_target(
             }
         }
         "0" => to = line_start(s, at),
+        "^" => to = first_nonblank(s, at),
         "$" => {
             for _ in 1..count {
                 let end = line_end(s, to);
@@ -1048,6 +1104,83 @@ mod tests {
         vim.mode = Mode::Normal;
         (vim, line)
     }
+
+    #[test]
+    fn unsupported_arguments_cannot_edit_or_replace_the_dot_change() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut vim, mut line) = normal("abcd");
+            vim.key(&mut line, key('x'), surface);
+            for keys in [
+                "ra", "f.", "2r.", "d2f.", "Tx", "ma", "'x", "`o", "\"p", "qa", "@o",
+            ] {
+                for c in keys.chars() {
+                    assert_eq!(vim.key(&mut line, key(c), surface), Outcome::Handled);
+                }
+                assert_eq!(&*line, "bcd", "{surface:?} {keys}");
+                assert_eq!(vim.mode, Mode::Normal);
+                assert_eq!(vim.register, "a");
+                assert!(!vim.waiting_for_argument());
+                assert!(vim.label().contains("unsupported"));
+            }
+            vim.key(&mut line, key('.'), surface);
+            assert_eq!(&*line, "cd", "{surface:?} preserves the previous x for dot");
+            assert_eq!(vim.label(), "NORMAL");
+
+            vim.key(&mut line, key('r'), surface);
+            assert!(vim.waiting_for_argument());
+            let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+            assert_eq!(vim.key(&mut line, escape, surface), Outcome::Handled);
+            assert_eq!(vim.key(&mut line, escape, surface), Outcome::Escape);
+        }
+    }
+
+    #[test]
+    fn aliases_use_existing_operator_counts_and_first_nonblank_motion() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (alias, expansion) in [
+                ("D", "d$"),
+                ("C", "c$"),
+                ("Y", "yy"),
+                ("2s", "2cl"),
+                ("S", "cc"),
+            ] {
+                let (mut vim, mut line) = normal("abcdef\nsecond");
+                let (mut reference, mut expected) = normal("abcdef\nsecond");
+                for (keys, state, draft) in [
+                    (alias, &mut vim, &mut line),
+                    (expansion, &mut reference, &mut expected),
+                ] {
+                    state.key(draft, key('l'), surface);
+                    for c in keys.chars() {
+                        state.key(draft, key(c), surface);
+                    }
+                    if state.mode == Mode::Insert {
+                        state.key(draft, key('!'), surface);
+                        state.key(
+                            draft,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            surface,
+                        );
+                    }
+                }
+                assert_eq!(&*line, &*expected, "{surface:?} {alias}");
+                assert_eq!(line.cursor_byte(), expected.cursor_byte());
+                assert_eq!(vim.register, reference.register);
+            }
+
+            let (mut vim, mut line) = normal("hello");
+            for c in "shi".chars() {
+                vim.key(&mut line, key(c), surface);
+            }
+            assert_eq!(&*line, "hiello");
+            assert_eq!(vim.mode, Mode::Insert);
+
+            let (mut vim, mut line) = normal("  \tabc");
+            vim.key(&mut line, key('^'), surface);
+            assert_eq!(line.cursor_byte(), 3);
+        }
+    }
+
     #[test]
     fn composer_vim_vertical_goal_survives_separate_and_counted_motions() {
         for (text, goal) in [
