@@ -15746,21 +15746,28 @@ impl Daemon {
         if std::env::var_os(crate::logs::DAEMON_LOG_ENV).is_none() {
             return;
         }
+        let mut reopen = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let Ok(cfg) = self.config() else { continue };
-            match crate::logs::rotate_if_needed(
-                &self.paths,
-                cfg.daemon.log_max_bytes,
-                cfg.daemon.log_keep,
-            ) {
-                Ok(true) => {
-                    if let Err(e) = crate::logs::reopen_stdio(&self.paths) {
-                        tracing::warn!("reopen daemon log after rotation: {e}");
-                    }
+            if !reopen {
+                match crate::logs::rotate_if_needed(
+                    &self.paths,
+                    cfg.daemon.log_max_bytes,
+                    cfg.daemon.log_keep,
+                ) {
+                    Ok(rotated) => reopen = rotated,
+                    Err(e) => tracing::warn!("rotate daemon log: {e}"),
                 }
-                Ok(false) => {}
-                Err(e) => tracing::warn!("rotate daemon log: {e}"),
+            }
+            if reopen {
+                match crate::logs::reopen_stdio(&self.paths) {
+                    Ok(()) => {
+                        reopen = false;
+                        tracing::info!("rotated daemon log");
+                    }
+                    Err(e) => tracing::warn!("reopen daemon log after rotation: {e}"),
+                }
             }
         }
     }
@@ -16452,10 +16459,7 @@ fn spawn_daemon_child(paths: &Paths) -> Result<std::process::Child> {
     let exe = std::env::current_exe().context("locate formless binary")?;
     let cfg = Config::load(paths).unwrap_or_default();
     let _ = crate::logs::rotate_if_needed(paths, cfg.daemon.log_max_bytes, cfg.daemon.log_keep);
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.log_file())?;
+    let log = crate::logs::open_daemon_log(paths)?;
     let log_err = log.try_clone()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")

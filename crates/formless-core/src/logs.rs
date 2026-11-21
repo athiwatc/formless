@@ -10,6 +10,20 @@ use std::path::PathBuf;
 /// never touches its own stdio.
 pub const DAEMON_LOG_ENV: &str = "FORMLESS_DAEMON_LOG";
 
+pub(crate) fn open_daemon_log(paths: &Paths) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    options.open(paths.log_file())
+}
+
 fn rotated(paths: &Paths, n: usize) -> PathBuf {
     let mut name = paths.log_file().into_os_string();
     name.push(format!(".{n}"));
@@ -231,10 +245,7 @@ pub fn reopen_stdio(paths: &Paths) -> std::io::Result<()> {
     extern "C" {
         fn dup2(src: i32, dst: i32) -> i32;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.log_file())?;
+    let file = open_daemon_log(paths)?;
     for fd in [1, 2] {
         // SAFETY: plain syscall on descriptors this process owns.
         if unsafe { dup2(file.as_raw_fd(), fd) } < 0 {
@@ -244,7 +255,55 @@ pub fn reopen_stdio(paths: &Paths) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn reopen_stdio(paths: &Paths) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    let output = open_daemon_log(paths)?;
+    let errors = output.try_clone()?;
+    // Keep Rust's buffered logging threads from using a handle while it is
+    // being replaced. These locks also preserve pending output in the old log.
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    let _ = stdout.flush();
+    let _ = stderr.flush();
+
+    // SAFETY: both replacement handles are live files, and the daemon is
+    // redirecting only its own stdout and stderr. After installing them,
+    // keep them open for the process and retire the replaced handles once.
+    unsafe {
+        let old_output = GetStdHandle(STD_OUTPUT_HANDLE);
+        let old_errors = GetStdHandle(STD_ERROR_HANDLE);
+        if SetStdHandle(STD_OUTPUT_HANDLE, output.as_raw_handle()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if SetStdHandle(STD_ERROR_HANDLE, errors.as_raw_handle()) == 0 {
+            let error = std::io::Error::last_os_error();
+            if SetStdHandle(STD_OUTPUT_HANDLE, old_output) == 0 {
+                // The process still uses this replacement on stdout.
+                let _ = output.into_raw_handle();
+            }
+            return Err(error);
+        }
+        let _ = output.into_raw_handle();
+        let _ = errors.into_raw_handle();
+        if !old_output.is_null() && old_output != INVALID_HANDLE_VALUE {
+            CloseHandle(old_output);
+        }
+        if !old_errors.is_null() && old_errors != INVALID_HANDLE_VALUE && old_errors != old_output
+        {
+            CloseHandle(old_errors);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn reopen_stdio(_paths: &Paths) -> std::io::Result<()> {
     Ok(())
 }

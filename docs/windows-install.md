@@ -98,6 +98,10 @@ No administrator or machine-wide PATH change is needed.
 
 ## Manual updates
 
+On Windows, `formless update` prints the winget upgrade command. Cargo
+installations get the Cargo upgrade command. The manual ZIP procedure
+below also applies to binaries installed through the walkthrough above.
+
 `formless update check` reports releases; it does not replace the installed
 binary. For a manual update, choose a newer actually available matching release
 and repeat checksum verification and extraction into a new directory. Close
@@ -110,6 +114,10 @@ with the newly verified executable directory, preserving other entries. Open
 a fresh terminal and verify its resolved path and version. Do not overwrite
 configuration/data as part of replacing the binary. Winget publication is
 separate; templates alone do not establish that `winget install` is available.
+
+If Windows rejects a long profile data directory, `formless doctor` reports
+the path length alongside the directory or database error. A shorter
+`FORMLESS_DATA_DIR` can avoid the Windows path limit.
 
 PowerShell reference: [Get-FileHash](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash),
 [Expand-Archive](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.archive/expand-archive),

@@ -28,6 +28,27 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  windows-smoke:
+    name: Windows daemon and console smoke
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Detached daemon rotation and long profile paths
+        run: cargo test --locked -p formless-bin --test windows_long_daemon -- --test-threads=1
+      - name: Legacy console code pages and TUI frame
+        run: cargo test --locked -p formless-tui --lib windows_console_smoke -- --test-threads=1
+      - name: Windows update guidance
+        run: cargo test --locked -p formless-bin --bin formless windows_upgrade_uses_cargo_or_winget
+      - name: Release check
+        run: .\target\debug\formless.exe update check --json
+
   build-test:
     name: Build and test (${{ matrix.platform }})
     # Never execute fork contributions on the persistent self-hosted machine.
