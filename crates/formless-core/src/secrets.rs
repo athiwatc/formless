@@ -25,6 +25,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("AIza", "Google API key"),
     ("AKIA", "AWS access key"),
     ("ASIA", "AWS access key"),
+    ("dop_v1_", "DigitalOcean token"),
 ];
 
 const MARK: &str = "[REDACTED]";
@@ -261,6 +262,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn digitalocean_personal_tokens_are_redacted_without_matching_short_mentions() {
+        let suffix = "0123456789abcdef".repeat(4);
+        let input = format!("credential rejected: (dop_v1_{suffix})");
+        let (redacted, kind) = redact(&input);
+        assert_eq!(redacted, "credential rejected: ([REDACTED])");
+        assert_eq!(kind, Some("DigitalOcean token"));
+
+        let notes = format!("examples: dop_v1_short dop_{suffix}");
+        assert_eq!(redact(&notes), (notes, None));
+    }
 
     #[test]
     fn finds_and_blanks_secret_shapes_not_key_names() {
