@@ -118,6 +118,14 @@ pub const COMMANDS: &[Command] = &[
         "list and switch Sessions (T toggles lineage tree)",
         Session,
     ),
+    cmd("main", "", "open the canonical Main Chat", Session),
+    cmd("topics", "", "browse Main Chat and topic conversations", Session),
+    cmd(
+        "topic",
+        "[ID|start|recover|retry TOPIC FEATURE|reject TOPIC REASON]",
+        "propose, review, or manage a Topic Chat",
+        Session,
+    ),
     cmd("fork", "", "fork the current Session", Session),
     cmd("search", "", "search all Sessions", Session),
     cmd(

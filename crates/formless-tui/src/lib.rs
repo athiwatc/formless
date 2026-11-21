@@ -45,6 +45,8 @@ mod text_history;
 mod theme;
 #[cfg(test)]
 mod toast_preview_tests;
+mod topic;
+mod topic_app;
 mod tour;
 mod ui;
 mod user_commands_ui;
@@ -344,6 +346,39 @@ enum Pending {
     UpdateModule,
     ListSessions,
     GetSession,
+    TopicCapability {
+        epoch: u64,
+    },
+    TopicMain {
+        generation: u64,
+        open: bool,
+    },
+    TopicList {
+        generation: u64,
+    },
+    TopicGet {
+        topic_id: String,
+        epoch: u64,
+    },
+    TopicPropose,
+    TopicApprove {
+        topic_id: String,
+        source_session_id: String,
+        start_after_approval: bool,
+    },
+    TopicStart {
+        topic_id: String,
+    },
+    TopicReject {
+        topic_id: String,
+    },
+    TopicRecover {
+        topic_id: String,
+    },
+    TopicRetry {
+        topic_id: String,
+        feature_id: String,
+    },
     ReconnectSession,
     CreateSession,
     ForkSession,
@@ -1751,6 +1786,11 @@ struct App {
     inbox: Option<mpsc::Receiver<ServerMessage>>,
     clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
+    topic: topic::State,
+    topic_main_generation: u64,
+    topic_list_generation: u64,
+    topic_epoch: u64,
+    pending_topic_actions: HashSet<String>,
     session_idx: usize,
     session_filter: lists::ListFilter,
     session_comparison_revision: u64,
@@ -2145,6 +2185,11 @@ impl App {
             inbox: None,
             clipboard_write: Default::default(),
             sessions: Vec::new(),
+            topic: topic::State::default(),
+            topic_main_generation: 0,
+            topic_list_generation: 0,
+            topic_epoch: 0,
+            pending_topic_actions: HashSet::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
@@ -2387,6 +2432,7 @@ impl App {
         self.inbox = Some(inbox);
         self.send_request(Pending::DaemonMode, Request::Status);
         self.send_request(Pending::ListSessions, Request::ListSessions);
+        self.topic_connected();
         self.refresh_description_reviews(false);
         if self.offline.is_some() {
             self.begin_reconnect_snapshot();
@@ -3122,6 +3168,7 @@ impl App {
 
     fn drain_daemon(&mut self) {
         self.expire_pending();
+        self.topic_tick();
         self.restore_attachment_drafts();
         let Some(inbox) = self.inbox.take() else {
             return;
@@ -3281,6 +3328,10 @@ impl App {
                             }));
                         }
                     }
+                    if kind.is_topic() {
+                        self.topic_reply(kind, ok, result, error);
+                        continue;
+                    }
                     if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation != self.branch_summary.generation)
                     {
                         continue;
@@ -3344,6 +3395,18 @@ impl App {
                         }
                         Pending::ApprovalDecision { .. } => {
                             unreachable!("approval acknowledgements handled above")
+                        }
+                        Pending::TopicCapability { .. }
+                        | Pending::TopicMain { .. }
+                        | Pending::TopicList { .. }
+                        | Pending::TopicGet { .. }
+                        | Pending::TopicPropose
+                        | Pending::TopicApprove { .. }
+                        | Pending::TopicStart { .. }
+                        | Pending::TopicReject { .. }
+                        | Pending::TopicRecover { .. }
+                        | Pending::TopicRetry { .. } => {
+                            unreachable!("topic replies handled above")
                         }
                         Pending::HunkReview { reply, action } => {
                             self.hunk_review_result(reply, action, result)
@@ -5919,9 +5982,9 @@ impl App {
             // This client keeps legacy Subscribe. Correlated answer frames
             // belong only to explicit future-attempt consumers.
             Event::TranscriptAttempt { .. }
-            | Event::TopicChanged { .. }
             | Event::HarnessPermissionRequested { .. }
             | Event::HarnessPermissionClosed { .. } => {}
+            Event::TopicChanged { topic_id } => self.topic_changed(topic_id),
             Event::MessageAppended {
                 session_id,
                 message,
@@ -7085,6 +7148,9 @@ impl App {
                 .push("not sent — offline; your input is kept as a draft".into());
             return;
         }
+        if self.topic_blocks_submit() {
+            return;
+        }
         if let Some(edit) = self.editing_queued {
             self.submit_queued_edit(edit);
             return;
@@ -7749,6 +7815,8 @@ impl App {
                 Request::CreateSession { name: None },
             ),
             "sessions" => self.open_view(View::Sessions),
+            "main" | "topics" | "topic" => self.topic_slash(cmd, ""),
+            cmd if cmd.starts_with("topic ") => self.topic_slash("topic", &cmd[6..]),
             "fork" => {
                 if let Some(id) = self.current.clone() {
                     self.request(
@@ -9816,6 +9884,9 @@ impl App {
         }
         if self.rollback_pick.is_some() {
             self.rollback_key(key);
+            return;
+        }
+        if self.topic_key(key) {
             return;
         }
         if self.model_overlay.is_some()
@@ -12252,7 +12323,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Chat if pane_layout(app.multi_pane, chunks[1].width) => {
             chat_focus = draw_panes(f, chunks[1], app);
         }
-        View::Chat => chat_focus = draw_chat(f, chunks[1], app),
+        View::Chat => chat_focus = topic_app::draw_chat_with_topics(f, chunks[1], app),
         View::Sessions => draw_sessions(f, chunks[1], app),
         View::Settings => draw_settings(f, chunks[1], app),
         View::Tools => draw_tools(f, chunks[1], app),
@@ -12274,6 +12345,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         chat_focus,
     );
     draw_status(f, chunks[3], app, chat_focus);
+    if app.topic.overlay_open() {
+        app.topic.draw_overlay(f, app.color);
+    }
     // Give the form the full frame after drawing its background. Approval
     // and other modal overlays below keep their existing priority.
     if app.view == View::Settings {
@@ -20471,6 +20545,11 @@ mod tests {
             inbox: None,
             clipboard_write: Default::default(),
             sessions: Vec::new(),
+            topic: topic::State::default(),
+            topic_main_generation: 0,
+            topic_list_generation: 0,
+            topic_epoch: 0,
+            pending_topic_actions: HashSet::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
