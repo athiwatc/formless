@@ -2184,7 +2184,9 @@ impl Provider {
             result.reasoning = false;
             result.tool_calling = false;
             result.prompt_fallback = false;
-            result.error = Some(format!("provider served model '{served}' during the test for '{model}'"));
+            result.error = Some(format!(
+                "provider served model '{served}' during the test for '{model}'"
+            ));
             result.served_model = Some(served);
         }
         result
@@ -2196,7 +2198,11 @@ impl Provider {
         }
     }
 
-    async fn test_model_inner(&self, model: &str, policy: &crate::probe_policy::ProbePolicy) -> ModelTest {
+    async fn test_model_inner(
+        &self,
+        model: &str,
+        policy: &crate::probe_policy::ProbePolicy,
+    ) -> ModelTest {
         let mut t = ModelTest {
             model: model.to_string(),
             tested_at: chrono::Utc::now().to_rfc3339(),
