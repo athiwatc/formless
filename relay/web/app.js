@@ -1881,6 +1881,96 @@
 
   // Tiny tokenizer-highlighter, mirroring the TUI's (crates/formless-tui/src/highlight.rs).
   const W = (s) => new Set(s.split(" "));
+  const JS_REGEX_KEYWORDS = W("await case delete do else extends in instanceof new of return throw typeof void yield");
+  const JS_CONTEXTUAL_REGEX_KEYWORDS = W("await of yield");
+  const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
+  const JS_LINE_END = /[\n\r\u2028\u2029]/;
+
+  function jsxClosingTagEnd(code, start) {
+    const closingTag = /(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*)?\s*>/uy;
+    closingTag.lastIndex = start + 1;
+    if (!closingTag.test(code)) return start;
+    const end = closingTag.lastIndex;
+    // After a JSX tag, division needs a right operand. A member dot
+    // or expression terminator instead permits a regex comparison.
+    const regexSuffix = /^[dgimsuvy]*(?:\.(?![0-9])|\s*(?:[;,)\]}]|$))/;
+    return code[end] === "/" && regexSuffix.test(code.slice(end + 1)) ? start : end;
+  }
+
+  function jsRegexEnd(code, start, state, lang) {
+    const tokenEnd = (at) => {
+      while (at > 0) {
+        const commentStart = state.comments.get(at);
+        if (commentStart !== undefined) at = commentStart;
+        else if (/\s/.test(code[at - 1])) at--;
+        else break;
+      }
+      return at;
+    };
+    const before = tokenEnd(start);
+    const last = code[before - 1];
+    // A closing brace or postfix operator can end a division operand.
+    if (before === state.jsxTagEnd || last === "}" || code.slice(Math.max(0, before - 2), before) === "++" ||
+        code.slice(Math.max(0, before - 2), before) === "--") return start;
+    let keyword = "";
+    if (before > 0 && !"=(,:[!&|?{;+-*%<>~^".includes(last)) {
+      let wordStart = before;
+      while (wordStart > 0 && JS_IDENT_CONTINUE.test(code[wordStart - 1])) wordStart--;
+      keyword = code.slice(wordStart, before);
+      const prefix = tokenEnd(wordStart);
+      const previous = code[prefix - 1];
+      const member = previous === "#" || (previous === "." && !code.startsWith("...", prefix - 3));
+      const splitSurrogate = /[\udc00-\udfff]/.test(code[wordStart - 1] ?? "");
+      if (!JS_REGEX_KEYWORDS.has(keyword) || member || splitSurrogate) return start;
+    }
+    const contextual = JS_CONTEXTUAL_REGEX_KEYWORDS.has(keyword);
+    let inClass = false;
+    for (let end = start + 1; end < code.length; end++) {
+      const c = code[end];
+      if (JS_LINE_END.test(c)) break;
+      if (c === "\\") {
+        end++;
+        if (end === code.length || JS_LINE_END.test(code[end])) break;
+      } else if (c === "[") inClass = true;
+      else if (c === "]") inClass = false;
+      else if (c === "/" && !inClass) {
+        // A guessed closer after a contextual identifier can instead open
+        // a real comment after the first divisor.
+        if (contextual) {
+          const adjacentComment = code.startsWith("//", end + 1) ||
+            (code.startsWith("/*", end + 1) && code.indexOf("*/", end + 3) >= 0);
+          if (!adjacentComment && (code[end + 1] === "/" ||
+              (code[end + 1] === "*" && code.indexOf("*/", end + 2) >= 0))) return start;
+        }
+        end++;
+        while (end < code.length && /[a-z]/i.test(code[end])) {
+          if (!"dgimsuvy".includes(code[end])) return start;
+          end++;
+        }
+        if (contextual) {
+          let next = end;
+          for (;;) {
+            while (next < code.length && /\s/.test(code[next]) && !JS_LINE_END.test(code[next])) next++;
+            if (!code.startsWith("/*", next)) break;
+            const close = code.indexOf("*/", next + 2);
+            if (close < 0 || JS_LINE_END.test(code.slice(next, close))) return end;
+            next = close + 2;
+          }
+          let wordEnd = next;
+          while (wordEnd < code.length && JS_IDENT_CONTINUE.test(code[wordEnd])) wordEnd++;
+          const word = code.slice(next, wordEnd);
+          const typescript = lang === "ts" || lang === "tsx" || lang === "typescript";
+          if (word && word !== "in" && word !== "instanceof" &&
+              !(typescript && (word === "as" || word === "satisfies"))) return start;
+          if (code[next] === "'" || code[next] === '"') return start;
+        }
+        return end;
+      }
+    }
+    return start;
+  }
+
+
   const HL = {
     rust: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct trait type unsafe use where while"), lit: W("true false self Self None Some Ok Err super") },
     js: { lc: ["//"], bc: ["/*", "*/"], q: "\"'`", kw: W("as async await break case catch class const continue debugger default delete do else enum export extends finally for from function if implements import in instanceof interface let new of private protected public readonly return static switch throw try type typeof var void while with yield"), lit: W("true false null undefined NaN this super") },
@@ -2147,6 +2237,7 @@
     const shell = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang)
       ? shellCommentState(code, lang) : null;
     const kotlin = lang === "kotlin" || lang === "kt";
+    const js = L === HL.js ? { comments: new Map(), jsxTagEnd: -1 } : null;
     const toml = lang === "toml";
     const php = L === HL.php;
     const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
@@ -2234,6 +2325,7 @@
       if (L.bc && code.startsWith(L.bc[0], i)) {
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -2263,6 +2355,7 @@
         const lineEnd = end < 0 ? code.length : end;
         const tag = php ? code.slice(i, lineEnd).indexOf("?>") : -1;
         const stop = tag < 0 ? lineEnd : i + tag;
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         endedByComment = true;
@@ -2336,6 +2429,19 @@
         tok("tok-num", number);
         i += number.length;
         continue;
+      }
+      if (c === "/" && js) {
+        const tag = (lang === "jsx" || lang === "tsx") && code[i - 1] === "<"
+          ? jsxClosingTagEnd(code, i) : i;
+        if (tag !== i) js.jsxTagEnd = tag;
+        else {
+          const stop = jsRegexEnd(code, i, js, lang);
+          if (stop !== i) {
+            tok("tok-str", code.slice(i, stop));
+            i = stop;
+            continue;
+          }
+        }
       }
       if (L.tags && c === "<") {
         const m = code.slice(i).match(/^<\/?[\w:-]+/);
