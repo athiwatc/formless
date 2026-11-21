@@ -320,6 +320,11 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                 } => format!("page {destination:?} ok={}", result.is_ok()),
                 Update::Action { result, .. } => format!("action {result:?}"),
                 Update::Notice(notice) => notice.clone(),
+                Update::ResourceAdded { destination, .. } => format!("added {destination:?}"),
+                Update::ManagementNotice {
+                    destination,
+                    notice,
+                } => format!("{destination:?}: {notice}"),
                 Update::ApprovalInventory {
                     result, revision, ..
                 } => format!("approval inventory {revision}: ok={}", result.is_ok()),

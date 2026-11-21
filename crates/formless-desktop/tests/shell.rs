@@ -36,6 +36,8 @@ mod profile_search_tests;
 mod question_tests;
 #[path = "support/reading_positions.rs"]
 mod reading_position_tests;
+#[path = "support/resource_manage.rs"]
+mod resource_manage_tests;
 #[path = "support/run_actions.rs"]
 mod run_action_tests;
 #[path = "support/run_inspection.rs"]
@@ -4049,7 +4051,7 @@ fn overlay_panels_fit_a_reflowed_window_and_their_contents_are_reachable(cx: &mu
         // Its list and its destinations are inside it, and the list works.
         let first = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
         assert!(window.find(first).bounds().right() <= MINIMUM.width);
-        for destination in ["Chat", "Tools", "Proposals"] {
+        for destination in ["Chat", "Tools"] {
             let id = gpui_kit::SharedString::from(format!("destination-{destination}"));
             let bounds = window.find(id).bounds();
             assert!(
@@ -4059,6 +4061,14 @@ fn overlay_panels_fit_a_reflowed_window_and_their_contents_are_reachable(cx: &mu
                 "{destination}: {bounds:?}"
             );
         }
+        window.scroll(
+            "destination-list",
+            ScrollDelta::Pixels(point(px(0.), px(-500.))),
+            cx,
+        );
+        settle_frames(window, cx);
+        let proposals = window.find("destination-Proposals").bounds();
+        assert!(proposals.bottom() <= MINIMUM.height);
         window.press("down", cx);
         assert_eq!(shell.read(cx).sidebar().selected_index(), Some(1));
 

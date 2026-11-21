@@ -146,6 +146,10 @@ pub enum Destination {
     Chat,
     Sessions,
     Tools,
+    Mcp,
+    Skills,
+    Memory,
+    Jobs,
     Metrics,
     Proposals,
     Settings,
@@ -159,11 +163,15 @@ pub enum Destination {
 
 impl Destination {
     /// Persistent navigation order, matching the TUI's view order.
-    pub const NAVIGATION: [Destination; 6] = [
+    pub const NAVIGATION: [Destination; 10] = [
         Destination::Chat,
         Destination::Sessions,
         Destination::Settings,
         Destination::Tools,
+        Destination::Mcp,
+        Destination::Skills,
+        Destination::Memory,
+        Destination::Jobs,
         Destination::Metrics,
         Destination::Proposals,
     ];
@@ -173,6 +181,10 @@ impl Destination {
             Destination::Chat => "Chat",
             Destination::Sessions => "Sessions",
             Destination::Tools => "Tools",
+            Destination::Mcp => "MCP servers",
+            Destination::Skills => "Skills",
+            Destination::Memory => "Memory",
+            Destination::Jobs => "Jobs",
             Destination::Metrics => "Metrics",
             Destination::Proposals => "Proposals",
             Destination::Settings => "Settings",
@@ -897,8 +909,23 @@ mod tests {
         let mut all = Destination::NAVIGATION.to_vec();
         all.push(Destination::Search);
         all.push(Destination::ProfileSearch);
-        assert_eq!(all.len(), 8);
-        assert_eq!(all.iter().collect::<HashSet<_>>().len(), 8);
+        assert_eq!(all.len(), 12);
+        assert_eq!(all.iter().collect::<HashSet<_>>().len(), 12);
+        assert_eq!(
+            Destination::NAVIGATION.map(Destination::label),
+            [
+                "Chat",
+                "Sessions",
+                "Settings",
+                "Tools",
+                "MCP servers",
+                "Skills",
+                "Memory",
+                "Jobs",
+                "Metrics",
+                "Proposals"
+            ]
+        );
         assert!(Destination::NAVIGATION.iter().all(|d| !d.is_transient()));
         assert!(Destination::Search.is_transient());
         assert!(Destination::ProfileSearch.is_transient());

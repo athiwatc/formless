@@ -216,9 +216,23 @@ pub enum Update {
         error: String,
     },
     Notice(String),
+    ResourceAdded {
+        destination: Destination,
+        text: String,
+        schedule: String,
+    },
+    ManagementNotice {
+        destination: Destination,
+        notice: String,
+    },
 }
 
 pub enum Command {
+    Manage {
+        destination: Destination,
+        request: Request,
+        label: String,
+    },
     StageAttachments(attachments::Operation),
     UndoDelete(uuid::Uuid),
     ReadRunAction {
@@ -650,6 +664,7 @@ impl Client {
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
+                | Command::Manage { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -815,6 +830,13 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    Manage {
+        destination: Destination,
+        label: String,
+        undo: bool,
+        run_job: bool,
+        add: Option<(String, String)>,
+    },
     Attachment(Box<attachments::Work>),
     RunReconcile(Box<run_actions::Recovery>),
     RestoreSession(crate::run_actions::DeleteUndo),
@@ -1542,16 +1564,18 @@ impl Engine {
         {
             return;
         }
-        let request = match destination {
-            Destination::Tools => Request::ListTools,
-            Destination::Metrics => Request::RunMetrics {
-                limit: Some(100),
-                session_id: None,
-                since: None,
+        let request = match crate::manage::list_request(destination) {
+            Some(request) => request,
+            None => match destination {
+                Destination::Metrics => Request::RunMetrics {
+                    limit: Some(100),
+                    session_id: None,
+                    since: None,
+                },
+                Destination::Proposals => Request::ListProposals,
+                Destination::Settings => Request::GetSettings,
+                _ => return,
             },
-            Destination::Proposals => Request::ListProposals,
-            Destination::Settings => Request::GetSettings,
-            _ => return,
         };
         self.request(request, Pending::Page(destination));
     }
@@ -2117,6 +2141,43 @@ impl Engine {
                 generation,
             } => self.select(session_id, generation),
             Command::Page(page) => self.load_page(page),
+            Command::Manage {
+                destination,
+                request,
+                label,
+            } => {
+                if self.ready {
+                    let undo = matches!(request, Request::UndoRegistryChange);
+                    let run_job = matches!(request, Request::RunJobNow { .. });
+                    let add = match &request {
+                        Request::AddSkill { source, .. } => Some((source.clone(), String::new())),
+                        Request::AddJob { prompt, cron, .. } => {
+                            Some((prompt.clone(), cron.clone().unwrap_or_default()))
+                        }
+                        Request::UpsertMemory {
+                            id: None,
+                            text: Some(text),
+                            ..
+                        } => Some((text.clone(), String::new())),
+                        _ => None,
+                    };
+                    self.request(
+                        request,
+                        Pending::Manage {
+                            destination,
+                            label,
+                            undo,
+                            run_job,
+                            add,
+                        },
+                    );
+                } else {
+                    self.updates.push(Update::ManagementNotice {
+                        destination,
+                        notice: format!("Could not {label}: Not connected; nothing was sent."),
+                    });
+                }
+            }
             Command::Refresh => {
                 self.recover_run_actions();
                 self.stream_reload();
@@ -2402,6 +2463,21 @@ impl Engine {
         let definite_rejection = run_actions::definite_rejection(&message);
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if let Some(destination) = self.page {
+                    let refresh = matches!(
+                        (destination, &event),
+                        (
+                            Destination::Tools,
+                            Event::RegistryChanged { .. } | Event::ToolUpdated { .. }
+                        ) | (Destination::Mcp, Event::McpServersChanged)
+                            | (Destination::Skills, Event::SkillsChanged)
+                            | (Destination::Memory, Event::MemoryUpdated)
+                            | (Destination::Jobs, Event::JobsChanged)
+                    );
+                    if refresh {
+                        self.load_page(destination);
+                    }
+                }
                 if let Event::CompactionNotice { session_id, .. } = &event {
                     self.pending.retain(|_, p| !matches!(p, Pending::LiveContext(owner) if owner.session == *session_id));
                     self.outgoing.retain(|r| self.pending.contains_key(&r.id));
@@ -3029,6 +3105,65 @@ impl Engine {
                     query,
                     result: result.and_then(profile_search::decode),
                 })
+            }
+            Pending::Manage {
+                destination,
+                label,
+                undo,
+                run_job,
+                add,
+            } => {
+                let succeeded = result.is_ok();
+                let notice = match result {
+                    Ok(value)
+                        if value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .is_some_and(|error| !error.is_empty()) =>
+                    {
+                        format!("Could not {label}: {}", value["error"].as_str().unwrap())
+                    }
+                    Ok(value) if run_job => match value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .filter(|status| !status.is_empty())
+                    {
+                        Some(status) => format!("{label}: {status}"),
+                        None => format!("Could not {label}: daemon returned no execution status."),
+                    },
+                    Ok(value) if undo => {
+                        let summary = value
+                            .get("undone")
+                            .and_then(Value::as_str)
+                            .unwrap_or("registry change");
+                        format!("Undone: {summary}")
+                    }
+                    Ok(value) => match value
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .filter(|warning| !warning.is_empty())
+                    {
+                        Some(warning) => format!("Done: {label} · Warning: {warning}"),
+                        None => format!("Done: {label}"),
+                    },
+                    Err(error) => format!("Could not {label}: {error}"),
+                };
+                self.updates.push(Update::ManagementNotice {
+                    destination,
+                    notice,
+                });
+                if succeeded {
+                    if let Some((text, schedule)) = add {
+                        self.updates.push(Update::ResourceAdded {
+                            destination,
+                            text,
+                            schedule,
+                        });
+                    }
+                }
+                if self.page == Some(destination) {
+                    self.load_page(destination);
+                }
             }
             Pending::Page(destination) => self.updates.push(Update::Page {
                 destination,
@@ -5443,6 +5578,242 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn managed_pages_use_their_list_requests_and_deduplicate_pending_reads() {
+        for destination in [
+            Destination::Tools,
+            Destination::Mcp,
+            Destination::Skills,
+            Destination::Memory,
+            Destination::Jobs,
+        ] {
+            let mut engine = ready();
+            engine.load_page(destination);
+            engine.load_page(destination);
+            assert_eq!(engine.outgoing.len(), 1);
+            let request = engine.outgoing.pop_front().unwrap();
+            assert_eq!(
+                serde_json::to_value(request.request).unwrap(),
+                serde_json::to_value(crate::manage::list_request(destination).unwrap()).unwrap()
+            );
+            respond(&mut engine, request.id, json!([]));
+            assert!(
+                matches!(engine.updates.last(), Some(Update::Page { destination: d, result: Ok(_), .. }) if *d == destination)
+            );
+        }
+    }
+
+    #[test]
+    fn management_reports_receipts_and_refreshes_only_the_current_destination() {
+        for (success, current) in [
+            (true, Destination::Skills),
+            (false, Destination::Skills),
+            (true, Destination::Jobs),
+        ] {
+            let mut engine = ready();
+            engine.page = Some(current);
+            engine.command(Command::Manage {
+                destination: Destination::Skills,
+                request: Request::RemoveSkill { name: "foo".into() },
+                label: "remove skill foo".into(),
+            });
+            let request = engine.outgoing.pop_front().unwrap();
+            assert!(matches!(request.request, Request::RemoveSkill { name } if name == "foo"));
+            if success {
+                respond(&mut engine, request.id, json!({}));
+            } else {
+                engine
+                    .receive(ServerMessage::err(request.id, "permission denied".into()))
+                    .unwrap();
+            }
+            let expected = if success {
+                "Done: remove skill foo"
+            } else {
+                "Could not remove skill foo: permission denied"
+            };
+            assert!(engine
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::ManagementNotice { destination: Destination::Skills, notice } if notice == expected)));
+            assert_eq!(
+                engine.outgoing.len(),
+                usize::from(current == Destination::Skills)
+            );
+            if current == Destination::Skills {
+                assert!(matches!(engine.outgoing[0].request, Request::ListSkills));
+            }
+            assert_eq!(engine.page, Some(current));
+        }
+    }
+
+    #[test]
+    fn management_reports_payload_errors_job_statuses_and_warnings() {
+        let cases = [
+            (
+                Request::RestartMcpServer {
+                    name: "demo".into(),
+                },
+                json!({"restarted":"demo", "tools":null, "error":"startup failed"}),
+                "Could not action: startup failed",
+            ),
+            (
+                Request::RestartMcpServer {
+                    name: "demo".into(),
+                },
+                json!({"restarted":"demo", "tools":0, "error":null}),
+                "Done: action",
+            ),
+            (
+                Request::AddMcpServer {
+                    name: "demo".into(),
+                    server: json!({}),
+                },
+                json!({"added":"demo", "tools":null, "error":"startup failed"}),
+                "Could not action: startup failed",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"skipped: the previous firing is still running"}),
+                "action: skipped: the previous firing is still running",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"prompt delivery failed: provider unavailable"}),
+                "action: prompt delivery failed: provider unavailable",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"started in session s"}),
+                "action: started in session s",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({}),
+                "Could not action: daemon returned no execution status.",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"status":""}),
+                "Could not action: daemon returned no execution status.",
+            ),
+            (
+                Request::SetJobEnabled {
+                    id: "j".into(),
+                    enabled: true,
+                },
+                json!({"id":"j", "enabled":true, "warning":"Keep the daemon running"}),
+                "Done: action · Warning: Keep the daemon running",
+            ),
+        ];
+        for (request, payload, expected) in cases {
+            let mut engine = ready();
+            engine.command(Command::Manage {
+                destination: Destination::Jobs,
+                request,
+                label: "action".into(),
+            });
+            let outgoing = engine.outgoing.pop_front().unwrap();
+            respond(&mut engine, outgoing.id, payload);
+            assert!(engine.updates.iter().any(|update| matches!(update, Update::ManagementNotice { notice, .. } if notice == expected)), "{:?}", engine.updates);
+        }
+    }
+
+    #[test]
+    fn add_receipts_only_clear_drafts_after_success() {
+        for success in [false, true] {
+            let mut engine = ready();
+            engine.command(Command::Manage {
+                destination: Destination::Jobs,
+                request: crate::manage::add_job("Review", "bad schedule").unwrap(),
+                label: "add job".into(),
+            });
+            let outgoing = engine.outgoing.pop_front().unwrap();
+            if success {
+                respond(&mut engine, outgoing.id, json!({"id":"j"}));
+            } else {
+                engine
+                    .receive(ServerMessage::err(
+                        outgoing.id,
+                        "unparseable schedule".into(),
+                    ))
+                    .unwrap();
+            }
+            assert_eq!(engine.updates.iter().any(|update| matches!(update, Update::ResourceAdded { destination: Destination::Jobs, text, schedule } if text == "Review" && schedule == "bad schedule")), success);
+        }
+    }
+
+    #[test]
+    fn management_requires_ready_and_undo_names_the_reverted_change() {
+        let mut engine = Engine::default();
+        engine.command(Command::Manage {
+            destination: Destination::Tools,
+            request: Request::UndoRegistryChange,
+            label: "undo last change".into(),
+        });
+        assert!(engine.outgoing.is_empty());
+        assert!(
+            matches!(engine.updates.last(), Some(Update::ManagementNotice { destination: Destination::Tools, notice }) if notice.contains("Could not undo last change") && notice.contains("Not connected"))
+        );
+        let mut engine = ready();
+        engine.page = Some(Destination::Tools);
+        engine.command(Command::Manage {
+            destination: Destination::Tools,
+            request: Request::UndoRegistryChange,
+            label: "undo last change".into(),
+        });
+        let request = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(request.request, Request::UndoRegistryChange));
+        respond(
+            &mut engine,
+            request.id,
+            json!({"undone":"user retired fetch_page", "tool":{"name":"fetch_page"}}),
+        );
+        assert!(
+            matches!(engine.updates.last(), Some(Update::ManagementNotice { destination: Destination::Tools, notice }) if notice == "Undone: user retired fetch_page")
+        );
+        assert!(matches!(engine.outgoing[0].request, Request::ListTools));
+    }
+
+    #[test]
+    fn resource_events_reload_only_the_matching_page_and_coalesce_reads() {
+        let registry: Event = serde_json::from_value(json!({"type":"registry_changed", "change":{"tool_id":"t","name":"tool","action":"retired","from_version":1,"to_version":1,"author":"user","at":"now"}})).unwrap();
+        let tool: Event = serde_json::from_value(json!({"type":"tool_updated", "tool":{"id":"t","name":"tool","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":1,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}})).unwrap();
+        let cases = [
+            (Destination::Tools, registry),
+            (Destination::Tools, tool),
+            (Destination::Mcp, Event::McpServersChanged),
+            (Destination::Skills, Event::SkillsChanged),
+            (Destination::Memory, Event::MemoryUpdated),
+            (Destination::Jobs, Event::JobsChanged),
+        ];
+        for destination in [
+            Destination::Tools,
+            Destination::Mcp,
+            Destination::Skills,
+            Destination::Memory,
+            Destination::Jobs,
+            Destination::Settings,
+        ] {
+            for (matching, event) in &cases {
+                let mut engine = ready();
+                engine.page = Some(destination);
+                engine.receive(ServerMessage::Event(event.clone())).unwrap();
+                engine.receive(ServerMessage::Event(event.clone())).unwrap();
+                assert_eq!(
+                    engine.outgoing.len(),
+                    usize::from(destination == *matching),
+                    "{destination:?} / {event:?}"
+                );
+                assert_eq!(engine.page, Some(destination));
+            }
+        }
+        let mut engine = ready();
+        engine
+            .receive(ServerMessage::Event(Event::JobsChanged))
+            .unwrap();
+        assert!(engine.outgoing.is_empty());
     }
 
     #[tokio::test]
