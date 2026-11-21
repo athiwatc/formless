@@ -129,11 +129,21 @@ pub fn status(topic: &TopicInfo) -> &'static str {
         TopicStatus::PendingApproval => "Awaiting approval",
         TopicStatus::Approved => "Ready to start",
         TopicStatus::Rejected => "Kept in main chat",
-        TopicStatus::Running if topic.attempts.is_empty() => "No harness attempt yet",
+        TopicStatus::Running if !has_active_attempt(topic) => "No active harness attempt",
         TopicStatus::Running => "In progress",
         TopicStatus::Complete => "Ready for you",
         TopicStatus::Failed => "Needs attention",
     }
+}
+pub fn has_active_attempt(topic: &TopicInfo) -> bool {
+    topic.attempts.iter().any(|attempt| {
+        matches!(
+            attempt.status,
+            formless_protocol::TopicAttemptStatus::Building
+                | formless_protocol::TopicAttemptStatus::AwaitingReview
+                | formless_protocol::TopicAttemptStatus::Reviewing
+        )
+    })
 }
 pub fn feature_status(status: TopicFeatureStatus) -> &'static str {
     match status {
@@ -213,6 +223,26 @@ impl State {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn terminal_attempt_history_does_not_imply_a_retry_is_running() {
+        let (_, mut topic) = crate::fixture::topic_workspace();
+        topic.status = TopicStatus::Running;
+        for feature in &mut topic.features {
+            feature.status = TopicFeatureStatus::Pending;
+        }
+        for attempt in &mut topic.attempts {
+            attempt.status = formless_protocol::TopicAttemptStatus::Abandoned;
+        }
+        assert!(!topic.attempts.is_empty());
+        assert!(!has_active_attempt(&topic));
+        assert_eq!(status(&topic), "No active harness attempt");
+        topic.attempts[0].status = formless_protocol::TopicAttemptStatus::Building;
+        assert!(has_active_attempt(&topic));
+        assert_eq!(status(&topic), "In progress");
+        topic.attempts.clear();
+        assert!(!has_active_attempt(&topic));
+        assert_eq!(status(&topic), "No active harness attempt");
+    }
     #[test]
     fn only_saved_user_ids_are_selectable_and_large_previews_are_bounded() {
         let messages = candidates(&json!({"messages":[

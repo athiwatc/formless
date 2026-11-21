@@ -655,7 +655,7 @@ impl Shell {
                         })),
                 );
             } else if topic.status == TopicStatus::Failed
-                || (topic.status == TopicStatus::Running && topic.attempts.is_empty())
+                || (topic.status == TopicStatus::Running && !topics::has_active_attempt(topic))
             {
                 panel = panel.child(
                     readable(

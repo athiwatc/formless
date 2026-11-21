@@ -172,7 +172,11 @@ fn claimed_but_unstarted_topic_can_recover_then_retry_without_another_move(
     step(cx, handle, |window, cx| {
         let (_, mut topic) = fixture::topic_workspace();
         topic.status = formless_protocol::TopicStatus::Running;
-        topic.attempts.clear();
+        // Recovery preserves history. A later failed launch must still be
+        // recoverable when those older attempts are terminal.
+        for attempt in &mut topic.attempts {
+            attempt.status = formless_protocol::TopicAttemptStatus::Abandoned;
+        }
         for feature in &mut topic.features {
             feature.status = formless_protocol::TopicFeatureStatus::Pending;
         }
@@ -195,7 +199,7 @@ fn claimed_but_unstarted_topic_can_recover_then_retry_without_another_move(
             .find("topic-detail-name")
             .value()
             .unwrap()
-            .contains("No harness attempt yet"));
+            .contains("No active harness attempt"));
         assert!(window
             .find("topic-recovery-help")
             .value()
