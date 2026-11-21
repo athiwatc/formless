@@ -6,6 +6,7 @@ pub mod caps;
 mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
+pub mod process_group;
 mod processes;
 mod read_size;
 use read_size::ReadSize;
