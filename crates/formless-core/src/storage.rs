@@ -74,16 +74,6 @@ pub(crate) use recap_storage::RecapRunFacts;
 mod forecast_report_storage;
 pub(crate) use forecast_report_storage::ForecastMetricInput;
 
-fn run_duration_ms(created: &str, updated: &str) -> i64 {
-    match (
-        chrono::DateTime::parse_from_rfc3339(created),
-        chrono::DateTime::parse_from_rfc3339(updated),
-    ) {
-        (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
-        _ => 0,
-    }
-}
-
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
