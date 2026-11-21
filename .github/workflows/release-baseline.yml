@@ -411,7 +411,7 @@ jobs:
       - name: Record exact build toolchain
         shell: bash
         run: |
-          build_image=$(awk '$1 == "FROM" && $3 == "AS" && $4 == "build" { print $2; exit }' Dockerfile)
+          build_image=$(awk '$1 == "FROM" && $3 == "AS" && $4 == "build-base" { print $2; exit }' Dockerfile)
           test -n "$build_image"
           docker run --rm --network none "$build_image" rustc -Vv
       - name: Smoke private container with positive RPC proof
