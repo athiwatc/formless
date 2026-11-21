@@ -1029,6 +1029,7 @@ impl Preparation {
 #[derive(Default)]
 struct Engine {
     topics_revision: u64,
+    topic_sessions: HashSet<String>,
     topics_available: bool,
     topics_polled: Option<std::time::Instant>,
     attachment_conversions: VecDeque<attachments::ClipboardJob>,
@@ -2953,10 +2954,24 @@ impl Engine {
                     return Ok(());
                 }
                 let result = result.and_then(|v| action.decode(v));
-                if matches!(&result, Ok(crate::topics::Reply::Inventory(_))) {
+                if let Ok(crate::topics::Reply::Inventory(topics)) = &result {
                     // A fresh inventory can introduce a topic/harness transcript
                     // before its SessionUpdated event reaches this connection.
-                    self.dirty_list = true;
+                    let sessions = topics
+                        .iter()
+                        .flat_map(|topic| {
+                            topic.topic_session_id.iter().cloned().chain(
+                                topic
+                                    .attempts
+                                    .iter()
+                                    .map(|attempt| attempt.conversation_session_id.clone()),
+                            )
+                        })
+                        .collect::<HashSet<_>>();
+                    if sessions != self.topic_sessions {
+                        self.topic_sessions = sessions;
+                        self.dirty_list = true;
+                    }
                 }
                 if let crate::topics::Action::MoveAndStart(id) = &action {
                     if matches!(&result, Ok(crate::topics::Reply::Topic(t)) if t.id == *id && t.status == formless_protocol::TopicStatus::Approved)
@@ -4553,6 +4568,15 @@ mod tests {
         respond(&mut engine, request.id, json!([topic]));
         assert!(engine.dirty_list, "new transcript rows must be discovered");
         assert!(engine.outgoing.is_empty(), "inventory never starts work");
+        engine.dirty_list = false;
+        engine.topic_command(None, crate::topics::Action::List);
+        let request = engine.outgoing.pop_back().unwrap();
+        let (_, topic) = crate::fixture::topic_workspace();
+        respond(&mut engine, request.id, json!([topic]));
+        assert!(
+            !engine.dirty_list,
+            "unchanged idle polls do not reload Sessions"
+        );
     }
 
     fn ready() -> Engine {
