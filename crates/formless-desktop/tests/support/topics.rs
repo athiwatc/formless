@@ -89,6 +89,10 @@ fn topic_accept_and_cancel_emit_distinct_single_intents(cx: &mut TestAppContext)
                 )
             });
             window.render_frame(cx);
+            assert!(
+                window.find("topic-consent").visible(),
+                "daemon proposal appears in its source chat without a navigation step"
+            );
             window.click("topic-topic-formless", cx);
             window.render_frame(cx);
             assert!(window

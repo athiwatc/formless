@@ -552,7 +552,11 @@ impl Shell {
                     .disabled(busy || ui.selected.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.propose_topic(cx))),
             );
-        } else if let Some(topic) = ui.state.selected() {
+        } else if let Some(topic) = ui
+            .state
+            .selected()
+            .or_else(|| ui.state.pending_for(self.sidebar.active_id()))
+        {
             panel = panel
                 .child(
                     readable(

@@ -87,8 +87,12 @@ pub fn candidates(value: &serde_json::Value) -> Vec<Candidate> {
             if m["role"].as_str()? != "user" {
                 return None;
             }
+            let id = m["id"].as_str()?;
+            if id.trim().is_empty() {
+                return None;
+            }
             Some(Candidate {
-                id: m["id"].as_str()?.to_string(),
+                id: id.to_string(),
                 seq: m["seq"].as_i64()?,
                 preview: m["content"].as_str()?.chars().take(160).collect(),
             })
@@ -172,6 +176,13 @@ impl State {
             .iter()
             .find(|t| Some(&t.id) == self.selected.as_ref())
     }
+    /// Daemon suggestions use the same consent view as a manual proposal.
+    /// Merely receiving a proposal never approves or starts it.
+    pub fn pending_for(&self, source: Option<&str>) -> Option<&TopicInfo> {
+        self.topics.iter().find(|t| {
+            t.status == TopicStatus::PendingApproval && Some(t.source_session_id.as_str()) == source
+        })
+    }
     pub fn attempt_for(
         &self,
         session: &str,
@@ -201,6 +212,7 @@ mod tests {
         let messages = candidates(&json!({"messages":[
             {"id":"assistant","seq":0,"role":"assistant","content":"not a request"},
             {"id":"request","seq":1,"role":"user","content":"ก".repeat(1000)},
+            {"id":" ","seq":2,"role":"user","content":"empty identity"},
             {"seq":2,"role":"user","content":"no identity"}
         ]}));
         assert_eq!(messages.len(), 1);
@@ -220,5 +232,18 @@ mod tests {
         state.disconnect();
         assert!(state.pending.is_none());
         assert!(state.notice.unwrap().contains("unknown"));
+    }
+
+    #[test]
+    fn daemon_proposals_only_prompt_the_source_chat_and_never_imply_consent() {
+        let (_, mut topic) = crate::fixture::topic_workspace();
+        topic.status = TopicStatus::PendingApproval;
+        let mut state = State::default();
+        state.apply(Reply::Inventory(vec![topic]));
+        assert!(state.pending_for(Some("main")).is_some());
+        assert!(state.pending_for(Some("other")).is_none());
+        assert!(state.pending_for(None).is_none());
+        assert!(state.selected.is_none());
+        assert!(state.pending.is_none());
     }
 }
