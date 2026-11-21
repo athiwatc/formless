@@ -111,6 +111,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
 
     let mut environment = request.environment.clone();
     environment.insert(CONFIG_ENV.into(), config_content.into());
+    environment.insert("PWD".into(), request.cwd.as_os_str().to_owned());
 
     Ok(CommandSpec {
         program: request
@@ -341,15 +342,12 @@ mod tests {
             let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
             assert_eq!(spec.program, PathBuf::from("/opt/test/opencode"));
             assert_eq!(
+                spec.environment[&OsString::from("PWD")],
+                spec.cwd.as_os_str()
+            );
+            assert_eq!(
                 &args[..6],
-                [
-                    "run",
-                    "--standalone",
-                    "--format",
-                    "json",
-                    "--agent",
-                    agent,
-                ]
+                ["run", "--standalone", "--format", "json", "--agent", agent,]
             );
             assert_eq!(
                 &args[6..],
@@ -475,7 +473,12 @@ mod tests {
         request.model = Some("model-without-provider".into());
         assert!(command_spec(&request).is_err());
         request.model = None;
+        request.environment.insert("PWD".into(), "/wrong".into());
         let spec = command_spec(&request).unwrap();
+        assert_eq!(
+            spec.environment[&OsString::from("PWD")],
+            request.cwd.as_os_str()
+        );
         let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert_eq!(&args[6..], ["--", "prompt"]);
         request.executable = None;
@@ -576,7 +579,7 @@ mod tests {
         let executable = directory.0.join("fake-opencode");
         fs::write(
             &executable,
-            "#!/bin/sh\nset -eu\n[ \"$#\" -eq 8 ]\n[ \"$1\" = run ]\n[ \"$2\" = --standalone ]\n[ \"$3\" = --format ]\n[ \"$4\" = json ]\n[ \"$5\" = --agent ]\n[ \"$6\" = build ]\n[ \"$7\" = -- ]\n[ \"$8\" = --prompt-as-one-argument ]\n[ \"$(pwd)\" = \"$EXPECTED_CWD\" ]\n[ \"$FORMLESS_TOPIC_CAPABILITY\" = unit-test-secret ]\ncase \"$OPENCODE_CONFIG_CONTENT\" in *'{env:FORMLESS_TOPIC_CAPABILITY}'*) ;; *) exit 11 ;; esac\ncase \"$OPENCODE_CONFIG_CONTENT\" in *\"$FORMLESS_TOPIC_CAPABILITY\"*) exit 12 ;; esac\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"text\",\"text\":\"fake response\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n",
+            "#!/bin/sh\nset -eu\n[ \"$#\" -eq 8 ]\n[ \"$1\" = run ]\n[ \"$2\" = --standalone ]\n[ \"$3\" = --format ]\n[ \"$4\" = json ]\n[ \"$5\" = --agent ]\n[ \"$6\" = build ]\n[ \"$7\" = -- ]\n[ \"$8\" = --prompt-as-one-argument ]\n[ \"$(pwd)\" = \"$EXPECTED_CWD\" ]\n[ \"$PWD\" = \"$EXPECTED_CWD\" ]\n[ \"$FORMLESS_TOPIC_CAPABILITY\" = unit-test-secret ]\ncase \"$OPENCODE_CONFIG_CONTENT\" in *'{env:FORMLESS_TOPIC_CAPABILITY}'*) ;; *) exit 11 ;; esac\ncase \"$OPENCODE_CONFIG_CONTENT\" in *\"$FORMLESS_TOPIC_CAPABILITY\"*) exit 12 ;; esac\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"text\",\"text\":\"fake response\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
