@@ -628,12 +628,12 @@ impl State {
             ["start", topic_id] => self
                 .open_action(topic_id, ConfirmedAction::Start)
                 .then_some(())
-                .ok_or_else(|| self.unavailable_action(&topic_id)),
+                .ok_or_else(|| self.unavailable_action(topic_id)),
             ["recover"] => self.open_action_for_selected(ConfirmedAction::Recover),
             ["recover", topic_id] => self
                 .open_action(topic_id, ConfirmedAction::Recover)
                 .then_some(())
-                .ok_or_else(|| self.unavailable_action(&topic_id)),
+                .ok_or_else(|| self.unavailable_action(topic_id)),
             ["retry", topic_id, feature_id] => self
                 .open_action(
                     topic_id,
@@ -642,7 +642,7 @@ impl State {
                     },
                 )
                 .then_some(())
-                .ok_or_else(|| self.unavailable_action(&topic_id)),
+                .ok_or_else(|| self.unavailable_action(topic_id)),
             ["retry", feature_id] => {
                 let Some(Node::Topic(topic_id)) = self.selected_topic_node() else {
                     return Err("Select a topic with /topics first.".into());
@@ -671,11 +671,11 @@ impl State {
             ["reject", topic_id] => self
                 .open_reject(topic_id)
                 .then_some(())
-                .ok_or_else(|| self.unavailable_action(&topic_id)),
+                .ok_or_else(|| self.unavailable_action(topic_id)),
             [topic_id] => self
                 .open_details(topic_id)
                 .then_some(())
-                .ok_or_else(|| self.unavailable_action(&topic_id)),
+                .ok_or_else(|| self.unavailable_action(topic_id)),
             _ => Err(
                 "Usage: /topic [ID|start|recover|retry TOPIC FEATURE|reject TOPIC REASON]".into(),
             ),
