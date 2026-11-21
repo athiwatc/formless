@@ -52,6 +52,8 @@ fn row(label: &str, preview: String, detail: String) -> Row {
         preview: preview.chars().take(PREVIEW_CHARS).collect(),
         preview_truncated: preview.chars().nth(PREVIEW_CHARS).is_some(),
         detail,
+        status: None,
+        actions: Vec::new(),
     }
 }
 #[derive(Debug)]

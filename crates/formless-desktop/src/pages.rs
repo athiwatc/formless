@@ -1,4 +1,5 @@
-//! Bounded read-only projections of existing daemon destinations.
+//! Bounded projections of daemon destinations.
+use crate::manage::{self, RowAction};
 use crate::model::Destination;
 use serde_json::Value;
 
@@ -11,6 +12,8 @@ pub struct Row {
     pub preview: String,
     pub preview_truncated: bool,
     pub detail: String,
+    pub status: Option<String>,
+    pub actions: Vec<RowAction>,
 }
 
 #[derive(Debug, Default)]
@@ -24,7 +27,12 @@ pub struct Page {
 impl Page {
     pub fn decode(destination: Destination, value: Value) -> Result<Self, String> {
         let entries: Vec<(String, Value)> = match destination {
-            Destination::Tools | Destination::Proposals => {
+            Destination::Tools
+            | Destination::Mcp
+            | Destination::Skills
+            | Destination::Memory
+            | Destination::Jobs
+            | Destination::Proposals => {
                 let values = value.as_array().ok_or("Expected a list from the daemon")?;
                 values
                     .iter()
@@ -85,6 +93,11 @@ impl Page {
             .into_iter()
             .take(MAX_ROWS)
             .map(|(label, value)| {
+                let (label, status, actions) = if manage::list_request(destination).is_some() {
+                    manage::projection(destination, &value)?
+                } else {
+                    (label, None, Vec::new())
+                };
                 let detail = serde_json::to_string_pretty(&value).expect("JSON value serializes");
                 let fields = match &value {
                     Value::Object(fields) => fields
@@ -108,24 +121,31 @@ impl Page {
                 };
                 let preview_truncated = fields.chars().nth(PREVIEW_CHARS).is_some();
                 let preview: String = fields.chars().take(PREVIEW_CHARS).collect();
-                Row {
+                Ok(Row {
                     label,
                     preview,
                     preview_truncated,
                     detail,
-                }
+                    status,
+                    actions,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         let scope = if destination == Destination::Metrics {
             " · Summary and up to 100 recent Runs"
         } else {
             ""
         };
+        let editing = if manage::list_request(destination).is_some() {
+            ""
+        } else {
+            " · Read only. Use the Formless TUI to edit."
+        };
         Ok(Self {
             revision: 0,
             selected: (!rows.is_empty()).then_some(0),
             notice: format!(
-                "{} entries{}{scope} · Read only. Use the Formless TUI to edit.",
+                "{} entries{}{scope}{editing}",
                 rows.len(),
                 if truncated { " · first 1000 only" } else { "" }
             ),
@@ -138,6 +158,66 @@ impl Page {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn manageable_destinations_decode_states_actions_and_raw_details() {
+        let cases = [
+            (
+                Destination::Tools,
+                json!({"id":"t", "name":"Tool", "retired":true}),
+                "Tool",
+                "retired",
+                vec!["Disable", "Pin", "Restore"],
+            ),
+            (
+                Destination::Mcp,
+                json!({"name":"server", "state":"failed", "tool_count":2}),
+                "server · failed · 2 tools",
+                "failed",
+                vec!["Restart", "Remove"],
+            ),
+            (
+                Destination::Skills,
+                json!({"name":"skill", "version":3, "enabled":false}),
+                "skill v3",
+                "disabled",
+                vec!["Enable", "Remove"],
+            ),
+            (
+                Destination::Memory,
+                json!({"id":"m", "text":"Remember this", "enabled":false}),
+                "Remember this",
+                "off",
+                vec!["Enable", "Delete"],
+            ),
+            (
+                Destination::Jobs,
+                json!({"id":"j", "prompt":"Do this", "approved":false}),
+                "Do this",
+                "needs approval",
+                vec!["Approve", "Run now", "Delete"],
+            ),
+        ];
+        for (destination, value, label, status, actions) in cases {
+            let page = Page::decode(destination, json!([value.clone()])).unwrap();
+            let row = &page.rows[0];
+            assert_eq!(row.label, label);
+            assert_eq!(row.status.as_deref(), Some(status));
+            assert_eq!(
+                row.actions.iter().map(|a| a.label).collect::<Vec<_>>(),
+                actions
+            );
+            assert!(!page.notice.contains("Read only"));
+            assert_eq!(serde_json::from_str::<Value>(&row.detail).unwrap(), value);
+            assert!(Page::decode(destination, json!([]))
+                .unwrap()
+                .rows
+                .is_empty());
+            for invalid in [Value::Null, json!({}), json!([null]), json!([{}])] {
+                assert!(Page::decode(destination, invalid).is_err());
+            }
+        }
+    }
 
     #[test]
     fn validates_shapes_instead_of_showing_malformed_replies_as_empty() {
@@ -163,7 +243,7 @@ mod tests {
 
     #[test]
     fn bounded_unicode_preview_keeps_exact_copy_source_and_labels_partial_results() {
-        let value = json!({"name": "Thai ไทย", "text": "😀".repeat(900)});
+        let value = json!({"id": "tool-1", "name": "Thai ไทย", "text": "😀".repeat(900)});
         let page = Page::decode(
             Destination::Tools,
             Value::Array(vec![value.clone(); MAX_ROWS + 20]),
