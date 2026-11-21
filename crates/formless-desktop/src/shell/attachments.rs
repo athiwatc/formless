@@ -91,6 +91,7 @@ pub(super) fn transcript_chips(
 pub(super) struct State {
     pub(super) needs_refresh: bool,
     pub(super) pending: Option<Report>,
+    pub(super) reference_operation: Option<uuid::Uuid>,
     operations: HashMap<uuid::Uuid, Vec<String>>,
     mutations: HashSet<uuid::Uuid>,
     waiting: Vec<Intake>,
