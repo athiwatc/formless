@@ -17366,6 +17366,8 @@ fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused: bool) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         form.viewport.set(Default::default());
@@ -17389,7 +17391,7 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
         let mut text = if field.masked {
-            "•".repeat(field.input.chars().count())
+            "•".repeat(field.input.graphemes(true).count())
         } else {
             field.input.to_string()
         };
@@ -17400,7 +17402,7 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused
         if active {
             let (before, _) = field.input.split_at(field.input.cursor_byte());
             let before = if field.masked {
-                "•".repeat(before.chars().count())
+                "•".repeat(before.graphemes(true).count())
             } else {
                 before.to_owned()
             };
@@ -24006,7 +24008,7 @@ mod tests {
         app.settings_form = Some(form);
 
         let first = render(&mut app, 65, 9);
-        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("••••▏"), "{first}");
         assert!(first.contains("Enter next, then save"), "{first}");
         assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
         assert!(!first.contains("ab界"), "{first}");
@@ -24043,11 +24045,11 @@ mod tests {
 
         app.key(key(KeyCode::Left));
         let followed = render(&mut app, 65, 9);
-        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(followed.contains("••••▏"), "{followed}");
         assert!(!followed.contains("ab界"), "{followed}");
         app.paste("X");
         let edited = render(&mut app, 65, 9);
-        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(edited.contains("•••••▏"), "{edited}");
         assert!(!edited.contains("ab界"), "{edited}");
         app.key(key(KeyCode::Tab));
         let next_field = render(&mut app, 65, 9);
