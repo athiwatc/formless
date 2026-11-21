@@ -1330,6 +1330,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "directories",
  "formless-core",
  "formless-protocol",
  "formless-runtime",

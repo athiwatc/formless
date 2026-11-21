@@ -3641,14 +3641,42 @@ fn redact(text: &str) -> String {
         .map(|(re, to)| (regex::Regex::new(re).expect("redaction rule"), to))
         .collect()
     });
-    let mut out = text.to_string();
+    let native =
+        directories::BaseDirs::new().map(|dirs| dirs.home_dir().as_os_str().to_os_string());
+    let homes = [
+        native,
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOME"),
+    ];
+    let mut out = redact_report_home_paths(
+        text,
+        homes.iter().flatten().map(|home| home.to_string_lossy()),
+    );
     for (re, to) in rules {
         out = re.replace_all(&out, *to).into_owned();
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
-        out = out.replace(&*home.to_string_lossy(), "~");
-    }
     out
+}
+
+fn redact_report_home_paths<'a>(
+    text: &str,
+    homes: impl IntoIterator<Item = std::borrow::Cow<'a, str>>,
+) -> String {
+    let mut spellings = Vec::new();
+    for home in homes.into_iter().filter(|home| !home.is_empty()) {
+        // JSON escapes native separators before the report is redacted.
+        let escaped = serde_json::Value::String(home.to_string()).to_string();
+        spellings.push(escaped[1..escaped.len() - 1].to_owned());
+        if home.contains('\\') {
+            spellings.push(home.replace('\\', "/"));
+        }
+        spellings.push(home.into_owned());
+    }
+    spellings.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    spellings.dedup();
+    spellings
+        .into_iter()
+        .fold(text.to_owned(), |out, spelling| out.replace(&spelling, "~"))
 }
 
 /// `doctor --json`: the facts and problems, redacted.
@@ -9950,6 +9978,41 @@ mod tests {
         }
         // Ordinary ids and words survive.
         assert!(r.contains("79d338f2-4f6c-4116-b2d7-3043bbfd084b ok"), "{r}");
+    }
+
+    #[test]
+    fn reports_redact_native_home_and_shell_spellings_in_text_and_json() {
+        use std::borrow::Cow;
+        let homes = [
+            r"C:\Users\Example Person",
+            "/c/Users/Example Person",
+            "/home/fixture",
+        ];
+        let input = serde_json::json!({
+            "native": r"C:\Users\Example Person\AppData\Formless",
+            "native_slashes": "C:/Users/Example Person/AppData/Formless",
+            "shell": "/c/Users/Example Person/.config/formless",
+            "unix": "/home/fixture/.local/share/formless",
+            "ordinary": r"C:\Work\Formless",
+        });
+        let masked = redact_report_home_paths(&input.to_string(), homes.map(Cow::Borrowed));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&masked).unwrap(),
+            serde_json::json!({
+                "native": r"~\AppData\Formless",
+                "native_slashes": "~/AppData/Formless",
+                "shell": "~/.config/formless",
+                "unix": "~/.local/share/formless",
+                "ordinary": r"C:\Work\Formless",
+            })
+        );
+        assert_eq!(
+            redact_report_home_paths(
+                r"log at C:\Users\Example Person\logs",
+                homes.map(Cow::Borrowed)
+            ),
+            r"log at ~\logs"
+        );
     }
 
     #[test]
