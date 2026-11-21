@@ -11547,32 +11547,39 @@ impl Daemon {
         )
         .map_err(|error| anyhow!(error))?;
         let root = mention_root(root_hint)?;
-        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
-        let input_path = if let Some(rest) = path.strip_prefix("~/") {
-            home.as_ref()
-                .filter(|home| home.is_absolute())
-                .context("native home is unavailable for this mention")?
-                .join(rest)
+        let (input_path, home_root) = if let Some(rest) = crate::files::home_path_suffix(path) {
+            let base = directories::BaseDirs::new()
+                .filter(|base| base.home_dir().is_absolute())
+                .context("native home is unavailable for this mention")?;
+            let home = base.home_dir();
+            (
+                home.join(rest),
+                Some(
+                    home.canonicalize()
+                        .context("native home cannot be resolved")?,
+                ),
+            )
         } else {
-            std::path::PathBuf::from(path)
+            (std::path::PathBuf::from(path), None)
         };
+        let (input_path, full) = crate::files::resolve_file_mention(&root, input_path)
+            .with_context(|| format!("no file '{path}'"))?;
         // Preserve the configured root spelling as well as its resolved
         // destination: a credential/profile namespace can itself be an alias.
         let requested = raw_root.join(&input_path);
-        let full = root
-            .join(input_path)
-            .canonicalize()
-            .with_context(|| format!("no file '{path}'"))?;
-        // A mention reaches only the working folder (or ~/ when written so),
+        // A mention reaches only the working folder (or an explicit home path),
         // and never a credential, whoever pasted it (#863).
-        let inside = full.starts_with(&root)
-            || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
-        if !inside {
+        let authority_root = if full.starts_with(&root) {
+            Some(&root)
+        } else {
+            home_root.as_ref().filter(|home| full.starts_with(home))
+        };
+        let Some(authority_root) = authority_root else {
             return Err(anyhow!(
                 "@{path} is outside the working folder {}; attach it with /attach instead",
                 root.display()
             ));
-        }
+        };
         if let Some(why) = credential_path(&full) {
             return Err(anyhow!(
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
@@ -11602,14 +11609,7 @@ impl Daemon {
             };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let authority_root = if full.starts_with(&root) {
-                root.clone()
-            } else {
-                home.as_ref()
-                    .context("authorized home is unavailable")?
-                    .canonicalize()?
-            };
-            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+            let bytes=crate::attachment_access::read_rooted_file(authority_root,&full,inline_limit)
                 .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
@@ -15815,7 +15815,17 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let listener = tokio::net::UnixListener::bind(&sock)
+            .with_context(|| format!("bind {}", sock.display()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(&sock)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
+            bail!("socket ownership or permissions changed during bind");
+        }
+        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -15825,6 +15835,10 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if !unix_peer_is_owner(&stream) {
+                        tracing::warn!("rejecting Unix socket peer without owner credentials");
+                        continue;
+                    }
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(stream).await });
                 }
@@ -17182,6 +17196,9 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
@@ -17200,7 +17217,10 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".pypirc",
         "rclone.conf",
         ".rclone.conf",
+        ".yarnrc",
+        ".yarnrc.yml",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
     ]
     .contains(&name.as_str())
@@ -17209,9 +17229,13 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
         || name.ends_with(".p12")
         || name.ends_with(".pfx");
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("a Pulumi credentials file");
+    }
     secret_file.then_some("a key or secrets file")
 }
 
@@ -17389,9 +17413,59 @@ fn harness_target(op: &str, args: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+fn unix_peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    unix_peer_uid_matches(stream, uid)
+}
+
+#[cfg(unix)]
+fn unix_peer_uid_matches(stream: &tokio::net::UnixStream, uid: libc::uid_t) -> bool {
+    stream.peer_cred().is_ok_and(|peer| peer.uid() == uid)
+}
+
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_and_owner_can_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::Path::new("/tmp").join(format!("fl-ipc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _client = tokio::net::UnixStream::connect(paths.socket_path())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(unix_peer_is_owner(&peer));
+        let actual_uid = peer.peer_cred().unwrap().uid();
+        assert!(!unix_peer_uid_matches(&peer, actual_uid.wrapping_add(1)));
+        drop(listener);
+        drop(daemon);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {
