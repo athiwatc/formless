@@ -655,6 +655,22 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+fn windows_drive_path(path: &str) -> bool {
+    matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
+fn approval_path(path: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let plain = path
+        .strip_prefix(r"\\?\")
+        .filter(|plain| windows_drive_path(plain))
+        .unwrap_or(path);
+    if windows_drive_path(plain) || path.starts_with(r"\\") {
+        (plain.replace('\\', "/").to_ascii_lowercase().into(), true)
+    } else {
+        (path.into(), false)
+    }
+}
+
 /// Why a Capability is unusually broad, if it is (SPEC §10.3): bare `net`
 /// or `process`, `fs:write` on the whole disk or a home folder, or `env`
 /// for a key that looks like a secret. Approval prompts flag these loudly
@@ -666,13 +682,16 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         _ => {}
     }
     if let Some(path) = spec.strip_prefix("fs:write:") {
+        let (path, _) = approval_path(path);
         let p = path.trim_end_matches('/');
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
         let home = matches!(
             parts.as_slice(),
             [] | ["Users" | "home"] | ["Users" | "home", _] | ["root"]
         );
-        if p.is_empty() || p == "~" || home {
+        let windows_home = windows_drive_path(&path)
+            && matches!(parts.as_slice(), [_] | [_, "users"] | [_, "users", _]);
+        if p.is_empty() || p == "~" || home || windows_home {
             return Some("writing anywhere in your files");
         }
     }
@@ -847,6 +866,7 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     if is_composer_auth_path(std::path::Path::new(path)) {
         return Some((true, "holds Composer credentials".into()));
     }
+    let (path, windows) = approval_path(path);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     const SECRET_DIRS: [(&str, &str); 7] = [
         (".ssh", "SSH keys"),
@@ -858,7 +878,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
         (".password-store", "saved passwords"),
     ];
     for (dir, what) in SECRET_DIRS {
-        if segments.contains(&dir) {
+        if segments.contains(&dir)
+            || (windows && segments.iter().any(|part| part.eq_ignore_ascii_case(dir)))
+        {
             return Some((true, format!("holds {what}")));
         }
     }
@@ -868,18 +890,23 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     {
         return Some((true, "holds account credentials".into()));
     }
-    if is_pulumi_credentials_path(std::path::Path::new(path)) {
+    if is_pulumi_credentials_path(std::path::Path::new(&*path)) {
         return Some((true, "holds Pulumi credentials".into()));
     }
     if segments.first() == Some(&"etc") {
         return Some((true, "system configuration".into()));
     }
-    let cwd = cwd.filter(|c| !c.is_empty())?.trim_end_matches('/');
-    let inside = path == cwd || path.starts_with(&format!("{cwd}/"));
+    let cwd = cwd.filter(|c| !c.is_empty())?;
+    let (normalized_cwd, _) = approval_path(cwd);
+    let compared_cwd = normalized_cwd.trim_end_matches('/');
+    let inside = path == compared_cwd || path.starts_with(&format!("{compared_cwd}/"));
     Some(if inside {
         (false, "inside the working folder".into())
     } else {
-        (true, format!("outside the working folder {cwd}"))
+        (
+            true,
+            format!("outside the working folder {}", cwd.trim_end_matches('/')),
+        )
     })
 }
 
@@ -2197,6 +2224,9 @@ pub enum Request {
     /// named "… · original answer" before it is replaced.
     RetryRun {
         session_id: String,
+        /// Reject when the latest Run has changed since the user selected it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default = "default_true")]
@@ -4127,6 +4157,61 @@ mod tests {
         for spec in ["process:pipx", "process:pipenv", "process:piper"] {
             assert_eq!(broad_capability(spec), None, "{spec}");
         }
+    }
+
+    #[test]
+    fn windows_drive_and_home_write_scopes_are_broad() {
+        for path in [
+            r"C:\",
+            "c:/",
+            r"D:\Users",
+            r"C:\Users\Ada\",
+            r"\\?\C:\USERS\Ada",
+        ] {
+            assert_eq!(
+                broad_capability(&format!("fs:write:{path}")),
+                Some("writing anywhere in your files"),
+                "{path}"
+            );
+        }
+        for path in [
+            r"C:",
+            r"C:Users\Ada",
+            r"C:\Users\Ada\project",
+            r"C:\repo\Users\Ada",
+            r"/project\Users\Ada",
+        ] {
+            assert_eq!(
+                broad_capability(&format!("fs:write:{path}")),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_notes_handle_credential_folders_and_working_directory_boundaries() {
+        assert_eq!(
+            path_note(r"fs:read:C:\Users\Ada\.SSH\id_rsa", Some(r"C:\Users\Ada")),
+            Some((true, "holds SSH keys".into()))
+        );
+        assert_eq!(
+            path_note(
+                "fs:read:c:/Users/Ada/project/file",
+                Some(r"C:\USERS\Ada\project\")
+            ),
+            Some((false, "inside the working folder".into()))
+        );
+        assert_eq!(
+            path_note(
+                "fs:read:c:/Users/Ada/project-other/file",
+                Some(r"C:\Users\Ada\project")
+            ),
+            Some((
+                true,
+                r"outside the working folder C:\Users\Ada\project".into()
+            ))
+        );
     }
 
     #[test]
