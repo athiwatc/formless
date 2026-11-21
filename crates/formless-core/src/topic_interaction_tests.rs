@@ -98,7 +98,6 @@ fn permission(always: bool) -> HarnessPermissionRequest {
         raw_input: Some(json!({"path":"invoices"})),
         options: vec![
             HarnessPermissionOption {
-                extra: Default::default(),
                 option_id: "allow".into(),
                 name: "Allow".into(),
                 kind: if always {
@@ -108,7 +107,6 @@ fn permission(always: bool) -> HarnessPermissionRequest {
                 },
             },
             HarnessPermissionOption {
-                extra: Default::default(),
                 option_id: "reject".into(),
                 name: "Reject".into(),
                 kind: HarnessPermissionOptionKind::RejectOnce,

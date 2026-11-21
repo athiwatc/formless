@@ -10,8 +10,9 @@ its own spec. Core v2's topic orchestrator is not yet available, so this adapter
 does not make `StartTopicWorkflow` execute steps.
 
 `HarnessRequest.access` (`StepAccess::ReadOnly` or `Write`) controls mode/argv
-selection. Permission IDs, names, kinds, and opaque option metadata reach the
-interaction handler unchanged. An unanswered permission is rejected. The adapter
+selection. Permission IDs, names, and kinds reach the interaction handler unchanged;
+vendor tool-call `_meta` is kept under `raw_input._meta` by the shared adapter.
+An unanswered permission is rejected. The adapter
 does not cache approvals; core's AllowAlways cache is scoped to the attempt, and
 each run starts a fresh agent process/session. Text messages/thoughts, tool calls,
 and plans are mapped to core updates using the shared `acp::Interactions` adapter.

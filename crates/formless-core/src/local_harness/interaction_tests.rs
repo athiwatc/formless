@@ -78,8 +78,8 @@ mod fixture {
 
     fn options() -> Value {
         json!([
-            {"optionId":"yes","kind":"allow_always","name":"Allow for this attempt","_meta":{"vendor":"opaque"}},
-            {"optionId":"no","kind":"reject_once","name":"Reject","extra":[1,2]}
+            {"optionId":"yes","kind":"allow_always","name":"Allow for this attempt"},
+            {"optionId":"no","kind":"reject_once","name":"Reject"}
         ])
     }
 
@@ -121,7 +121,7 @@ mod fixture {
                 script.push_str(&format!("printf '%s\\n' '{notification}'\n"));
             }
             let permission = json!({"jsonrpc":"2.0","id":90,"method":"session/request_permission","params":{
-                "sessionId":"fixture","toolCall":{"title":"Read file","kind":"read","rawInput":{"path":"input"}},"options":options()}});
+                "sessionId":"fixture","toolCall":{"title":"Read file","kind":"read","rawInput":{"path":"input"},"_meta":{"vendor":"opaque"}},"options":options()}});
             let done = json!({"jsonrpc":"2.0","id":prompt_id,"result":{"stopReason":"end_turn"}});
             script.push_str(&format!("printf '%s\\n' '{permission}'\nIFS= read -r line\nprintf '%s\\n' \"$line\" > permission-reply\nprintf '%s\\n' '{done}'\n"));
             fs::write(agent.0.join("agent"), script).unwrap();
@@ -175,7 +175,10 @@ mod fixture {
                 assert_eq!(permissions.len(), 1);
                 assert_eq!(permissions[0].title, "Read file");
                 assert_eq!(permissions[0].kind, "read");
-                assert_eq!(permissions[0].raw_input, Some(json!({"path":"input"})));
+                assert_eq!(
+                    permissions[0].raw_input,
+                    Some(json!({"path":"input","_meta":{"vendor":"opaque"}}))
+                );
                 let mut forwarded = serde_json::to_value(&permissions[0].options).unwrap();
                 for option in forwarded.as_array_mut().unwrap() {
                     let object = option.as_object_mut().unwrap();
