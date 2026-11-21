@@ -286,7 +286,7 @@ pub struct Probe {
 }
 
 #[cfg(not(test))]
-const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 #[cfg(test)]
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 

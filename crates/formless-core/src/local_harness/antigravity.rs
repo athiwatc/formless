@@ -11,6 +11,7 @@ use super::acp::{self, AgentSpec, PermissionHandler};
 use super::{CommandSpec, HarnessKind, HarnessRequest, HarnessResult, StepAccess};
 use anyhow::{anyhow, bail, Context, Result};
 use formless_protocol::HarnessAvailability;
+use formless_runtime::process_group::SupervisedProcess;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -50,7 +51,7 @@ pub fn open_session(request: &HarnessRequest) -> Result<String> {
 
 /// Readiness for `ListHarnesses`. ACP `initialize` gives install state and version without
 /// a sign-in; `agy models` then needs the user's existing sign-in and asks for one without
-/// it. Nothing is written and no credentials are read.
+/// it. Nothing is written and no credentials are read. Bounded at about 9s in total.
 pub fn availability(
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
@@ -73,7 +74,7 @@ pub fn availability(
 }
 
 #[cfg(not(test))]
-const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
+const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MODELS_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -82,18 +83,20 @@ fn models_signed_in(
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> Option<bool> {
-    let mut child = Command::new(executable.unwrap_or_else(|| PathBuf::from(SPEC.program)))
+    let mut command = Command::new(executable.unwrap_or_else(|| PathBuf::from(SPEC.program)));
+    command
         .arg("models")
         .current_dir(std::env::temp_dir())
         .envs(environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    // Dropping the supervised child kills agy's whole process group on every exit path.
+    let mut child = SupervisedProcess::spawn(command).ok()?;
+    let (_, stdout, stderr) = child.take_pipes();
     let mut pipes: Vec<Box<dyn Read + Send>> = Vec::new();
-    pipes.extend(child.stdout.take().map(|pipe| Box::new(pipe) as _));
-    pipes.extend(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    pipes.extend(stdout.map(|pipe| Box::new(pipe) as _));
+    pipes.extend(stderr.map(|pipe| Box::new(pipe) as _));
     let readers: Vec<_> = pipes
         .into_iter()
         .map(|mut pipe| {
@@ -109,13 +112,10 @@ fn models_signed_in(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            _ => return None,
         }
     };
+    drop(child);
     let output: String = readers
         .into_iter()
         .filter_map(|reader| reader.join().ok())
