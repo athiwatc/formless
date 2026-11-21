@@ -225,6 +225,11 @@ fn estimate_output_formats_stay_local_on_a_new_profile() {
     assert_eq!(json, alias);
     let forecast = serde_json::from_value(json).unwrap();
     let human = String::from_utf8(estimate(&[])).unwrap();
+    assert!(
+        human.ends_with('\n') && !human.ends_with("\n\n"),
+        "{human:?}"
+    );
+    assert!(human.lines().all(|line| !line.ends_with(' ')), "{human:?}");
     assert_eq!(
         human,
         format!("{}\n", formless_core::forecast::describe(&forecast))
@@ -351,6 +356,131 @@ fn fixture_write_frame(
         }
     }
     Ok(true)
+}
+
+#[cfg(unix)]
+#[test]
+fn live_estimate_formats_synthetic_history_without_altering_machine_output() {
+    use formless_protocol::{Request, RequestEnvelope, RunForecast, ServerMessage};
+    use serde_json::json;
+    use std::os::unix::{fs::DirBuilderExt, net::UnixListener};
+
+    // Keep this socket inside an exclusively owned, short path even when
+    // the OS chooses a long user-specific temporary directory.
+    let root = std::path::Path::new("/tmp").join(format!("fl-ef-{}", unique()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let root = Fixture(root);
+    let paths = formless_core::Paths {
+        data_dir: root.0.join("d"),
+        config_dir: root.0.join("c"),
+        profile: "default".into(),
+    };
+    std::fs::create_dir(&paths.data_dir).unwrap();
+    let forecast: RunForecast = serde_json::from_value(json!({
+        "fingerprint": "forecast-fixture",
+        "basis": {
+            "provider_key": "fixture", "model": "fixture", "role": "fixture",
+            "session_id": null, "cwd_hash": "fixture", "tools_hash": "fixture",
+            "prompt_tokens": 12
+        },
+        "comparable_runs": 4,
+        "steps": {"p50": 11.6, "p90": 31.4},
+        "tokens": {"p50": 48213.125, "p90": 90550.75},
+        "cost_usd": {"p50": 0.000001, "p90": 0.004},
+        "duration_ms": {"p50": 499.75, "p90": 84211.75},
+        "context_tokens": 100000, "context_source": "fixture", "will_compact": false,
+        "compaction_probability": 0.126, "cached_fraction": {"p50": 0.426, "p90": 0.8},
+        "unpriced": false, "warnings": [], "confirmation_required": false,
+        "hint": "Synthetic forecast"
+    }))
+    .unwrap();
+    let machine = serde_json::to_value(&forecast).unwrap();
+    let exact_json = format!("{}\n", serde_json::to_string_pretty(&forecast).unwrap());
+    let socket = paths.socket_path();
+    assert!(socket.starts_with(&root.0));
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    let thread = std::thread::spawn(move || {
+        while !stopped.load(Ordering::SeqCst) {
+            let (mut socket, _) = match listener.accept() {
+                Ok(peer) => peer,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("private forecast fixture accept: {error}"),
+            };
+            socket.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut pending = Vec::new();
+            while let Some(line) =
+                fixture_read_frame(&mut socket, &mut pending, &stopped, deadline).unwrap()
+            {
+                let envelope: RequestEnvelope = serde_json::from_slice(&line).unwrap();
+                let result = match envelope.request {
+                    Request::Status => {
+                        json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"secure":true})
+                    }
+                    Request::ForecastRun {
+                        input,
+                        for_send: false,
+                    } => {
+                        assert_eq!(input.draft, "synthetic task");
+                        assert_eq!(input.model.as_deref(), Some("fixture"));
+                        assert!(input.session_id.is_none() && input.attachments.is_empty());
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        machine.clone()
+                    }
+                    request => panic!("unexpected request from estimate: {request:?}"),
+                };
+                let reply = ServerMessage::Response {
+                    id: envelope.id,
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                };
+                if !fixture_write_frame(&mut socket, &reply, &stopped, deadline).unwrap() {
+                    break;
+                }
+            }
+        }
+    });
+    let server = FixtureThread {
+        stop,
+        thread: Some(thread),
+    };
+    let estimate = |flags: &[&str]| {
+        let result = output({
+            let mut cmd = command(&paths);
+            cmd.current_dir(&root.0)
+                .args(["run", "--estimate", "synthetic task", "--model", "fixture"])
+                .args(flags);
+            cmd
+        });
+        assert!(result.status.success(), "{:?}", result);
+        assert!(result.stderr.is_empty(), "{:?}", result);
+        result.stdout
+    };
+    for flags in [&["--json"][..], &["--output", "json"][..]] {
+        assert_eq!(estimate(flags), exact_json.as_bytes());
+    }
+    let human = estimate(&[]);
+    assert_eq!(estimate(&["--output", "text"]), human);
+    drop(server);
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    assert!(!paths.db_file().exists());
+    assert!(!paths.config_dir.exists());
+    assert_eq!(
+        String::from_utf8(human).unwrap(),
+        "Synthetic forecast\nSteps: p50 12 / p90 31\nTokens: p50 48,213 / p90 90,551\nCost: p50 $1.00e-6 / p90 $0.0040\nDuration: p50 0.5s / p90 1m24s\nCached fraction: p50 43% / p90 80%\nCompaction probability: 13%\n"
+    );
 }
 
 #[cfg(unix)]

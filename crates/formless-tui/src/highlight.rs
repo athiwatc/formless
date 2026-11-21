@@ -319,6 +319,10 @@ const CONFIG: Lang = Lang {
     raw_strings: false,
     regex: false,
 };
+const TOML: Lang = Lang {
+    multiline: &["\"\"\"", "'''"],
+    ..CONFIG
+};
 /// INI and properties: `;` comments too.
 const INI: Lang = Lang {
     line_comments: &["#", ";"],
@@ -435,6 +439,11 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+const SCSS_LESS: Lang = Lang {
+    line_comments: &["//"],
+    ..CSS
+};
+
 /// MySQL requires whitespace or a control character after a double dash.
 const MYSQL: Lang = Lang {
     line_comments: &["--", "#"],
@@ -481,12 +490,14 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "json" => &JSON,
         "jsonc" => &JSONC,
         "json5" => &JSON5,
-        "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
+        "yaml" | "yml" | "env" | "dotenv" => &CONFIG,
+        "toml" => &TOML,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
         "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
         "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
-        "css" | "scss" | "less" => &CSS,
+        "css" => &CSS,
+        "scss" | "less" => &SCSS_LESS,
         _ => return None,
     })
 }
@@ -506,12 +517,15 @@ enum Tok {
 
 pub(crate) struct Highlighter {
     lang: &'static Lang,
+    stylesheet_line_comments: bool,
     rust_numbers: bool,
     powershell: bool,
     python_comments: bool,
+    toml_strings: bool,
     mysql_comments: bool,
     php_comments: bool,
     json5_strings: bool,
+    shell_literal_quotes: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -637,17 +651,35 @@ fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> boo
         && !matches!(suffix.first(), Some('"' | '\''))
 }
 
+/// Consume an unquoted url(...) argument as a unit so its slashes stay literal.
+fn unquoted_stylesheet_url_end(chars: &[char], mut i: usize) -> Option<usize> {
+    loop {
+        match chars.get(i)? {
+            ')' => return Some(i + 1),
+            '\'' | '"' | '(' => return None,
+            '\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
         lang(&name).map(|lang| Self {
             lang,
+            stylesheet_line_comments: matches!(name.as_str(), "scss" | "less"),
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            toml_strings: name == "toml",
             mysql_comments: name == "mysql",
             php_comments: name == "php",
             json5_strings: name == "json5",
+            shell_literal_quotes: matches!(
+                name.as_str(),
+                "sh" | "bash" | "zsh" | "shell" | "console"
+            ),
             color,
             in_block: 0,
             in_str: None,
@@ -673,6 +705,7 @@ impl Highlighter {
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
+        let toml = self.toml_strings;
         let mysql = self.mysql_comments;
         let php = self.php_comments;
         let chars: Vec<char> = line.chars().collect();
@@ -696,12 +729,13 @@ impl Highlighter {
         };
         let mut i = 0;
         // Config keys: `  name:` / `name =` at line start.
-        if let Some(sep) = l.key_sep {
+        if let Some(sep) = l.key_sep.filter(|_| self.in_str.is_none()) {
             let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
             let end = (lead..chars.len()).find(|&j| chars[j] == sep || chars[j] == '=');
             if let Some(end) = end {
                 let key = &chars[lead..end];
                 let bare = !key.is_empty()
+                    && !l.multiline.iter().any(|delimiter| at(lead, delimiter))
                     && key
                         .iter()
                         .all(|c| c.is_alphanumeric() || "_-. \"'[]".contains(*c));
@@ -715,14 +749,27 @@ impl Highlighter {
         // Where the string closed by `close` ends, scanning from `from`:
         // just past the delimiter, or None when it runs past the line.
         let close_at = |from: usize, close: &str| -> Option<usize> {
+            let escapes =
+                !(l.raw_strings || toml && close.starts_with('\'') || mysql && close == "`");
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' && !(mysql && close == "`") {
+                if chars[j] == '\\' && escapes {
                     j += 2;
                     continue;
                 }
                 if at(j, close) {
-                    return Some(j + close.chars().count());
+                    let end = j + close.chars().count();
+                    // TOML allows up to two quotes before the closing delimiter.
+                    let trailing = if toml {
+                        chars[end..]
+                            .iter()
+                            .take(2)
+                            .take_while(|&&c| c == chars[j])
+                            .count()
+                    } else {
+                        0
+                    };
+                    return Some(end + trailing);
                 }
                 j += 1;
             }
@@ -730,12 +777,7 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
-                // Raw strings (`"#…` closers) have no escapes.
-                let stop = if l.raw_strings {
-                    (i..chars.len())
-                        .find(|&j| at(j, &close))
-                        .map(|j| j + close.chars().count())
-                } else if self.powershell && close.ends_with('@') {
+                let stop = if self.powershell && close.ends_with('@') {
                     (i == 0 && at(0, &close)).then_some(2)
                 } else if self.powershell {
                     powershell_quote_end(&chars, i, close.chars().next().unwrap())
@@ -821,6 +863,7 @@ impl Highlighter {
                         || self.powershell
                         || i == 0
                         || chars[i - 1].is_whitespace()
+                        || toml && l.quotes.contains(&chars[i - 1])
                 };
             if hash_comment
                 && l.line_comments.iter().any(|p| {
@@ -961,9 +1004,12 @@ impl Highlighter {
                 continue;
             }
             if l.quotes.contains(&c) {
+                // Shell $'…' strings interpret escapes. Ordinary single quotes do not.
+                let literal = c == '\''
+                    && (toml || (self.shell_literal_quotes && (i == 0 || chars[i - 1] != '$')));
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
-                    j += if chars[j] == '\\' { 2 } else { 1 };
+                    j += if !literal && chars[j] == '\\' { 2 } else { 1 };
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
@@ -1050,6 +1096,17 @@ impl Highlighter {
                     Tok::Plain
                 };
                 push(tok, &chars[i..j]);
+                if self.stylesheet_line_comments
+                    && word.eq_ignore_ascii_case("url")
+                    && chars.get(j) == Some(&'(')
+                    && (i == 0 || chars[i - 1] != '-')
+                {
+                    if let Some(end) = unquoted_stylesheet_url_end(&chars, j + 1) {
+                        push(Tok::Plain, &chars[j..end]);
+                        i = end;
+                        continue;
+                    }
+                }
                 i = j;
                 continue;
             }
@@ -1556,6 +1613,50 @@ mod tests {
     }
 
     #[test]
+    fn scss_and_less_comments_end_at_newline_and_leave_urls_intact() {
+        for lang in ["scss", "Less"] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            let comment = "// important: skip the /* old sheet";
+            let spans = highlighter.line(comment);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].content, comment);
+            assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+
+            let line = r#"@media { a: URL(https://example.com/a\).png); b: url("//example.test/b"); } // end"#;
+            let spans = highlighter.line(line);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                line
+            );
+            assert!(spans
+                .iter()
+                .any(|span| span.content == "media" && span.style.fg == Some(Color::Magenta)));
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r#""//example.test/b""#
+                    && span.style.fg == Some(Color::Green)));
+            let comments: Vec<_> = spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(comments, ["// end"]);
+        }
+        let mut css = Highlighter::new("css", true).unwrap();
+        assert!(css
+            .line("// import")
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(css.line("/* import */")[0]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
+    }
+
+    #[test]
     fn tokenizes_common_shapes() {
         let t = toks("rust", "let x = foo(\"hi\", 42); // done");
         assert!(t.contains(&("let".into(), Some(Color::Magenta))));
@@ -1590,6 +1691,47 @@ mod tests {
         h.line(line)
             .iter()
             .all(|s| s.style.fg == Some(Color::Green))
+    }
+
+    #[test]
+    fn toml_multiline_strings_keep_hashes_and_keys_until_the_closer() {
+        for (delimiter, middle, closing) in [
+            ("\"\"\"", r#"\""" keep # escaped quote"#, "\"\"\"\"\""),
+            ("'''", "keep # literal", "\\'''''"),
+        ] {
+            let mut h = Highlighter::new("TOML", true).unwrap();
+            h.line(&format!("text = {delimiter}"));
+            for source in [middle, "name = not a key", "# still content"] {
+                let spans = h.line(source);
+                assert_eq!(spans.len(), 1, "{spans:?}");
+                assert_eq!(spans[0].content, source);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+            }
+            let spacing = if delimiter.starts_with('"') { "" } else { " " };
+            let spans = h.line(&format!("{closing}{spacing}# outside"));
+            assert_eq!(spans[0].content, closing);
+            assert_eq!(spans[0].style.fg, Some(Color::Green));
+            assert_eq!(spans.last().unwrap().content, "# outside");
+            assert_eq!(spans.last().unwrap().style.fg, Some(Color::DarkGray));
+            let next = h.line("name = \"formless\" # comment");
+            assert!(next
+                .iter()
+                .any(|s| s.content.trim_end() == "name" && s.style.fg == Some(Color::Blue)));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "\"formless\"" && s.style.fg == Some(Color::Green)));
+            assert_eq!(next.last().unwrap().style.fg, Some(Color::DarkGray));
+
+            h.line("items = [");
+            let first = h.line(&format!("  {delimiter}a = b"));
+            assert!(first.iter().any(|s| {
+                s.content == format!("{delimiter}a = b") && s.style.fg == Some(Color::Green)
+            }));
+            assert!(all_str(&mut h, "# inside the array value"));
+            assert!(all_str(&mut h, delimiter));
+            h.line("]");
+            assert_eq!(h.line("# outside")[0].style.fg, Some(Color::DarkGray));
+        }
     }
 
     /// Strings that run across lines stay strings until they close (#876).
@@ -1768,6 +1910,29 @@ mod tests {
                     "{lang}: {source}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shell_quotes_keep_literal_backslashes_and_supported_escapes() {
+        fn check(lang: &str, input: &str, quoted: &str) {
+            let spans = toks(lang, input);
+            assert!(
+                spans.contains(&(quoted.to_owned(), Some(Color::Green))),
+                "{lang}: {spans:?}"
+            );
+            assert!(
+                spans.contains(&("if".into(), Some(Color::Magenta))),
+                "{lang}: {spans:?}"
+            );
+        }
+        for lang in ["sh", "Bash", "zsh", "shell", "console"] {
+            check(lang, r"echo 'path\'; if true; then echo hi; fi", r"'path\'");
+            check(lang, r#"echo "say \"hi\""; if true"#, r#""say \"hi\"""#);
+            check(lang, r"echo $'it\'s'; if true", r"'it\'s'");
+        }
+        for lang in ["fish", "ruby", "perl"] {
+            check(lang, r"echo 'it\'s'; if true", r"'it\'s'");
         }
     }
 

@@ -198,6 +198,11 @@ fn is_model_failure(error: &anyhow::Error) -> bool {
             .is_none()
 }
 
+fn run_cancelled(cancel: &CancellationToken, cancel_flag: &AtomicBool) -> bool {
+    // The Run controller sets the sandbox flag before waking token waiters.
+    cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst)
+}
+
 /// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     match e.downcast_ref::<RequestFailure>() {
@@ -3176,7 +3181,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3219,17 +3224,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -5960,8 +5955,11 @@ impl Daemon {
                     }
                     // Steered messages continue the same Run (next step boundary).
                     while steer_rx.try_recv().is_ok() {}
-                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
-                    {
+                    match self.extend_or_close_steering(
+                        &session_id,
+                        &run_id,
+                        run_cancelled(&cancel, &cancel_flag),
+                    ) {
                         steering_daemon::SteeringOutcome::Extend => continue,
                         steering_daemon::SteeringOutcome::Completed => {}
                         steering_daemon::SteeringOutcome::Interrupted => {
@@ -5972,7 +5970,7 @@ impl Daemon {
                     }
                     break;
                 }
-                Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
+                Err(_) if run_cancelled(&cancel, &cancel_flag) => {
                     final_status = "interrupted";
                     self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
@@ -7538,8 +7536,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
@@ -10246,7 +10244,7 @@ impl Daemon {
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
-            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            let interrupted = outcome.is_err() && run_cancelled(cancel, cancel_flag);
             if let Some((r, task, identity)) =
                 role.as_ref().filter(|_| !interrupted).and_then(|r| {
                     let task = routing_task.as_ref()?;
@@ -15737,6 +15735,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
@@ -17053,14 +17056,36 @@ fn call_failed(text: String) -> String {
     text
 }
 
-/// A stored tool message's meta: which call it answers, and whether it
-/// reports a failure (Anthropic `tool_result.is_error`).
+/// A stored tool message's meta: call identity and explicit outcome.
 pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    let mut meta = json!({"tool_call_id": call_id, "name": name});
-    if is_error {
-        meta["is_error"] = json!(true);
+    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn stored_tool_result_outcome_preserves_provider_projection() {
+    let mut message = formless_protocol::MessageInfo {
+        id: "result".into(),
+        session_id: "session".into(),
+        seq: 1,
+        role: "tool".into(),
+        content: r#"{"ok":false}"#.into(),
+        created_at: String::new(),
+        meta: Some(json!({"tool_call_id": "call", "name": "tool_name"}).to_string()),
+    };
+    let legacy_projection = crate::storage::provider_message(&message);
+    for is_error in [false, true] {
+        let meta = tool_result_meta("call", "tool_name", is_error);
+        let parsed: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
+        message.meta = Some(meta);
+
+        let mut expected = legacy_projection.clone();
+        if is_error {
+            expected["_is_error"] = json!(true);
+        }
+        assert_eq!(crate::storage::provider_message(&message), expected);
     }
-    meta.to_string()
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):
@@ -17268,14 +17293,28 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
         ".yarnrc",
@@ -17286,12 +17325,15 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         "credentials",
         "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
         || name.ends_with(".pem")
         || name.ends_with(".ppk")
         || name.ends_with(".key")
