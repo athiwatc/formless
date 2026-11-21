@@ -410,6 +410,48 @@ fn fixture(name: &str) -> PathBuf {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn aborting_run_cancels_the_blocking_task_without_cancelling_caller() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fl-opencode-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let executable = dir.join("opencode");
+    std::fs::copy(fixture("opencode-acp.py"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let probe = dir.join("cancel-probe");
+    let mut request = request(StepAccess::Write);
+    request.cwd = dir.clone();
+    request.executable = Some(executable);
+    request
+        .environment
+        .insert("CANCEL_PROBE".into(), probe.clone().into_os_string());
+    let caller_cancel = CancellationToken::new();
+    let cancel = caller_cancel.clone();
+    let core = Arc::new(CoreHandler::default());
+    let weak = Arc::downgrade(&core);
+    let task = tokio::spawn(async move { run(&request, core, &cancel).await });
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while std::fs::read_to_string(&probe).unwrap_or_default() != "ready" {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    ready.expect("fake ACP executable did not reach the prompt");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while weak.strong_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blocking ACP task survived aborting the run");
+    assert_eq!(std::fs::read_to_string(&probe).unwrap(), "cancelled");
+    assert!(!caller_cancel.is_cancelled());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn public_dispatch_runs_executable_override_with_core_interactions() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("fl-opencode-{}", uuid::Uuid::new_v4()));

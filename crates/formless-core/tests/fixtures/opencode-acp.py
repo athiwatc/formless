@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import json
 import os
+import signal
 import sys
 
 
@@ -42,6 +43,15 @@ assert request["params"]["value"] == "build"
 reply(request, {})
 prompt = read()
 assert prompt["method"] == "session/prompt"
+if "CANCEL_PROBE" in os.environ:
+    signal.alarm(10)
+    with open(os.environ["CANCEL_PROBE"], "w") as probe:
+        probe.write("ready")
+    assert read()["method"] == "session/cancel"
+    with open(os.environ["CANCEL_PROBE"], "w") as probe:
+        probe.write("cancelled")
+    reply(prompt, {"stopReason": "cancelled"})
+    sys.exit(0)
 send({"id": 90, "method": "session/request_permission", "params": {
     "sessionId": "fake-session",
     "toolCall": {"name": "execute", "title": "execute", "kind": "other",

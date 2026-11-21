@@ -60,7 +60,8 @@ pub async fn run(
 ) -> Result<HarnessResult> {
     let request = prepare(request)?;
     let runtime = tokio::runtime::Handle::current();
-    let cancel = cancel.clone();
+    let cancel = cancel.child_token();
+    let _cancel_on_drop = cancel.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
         let mut permissions = AttemptScoped(acp::Interactions {
             handler: interactions.as_ref(),
