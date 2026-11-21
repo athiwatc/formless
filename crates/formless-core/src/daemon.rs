@@ -684,12 +684,12 @@ mod pipeline_daemon_tests;
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
 
-#[path = "reviewed_send.rs"]
-mod reviewed_send;
-#[path = "onboarding_tour.rs"]
-mod onboarding_tour;
 #[path = "model_listing_health.rs"]
 mod model_listing_health;
+#[path = "onboarding_tour.rs"]
+mod onboarding_tour;
+#[path = "reviewed_send.rs"]
+mod reviewed_send;
 #[cfg(test)]
 #[path = "reviewed_send_tests.rs"]
 mod reviewed_send_tests;
@@ -1046,10 +1046,11 @@ impl Daemon {
         let model_test_cache = Arc::new(crate::model_test_cache::ModelTestCache::new(
             paths.data_dir.join("model_tests.json"),
         ));
-        let model_listing_health = model_listing_health::State::load(&paths).unwrap_or_else(|error| {
-            tracing::warn!("could not read model listing state: {error:#}");
-            Default::default()
-        });
+        let model_listing_health =
+            model_listing_health::State::load(&paths).unwrap_or_else(|error| {
+                tracing::warn!("could not read model listing state: {error:#}");
+                Default::default()
+            });
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -1851,7 +1852,8 @@ impl Daemon {
                         |s| json!({"conn": s.conn, "queued": s.tx.max_capacity() - s.tx.capacity()})
                     )
                     .collect::<Vec<_>>());
-                let (missing, model_checked_at, model_checks_skipped) = self.model_listing_health.locked().report();
+                let (missing, model_checked_at, model_checks_skipped) =
+                    self.model_listing_health.locked().report();
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
                     "missing_models": missing,
@@ -1890,7 +1892,9 @@ impl Daemon {
                 });
                 Ok(json!({"shutting_down": true}))
             }
-            Request::DismissMissingModel { provider, model } => self.dismiss_missing_model(&provider, &model),
+            Request::DismissMissingModel { provider, model } => {
+                self.dismiss_missing_model(&provider, &model)
+            }
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,
             )?),
@@ -4928,10 +4932,13 @@ impl Daemon {
                 Ok(serde_json::to_value(p)?)
             }
             Request::AcknowledgeApprovalHelp => {
-                crate::onboarding::save(&self.paths, &crate::onboarding::Seen {
-                    approval_help: true,
-                    ..Default::default()
-                })?;
+                crate::onboarding::save(
+                    &self.paths,
+                    &crate::onboarding::Seen {
+                        approval_help: true,
+                        ..Default::default()
+                    },
+                )?;
                 self.broadcast(Event::ApprovalHelpSeen);
                 Ok(json!({"approval_help_seen": true}))
             }
@@ -8261,7 +8268,10 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
-            toolreg::CREATE_TOOL => match self.create_agent_tool(session_id, run_id, &args, cfg, cancel_flag).await {
+            toolreg::CREATE_TOOL => match self
+                .create_agent_tool(session_id, run_id, &args, cfg, cancel_flag)
+                .await
+            {
                 Ok((text, change)) => {
                     let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {
@@ -13007,7 +13017,10 @@ impl Daemon {
             tool["implementation_js"] = json!(code);
             tool["capabilities"] = json!([]);
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            match self.create_agent_tool(session_id, run_id, &tool, cfg, &cancel_flag).await {
+            match self
+                .create_agent_tool(session_id, run_id, &tool, cfg, &cancel_flag)
+                .await
+            {
                 Ok((text, change)) => {
                     let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {

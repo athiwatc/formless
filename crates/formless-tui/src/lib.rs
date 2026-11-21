@@ -259,7 +259,10 @@ enum Pending {
     DaemonMode,
     SendMessage,
     TourSession,
-    TourRun { session_id: String, run_id: String },
+    TourRun {
+        session_id: String,
+        run_id: String,
+    },
     TourCleanup,
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
@@ -989,7 +992,10 @@ impl Wizard {
             }
             Some("api_key" | "model" | "effort") if !self.base_url.is_empty() => {
                 self.enter_api_key_step();
-                self.status = tr_format("Welcome back: you were setting up {}. {}", &[&self.base_url, &self.status]);
+                self.status = tr_format(
+                    "Welcome back: you were setting up {}. {}",
+                    &[&self.base_url, &self.status],
+                );
             }
             _ => {}
         }
@@ -1093,7 +1099,8 @@ impl Wizard {
         self.api_key = self.api_key.trim().to_string();
         if self.api_key.chars().any(char::is_whitespace) {
             self.status =
-                tr("The API key contains whitespace inside it. Remove it before continuing.").into();
+                tr("The API key contains whitespace inside it. Remove it before continuing.")
+                    .into();
             false
         } else {
             true
@@ -1133,7 +1140,10 @@ impl Wizard {
                 status.push_str(&tr_format(" Get one at {}", &[url]));
             }
             if let Some((var, _)) = formless_core::presets::env_key(p) {
-                status = tr_format("Found ${}: press Enter to use it, or type a different key.", &[var]);
+                status = tr_format(
+                    "Found ${}: press Enter to use it, or type a different key.",
+                    &[var],
+                );
             }
         }
         self.status = status;
@@ -1188,7 +1198,8 @@ impl Wizard {
             }
             self.preset = None;
             self.step = WizardStep::BaseUrl;
-            self.status = tr("Enter your provider base URL (any OpenAI-compatible endpoint).").into();
+            self.status =
+                tr("Enter your provider base URL (any OpenAI-compatible endpoint).").into();
             return;
         };
         let endpoint = if p.local
@@ -5572,7 +5583,11 @@ impl App {
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
-            if self.tour.as_ref().is_some_and(|tour| self.is_current(&tour.session_id)) {
+            if self
+                .tour
+                .as_ref()
+                .is_some_and(|tour| self.is_current(&tour.session_id))
+            {
                 self.notes.push(tr("Tour guidance paused. Return to the Guided tour Session or type /tour to continue.").into());
             }
             self.cancel_branch_summary();
@@ -8779,7 +8794,8 @@ impl App {
                                     let action = if offer.models == 0 {
                                         offer.offer_with(tr_format)
                                     } else {
-                                        tr("Press Enter to use the highlighted provider.").to_string()
+                                        tr("Press Enter to use the highlighted provider.")
+                                            .to_string()
                                     };
                                     tr_format("Found {}. {}", &[&summary, &action])
                                 };
@@ -8818,7 +8834,8 @@ impl App {
                         let why = wizard_explain(&e, &w.base_url, "");
                         if why.category == "auth" {
                             w.enter_api_key_step();
-                            w.status = tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
+                            w.status =
+                                tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
                         } else {
                             w.picker = picker::ModelPicker::new(Vec::new());
                             w.picker.query = w.saved_model.clone();
@@ -8838,7 +8855,8 @@ impl App {
                         w.picker.query = w.saved_model.clone();
                         w.step = WizardStep::PickModel;
                         w.status =
-                            tr("The endpoint listed no models; type a model name, then Enter.").into();
+                            tr("The endpoint listed no models; type a model name, then Enter.")
+                                .into();
                     }
                     WizardJob::Probe(_, Ok(r)) if r.tool_calling => {
                         w.prompt_fallback = r.prompt_fallback;
@@ -8853,7 +8871,8 @@ impl App {
                         let why = wizard_explain(&e, &w.base_url, &w.model());
                         if why.category == "auth" {
                             w.enter_api_key_step();
-                            w.status = tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
+                            w.status =
+                                tr_format("{} Enter it again. ({})", &[&why.message, &why.details]);
                         } else {
                             w.step = WizardStep::Failed;
                             w.status = tr_format(
@@ -9126,7 +9145,8 @@ impl App {
                     w.invalidate_jobs();
                     let generation = w.generation;
                     w.step = WizardStep::Probing;
-                    w.status = tr("Probing endpoint (connectivity + streaming + tool-calling)…").into();
+                    w.status =
+                        tr("Probing endpoint (connectivity + streaming + tool-calling)…").into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
                     let mut pcfg = formless_core::config::ProviderCfg::default();
@@ -10794,7 +10814,9 @@ impl App {
     fn save_seen(&mut self) {
         match formless_core::onboarding::save(&self.paths, &self.seen) {
             Ok(merged) => self.seen = merged,
-            Err(error) => self.notes.push(format!("Could not save onboarding preferences ({error})")),
+            Err(error) => self
+                .notes
+                .push(format!("Could not save onboarding preferences ({error})")),
         }
     }
 
@@ -19870,7 +19892,9 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
                         .unwrap_or_default();
                     let found = w
                         .local_offer_for(p.id)
-                        .map(|offer| tr_format("  (found: {})", &[&local_model_count(offer.models)]))
+                        .map(|offer| {
+                            tr_format("  (found: {})", &[&local_model_count(offer.models)])
+                        })
                         .unwrap_or_default();
                     format!("{}. {}{env}{found}", i + 1, p.name)
                 })
