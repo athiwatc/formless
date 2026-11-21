@@ -802,7 +802,17 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 71;
+pub const SCHEMA_VERSION: i64 = 73;
+
+#[path = "topic_context.rs"]
+mod topic_context;
+
+#[path = "topic_schema_v72.rs"]
+mod topic_schema_v72;
+
+#[cfg(test)]
+#[path = "topic_schema_v72_tests.rs"]
+mod topic_schema_v72_tests;
 
 const SCHEMA_V71: &str = "
 CREATE TABLE IF NOT EXISTS profile_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -810,7 +820,7 @@ CREATE TABLE IF NOT EXISTS topics (
  id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
  workspace TEXT,workspace_kind TEXT NOT NULL,
  base_revision TEXT,outline TEXT NOT NULL DEFAULT '[]',
- source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ source_session_id TEXT NOT NULL,
  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,status TEXT NOT NULL,
  redirect_message_id TEXT,rejection_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_topics_status_updated ON topics(status,updated_at DESC);
@@ -936,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 69] = [
+const MIGRATIONS: [(i64, MigrationStep); 71] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1269,6 +1279,10 @@ const MIGRATIONS: [(i64, MigrationStep); 69] = [
         Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
     }),
     (71, migrate_v71),
+    (72, topic_schema_v72::migrate),
+    (73, |c| {
+        add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2040,18 +2054,29 @@ impl Store {
         Ok(rows)
     }
 
+    pub(crate) fn topic_session_family(&self, id: &str) -> Result<Vec<String>> {
+        let descendants = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE family(id) AS (SELECT ?1 UNION
+                 SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
+                 WHERE s.session_kind='topic_attempt' OR EXISTS(
+                   SELECT 1 FROM topics child JOIN topics parent ON child.parent_topic_id=parent.id
+                   WHERE child.topic_session_id=s.id AND parent.topic_session_id=f.id))
+                 SELECT id FROM family",
+            )?
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(descendants)
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         self.note_rewrite();
         self.transaction(|st| {
-            let descendants=st.conn.prepare(
-                "WITH RECURSIVE family(id) AS (SELECT id FROM sessions WHERE id=?1 UNION
-                 SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
-                 WHERE s.session_kind IN ('topic','topic_attempt') UNION
-                 SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
-                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family"
-            )?.query_map([id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let descendants=st.topic_session_family(id)?;
             let mut deleted=false;
             for session_id in descendants {
+                st.ex("DELETE FROM topics WHERE source_session_id=?1 AND status IN ('pending_approval','rejected')",params![session_id])?;
                 st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
                 st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
                 st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;
@@ -6958,6 +6983,18 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
+    }
+
+    /// Paths of a Session's artifacts (to delete with it).
+    pub(crate) fn session_artifact_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id,path FROM artifacts WHERE session_id=?1")?
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// Paths of a Session's artifacts (to delete with it).

@@ -116,6 +116,109 @@ fn permission(always: bool) -> HarnessPermissionRequest {
 }
 
 #[tokio::test]
+async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let fixture = Fixture::new(&env);
+    let mut proposal = topic_fixture_proposal(&fixture, None);
+    proposal.features = vec![
+        TopicFeatureProposal {
+            source_message_id: proposal.message_ids[0].clone(),
+            request: "X".into(),
+        },
+        TopicFeatureProposal {
+            source_message_id: proposal.message_ids[0].clone(),
+            request: "Y".into(),
+        },
+    ];
+    let topic = fixture.daemon().propose_topic_request(&proposal).unwrap();
+    let topic = fixture
+        .daemon()
+        .with_store(|st| st.approve_topic(&topic.id))
+        .unwrap();
+    fixture
+        .daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let token = "fixture token".repeat(4);
+    let attempts: Vec<_> = topic
+        .features
+        .iter()
+        .map(|feature| {
+            fixture
+                .daemon()
+                .with_store(|st| {
+                    st.begin_topic_attempt(
+                        &topic.id,
+                        &feature.id,
+                        "Step",
+                        StepAccess::Write,
+                        HarnessKind::Claude,
+                        None,
+                        None,
+                        &[],
+                        &token,
+                        topic.workspace.as_ref().unwrap(),
+                    )
+                })
+                .unwrap()
+        })
+        .collect();
+    let f = TopicFixture {
+        fixture,
+        topic,
+        attempt: attempts[1].clone(),
+        token: token.clone(),
+    };
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiter = tokio::spawn(async move {
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    f.daemon()
+        .handle(Request::TopicMcp {
+            request: TopicMcpRequest {
+                attempt_id: attempts[0].id.clone(),
+                capability_token: token,
+                operation: TopicMcpOperation::ReportResult {
+                    status: TopicAttemptStatus::NeedsUser,
+                    summary: "Need help with X".into(),
+                    outputs: vec![],
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.state().status, TopicStatus::NeedsUser);
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: Some("allow".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiter.await.unwrap().as_deref(), Some("allow"));
+    assert_eq!(f.state().status, TopicStatus::Running);
+    assert_eq!(
+        f.daemon()
+            .with_reader(|st| st.get_topic_attempt(&attempts[1].id))
+            .unwrap()
+            .unwrap()
+            .status,
+        TopicAttemptStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn topic_permission_fixture_round_trip_replay_wrong_option_and_live_updates() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = TopicFixture::new(&env);
@@ -143,7 +246,7 @@ async fn topic_permission_fixture_round_trip_replay_wrong_option_and_live_update
             .with_reader(|st| st.list_messages(&f.attempt.conversation_session_id))
             .unwrap()
             .len(),
-        4
+        3
     );
     let waiter = tokio::spawn(async move {
         handler
