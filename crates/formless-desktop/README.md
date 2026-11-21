@@ -1,3 +1,19 @@
+# macOS app bundle
+
+Build an unsigned development app from the repository root:
+
+```sh
+python3 crates/formless-desktop/scripts/package-desktop.py --profile dev --output ~/formless-app
+```
+
+Double-click `Formless.app` to start the current profile's daemon if needed and
+connect to it. The bundle includes the `formless` CLI; closing the window leaves
+the daemon running. `--connect PATH` overrides autostart, and fixture/diagnostic
+options disable implicit autostart. Outside the bundle, use `--start-daemon` to
+opt in. CLI lookup tries the sibling binary, then `FORMLESS_BIN`, then PATH.
+Startup failures are reported on stderr and in an alert, then the app quits.
+This development bundle is unsigned; CLI dependency notices are not yet collected.
+
 # formless-desktop (optional native client)
 
 An optional native desktop shell for Formless built on
