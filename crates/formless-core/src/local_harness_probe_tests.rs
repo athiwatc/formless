@@ -7,6 +7,11 @@ fn fixture() -> (ProbeDirectory, ProbeContext) {
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,time,pathlib,subprocess
 if '--version' in sys.argv:
+    if os.environ.get('PROBE_VERSION_FAIL'):sys.exit(1)
+    if os.environ.get('PROBE_VERSION_HANG'):
+        child=subprocess.Popen(['sleep','120'])
+        pathlib.Path(os.environ['PROBE_PID']).write_text(str(child.pid))
+        time.sleep(120)
     if os.environ.get('PROBE_GATE'):
         gate=pathlib.Path(os.environ['PROBE_GATE'])
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
@@ -53,12 +58,12 @@ for line in sys.stdin:
 async fn official_probes_report_version_and_explicit_auth_status() {
     let (_root, mut ctx) = fixture();
     for kind in [HarnessKind::Claude, HarnessKind::Codex] {
-        let ready = dispatch(kind, &ctx).await;
+        let ready = dispatch(kind, &ctx, None).await;
         assert!(ready.installed);
         assert_eq!(ready.signed_in, Some(true));
         assert_eq!(ready.version.as_deref(), Some("fixture 1.0"));
         ctx.environment.insert("PROBE_MODE".into(), "auth".into());
-        assert_eq!(dispatch(kind, &ctx).await.signed_in, Some(false));
+        assert_eq!(dispatch(kind, &ctx, None).await.signed_in, Some(false));
         ctx.environment.remove(std::ffi::OsStr::new("PROBE_MODE"));
     }
 }
@@ -72,7 +77,6 @@ async fn list_probes_run_concurrently_and_opencode_uses_adapter() {
         HarnessKind::Pi,
         HarnessKind::OpenCode,
         HarnessKind::Antigravity,
-        HarnessKind::Acp,
         HarnessKind::Muse,
     ] {
         let target = root.0.join(kind_name(kind));
@@ -89,7 +93,8 @@ async fn list_probes_run_concurrently_and_opencode_uses_adapter() {
     ctx.environment
         .insert("PROBE_GATE".into(), root.0.clone().into_os_string());
     let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
-    assert_eq!(values.len(), 7);
+    assert_eq!(values.len(), 6);
+    assert!(!values.iter().any(|value| value.kind == HarnessKind::Acp));
     assert!(values.iter().all(|value| value.installed));
     assert!(values[..2]
         .iter()
@@ -108,7 +113,7 @@ async fn list_probes_run_concurrently_and_opencode_uses_adapter() {
     assert!(values[2..]
         .iter()
         .filter(|value| value.kind != HarnessKind::OpenCode)
-        .all(|value| value.signed_in.is_none() && value.version.is_none()));
+        .all(|value| value.signed_in.is_none() && value.version.as_deref() == Some("fixture 1.0")));
 }
 
 #[tokio::test]
@@ -124,7 +129,7 @@ async fn opencode_uses_path_lookup_and_respects_invalid_override() {
         .insert("PATH".into(), std::env::join_paths(path).unwrap());
     ctx.environment
         .remove(std::ffi::OsStr::new("FORMLESS_TOPIC_OPENCODE_EXE"));
-    let value = probe_environment(HarnessKind::OpenCode, &ctx.environment, ctx.timeout).await;
+    let value = probe_environment(HarnessKind::OpenCode, None, &ctx.environment, ctx.timeout).await;
     assert!(value.installed);
     assert_eq!(value.version.as_deref(), Some("2.3.2"));
     assert_eq!(value.signed_in, None);
@@ -132,7 +137,7 @@ async fn opencode_uses_path_lookup_and_respects_invalid_override() {
         "FORMLESS_TOPIC_OPENCODE_EXE".into(),
         root.0.join("missing").into_os_string(),
     );
-    let value = probe_environment(HarnessKind::OpenCode, &ctx.environment, ctx.timeout).await;
+    let value = probe_environment(HarnessKind::OpenCode, None, &ctx.environment, ctx.timeout).await;
     assert!(!value.installed);
     assert_eq!(value.version, None);
 }
@@ -148,19 +153,19 @@ async fn muse_pi_overrides_and_missing_or_relative_executables() {
         .into();
         ctx.environment
             .insert(key.clone(), ctx.executable.clone().into_os_string());
-        let value = probe_environment(kind, &ctx.environment, Duration::from_secs(1)).await;
+        let value = probe_environment(kind, None, &ctx.environment, Duration::from_secs(1)).await;
         assert!(value.installed);
         assert_eq!(value.signed_in, None);
         ctx.environment.insert(key.clone(), "relative".into());
         assert!(
-            !probe_environment(kind, &ctx.environment, Duration::from_secs(1))
+            !probe_environment(kind, None, &ctx.environment, Duration::from_secs(1))
                 .await
                 .installed
         );
         ctx.environment
             .insert(key, "/missing/formless-fixture".into());
         assert!(
-            !probe_environment(kind, &ctx.environment, Duration::from_secs(1))
+            !probe_environment(kind, None, &ctx.environment, Duration::from_secs(1))
                 .await
                 .installed
         );
@@ -179,6 +184,78 @@ async fn official_probe_timeout_is_unknown_and_bounded() {
     assert!(value.installed);
     assert_eq!(value.signed_in, None);
     assert_eq!(value.detail.as_deref(), Some("probe timed out"));
+}
+
+#[tokio::test]
+async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() {
+    let (_root, mut ctx) = fixture();
+    let value = dispatch(HarnessKind::Acp, &ctx, Some("grok")).await;
+    assert_eq!(value.acp_agent.as_deref(), Some("grok"));
+    assert!(value.installed);
+    assert!(value.signed_in.is_none());
+    ctx.environment.clear();
+    let missing = probe_environment(
+        HarnessKind::Acp,
+        Some("grok"),
+        &ctx.environment,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(missing.acp_agent.as_deref(), Some("grok"));
+    assert!(!missing.installed);
+    assert_eq!(
+        missing.detail.as_deref(),
+        Some("ACP agent executable is not configured")
+    );
+}
+
+#[tokio::test]
+async fn fallback_missing_version_failure_and_timeout_keep_auth_unknown_and_kill_children() {
+    let (root, mut ctx) = fixture();
+    let executable = ctx.executable.clone();
+    ctx.executable = root.0.join("missing");
+    let missing = dispatch(HarnessKind::Pi, &ctx, None).await;
+    assert!(!missing.installed);
+    assert_eq!(missing.signed_in, None);
+    ctx.executable = executable;
+    ctx.environment
+        .insert("PROBE_VERSION_FAIL".into(), "1".into());
+    let failed = dispatch(HarnessKind::Muse, &ctx, None).await;
+    assert!(failed.installed);
+    assert_eq!(failed.signed_in, None);
+    assert_eq!(failed.version, None);
+    assert_eq!(failed.detail.as_deref(), Some("version probe failed"));
+    ctx.environment
+        .remove(std::ffi::OsStr::new("PROBE_VERSION_FAIL"));
+    ctx.environment
+        .insert("PROBE_VERSION_HANG".into(), "1".into());
+    ctx.timeout = Duration::from_millis(300);
+    let timed = tokio::time::timeout(
+        Duration::from_secs(2),
+        dispatch(HarnessKind::Antigravity, &ctx, None),
+    )
+    .await
+    .unwrap();
+    assert!(timed.installed);
+    assert_eq!(timed.signed_in, None);
+    assert_eq!(timed.detail.as_deref(), Some("probe timed out"));
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::fs::read_to_string(root.0.join("pid")).unwrap();
+        let stat = PathBuf::from(format!("/proc/{pid}/stat"));
+        for _ in 0..100 {
+            if std::fs::read_to_string(&stat).map_or(true, |value| {
+                value
+                    .split(')')
+                    .nth(1)
+                    .is_some_and(|state| state.trim_start().starts_with('Z'))
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fallback probe left a live child");
+    }
 }
 
 #[tokio::test]
