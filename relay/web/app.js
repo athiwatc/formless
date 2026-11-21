@@ -1868,6 +1868,7 @@
   async function refreshTopics(initial = false) {
     const channel = S.channel;
     if (!channel || !S.daemonOnline) return;
+    if (initial) S.topicsUnsupported = false;
     initial = initial || !S.mainChat;
     if (topicRefresh?.channel === channel) return topicRefresh.promise;
     const refresh = { channel };

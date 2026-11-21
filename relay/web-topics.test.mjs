@@ -123,9 +123,9 @@ test('transient first topic load is retried without reconnecting', async () => {
   const calls = [];
   const c = setup(['refreshTopics'], { request: async () => { throw new Error('request timed out'); } });
   vm.runInContext('let topicRefresh = null;', c);
-  c.S.mainChat = null; c.S.topics = []; c.S.topicsAvailable = false;
+  c.S.mainChat = null; c.S.topics = []; c.S.topicsAvailable = false; c.S.topicsUnsupported = true;
   await c.refreshTopics(true);
-  assert.equal(c.S.topicsUnsupported, undefined);
+  assert.equal(c.S.topicsUnsupported, false, 'a reconnect retries discovery even after an older daemon');
   c.request = async req => { calls.push(req.type); return req.type === 'get_main_chat' ? { id: 'main' } : [topic()]; };
   await c.refreshTopics();
   assert.deepEqual(calls, ['get_main_chat', 'list_topics']);
