@@ -45,6 +45,7 @@ use formless_core::{Config, Paths};
 use formless_protocol::{
     ApprovalScope, Event, Question, QuestionAnswer, Request, SendMode, ServerMessage, SessionInfo,
 };
+use formless_tui::local_timestamp;
 use serde_json::Value;
 use std::io::Write;
 use std::sync::Arc;
@@ -227,7 +228,7 @@ enum Cmd {
     },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
+        after_help = "Examples:\n  formless jobs list\n  formless jobs preview \"every weekday at 9am\"\n  formless jobs history JOB_ID --limit 50 --json"
     )]
     Jobs {
         #[command(subcommand)]
@@ -247,6 +248,9 @@ enum Cmd {
         /// How many of the latest entries to show (default 200; 0 = all)
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
+        /// Print one JSON object per selected entry (snapshot only)
+        #[arg(long, conflicts_with = "follow")]
+        jsonl: bool,
     },
     /// Print the man page (roff), for packaging: `formless man > formless.1`
     #[command(hide = true)]
@@ -378,7 +382,7 @@ enum Cmd {
         /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
         /// Continue an existing session by id, or `last` (default: ephemeral)
-        #[arg(long)]
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         session: Option<String>,
         /// Continue the Session the last `formless run` used (= --session last)
         #[arg(long = "continue", short = 'c', conflicts_with = "session")]
@@ -390,12 +394,14 @@ enum Cmd {
         /// terminal, otherwise tell the agent nobody can answer)
         #[arg(long)]
         answer: Option<String>,
-        /// Emit one JSON event per line (same as --output jsonl-events)
+        /// Emit one JSON event per line (same as --output jsonl-events).
+        /// With --estimate, print one JSON forecast instead.
         #[arg(long, conflicts_with = "output")]
         json: bool,
         /// text: stream the answer and progress; final: only the final
         /// answer on stdout; json: one result object at the end;
-        /// jsonl-events: every event, one per line
+        /// jsonl-events: every event, one per line.
+        /// With --estimate, use text or json to print the forecast.
         #[arg(long, value_enum, default_value = "text")]
         output: RunOutput,
         /// No progress lines ([tool], [approval], …) on stderr; errors still show
@@ -1101,6 +1107,17 @@ enum JobsAction {
         #[arg(long)]
         webhook: Option<String>,
     },
+    /// Preview projected times for a recurring schedule
+    #[command(
+        long_about = "Preview a recurring schedule (cron or supported plain English). Times are projected from the daemon's current local time. The preview leaves jobs unchanged and is not a guarantee of validation by jobs add or future execution."
+    )]
+    Preview {
+        /// Recurring schedule expression, quoted if it contains spaces
+        schedule: String,
+        /// Print the daemon's cron and next times as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Fire a job now (its schedule is unchanged)
     Run {
         /// Scheduled job ID
@@ -1110,6 +1127,9 @@ enum JobsAction {
     History {
         /// Scheduled job ID
         id: String,
+        /// Maximum number of recent firings to show (1–500)
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -1494,10 +1514,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
                 tbl.row(vec![
                     t(d.capability.clone(), Tone::Warn),
                     c(d.tool_name.clone()),
-                    c(d.created_at
-                        .get(..16)
-                        .unwrap_or(&d.created_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&d.created_at).replace('T', " ")),
                     c(if d.denied_by.is_empty() {
                         "-".to_string()
                     } else {
@@ -1520,7 +1537,7 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
             }
             let when = |t: &Option<String>| {
                 t.as_deref()
-                    .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+                    .map(|s| local_timestamp(s).replace('T', " "))
                     .unwrap_or_else(|| "-".into())
             };
             let mut tbl = Table::new(&[
@@ -2100,10 +2117,20 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         attach,
         cwd,
         json,
+        output,
         pipeline,
         ..
     }) = &cli.cmd
     {
+        let forecast_json = match output {
+            RunOutput::Text => *json,
+            RunOutput::Json => true,
+            RunOutput::Final | RunOutput::JsonlEvents => {
+                return Err(usage(
+                    "--estimate does not support --output final or jsonl-events. Use --output text or json.",
+                ));
+            }
+        };
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
@@ -2116,6 +2143,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             session.clone()
         };
         let session = if let Some(wanted) = session {
+            validate_session_selector(&wanted)?;
             let sessions: Vec<SessionInfo> = if live {
                 serde_json::from_value(formless_tui::client::request_once(
                     &paths,
@@ -2217,7 +2245,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         };
         // Only an owned DTO reaches output: private readers and maintenance
         // freezes have dropped, even if stdout is a backpressured pipe.
-        if *json {
+        if forecast_json {
             println!("{}", serde_json::to_string_pretty(&forecast)?);
         } else {
             println!("{}", formless_core::forecast::describe(&forecast));
@@ -2399,7 +2427,8 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             level,
             since,
             lines,
-        }) => logs_cmd(&paths, follow, level, since, lines),
+            jsonl,
+        }) => logs_cmd(&paths, follow, level, since, lines, jsonl),
         Some(Cmd::Completions { .. } | Cmd::Man | Cmd::Commands { .. }) => {
             unreachable!("handled before the profile is set up")
         }
@@ -2748,10 +2777,14 @@ fn upgrade_command() -> &'static str {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    upgrade_command_for_exe(&exe)
+}
+
+fn upgrade_command_for_exe(exe: &str) -> &'static str {
     if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
         "brew upgrade formless"
     } else if exe.contains("/.cargo/bin/") {
-        "cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked --force"
+        "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
@@ -2970,8 +3003,8 @@ fn relay_cmd(paths: Paths, action: RelayAction) -> Result<()> {
                         } else {
                             &c.user_agent
                         },
-                        c.first_seen.get(..16).unwrap_or(&c.first_seen),
-                        c.last_seen.get(..16).unwrap_or(&c.last_seen)
+                        local_timestamp(&c.first_seen),
+                        local_timestamp(&c.last_seen)
                     );
                 }
             }
@@ -5732,6 +5765,7 @@ enum SessionsAction {
     /// Inventory stored sub-agents for a resolved Session
     Subagents {
         /// Session id, unambiguous prefix or name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Preserve the complete daemon sub-agent array as JSON
         #[arg(long)]
@@ -5752,6 +5786,7 @@ enum SessionsAction {
     /// Read recorded Session usage and the current prompt/context estimate
     Usage {
         /// Session selector, using the existing ID/prefix/name resolution
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print both complete daemon reports as one JSON value
         #[arg(long)]
@@ -5760,6 +5795,7 @@ enum SessionsAction {
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Name for the new branch Session
         #[arg(long)]
@@ -5774,8 +5810,10 @@ enum SessionsAction {
     /// Compare stored branch messages and recorded local usage (no model call)
     Compare {
         /// First Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         left: String,
         /// Second Session ID or unambiguous prefix, in comparison order
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         right: String,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -5799,6 +5837,7 @@ enum SessionsAction {
     /// Pin a Session using its stored returned state
     Pin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5807,6 +5846,7 @@ enum SessionsAction {
     /// Unpin a Session using its stored returned state
     Unpin {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Print the returned Session as JSON
         #[arg(long)]
@@ -5818,6 +5858,7 @@ enum SessionsAction {
     )]
     Tag {
         /// Session ID, unambiguous prefix or full name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Replacement tags, passed unchanged to storage; omission only reads
         tags: Vec<String>,
@@ -5831,10 +5872,14 @@ enum SessionsAction {
     /// Show a Session's transcript
     Show {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
         follow: bool,
+        /// Show only the newest N stored messages from the fetched transcript
+        #[arg(long, conflicts_with = "follow")]
+        last: Option<std::num::NonZeroUsize>,
         /// Tagged Event lines, as with run --output jsonl-events
         #[arg(long, requires = "follow")]
         jsonl: bool,
@@ -5845,6 +5890,7 @@ enum SessionsAction {
     /// Show a Run's tracked files and diffs
     Files {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Run ID whose tracked files to inspect; omit for the latest Run
         #[arg(long)]
@@ -5856,6 +5902,7 @@ enum SessionsAction {
     /// Attempt safe restoration of one path or all tracked files
     Rewind {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Tracked path to restore; omit to consider all tracked files
         path: Option<String>,
@@ -5869,6 +5916,7 @@ enum SessionsAction {
     /// Rename a Session
     Rename {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// New display name for the Session
         name: String,
@@ -5876,11 +5924,13 @@ enum SessionsAction {
     /// Delete a Session (restorable for daemon.delete_undo_secs)
     Rm {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring back a Session deleted moments ago (full id)
     Restore {
         /// Full ID of the recently deleted Session
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Import a Session bundle (from `sessions export --format json`)
@@ -5910,17 +5960,20 @@ enum SessionsAction {
     /// Hide a Session from the default list (kept and searchable)
     Archive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Bring an archived Session back
     Unarchive {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
     },
     /// Export a Session: the re-importable JSON bundle, or a readable
     /// Markdown or HTML transcript
     Export {
         /// Session ID or unambiguous prefix
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
         id: String,
         /// Export format; omit to infer from the output extension, otherwise json
         #[arg(long, value_enum)]
@@ -5942,6 +5995,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             follow: true,
             json,
             jsonl,
+            ..
         } => {
             let code = cli_attach::follow(&paths, &id, json || jsonl)?;
             if code != 0 {
@@ -6031,10 +6085,23 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 cli_session_report::list_table(&shown).print();
             }
         }
-        SessionsAction::Show { id, json, .. } => {
+        SessionsAction::Show { id, last, json, .. } => {
             let s = find_session(&paths, &id)?;
-            let r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let mut r = daemon(Request::GetSession { id: s.id.clone() })?;
+            let truncated = last.and_then(|last| {
+                let messages = r.get_mut("messages")?.as_array_mut()?;
+                let total = messages.len();
+                let count = last.get();
+                if total <= count {
+                    return None;
+                }
+                drop(messages.drain(..total - count));
+                Some((count, total))
+            });
             if json {
+                if let Some((_, total)) = truncated {
+                    r["total_messages"] = serde_json::json!(total);
+                }
                 println!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
             }
@@ -6045,7 +6112,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             println!(
                 "{} messages · updated {}{}{}",
                 s.message_count,
-                s.updated_at.get(..16).unwrap_or(&s.updated_at),
+                local_timestamp(&s.updated_at),
                 s.model
                     .as_deref()
                     .map(|m| format!(" · {m}"))
@@ -6055,6 +6122,9 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     .map(|c| format!(" · in {c}"))
                     .unwrap_or_default()
             );
+            if let Some((count, total)) = truncated {
+                println!("Showing last {count} of {total} stored messages.");
+            }
             print!("{}", cli_session_report::metadata(&s));
             let messages: Vec<formless_protocol::MessageInfo> =
                 serde_json::from_value(r["messages"].clone()).unwrap_or_default();
@@ -6066,8 +6136,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     _ => "  note",
                 };
                 if m.role == "tool" {
-                    let first = m.content.lines().next().unwrap_or_default();
-                    println!("{who}: {}", first.chars().take(120).collect::<String>());
+                    println!("{who}: {}", tool_result_preview(&m.content));
                 } else if !m.content.trim().is_empty() {
                     println!("\n{who}:\n{}", m.content.trim_end());
                 }
@@ -6332,7 +6401,35 @@ fn config_edit(paths: &Paths) -> Result<()> {
     }
 }
 
-/// The Session with this id or id prefix.
+/// First-line tool output for the static human Session transcript.
+fn tool_result_preview(content: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    // An initial LF or CRLF ends the displayed line. Anything after that
+    // terminator, including additional blank lines, is omitted content.
+    let (first, omitted_lines) = match content.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), !rest.is_empty()),
+        None => (content, false),
+    };
+    // The visible marker is outside the 120-scalar content budget.
+    let mut remaining = 120;
+    let mut end = 0;
+    for (offset, grapheme) in first.grapheme_indices(true) {
+        let scalars = grapheme.chars().take(remaining + 1).count();
+        if scalars > remaining {
+            break;
+        }
+        remaining -= scalars;
+        end = offset + grapheme.len();
+    }
+    if omitted_lines || end < first.len() {
+        Cow::Owned(format!("{}…", &first[..end]))
+    } else {
+        Cow::Borrowed(first)
+    }
+}
+
 fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String> {
     value
         .parse::<usize>()
@@ -6357,12 +6454,7 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
         return out;
     }
     for hit in hits {
-        // Same boundary-safe stored date/time presentation as other CLI rows.
-        let time = hit
-            .created_at
-            .get(..16)
-            .unwrap_or(&hit.created_at)
-            .replace('T', " ");
+        let time = local_timestamp(&hit.created_at).replace('T', " ");
         let short_id: String = hit.session_id.chars().take(8).collect();
         let _ = writeln!(
             out,
@@ -6386,7 +6478,15 @@ fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::Sea
     out
 }
 
+fn validate_session_selector(id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(usage("Session selector must not be empty"));
+    }
+    Ok(())
+}
+
 fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
         Request::ListSessions,
@@ -6395,6 +6495,7 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
 }
 
 fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
+    validate_session_selector(id)?;
     // An exact id, else an id prefix, else a name (SPEC §12, Session selectors).
     if let Some(s) = list.iter().find(|s| s.id == id) {
         return Ok(s.clone());
@@ -6863,6 +6964,19 @@ fn roles_cmd(paths: Paths, action: RolesAction) -> Result<()> {
     Ok(())
 }
 
+fn format_job_history_duration(started_at: &str, finished_at: Option<&str>) -> String {
+    let duration = finished_at.and_then(|finished_at| {
+        let started = chrono::DateTime::parse_from_rfc3339(started_at).ok()?;
+        let finished = chrono::DateTime::parse_from_rfc3339(finished_at).ok()?;
+        (finished - started).to_std().ok()
+    });
+    match duration {
+        Some(duration) if duration.as_secs() == 0 => format!("{}ms", duration.as_millis()),
+        Some(duration) => format_duration(duration),
+        None => "-".into(),
+    }
+}
+
 fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
@@ -6896,8 +7010,8 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                     c(j["cron"].as_str().unwrap_or("once")),
                     c(j["next_run"]
                         .as_str()
-                        .map(|n| n.get(..16).unwrap_or(n))
-                        .unwrap_or("-")),
+                        .map(local_timestamp)
+                        .unwrap_or_else(|| "-".into())),
                     t(
                         last,
                         if last == "completed" {
@@ -6964,14 +7078,40 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
                 eprintln!("warning: {w}");
             }
         }
+        JobsAction::Preview { schedule, json } => {
+            let preview = daemon(Request::PreviewSchedule { schedule })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+                return Ok(());
+            }
+            let cron = preview["cron"]
+                .as_str()
+                .context("schedule preview did not return a cron expression")?;
+            let next = preview["next"]
+                .as_array()
+                .context("schedule preview did not return a list of times")?
+                .iter()
+                .map(|time| time.as_str().context("invalid time in schedule preview"))
+                .collect::<Result<Vec<_>>>()?;
+            println!("Cron: {cron}");
+            if next.is_empty() {
+                println!("No upcoming times were returned.");
+            } else {
+                println!("Projected from the daemon's current local time:");
+                for time in next {
+                    println!("  {time}");
+                }
+            }
+        }
         JobsAction::Run { id } => {
             let r = daemon(Request::RunJobNow { id: id.clone() })?;
             println!("{id}: {}", r["status"].as_str().unwrap_or_default());
         }
-        JobsAction::History { id, json } => {
+        JobsAction::History { id, limit, json } => {
+            let limit = usize::from(limit);
             let runs = daemon(Request::JobRuns {
                 id: id.clone(),
-                limit: None,
+                limit: Some(limit),
             })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&runs)?);
@@ -6981,24 +7121,14 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             if runs.is_empty() {
                 println!("{id} has not run yet");
             }
+            let at_limit = runs.len() == limit;
             let mut tbl = Table::new(&[
                 "STARTED", "TRIGGER", "OUTCOME", "TOOK", "COST", "SESSION", "DETAIL",
             ]);
             for r in runs {
-                let took = r
-                    .finished_at
-                    .as_deref()
-                    .and_then(|f| {
-                        let a = chrono::DateTime::parse_from_rfc3339(&r.started_at).ok()?;
-                        let b = chrono::DateTime::parse_from_rfc3339(f).ok()?;
-                        Some(format!("{}s", (b - a).num_seconds()))
-                    })
-                    .unwrap_or_else(|| "-".into());
+                let took = format_job_history_duration(&r.started_at, r.finished_at.as_deref());
                 tbl.row(vec![
-                    c(r.started_at
-                        .get(..16)
-                        .unwrap_or(&r.started_at)
-                        .replace('T', " ")),
+                    c(local_timestamp(&r.started_at).replace('T', " ")),
                     c(r.trigger),
                     t(
                         r.status.clone(),
@@ -7018,6 +7148,13 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
             }
             if !tbl.is_empty() {
                 tbl.print();
+            }
+            if at_limit {
+                if limit == 500 {
+                    println!("Showing the maximum of 500 firings. More may exist.");
+                } else {
+                    println!("Showing newest {limit} firings. More may exist. Use --limit to request up to 500.");
+                }
             }
         }
         JobsAction::Enable { id } => {
@@ -8214,6 +8351,7 @@ fn logs_cmd(
     level: Option<String>,
     since: Option<std::time::Duration>,
     lines: usize,
+    jsonl: bool,
 ) -> Result<()> {
     let max_level = level.as_deref().and_then(log_level).unwrap_or(4);
     let cutoff =
@@ -8227,7 +8365,12 @@ fn logs_cmd(
             }
     };
     let live = paths.log_file();
-    let summary = log_output::history(paths, lines, &keep, &mut std::io::stdout().lock())?;
+    let format = if jsonl {
+        log_output::Format::Jsonl
+    } else {
+        log_output::Format::Text
+    };
+    let summary = log_output::history(paths, lines, &keep, format, &mut std::io::stdout().lock())?;
     log_truncation_notice(&summary);
     if summary.entries == 0 && !follow {
         eprintln!(
@@ -8266,6 +8409,22 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
         formless_tui::client::request_once(paths, Request::ListTools)?,
     )?;
     cli_tool_lookup::resolve(&tools, name).cloned()
+}
+
+fn tool_detail_calls_line(m: &formless_protocol::ToolMetricsInfo) -> String {
+    format!(
+        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
+        m.total,
+        m.success,
+        m.failure,
+        m.denied,
+        m.success_rate
+            .map(formless_core::success_rate::label)
+            .unwrap_or_else(|| "-".into()),
+        m.p50_ms
+            .map(|v| format!("{v:.0}ms"))
+            .unwrap_or_else(|| "-".into())
+    )
 }
 
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {
@@ -8314,19 +8473,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     );
     println!("memory:       {} MB", t.memory_mb);
     let m = &d.metrics;
-    println!(
-        "calls:        {} ({} ok, {} failed, {} denied) · success {} · p50 {}",
-        m.total,
-        m.success,
-        m.failure,
-        m.denied,
-        m.success_rate
-            .map(|r| format!("{:.0}%", r * 100.0))
-            .unwrap_or_else(|| "-".into()),
-        m.p50_ms
-            .map(|v| format!("{v:.0}ms"))
-            .unwrap_or_else(|| "-".into())
-    );
+    println!("{}", tool_detail_calls_line(m));
     println!(
         "latency:      p50 {} · p95 {}",
         m.p50_ms
@@ -8902,6 +9049,67 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_detail_calls_use_shared_success_rate_labels() {
+        use super::tool_detail_calls_line;
+
+        for (rate, label) in [
+            (None, "-"),
+            (Some(0.0), "0%"),
+            (Some(2.0 / 3.0), "67%"),
+            (Some(0.995), ">99%"),
+            (Some(0.9999), ">99%"),
+            (Some(1.0), "100%"),
+        ] {
+            let metrics = formless_protocol::ToolMetricsInfo {
+                total: 5,
+                success: 2,
+                failure: 2,
+                denied: 1,
+                success_rate: rate,
+                p50_ms: Some(12.0),
+                ..Default::default()
+            };
+            assert_eq!(
+                tool_detail_calls_line(&metrics),
+                format!("calls:        5 (2 ok, 2 failed, 1 denied) · success {label} · p50 12ms")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_preview_marks_omission_at_complete_grapheme_boundaries() {
+        use super::tool_result_preview;
+
+        for (content, expected) in [
+            ("", ""),
+            ("value", "value"),
+            ("value\n", "value"),
+            ("value\r\n", "value"),
+            ("value\n\n", "value…"),
+            ("value\r\n\r\n", "value…"),
+            ("value\r\nmore", "value…"),
+            ("\nmore", "…"),
+        ] {
+            assert_eq!(tool_result_preview(content), expected);
+        }
+        let exact = "界".repeat(120);
+        assert_eq!(tool_result_preview(&exact), exact);
+        assert_eq!(
+            tool_result_preview(&format!("{exact}x")),
+            format!("{exact}…")
+        );
+        let prefix = "x".repeat(119);
+        for grapheme in ["e\u{301}", "👍🏽", "👩‍💻"] {
+            assert_eq!(
+                tool_result_preview(&format!("{prefix}{grapheme}")),
+                format!("{prefix}…")
+            );
+        }
+        let oversized = format!("e{}", "\u{301}".repeat(120));
+        assert_eq!(tool_result_preview(&oversized), "…");
+    }
+
     #[test]
     fn profile_namespace_parser_refuses_reserved_names_before_running_cli_actions() {
         use clap::Parser;
@@ -9550,6 +9758,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cargo_upgrade_uses_git_package_not_a_checkout_path() {
+        let cmd = super::upgrade_command_for_exe("/home/user/.cargo/bin/formless");
+        let (install, force) = cmd.rsplit_once(' ').expect("Cargo upgrade flag");
+        assert_eq!(force, "--force");
+        assert_eq!(
+            install.split_whitespace().collect::<Vec<_>>(),
+            [
+                "cargo",
+                "install",
+                "--git",
+                "https://github.com/athiwatc/formless",
+                "--locked",
+                "formless-bin",
+            ]
+        );
+        let readme = include_str!("../../../README.md");
+        assert!(readme.contains(&format!("`{install}`")));
+    }
+
     /// Root presentation order is deliberate (#1609), independently of inventory.
     #[test]
     fn root_help_and_man_use_alphabetical_command_order() {
@@ -9760,6 +9988,33 @@ mod tests {
             "1h30m"
         );
         assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn jobs_history_formats_elapsed_time_and_missing_values() {
+        let started_at = "2026-11-18T10:00:00.123Z";
+        for (finished_at, expected) in [
+            (Some("2026-11-18T10:00:00.579Z"), "456ms"),
+            (Some("2026-11-18T10:00:01.122999999Z"), "999ms"),
+            (Some("2026-11-18T10:00:01.123Z"), "1s"),
+            (Some("2026-11-18T10:00:45.123Z"), "45s"),
+            (Some("2026-11-18T12:30:00.123+01:00"), "1h30m"),
+            (Some(started_at), "0ms"),
+            (Some("2026-11-18T10:00:00.122999999Z"), "-"),
+            (Some("2026-11-18T09:59:57.123Z"), "-"),
+            (Some("not a timestamp"), "-"),
+            (None, "-"),
+        ] {
+            assert_eq!(
+                format_job_history_duration(started_at, finished_at),
+                expected,
+                "{finished_at:?}"
+            );
+        }
+        assert_eq!(
+            format_job_history_duration("not a timestamp", Some(started_at)),
+            "-"
+        );
     }
 
     #[test]

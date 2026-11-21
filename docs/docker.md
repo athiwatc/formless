@@ -15,7 +15,7 @@ docker run -d --name formless --restart unless-stopped \
   -v formless-data:/data -v formless-config:/config \
   -v "$PWD/api_key.txt:/run/secrets/api_key:ro" \
   -e FORMLESS_API_KEY_FILE=/run/secrets/api_key \
-  ghcr.io/athiwatc/formless
+  ghcr.io/athiwatc/formless:latest
 ```
 
 Then give it a provider. Write a `config.toml` (any setting from the
@@ -66,6 +66,64 @@ can't write its database), and `docker logs formless` says so.
 - `docker stop` sends SIGTERM through tini. Formless uses the same shutdown
   path as `formless daemon stop` to stop its MCP servers and remove the
   daemon socket and PID marker.
+
+## Upgrade or roll back
+
+Release images publish a version tag with a leading `v` (for example,
+`v0.1.0`) and a floating `latest` tag. Omitting the tag means `latest`.
+Pin a published version tag or an image digest on servers so a recreate
+does not silently switch versions.
+
+Before upgrading, record the current image tag or digest and the original run
+options. Choose a maintenance window, let active Runs finish, and stop all
+containers and other processes that write to either volume before copying
+both volumes to a separate backup location. This includes any other Formless
+profiles that share the volumes. Keep the pairing secret and backup private. The daemon cannot run
+jobs while it is stopped; check Runs and the job schedule after restart rather
+than assuming interrupted work resumed.
+
+Using the settings from [Start it](#start-it), pull the new tag before stopping the
+container. Replace `vX.Y.Z` with the published target tag:
+
+```sh
+image=ghcr.io/athiwatc/formless:vX.Y.Z
+docker pull "$image"
+docker stop formless
+```
+
+Back up both stopped volumes before continuing. Once the backup is verified,
+recreate the container:
+
+```sh
+image=ghcr.io/athiwatc/formless:vX.Y.Z
+docker rm formless
+docker run -d --name formless --restart unless-stopped \
+  -v formless-data:/data -v formless-config:/config \
+  -v "$PWD/api_key.txt:/run/secrets/api_key:ro" \
+  -e FORMLESS_API_KEY_FILE=/run/secrets/api_key \
+  "$image"
+docker exec formless formless --version
+docker exec formless formless doctor
+```
+
+Retain your existing mounts, environment, network and profile flags if they
+differ. Remove only the container, not the volumes. With Compose, set the
+service's `image:` to the new tag, run `docker compose pull formless`, then run
+`docker compose stop formless`. Back up both volumes before running `docker compose up -d formless`.
+Replace `formless` with your service name when it differs. Do not use
+`docker compose down -v` for an upgrade. Check `docker ps` for a healthy
+container and `docker logs formless` if startup or `doctor` fails.
+
+Do not use `formless update` inside the container. The binary belongs to the
+image; replace the image and preserve the volumes instead.
+
+For rollback, stop the new container and any other writers. Before starting
+the previous image, check whether that version can open the post-upgrade
+state. If compatibility is not documented, restore the pre-upgrade data and
+config backup into separate volumes first. Then recreate the container with
+the previous tag or digest. If you restored the backup, mount the restored
+volumes instead of the migrated originals. Keep the post-upgrade volumes
+intact; the restored copy does not contain changes made since the backup.
 
 ## The API key
 

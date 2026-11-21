@@ -25,10 +25,16 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls
-   to the user-configured provider endpoint, the user-enabled Relay, and
-   explicit user-run commands (e.g. `formless update check`). No automatic
-   update checker, no phone-home.
+5. **Local-first, zero telemetry.** Network activity can include requests to
+   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
+   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
+   Naming and auto-download are enabled by default. When both are enabled
+   in a build with embedded naming, an eligible Session can trigger a
+   download of its missing configured catalogue model and tokenizer from
+   Hugging Face. `naming.auto_download = false` disables
+   automatic naming downloads; `naming.enabled = false` disables automatic
+   naming. These settings do not block explicit `formless naming pull`.
+   There is no automatic update checker.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -105,15 +111,17 @@ without redesign.
 | Daemon Core | Long-lived process owning loop, Tools, Sessions, state. |
 | Relay | Hosted encrypted intermediary for the Web frontend (v2, §12). |
 
-## 4. Provider (v1: OpenAI-compatible only)
+<a id="4-provider-v1-openai-compatible-only"></a>
+
+## 4. Provider
 
 ### 4.1 Scope
 
-- v1 supports exactly one provider type: any **OpenAI-compatible** endpoint
-  speaking **Chat Completions**: `POST {base_url}/chat/completions` with
-  Bearer auth and SSE streaming, and `GET {base_url}/models` for discovery.
-- `base_url` is used **verbatim** (the daemon appends only `/chat/completions`
-  and `/models`); non-`/v1` layouts work. Free-form extra headers (e.g.
+- `provider.api_style = "chat"` uses **OpenAI-compatible Chat Completions**
+  by default. It sends `POST {base_url}/chat/completions` with Bearer auth
+  and SSE streaming, and uses `GET {base_url}/models` for discovery.
+- Configure `base_url` with the endpoint's path prefix. The daemon appends
+  the path for the selected API style without adding `/v1`. Extra headers (e.g.
   organisation/project) are configurable per provider and sent on every call.
 - v2: `provider.api_style = "responses"` speaks the Responses API
   (`POST {base_url}/responses`, converted input/tools, streamed
@@ -214,7 +222,7 @@ without redesign.
 ### 4.2 Configuration and selection
 
 - **Provider presets** (`presets.rs`): OpenAI, Anthropic
-  (OpenAI-compatible endpoint), OpenRouter, Google Gemini
+  (native Messages API), OpenRouter, Google Gemini
   (OpenAI-compatible), Groq, Ollama (local) and LM Studio (local). Each
   preset gives the base URL and `api_style`, where to get a key, the
   environment variable that often holds one, and a default model that is
@@ -269,7 +277,7 @@ without redesign.
   automatic compaction is audited with it (`compaction.window`).
 - An assistant turn's text before its tool calls (a preamble such as
   "Let me check the file first") is kept in the history sent back to the
-  model, on both API styles.
+  model across all three API styles.
 - Tool arguments the model sends as JSON-encoded strings where the
   schema expects an object or array (some models do this for nested
   values) are parsed before validation, for built-ins and registry Tools
@@ -459,10 +467,12 @@ without redesign.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
-Before the first Session, the wizard probes the endpoint: connectivity,
-streaming, and a **test tool-call**. If tool-calling is unsupported, session
-start is refused with a clear explanation. Native tool-calling is required
-in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
+Before the first Session, the wizard checks connectivity, streaming, and a
+**test tool-call**. The original v1 scope required native tool calling.
+The current probe accepts either native or [prompt-based tool calling](#41-scope).
+When the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"`.
+A result with neither mode demonstrated blocks Session start. Probe errors
+also block completion and show the reported cause.
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
 The probe also makes one real streamed request and reports `streaming`
@@ -2153,23 +2163,23 @@ pattern (§4.4).
 ### 7.5 QuickJS runtime and host API
 
 - Engine: QuickJS-NG via `rquickjs`, embedded in-process. Tools are
-  single-file plain JS; the daemon provides the entire API surface (bare JS
-  has no ambient authority of any kind). The surface is deliberately
-  **near-minimal**: it offers only effects JS cannot produce itself.
-  Everything else (URL parsing, base64-to-bytes, hashing, compression,
-  formats) is written by the agent, typically as shared modules.
+  single-file plain JavaScript. QuickJS provides ECMAScript built-ins such
+  as `JSON`. The runtime installs the host APIs listed here. Tools can
+  implement helpers such as URL parsing, hashing and format conversion in
+  shared JavaScript modules.
   - `run(input)` may be `async`; the returned Promise is settled before the
     Invocation ends. A Tool reports failure by **throwing**. A returned
-    object whose `error` field is truthy is recorded as a failure too (§8.1),
-    so swallowed errors cannot inflate the success rate.
+    object whose `error` field is truthy is recorded as a failure too (§8.1)
+    unless the output schema declares an `error` property.
   - Data options take `encoding: "utf8"` (default) or `"base64"`, so any
     binary data crosses the boundary as a string. Text chunks never split a
     UTF-8 character.
   - `fetch(url, {method, headers, body, bodyEncoding, encoding})` →
     `{status, ok, url, headers, body, text(), json()}` and
     `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
-    memory) — gated by `net`. http(s) only; redirects are followed, each hop
-    scope-checked; no request timeout.
+    memory) require `net`. They support HTTP(S) and check the scope on each
+    redirect. The configured connection and total deadlines apply to both
+    APIs, with one total budget for redirects and body reads (§13).
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -2177,17 +2187,20 @@ pattern (§4.4).
     so the child never blocks), logs at `tools.max_log_bytes`, and `emit`
     at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
     the setting and the streaming alternative.
-  - `fs.read/write/append` (whole-value), `fs.exists`, `fs.stat` (`{type,
-    size, modified_ms}` or null), `fs.list(dir, {details})`, and
+  - `fs.read` (whole-value), `fs.exists`, `fs.stat` (`{type,
+    size, modified_ms, readonly?}` or null), `fs.list(dir, {details})`, and
     `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
-    — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
-    `fs:write` (both paths for rename). Writes create missing parent dirs.
+    — gated by `fs:read`. `fs.write/append/mkdir/rename` and
+    `fs.remove(path, {recursive})` require `fs:write` (both paths for rename).
+    `fs.stat` includes `readonly` for on-disk entries. Writes create missing
+    parent dirs. Removal is recursive when `recursive` is true.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
     stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
     stdin closed unless given. An optional integer `timeout_ms` from 0 to
     86400000 terminates the owned process group/job on expiry and returns
     `timed_out: true`; omission preserves cancellation-only execution.
+    `timeoutMs` is an alias used when `timeout_ms` is absent or null.
   - `process.spawn(cmd, args, opts)` takes the same options and checks as
     `process.run`, returning an Invocation-local handle. `handle.read(size)`
     blocks for the next available `{stream: "stdout"|"stderr", data, eof:
@@ -2245,20 +2258,34 @@ pattern (§4.4).
     global throttle table. Clients match IDs exactly; legacy ID-less updates may
     match only one unambiguous running call. Progress is ignored in smoke tests,
     replays and dry runs.
-  - `tools.call(name, input)` — composition (§7.6). Returns a Promise of
+  - `tools.call(name, input)` uses the nested Tool checks in §7.6 or
+    `mcp:<server>` for MCP calls (§7.9). It returns a Promise of
     the nested Tool's output, so several run in parallel under
     `Promise.all` (§7.12). Every call must settle before `run` is done: a
     Tool that returns while a call is still pending fails ("await every
     call"), because a forgotten `await` would otherwise pass a Promise off
     as data.
-  - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
-    body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
-    (gated by `llm`; one non-streaming completion via the daemon's
-    configured provider, with the Session's model and reasoning effort
-    unless `model` is given), `agents.run(task, {system, model})` (gated by
-    `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
-    modules (§7.6). In smoke tests these are stubbed; in optimiser
-    replay the side-effecting ones are denied.
+  - `clipboard.read()` and `clipboard.write(text)` require `clipboard:read`
+    and `clipboard:write` respectively. `notify(title, body)` and its alias
+    `notifications.send(title, body)` require `notify` (§7.4).
+  - `harness.read()` and `harness.call("read", {}, "")` require `harness:read`.
+    Mutations through `harness.call(op, args, reason)` require the applicable
+    `harness:<scope>` and follow the approval flow in §7.13.
+  - `llm.complete(prompt, {system, model, role, schema})` uses the `llm`
+    Capability. It makes a non-streaming completion and returns text by
+    default or a validated JSON value with `schema` (§4.2). `agents.run(task,
+    {system, model, role})` uses `agent` and returns the sub-agent's final text
+    (§7.6). In both calls a nonempty `role` takes precedence over `model`.
+    A Role selects its configured provider and model. An explicit model or
+    Role must fit any scope on the Capability (§7.4). When both options are
+    omitted, the first entry of a scoped grant is used. An unscoped grant
+    inherits the Session's selection.
+  - `requireModule(name)` and its alias `modules.load(name)` load shared
+    JavaScript modules. `modules.list()` lists names available to the
+    Invocation. These helpers use the supplied module registry (§7.6) and
+    require no Capability.
+  - `emit(chunk)` appends to the Invocation's output artifact, subject to
+    `tools.max_emit_bytes` (§7.12). It requires no Capability.
   - `store.get(key, {ns})`, `store.set(key, json, {ns})`,
     `store.delete(key, {ns})` and `store.list(prefix, {ns})` keep small
     state between Invocations: caches, cursors, tokens and rate-limit
@@ -2281,8 +2308,9 @@ pattern (§4.4).
     Root functions, symbols and `toJSON` methods returning `undefined` are
     rejected rather than silently becoming null; an absent `run` return
     deliberately becomes null. A result's `toJSON` is invoked only once.
-  - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
-    (base64). Nothing else.
+  - `console.log/info/warn/error` write capped Invocation logs. `sleep(ms)`,
+    `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`,
+    `cryptoRandom()` (UUID) and `randomBytes(n)` (base64) require no Capability.
 
     `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
     numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
@@ -2305,8 +2333,8 @@ pattern (§4.4).
 
 - A Tool may invoke other Tools via `tools.call`. Nested Invocations are
   recorded and measured like top-level ones. Composition cannot launder
-  permissions: the called Tool runs under **its own** declared Capabilities
-  and the outer Tool's Capabilities also apply. Nesting depth is bounded by
+  permissions. Each Tool runs under its own declared Capabilities and the
+  called Tool goes through its own approval checks. Nesting depth is bounded by
   the sandbox implementation (cycle-safe), faults tagged as Invocation
   failures.
 - Shared JS modules (v2): `create_module` stores versioned, immutable
@@ -2333,10 +2361,10 @@ pattern (§4.4).
     roll back), used by, code, "Edit code" and "Delete". Delete warns,
     naming the Tools that load it.
 - Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
-  `agent` Capability calls `agents.run(task, {system, model})` to run a
-  sub-agent — its own provider loop over the same Tools, with no step
-  limit (it ends on a final answer, a fault or cancellation) — and
-  receives only its final text. There is no sub-agent built-in, so
+  `agent` Capability calls `agents.run(task, {system, model, role})` to run a
+  sub-agent. Its provider loop runs over the same Tools and ends on a final
+  answer, a fault, cancellation or its turn limit (§4.6). The Tool receives
+  the sub-agent's final text. There is no sub-agent built-in, so
   delegation is always a measured, approval-gated Invocation; parallel
   delegation is several such calls in one turn, which run concurrently.
   The sub-agent's own Tool calls pass the same approval pre-pass as the
@@ -3364,6 +3392,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
   list and Run start/end stay global. A new connection receives everything;
   the TUI, web and headless clients subscribe to the Session they show.
+- Optional capability `future_transcript_attempts_v1` adds per-connection
+  `SubscribeTranscriptAttempts`, `GetTranscriptBarrier`, and correlated
+  answer-only `TranscriptAttempt` start/delta/close frames. It admits complete
+  future attempts after a later producer barrier; it is not mid-attempt replay
+  or a canonical commit watermark. Canonical events cannot be discarded by
+  that cursor. Existing Subscribe restores legacy mode. The native desktop
+  keeps this path disabled pending full transport acceptance. See
+  [the exact contract and acceptance gates](docs/desktop/future-attempt-protocol-20261115.md).
 - **Compatibility.** `Ping` and `Status` report `min_protocol`,
   `max_protocol` and `features` (named optional capabilities); peers use
   the highest version both speak, and the daemon accepts any envelope
@@ -3669,8 +3705,12 @@ refresh a cache, nightly cleanup.
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron.
-    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
-    which `jobs add` prints to confirm.
+    `PreviewSchedule {schedule}` returns the cron and up to three projected
+    recurring times from the daemon's current local time. `jobs add` prints
+    them after creation. `formless jobs preview SCHEDULE [--json]` requests
+    the same preview without creating or updating a Job. An empty preview
+    means no upcoming times were returned. Adding a Job performs its own
+    validation.
   - Both entry points require a nonblank prompt and a one-shot time strictly
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
@@ -3713,8 +3753,11 @@ refresh a cache, nightly cleanup.
 - **History:** every firing is a `job_runs` row: trigger (`schedule` or
   `manual`), outcome (the Run's final status, or `skipped`), duration,
   cost, Session and details. `JobRuns {id}`, `formless jobs history ID`,
-  `/jobs history ID` and the web "History" button show it. A firing whose
-  Run doesn't complete posts a note to every client.
+  `/jobs history ID` and the web "History" button show it. The CLI shows the
+  newest 20 firings by default. `--limit N` accepts 1–500, and the human
+  output warns when that many rows were returned. JSON remains an array of
+  firings in newest-first order. A firing whose Run doesn't complete posts
+  a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
   schedule is unchanged. A successful manual retry records its outcome in
@@ -4483,7 +4526,9 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
   use (prompt, completion, cached) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
-  `provider.prices` (no cost when a model in the bucket has no price). The
+  `provider.prices` (no cost when a model in the bucket has no price). Session
+  rows carry the stable `session_id` and display the Session name in `key`.
+  They use the ID as the label when the Session record is missing. The
   TUI Metrics view charts it for the selected range: a bar per day (or key)
   split into cached, fresh prompt and completion tokens, with totals and
   cost; `b` cycles the breakdown.
@@ -4584,6 +4629,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   sort by that column on click or Enter; a second click reverses it. Each
   column's natural order is names A→Z and numbers or dates biggest first.
   The headers carry `aria-sort`, and the Sort menu follows.
+  Tool usage time is the start of the latest retained Invocation, regardless
+  of outcome. Web Tools and Metrics show that time as of the latest Tool
+  refresh, and the TUI shows it in Tool details. An absent time is unknown,
+  including when all call history was pruned or the daemon predates the field.
+  The last-used sort puts unknown times after known ones and breaks ties by
+  name and Tool ID.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
@@ -4898,6 +4949,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   it and a double-click opens it (as Enter), and clicking a tool call's
   header in the chat expands or collapses it. Each frame records its
   clickable regions, list rows from the widgets' own scroll offsets.
+  The wheel over an active Sessions, Tools or Proposals list moves the
+  selection by up to three filtered items without activating a row.
 
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
@@ -5051,6 +5104,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     uses the browser Notification API, asked for on the first message
     you send;
   - `off` does nothing.
+  In tmux, enable `set -g focus-events on` so the TUI receives focus
+  reports from a compatible outer terminal. For the desktop escape
+  sequence, also enable `set -g allow-passthrough on` on tmux versions
+  with that option. The `on` setting forwards sequences from visible
+  panes. Reattach tmux clients after changing focus reporting.
+
   The web tab title also counts unseen alerts (`(2) Formless`) until you
   come back. Interrupted Runs never notify.
 
@@ -5218,8 +5277,8 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
-| `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
-| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless jobs` | `list`, `add`, `run`, `history ID [--limit N]`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
@@ -5280,6 +5339,13 @@ reported separately from an empty archive selection, which names the alternate
 list command and count. Static human `sessions show` includes stored archived,
 pinned, tags and last recorded Run status metadata; absent status is "not
 recorded". JSON and `--follow` retain their existing contracts.
+
+`formless sessions show ID --last N` displays the newest N stored messages
+in their original order, including blank entries in the selection before
+human formatting. N must be positive. When earlier messages are omitted,
+the human display reports the selected and total counts and `--json` adds
+`total_messages` next to the shortened `messages` array. The bound applies
+to display after fetching the full snapshot and conflicts with `--follow`.
 
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
@@ -5418,7 +5484,7 @@ previous headless Run's Session.
   values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
   keys, long opaque tokens, and the home path (shown as `~`). The file says
   to read it before attaching it.
-- `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
+- `formless logs [-f | --jsonl] [--level warn] [--since 10m] [-n 200]` shows the
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
@@ -5432,6 +5498,13 @@ previous headless Run's Session.
   `info` and above by default (other commands only errors), `RUST_LOG`
   overrides it, and colour codes are only used on a terminal, never in the
   file.
+  `--jsonl` is snapshot-only and conflicts with `--follow`. It emits one JSON
+  object per selected entry with `timestamp` (RFC 3339 or null),
+  `filter_level` (the lowercase effective filter level, defaulting to
+  `info` for missing or unknown levels), and `text` (the same grouped,
+  normalized and possibly truncated entry as in raw output). `--since`
+  excludes undated entries. No matches leave stdout empty and print the
+  usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
@@ -5478,7 +5551,10 @@ previous headless Run's Session.
   - `json`: one `{session_id, status, answer, result, error}` object at the end;
     `answer` retains its text form. `result` carries the validated JSON value
     on a successful schema Run and is null otherwise;
-  - `jsonl-events`: every event, one per line; `--json` is the same.
+  - `jsonl-events`: every event, one per line; `--json` is the same for a Run.
+  - With `--estimate`, `text` prints the human forecast and `json` prints one
+    forecast object. `--json` is an alias for the forecast object in this
+    mode. `final` and `jsonl-events` are usage errors for estimates.
 
   Pipeline options are per Run, never edits to the profile configuration or
   Session's standing instructions. `--system TEXT` appends exact bounded
@@ -6637,8 +6713,8 @@ order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
 Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
 the complete array and null costs. Cost is the daemon's current estimate, not a
-billing guarantee. Session grouping currently uses display names and merges
-equal-named Sessions (#1585); this caller cannot recover missing identities.
+billing guarantee. Session groups use the ID for attribution and display the
+current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
 before contact. Aggregation, pricing and recording remain unchanged.
 

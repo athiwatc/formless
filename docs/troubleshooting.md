@@ -44,6 +44,19 @@ macOS asks once per binary for access to the stored API key. Choose
 asks again. If prompts keep coming back, re-enter the key with `/setup` in
 the TUI, so the new binary owns it.
 
+## TUI notifications in tmux
+
+Both `tui.notify = "bell"` and `tui.notify = "desktop"` wait for the
+terminal to report that the TUI lost focus. Add `set -g focus-events on`
+to your tmux configuration and use an outer terminal that reports focus.
+Reload the tmux configuration and reattach clients after changing this
+setting.
+
+For desktop alerts, add `set -g allow-passthrough on` on tmux versions
+with that option. It forwards Formless's notification escape sequence
+from a visible pane to the outer terminal. The outer terminal must
+support the notification sequence.
+
 ## The model doesn't call Tools
 
 - Test it: `/test` (TUI), the picker's **Test**, or

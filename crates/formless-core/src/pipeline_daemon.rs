@@ -83,6 +83,7 @@ impl Daemon {
                     CachedPipeline {
                         digest,
                         sent: SentEntry {
+                            steer_run_id: None,
                             at: std::time::Instant::now(),
                             outcome: rx.clone(),
                         },

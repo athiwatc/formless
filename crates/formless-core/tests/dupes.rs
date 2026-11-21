@@ -24,6 +24,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         },
@@ -84,6 +85,68 @@ fn similar_tools_are_paired_and_different_ones_are_not() {
             ("read_file".into(), "read_text_file".into())
         ]
     );
+}
+
+#[test]
+fn only_known_input_fields_contribute_to_duplicate_scoring() {
+    for (left, right) in [
+        (
+            r#"{"oneOf":[{"properties":{"url":{}}}]}"#,
+            r#"{"oneOf":[{"properties":{"channel":{}}}]}"#,
+        ),
+        (
+            r#"{"type":"object","const":{"url":"fixture"}}"#,
+            r#"{"type":"object","enum":[{"channel":"fixture"}]}"#,
+        ),
+        (
+            r##"{"$ref":"#/$defs/url","$defs":{"url":{"properties":{"url":{}}}}}"##,
+            "{}",
+        ),
+        ("unreadable", "also unreadable"),
+        (r#"{"properties":null}"#, r#"{"properties":{}}"#),
+        (
+            r#"{"type":"object","properties":{},"required":["url"]}"#,
+            "{}",
+        ),
+        (r#"{"type":"object","minProperties":1}"#, "{}"),
+        (
+            r#"{"type":"object","additionalProperties":{"type":"string"}}"#,
+            r#"{"type":"object","additionalProperties":false}"#,
+        ),
+    ] {
+        let a = tool(
+            "fetch_page",
+            "Download remote content",
+            left,
+            "return 'page';",
+        );
+        let b = tool(
+            "fetch_feed",
+            "Download remote content",
+            right,
+            "return 'feed';",
+        );
+        let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+        assert_eq!(reason, "similar descriptions");
+        assert!(score < formless_core::dupes::THRESHOLD, "{score} {reason}");
+        assert!(near_duplicates(&[a, b]).is_empty());
+    }
+
+    let a = tool(
+        "fetch_page",
+        "Download remote content",
+        "{}",
+        "return 'page';",
+    );
+    let b = tool(
+        "fetch_feed",
+        "Download remote content",
+        r#"{"type":"object","properties":{}}"#,
+        "return 'feed';",
+    );
+    let pairs = near_duplicates(&[a, b]);
+    assert_eq!(pairs.len(), 1);
+    assert!(pairs[0].reason.contains("same input fields"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
