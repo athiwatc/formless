@@ -164,7 +164,9 @@ def exercise(page, url, app):
     page.evaluate("__runningFixture.hide(true)")
     tick(page, 8)
     page.evaluate("__runningFixture.event('invocation_completed')")
-    tick(page, 8)
+    # Events refresh even while hidden; only periodic polling pauses.
+    wait_requests(page, 9)
+    tick(page, 9)
     page.evaluate("__runningFixture.hide(false)")
     wait_requests(page, 9)
     reply(page, 9)
@@ -191,16 +193,19 @@ def exercise(page, url, app):
     reply(page, 12)
     expect(panel).to_be_hidden()
 
-    # A pre-exposure response may be stale, even when its list is empty.
+    # Exposure reuses a pending read on the same connection.
     page.evaluate("() => { __runningFixture.hide(true); __runningFixture.event('invocation_pending'); }")
     wait_requests(page, 13)
     page.evaluate("__runningFixture.hide(false)")
+    assert page.evaluate("__runningFixture.count()") == 13
     reply(page, 13, {**ROW, "tool_name": "pre-exposure snapshot"})
-    wait_requests(page, 14)
-    expect(panel).to_be_hidden()
+    expect(panel).to_contain_text("pre-exposure snapshot")
+    tick(page, 14)
     page.evaluate("__runningFixture.fail(14)")
+    expect(panel).to_contain_text("pre-exposure snapshot")
     tick(page, 15)
     reply(page, 15)
+    expect(panel).to_be_hidden()
     tick(page, 15)
 
 
