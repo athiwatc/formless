@@ -4,7 +4,11 @@
 
 pub mod caps;
 mod clipboard_diagnostics;
+mod desktop_notification;
 mod dns;
+pub use desktop_notification::desktop_notify;
+#[cfg(any(target_os = "macos", test))]
+pub use desktop_notification::macos_notification_script;
 mod process_executable;
 pub mod process_group;
 mod processes;
@@ -1496,7 +1500,7 @@ impl State {
                         Ok(Value::Null)
                     }
                     HostMode::Live => {
-                        notify(
+                        desktop_notify(
                             a["title"].as_str().unwrap_or_default(),
                             a["body"].as_str().unwrap_or_default(),
                         )?;
@@ -3056,28 +3060,6 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
 }
 
-fn notify(title: &str, body: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            esc(body),
-            esc(title)
-        );
-        run_capture("osascript", &["-e", &script], None).map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        run_capture("notify-send", &[title, body], None).map(|_| ())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (title, body);
-        Err("notifications unsupported on this platform".into())
-    }
-}
-
 fn listing_directory<T>(
     path: &Path,
     overlay: bool,
@@ -3659,6 +3641,15 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_notifications_put_multiline_messages_on_one_source_line() {
+        let script = macos_notification_script("title\rline", "first\r\nsecond \"quoted\" \\");
+        assert_eq!(
+            script,
+            r#"display notification "first second \"quoted\" \\" with title "title line""#
+        );
+    }
 
     #[test]
     fn log_buffer_counts_empty_lines_and_retains_tool_text() {

@@ -3780,6 +3780,9 @@ refresh a cache, nightly cleanup.
   --to-file PATH --webhook URL`) sends the answer when the firing's Run
   ends: a desktop notification, a Markdown entry appended to a file,
   and/or a JSON POST (`job_id, prompt, status, answer, session_id`).
+  Desktop delivery runs off the daemon executor and gives the notifier
+  five seconds to submit the message. On Windows, Jobs and Tool notifications
+  use the BurntToast module in Windows PowerShell under an interactive login.
   These are targets the user configured, so they need no approval; the
   results go in the history and the audit log (`job.deliver`). For other
   channels (email, chat) point a webhook at them, or have the prompt use

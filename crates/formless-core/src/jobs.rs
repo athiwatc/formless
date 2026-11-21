@@ -429,9 +429,13 @@ pub async fn deliver(
     let title = format!("Job {}: {status}", job.id);
     if target["notify"] == true {
         let body: String = answer.chars().take(200).collect();
-        out.push(match notify(&title, &body) {
-            Ok(()) => "notified".into(),
-            Err(e) => format!("notify failed: {e}"),
+        let result =
+            tokio::task::spawn_blocking(move || formless_runtime::desktop_notify(&title, &body))
+                .await;
+        out.push(match result {
+            Ok(Ok(())) => "notified".into(),
+            Ok(Err(error)) => format!("notify failed: {error}"),
+            Err(error) => format!("notify failed: {error}"),
         });
     }
     if let Some(path) = target["file"].as_str() {
@@ -475,43 +479,6 @@ pub async fn deliver(
         });
     }
     out
-}
-
-fn notify(title: &str, body: &str) -> std::result::Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let (cmd, args) = {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        (
-            "osascript",
-            vec![
-                "-e".to_string(),
-                format!(
-                    "display notification \"{}\" with title \"{}\"",
-                    esc(body),
-                    esc(title)
-                ),
-            ],
-        )
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (cmd, args) = ("notify-send", vec![title.to_string(), body.to_string()]);
-    #[cfg(not(unix))]
-    {
-        let _ = (title, body);
-        return Err("desktop notifications are not supported here".into());
-    }
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new(cmd)
-            .args(&args)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{cmd} exited with {status}"))
-        }
-    }
 }
 
 #[cfg(test)]
