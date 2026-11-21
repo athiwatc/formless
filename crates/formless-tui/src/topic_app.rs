@@ -564,9 +564,17 @@ impl App {
                         self.notes.push("No harnesses reported.".into())
                     }
                     Some(harnesses) => {
+                        let ready = harnesses
+                            .iter()
+                            .filter(|h| h.installed && h.signed_in != Some(false))
+                            .count();
+                        let total = harnesses.len();
                         for harness in harnesses {
                             self.notes.push(topic::harness_availability_line(&harness));
                         }
+                        self.notes.push(format!(
+                            "Harnesses: {ready} of {total} ready · /notes lists them all."
+                        ));
                     }
                     None => self.notes.push(format!("Harness check failed: {reason}")),
                 }
@@ -1225,7 +1233,9 @@ mod tests {
             requests[3].id,
             serde_json::json!([{"kind":"codex","acp_agent":null,"installed":true,"signed_in":false,"version":"1.2","detail":null}]),
         );
-        assert_eq!(app.notes.last().unwrap(), "Codex: signed out · 1.2");
+        let notes = &app.notes[app.notes.len() - 2..];
+        assert_eq!(notes[0], "Codex: signed out · 1.2");
+        assert_eq!(notes[1], "Harnesses: 0 of 1 ready · /notes lists them all.");
     }
 
     #[test]
