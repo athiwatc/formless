@@ -3493,7 +3493,8 @@ impl Shell {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
             has_history: self.timeline.read(cx).item_count() > 0,
-            can_recover: self.client_connected
+            can_recover: !self.harness_read_only()
+                && self.client_connected
                 && self.client_snapshot_ready
                 && self
                     .client_recovery
@@ -3509,7 +3510,9 @@ impl Shell {
                 && self.mode_disable_action().is_none())
             .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
-            can_edit_session: self.client_connected && self.session_edit_target().is_some(),
+            can_edit_session: !self.harness_read_only()
+                && self.client_connected
+                && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
             composing,
