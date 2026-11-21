@@ -25,6 +25,7 @@ pub(super) fn definite_rejection(message: &ServerMessage) -> bool {
 
 #[derive(Debug)]
 pub(super) struct Work {
+    pub(super) sent_at: Option<std::time::Instant>,
     pub dispatch: Dispatch,
     revision: u64,
     quote: Option<formless_protocol::RunForecast>,
@@ -193,6 +194,7 @@ impl Engine {
         }
         let id = dispatch.action.owner.session.clone();
         let work = Box::new(Work {
+            sent_at: None,
             dispatch,
             revision: self.status_revision,
             quote: None,
@@ -371,6 +373,7 @@ impl Engine {
             return false;
         }
         w.sent = true;
+        w.sent_at = Some(std::time::Instant::now());
         self.run_recoveries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -738,7 +741,11 @@ mod tests {
         reply(&mut e, snapshot());
         let request = e.outgoing.pop_front().unwrap();
         assert!(e.action_before_write(request.id));
-        let acknowledged_at = std::time::Instant::now();
+        let Some(Pending::RunWrite(work)) = e.pending.get(&request.id) else {
+            panic!("delete write");
+        };
+        let sent_at = work.sent_at.unwrap();
+        let daemon_started_at = sent_at + Duration::from_secs(1);
         e.receive(ServerMessage::ok(
             request.id,
             json!({"deleted":true,"undo_secs":30}),
@@ -746,7 +753,8 @@ mod tests {
         .unwrap();
         let ticket = e.delete_undo.clone().unwrap();
         assert!(ticket.available());
-        assert!(ticket.deadline >= acknowledged_at + Duration::from_secs(30));
+        assert_eq!(ticket.deadline, sent_at + Duration::from_secs(30));
+        assert!(ticket.deadline <= daemon_started_at + Duration::from_secs(30));
         assert!(ticket.deadline <= std::time::Instant::now() + Duration::from_secs(30));
         e.active = Some("other".into());
         e.command(Command::UndoDelete(ticket.operation));
@@ -762,22 +770,25 @@ mod tests {
         assert!(e.outgoing.is_empty());
     }
     #[test]
-    fn unusable_delete_windows_do_not_offer_undo() {
-        for window in [Value::Null, json!(0), json!(u64::MAX), json!("invalid")] {
-            let (mut e, _, d) = setup(Kind::Delete);
-            review(&mut e, d.clone(), false);
-            e.command(Command::ConfirmRunAction(d.action.operation));
-            e.command(Command::CommitRunAction(d.action.operation));
-            reply(&mut e, snapshot());
-            let request = e.outgoing.pop_front().unwrap();
-            assert!(e.action_before_write(request.id));
-            e.receive(ServerMessage::ok(
-                request.id,
-                json!({"deleted":true,"undo_secs":window}),
-            ))
-            .unwrap();
-            assert!(e.delete_undo.is_none());
-        }
+    fn a_delayed_delete_ack_cannot_extend_the_daemons_purge_window() {
+        let (mut e, _, d) = setup(Kind::Delete);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        let Some(Pending::RunWrite(work)) = e.pending.get_mut(&request.id) else {
+            panic!("delete write");
+        };
+        work.sent_at = Some(std::time::Instant::now() - Duration::from_secs(60));
+        e.receive(ServerMessage::ok(
+            request.id,
+            json!({"deleted":true,"undo_secs":30}),
+        ))
+        .unwrap();
+        assert!(e.delete_undo.is_none());
+        assert!(!e.updates.iter().any(|u| matches!(u, Update::DeleteUndo(_))));
     }
     #[test]
     fn daemon_mutation_error_is_unknown_and_reloads_canonical_state() {

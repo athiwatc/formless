@@ -2637,9 +2637,7 @@ impl Engine {
                         .as_ref()
                         .ok()
                         .and_then(|v| v["undo_secs"].as_u64())
-                        .and_then(|secs| {
-                            std::time::Instant::now().checked_add(Duration::from_secs(secs))
-                        })
+                        .and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs)))
                     {
                         let ticket = crate::run_actions::DeleteUndo {
                             owner: w.dispatch.action.owner.clone(),
