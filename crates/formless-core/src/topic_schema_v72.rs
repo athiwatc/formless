@@ -50,9 +50,12 @@ pub(super) fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch(SCHEMA_V71)?;
     if v1 {
         c.execute_batch(&format!("INSERT INTO topics({TOPICS})
-            SELECT id,name,NULL,repo,'git',base_revision,'[]',source_session_id,topic_session_id,
+            SELECT id,name,COALESCE(
+              (SELECT p.id FROM formless_v72_topics p WHERE p.topic_session_id=legacy.source_session_id AND p.id!=legacy.id),
+              (SELECT p.id FROM formless_v72_topics p JOIN sessions s ON s.parent_session_id=p.topic_session_id WHERE s.id=legacy.topic_session_id AND p.id!=legacy.id)),
+            repo,'git',base_revision,'[]',source_session_id,topic_session_id,
             CASE WHEN status='running' THEN 'needs_user' ELSE status END,
-            redirect_message_id,rejection_reason,created_at,updated_at FROM formless_v72_topics;
+            redirect_message_id,rejection_reason,created_at,updated_at FROM formless_v72_topics legacy;
             INSERT INTO topic_features({FEATURES})
             SELECT id,topic_id,source_message_id,source_seq,request,
             CASE WHEN status IN ('ready','failed') THEN status ELSE 'pending' END,NULL,
