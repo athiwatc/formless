@@ -5,6 +5,7 @@
 //! to the terminal when the visible links or their rendered cells change.
 //! Cells leaving a link are repainted with no hyperlink active.
 
+pub use formless_core::files::path_and_line;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -138,22 +139,6 @@ fn link_cells<'a>(buf: &'a Buffer, link: &Painted) -> impl Iterator<Item = (Rang
 /// prefixes, as a standards-compliant terminal hyperlink.
 pub fn file_url(path: &std::path::Path) -> Option<String> {
     url::Url::from_file_path(path).ok().map(String::from)
-}
-
-/// Parse only numeric suffixes, preserving drive colons and colons in paths.
-pub fn path_and_line(word: &str) -> (&str, Option<u32>) {
-    let Some((head, last)) = word.rsplit_once(':') else {
-        return (word, None);
-    };
-    let Ok(number) = last.parse::<u32>() else {
-        return (word, None);
-    };
-    if let Some((path, line)) = head.rsplit_once(':') {
-        if let Ok(line) = line.parse::<u32>() {
-            return (path, Some(line));
-        }
-    }
-    (head, Some(number))
 }
 
 /// URLs in a line of text, as (start char, end char exclusive, url).

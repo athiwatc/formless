@@ -191,6 +191,29 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
   assert.equal(c.$('input').value, 'B draft');
   assert.equal(vm.runInContext('attachmentDrafts.A', c), 'please read @file');
 });
+test('line citations queue files for review and report missing citations', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit', 'mentionMatches', 'mentionsIn'], {
+    isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    note: (message, failed) => notes.push({ message, failed }),
+    request: async (request) => {
+      calls.push(request);
+      if (request.path === 'src/main.rs:42:8') return { name: 'main.rs' };
+      throw new Error("no file '" + request.path + "'");
+    },
+  });
+  vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+  const draft = 'Compare @src/main.rs:42:8 with @missing.rs:4 and @someone';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls.map((request) => request.path), ['src/main.rs:42:8', 'missing.rs:4', 'someone']);
+  assert.equal(c.S.chips.A[0].name, 'main.rs');
+  assert.equal(c.$('input').value, draft);
+  assert.deepEqual(notes.filter((entry) => entry.failed).map((entry) => entry.message), [
+    "cannot attach @missing.rs:4: no file 'missing.rs:4'",
+  ]);
+});
+
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
@@ -1090,4 +1113,13 @@ test('Azure directory warnings match on Unix and Windows paths', () => {
     assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds cloud credentials']);
   }
   assert.deepEqual(Array.from(c.pathNote('fs:read:/work/accessTokens.json', '/work')), [false, 'inside the working folder']);
+});
+test('Pulumi credentials get an approval warning only under the Pulumi directory', () => {
+  const c = setup(['pathNote', 'normalizeApprovalPath']);
+  for (const path of ['/work/.PuLuMi/nested/Credentials.json', 'C:\\Users\\fixture\\.pulumi\\credentials.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds Pulumi credentials']);
+  }
+  for (const path of ['/work/credentials.json', '/work/.pulumi/stacks/dev.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [false, 'inside the working folder']);
+  }
 });

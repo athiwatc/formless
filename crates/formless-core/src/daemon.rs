@@ -198,6 +198,11 @@ fn is_model_failure(error: &anyhow::Error) -> bool {
             .is_none()
 }
 
+fn run_cancelled(cancel: &CancellationToken, cancel_flag: &AtomicBool) -> bool {
+    // The Run controller sets the sandbox flag before waking token waiters.
+    cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst)
+}
+
 /// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     match e.downcast_ref::<RequestFailure>() {
@@ -3176,7 +3181,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3219,17 +3224,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -3726,6 +3721,7 @@ impl Daemon {
                     prompt: i64,
                     completion: i64,
                     cached: i64,
+                    cache_write: i64,
                     cost: Option<f64>,
                 }
                 let mut out: Vec<UsageBucket> = Vec::new();
@@ -3737,6 +3733,7 @@ impl Daemon {
                             bucket.prompt += p;
                             bucket.completion += c;
                             bucket.cached += cached;
+                            bucket.cache_write += cw;
                             bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
                         None => out.push(UsageBucket {
@@ -3745,12 +3742,15 @@ impl Daemon {
                             prompt: p,
                             completion: c,
                             cached,
+                            cache_write: cw,
                             cost: price,
                         }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
+                    out.sort_by_key(|bucket| {
+                        std::cmp::Reverse(i128::from(bucket.prompt) + i128::from(bucket.completion))
+                    });
                 }
                 Ok(json!(out
                     .into_iter()
@@ -3758,7 +3758,8 @@ impl Daemon {
                         let mut row = json!({
                             "key": bucket.label.as_deref().unwrap_or(&bucket.key),
                             "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
-                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                            "cached_tokens": bucket.cached, "cache_write_tokens": bucket.cache_write,
+                            "cost": bucket.cost,
                         });
                         if bucket.label.is_some() {
                             row["session_id"] = json!(bucket.key);
@@ -4271,6 +4272,8 @@ impl Daemon {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
                         run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
                     }
+                } else {
+                    run["spend_error"] = json!("configuration could not be loaded");
                 }
                 Ok(run)
             }
@@ -5960,8 +5963,11 @@ impl Daemon {
                     }
                     // Steered messages continue the same Run (next step boundary).
                     while steer_rx.try_recv().is_ok() {}
-                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
-                    {
+                    match self.extend_or_close_steering(
+                        &session_id,
+                        &run_id,
+                        run_cancelled(&cancel, &cancel_flag),
+                    ) {
                         steering_daemon::SteeringOutcome::Extend => continue,
                         steering_daemon::SteeringOutcome::Completed => {}
                         steering_daemon::SteeringOutcome::Interrupted => {
@@ -5972,7 +5978,7 @@ impl Daemon {
                     }
                     break;
                 }
-                Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
+                Err(_) if run_cancelled(&cancel, &cancel_flag) => {
                     final_status = "interrupted";
                     self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
@@ -7538,8 +7544,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
@@ -10246,7 +10252,7 @@ impl Daemon {
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
-            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            let interrupted = outcome.is_err() && run_cancelled(cancel, cancel_flag);
             if let Some((r, task, identity)) =
                 role.as_ref().filter(|_| !interrupted).and_then(|r| {
                     let task = routing_task.as_ref()?;
@@ -11572,32 +11578,39 @@ impl Daemon {
         )
         .map_err(|error| anyhow!(error))?;
         let root = mention_root(root_hint)?;
-        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
-        let input_path = if let Some(rest) = path.strip_prefix("~/") {
-            home.as_ref()
-                .filter(|home| home.is_absolute())
-                .context("native home is unavailable for this mention")?
-                .join(rest)
+        let (input_path, home_root) = if let Some(rest) = crate::files::home_path_suffix(path) {
+            let base = directories::BaseDirs::new()
+                .filter(|base| base.home_dir().is_absolute())
+                .context("native home is unavailable for this mention")?;
+            let home = base.home_dir();
+            (
+                home.join(rest),
+                Some(
+                    home.canonicalize()
+                        .context("native home cannot be resolved")?,
+                ),
+            )
         } else {
-            std::path::PathBuf::from(path)
+            (std::path::PathBuf::from(path), None)
         };
+        let (input_path, full) = crate::files::resolve_file_mention(&root, input_path)
+            .with_context(|| format!("no file '{path}'"))?;
         // Preserve the configured root spelling as well as its resolved
         // destination: a credential/profile namespace can itself be an alias.
         let requested = raw_root.join(&input_path);
-        let full = root
-            .join(input_path)
-            .canonicalize()
-            .with_context(|| format!("no file '{path}'"))?;
-        // A mention reaches only the working folder (or ~/ when written so),
+        // A mention reaches only the working folder (or an explicit home path),
         // and never a credential, whoever pasted it (#863).
-        let inside = full.starts_with(&root)
-            || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
-        if !inside {
+        let authority_root = if full.starts_with(&root) {
+            Some(&root)
+        } else {
+            home_root.as_ref().filter(|home| full.starts_with(home))
+        };
+        let Some(authority_root) = authority_root else {
             return Err(anyhow!(
                 "@{path} is outside the working folder {}; attach it with /attach instead",
                 root.display()
             ));
-        }
+        };
         if let Some(why) = credential_path(&full) {
             return Err(anyhow!(
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
@@ -11627,14 +11640,7 @@ impl Daemon {
             };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let authority_root = if full.starts_with(&root) {
-                root.clone()
-            } else {
-                home.as_ref()
-                    .context("authorized home is unavailable")?
-                    .canonicalize()?
-            };
-            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+            let bytes=crate::attachment_access::read_rooted_file(authority_root,&full,inline_limit)
                 .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
@@ -15737,6 +15743,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
@@ -17053,14 +17064,36 @@ fn call_failed(text: String) -> String {
     text
 }
 
-/// A stored tool message's meta: which call it answers, and whether it
-/// reports a failure (Anthropic `tool_result.is_error`).
+/// A stored tool message's meta: call identity and explicit outcome.
 pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    let mut meta = json!({"tool_call_id": call_id, "name": name});
-    if is_error {
-        meta["is_error"] = json!(true);
+    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn stored_tool_result_outcome_preserves_provider_projection() {
+    let mut message = formless_protocol::MessageInfo {
+        id: "result".into(),
+        session_id: "session".into(),
+        seq: 1,
+        role: "tool".into(),
+        content: r#"{"ok":false}"#.into(),
+        created_at: String::new(),
+        meta: Some(json!({"tool_call_id": "call", "name": "tool_name"}).to_string()),
+    };
+    let legacy_projection = crate::storage::provider_message(&message);
+    for is_error in [false, true] {
+        let meta = tool_result_meta("call", "tool_name", is_error);
+        let parsed: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
+        message.meta = Some(meta);
+
+        let mut expected = legacy_projection.clone();
+        if is_error {
+            expected["_is_error"] = json!(true);
+        }
+        assert_eq!(crate::storage::provider_message(&message), expected);
     }
-    meta.to_string()
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):
@@ -17260,6 +17293,9 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS
@@ -17269,31 +17305,61 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
+        "rclone.conf",
+        ".rclone.conf",
+        ".yarnrc",
+        ".yarnrc.yml",
         "credentials.tfrc.json",
         ".terraformrc",
         "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
+        || name.ends_with(".p8")
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
+        || name.ends_with(".jks")
+        || name.ends_with(".keystore")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("a Pulumi credentials file");
+    }
     secret_file.then_some("a key or secrets file")
 }
 

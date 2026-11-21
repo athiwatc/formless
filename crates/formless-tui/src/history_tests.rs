@@ -121,7 +121,7 @@ fn history_large_session_borrows_payloads_and_renders_only_a_bounded_match_previ
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 4)).unwrap();
     for _ in 0..4 {
         terminal
-            .draw(|frame| draw_input(frame, Rect::new(0, 0, 100, 4), &app, false))
+            .draw(|frame| draw_input(frame, Rect::new(0, 0, 100, 4), &app, false, None))
             .unwrap();
     }
     let screen: String = terminal
