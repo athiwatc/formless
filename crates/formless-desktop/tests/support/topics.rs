@@ -684,6 +684,40 @@ fn harness_details_export_its_own_transcript_without_allowing_setting_writes(
         assert!(
             matches!(commands.as_slice(), [WireCommand::ExportSession {session_id, ..}] if session_id == "claude-chat")
         );
+        let [WireCommand::ExportSession {
+            operation, format, ..
+        }] = commands.as_slice()
+        else {
+            unreachable!()
+        };
+        let exported = "Persisted harness transcript ไทย 😀\n";
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::SessionExport {
+                    connection: 0,
+                    operation: *operation,
+                    session_id: "claude-chat".into(),
+                    format: *format,
+                    result: Ok(formless_desktop::session_export::Document {
+                        name: "Harness attempt".into(),
+                        text: exported.into(),
+                    }),
+                },
+                window,
+                cx,
+            )
+        });
+        for _ in 0..100 {
+            window.render_frame(cx);
+            if window.find("session-export-copy").focused() == Some(true) {
+                break;
+            }
+            window.press("tab", cx);
+        }
+        assert_eq!(window.find("session-export-copy").focused(), Some(true));
+        window.press("space", cx);
+        assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), exported);
+        assert!(shell.update(cx, |s, _| s.take_client_commands()).is_empty());
     });
 }
 
