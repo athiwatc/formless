@@ -154,7 +154,7 @@ fn commands_list_mirrors_current_metadata_overrides_and_builtin_shadowing_withou
         "workflow.md",
         "---\ndescription: Global review\n---\nGlobal $ARGUMENTS\n",
     );
-    f.file(true,"workflow.md","---\ndescription: Project review\n---\nReview $1 then $ARGUMENTS @never-open-this-file @blocked-attachment\n!touch should-not-exist\n$(touch should-not-exist)\n");
+    f.file(true,"workflow.md","---\ndescription: Project review\nargument-hint: '<change> [notes]'\nallowed-tools: example\n---\nReview $1 then $ARGUMENTS @never-open-this-file @blocked-attachment\n!touch should-not-exist\n$(touch should-not-exist)\n");
     f.file(
         false,
         "release.md",
@@ -196,9 +196,15 @@ fn commands_list_mirrors_current_metadata_overrides_and_builtin_shadowing_withou
     assert_eq!(commands.len(), 2);
     let review = commands.iter().find(|c| c["name"] == "workflow").unwrap();
     assert_eq!(review["description"], "Project review");
+    assert_eq!(review["argument_hint"], "<change> [notes]");
     assert_eq!(review["source"], "project");
     assert_eq!(review["max_position"], 1);
     assert_eq!(review["uses_arguments"], true);
+    assert_eq!(value["diagnostics"][0]["warning"], true);
+    assert_eq!(
+        value["diagnostics"][0]["message"],
+        "Ignored frontmatter key `allowed-tools`"
+    );
     assert!(
         !commands.iter().any(|c| c["name"] == "quit"),
         "builtin wins"
@@ -217,7 +223,8 @@ fn commands_list_mirrors_current_metadata_overrides_and_builtin_shadowing_withou
     let text = f.run(&["commands", "list"]);
     assert!(text.status.success());
     let text = String::from_utf8(text.stdout).unwrap();
-    assert!(text.contains("/workflow <arg1> [arguments…]"), "{text}");
+    assert!(text.contains("/workflow <change> [notes]"), "{text}");
+    assert!(text.contains("/release [arguments…]"), "{text}");
     assert!(
         text.contains("/workflow") && text.contains("Project review") && text.contains("/quit")
     );

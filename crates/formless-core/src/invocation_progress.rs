@@ -18,6 +18,8 @@ struct State {
     latest: Option<ProgressValue>,
     high_water: Option<f64>,
     emitted: Option<(Instant, ProgressValue)>,
+    flush_scheduled: bool,
+    closed: bool,
 }
 
 pub(crate) struct InvocationProgress {
@@ -28,6 +30,7 @@ pub(crate) struct InvocationProgress {
 pub(crate) struct Update {
     pub advanced: bool,
     pub emit: Option<ProgressValue>,
+    pub flush_at: Option<Instant>,
 }
 
 impl Default for InvocationProgress {
@@ -62,6 +65,13 @@ impl InvocationProgress {
                 .collect(),
         };
         let mut state = self.state.locked();
+        if state.closed {
+            return Update {
+                advanced: false,
+                emit: None,
+                flush_at: None,
+            };
+        }
         let advanced = value
             .fraction
             .is_some_and(|fraction| state.high_water.is_none_or(|previous| fraction > previous));
@@ -75,12 +85,58 @@ impl InvocationProgress {
             {
                 None
             }
-            _ => Some(value),
+            _ => Some(value.clone()),
         };
         if let Some(value) = &emit {
             state.emitted = Some((now, value.clone()));
         }
-        Update { advanced, emit }
+        let flush_at = if state.flush_scheduled {
+            None
+        } else {
+            state
+                .emitted
+                .as_ref()
+                .filter(|(_, previous)| previous != &value)
+                .and_then(|(at, _)| at.checked_add(EMISSION_INTERVAL))
+        };
+        state.flush_scheduled |= flush_at.is_some();
+        Update {
+            advanced,
+            emit,
+            flush_at,
+        }
+    }
+
+    /// The one scheduled timer coalesces updates. If a newer leading
+    /// emission moved the deadline, return that deadline to the same timer.
+    pub fn flush_due(&self, now: Instant, emit: impl FnOnce(ProgressValue)) -> Option<Instant> {
+        let mut state = self.state.locked();
+        if !state.flush_scheduled {
+            return None;
+        }
+        let due = state.emitted.as_ref().and_then(|(at, previous)| {
+            (state.latest.as_ref() != Some(previous)).then(|| *at + EMISSION_INTERVAL)
+        });
+        if let Some(due) = due.filter(|due| *due > now) {
+            return Some(due);
+        }
+        state.flush_scheduled = false;
+        if due.is_some() {
+            let value = state
+                .latest
+                .clone()
+                .expect("a new report scheduled the flush");
+            state.emitted = Some((now, value.clone()));
+            // Serialize the synchronous event publication with close().
+            emit(value);
+        }
+        None
+    }
+
+    pub fn close(&self) {
+        let mut state = self.state.locked();
+        state.closed = true;
+        state.flush_scheduled = false;
     }
 }
 
@@ -152,6 +208,71 @@ mod tests {
                 .report(Some(1.0), "toggle", now + Duration::from_secs(7))
                 .advanced
         );
+    }
+
+    #[test]
+    fn trailing_progress_emits_the_latest_tuple_once_without_another_report() {
+        let progress = InvocationProgress::default();
+        let now = Instant::now();
+        assert!(progress.report(Some(0.1), "starting", now).emit.is_some());
+        let pending = progress.report(Some(0.5), "halfway", now + Duration::from_millis(10));
+        assert!(pending.advanced && pending.emit.is_none());
+        let deadline = now + EMISSION_INTERVAL;
+        assert_eq!(pending.flush_at, Some(deadline));
+        let pending = progress.report(Some(0.9), "writing", now + Duration::from_millis(20));
+        assert!(pending.emit.is_none() && pending.flush_at.is_none());
+        assert_eq!(
+            progress.flush_due(deadline - Duration::from_millis(1), |_| panic!("too early")),
+            Some(deadline)
+        );
+        let mut emitted = Vec::new();
+        assert_eq!(
+            progress.flush_due(deadline, |value| emitted.push(value)),
+            None
+        );
+        assert_eq!(
+            progress.flush_due(deadline + EMISSION_INTERVAL, |value| emitted.push(value)),
+            None
+        );
+        assert_eq!(
+            emitted,
+            [ProgressValue {
+                fraction: Some(0.9),
+                label: "writing".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn later_leading_emission_reschedules_and_close_cancels_the_flush() {
+        let progress = InvocationProgress::default();
+        let now = Instant::now();
+        let first_due = now + EMISSION_INTERVAL;
+        progress.report(Some(0.1), "first", now);
+        assert_eq!(
+            progress
+                .report(Some(0.2), "queued", now + Duration::from_millis(5))
+                .flush_at,
+            Some(first_due)
+        );
+        assert!(progress
+            .report(Some(0.3), "leading", first_due)
+            .emit
+            .is_some());
+        let queued = progress.report(Some(0.4), "latest", first_due + Duration::from_millis(1));
+        assert!(queued.emit.is_none() && queued.flush_at.is_none());
+        let later_due = first_due + EMISSION_INTERVAL;
+        assert_eq!(
+            progress.flush_due(first_due + Duration::from_millis(2), |_| panic!(
+                "too early"
+            )),
+            Some(later_due)
+        );
+        progress.close();
+        assert_eq!(progress.flush_due(later_due, |_| panic!("closed")), None);
+        let closed = progress.report(Some(1.0), "closed", later_due);
+        assert!(!closed.advanced && closed.emit.is_none() && closed.flush_at.is_none());
+        assert_eq!(progress.snapshot().unwrap().label, "latest");
     }
 
     #[test]

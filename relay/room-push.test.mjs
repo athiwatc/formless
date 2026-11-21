@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { b64u } from "./push.mjs";
-import { roomFixture } from "./test-room-state.mjs";
+import { ackControls, controls, roomFixture } from "./test-room-state.mjs";
 
 const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
 const env = {
@@ -24,6 +24,53 @@ async function setup(t, names) {
   room.admit(daemon, "daemon", true, "", true);
   return { storage, push: kind => room.webSocketMessage(daemon, JSON.stringify({ relay: "push", kind })) };
 }
+
+test("ready push refusals preserve the connection and keep storage within capacity", async t => {
+  const fixture = roomFixture(env);
+  t.after(() => fixture.close());
+  const { room, socket, storage } = fixture;
+  const daemon = socket(), browser = socket();
+  room.admit(daemon, "daemon", true, "", true);
+  await ackControls(room, daemon);
+  room.admit(browser, "client", true, "fixture");
+  await ackControls(room, daemon);
+  await ackControls(room, browser);
+  const send = (ws, packet) => room.webSocketMessage(ws, JSON.stringify(packet));
+  await send(daemon, { relay: "ready", cid: browser.att.cid, g: browser.att.g });
+  await ackControls(room, daemon);
+  await ackControls(room, browser);
+  const subscribe = sub => send(browser, { relay: "push_subscribe", sub });
+  const last = () => controls(browser).at(-1);
+
+  await subscribe({ ...subscription("invalid"), endpoint: "https://fixture.invalid/push" });
+  assert.deepEqual(last(), { relay: "push_refused", reason: "invalid", operation: "subscribe" });
+  await ackControls(room, browser);
+
+  for (let i = 0; i < 10; i++) {
+    await subscribe(subscription(i));
+    assert.deepEqual(last(), { relay: "push_subscribed" });
+    await ackControls(room, browser);
+  }
+  await subscribe(subscription(10));
+  assert.deepEqual(last(), { relay: "push_refused", reason: "capacity", operation: "subscribe" });
+  await ackControls(room, browser);
+  assert.equal((await storage.list({ prefix: "push:" })).size, 10);
+
+  const id = crypto.randomUUID();
+  const remove = () => send(browser, { relay: "push_unsubscribe", endpoint: subscription(0).endpoint, id });
+  room.pushJobs.add(browser.att.sid);
+  await remove();
+  assert.deepEqual(last(), { relay: "push_refused", reason: "busy", operation: "unsubscribe", id });
+  await ackControls(room, browser);
+  room.pushJobs.delete(browser.att.sid);
+  await remove();
+  assert.deepEqual(last(), { relay: "push_unsubscribed", id });
+  await ackControls(room, browser);
+  await subscribe(subscription(10));
+  assert.deepEqual(last(), { relay: "push_subscribed" });
+  assert.equal(browser.closed, null);
+  assert.equal(daemon.closed, null);
+});
 
 test("pushes arriving during a fan-out trigger one trailing pass with current subscriptions", { timeout: 3_000 }, async t => {
   const { push, storage } = await setup(t, ["pending", "healthy", "expired"]);

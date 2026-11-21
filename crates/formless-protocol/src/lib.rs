@@ -655,6 +655,35 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// Split a process grant into its executable and optional first-argument scope.
+pub fn split_process_grant(grant: &str) -> (&str, Option<&str>) {
+    match grant.rsplit_once(':') {
+        // `C:\…` is a Windows path, not a command with sub-commands.
+        Some((cmd, scope))
+            if cmd.len() > 1 && !scope.is_empty() && !scope.contains(['/', '\\']) =>
+        {
+            (cmd, Some(scope))
+        }
+        _ => (grant, None),
+    }
+}
+
+fn windows_drive_path(path: &str) -> bool {
+    matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
+}
+
+fn approval_path(path: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let plain = path
+        .strip_prefix(r"\\?\")
+        .filter(|plain| windows_drive_path(plain))
+        .unwrap_or(path);
+    if windows_drive_path(plain) || path.starts_with(r"\\") {
+        (plain.replace('\\', "/").to_ascii_lowercase().into(), true)
+    } else {
+        (path.into(), false)
+    }
+}
+
 /// Why a Capability is unusually broad, if it is (SPEC §10.3): bare `net`
 /// or `process`, `fs:write` on the whole disk or a home folder, or `env`
 /// for a key that looks like a secret. Approval prompts flag these loudly
@@ -666,13 +695,16 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         _ => {}
     }
     if let Some(path) = spec.strip_prefix("fs:write:") {
+        let (path, _) = approval_path(path);
         let p = path.trim_end_matches('/');
         let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
         let home = matches!(
             parts.as_slice(),
             [] | ["Users" | "home"] | ["Users" | "home", _] | ["root"]
         );
-        if p.is_empty() || p == "~" || home {
+        let windows_home = windows_drive_path(&path)
+            && matches!(parts.as_slice(), [_] | [_, "users"] | [_, "users", _]);
+        if p.is_empty() || p == "~" || home || windows_home {
             return Some("writing anywhere in your files");
         }
     }
@@ -681,21 +713,26 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
     // and write files. Argument scoping (`process:git:status`) narrows the
     // others, not these.
     if let Some(cmd) = spec.strip_prefix("process:") {
-        let name = cmd.split(':').next().unwrap_or(cmd);
+        let (name, _) = split_process_grant(cmd);
         let base = name
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(name)
-            .trim_end_matches(".exe")
             .to_ascii_lowercase();
+        let base = base.trim_end_matches(".exe");
         // Versioned names (`python3.11`, `ruby3.2`, `node20`) count too.
         let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
         if matches!(
-            base.as_str(),
+            base,
             "sh" | "bash"
                 | "zsh"
                 | "fish"
                 | "dash"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "mksh"
+                | "ash"
                 | "cmd"
                 | "powershell"
                 | "pwsh"
@@ -704,36 +741,50 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "xargs"
                 | "sudo"
                 | "doas"
-        ) || matches!(
-            stem,
-            "python"
-                | "node"
-                | "deno"
-                | "bun"
-                | "perl"
-                | "ruby"
-                | "php"
-                | "lua"
-                | "tclsh"
-                | "wish"
-                | "expect"
-        ) {
+                | "pkexec"
+                | "su"
+                | "runuser"
+        ) || base == "nodejs"
+            || matches!(
+                stem,
+                "python"
+                    | "pythonw"
+                    | "py"
+                    | "pyw"
+                    | "node"
+                    | "deno"
+                    | "bun"
+                    | "perl"
+                    | "ruby"
+                    | "php"
+                    | "lua"
+                    | "tclsh"
+                    | "wish"
+                    | "expect"
+            )
+        {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
         if matches!(
-            base.as_str(),
+            base,
             "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat"
         ) {
             return Some("it can reach any host and write files, like net plus fs:write");
         }
         // Run other programs through options or files they read (#1099).
-        match base.as_str() {
+        match base {
             "git" => {
                 return Some(
                     "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
                 )
             }
+            _ if stem == "go" => {
+                return Some("the Go tool can build and execute repository code")
+            }
             "find" => return Some("find can run any program (-exec)"),
+            _ if stem == "pip" => {
+                return Some("pip can execute code from package build backends")
+            }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
@@ -796,6 +847,24 @@ pub fn sensitive_read_warning(spec: &str) -> Option<&'static str> {
     })
 }
 
+/// The credential file in a conventional Composer configuration directory.
+pub fn is_composer_auth_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter().rev();
+    let matches = |part: Option<&std::ffi::OsStr>, expected: &str| {
+        part.is_some_and(|part| {
+            let name = part.to_string_lossy();
+            #[cfg(windows)]
+            let name = name.split(':').next().unwrap_or_default();
+            name.eq_ignore_ascii_case(expected)
+        })
+    };
+    if !matches(parts.next(), "auth.json") {
+        return false;
+    }
+    let parent = parts.next();
+    matches(parent, ".composer") || matches(parent, "composer") && matches(parts.next(), ".config")
+}
+
 /// Where an `fs:` Capability's path lies (SPEC §10.3), for approval
 /// prompts: `(warn, note)`. Credential reads always warn, including inside
 /// the working folder. Other secret folders and paths outside it warn too.
@@ -806,6 +875,10 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     let path = spec
         .strip_prefix("fs:read:")
         .or_else(|| spec.strip_prefix("fs:write:"))?;
+    if is_composer_auth_path(std::path::Path::new(path)) {
+        return Some((true, "holds Composer credentials".into()));
+    }
+    let (path, windows) = approval_path(path);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     const SECRET_DIRS: [(&str, &str); 7] = [
         (".ssh", "SSH keys"),
@@ -817,7 +890,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
         (".password-store", "saved passwords"),
     ];
     for (dir, what) in SECRET_DIRS {
-        if segments.contains(&dir) {
+        if segments.contains(&dir)
+            || (windows && segments.iter().any(|part| part.eq_ignore_ascii_case(dir)))
+        {
             return Some((true, format!("holds {what}")));
         }
     }
@@ -830,12 +905,17 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     if segments.first() == Some(&"etc") {
         return Some((true, "system configuration".into()));
     }
-    let cwd = cwd.filter(|c| !c.is_empty())?.trim_end_matches('/');
-    let inside = path == cwd || path.starts_with(&format!("{cwd}/"));
+    let cwd = cwd.filter(|c| !c.is_empty())?;
+    let (normalized_cwd, _) = approval_path(cwd);
+    let compared_cwd = normalized_cwd.trim_end_matches('/');
+    let inside = path == compared_cwd || path.starts_with(&format!("{compared_cwd}/"));
     Some(if inside {
         (false, "inside the working folder".into())
     } else {
-        (true, format!("outside the working folder {cwd}"))
+        (
+            true,
+            format!("outside the working folder {}", cwd.trim_end_matches('/')),
+        )
     })
 }
 
@@ -2138,6 +2218,9 @@ pub enum Request {
     /// named "… · original answer" before it is replaced.
     RetryRun {
         session_id: String,
+        /// Reject when the latest Run has changed since the user selected it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default = "default_true")]
@@ -3849,6 +3932,164 @@ mod tests {
     }
 
     #[test]
+    fn shell_launcher_and_interpreter_aliases_require_extra_confirmation() {
+        let reason = broad_capability("process:bash").unwrap();
+        for spec in [
+            "process:pkexec",
+            "process:/usr/bin/pkexec",
+            "process:su",
+            "process:su.exe",
+            "process:runuser",
+            "process:ksh",
+            "process:/usr/bin/ksh",
+            "process:csh",
+            "process:tcsh",
+            "process:mksh",
+            "process:ash",
+            "process:nodejs",
+            "process:pythonw",
+            "process:pythonw.exe",
+            "process:py",
+            "process:py.exe",
+            "process:pyw",
+            "process:pyw.exe",
+            "process:py3",
+            r"process:C:\Python311\pythonw.exe",
+        ] {
+            assert_eq!(broad_capability(spec), Some(reason), "{spec}");
+        }
+        for spec in ["process:ls", "process:pytest", "process:nodejs-helper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn windows_process_path_keeps_drive_prefix_and_optional_scope() {
+        for (spec, equivalent) in [
+            (r"process:C:\Windows\System32\CMD.EXE", "process:cmd"),
+            (
+                r"process:C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "process:powershell",
+            ),
+            (r"process:C:\Python311\python.exe", "process:python"),
+            ("process:C:/Python311/python.exe", "process:python"),
+            (r"process:C:\Windows\System32\curl.exe", "process:curl"),
+            (r"process:C:\Program Files\Git\cmd\git.exe", "process:git"),
+            (
+                r"process:C:\Program Files\Git\cmd\git.exe:status|log",
+                "process:git:status|log",
+            ),
+        ] {
+            let reason = broad_capability(equivalent).unwrap();
+            assert_eq!(broad_capability(spec), Some(reason), "{spec}");
+        }
+        assert_eq!(broad_capability(r"process:C:\tools\pytest.exe"), None);
+        assert_eq!(broad_capability(r"process:C:\tools\ls.exe"), None);
+    }
+
+    #[test]
+    fn go_requires_broad_process_confirmation() {
+        for spec in [
+            "process:go",
+            "process:/usr/local/go/bin/go",
+            "process:go.exe",
+            "process:GO",
+            "process:go1.22.5",
+            "process:go:test",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("the Go tool can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:gofmt",
+            "process:godoc",
+            "process:goreleaser",
+            "process:golangci-lint",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn pip_requires_broad_process_confirmation() {
+        for spec in [
+            "process:pip",
+            "process:pip3",
+            "process:pip3.11",
+            "process:/usr/bin/pip3",
+            "process:pip.exe",
+            "process:pip:install",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("pip can execute code from package build backends"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:pipx", "process:pipenv", "process:piper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn windows_drive_and_home_write_scopes_are_broad() {
+        for path in [
+            r"C:\",
+            "c:/",
+            r"D:\Users",
+            r"C:\Users\Ada\",
+            r"\\?\C:\USERS\Ada",
+        ] {
+            assert_eq!(
+                broad_capability(&format!("fs:write:{path}")),
+                Some("writing anywhere in your files"),
+                "{path}"
+            );
+        }
+        for path in [
+            r"C:",
+            r"C:Users\Ada",
+            r"C:\Users\Ada\project",
+            r"C:\repo\Users\Ada",
+            r"/project\Users\Ada",
+        ] {
+            assert_eq!(
+                broad_capability(&format!("fs:write:{path}")),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_path_notes_handle_credential_folders_and_working_directory_boundaries() {
+        assert_eq!(
+            path_note(r"fs:read:C:\Users\Ada\.SSH\id_rsa", Some(r"C:\Users\Ada")),
+            Some((true, "holds SSH keys".into()))
+        );
+        assert_eq!(
+            path_note(
+                "fs:read:c:/Users/Ada/project/file",
+                Some(r"C:\USERS\Ada\project\")
+            ),
+            Some((false, "inside the working folder".into()))
+        );
+        assert_eq!(
+            path_note(
+                "fs:read:c:/Users/Ada/project-other/file",
+                Some(r"C:\Users\Ada\project")
+            ),
+            Some((
+                true,
+                r"outside the working folder C:\Users\Ada\project".into()
+            ))
+        );
+    }
+
+    #[test]
     fn lines_are_capped_while_reading() {
         let mut r = std::io::BufReader::new(&b"short\nxxxxxxxxxxxxxxxxxxxx"[..]);
         assert_eq!(
@@ -4006,6 +4247,29 @@ mod tests {
             "env:LANG",
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
+        }
+    }
+
+    #[test]
+    fn composer_auth_warnings_are_limited_to_config_locations() {
+        for path in [
+            "/work/.composer/auth.json",
+            "/work/.config/Composer/AUTH.JSON",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((true, "holds Composer credentials".into()))
+            );
+        }
+        for path in [
+            "/work/auth.json",
+            "/work/.composer/cache/auth.json",
+            "/work/.config/composer/config.json",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((false, "inside the working folder".into()))
+            );
         }
     }
 
