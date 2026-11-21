@@ -12113,7 +12113,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // and other modal overlays below keep their existing priority.
     if app.view == View::Settings {
         if let Some(form) = &app.settings_form {
-            draw_settings_form(f, form, app.color);
+            draw_settings_form(f, form, app.color, false);
         }
     }
     if app.view == View::Chat && app.renaming.is_none() {
@@ -24020,7 +24020,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_settings_form(frame, form, false))
+            .draw(|frame| draw_settings_form(frame, form, false, true))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
