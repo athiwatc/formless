@@ -273,5 +273,37 @@ class LinkChecks(unittest.TestCase):
             self.assertEqual(links.main(["script", "lychee", "README.md"]), 0)
         self.assertNotIn("dummy", " ".join(calls[-1]))
 
+
+class NamingModelDocs(unittest.TestCase):
+    def test_readme_weights_match_naming_catalogue(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "crates/formless-core/src/namer.rs").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        catalogue = re.search(r"^pub const MODELS: &\[ModelSpec\] = &\[([^\]]+)\];$", source, re.M)
+        self.assertIsNotNone(catalogue, "No naming model catalogue found")
+        expected = {}
+        for name in catalogue.group(1).split(","):
+            name = name.strip()
+            if not name:
+                continue
+            model = re.search(
+                rf"^pub const {re.escape(name)}: ModelSpec = ModelSpec \{{\n(.*?)^\}};",
+                source, re.M | re.S,
+            )
+            self.assertIsNotNone(model, f"Unknown model constant: {name}")
+            model_id = re.search(r'\bid: "([^"]+)"', model.group(1)).group(1)
+            byte_count = re.search(r"\bgguf_bytes: ([\d_]+)", model.group(1)).group(1)
+            self.assertNotIn(model_id, expected)
+            expected[model_id] = int(byte_count.replace("_", ""))
+        section = re.search(r"^### Naming model catalogue\n(.*?)(?=^## |\Z)", readme, re.M | re.S)
+        self.assertIsNotNone(section, "No README naming model table found")
+        rows = re.findall(
+            r"^\| `([^`]+)` \| [^|]+ \| [^|]+ \| ([\d,]+) \|", section.group(1), re.M,
+        )
+        actual = {model_id: int(byte_count.replace(",", "")) for model_id, byte_count in rows}
+        self.assertEqual(len(rows), len(actual), "Duplicate model IDs in README")
+        self.assertTrue(expected, "Expected at least one model")
+        self.assertEqual(actual, expected)
+
 if __name__ == "__main__":
     unittest.main()

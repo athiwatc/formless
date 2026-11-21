@@ -1,7 +1,9 @@
 //! Native caps outside the JS heap (#604). Their own test binary: the caps
 //! are process-wide, so lowering them here can't affect other tests.
 
-use formless_runtime::{execute, Capabilities, ExecErrorKind, ExecRequest, HostMode, NoHostOps};
+use formless_runtime::{
+    execute, Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps, NoHostOps,
+};
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -137,4 +139,125 @@ fn reads_output_and_logs_stop_at_their_caps() {
     assert!(total < 450, "{total}");
     assert!(logged.logs.last().unwrap().starts_with("[log limit"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dry_run_effects_share_log_budget_on_success_and_error() {
+    formless_runtime::set_io_limits(1_000, 2_000, 300);
+    for after_logging in [
+        "return store.get('fixture');",
+        "throw new Error('fixture failure');",
+    ] {
+        let req = ExecRequest {
+            output_schema: None,
+            code: format!(
+                r#"function run() {{
+                    console.log('é'.repeat(100));
+                    store.set('fixture', 10);
+                    console.warn('x'.repeat(70));
+                    console.error('small later line');
+                    for (let i = 0; i < 5; i++) store.set('fixture', i);
+                    {after_logging}
+                }}"#,
+            ),
+            input: json!({}),
+            caps: Capabilities::parse(&["store".into()]).unwrap(),
+            memory_mb: 64,
+            mode: HostMode::DryRun,
+            cancel: Arc::new(AtomicBool::new(false)),
+            overlay: None,
+            activity: None,
+            modules: Arc::new(Vec::new()),
+        };
+        let logs = match execute(&req, Arc::new(NoHostOps)) {
+            Ok(outcome) => {
+                assert!(after_logging.starts_with("return"));
+                assert_eq!(outcome.output, 4);
+                outcome.logs
+            }
+            Err(error) => {
+                assert!(error.message.contains("fixture failure"), "{error}");
+                error.logs
+            }
+        };
+        assert_eq!(
+            logs,
+            [
+                "é".repeat(100),
+                "[dry run] would store fixture = 10".into(),
+                "[log limit of 300 bytes reached (tools.max_log_bytes); later lines dropped] [dry run] 5 further would-be effects omitted".into(),
+            ],
+        );
+    }
+}
+
+#[test]
+fn streamed_body_timeout_keeps_settings_from_before_reload() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    struct ReloadTimeouts;
+    impl HostOps for ReloadTimeouts {
+        fn data_observed(&self, kind: &str, _origin: &str) -> Result<(), String> {
+            assert_eq!(kind, "url");
+            formless_runtime::set_fetch_timeouts(4_000, 5_000);
+            Ok(())
+        }
+    }
+
+    formless_runtime::set_fetch_timeouts(1_000, 1_200);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut request = BufReader::new(socket);
+        loop {
+            let mut line = String::new();
+            assert!(
+                request.read_line(&mut line).unwrap() > 0,
+                "incomplete HTTP request"
+            );
+            if line == "\r\n" {
+                break;
+            }
+        }
+        request
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\na")
+            .unwrap();
+        // Hold the response open while the client's native deadline expires.
+        let _ = request.read(&mut [0u8; 1]);
+    });
+    let req = ExecRequest {
+        output_schema: None,
+        code: format!(
+            r#"function run() {{ fetchChunks("http://{addr}/", {{}}, 4, () => {{}}); }}"#,
+        ),
+        input: json!({}),
+        caps: Capabilities::parse(&["net:127.0.0.1".into()]).unwrap(),
+        memory_mb: 64,
+        mode: HostMode::Live,
+        cancel: Arc::new(AtomicBool::new(false)),
+        overlay: None,
+        activity: None,
+        modules: Arc::new(Vec::new()),
+    };
+    let error = execute(&req, Arc::new(ReloadTimeouts)).unwrap_err();
+    assert!(error.message.contains("fetch timed out:"), "{error}");
+    assert!(error.message.contains("reading response body"), "{error}");
+    assert!(
+        error
+            .message
+            .contains("tools.fetch_connect_timeout_secs=1s"),
+        "{error}"
+    );
+    assert!(
+        error.message.contains("tools.fetch_timeout_secs=1.2s"),
+        "{error}"
+    );
+    server.join().unwrap();
 }

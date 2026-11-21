@@ -1,0 +1,38 @@
+{
+  "compiler_commit_hash": "0ef1bc386059596dada8fb65b50425aab2ea637a",
+  "files": [
+    {
+      "git_blob": "1b5ec8b78e237b5c3b3d812a7c0a6589d0f7161d",
+      "local": "toolchain/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/LICENSE-APACHE",
+      "name": "LICENSE-APACHE",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/LICENSE-APACHE"
+    },
+    {
+      "git_blob": "a2070c4be7acd5316f8d0357ca3c12419a2f3c62",
+      "local": "toolchain/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/LICENSE-MIT",
+      "name": "LICENSE-MIT",
+      "sha256": "b71bd43a069ca0641a9ecfe585ca7b3c53b5cc1608f8b68321168698e28b5ea1",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/LICENSE-MIT"
+    },
+    {
+      "git_blob": "4dad74f234eaaaa3c311ca031216e16fc9c4e940",
+      "local": "toolchain/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/COPYRIGHT",
+      "name": "COPYRIGHT",
+      "sha256": "172020dbfd5b53a226dfde77616190a48dcff519b0bc0e6deb91a8450782c4af",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/COPYRIGHT"
+    },
+    {
+      "local": "toolchain/rust/0ef1bc386059596dada8fb65b50425aab2ea637a/COPYRIGHT-library.html",
+      "name": "COPYRIGHT-library.html",
+      "origin": {
+        "compiler_commit_hash": "0ef1bc386059596dada8fb65b50425aab2ea637a",
+        "kind": "installed-toolchain",
+        "relative": "share/doc/rust/COPYRIGHT-library.html"
+      },
+      "sha256": "626556344c12679d7cab2c1aa2ce80de01937b62c2c88c62f0650a469be18799"
+    }
+  ],
+  "schema": 1,
+  "scope": "Three top-level source notices verified against upstream Git blobs at the compiler commit, plus the matching installed toolchain COPYRIGHT-library.html. Component/target coverage and distribution obligations still require manual review."
+}

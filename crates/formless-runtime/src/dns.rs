@@ -2,7 +2,7 @@
 //! be cancelled portably; a stalled lookup occupies one of four workers,
 //! never a new abandoned resolver thread for each fetch.
 
-use crate::sync::LockExt;
+use crate::{sync::LockExt, FetchTimeouts};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
@@ -35,8 +35,11 @@ struct ResolverPool {
     capacity: usize,
 }
 
-fn timed_out(host: &str) -> String {
-    format!("fetch timed out: DNS resolution for {host} exceeded the connection/total deadline")
+fn timed_out(host: &str, timeouts: FetchTimeouts) -> String {
+    format!(
+        "fetch timed out: DNS resolution for {host} exceeded the connection/total deadline (configured {})",
+        timeouts.settings()
+    )
 }
 
 impl ResolverPool {
@@ -81,13 +84,19 @@ impl ResolverPool {
         Ok(pool)
     }
 
-    fn resolve(&self, host: &str, port: u16, deadline: Instant) -> LookupResult {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+        timeouts: FetchTimeouts,
+    ) -> LookupResult {
         let (reply, result) = mpsc::sync_channel(1);
         let mut queue = self.shared.queue.locked();
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return Err(timed_out(host));
+                return Err(timed_out(host, timeouts));
             }
             if queue.closed {
                 return Err("fetch DNS resolver is unavailable".into());
@@ -112,11 +121,11 @@ impl ResolverPool {
         }
         drop(queue);
         match result.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(_) if Instant::now() >= deadline => Err(timed_out(host)),
+            Ok(_) if Instant::now() >= deadline => Err(timed_out(host, timeouts)),
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out(host)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out(host, timeouts)),
             Err(mpsc::RecvTimeoutError::Disconnected) if Instant::now() >= deadline => {
-                Err(timed_out(host))
+                Err(timed_out(host, timeouts))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err("fetch DNS resolver worker failed".into())
@@ -136,7 +145,12 @@ impl Drop for ResolverPool {
     }
 }
 
-pub(super) fn resolve(host: &str, port: u16, deadline: Instant) -> LookupResult {
+pub(super) fn resolve(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    timeouts: FetchTimeouts,
+) -> LookupResult {
     static POOL: OnceLock<Result<ResolverPool, String>> = OnceLock::new();
     POOL.get_or_init(|| {
         ResolverPool::new(
@@ -152,7 +166,7 @@ pub(super) fn resolve(host: &str, port: u16, deadline: Instant) -> LookupResult 
     })
     .as_ref()
     .map_err(Clone::clone)?
-    .resolve(host, port, deadline)
+    .resolve(host, port, deadline, timeouts)
 }
 
 #[cfg(test)]
@@ -169,6 +183,10 @@ mod tests {
     fn stalled_os_lookup_does_not_strand_http_send_worker_and_pool_recovers() {
         // DNS receives the smaller connection/total budget in either order.
         for (connect_ms, total_ms) in [(80, 200), (200, 80)] {
+            let timeouts = FetchTimeouts {
+                connect_ms,
+                total_ms,
+            };
             let (entered_tx, entered_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             let release_rx = Mutex::new(release_rx);
@@ -197,17 +215,14 @@ mod tests {
                     headers: Vec::new(),
                     body: None,
                     scope: vec!["stalled.example".into()],
-                    timeouts: crate::FetchTimeouts {
-                        connect_ms,
-                        total_ms,
-                    },
+                    timeouts,
                 };
                 let result = crate::send_request_with_resolver(request, &|host, port, deadline| {
                     assert!(
                         deadline.saturating_duration_since(Instant::now())
                             <= Duration::from_millis(connect_ms.min(total_ms))
                     );
-                    caller_pool.resolve(host, port, deadline)
+                    caller_pool.resolve(host, port, deadline, timeouts)
                 })
                 .map(|_| ());
                 // This is the HTTP worker's own completion, while the OS
@@ -226,6 +241,10 @@ mod tests {
                 error.starts_with("fetch timed out: DNS resolution"),
                 "{error}"
             );
+            assert!(
+                error.ends_with(&format!("(configured {})", timeouts.settings())),
+                "{error}"
+            );
             caller.join().unwrap();
             assert!(
                 finished_rx.try_recv().is_err(),
@@ -234,8 +253,13 @@ mod tests {
             release_tx.send(()).unwrap();
             finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(
-                pool.resolve("fresh.example", 80, Instant::now() + Duration::from_secs(2))
-                    .unwrap(),
+                pool.resolve(
+                    "fresh.example",
+                    80,
+                    Instant::now() + Duration::from_secs(2),
+                    timeouts
+                )
+                .unwrap(),
                 addresses()
             );
             assert_eq!(
@@ -249,6 +273,10 @@ mod tests {
     fn fixed_pool_bounds_queue_and_skips_expired_work_before_reuse() {
         const WORKERS: usize = 2;
         const CAPACITY: usize = 3;
+        let timeouts = FetchTimeouts {
+            connect_ms: 300,
+            total_ms: 5000,
+        };
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
@@ -279,6 +307,7 @@ mod tests {
                     &format!("blocked-{index}"),
                     80,
                     Instant::now() + Duration::from_secs(5),
+                    timeouts,
                 )
             }));
         }
@@ -299,6 +328,7 @@ mod tests {
                         &format!("queued-{index}"),
                         80,
                         Instant::now() + Duration::from_millis(300),
+                        timeouts,
                     ))
                     .unwrap();
             }));
@@ -323,6 +353,7 @@ mod tests {
                         &format!("overflow-{index}"),
                         80,
                         Instant::now() + Duration::from_millis(300),
+                        timeouts,
                     ))
                     .unwrap();
             }));
@@ -366,8 +397,13 @@ mod tests {
             "expired queued lookup executed"
         );
         assert_eq!(
-            pool.resolve("fresh", 80, Instant::now() + Duration::from_secs(2))
-                .unwrap(),
+            pool.resolve(
+                "fresh",
+                80,
+                Instant::now() + Duration::from_secs(2),
+                timeouts
+            )
+            .unwrap(),
             addresses()
         );
         assert_eq!(

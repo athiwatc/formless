@@ -56,3 +56,34 @@ test('actual result chip omits one-line badges and preserves expanded text', () 
     assert.equal(chip.children[1].text, text);
   }
 });
+test('stored outcome, not tool payload text, controls the historical result status', () => {
+  const c = fixture();
+  const cases = [
+    ['{"ok":false}', '{"tool_call_id":"call-1","name":"read_file"}', false],
+    ['Error: sample content', '{"is_error":false}', false],
+    ['command exited with status 128', '{"is_error":true}', true],
+    ['{"ok":false}', null, false],
+    ['error response read from a file', '{broken', false],
+    ['result', 'null', false],
+    ['result', '{"is_error":"true"}', false],
+  ];
+  assert.match(source, /m\.role === "tool"[\s\S]{0,170}toolResultChip\(m\.content \|\| "", m\.meta\)/);
+  for (const [text, meta, failed] of cases) {
+    const chip = c.toolResultChip(text, meta);
+    assert.equal(chip.attrs.class.endsWith(' failed'), failed, meta);
+    assert.equal(chip.children[0].children[0].children[0], failed ? '↳ failed' : '↳ result');
+    assert.equal(chip.children[1].text, text);
+  }
+});
+test('approval expiration shows whole hours and remaining minutes without rounding up', () => {
+  const now = Date.parse('2026-11-20T04:00:00Z');
+  const c = vm.createContext({ Date: { parse: Date.parse, now: () => now }, uiFormat: String });
+  vm.runInContext(fn('untilTime'), c);
+  for (const [seconds, output] of [
+    [-60, 'ended'], [0, 'ended'], [59, 'in less than 1m'], [60, 'in 1m'],
+    [3599, 'in 59m'], [3600, 'in 1h'], [5340, 'in 1h 29m'], [5400, 'in 1h 30m'],
+    [7199, 'in 1h 59m'], [9000, 'in 2h 30m'], [86400, 'in 24h'],
+  ]) assert.equal(c.untilTime(new Date(now + seconds * 1000).toISOString()), output, seconds);
+  assert.equal(c.untilTime('bad'), 'bad');
+  assert.equal(c.untilTime(''), '');
+});

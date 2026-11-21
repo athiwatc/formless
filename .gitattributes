@@ -1,0 +1,6 @@
+# Hash-bound package inputs and notice snapshots must retain upstream bytes.
+/LICENSE text eol=lf
+/crates/formless-desktop/Cargo.lock text eol=lf
+/crates/formless-desktop/notices/** -text
+# This generated legal report contains upstream layout whitespace. Preserve it.
+/crates/formless-desktop/notices/toolchain/rust/*/COPYRIGHT-library.html whitespace=-blank-at-eol

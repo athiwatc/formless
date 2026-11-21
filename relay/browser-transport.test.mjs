@@ -23,7 +23,7 @@ async function browser(keyGate=null,decryptGate=null){
     $:id=>{if(!elements.has(id))elements.set(id,{textContent:'',classList:{add(){},remove(){},contains(){return true;}}});return elements.get(id);},
     setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},onMessage(message){messages.push(message);},
   });
-  vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt'].map(fn).join('\n'),c);
+  vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
   S.key=await webcrypto.subtle.importKey('raw',new Uint8Array(32).fill(7),'HKDF',false,['deriveBits','deriveKey']);
   c.openRelay();const ws=S.ws;ws.onopen();
   const control=(body,receipt)=>ws.onmessage({data:JSON.stringify({relay:'control',g:generation,receipt,f:JSON.stringify(body)})});
@@ -70,11 +70,37 @@ test('service worker install actually precaches the shared browser transport',as
 
 test('push registration receipts do not impersonate daemon offline controls',async()=>{
   const b=await browser();b.S.daemonOnline=true;const channel={fixture:true};b.S.channel=channel;
-  for(const [relay,receipt] of [['push_subscribed','B'.repeat(22)],['push_unsubscribed','C'.repeat(22)]]){
-    b.control({relay},receipt);await until(()=>b.sent.some(frame=>frame.relay==='ack_control'&&frame.receipt===receipt));
+  const registration=[],removal=[];
+  b.S.pushRegistration={finish:socket=>registration.push(socket)};
+  b.S.pushRemovalAck=(socket,id)=>removal.push({socket,id});
+  const id='f0ae9f18-2a8b-45c9-a338-53dfdc62c127';
+  for(const [body,receipt] of [[{relay:'push_subscribed'},'B'.repeat(22)],[{relay:'push_unsubscribed',id},'C'.repeat(22)]]){
+    b.control(body,receipt);await until(()=>b.sent.some(frame=>frame.relay==='ack_control'&&frame.receipt===receipt));
     assert.equal(b.S.daemonOnline,true);assert.equal(b.S.channel,channel);
   }
+  assert.deepEqual(registration,[b.ws]);
+  assert.deepEqual(removal,[{socket:b.ws,id}]);
   assert.deepEqual(b.closes,[]);b.ws.close(1000);
+});
+
+test('push refusals settle only the matching operation and leave the socket open',async()=>{
+  const b=await browser();
+  b.S.daemonOnline=true;
+  b.S.channel={fixture:true};
+  const channel=b.S.channel;
+  const registration=[],removal=[];
+  b.S.pushRegistration={finish:(socket,outcome)=>registration.push({socket,outcome})};
+  b.S.pushRemovalAck=(socket,id,confirmed)=>removal.push({socket,id,confirmed});
+  const id='f0ae9f18-2a8b-45c9-a338-53dfdc62c127';
+  b.control({relay:'push_refused',operation:'subscribe',reason:'capacity'},'B'.repeat(22));
+  b.control({relay:'push_refused',operation:'unsubscribe',reason:'busy',id},'C'.repeat(22));
+  await until(()=>b.sent.some(frame=>frame.relay==='ack_control'&&frame.receipt==='C'.repeat(22)));
+  assert.deepEqual(registration,[{socket:b.ws,outcome:'The relay has reached its notification device limit.'}]);
+  assert.deepEqual(removal,[{socket:b.ws,id,confirmed:false}]);
+  assert.equal(b.S.channel,channel);
+  assert.equal(b.S.daemonOnline,true);
+  assert.deepEqual(b.closes,[]);
+  b.ws.close(1000);
 });
 
 
