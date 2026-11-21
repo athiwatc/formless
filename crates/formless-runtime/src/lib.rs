@@ -1681,11 +1681,11 @@ impl State {
             "fs_read" => {
                 let enc = enc_of(&a["encoding"])?;
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
-                        return Ok(encode(&bytes, enc));
-                    }
+                match self.overlay_read(&p, |bytes| {
+                    check_read_size(ReadSize::Exact(bytes.len() as u64))?;
+                    Ok(encode(bytes, enc))
+                }) {
+                    Some(Some(encoded)) => return encoded,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
                 }
@@ -1708,7 +1708,7 @@ impl State {
                     // Capability must still be declared; the write lands in
                     // the overlay (readable this run, never on disk) (§8.4).
                     let mut full = if append {
-                        match self.overlay_get(&p) {
+                        match self.overlay_read(&p, <[u8]>::to_vec) {
                             Some(prev) => prev.unwrap_or_default(),
                             None if p.exists() => read_capped(&p)?,
                             None => Vec::new(),
@@ -1748,16 +1748,16 @@ impl State {
             }
             "fs_exists" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                Ok(json!(match self.overlay_get(&p) {
+                Ok(json!(match self.overlay_read(&p, |_| ()) {
                     Some(v) => v.is_some(),
                     None => p.exists(),
                 }))
             }
             "fs_stat" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(b)) => {
-                        return Ok(json!({"type": "file", "size": b.len(), "modified_ms": null}))
+                match self.overlay_read(&p, <[u8]>::len) {
+                    Some(Some(size)) => {
+                        return Ok(json!({"type": "file", "size": size, "modified_ms": null}))
                     }
                     Some(None) => return Ok(Value::Null),
                     None => {}
@@ -1841,7 +1841,7 @@ impl State {
                 }
 
                 if self.mode.is_overlay() {
-                    let bytes = match self.overlay_get(&from) {
+                    let bytes = match self.overlay_read(&from, <[u8]>::to_vec) {
                         Some(Some(b)) => b,
                         Some(None) => return Err(format!("not found: {}", from.display())),
                         None if from.is_dir() => {
@@ -1872,12 +1872,13 @@ impl State {
                 let offset = a["offset"].as_u64().unwrap_or(0);
                 let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
                 self.guard_read(a["path"].as_str().unwrap_or_default(), &p, "file chunk")?;
-                let (buf, total) = match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        let start = (offset as usize).min(bytes.len());
-                        let end = (start + size).min(bytes.len());
-                        (bytes[start..end].to_vec(), bytes.len() as u64)
-                    }
+                let overlay_chunk = self.overlay_read(&p, |bytes| {
+                    let start = offset.min(bytes.len() as u64) as usize;
+                    let end = (start + size).min(bytes.len());
+                    (bytes[start..end].to_vec(), bytes.len() as u64)
+                });
+                let (buf, total) = match overlay_chunk {
+                    Some(Some(chunk)) => chunk,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
                         let mut f =
@@ -1905,18 +1906,20 @@ impl State {
         }
     }
 
-    /// Overlay entry for `p`: `Some(None)` if it or an ancestor was removed.
-    fn overlay_get(&self, p: &Path) -> Option<Option<Vec<u8>>> {
+    /// Inspect an exact overlay entry while holding the lock. A removed entry
+    /// or ancestor returns `Some(None)`. The callback only reads the borrowed
+    /// bytes and must perform no filesystem access or reacquire the overlay.
+    fn overlay_read<T>(&self, path: &Path, inspect: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
         if !self.mode.is_overlay() {
             return None;
         }
-        let g = self.overlay.lock().ok()?;
-        if let Some(v) = g.get(&p.to_string_lossy().to_string()) {
-            return Some(v.clone());
+        let overlay = self.overlay.lock().ok()?;
+        if let Some(entry) = overlay.get(path.to_string_lossy().as_ref()) {
+            return Some(entry.as_deref().map(inspect));
         }
-        p.ancestors()
+        path.ancestors()
             .skip(1)
-            .any(|a| matches!(g.get(&a.to_string_lossy().to_string()), Some(None)))
+            .any(|ancestor| matches!(overlay.get(ancestor.to_string_lossy().as_ref()), Some(None)))
             .then_some(None)
     }
 
@@ -1930,7 +1933,7 @@ impl State {
         let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
         let details = a["details"].as_bool().unwrap_or(false);
         let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
-        if self.overlay_get(&p) != Some(None) {
+        if self.overlay_read(&p, |_| ()) != Some(None) {
             if let Some(rd) =
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
@@ -4848,6 +4851,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "aa").unwrap();
         std::fs::write(root.join("b.txt"), "bbb").unwrap();
         std::fs::create_dir(root.join("目录")).unwrap();
+        std::fs::write(root.join("目录/disk.txt"), "hidden on disk").unwrap();
         let request = |code: &str, mode| {
             let mut req = live(code);
             req.mode = mode;
@@ -4888,6 +4892,38 @@ mod tests {
                 out,
                 json!({"before":[],"after":["made"],"details":[{"name":"made","type":"file","size":3}]})
             );
+            let content = "fixture ไทย 日本語\n".repeat(9000);
+            let mut stream = request(
+                r#"function run(i) {
+                    const dir = i.root + '/目录';
+                    fs.remove(dir, {recursive:true});
+                    const hidden = dir + '/disk.txt';
+                    const path = dir + '/overlay.txt';
+                    fs.write(path, i.content);
+                    const chunks = [];
+                    fs.readChunks(path, 65536, chunk => chunks.push(chunk));
+                    return {
+                        content: chunks.join(''), chunks: chunks.length,
+                        exists: fs.exists(path), stat: fs.stat(path),
+                        hidden: fs.exists(hidden), hiddenStat: fs.stat(hidden),
+                        diskFallback: fs.read(i.root + '/b.txt'),
+                    };
+                }"#,
+                mode,
+            );
+            stream.input["content"] = json!(content);
+            let result = execute(&stream, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(result["content"], content);
+            assert!(result["chunks"].as_u64().unwrap() > 1);
+            assert_eq!(result["exists"], true);
+            assert_eq!(
+                result["stat"],
+                json!({"type":"file","size":content.len(),"modified_ms":null})
+            );
+            assert_eq!(result["hidden"], false);
+            assert_eq!(result["hiddenStat"], Value::Null);
+            assert_eq!(result["diskFallback"], "bbb");
+            assert!(!root.join("目录/overlay.txt").exists());
         }
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "aa");
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb");
