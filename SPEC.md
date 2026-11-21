@@ -7121,3 +7121,18 @@ requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
 memory, scoped to the current attempt and the exact kind/title/input, never
 persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
 permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.

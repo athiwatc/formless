@@ -2,6 +2,7 @@ use super::*;
 
 fn message(index: i64, content: &str) -> MessageInfo {
     MessageInfo {
+        generated_by: None,
         id: format!("history-{index}"),
         session_id: "s1".into(),
         seq: index,

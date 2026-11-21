@@ -802,7 +802,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 73;
+pub const SCHEMA_VERSION: i64 = 74;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 71] = [
+const MIGRATIONS: [(i64, MigrationStep); 72] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1283,6 +1283,7 @@ const MIGRATIONS: [(i64, MigrationStep); 71] = [
     (73, |c| {
         add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
     }),
+    (74, |c| add_column(c, "messages", "generated_by TEXT")),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -1771,6 +1772,13 @@ impl Store {
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
         Ok(MessageInfo {
+            generated_by: r
+                .as_ref()
+                .column_index("generated_by")
+                .ok()
+                .map(|index| r.get::<_, Option<String>>(index))
+                .transpose()?
+                .flatten(),
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             seq: r.get("seq")?,
@@ -2167,6 +2175,16 @@ impl Store {
         content: &str,
         meta: Option<String>,
     ) -> Result<MessageInfo> {
+        self.append_message_generated(session_id, role, content, meta, None)
+    }
+    pub(crate) fn append_message_generated(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        meta: Option<String>,
+        generated_by: Option<&str>,
+    ) -> Result<MessageInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         // One write transaction, taken up front (IMMEDIATE): the next seq is
@@ -2176,14 +2194,15 @@ impl Store {
         let tx=&st.conn;
         let seq: i64 = tx
             .prepare_cached(
-                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
-                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6 FROM messages WHERE session_id=?2 \
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) \
+                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6, ?7 FROM messages WHERE session_id=?2 \
                  RETURNING seq",
             )?
-            .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
+            .query_row(params![id, session_id, role, content, t, meta,generated_by], |r| r.get(0))?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
         Ok(MessageInfo {
+            generated_by:generated_by.map(str::to_owned),
             id,
             session_id: session_id.into(),
             seq,
@@ -2415,7 +2434,7 @@ impl Store {
         let fork = self.create_session(Some(name))?;
         self.set_session_model(&fork.id, orig.model, orig.reasoning_effort)?;
         for message in messages {
-            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta])?;
+            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta,message.generated_by])?;
         }
         let complete = up_to_seq.is_none()
             || !self.conn.query_row(
@@ -6995,6 +7014,10 @@ impl Store {
             .prepare("SELECT id,path FROM artifacts WHERE session_id=?1")?
             .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn orphaned_artifact_records(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.conn.prepare("SELECT id,session_id FROM artifacts WHERE session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=artifacts.session_id)")?
+            .query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Paths of a Session's artifacts (to delete with it).

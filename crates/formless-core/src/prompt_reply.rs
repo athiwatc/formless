@@ -5,8 +5,18 @@ use super::*;
 pub(super) async fn wait<T>(
     registry: &StdMutex<HashMap<String, oneshot::Sender<T>>>,
     id: &str,
-    mut reply: oneshot::Receiver<T>,
+    reply: oneshot::Receiver<T>,
     cancel: &CancellationToken,
+    before_cancel_claim: impl FnOnce(),
+) -> Option<T> {
+    wait_until(registry, id, reply, cancel.cancelled(), before_cancel_claim).await
+}
+
+pub(super) async fn wait_until<T>(
+    registry: &StdMutex<HashMap<String, oneshot::Sender<T>>>,
+    id: &str,
+    mut reply: oneshot::Receiver<T>,
+    interrupted: impl std::future::Future<Output = ()>,
     before_cancel_claim: impl FnOnce(),
 ) -> Option<T> {
     let received = tokio::select! {
@@ -14,7 +24,7 @@ pub(super) async fn wait<T>(
         // case. The registry/drain below, rather than select priority, decides
         // the winner and preserves an already delivered/acknowledged answer.
         biased;
-        _ = cancel.cancelled() => {
+        _ = interrupted => {
             before_cancel_claim();
             let mut waiters = registry.locked();
             // Handlers remove AND send while holding this same mutex. Either
