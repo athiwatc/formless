@@ -21,13 +21,13 @@ pub(super) fn permission_glob(pattern: &str, value: &str) -> bool {
     let value: Vec<_> = value.chars().collect();
     let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
     while v < value.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
-            p += 1;
-            v += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
+        if p < pattern.len() && pattern[p] == '*' {
             star = Some(p);
             p += 1;
             retry = v;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
         } else if let Some(previous) = star {
             retry += 1;
             v = retry;
@@ -54,6 +54,12 @@ fn permission_option_ids(request: &HarnessPermissionRequest) -> Result<()> {
     Ok(())
 }
 
+enum RulePermission {
+    Unmatched,
+    Prompt,
+    Decided(String),
+}
+
 struct Handler {
     daemon: Arc<Daemon>,
     attempt_id: String,
@@ -77,17 +83,18 @@ impl InteractionHandler for Handler {
                 .with_reader(|st| st.authenticate_topic_attempt(&self.attempt_id, &self.token))
                 .ok()?;
             permission_option_ids(&request).ok()?;
-            if let Some(answer) = self
+            let rule = self
                 .daemon
                 .apply_topic_permission_rule(&attempt, &self.token, &request)
-                .ok()?
-            {
+                .ok()?;
+            if let RulePermission::Decided(answer) = rule {
                 return Some(answer);
             }
             let key = json!([request.kind, request.title, request.raw_input]).to_string();
-            let cached = rule_eligible(&request.kind)
-                .then(|| self.always.locked().get(&key).copied())
-                .flatten();
+            let cached = (rule_eligible(&request.kind)
+                && matches!(rule, RulePermission::Unmatched))
+            .then(|| self.always.locked().get(&key).copied())
+            .flatten();
             if let Some(kind) = cached {
                 let allow = kind == HarnessPermissionOptionKind::AllowAlways;
                 return request
@@ -252,11 +259,11 @@ impl Daemon {
         attempt: &TopicAttemptInfo,
         token: &str,
         request: &HarnessPermissionRequest,
-    ) -> Result<Option<String>> {
+    ) -> Result<RulePermission> {
         if !rule_eligible(&request.kind) {
-            return Ok(None);
+            return Ok(RulePermission::Prompt);
         }
-        let decision = self.with_store(|st| {
+        let (matched, decision) = self.with_store(|st| {
             st.transaction(|st| {
                 st.authenticate_topic_attempt(&attempt.id, token)?;
                 let topic = st.get_topic(&attempt.topic_id)?.context("topic vanished")?;
@@ -289,7 +296,9 @@ impl Daemon {
                         )
                     }
                 });
-                let Some(rule) = rule else { return Ok(None) };
+                let Some(rule) = rule else {
+                    return Ok((false, None));
+                };
                 let preferred = if rule.decision == formless_protocol::TopicRuleDecision::Reject {
                     HarnessPermissionOptionKind::RejectOnce
                 } else {
@@ -314,7 +323,7 @@ impl Daemon {
                         })
                     });
                 let Some(option) = option else {
-                    return Ok(None);
+                    return Ok((true, None));
                 };
                 let permission_id = uuid::Uuid::new_v4().to_string();
                 let message = st.append_message(
@@ -325,16 +334,23 @@ impl Daemon {
                         option.option_id, rule.rule_id
                     ),
                 )?;
-                Ok(Some((
-                    permission_id,
-                    rule.rule_id.clone(),
-                    option.option_id.clone(),
-                    message,
-                )))
+                Ok((
+                    true,
+                    Some((
+                        permission_id,
+                        rule.rule_id.clone(),
+                        option.option_id.clone(),
+                        message,
+                    )),
+                ))
             })
         })?;
         let Some((permission_id, rule, option, message)) = decision else {
-            return Ok(None);
+            return Ok(if matched {
+                RulePermission::Prompt
+            } else {
+                RulePermission::Unmatched
+            });
         };
         self.broadcast(Event::MessageAppended {
             session_id: attempt.conversation_session_id.clone(),
@@ -357,7 +373,7 @@ impl Daemon {
             option_id: Some(option.clone()),
             by: Some(format!("rule:{rule}")),
         });
-        Ok(Some(option))
+        Ok(RulePermission::Decided(option))
     }
     pub(super) fn notify_topic_attention(
         &self,
