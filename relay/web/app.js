@@ -489,6 +489,29 @@
       const windowsHome = /^[a-z]:\//.test(path) && (parts.length === 1 || (parts[1] === "users" && parts.length <= 3));
       if (p === "" || p === "~" || home || windowsHome) return "writing anywhere in your files";
     }
+    if (cap.startsWith("process:")) {
+      // Match the protocol's executable and first-argument split, including
+      // Windows drive-letter paths and optional scopes.
+      const grant = cap.slice(8);
+      const separator = grant.lastIndexOf(":");
+      const scope = grant.slice(separator + 1);
+      const executable = separator > 1 && scope && !/[\\/]/.test(scope)
+        ? grant.slice(0, separator) : grant;
+      const base = executable.split(/[\\/]/).pop()
+        .replace(/[A-Z]/g, (letter) => letter.toLowerCase()).replace(/(?:\.exe)+$/, "");
+      const stem = base.replace(/[0-9.]+$/, "");
+      if (["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "mksh", "ash", "cmd", "powershell", "pwsh", "osascript", "env", "xargs", "sudo", "doas", "pkexec", "su", "runuser", "nodejs"].includes(base)
+          || ["python", "pythonw", "py", "pyw", "node", "deno", "bun", "perl", "ruby", "php", "lua", "tclsh"].includes(stem)) {
+        return "an interpreter or shell: it can run any program, like bare process";
+      }
+      if (["curl", "wget", "ssh", "scp", "rsync", "nc", "ncat"].includes(base)) {
+        return "it can reach any host and write files, like net plus fs:write";
+      }
+      if (base === "git") return "git runs hooks and settings from the repository it works in, even for read-only sub-commands";
+      if (base === "find") return "find can run any program (-exec)";
+      if (base === "tar") return "tar can run any program (--to-command) and write anywhere";
+      if (["make", "cmake", "ninja"].includes(base)) return "a build tool runs whatever the build files say";
+    }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
@@ -1431,8 +1454,9 @@
   }
   function branchSummaryReviewText(basis, preview) {
     const usage = preview.usage, projection = preview.projection;
-    const lines = ["Source: " + basis.source_name + " (" + preview.source_id + ")", "Target: " + basis.target_name + " (" + preview.target_id + ")",
-      "Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown"),
+    const lines = [approvalText("Source: " + basis.source_name + " (" + preview.source_id + ")"),
+      approvalText("Target: " + basis.target_name + " (" + preview.target_id + ")"),
+      approvalText("Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown")),
       "Reported usage: " + usage.reported_prompt_tokens + " input / " + usage.reported_completion_tokens + " output tokens · " + usage.reported_cached_tokens + " cached / " + usage.reported_cache_write_tokens + " cache-write · " + usage.reported_requests + "/" + usage.requests + " requests reported",
       usage.usage_complete ? "Usage coverage: complete" : "Usage coverage: incomplete or unknown; missing usage is not zero",
       usage.cost != null ? "Recorded cost: " + uiMoney(usage.cost, 6) : "Total cost: unknown · priced subtotal only: " + uiMoney(usage.priced_cost_subtotal, 6),
@@ -1440,7 +1464,7 @@
     if (projection.metadata_omitted) lines.push("Source metadata omitted from generation.");
     if (projection.attachment_bodies_omitted) lines.push("Attachment bodies omitted from generation.");
     if (usage.estimated_requests) lines.push(usage.estimated_requests + " request prices estimated from local prices");
-    if ((usage.unpriced || []).length) lines.push("Unpriced: " + usage.unpriced.join(", "));
+    if ((usage.unpriced || []).length) lines.push("Unpriced: " + approvalText(usage.unpriced.join(", ")));
     lines.push(...(preview.warnings || []).map(warning => "Note: " + warning),
       "Insert appends one note to the target Session; it does not merge transcripts or start a Run.", "Exact candidate note (data):", "", preview.candidate);
     return lines.join("\n");
@@ -1469,7 +1493,7 @@
     if (basis.source_id !== source || basis.target_id !== stamp.target || !basis.source_revision || !basis.target_revision) {
       preparing = false; invalidateBranchSummary(); return note("Branch summary basis did not match the requested source and target.", true);
     }
-    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model + ". Started generation may finish and record usage after review is closed.";
+    pendingBody.textContent = approvalText("Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model) + ". Started generation may finish and record usage after review is closed.";
     const result = await act({ type: "prepare_branch_summary", source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision }, null, 120000);
     preparing = false;
     cancelAsk(stamp.generateTag);
@@ -4297,8 +4321,8 @@
       if (c.kind === "folder") return "folder " + name + "/";
       return (c.kind === "repo" ? "whole repo " : "project ") + c.path + (c.label ? " (" + c.label + ")" : "");
     };
-    const sel = h("select", { "aria-label": "Grant scope for " + cap },
-      opt.choices.map((c, i) => h("option", { value: String(i) }, label(c))));
+    const sel = h("select", { "aria-label": "Grant scope for " + approvalText(cap) },
+      opt.choices.map((c, i) => h("option", { value: String(i) }, approvalText(label(c)))));
     sel.value = String(req.picks[cap] || 0);
     sel.onchange = () => { req.picks[cap] = Number(sel.value); };
     return h("div", { class: "muted path-note" }, "Grant: ", sel, " (for Always, Session or Hour; Once allows just this call)");
@@ -4316,10 +4340,18 @@
    * are written out as `⟨U+202E⟩`, never obeyed, so `report\u202Efdp.exe`
    * can't pass for `reportexe.pdf` (#791). */
   const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+  const APPROVAL_CONTROLS = /[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
+  function visibleCodePoint(c) {
+    return "⟨U+" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩";
+  }
+  // Exact values in a decision show invisible formatting. Prose uses showBidi.
+  function approvalText(value) {
+    return String(value ?? "").replace(APPROVAL_CONTROLS, visibleCodePoint);
+  }
   function showBidi(root) {
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, (c) => "⟨U+" + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩");
+      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, visibleCodePoint);
       BIDI.lastIndex = 0;
     }
   }
@@ -4327,22 +4359,26 @@
     if (!context) return null;
     const call = context.call;
     return h("div", { class: "approval-context" },
-      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + warning)),
+      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + approvalText(warning))),
       (context.sources || []).length ? h("section", { class: "attention source-taint" },
         h("strong", null, "This Run read external content:"),
-        h("ul", null, context.sources.map(source => h("li", null, source.tool + " (" + source.kind + "): " + source.origin)))) : null,
+        h("ul", null, context.sources.map(source => h("li", null, approvalText(source.tool + " (" + source.kind + "): " + source.origin))))) : null,
       call ? h("details", { open: true, class: "call-preview" }, h("summary", null, "Resolved call arguments (redacted)"),
-        (call.urls || []).map(url => h("div", null, h("strong", null, url.method || "Method unresolved"), " ", h("code", null, url.url),
+        (call.urls || []).map(url => h("div", null, h("strong", null, approvalText(url.method || "Method unresolved")), " ", h("code", null, approvalText(url.url)),
           url.body_bytes != null ? h("p", null, "Supplied body: " + url.body_bytes + " bytes") : null,
-          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + url.body_preview) : null)),
-        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, path))),
-        h("pre", null, JSON.stringify(call.arguments, null, 2)),
+          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + approvalText(url.body_preview)) : null)),
+        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, approvalText(path)))),
+        h("pre", null, approvalText(JSON.stringify(call.arguments, null, 2))),
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
+    const alert = $("modal-confirm");
+    const confirmation = req?.broadConfirm && !S.approvalLater
+      ? "This grants broad access. Press the same button (or key) again to confirm, or allow it once." : "";
+    if (alert.textContent !== confirmation) alert.textContent = confirmation;
     $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
@@ -4357,7 +4393,6 @@
       // The first approval ever: what this is and how to undo it (#394).
       !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
         "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
-      req.broadConfirm ? h("p", { class: "error broad-confirm" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -4365,14 +4400,14 @@
           const answered = ((S.batchAnswers || {})[req.batch.batch_id] || {})[i + 1];
           const now = i + 1 === req.batch.index;
           return h("li", { class: now ? "now" : "muted" },
-            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, c.tool_name), " ",
-            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, cap)));
+            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, approvalText(c.tool_name)), " ",
+            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, approvalText(cap))));
         }))) : null,
       // What it does in plain words: AI-written, so labelled (SPEC §10.3).
       req.summary && (!req.detail || req.tool_id) ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
-      req.detail ? h("p", { class: "detail-text" }, req.detail) : null,
-      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
-          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + req.tool_name + ")") : null,
+      req.detail ? h("p", { class: "detail-text" }, approvalText(req.detail)) : null,
+      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, approvalText(toolTitleByName(req.tool_name) || req.tool_name)),
+          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + approvalText(req.tool_name) + ")") : null,
           req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:") : null,
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
@@ -4380,12 +4415,12 @@
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
-            ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
-            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
-              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
+            ? h("li", { class: "muted" }, h("span", { class: "tag" }, approvalText(c)), " already allowed")
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, approvalText(c)), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
+              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + approvalText(n[1])) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
               scopePicker(req, c))),
         req.detail && !req.tool_id ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
-      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
+      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, approvalText(req.code))) : null,
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
@@ -4660,12 +4695,12 @@
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (!head || head.deciding) return;
-    if (approved && head && head.kind !== "promotion" && scope !== "once") {
-      const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
-      if (broad.length && head.broadConfirm !== (scope || "always")) {
+    if (approved && head.kind !== "promotion" && scope !== "once") {
+      const broad = (head.capabilities || []).some((c) => !(head.already || []).includes(c) && isBroad(c));
+      if (broad && head.broadConfirm !== (scope || "always")) {
         head.broadConfirm = scope || "always";
         renderApproval();
-        toast("Broad access (" + broad.join(", ") + "): press again to grant it", true);
+        $("modal-confirm").scrollIntoView({ block: "nearest" });
         return;
       }
     }
@@ -8511,7 +8546,15 @@
       return;
     }
     const modalOpen = layer?.node === $("modal-backdrop");
+    if (modalOpen && e.repeat && e.key === "Enter") {
+      e.preventDefault();
+      return;
+    }
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (e.repeat && ["y", "o", "s", "1", "n", "N"].includes(e.key)) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
