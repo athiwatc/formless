@@ -6407,9 +6407,19 @@ fn config_edit(paths: &Paths) -> Result<()> {
             let _ = std::fs::remove_file(&draft);
             anyhow::bail!("the editor exited with {status}; config.toml unchanged");
         }
-        match Config::load_from(&draft) {
-            Ok(_) => {
-                std::fs::rename(&draft, &file)?;
+        let edited =
+            std::fs::read_to_string(&draft).with_context(|| format!("read {}", draft.display()));
+        match edited.and_then(|text| Config::load_from_text(&text, &draft).map(|_| text)) {
+            Ok(text) => {
+                formless_core::config::write_atomic(&file, text.as_bytes())?;
+                if let Err(error) = std::fs::remove_file(&draft) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "could not remove the saved draft {}: {error}",
+                            draft.display()
+                        );
+                    }
+                }
                 println!(
                     "saved {} (the daemon picks it up on its next read)",
                     file.display()
