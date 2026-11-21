@@ -90,6 +90,68 @@ fn queued(shell: &Entity<Shell>, cx: &mut App) -> Vec<Operation> {
 }
 
 #[gpui_kit::test]
+fn reconnect_refreshes_pending_chips_for_the_restored_session(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| shell.attach_paths(vec!["/file".into()], cx));
+        let operation = queued(&shell, cx).pop().unwrap();
+        complete(
+            &shell,
+            operation,
+            vec![file("kept", "kept.txt", "text/plain")],
+            window,
+            cx,
+        );
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected".into(),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: true,
+                    notice: "Reconnected".into(),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation: shell.client_generation(),
+                    snapshot: replies::session_snapshot(
+                        &id,
+                        &json!({"session":{"id":id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            shell.poll_client(window, cx);
+        });
+        let operation = queued(&shell, cx)
+            .pop()
+            .expect("reconnect inventory refresh");
+        assert!(matches!(operation.intake, Intake::Refresh));
+        complete(
+            &shell,
+            operation,
+            vec![file("kept", "kept.txt", "text/plain")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.find(("composer-attachment", 0_usize)).visible());
+        assert_ne!(window.find("composer-primary").disabled(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
 fn composer_batches_reserve_capacity_and_reject_extras(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     step(cx, handle, |window, cx| {

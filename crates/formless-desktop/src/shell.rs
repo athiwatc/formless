@@ -2412,6 +2412,9 @@ impl Shell {
                 self.client_connected = ready;
                 self.client_status = notice;
                 if ready {
+                    if !was_connected && self.sidebar.active_id().is_some() {
+                        self.attachments.needs_refresh = true;
+                    }
                     self.questions_restored(window, cx);
                 }
                 if !ready {
