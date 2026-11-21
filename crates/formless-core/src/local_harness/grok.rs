@@ -77,18 +77,6 @@ pub fn check_agent(initialized: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Preserves Grok's tool metadata when projecting an ACP permission to the wire.
-pub fn permission_raw_input(tool_call: &Value) -> Value {
-    let mut input = tool_call.get("rawInput").cloned().unwrap_or(Value::Null);
-    if let Some(metadata) = tool_call.get("_meta") {
-        if !input.is_object() {
-            input = serde_json::json!({"input": input});
-        }
-        input["_meta"] = metadata.clone();
-    }
-    input
-}
-
 pub fn questions(params: &Value) -> Result<Vec<Question>> {
     let entries = params
         .get("questions")
@@ -262,10 +250,7 @@ mod tests {
     impl PermissionHandler for Choose {
         fn decide(&mut self, request: &acp::PermissionRequest<'_>) -> Option<String> {
             self.1 += 1;
-            assert_eq!(
-                permission_raw_input(request.tool_call)["_meta"]["x.ai/tool"]["read_only"],
-                false
-            );
+            assert_eq!(request.tool_call["_meta"]["x.ai/tool"]["read_only"], false);
             self.0.map(String::from)
         }
     }
@@ -536,42 +521,53 @@ mod tests {
     }
 
     #[test]
-    fn permission_fixture_preserves_metadata_for_the_shared_user_handler() {
-        let fixture = r#"{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"smoke-session","toolCall":{"toolCallId":"smoke_call_1","kind":"other","title":"formless_smoke__echo","rawInput":{"variant":"UseTool","tool_name":"formless_smoke__echo","tool_input":{"text":"mcp-smoke"}},"_meta":{"x.ai/tool":{"version":1,"name":"use_tool","read_only":false}}},"options":[{"optionId":"allow-once","name":"allow once","kind":"allow_once"},{"optionId":"reject-once","name":"reject once","kind":"reject_once"}]}}"#;
-        let message: Value = serde_json::from_reader(Cursor::new(fixture)).unwrap();
-        let input = permission_raw_input(&message["params"]["toolCall"]);
-        assert_eq!(input["tool_name"], "formless_smoke__echo");
-        assert_eq!(input["_meta"]["x.ai/tool"]["read_only"], false);
-        assert_eq!(message["params"]["options"][0]["optionId"], "allow-once");
-        struct UserChoice;
-        impl acp::PermissionHandler for UserChoice {
-            fn decide(&mut self, request: &acp::PermissionRequest<'_>) -> Option<String> {
-                assert_eq!(request.tool_call["title"], "formless_smoke__echo");
-                assert_eq!(
-                    permission_raw_input(request.tool_call)["_meta"]["x.ai/tool"]["read_only"],
-                    false
-                );
-                Some(request.options[0]["optionId"].as_str().unwrap().into())
+    fn grok_permission_metadata_reaches_core_interaction_handler() {
+        use crate::local_harness::{
+            HarnessPermissionRequest, HarnessUpdate, InteractionFuture, InteractionHandler,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct User(AtomicUsize);
+        impl InteractionHandler for User {
+            fn request_permission<'a>(
+                &'a self,
+                request: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.title, "formless_smoke__echo");
+                assert_eq!(request.kind, "other");
+                let input = request.raw_input.unwrap();
+                assert_eq!(input["tool_name"], "formless_smoke__echo");
+                assert_eq!(input["_meta"]["x.ai/tool"]["name"], "use_tool");
+                assert_eq!(input["_meta"]["x.ai/tool"]["read_only"], false);
+                let choice = request.options[0].option_id.clone();
+                Box::pin(async move { Some(choice) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<QuestionAnswer>>> {
+                panic!("permission fixture unexpectedly asked a question")
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                Ok(())
             }
         }
-        let params = &message["params"];
-        let cancel = CancellationToken::new();
-        let request = acp::PermissionRequest {
-            tool_call: &params["toolCall"],
-            options: params["options"].as_array().unwrap(),
-            cancel: &cancel,
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let user = User(AtomicUsize::new(0));
+        let mut handler = acp::Interactions {
+            handler: &user,
+            runtime: runtime.handle().clone(),
         };
-        assert_eq!(
-            acp::PermissionHandler::decide(&mut UserChoice, &request).as_deref(),
-            Some("allow-once")
-        );
-        assert_eq!(permission_raw_input(&json!({})), Value::Null);
-        assert_eq!(
-            permission_raw_input(
-                &json!({"rawInput": "input", "_meta": {"x.ai/tool": {"read_only": false}}})
-            )["input"],
-            "input"
-        );
+        let mut lines = initialization();
+        lines.push(permission());
+        finish(&mut lines, 3, "end_turn");
+        let (result, sent) = drive_spec(StepAccess::Write, lines, &mut handler);
+        result.unwrap();
+        assert_eq!(user.0.load(Ordering::SeqCst), 1);
+        assert!(sent.iter().any(|message| message["id"] == 90
+            && message["result"]["outcome"]["optionId"] == "allow-once"));
     }
 
     #[test]

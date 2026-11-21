@@ -52,9 +52,10 @@ written. `--no-leader` prevents attachment to a shared agent process.
 
 Route `session/request_permission` through the shared user `PermissionHandler`,
 not `RejectAll`. Preserve title, kind, option ids/names/kinds, and raw input.
-`permission_raw_input` folds the captured toolCall `_meta` into raw input,
-including `_meta["x.ai/tool"]`; do not discard this vendor metadata when mapping
-to `HarnessPermissionRequest`. Only the user selects an option. `None` means
+Shared `acp::Interactions` folds the captured toolCall `_meta` into raw input,
+including `_meta["x.ai/tool"]`, when mapping to `HarnessPermissionRequest`.
+A Grok fixture verifies that metadata reaches the core `InteractionHandler`.
+Only the user selects an option. `None` means
 reject/cancel; `allow_always` is attempt-scoped and must never be persisted.
 Fixtures drive the real shared ACP transport with supplied user choices,
 permission acceptance/rejection/cancellation, authentication failure, and
