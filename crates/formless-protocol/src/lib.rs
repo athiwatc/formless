@@ -859,17 +859,25 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             ]
             .iter()
             .any(|ending| k.ends_with(ending));
-        let secret = [
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "CREDENTIAL",
-            "PRIVATE",
-            "AUTH",
-        ]
-        .iter()
-        .any(|w| k.contains(w))
+        let credential_part = k != "SSH_AUTH_SOCK"
+            && k.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|part| {
+                matches!(
+                    part,
+                    "TOKEN"
+                        | "TOKENS"
+                        | "SECRET"
+                        | "SECRETS"
+                        | "PASSWORD"
+                        | "PASSWORDS"
+                        | "PASSWD"
+                        | "CREDENTIAL"
+                        | "CREDENTIALS"
+                        | "PRIVATE"
+                        | "AUTH"
+                        | "AUTHORIZATION"
+                )
+            });
+        let secret = credential_part
             || credential_key
             || matches!(k.as_str(), "DATABASE_URL" | "REDIS_URL" | "MONGODB_URI")
             || k.ends_with("_PAT");
@@ -936,6 +944,12 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
         {
             return Some((true, format!("holds {what}")));
         }
+    }
+    if segments
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case(".azure"))
+    {
+        return Some((true, "holds cloud credentials".into()));
     }
     if segments
         .windows(2)
@@ -4699,7 +4713,10 @@ mod tests {
             "SIGNINGKEY",
             "HMACKEY",
             "PRIMARY_KEY_TOKEN",
-            "SSH_AUTH_SOCK",
+            "GITHUB_TOKEN",
+            "DB_PASSWORD",
+            "AUTHORIZATION",
+            "CREDENTIALS_FILE",
         ] {
             assert_eq!(
                 broad_capability(&format!("env:{name}")),
@@ -4720,10 +4737,28 @@ mod tests {
             "CANDIDATE_KEY",
             "SORT_KEY",
             "PARTITION_KEY",
+            "SSH_AUTH_SOCK",
+            "ssh_auth_sock",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "TOKENIZERS_PARALLELISM",
             "HOME",
         ] {
             assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");
         }
+    }
+
+    #[test]
+    fn azure_approval_warning_checks_the_credential_directory() {
+        assert_eq!(
+            path_note("fs:read:/work/.Azure/accessTokens.json", Some("/work")),
+            Some((true, "holds cloud credentials".into()))
+        );
+        assert_eq!(
+            path_note("fs:read:/work/accessTokens.json", Some("/work")),
+            Some((false, "inside the working folder".into()))
+        );
     }
 
     #[test]

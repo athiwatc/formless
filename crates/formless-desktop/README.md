@@ -507,6 +507,20 @@ In fixture mode, composer actions are recorded in the status line and never sent
 In daemon mode they retain the existing forecast/consent and acknowledgement
 path described above.
 
+Connected Chat also offers **Run actions** (and matching Commands entries):
+edit/resubmit the last user message, retry the latest Run with an optional
+alternate model while preserving the original answer in a fork, rate the Run,
+retry an in-flight provider request, compact, delete, and set/clear the daemon's
+working directory. Each action reads and freezes its exact Session/Run target,
+requires explicit review and confirmation, revalidates before writing, and waits
+for its own acknowledgement. Edit and Retry use daemon forecast consent.
+Compaction explicitly invokes the provider **without an available cost estimate**;
+provider-request retry continues an already-admitted Run, not a new forecast.
+Ambiguous writes are never replayed; an unknown outcome blocks further Run
+actions and requires inspection in the TUI. Drafts are retained. The Context
+inspector and status bar show live measured/estimated context usage; the
+inspector also shows provider retry/stall state, Run usage and compaction notices.
+
 Commands offers Use Enter for newlines / Use Enter to send. The default
 remains Enter for Send/Steer and Shift+Enter for a newline. In newline mode,
 Enter and Shift+Enter insert newlines and Cmd/Ctrl+Enter invokes Send/Steer.

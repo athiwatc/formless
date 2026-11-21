@@ -167,6 +167,10 @@ impl Store {
         &self.settings
     }
 
+    pub fn has_saved_settings(&self) -> bool {
+        self.basis.is_some()
+    }
+
     pub fn notice(&self) -> &str {
         self.error.as_deref().unwrap_or(if self.basis.is_none() {
             "No saved desktop preferences. Use Save to create them; Reload replaces unsaved view choices."

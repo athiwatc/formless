@@ -115,6 +115,163 @@ pub fn models_dir(paths: &Paths) -> PathBuf {
     paths.data_dir.join("models")
 }
 
+pub struct CachedModel {
+    pub id: &'static str,
+    pub bytes: u64,
+    pub installed: bool,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct CacheRemoval {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Refuse a cache directory redirected to a different location.
+fn existing_cache(paths: &Paths) -> Result<Option<PathBuf>> {
+    let dir = models_dir(paths);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => Ok(Some(dir)),
+        Ok(_) => bail!("naming cache is not a directory: {}", dir.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", dir.display())),
+    }
+}
+
+fn staging_prefix(dest: &std::path::Path) -> Result<String> {
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid naming model filename")?;
+    Ok(format!("{name}.download-"))
+}
+
+fn named_download_part(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|name| name.strip_suffix(".part"))
+        .is_some_and(|id| {
+            uuid::Uuid::parse_str(id)
+                .is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == id)
+        })
+}
+
+fn cache_files(
+    paths: &Paths,
+    spec: &ModelSpec,
+    directory: &std::path::Path,
+) -> Result<Vec<PathBuf>> {
+    let gguf = spec.gguf_path(paths);
+    let tokenizer = spec.tokenizer_path(paths);
+    let gguf_prefix = staging_prefix(&gguf)?;
+    let tokenizer_prefix = staging_prefix(&tokenizer)?;
+    let mut files = vec![
+        gguf.with_extension("part"),
+        tokenizer.with_extension("part"),
+        gguf,
+        tokenizer,
+    ];
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| {
+            named_download_part(name, &gguf_prefix) || named_download_part(name, &tokenizer_prefix)
+        }) {
+            files.push(entry.path());
+        }
+    }
+    Ok(files)
+}
+
+fn cached_file_bytes(file: &std::path::Path) -> Result<Option<u64>> {
+    match std::fs::symlink_metadata(file) {
+        Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
+        // The link itself can be removed without reading its target.
+        Ok(meta) if meta.file_type().is_symlink() => Ok(Some(0)),
+        Ok(_) => bail!("naming cache entry is not a file: {}", file.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", file.display())),
+    }
+}
+
+pub fn cached_models(paths: &Paths) -> Result<Vec<CachedModel>> {
+    let directory = models_dir(paths);
+    if !directory.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut models = Vec::new();
+    for spec in MODELS {
+        let mut bytes = 0u64;
+        let mut present = false;
+        for file in cache_files(paths, spec, &directory)? {
+            if let Some(size) = cached_file_bytes(&file)? {
+                present = true;
+                bytes = bytes.saturating_add(size);
+            }
+        }
+        if present {
+            models.push(CachedModel {
+                id: spec.id,
+                bytes,
+                installed: spec.installed(paths),
+            });
+        }
+    }
+    Ok(models)
+}
+
+fn open_model_lock(directory: &std::path::Path, spec: &ModelSpec) -> Result<std::fs::File> {
+    let lock_path = directory.join(format!("{}.lock", spec.file_stem()));
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open naming model lock {}", lock_path.display()))
+}
+
+fn try_model_lock(directory: &std::path::Path, spec: &ModelSpec) -> Result<std::fs::File> {
+    let lock = open_model_lock(directory, spec)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "naming model '{}' is in use. Retry when its load or download finishes.",
+            spec.id
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("lock naming model {}", spec.id))
+        }
+    }
+}
+
+/// Remove weights, tokenizers and partial downloads for the selected models.
+/// Lock files stay linked so a later download coordinates with this process.
+pub fn remove_cached_models(paths: &Paths, selected: &[ModelSpec]) -> Result<CacheRemoval> {
+    let Some(directory) = existing_cache(paths)? else {
+        return Ok(CacheRemoval::default());
+    };
+    let _locks = selected
+        .iter()
+        .map(|spec| try_model_lock(&directory, spec))
+        .collect::<Result<Vec<_>>>()?;
+    let mut files = Vec::new();
+    for spec in selected {
+        for file in cache_files(paths, spec, &directory)? {
+            if let Some(size) = cached_file_bytes(&file)? {
+                files.push((file, size));
+            }
+        }
+    }
+    let mut removed = CacheRemoval::default();
+    for (file, bytes) in files {
+        std::fs::remove_file(&file)
+            .with_context(|| format!("remove naming cache file {}", file.display()))?;
+        removed.files += 1;
+        removed.bytes = removed.bytes.saturating_add(bytes);
+    }
+    Ok(removed)
+}
+
 /// Whether this build can run a naming model at all.
 pub const fn embedded_available() -> bool {
     cfg!(feature = "embedded-llm")
@@ -136,20 +293,13 @@ fn download_client(idle_timeout: Duration, timeout: Duration) -> Result<reqwest:
 /// Fetch missing model files. Hold a per-model lock across both files so
 /// the daemon and CLI can share one download, including across processes.
 pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
-    use std::fs::{OpenOptions, TryLockError};
+    use std::fs::TryLockError;
 
     let models = models_dir(paths);
     std::fs::create_dir_all(&models)?;
-    let lock_path = models.join(format!("{}.lock", spec.file_stem()));
     // Keep the lock file in place so concurrent callers always lock the
     // same inode. A cancelling or exiting process releases the lock.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("open model download lock {}", lock_path.display()))?;
+    let lock = open_model_lock(&models, spec)?;
     let deadline = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
     loop {
         match lock.try_lock() {
@@ -195,15 +345,9 @@ fn clear_abandoned_downloads(directory: &std::path::Path, prefix: &str) -> Resul
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(id) = name
+        if name
             .to_str()
-            .and_then(|name| name.strip_prefix(prefix))
-            .and_then(|name| name.strip_suffix(".part"))
-        else {
-            continue;
-        };
-        if uuid::Uuid::parse_str(id)
-            .is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == id)
+            .is_some_and(|name| named_download_part(name, prefix))
             && entry.file_type()?.is_file()
         {
             std::fs::remove_file(entry.path())?;
@@ -224,11 +368,7 @@ async fn fetch_verified(
     let directory = dest
         .parent()
         .context("model download has no parent directory")?;
-    let filename = dest
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid model filename")?;
-    let prefix = format!("{filename}.download-");
+    let prefix = staging_prefix(dest)?;
     clear_abandoned_downloads(directory, &prefix)?;
     match std::fs::metadata(dest) {
         Ok(meta) if !meta.is_file() => {
@@ -630,6 +770,8 @@ pub fn llm_title(paths: &Paths, spec: &ModelSpec, user: &str) -> Result<String> 
     let mut cache = embedded::CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if embedded::cached_id(&cache) != Some(spec.id) {
         *cache = None;
+        let _lock = try_model_lock(&models_dir(paths), spec)?;
+        anyhow::ensure!(spec.installed(paths), "naming model files are missing");
         match embedded::load(paths, spec) {
             Ok(l) => *cache = Some(l),
             Err(e) => {
@@ -671,6 +813,111 @@ pub fn title(paths: &Paths, spec: Option<&ModelSpec>, user: &str) -> Option<(Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_fixture() -> (Paths, PathBuf) {
+        let root = std::env::temp_dir().join(format!("fl-naming-cache-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        std::fs::create_dir_all(models_dir(&paths)).unwrap();
+        (paths, root)
+    }
+
+    #[test]
+    fn naming_cache_reports_bytes_and_removes_selected_models_and_parts() {
+        let (paths, root) = cache_fixture();
+        let qwen = QWEN2_5_0_5B;
+        let lfm = LFM2_5_350M;
+        let weights = qwen.gguf_path(&paths);
+        std::fs::File::create(&weights)
+            .unwrap()
+            .set_len(qwen.gguf_bytes)
+            .unwrap();
+        std::fs::write(qwen.tokenizer_path(&paths), b"{}").unwrap();
+        std::fs::write(weights.with_extension("part"), b"old").unwrap();
+        let part = models_dir(&paths).join(format!(
+            "{}{}.part",
+            staging_prefix(&weights).unwrap(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(part, b"part").unwrap();
+        std::fs::write(
+            lfm.tokenizer_path(&paths).with_extension("part"),
+            b"partial",
+        )
+        .unwrap();
+        let unrelated = models_dir(&paths).join("notes.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let models = cached_models(&paths).unwrap();
+        let totals: Vec<_> = models
+            .iter()
+            .map(|model| (model.id, model.bytes, model.installed))
+            .collect();
+        assert_eq!(
+            totals,
+            [(qwen.id, qwen.gguf_bytes + 9, true), (lfm.id, 7, false)]
+        );
+        assert_eq!(
+            remove_cached_models(&paths, &[qwen]).unwrap(),
+            CacheRemoval {
+                files: 4,
+                bytes: qwen.gguf_bytes + 9
+            }
+        );
+        assert_eq!(cached_models(&paths).unwrap()[0].id, lfm.id);
+        assert_eq!(
+            remove_cached_models(&paths, MODELS).unwrap(),
+            CacheRemoval { files: 1, bytes: 7 }
+        );
+        assert!(cached_models(&paths).unwrap().is_empty());
+        assert!(unrelated.is_file());
+        assert!(models_dir(&paths)
+            .join(format!("{}.lock", qwen.file_stem()))
+            .is_file());
+        assert_eq!(
+            remove_cached_models(&paths, MODELS).unwrap(),
+            CacheRemoval::default()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remove_all_requires_exclusive_access_to_every_selected_model() {
+        let (paths, root) = cache_fixture();
+        let active = try_model_lock(&models_dir(&paths), &LFM2_5_350M).unwrap();
+        let first = QWEN2_5_0_5B.gguf_path(&paths);
+        let second = LFM2_5_350M.gguf_path(&paths).with_extension("part");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let error = remove_cached_models(&paths, MODELS).unwrap_err();
+        assert!(error.to_string().contains("is in use"));
+        assert!(first.is_file() && second.is_file());
+        drop(active);
+        assert_eq!(
+            remove_cached_models(&paths, MODELS).unwrap(),
+            CacheRemoval {
+                files: 2,
+                bytes: 11
+            }
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_preserves_files_outside_a_redirected_cache_directory() {
+        let (paths, root) = cache_fixture();
+        let models = models_dir(&paths);
+        let outside = root.join("elsewhere");
+        std::fs::rename(&models, &outside).unwrap();
+        let filename = QWEN2_5_0_5B.gguf_path(&paths);
+        let outside_weights = outside.join(filename.file_name().unwrap());
+        std::fs::write(&outside_weights, b"keep this model").unwrap();
+        std::os::unix::fs::symlink(&outside, &models).unwrap();
+        assert_eq!(cached_models(&paths).unwrap()[0].bytes, 15);
+        assert!(remove_cached_models(&paths, MODELS).is_err());
+        assert_eq!(std::fs::read(outside_weights).unwrap(), b"keep this model");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn clean_title_strips_wrapping_and_prefixes() {

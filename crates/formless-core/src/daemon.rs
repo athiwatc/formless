@@ -4035,14 +4035,15 @@ impl Daemon {
                         "no MCP server '{name}'"
                     ))));
                 }
-                let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
-                let text = std::fs::read(&file)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let all: Vec<&str> = text.lines().collect();
-                let n = lines.unwrap_or(50).clamp(1, 1000);
+                let file = crate::mcp_log::path(&self.paths, &name);
+                let log = file.clone();
+                let lines = lines.unwrap_or(50).clamp(1, 1000);
+                let recent =
+                    tokio::task::spawn_blocking(move || crate::mcp_log::read_lines(&log, lines))
+                        .await?
+                        .unwrap_or_default();
                 let server = &cfg.mcp.servers[&name];
-                let tail = all[all.len().saturating_sub(n)..]
+                let tail = recent
                     .iter()
                     .map(|line| crate::mcp_catalog::redact_server_text(server, line))
                     .collect::<Vec<_>>();
@@ -15703,6 +15704,16 @@ impl Daemon {
     /// keeping `daemon.backups_keep` (SPEC §9.6).
     async fn backup_loop(self: Arc<Self>) {
         loop {
+            let paths = self.paths.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::mcp_log::compact_logs(&paths, crate::mcp_log::MAX_BYTES, false)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "compact MCP logs"),
+                Err(error) => tracing::warn!(%error, "MCP log maintenance worker failed"),
+            }
             if let Ok(cfg) = self.config() {
                 let keep = cfg.daemon.backups_keep;
                 let due = crate::housekeeping::last_backup(&self.paths).is_none_or(|(_, at)| {
@@ -17412,6 +17423,7 @@ pub fn resolve_mime(claimed: Option<&str>, name: &str, bytes: &[u8]) -> String {
 pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
     (".ssh", "an SSH folder"),
     (".aws", "AWS credentials"),
+    (".azure", "Azure CLI credentials"),
     (".gnupg", "GnuPG keys"),
     (".kube", "Kubernetes config"),
     (".docker", "Docker credentials"),
@@ -17426,9 +17438,17 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
     }
+    let mut under_config = false;
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
-        if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
+        if p.eq_ignore_ascii_case("GitHub CLI") || (under_config && p.eq_ignore_ascii_case("gh")) {
+            return Some("GitHub CLI credentials");
+        }
+        under_config = p.eq_ignore_ascii_case(".config");
+        if let Some((_, why)) = CREDENTIAL_DIRS
+            .iter()
+            .find(|(d, _)| *d == p || (*d == ".azure" && p.eq_ignore_ascii_case(d)))
+        {
             return Some(why);
         }
     }
@@ -17456,6 +17476,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".htpasswd",
         ".npmrc",
         ".pypirc",
+        ".s3cfg",
+        ".boto",
+        ".vault-token",
         "rclone.conf",
         ".rclone.conf",
         ".yarnrc",

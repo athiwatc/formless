@@ -5,6 +5,9 @@ use super::*;
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::Notify;
 
+#[path = "run_actions_daemon.rs"]
+mod run_actions;
+
 fn encode(events: &[Value]) -> String {
     events
         .iter()
@@ -66,6 +69,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start(app: axum::Router, retries: usize) -> Self {
+        Self::start_with_stall(app, retries, 120).await
+    }
+
+    async fn start_with_stall(app: axum::Router, retries: usize, stall_secs: u64) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -79,9 +86,11 @@ impl Fixture {
         config.provider.api_style = "anthropic".into();
         config.provider.model = "desktop-ordering-model".into();
         config.provider.max_retries = retries;
+        config.provider.stall_notice_secs = stall_secs;
         config.naming.enabled = false;
         config.skills.auto_create = false;
         config.daemon.idle_grace_secs = 3600;
+        config.daemon.delete_undo_secs = 0;
         config.save(&paths).unwrap();
         let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
         let session = daemon
@@ -129,7 +138,15 @@ impl Fixture {
         })
         .await
         .expect("ordering fixture retained its private Profile lease");
-        std::fs::remove_dir_all(self.root).unwrap();
+        for attempt in 0..50 {
+            match std::fs::remove_dir_all(&self.root) {
+                Ok(()) => break,
+                Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) && attempt < 49 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("cannot remove fixture {}: {error}", self.root.display()),
+            }
+        }
     }
 }
 

@@ -51,6 +51,9 @@ async fn session_model_lost_ack_reconnect_and_explicit_unchanged_save_never_repe
                         }
                         json!([session])
                     }
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::GetSession { id } => {
                         assert_eq!(id, session.id);
                         json!({"session":session,"messages":[],"running":false,"step_mode":false,"pending_steps":{"prompts":[],"more":false},"pending_events":[]})

@@ -54,6 +54,9 @@ async fn a_lost_step_receipt_blocks_native_retries_across_physical_reconnect() {
                         json!({"subscribed":true,"conn":connection})
                     }
                     Request::ListSessions => json!([session]),
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::GetSession { id } => {
                         assert_eq!(id, peer_sid);
                         json!({"session":{"id":peer_sid},"running":!closed.load(Ordering::SeqCst),"messages":[],"pending_events":[],"pending_steps":PendingSteps{prompts:if closed.load(Ordering::SeqCst){vec![]}else{vec![peer_prompt.clone()]},more:false}})
