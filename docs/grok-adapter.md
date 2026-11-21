@@ -8,11 +8,14 @@ Unknown versions and prereleases fail closed.
 ## Integration boundary
 
 `local_harness::grok` supplies `program`, `args`, `environment`, `check_agent`,
-`AUTH_HINT`, and `READ_ONLY_MODE` for the forthcoming shared ACP `AgentSpec`.
+`AUTH_HINT`, and `READ_ONLY_MODE`, wired into `grok::SPEC: acp::AgentSpec`.
 Its final registry location is `local_harness/acp/`, agent id `grok`.
 It is not wired into `HarnessKind` or command/result dispatch and cannot yet
 run a topic step. No Grok-specific ACP transport or permission engine is
-duplicated here. The current `HarnessRole::Review` maps to read-only access;
+duplicated here. `grok::run` prepares prompt/environment overrides and delegates
+to shared `acp::run`; registry integration must preserve this preparation
+(AgentSpec currently has no environment override hook).
+The current `HarnessRole::Review` maps to read-only access;
 the shared contract's planned `StepAccess::ReadOnly` will replace that mapping.
 
 Launch write steps with:
@@ -50,8 +53,9 @@ not `RejectAll`. Preserve title, kind, option ids/names/kinds, and raw input.
 including `_meta["x.ai/tool"]`; do not discard this vendor metadata when mapping
 to `HarnessPermissionRequest`. Only the user selects an option. `None` means
 reject/cancel; `allow_always` is attempt-scoped and must never be persisted.
-The fixture exercises the existing shared handler interface with a supplied
-user choice; the pending shared transport's wire mapping is not integrated here.
+Fixtures drive the real shared ACP transport with supplied user choices,
+permission acceptance/rejection/cancellation, authentication failure, and
+read-only mode selection/denial. The pending v2 wire mapping remains separate.
 
 Grok's native question tool sends this **client request**, not an ACP permission:
 
@@ -65,9 +69,8 @@ optional descriptions/header, multi-select). `question_reply` converts ordered
 and free text are comma-separated. Empty/malformed requests, duplicate questions
 or option labels, and invalid selections fail closed without logging payloads.
 `vendor_request` uses the announced shared hook signature and calls the supplied
-handler with `{"questions": [...]}`, expecting an ordered answer array. Its local
-`PermissionHandler` is explicitly a temporary compatibility shim: on moving to
-the registry, replace it with the shared trait providing `ask_question`. The
+handler with `{"questions": [...]}`, expecting an ordered answer array. Its
+`PermissionHandler` is the shared ACP trait providing `ask_question`. The
 shared layer must validate session ownership and surface questions to the user,
 and its blocking handler must respect cancellation. No question is auto-answered.
 
@@ -103,8 +106,8 @@ No other non-standard client request was observed in these probes.
 ## Verification
 
 Unit fixtures validate launch/access flags, environment handling, and captured
-ACP initialization metadata, including empty and invalid responses. They do
-not test a shared ACP driver that has not yet been integrated. Question fixtures
+ACP initialization metadata, including empty and invalid responses. They
+exercise `grok::SPEC` through the shared ACP driver. Question fixtures
 also cover supplied user answers, multi-select/free text, decline, cancellation,
 unknown methods, and malformed request/answer rejection.
 
@@ -115,6 +118,12 @@ FORMLESS_LIVE_GROK=1 cargo test -p formless-core --lib live_grok_acp_initialize 
 
 Set `FORMLESS_GROK_BIN` if the binary is not on PATH. The ignored test only
 initializes and checks the installed agent; it does not require credentials.
+The separate ignored `live_grok_acp_turn` test requires a loopback provider and
+`FORMLESS_GROK_MCP_SCRIPT` pointing to the Python MCP stub. It drives both a real
+MCP invocation and a native question through the shared driver and supplied
+fixture user handler. The reusable `~/grok-research/rust_smoke.py` starts the fake
+provider, uses an isolated home/dummy environment key, and verifies that the MCP
+call and accepted user answer actually reach the model, not just `end_turn`.
 
 Separate pre-implementation live research used released Grok 1.0.92, isolated
 `GROK_HOME`, a loopback fake OpenAI-compatible provider, dummy environment API

@@ -6685,6 +6685,9 @@ not a user override. Named key fixtures use the documented
 `FORMLESS_GROK_BIN` selects its installed executable instead of `grok` on PATH.
 This test only negotiates ACP and validates version metadata; it does not prove
 authentication, MCP attachment, permission enforcement, or a completed turn.
+`FORMLESS_GROK_MCP_SCRIPT` supplies the Python MCP fixture for the separate ignored
+`live_grok_acp_turn` test. With the isolated loopback provider and dummy key, that
+test exercises per-session MCP and user questions through the shared ACP driver.
 
 `FORMLESS_LIVE_AGY=1` enables the ignored Antigravity ACP smoke test;
 `FORMLESS_AGY_BIN` selects its executable. `FORMLESS_TOPIC_CAPABILITY` carries
