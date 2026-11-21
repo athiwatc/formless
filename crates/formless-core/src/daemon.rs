@@ -1809,6 +1809,24 @@ impl Daemon {
     async fn handle_inner(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
         self.flush_routing()?;
         match req {
+            Request::GetMainChat => Ok(json!(self.with_store(Store::main_chat)?)),
+            Request::ProposeTopic { proposal } => Ok(json!(self.propose_topic_request(&proposal)?)),
+            Request::ListTopics => Ok(json!(self.with_reader(Store::list_topics)?)),
+            Request::GetTopic { topic_id } => Ok(json!(self
+                .with_reader(|st| st.get_topic(&topic_id))?
+                .context(RequestFailure::not_found("topic not found"))?)),
+            Request::RejectTopic { rejection } => Ok(json!(
+                self.with_store(|st| st.reject_topic(&rejection.topic_id))?
+            )),
+            Request::ApproveTopic { .. }
+            | Request::StartTopicWorkflow { .. }
+            | Request::ListTopicAttempts { .. }
+            | Request::GetTopicAttempt { .. }
+            | Request::RecoverTopic { .. }
+            | Request::RetryTopicFeature { .. }
+            | Request::TopicMcp { .. } => {
+                Err(RequestFailure::invalid("topic workflow is not available").into())
+            }
             Request::Ping => Ok(json!({
                 "pong": true,
                 "protocol": PROTOCOL_VERSION,
@@ -8258,6 +8276,11 @@ impl Daemon {
         if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
             return call_failed("error: interrupted".into());
         }
+        if crate::main_topic_suggestions::is_topic_tool(&tc.name) {
+            if let Err(error) = self.check_topic_tool_access(session_id, agent_depth) {
+                return call_failed(format!("error: {error}"));
+            }
+        }
         let mut args: Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
@@ -8326,6 +8349,13 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            crate::main_topic_suggestions::READ_TOPIC_CONTEXT
+            | crate::main_topic_suggestions::PROPOSE_TOPIC => {
+                match self.execute_topic_suggestion(session_id, &tc.name, &args) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => call_failed(format!("error: {error}")),
+                }
+            }
             toolreg::CREATE_TOOL => match self
                 .create_agent_tool(session_id, run_id, &args, cfg, cancel_flag)
                 .await
@@ -10088,7 +10118,14 @@ impl Daemon {
             let mut task_cost = Some(0.0);
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
-                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                    let mut defs =
+                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)?;
+                    defs.retain(|def| {
+                        !def["function"]["name"]
+                            .as_str()
+                            .is_some_and(crate::main_topic_suggestions::is_topic_tool)
+                    });
+                    Ok(defs)
                 })
             };
             let mut messages = vec![json!({
@@ -19486,6 +19523,10 @@ mod branch_summary;
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
 mod approval_daemon_tests;
+
+#[cfg(test)]
+#[path = "main_topic_suggestion_tests.rs"]
+mod main_topic_suggestion_tests;
 
 #[cfg(test)]
 #[path = "sensitive_read_daemon_tests.rs"]

@@ -991,6 +991,21 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
+The singleton Main Chat answers everyday questions in place. For an explicit
+request to do work in a local repo, its assistant can call `read_topic_context`
+for recent persisted user messages, the session's working directory, and
+existing proposals. It uses the user's stated or standing workflow preferences
+and asks for clarification when the repo or workflow is unknown.
+`propose_topic` records a `pending_approval` topic for the same consent UI
+used by manual proposals. Independent features can reference the same
+original message, and each proposed feature is visible in the shared topic
+inventory. These tools are unavailable outside the Main assistant, including
+to nested agents. Suggesting or declining never moves a message or starts a
+harness; only an explicit approval in the client can authorize that. A chat
+reply, including “yes”, is not consent. Repeating a pending suggestion for
+the same source messages returns the existing proposal; declining it does
+not cause the assistant to propose it again automatically.
+
 - Each user message in a Session starts a **Run**: the agent loops
   (think → tool call(s) → observe) autonomously until it produces a final
   answer, is interrupted, or pauses on provider failure/limit-free errors.
