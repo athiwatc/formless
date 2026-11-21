@@ -72,6 +72,46 @@ fn output(mut command: Command) -> std::process::Output {
     }
     child.wait_with_output().unwrap()
 }
+
+#[test]
+fn estimate_continuation_explains_missing_empty_and_deleted_last_sessions() {
+    let fixture = Fixture(std::env::temp_dir().join(format!("fl-estimate-continue-{}", unique())));
+    let paths = formless_core::Paths::from_dirs(fixture.0.join("d"), fixture.0.join("c")).unwrap();
+    let check = |flags: &[&str], message: &str| {
+        let mut invocation = command(&paths);
+        invocation
+            .args(["run", "--estimate"])
+            .args(flags)
+            .arg("fixture task");
+        let result = output(invocation);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(message),
+            "{result:?}"
+        );
+        assert!(!formless_core::daemon::daemon_reachable(&paths));
+    };
+    let missing = "no earlier `formless run` Session to continue; run once without --continue";
+    check(&["--continue"], missing);
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::write(paths.last_run_session_file(), " \n").unwrap();
+    check(&["--session", "last"], missing);
+
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap();
+    store.delete_session(&session.id).unwrap();
+    drop(store);
+    std::fs::write(paths.last_run_session_file(), &session.id).unwrap();
+    check(
+        &["--continue"],
+        &format!(
+            "the last `formless run` Session ({}) no longer exists; run once without --continue",
+            session.id
+        ),
+    );
+}
+
 #[test]
 fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
     let root = Fixture(std::env::temp_dir().join(format!("fl-estimate-cli-{}", unique())));
@@ -160,21 +200,52 @@ fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
     assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
 }
 #[test]
-fn estimate_new_profile_does_not_create_profile_directories() {
+fn estimate_output_formats_stay_local_on_a_new_profile() {
     let root = Fixture(std::env::temp_dir().join(format!("fl-estimate-new-{}", unique())));
     let paths = formless_core::Paths {
         data_dir: root.0.join("absent-data"),
         config_dir: root.0.join("absent-config"),
         profile: "forecast-new-fixture".into(),
     };
-    let mut cmd = command(&paths);
-    cmd.args(["run", "--estimate", "task", "--model", "model", "--json"]);
-    let result = output(cmd);
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    let estimate = |flags: &[&str]| {
+        let mut cmd = command(&paths);
+        cmd.args(["run", "--estimate", "task", "--model", "model"])
+            .args(flags);
+        let result = output(cmd);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let json: serde_json::Value = serde_json::from_slice(&estimate(&["--output", "json"])).unwrap();
+    let alias: serde_json::Value = serde_json::from_slice(&estimate(&["--json"])).unwrap();
+    // An empty local fixture has no comparable Runs or time-dependent data.
+    assert_eq!(json, alias);
+    let forecast = serde_json::from_value(json).unwrap();
+    let human = String::from_utf8(estimate(&[])).unwrap();
+    assert_eq!(
+        human,
+        format!("{}\n", formless_core::forecast::describe(&forecast))
     );
+    assert_eq!(estimate(&["--output", "text"]), human.as_bytes());
+
+    for mode in ["jsonl-events", "final"] {
+        let mut cmd = command(&paths);
+        // Keep the input pipe open. A command that reads it will hit the
+        // fixture deadline instead of exiting with the output-mode error.
+        cmd.args(["run", "--estimate", "-", "--output", mode])
+            .stdin(Stdio::piped());
+        let invalid = output(cmd);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+        let error = String::from_utf8_lossy(&invalid.stderr);
+        assert!(
+            error.contains("--estimate") && error.contains(mode),
+            "{error}"
+        );
+    }
     assert!(!paths.data_dir.exists() && !paths.config_dir.exists());
 }
 

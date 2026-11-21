@@ -168,19 +168,23 @@ mod tests {
         app.rollback_pick = Some(RollbackPick {
             tool_id: id,
             idx: 0,
-            armed: true,
+            armed_version: Some(1),
         });
         terminal.backend_mut().resize(100, 14);
         terminal
-            .draw(|frame| draw_rollback_picker(frame, &app, app.rollback_pick.as_ref().unwrap()))
+            .draw(|frame| {
+                let _ = draw_rollback_picker(frame, &app, app.rollback_pick.as_ref().unwrap());
+            })
             .unwrap();
         app.rollback_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(app.rollback_pick.as_ref().unwrap().idx, 8);
-        assert!(!app.rollback_pick.as_ref().unwrap().armed);
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, None);
         app.rollback_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.rollback_pick.as_ref().unwrap().idx, 29);
         terminal
-            .draw(|frame| draw_rollback_picker(frame, &app, app.rollback_pick.as_ref().unwrap()))
+            .draw(|frame| {
+                let _ = draw_rollback_picker(frame, &app, app.rollback_pick.as_ref().unwrap());
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let text = buffer

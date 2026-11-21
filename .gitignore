@@ -5,3 +5,6 @@ relay/.wrangler/
 # Local agent scratch state and automation screenshots
 .opencode/
 .screenshots/
+
+# Local evidence for the isolated desktop continuation (kept on disk).
+/evidence/gpui-1753-sol/

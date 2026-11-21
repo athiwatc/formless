@@ -442,8 +442,7 @@ fn postgres_password_env(cfg: &mut McpServerCfg) -> Result<()> {
         .collect();
     let query_password = pairs
         .iter()
-        .filter(|(k, _)| k == "password")
-        .next_back()
+        .rfind(|(k, _)| k.eq_ignore_ascii_case("password"))
         .map(|(_, v)| v.clone())
         .filter(|v| !v.is_empty());
     let password = match query_password {
@@ -932,6 +931,7 @@ mod tests {
             "postgresql://u:%GG@h/db",
             "postgresql://u:%ff@h/db",
             "postgresql://u@h/db?password=%00",
+            "postgresql://u@h/db?Password=%00",
         ] {
             assert!(server_config(
                 find("postgres").unwrap(),
