@@ -2953,6 +2953,11 @@ impl Engine {
                     return Ok(());
                 }
                 let result = result.and_then(|v| action.decode(v));
+                if matches!(&result, Ok(crate::topics::Reply::Inventory(_))) {
+                    // A fresh inventory can introduce a topic/harness transcript
+                    // before its SessionUpdated event reaches this connection.
+                    self.dirty_list = true;
+                }
                 if let crate::topics::Action::MoveAndStart(id) = &action {
                     if matches!(&result, Ok(crate::topics::Reply::Topic(t)) if t.id == *id && t.status == formless_protocol::TopicStatus::Approved)
                     {
@@ -4536,6 +4541,18 @@ mod tests {
 
     fn respond(engine: &mut Engine, id: u64, value: Value) {
         engine.receive(ServerMessage::ok(id, value)).unwrap();
+    }
+
+    #[test]
+    fn topic_inventory_discovers_new_transcripts_without_starting_work() {
+        let mut engine = ready();
+        engine.topic_command(None, crate::topics::Action::List);
+        let request = engine.outgoing.pop_back().unwrap();
+        assert!(matches!(request.request, Request::ListTopics));
+        let (_, topic) = crate::fixture::topic_workspace();
+        respond(&mut engine, request.id, json!([topic]));
+        assert!(engine.dirty_list, "new transcript rows must be discovered");
+        assert!(engine.outgoing.is_empty(), "inventory never starts work");
     }
 
     fn ready() -> Engine {
