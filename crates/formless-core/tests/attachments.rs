@@ -44,6 +44,23 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn detects_rclone_config_in_attachment_paths() {
+    for name in [
+        ".config/rclone/rclone.conf",
+        ".rclone.conf",
+        "AppData/Roaming/rclone/RCLONE.CONF",
+    ] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in [
+        ".config/rclone/notes.txt",
+        ".config/rclone/rclone.conf.example",
+    ] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn pulumi_mentions_warn_for_credentials_in_the_pulumi_directory() {
     for path in [
         ".pulumi/credentials.json",

@@ -17325,6 +17325,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".htpasswd",
         ".npmrc",
         ".pypirc",
+        "rclone.conf",
+        ".rclone.conf",
         ".yarnrc",
         ".yarnrc.yml",
         "credentials.tfrc.json",

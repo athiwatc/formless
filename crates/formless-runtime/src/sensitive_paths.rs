@@ -358,6 +358,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "_netrc"
             | ".htpasswd"
             | ".git-credentials"
+            | "rclone.conf"
+            | ".rclone.conf"
             | ".yarnrc"
             | ".yarnrc.yml"
             | ".pgpass"
@@ -561,6 +563,37 @@ mod tests {
             assert_eq!(
                 policy.classify(&path, &path).unwrap(),
                 PathDecision::Ordinary
+            );
+        }
+    }
+
+    #[test]
+    fn protects_rclone_config_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".config/rclone/rclone.conf",
+            ".rclone.conf",
+            "AppData/Roaming/rclone/RCLONE.CONF",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            ".config/rclone/notes.txt",
+            ".config/rclone/rclone.conf.example",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
             );
         }
     }
