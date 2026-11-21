@@ -1030,6 +1030,13 @@ enum ProvidersAction {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Dismiss one configured model warning for this profile
+    DismissWarning {
+        /// Configured provider name, including default
+        provider: String,
+        /// Model ID shown by the warning
+        model: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6836,6 +6843,14 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
         ProvidersAction::Remove { name } => {
             daemon(Request::RemoveProvider { name: name.clone() })?;
             println!("removed {name}");
+        }
+        ProvidersAction::DismissWarning { provider, model } => {
+            let r = daemon(Request::DismissMissingModel { provider, model })?;
+            if r["dismissed"] == true {
+                println!("Model warning dismissed.");
+            } else {
+                println!("No active warning matched that provider and model.");
+            }
         }
         ProvidersAction::Test {
             name,

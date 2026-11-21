@@ -2285,10 +2285,26 @@ impl Provider {
     /// `GET /models`; on the Messages API every page of it
     /// (`has_more` / `after_id`), joined into one `data` list.
     async fn models_body(&self) -> Result<Value> {
+        Ok(self.models_body_with_completeness().await?.0)
+    }
+
+    /// The picker can display any result. The daily check requires an
+    /// authoritative listing before a missing entry is evidence.
+    pub(crate) async fn models_for_health_check(&self) -> Result<Option<Vec<String>>> {
+        let (body, complete) = self.models_body_with_completeness().await?;
+        let mut models = parse_models(&body);
+        models.retain(|model| !model.trim().is_empty());
+        let listed = body["data"].as_array().map_or(0, Vec::len);
+        Ok((complete && !models.is_empty() && models.len() == listed).then_some(models))
+    }
+
+    async fn models_body_with_completeness(&self) -> Result<(Value, bool)> {
         const MAX_PAGES: usize = 20;
         let mut auth = AuthRecovery::default();
         let mut all: Option<Value> = None;
         let mut after: Option<String> = None;
+        let mut complete = false;
+        let mut total = 0;
         for _ in 0..MAX_PAGES {
             let (resp, credential) = self
                 .send_authenticated(
@@ -2314,9 +2330,21 @@ impl Provider {
                     auth.detail()
                 ));
             }
+            let link_continues = resp
+                .headers()
+                .get_all(reqwest::header::LINK)
+                .iter()
+                .any(|header| header.to_str().is_ok_and(model_listing_link_continues));
             let page: Value = resp.json().await.context("parse /models")?;
             let more = self.cfg.anthropic() && page["has_more"] == true;
-            after = page["last_id"].as_str().map(str::to_string);
+            let next = page["last_id"].as_str().filter(|id| !id.is_empty());
+            let next_changed = next != after.as_deref();
+            let can_continue = more && next.is_some() && next_changed;
+            if can_continue {
+                after = next.map(str::to_owned);
+            }
+            total = total.max(model_listing_total(&page));
+            complete = !link_continues && !model_listing_continues(&page);
             match &mut all {
                 None => all = Some(page),
                 Some(a) => {
@@ -2326,7 +2354,7 @@ impl Provider {
                     }
                 }
             }
-            if !more || after.is_none() {
+            if !can_continue {
                 break;
             }
         }
@@ -2338,7 +2366,8 @@ impl Provider {
                 .flatten()
                 .filter_map(|m| Some((m["id"].as_str()?.to_string(), m["max_tokens"].as_u64()?))),
         );
-        Ok(body)
+        let complete = complete && (total == 0 || parse_models(&body).len() as u64 >= total);
+        Ok((body, complete))
     }
 
     /// Prices the endpoint's `/models` listing gives (OpenRouter's
@@ -4814,6 +4843,59 @@ fn merge_tool_fragment(
         grow(&mut slot.arguments, a, &mut mode.arguments_appending);
     }
     Ok(())
+}
+
+fn model_listing_link_continues(header: &str) -> bool {
+    header.split(',').any(|element| {
+        element.split(';').skip(1).any(|attribute| {
+            attribute.split_once('=').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("rel")
+                    && value
+                        .trim()
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .any(|relation| relation.eq_ignore_ascii_case("next"))
+            })
+        })
+    })
+}
+
+fn model_listing_continues(page: &Value) -> bool {
+    fn has_next(value: &Value) -> bool {
+        !value.is_null()
+            && value != false
+            && value.as_str() != Some("")
+            && value.as_u64() != Some(0)
+    }
+    [page, &page["pagination"], &page["links"]]
+        .into_iter()
+        .any(|object| {
+            ["has_more", "hasMore", "truncated", "incomplete"]
+                .iter()
+                .any(|key| object[*key] == true)
+                || [
+                    "next",
+                    "next_page",
+                    "nextPage",
+                    "next_cursor",
+                    "next_page_token",
+                    "nextPageToken",
+                ]
+                .iter()
+                .any(|key| has_next(&object[*key]))
+        })
+}
+
+fn model_listing_total(page: &Value) -> u64 {
+    [page, &page["pagination"]]
+        .into_iter()
+        .flat_map(|object| {
+            ["total", "total_count", "totalCount"]
+                .into_iter()
+                .filter_map(|key| object[key].as_u64())
+        })
+        .max()
+        .unwrap_or_default()
 }
 
 fn parse_models(body: &Value) -> Vec<String> {
