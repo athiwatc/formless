@@ -3335,7 +3335,7 @@ impl Store {
         })
     }
 
-    fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
+    pub(crate) fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
         self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
@@ -3343,6 +3343,11 @@ impl Store {
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
             "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
         }))).optional().map_err(Into::into)
+    }
+
+    pub(crate) fn run_used_tool(&self, run_id: &str, tool_id: &str) -> Result<bool> {
+        Ok(self.ps("SELECT EXISTS(SELECT 1 FROM invocations WHERE run_id=?1 AND tool_id=?2 AND status='success')")?
+            .query_row(params![run_id, tool_id], |row| row.get(0))?)
     }
 
     pub fn run_metrics_for(

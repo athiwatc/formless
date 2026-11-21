@@ -557,8 +557,8 @@ pub const COMMANDS: &[Command] = &[
     ),
     cmd(
         "tour",
-        "[skip]",
-        "a 2-minute guided first task; `skip` hides the offer",
+        "[skip|cleanup]",
+        "a guided first task. `skip` hides the offer and `cleanup` archives the tour and retires its sample",
         App,
     ),
     cmd("notes", "", "every note so far, in the pager", App),

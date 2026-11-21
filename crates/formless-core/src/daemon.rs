@@ -685,6 +685,8 @@ mod send_dedupe_tests;
 
 #[path = "reviewed_send.rs"]
 mod reviewed_send;
+#[path = "onboarding_tour.rs"]
+mod onboarding_tour;
 #[cfg(test)]
 #[path = "reviewed_send_tests.rs"]
 mod reviewed_send_tests;
@@ -1885,6 +1887,9 @@ impl Daemon {
                 let s = self.with_store(|st| st.create_session(name))?;
                 Ok(serde_json::to_value(s)?)
             }
+            Request::CreateTourSession => self.create_tour_session(),
+            Request::GetTourRun { session_id, run_id } => self.get_tour_run(&session_id, &run_id),
+            Request::CleanupTour => self.cleanup_tour(),
             Request::SaveSessionTemplate {
                 id,
                 name,
@@ -4450,7 +4455,7 @@ impl Daemon {
                 });
                 let expected = expected_current_version.map(|version| (id, version));
                 let (info, version, _, compatibility) = self
-                    .create_tool_as_expected(&args, &cfg, "user", None, expected)
+                    .create_tool_as_expected(&args, &cfg, "user", None, expected, None)
                     .await?;
                 Ok(json!({"tool": info, "version": version, "schema_compatibility": compatibility}))
             }
@@ -8224,7 +8229,7 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
-            toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg, cancel_flag).await {
+            toolreg::CREATE_TOOL => match self.create_agent_tool(session_id, run_id, &args, cfg, cancel_flag).await {
                 Ok((text, change)) => {
                     let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {
@@ -10284,8 +10289,18 @@ impl Daemon {
         cfg: &Config,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(String, ToolChange)> {
+        self.create_tool_for_run(args, cfg, cancel, None).await
+    }
+
+    async fn create_tool_for_run(
+        self: &Arc<Self>,
+        args: &Value,
+        cfg: &Config,
+        cancel: &Arc<AtomicBool>,
+        tour_run: Option<&str>,
+    ) -> Result<(String, ToolChange)> {
         let (info, version, smoke_note, compatibility) = self
-            .create_tool_as(args, cfg, "agent", Some(cancel.clone()))
+            .create_tool_as_expected(args, cfg, "agent", Some(cancel.clone()), None, tour_run)
             .await?;
         let mut out = json!({"created": info.name, "version": version, "schema_compatibility": compatibility});
         if let Some(note) = smoke_note {
@@ -10361,7 +10376,7 @@ impl Daemon {
         Option<String>,
         crate::tool_compatibility::ToolSchemaReport,
     )> {
-        self.create_tool_as_expected(args, cfg, author, cancel, None)
+        self.create_tool_as_expected(args, cfg, author, cancel, None, None)
             .await
     }
 
@@ -10372,6 +10387,7 @@ impl Daemon {
         author: &str,
         cancel: Option<Arc<AtomicBool>>,
         expected: Option<(String, i64)>,
+        tour_run: Option<&str>,
     ) -> Result<(
         ToolInfo,
         i64,
@@ -10379,6 +10395,9 @@ impl Daemon {
         crate::tool_compatibility::ToolSchemaReport,
     )> {
         let d = ToolDraft::parse(args, cfg, true)?;
+        if tour_run.is_some() {
+            onboarding_tour::validate_sample(&d)?;
+        }
         let allow_breaking = match args.get("allow_breaking") {
             None => false,
             Some(Value::Bool(value)) => *value,
@@ -10411,6 +10430,10 @@ impl Daemon {
         let (info, version, compatibility, change) = self
             .with_store(|st| {
                 let write = |st: &Store| {
+                    if tour_run.is_some() {
+                        anyhow::ensure!(st.get_tool_by_name(&d.name)?.is_none(),
+                            "the tour Sample Tool name is already in use; use the existing sample instead");
+                    }
                     let (mut info, version, compatibility) = st
                         .create_tool_version_with_schema_report(
                             &d.name,
@@ -10430,6 +10453,9 @@ impl Daemon {
                     if let Some(tags) = args["tags"].as_array() {
                         let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
                         info = st.set_tool_tags(&info.id, &tags)?.unwrap_or(info);
+                    }
+                    if let Some(run_id) = tour_run {
+                        info = onboarding_tour::register_sample(st, &info, run_id)?;
                     }
                     let before = compatibility.base_version;
                     let action = if before == 0 { "created" } else { "updated" };
@@ -13018,7 +13044,7 @@ impl Daemon {
             tool["implementation_js"] = json!(code);
             tool["capabilities"] = json!([]);
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            match self.create_tool_impl(&tool, cfg, &cancel_flag).await {
+            match self.create_agent_tool(session_id, run_id, &tool, cfg, &cancel_flag).await {
                 Ok((text, change)) => {
                     let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {

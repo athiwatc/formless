@@ -1882,6 +1882,15 @@ pub enum Request {
     CreateSession {
         name: Option<String>,
     },
+    /// Open a labelled onboarding Session and report whether its sample exists.
+    CreateTourSession,
+    /// Read the status and sample evidence for an exact onboarding Run.
+    GetTourRun {
+        session_id: String,
+        run_id: String,
+    },
+    /// Archive the tour Sessions and retire the unmodified sample Tool.
+    CleanupTour,
     RenameSession {
         id: String,
         name: String,

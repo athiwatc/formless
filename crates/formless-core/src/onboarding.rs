@@ -8,6 +8,8 @@ use std::{
     path::Path,
 };
 
+pub const TOUR_TOOL_NAME: &str = "formless_tour_word_counter";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     pub approval_help: bool,

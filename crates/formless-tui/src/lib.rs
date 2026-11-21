@@ -41,6 +41,7 @@ mod text_history;
 mod theme;
 #[cfg(test)]
 mod toast_preview_tests;
+mod tour;
 mod ui;
 mod user_commands_ui;
 mod vim;
@@ -254,6 +255,9 @@ enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
+    TourSession,
+    TourRun { session_id: String, run_id: String },
+    TourCleanup,
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -1192,9 +1196,6 @@ impl Wizard {
     }
 }
 
-/// The tour's sample task: small, and it makes the agent build a Tool.
-const TOUR_TASK: &str = "Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"";
-
 #[cfg(test)]
 fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
     formless_core::setup_draft::file(paths)
@@ -1971,9 +1972,7 @@ struct App {
     pull_status: Option<String>,
     /// One-time onboarding moments, persisted.
     seen: Seen,
-    /// The guided tour's stage while it runs (`/tour`): 1 sent the task,
-    /// 2 the Tool exists, 3 done.
-    tour: Option<u8>,
+    tour: Option<tour::Tour>,
     /// The daemon connection was lost: (since, last reconnect attempt).
     offline: Option<(Instant, Instant)>,
     /// The authoritative Session read required before leaving reconnect mode.
@@ -2368,6 +2367,7 @@ impl App {
         self.hunk_review.clear();
         self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
+        self.tour_send_lost(None);
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
         self.clear_attention();
@@ -2525,6 +2525,7 @@ impl App {
                 "reconnected to the daemon after {}",
                 format_elapsed(since.elapsed())
             ));
+            self.refresh_tour();
         }
     }
 
@@ -2797,6 +2798,7 @@ impl App {
                     | Request::PreviewDescriptionBundle { .. }
                     | Request::ContextUsage { .. }
                     | Request::RunMetrics { .. }
+                    | Request::GetTourRun { .. }
                     | Request::SessionUsage { .. }
                     | Request::ListInvocations
                     | Request::Subscribe { .. }
@@ -2887,6 +2889,7 @@ impl App {
             ));
             if matches!(kind, Pending::SendMessage) {
                 self.restore_unsent_draft();
+                self.tour_send_lost(Some(id));
             }
             if matches!(kind, Pending::ReconnectSession) {
                 self.reconnect_read_failed(id);
@@ -2902,8 +2905,12 @@ impl App {
         }
     }
     fn send_chat_message(&mut self, session_id: String, content: String, mode: SendMode) {
+        let is_tour = self.tour_draft_sent(&session_id, &content, &mode);
         if let Some(client) = &self.client {
             let id = self.sends.send(client, session_id, content, mode);
+            if is_tour {
+                self.tour_sending(id);
+            }
             self.pending.insert(id, Pending::SendMessage);
             self.pending_since.insert(id, Instant::now());
         }
@@ -3041,6 +3048,7 @@ impl App {
                     result,
                     error,
                 } => {
+                    self.tour_send_answered(id, ok, result.as_ref());
                     if ok
                         && self.sends.message(id).is_some_and(|(session, text)| {
                             self.restored_send
@@ -3248,6 +3256,11 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::TourSession => self.open_tour_reply(result),
+                        Pending::TourRun { session_id, run_id } => {
+                            self.apply_tour_status(&session_id, &run_id, &result);
+                        }
+                        Pending::TourCleanup => self.tour_cleanup_reply(&result),
                         Pending::DaemonMode => {
                             self.daemon_secure = result["secure"].as_bool();
                             if let Some(seen) = result["approval_help_seen"].as_bool() {
@@ -5499,6 +5512,9 @@ impl App {
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
+            if self.tour.as_ref().is_some_and(|tour| self.is_current(&tour.session_id)) {
+                self.notes.push(tr("Tour guidance paused. Return to the Guided tour Session or type /tour to continue.").into());
+            }
             self.cancel_branch_summary();
             self.hunk_review.clear();
         }
@@ -5558,9 +5574,11 @@ impl App {
             self.set_activity("working");
         }
         self.follow_chat_bottom();
+        self.refresh_tour();
     }
 
     fn on_event(&mut self, ev: Event) {
+        self.observe_tour_event(&ev);
         if let Event::RunFinished {
             session_id,
             run_id,
@@ -5970,24 +5988,6 @@ impl App {
                 session_id,
                 run_id,
                 status,
-            } if self.tour.is_some() && self.is_current(&session_id) => {
-                self.tour = None;
-                self.seen.tour_done = true;
-                self.save_seen();
-                self.notes.push(
-                    tr("Tour 3/3 · Done. Ask for anything: the agent reuses its Tools and builds new ones. /help lists every command and key; Tab switches views.")
-                        .into(),
-                );
-                self.on_event(Event::RunFinished {
-                    session_id,
-                    run_id,
-                    status,
-                });
-            }
-            Event::RunFinished {
-                session_id,
-                run_id,
-                status,
             } => {
                 if self.is_current(&session_id)
                     && self.live_run.as_ref().is_some_and(|(id, _)| id != &run_id)
@@ -6147,13 +6147,6 @@ impl App {
             } => {
                 if !self.is_current(&session_id) {
                     return;
-                }
-                if ok && tool_name == "create_tool" && self.tour == Some(1) {
-                    self.tour = Some(2);
-                    self.notes.push(
-                        tr("Tour 2/3 · The agent just built a Tool. It's in the Tools view now (Tab to switch views, Esc back): its code, versions and how well it does. Watch it use the Tool next.")
-                            .into(),
-                    );
                 }
                 if let Some(call) = self.running_call(
                     &session_id,
@@ -8274,6 +8267,7 @@ impl App {
                 self.save_seen();
                 self.notes.push(tr("tour skipped; /tour starts it any time").into());
             }
+            "tour cleanup" => self.request(Pending::TourCleanup, Request::CleanupTour),
             "setup" => {
                 // The wizard again, at the key step of the saved provider:
                 // re-enter a key, or Esc back to change provider (§10.1).
@@ -8290,16 +8284,9 @@ impl App {
                 }
             }
             cmd if cmd.starts_with("tour ") => {
-                self.notes.push(tr("usage: /tour starts the guided first task; /tour skip hides the offer").into())
+                self.notes.push(tr("Use /tour to start, /tour skip to hide the offer, and /tour cleanup to archive the tour and retire its sample.").into())
             }
-            "tour" => {
-                self.tour = Some(1);
-                self.input.set(tr(TOUR_TASK));
-                self.notes.push(
-                    tr("Tour 1/3 · A sample task is in the input. Press Enter: the agent has no Tool for this yet, so it builds one, and keeps it for next time.")
-                        .into(),
-                );
-            }
+            "tour" => self.open_tour(),
             "routing" => self.request(Pending::Routing, Request::RoutingDecisions),
             cmd if cmd == "test" || cmd.starts_with("test ") => {
                 let model = cmd["test".len()..].trim().to_string();
@@ -21536,8 +21523,8 @@ mod tests {
             };
             let offer = local.offer_with(tr_format);
             assert!(offer.contains(address) && offer.contains("มี 2 โมเดล"));
-            assert!(tr(TOUR_TASK).starts_with("สร้างเครื่องมือ"));
-            assert!(tr(TOUR_TASK).contains("The quick brown fox"));
+            assert!(tour::sample_prompt(false).starts_with("สร้างเครื่องมือ"));
+            assert!(tour::sample_prompt(false).contains("The quick brown fox"));
             assert_eq!(tr_format("Found {}. {}", &["{}", "ค่า"]), "พบ {} ค่า");
         });
     }
