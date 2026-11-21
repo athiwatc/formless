@@ -41,9 +41,73 @@ fn v39_ships_the_missing_indexes() {
         "idx_inv_running",
         "idx_artifacts_session",
         "idx_audit_created",
+        "idx_checkpoints_session",
+        "idx_run_usage_created",
     ] {
         assert!(names.iter().any(|n| n == want), "missing index {want}");
     }
+}
+
+#[test]
+fn opening_a_v67_database_adds_query_indexes_once_without_changing_checkpoint_rows() {
+    let db = temp_db("checkpoint-usage-indexes");
+    let store = Store::open(&db).unwrap();
+    let session = store.create_session(Some("fixture".into())).unwrap().id;
+    store.save_checkpoint(&session, "first", 5).unwrap();
+    store
+        .save_checkpoint(&session, "later row at the same sequence", 5)
+        .unwrap();
+    drop(store);
+
+    let raw = Connection::open(&db).unwrap();
+    raw.execute_batch(
+        "DROP INDEX idx_checkpoints_session;
+         DROP INDEX idx_run_usage_created;
+         PRAGMA user_version=67;",
+    )
+    .unwrap();
+    let before: String = raw.query_row(
+        "SELECT summary FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1",
+        [&session],
+        |row| row.get(0),
+    ).unwrap();
+    drop(raw);
+    assert!(!index_names(&db)
+        .iter()
+        .any(|n| n == "idx_checkpoints_session"));
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(
+        store.latest_checkpoint(&session).unwrap(),
+        Some((before, 5))
+    );
+    assert_eq!(store.list_checkpoints(&session).unwrap().len(), 2);
+    let migrated_indexes = index_names(&db);
+    assert!(migrated_indexes
+        .iter()
+        .any(|n| n == "idx_checkpoints_session"));
+    assert!(migrated_indexes
+        .iter()
+        .any(|n| n == "idx_run_usage_created"));
+    let raw = Connection::open(&db).unwrap();
+    let schema: i64 = raw
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        raw.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    drop(store);
+    drop(Store::open(&db).unwrap());
+    assert_eq!(
+        raw.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        schema
+    );
+    assert_eq!(migrated_indexes, index_names(&db));
+    drop(raw);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
 }
 
 #[test]
