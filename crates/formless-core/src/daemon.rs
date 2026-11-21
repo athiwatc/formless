@@ -928,6 +928,7 @@ pub struct Daemon {
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
+    topic_activity: tokio::sync::Notify,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1175,6 +1176,7 @@ impl Daemon {
             topic_questions: StdMutex::new(HashMap::new()),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
+            topic_activity: tokio::sync::Notify::new(),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1799,7 +1801,7 @@ impl Daemon {
             Event::ApprovalAnswered { approval_id, .. } | Event::ApprovalClosed { approval_id } => {
                 self.remove_attention(approval_id)
             }
-            Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            Event::UserQuestionClosed { question_id, .. } => self.remove_attention(question_id),
             Event::HarnessPermissionClosed { permission_id, .. } => {
                 self.remove_attention(permission_id)
             }
@@ -2082,6 +2084,17 @@ impl Daemon {
                 Ok(serde_json::to_value(attempt)?)
             }
             Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id).await,
+            Request::SetTopicContextAccess { topic_id, allow } => {
+                let topic = self.with_store(|st| st.set_topic_context_access(&topic_id, allow))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::AddTopicPermissionRule { .. }
+            | Request::RemoveTopicPermissionRule { .. }
+            | Request::SetTopicLimits { .. }
+            | Request::ListHarnesses => {
+                bail!("topic control request is not implemented yet");
+            }
             Request::CancelTopic { topic_id } => {
                 let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
@@ -2095,8 +2108,46 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::RecoverTopic { recovery } => {
-                let topic = self.with_store(|st| st.recover_topic(&recovery.topic_id))?;
-                self.close_topic_interactions(&recovery.topic_id, None);
+                let topic = {
+                    let _launch = self.topic_launch.locked();
+                    let topic = self
+                        .with_reader(|st| st.get_topic(&recovery.topic_id))?
+                        .context("topic not found")?;
+                    for ((id, _), cancel) in self.topic_steps.locked().iter() {
+                        if id == &topic.id {
+                            cancel.cancel();
+                        }
+                    }
+                    if let Some(session) = &topic.topic_session_id {
+                        if let Some(run) = self.runs.locked().get(session) {
+                            run.cancel_flag.store(true, Ordering::SeqCst);
+                            run.cancel.cancel();
+                        }
+                    }
+                    self.close_topic_interactions(&topic.id, None);
+                    self.with_store(|st| st.recover_topic(&topic.id))?
+                };
+                if let Some(session) = &topic.topic_session_id {
+                    self.stop_one_session_work(session).await?;
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        let notified = self.topic_activity.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if !self
+                            .topic_steps
+                            .locked()
+                            .keys()
+                            .any(|(id, _)| id == &topic.id)
+                        {
+                            break;
+                        }
+                        notified.await;
+                    }
+                })
+                .await
+                .context("topic recovery is recorded, but harness cleanup is still pending")?;
                 self.broadcast(Event::TopicChanged {
                     topic_id: topic.id.clone(),
                 });
@@ -2152,11 +2203,10 @@ impl Daemon {
                         let mut message=None;
                         let value=match request.operation {
                             TopicMcpOperation::RequestPermission {..} | TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
-                            TopicMcpOperation::ListConversations => serde_json::to_value(st.list_sessions()?)?,
+                            TopicMcpOperation::ListConversations => st.topic_list_conversations(&attempt.topic_id)?,
+                            TopicMcpOperation::SearchConversations {query} => st.topic_search_conversations(&attempt.topic_id,&query)?,
                             TopicMcpOperation::ReadConversation {session_id} => {
-                                if st.session_deleted(&session_id)? {bail!("conversation is deleted");}
-                                json!({"session":st.get_session(&session_id)?.context("conversation not found")?,
-                                    "messages":st.list_messages(&session_id)?})
+                                st.topic_read_conversation(&attempt.topic_id,&session_id)?
                             }
                             TopicMcpOperation::AppendConversation {content} => {
                                 let msg=st.append_message(&attempt.conversation_session_id,"assistant",&content)?;
@@ -8659,6 +8709,32 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            toolreg::TOPIC_LIST_CONVERSATIONS
+            | toolreg::TOPIC_READ_CONVERSATION
+            | toolreg::TOPIC_SEARCH_CONVERSATIONS => match self.with_reader(|st| {
+                if !st.is_topic_orchestrator(session_id)? {
+                    bail!("topic conversation tool requires an active Topic Chat");
+                }
+                let topic = st
+                    .topic_for_session(session_id)?
+                    .context("topic not found")?;
+                match tc.name.as_str() {
+                    toolreg::TOPIC_LIST_CONVERSATIONS => st.topic_list_conversations(&topic.id),
+                    toolreg::TOPIC_READ_CONVERSATION => st.topic_read_conversation(
+                        &topic.id,
+                        args["session_id"]
+                            .as_str()
+                            .context("session_id is required")?,
+                    ),
+                    _ => st.topic_search_conversations(
+                        &topic.id,
+                        args["query"].as_str().context("query is required")?,
+                    ),
+                }
+            }) {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: {error:#}")),
+            },
             toolreg::TOPIC_RUN_STEP => match self.run_topic_step(session_id, &args, cancel).await {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
@@ -12796,6 +12872,7 @@ impl Daemon {
             ),
         };
         self.broadcast(Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: question_id.clone(),
@@ -12805,7 +12882,10 @@ impl Daemon {
             questions: questions.clone(),
         });
         let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
-        self.broadcast(Event::UserQuestionClosed { question_id });
+        self.broadcast(Event::UserQuestionClosed {
+            answered_by: None,
+            question_id,
+        });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
         if answers.is_empty() {
             // Free text from a client that answers in one line.

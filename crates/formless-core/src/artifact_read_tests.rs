@@ -887,7 +887,26 @@ async fn topic_fixture_scoped_mcp_results_conversations_files_and_cancellation()
         .as_array()
         .unwrap()
         .iter()
+        .any(|s| s["id"] == attempt.conversation_session_id));
+    assert!(!conversations
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|s| s["id"] == f.session));
+    assert!(f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadConversation {
+            session_id: f.session.clone()
+        }))
+        .await
+        .is_err());
+    f.daemon()
+        .handle(Request::SetTopicContextAccess {
+            topic_id: topic.id.clone(),
+            allow: true,
+        })
+        .await
+        .unwrap();
     let conversation = f
         .daemon()
         .handle(call(TopicMcpOperation::ReadConversation {

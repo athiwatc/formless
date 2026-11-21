@@ -7091,6 +7091,15 @@ Topic Chat defaults to that topic as parent; other sources create roots.
 ListTopics includes all levels and their parent IDs. Cyclic parent chains are
 rejected. Permanent deletion/purge removes descendant topics and their canonical
 conversations; cancellation affects only the selected topic, not its children.
+Purging a source removes pending/rejected proposals, not approved topics.
+Source-owned attachments referenced by surviving moved topic messages are retained.
+
+Harness and topic-model conversation tools default to the topic branch: the
+topic and all ancestor Topic Chats and their attempt transcripts, not Main
+Chat, siblings or unrelated sessions. The user-only SetTopicContextAccess
+sets persisted allow_external_context (default false); opting in permits all
+non-deleted conversations. List/read/search share this scope. Search is a
+case-insensitive substring match returning at most 40 bounded snippets.
 
 The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
 in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors

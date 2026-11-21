@@ -155,6 +155,23 @@ fn topic_schema_v72_preserves_v2_v71_topics_and_relaxes_source_fk() {
     );
     drop(store);
     let reopened = Store::open(&file).unwrap();
+    assert!(
+        !reopened
+            .get_topic("legacy")
+            .unwrap()
+            .unwrap()
+            .allow_external_context
+    );
+    reopened.set_topic_context_access("legacy", true).unwrap();
+    drop(reopened);
+    let reopened = Store::open(&file).unwrap();
+    assert!(
+        reopened
+            .get_topic("legacy")
+            .unwrap()
+            .unwrap()
+            .allow_external_context
+    );
     assert_eq!(reopened.list_topics().unwrap().len(), 1);
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();

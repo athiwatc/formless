@@ -99,6 +99,7 @@ impl Drop for StepLease {
     fn drop(&mut self) {
         self.token.cancel();
         self.daemon.topic_steps.locked().remove(&self.key);
+        self.daemon.topic_activity.notify_waiters();
     }
 }
 struct Worktree {

@@ -9,8 +9,13 @@ fn tools() -> Value {
     for (name, description, schema) in [
         (
             "list_conversations",
-            "List shared Formless conversations",
+            "List conversations in the permitted topic context",
             json!({"type":"object","properties":{}}),
+        ),
+        (
+            "search_conversations",
+            "Search permitted conversations; at most 40 bounded snippets",
+            json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
         ),
         (
             "read_conversation",
