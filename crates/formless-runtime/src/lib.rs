@@ -1303,13 +1303,8 @@ const PROCESS_BASE_ENV: &[&str] = &[
 /// A `process:` grant's command and, for `process:git:status|log`, the
 /// first arguments it allows (None = any).
 pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
-    match grant.rsplit_once(':') {
-        // `C:\…` is a Windows path, not a command with sub-commands.
-        Some((cmd, subs)) if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) => {
-            (cmd, Some(subs.split('|').collect()))
-        }
-        _ => (grant, None),
-    }
+    let (cmd, scope) = formless_protocol::split_process_grant(grant);
+    (cmd, scope.map(|scope| scope.split('|').collect()))
 }
 
 fn process_allowed(allowed: &[String], cmd: &str, first_arg: Option<&str>) -> bool {
@@ -4191,6 +4186,10 @@ mod tests {
         assert_eq!(
             process_grant("C:\\tools\\x.exe"),
             ("C:\\tools\\x.exe", None)
+        );
+        assert_eq!(
+            process_grant("C:/Program Files/git.exe:status|log"),
+            ("C:/Program Files/git.exe", Some(vec!["status", "log"]))
         );
         let allowed = vec!["git:status|log".to_string()];
         assert!(process_allowed(&allowed, "git", Some("log")));

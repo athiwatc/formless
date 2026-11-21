@@ -70,6 +70,10 @@ mod attachment_expiry;
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
 
+#[path = "forecast_report_storage.rs"]
+mod forecast_report_storage;
+pub(crate) use forecast_report_storage::ForecastMetricInput;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -1860,6 +1864,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// Newest transcript sequence without decoding any message bodies.
+    pub(crate) fn last_message_seq(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The same newest user row as reversing a Session transcript, including
+    /// empty content. Compare and retry need its identity, sequence, and text.
+    pub(crate) fn last_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, seq, content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Suggest-name prompt: the latest four nonblank user rows, in transcript
+    /// order. Step through a single SQL snapshot rather than materializing
+    /// unrelated messages or retaining unbounded user text.
+    pub(crate) fn recent_user_naming_input(&self, session_id: &str) -> Result<String> {
+        const LIMIT: usize = 4;
+        const MAX_CHARS: usize = 2000;
+        let mut stmt = self.ps(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let mut recent = Vec::with_capacity(LIMIT);
+        while recent.len() < LIMIT {
+            let Some(row) = rows.next()? else { break };
+            let text = row.get_ref(0)?.as_str()?;
+            if !text.trim().is_empty() {
+                recent.push(text.chars().take(MAX_CHARS).collect::<String>());
+            }
+        }
+        recent.reverse();
+        Ok(recent.join("\n").chars().take(MAX_CHARS).collect())
+    }
+
     /// One Session-scoped message, using the same row/metadata conversion as
     /// transcript reads. Unrelated rows are deliberately not decoded here.
     pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
@@ -3221,10 +3274,10 @@ impl Store {
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(expected > 0
-            && expected == rows
-            && expected == known
-            && main >= self.run_steps(run_id)?)
+        Ok(
+            forecast_report_storage::covered_requests(expected, rows, known)
+                && main >= self.run_steps(run_id)?,
+        )
     }
 
     /// Check coverage for a branch's allocated Runs in one statement.
@@ -8340,6 +8393,107 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}
+
+#[cfg(test)]
+mod narrow_transcript_tests {
+    use super::*;
+
+    fn assert_projection_matches_full(store: &Store, session: &str) {
+        let full = store.list_messages(session).unwrap();
+        assert_eq!(
+            store.last_message_seq(session).unwrap(),
+            full.last().map_or(0, |row| row.seq)
+        );
+        let last_user = full.iter().rev().find(|row| row.role == "user");
+        assert_eq!(
+            store.last_user_message(session).unwrap(),
+            last_user.map(|row| (row.id.clone(), row.seq, row.content.clone()))
+        );
+        let users: Vec<_> = full
+            .iter()
+            .filter(|row| row.role == "user" && !row.content.trim().is_empty())
+            .map(|row| row.content.as_str())
+            .collect();
+        let legacy = users[users.len().saturating_sub(4)..]
+            .join("\n")
+            .chars()
+            .take(2000)
+            .collect::<String>();
+        assert_eq!(store.recent_user_naming_input(session).unwrap(), legacy);
+    }
+
+    #[test]
+    fn narrow_transcript_reads_keep_unicode_cap_and_empty_latest_user() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let other = store.create_session(None).unwrap().id;
+        store
+            .append_message(&other, "user", "not this Session")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+        store
+            .append_message(&session, "assistant", "no user yet")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+
+        let long_user = "ก中".repeat(1800);
+        let long_tool = "unrelated tool output".repeat(120_000);
+        for (role, content) in [
+            ("user", "excluded oldest"),
+            ("assistant", "assistant"),
+            ("user", "oldest kept"),
+            ("user", "\t\n"),
+            ("user", long_user.as_str()),
+            ("tool", long_tool.as_str()),
+            ("user", "third kept"),
+            ("user", "\u{2003}\u{00A0}"),
+            ("user", "fourth kept"),
+            ("user", ""),
+            ("system-note", "last sequence is not the newest user"),
+        ] {
+            store.append_message(&session, role, content).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        let recent = store.recent_user_naming_input(&session).unwrap();
+        assert_eq!(recent.chars().count(), 2000);
+        assert!(recent.starts_with("oldest kept\nก中"));
+        assert!(store
+            .last_user_message(&session)
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
+
+    #[test]
+    fn narrow_transcript_reads_match_equal_sequences_in_both_directions() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        for (id, role, content) in [
+            ("old", "user", "discarded"),
+            ("z", "user", "first kept"),
+            ("y", "user", "second kept"),
+            ("x", "assistant", "ignored"),
+            ("w", "user", "third kept"),
+            ("v", "user", "last kept"),
+            ("u", "user", "\u{2003}"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at) VALUES(?1,?2,1,?3,?4,'fixture')",
+                params![id, session, role, content],
+            ).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        assert_eq!(
+            store.last_user_message(&session).unwrap(),
+            Some(("u".into(), 1, "\u{2003}".into()))
+        );
+        assert_eq!(
+            store.recent_user_naming_input(&session).unwrap(),
+            "first kept\nsecond kept\nthird kept\nlast kept"
+        );
     }
 }
 
