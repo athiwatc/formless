@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chromium regressions for #2188–#2195 using a local app and synthetic replies.
+"""Chromium interaction regressions using a local app and synthetic replies.
 
 Run with Python Playwright and /usr/bin/chromium. No live grants, devices,
 provider credentials, or push services are used.
@@ -78,6 +78,22 @@ HOOK = r"""
     F.reveal("approvals");
     S.grants=[...F.grants]; S.grantsSelected=new Set(); renderApprovals();
   };
+  F.dialogActions = () => {
+    F.reveal();
+    S.current="first";
+    S.sessions=[session("first","First Session"),session("second","Second Session")];
+    S.liveRun={id:"run-a",ended:true};
+    S.queued=[{id:7,content:"  first\r\nsecond  "}];
+    renderQueue();
+    F.reply("list_models", {models:["first-model","other-model"]});
+    F.reply("run_files", {run_id:"run-a",files:[{path:"fixture.txt",status:"modified",revertible:true}]});
+    const controls=h("div", {id:"fixture-actions"}, rateButtons(),
+      h("button", {type:"button",onclick:showRunFiles}, "Files"));
+    $("composer").prepend(controls);
+  };
+  F.askFixtureQuestion = () => onEvent({type:"user_question",session_id:"first",question_id:"question-a",question:"Fixture question"});
+  F.advanceRun = () => onEvent({type:"run_started",session_id:S.current,run_id:"run-b"});
+  F.switchFixtureSession = () => { S.current="second"; sessionSeq++; };
   F.draft = (kind) => {
     F.reveal("settings");
     return ({job:newJob, mcp:addMcpServer, skill:addSkill, role:()=>editRole("",{},["default"]),
@@ -431,7 +447,98 @@ def push(page, mode):
             expect(feedback).to_have_text("")
 
 
+def action_dialogs(page):
+    page.evaluate("__interaction.dialogActions()")
+    modal = page.locator("#ask-backdrop")
+    edit = page.get_by_role("button", name="Edit", exact=True)
+    edit.click()
+    field = modal.get_by_role("textbox", name="Queued message")
+    expect(field).to_be_focused()
+    expect(field).to_have_value("  first\nsecond  ")
+    field.fill(" \n ")
+    modal.get_by_role("button", name="Save").click()
+    expect(modal.get_by_text("Enter a nonempty message.")).to_be_visible()
+    expect(field).to_be_focused()
+    page.evaluate("__interaction.askFixtureQuestion()")
+    expect(field).to_have_value(" \n ")
+    field.fill("  first\nsecond  ")
+    modal.get_by_role("button", name="Save").click()
+    expect(modal.get_by_text("Fixture question")).to_be_visible()
+    modal.get_by_role("button", name="Cancel").click()
+    expect(modal).to_be_hidden()
+    assert page.evaluate("__interaction.calls.find(x=>x.type==='edit_queued').content") == "  first\r\nsecond  "
+
+    edit.click()
+    expect(field).to_be_focused()
+    field.fill("  edited\ntext  ")
+    modal.get_by_role("button", name="Save").click()
+    expect(modal).to_be_hidden()
+    expect(edit).to_be_focused()
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').at(-1).content") == "  edited\ntext  "
+    edit.click()
+    field.fill("discard this edit")
+    page.keyboard.press("Escape")
+    expect(edit).to_be_focused()
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').length") == 2
+
+    rating = page.locator("#fixture-actions").get_by_role("button", name="👎")
+    rating.click()
+    expect(modal.get_by_role("textbox", name="Optional rating comment")).to_be_focused()
+    modal.get_by_role("button", name="Cancel").click()
+    expect(modal).to_be_hidden()
+    assert page.evaluate("__interaction.calls.find(x=>x.type==='rate_run')") == {
+        "type": "rate_run", "session_id": "first", "run_id": "run-a", "rating": "bad", "comment": None,
+    }
+
+    retry = page.get_by_role("button", name="Retry with…")
+    retry.click()
+    picker = page.get_by_role("dialog", name="Retry with a model")
+    model = picker.get_by_role("textbox", name="Filter models")
+    expect(model).to_be_focused()
+    expect(picker.get_by_role("button", name="Set as default")).to_have_count(0)
+    expect(picker.get_by_role("button", name="Test")).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(retry).to_be_focused()
+    assert page.evaluate("__interaction.calls.every(x=>x.type!=='retry_run')")
+    retry.click()
+    model.fill("custom/model")
+    model.press("Enter")
+    expect(picker).to_have_count(0)
+    assert page.evaluate("__interaction.calls.find(x=>x.type==='retry_run')") == {
+        "type": "retry_run", "session_id": "first", "expected_run_id": "run-a", "model": "custom/model",
+    }
+    assert page.evaluate("__interaction.calls.every(x=>!['set_setting','set_session_model'].includes(x.type))")
+
+    files = page.locator("#fixture-actions").get_by_role("button", name="Files")
+    files.click()
+    file_dialog = page.get_by_role("dialog", name="Files changed")
+    revert = file_dialog.get_by_role("button", name="Revert all")
+    revert.click()
+    expect(modal.get_by_text("Paths changed since the Run may be skipped.", exact=False)).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(revert).to_be_focused()
+    revert.click()
+    page.evaluate("__interaction.reply('rewind_run', {restored:['fixture.txt'],skipped:[]})")
+    modal.get_by_role("button", name="Revert all").click()
+    expect(file_dialog).to_have_count(0)
+    expect(files).to_be_focused()
+    assert page.evaluate("__interaction.calls.find(x=>x.type==='rewind_run').run_id") == "run-a"
+
+    retry.click()
+    page.evaluate("__interaction.advanceRun()")
+    model.fill("stale/model")
+    model.press("Enter")
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='retry_run').length") == 1
+    edit.click()
+    page.evaluate("__interaction.switchFixtureSession()")
+    field.fill("stale queue edit")
+    modal.get_by_role("button", name="Save").click()
+    expect(modal).to_be_hidden()
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').length") == 2
+
+
 CASES = {
+    "1447-action-dialogs": action_dialogs,
     "2188-undo": undo,
     "2189-push-connected": lambda page: push(page, "connected"),
     "2189-push-offline": lambda page: push(page, "offline"),

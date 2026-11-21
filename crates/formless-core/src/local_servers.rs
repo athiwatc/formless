@@ -31,36 +31,37 @@ fn loopbacks(port: u16) -> Vec<SocketAddr> {
     ]
 }
 
-// Supported Ollama Host forms, restricted to local addresses before any I/O.
+// Supported host forms, restricted to local addresses before any I/O.
 // No hostname is resolved, including localhost and unspecified bind hosts.
-fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
+fn host_origins(raw: Option<&str>, env: &str, port: u16) -> Result<Vec<String>, String> {
     let raw = raw.unwrap_or("").trim().trim_matches(['\'', '"']);
     if raw.is_empty() {
-        return Ok(loopbacks(11434)
+        return Ok(loopbacks(port)
             .into_iter()
             .map(|addr| format!("http://{addr}"))
             .collect());
     }
-    let invalid = "OLLAMA_HOST is not a supported local address; add the provider manually.";
+    let invalid = || format!("{env} is not a supported local address; add the provider manually.");
+    let remote = || format!("{env} points at a remote host; add it as a provider manually.");
     if raw.len() > 2048 || raw.chars().any(char::is_control) || raw.contains(['@', '?', '#']) {
-        return Err(invalid);
+        return Err(invalid());
     }
     let (scheme, hostpath, default_port) = match raw.split_once("://") {
         Some(("http", rest)) => ("http", rest, 80),
         Some(("https", rest)) => ("https", rest, 443),
-        Some(_) => return Err(invalid),
-        None => ("http", raw, 11434),
+        Some(_) => return Err(invalid()),
+        None => ("http", raw, port),
     };
     let (authority, path) = hostpath
         .split_once('/')
         .map_or((hostpath, ""), |(host, path)| (host, path));
     let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, tail) = bracketed.split_once(']').ok_or(invalid)?;
+        let (host, tail) = bracketed.split_once(']').ok_or_else(invalid)?;
         let port = if tail.is_empty() {
             default_port
         } else {
             tail.strip_prefix(':')
-                .ok_or(invalid)?
+                .ok_or_else(invalid)?
                 .parse::<u16>()
                 .unwrap_or(default_port)
         };
@@ -77,9 +78,7 @@ fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
     } else if host.is_empty() {
         vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)]
     } else {
-        let mut ip: IpAddr = host
-            .parse()
-            .map_err(|_| "OLLAMA_HOST points at a remote host; add it as a provider manually.")?;
+        let mut ip: IpAddr = host.parse().map_err(|_| remote())?;
         if let IpAddr::V6(v6) = ip {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 ip = IpAddr::V4(v4);
@@ -93,7 +92,7 @@ fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
             };
         }
         if !ip.is_loopback() {
-            return Err("OLLAMA_HOST points at a remote host; add it as a provider manually.");
+            return Err(remote());
         }
         vec![SocketAddr::new(ip, port)]
     };
@@ -103,7 +102,7 @@ fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
             let value = format!("{scheme}://{addr}/{}", path.trim_end_matches('/'));
             reqwest::Url::parse(&value)
                 .map(|url| url.as_str().trim_end_matches('/').to_string())
-                .map_err(|_| invalid)
+                .map_err(|_| invalid())
         })
         .collect()
 }
@@ -221,12 +220,18 @@ pub fn discover() -> Vec<LocalServer> {
     discover_with_guidance().servers
 }
 
-// One `OLLAMA_HOST` snapshot yields both the probe origins and the hint.
-fn ollama_host(value: &Result<String, std::env::VarError>) -> Result<Vec<String>, &'static str> {
+// One environment snapshot yields both the probe origins and the hint.
+fn local_host(
+    value: &Result<String, std::env::VarError>,
+    env: &str,
+    port: u16,
+) -> Result<Vec<String>, String> {
     if matches!(value, Err(std::env::VarError::NotUnicode(_))) {
-        Err("OLLAMA_HOST is not a supported local address; add the provider manually.")
+        Err(format!(
+            "{env} is not a supported local address; add the provider manually."
+        ))
     } else {
-        ollama_origins(value.as_deref().ok())
+        host_origins(value.as_deref().ok(), env, port)
     }
 }
 
@@ -235,46 +240,96 @@ fn ollama_host(value: &Result<String, std::env::VarError>) -> Result<Vec<String>
 /// no I/O, no environment reads and no name resolution. Probe-dependent
 /// guidance from [`discover_with_guidance`] is not included.
 pub fn ollama_host_guidance(value: &Result<String, std::env::VarError>) -> Option<String> {
-    ollama_host(value).err().map(str::to_string)
+    local_host(value, "OLLAMA_HOST", 11434).err()
 }
 
 pub fn discover_with_guidance() -> Discovery {
-    let value = std::env::var("OLLAMA_HOST");
-    let raw = value.as_deref().ok();
-    let configured = raw.is_some_and(|s| !s.trim().trim_matches(['\'', '"']).is_empty());
-    let (ollama, mut hint) = match ollama_host(&value) {
-        Ok(origins) => (origins, None),
-        Err(hint) => (Vec::new(), Some(hint.to_string())),
-    };
-    let Ok(client) = client() else {
-        return Discovery {
-            servers: Vec::new(),
-            hint,
-        };
-    };
+    let client = client().ok();
     let mut found = Vec::new();
-    let lmstudio = loopbacks(1234)
-        .into_iter()
-        .map(|addr| format!("http://{addr}"))
-        .collect();
+    let mut hints = Vec::new();
     let mut budget = 4;
-    for (id, origins) in [("ollama", ollama), ("lmstudio", lmstudio)] {
-        if let Some(server) = probe_origins(&client, id, &origins, &mut budget) {
+    for (id, app, env, port) in [
+        ("ollama", "Ollama", "OLLAMA_HOST", 11434),
+        ("lmstudio", "LM Studio", "LM_STUDIO_HOST", 1234),
+    ] {
+        let value = std::env::var(env);
+        let origins = match local_host(&value, env, port) {
+            Ok(origins) => origins,
+            Err(hint) => {
+                hints.push(hint);
+                continue;
+            }
+        };
+        let Some(client) = client.as_ref() else {
+            continue;
+        };
+        if let Some(server) = probe_origins(client, id, &origins, &mut budget) {
             found.push(server);
-        } else if id == "ollama" && configured && hint.is_none() {
-            hint = Some("No model API answered at the local OLLAMA_HOST address. Check Ollama or add the provider manually.".into());
+        } else if value
+            .as_deref()
+            .is_ok_and(|s| !s.trim().trim_matches(['\'', '"']).is_empty())
+        {
+            hints.push(format!("No model API answered at the local {env} address. Check {app} or add the provider manually."));
         }
     }
     found.sort_by_key(|s| s.models == 0);
     Discovery {
         servers: found,
-        hint,
+        hint: (!hints.is_empty()).then(|| hints.join(" ")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lm_studio_host_environment_finds_the_model_api_on_a_custom_port() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        env.set("OLLAMA_HOST", "remote.example");
+        env.set("LM_STUDIO_HOST", address.to_string());
+        let (thread, seen) = serve(
+            listener,
+            r#"{"object":"list","data":[{"id":"fixture"}]}"#.into(),
+            "200 OK",
+        );
+        let result = discover_with_guidance();
+        thread.join().unwrap();
+        assert_eq!(
+            result.servers,
+            [LocalServer {
+                preset_id: "lmstudio",
+                base_url: format!("http://{address}/v1"),
+                models: 1
+            }]
+        );
+        assert!(seen.lock().unwrap().starts_with("GET /v1/models HTTP/1.1"));
+        assert!(result
+            .hint
+            .unwrap()
+            .contains("OLLAMA_HOST points at a remote host"));
+    }
+
+    #[test]
+    fn lm_studio_host_defaults_to_loopback_and_refuses_remote_addresses() {
+        assert_eq!(
+            host_origins(None, "LM_STUDIO_HOST", 1234).unwrap(),
+            ["http://127.0.0.1:1234", "http://[::1]:1234"]
+        );
+        assert_eq!(
+            host_origins(Some("private.example:1235"), "LM_STUDIO_HOST", 1234).unwrap_err(),
+            "LM_STUDIO_HOST points at a remote host; add it as a provider manually."
+        );
+        assert!(host_origins(
+            Some("http://user:fixture@localhost:1235"),
+            "LM_STUDIO_HOST",
+            1234
+        )
+        .is_err());
+    }
+
     #[test]
     fn ollama_host_environment_finds_a_random_local_port() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -433,11 +488,15 @@ mod tests {
                 vec!["http://127.0.0.1:11500/prefix", "http://[::1]:11500/prefix"],
             ),
         ] {
-            assert_eq!(ollama_origins(Some(raw)).unwrap(), expected, "{raw}");
+            assert_eq!(
+                host_origins(Some(raw), "OLLAMA_HOST", 11434).unwrap(),
+                expected,
+                "{raw}"
+            );
         }
         let defaults = vec!["http://127.0.0.1:11434", "http://[::1]:11434"];
         for raw in [None, Some(""), Some("  ")] {
-            assert_eq!(ollama_origins(raw).unwrap(), defaults);
+            assert_eq!(host_origins(raw, "OLLAMA_HOST", 11434).unwrap(), defaults);
         }
     }
 
@@ -458,14 +517,17 @@ mod tests {
             "[::1",
             "local\nhost",
         ] {
-            assert!(ollama_origins(Some(raw)).is_err(), "{raw}");
+            assert!(
+                host_origins(Some(raw), "OLLAMA_HOST", 11434).is_err(),
+                "{raw}"
+            );
         }
         let env = crate::credential_env::EnvGuard::isolated();
         env.set("OLLAMA_HOST", "http://user:secret@example.com:11500");
         // The pure path discovery uses: no Ollama candidate, so no Ollama
         // server can be reported, and no fixed-port LM Studio probe runs.
         let value = std::env::var("OLLAMA_HOST");
-        assert!(ollama_host(&value).is_err());
+        assert!(local_host(&value, "OLLAMA_HOST", 11434).is_err());
         let hint = ollama_host_guidance(&value);
         assert!(hint.as_ref().unwrap().contains("manually"));
         assert!(!hint.unwrap().contains("secret"));
@@ -475,7 +537,8 @@ mod tests {
     fn ollama_host_path_is_probed_and_retained_without_redirects() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let origins = ollama_origins(Some(&format!("http://{addr}/prefix"))).unwrap();
+        let origins =
+            host_origins(Some(&format!("http://{addr}/prefix")), "OLLAMA_HOST", 11434).unwrap();
         let (thread, seen) = serve(
             listener,
             r#"{"models":[{"name":"fixture"}]}"#.into(),

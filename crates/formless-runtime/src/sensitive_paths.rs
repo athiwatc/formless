@@ -335,6 +335,9 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "_netrc"
             | ".git-credentials"
             | ".vault-token"
+            | "credentials.tfrc.json"
+            | ".terraformrc"
+            | "terraform.rc"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
@@ -399,6 +402,38 @@ mod tests {
             );
         }
         for relative in ["project/vault/notes.txt", ".vault-token.example"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn protects_terraform_config_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".terraform.d/credentials.tfrc.json",
+            ".terraformrc",
+            "AppData/Roaming/TERRAFORM.RC",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            ".terraform/notes.txt",
+            "credentials.tfrc.json.example",
+            ".terraformrc.sample",
+        ] {
             let path = root.join(relative);
             assert_eq!(
                 policy.classify(&path, &path).unwrap(),

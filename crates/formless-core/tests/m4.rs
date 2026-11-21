@@ -2668,6 +2668,7 @@ async fn retry_reruns_the_last_message_on_another_model() {
     let first = c.run_to_finish().await;
     c.send(Request::RetryRun {
         session_id: id.clone(),
+        expected_run_id: None,
         model: Some("other".into()),
         keep_original: true,
     })
@@ -2679,6 +2680,7 @@ async fn retry_reruns_the_last_message_on_another_model() {
     // The Session's own model is unchanged: the next Run uses it again.
     c.send(Request::RetryRun {
         session_id: id.clone(),
+        expected_run_id: None,
         model: None,
         keep_original: false,
     })
