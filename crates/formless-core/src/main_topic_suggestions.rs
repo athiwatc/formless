@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{bail, ensure, Context, Result};
 use formless_protocol::{
-    HarnessKind, TopicFeatureProposal, TopicInfo, TopicProposalRequest, TopicStatus,
+    TopicFeatureProposal, TopicInfo, TopicProposalRequest, TopicStatus, TopicStepOutline,
+    WorkspaceKind,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -14,8 +15,15 @@ use crate::storage::Store;
 
 pub(crate) const READ_TOPIC_CONTEXT: &str = "read_topic_context";
 pub(crate) const PROPOSE_TOPIC: &str = "propose_topic";
-const POLICY: &str = r#"Main Chat topic suggestions:
-Answer everyday chat, questions and brainstorming normally in Main. For an explicit request to do work in a named repo or project, use read_topic_context to get the persisted source user message IDs and local working directory, then propose_topic rather than starting work. One user message can request multiple independent features: put each in its own feature request, linked to that same original message ID, in one proposal. Do not create synthetic messages. Use the user's stated or standing builder and reviewer preferences and a known local repository path (the working directory is only a hint); ask in chat if the repo or workflow is unclear. Do not guess. Do not automatically re-propose cancelled or declined work. A proposal is pending only: the user must explicitly approve in the client's consent UI. A yes in chat is not approval to move messages, start work, run a harness, or use other tools to do the proposed work."#;
+const POLICY: &str = r#"Topic suggestions:
+Answer everyday chat, questions and brainstorming normally. For an explicit request to do work that belongs in a topic (such as changes in a named repo or a new accounting flow), use read_topic_context to get the persisted source user message IDs, topic tree and local working directory, then propose_topic rather than starting the proposed work. In a Topic Chat, continue the current topic's work normally; propose a child or another topic only for distinct work. Choose the closest existing topic that is neither pending approval nor rejected as parent when the request clearly belongs there. Otherwise omit the parent: from a Topic Chat this defaults to the current topic, and from Main the proposal sits directly under Main.
+One user message can request multiple independent work items: put each in its own feature request linked to the same original message ID. Do not create synthetic messages. Include a workspace only when the user names one or a known repo applies; otherwise omit it to use scratch space. The working directory is a hint, not a workspace choice by itself. Use an outline only from the user's stated or standing preferences; otherwise leave it empty. Keep workflow steps within the leaf topic instead of treating steps as child topics. Any supported harness can take any step, including using the same harness for multiple steps. The outline is advisory; the Formless model orchestrating the Topic Chat makes the final decisions.
+In a Topic Chat, bring harness questions and permission requests to the user. Do not answer on the user's behalf or grant or deny harness permissions yourself. Approving, rejecting, and cancelling topics are user actions, never assistant tool actions. Do not automatically re-propose cancelled or declined work. A proposal is pending only: the user must explicitly approve in the client's consent UI. A yes in chat is not approval to move messages, start work, run a harness, or use other tools to do the proposed work."#;
+
+pub(crate) enum SuggestionSource {
+    Main,
+    Topic(String),
+}
 
 pub(crate) fn is_topic_tool(name: &str) -> bool {
     matches!(name, READ_TOPIC_CONTEXT | PROPOSE_TOPIC)
@@ -26,7 +34,7 @@ pub(crate) fn system_prompt<'a>(
     session_id: &str,
     prompt: &'a str,
 ) -> Result<Cow<'a, str>> {
-    if store.is_main_chat(session_id)? && !prompt.contains(POLICY) {
+    if store.topic_suggestion_source(session_id)?.is_some() && !prompt.contains(POLICY) {
         Ok(Cow::Owned(format!("{prompt}\n\n{POLICY}")))
     } else {
         Ok(Cow::Borrowed(prompt))
@@ -37,23 +45,32 @@ pub(crate) fn definitions() -> [Value; 2] {
     [
         json!({"type": "function", "function": {
             "name": READ_TOPIC_CONTEXT,
-            "description": "Read recent Main Chat user message IDs and their original text, the local working directory, and recent topic proposal statuses. Use only to prepare a topic suggestion for explicit project work.",
+            "description": "Read recent user message IDs and original text from this chat, the local working directory, and the topic hierarchy. Use only to prepare a topic suggestion for explicit work.",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": false}
         }}),
         json!({"type": "function", "function": {
             "name": PROPOSE_TOPIC,
-            "description": "Suggest a pending topic for explicit project work in Main Chat. Use the user's repo and preferred builder and reviewer. Each independent feature gets its own request linked to the original user message. This does not approve, move messages, or start work.",
+            "description": "Suggest a pending topic for explicit work in Main or a Topic Chat. Each independent work item gets its own feature linked to the original user message. An optional outline is advisory. This does not approve, move messages, or start work.",
             "parameters": {
                 "type": "object", "additionalProperties": false,
-                "required": ["name", "message_ids", "repo", "builder", "reviewer", "features"],
+                "required": ["name", "message_ids", "features"],
                 "properties": {
                     "name": {"type": "string", "minLength": 1},
                     "message_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
-                    "repo": {"type": "string", "description": "Known absolute path to the user's local Git repository root."},
-                    "builder": {"type": "string", "enum": ["claude", "codex"]},
-                    "builder_model": {"type": ["string", "null"]},
-                    "reviewer": {"type": "string", "enum": ["claude", "codex"]},
-                    "reviewer_model": {"type": ["string", "null"]},
+                    "workspace": {"type": ["string", "null"], "description": "Known absolute workspace path; omit for scratch space."},
+                    "parent_topic_id": {"type": ["string", "null"], "description": "Existing parent topic ID; omit to use the current topic, or Main if called there."},
+                    "outline": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["title", "instructions", "access"],
+                        "properties": {
+                            "title": {"type": "string"},
+                            "instructions": {"type": "string"},
+                            "harness": {"enum": ["claude", "codex", "pi", "opencode", "antigravity", "acp", "muse", null]},
+                            "acp_agent": {"type": ["string", "null"], "description": "Required for the acp harness; omit for all other harnesses."},
+                            "model": {"type": ["string", "null"]},
+                            "access": {"type": "string", "enum": ["read_only", "write"]}
+                        }
+                    }},
                     "features": {"type": "array", "minItems": 1, "items": {
                         "type": "object", "additionalProperties": false,
                         "required": ["source_message_id", "request"],
@@ -73,11 +90,10 @@ pub(crate) fn definitions() -> [Value; 2] {
 struct ProposalArgs {
     name: String,
     message_ids: Vec<String>,
-    repo: PathBuf,
-    builder: HarnessKind,
-    builder_model: Option<String>,
-    reviewer: HarnessKind,
-    reviewer_model: Option<String>,
+    workspace: Option<PathBuf>,
+    parent_topic_id: Option<String>,
+    #[serde(default)]
+    outline: Vec<TopicStepOutline>,
     features: Vec<TopicFeatureProposal>,
 }
 
@@ -88,8 +104,9 @@ impl Daemon {
         agent_depth: usize,
     ) -> Result<()> {
         ensure!(
-            agent_depth == 0 && self.with_reader(|st| st.is_main_chat(session_id))?,
-            "topic suggestion tools are only available to the Main Chat assistant"
+            agent_depth == 0
+                && self.with_reader(|st| Ok(st.topic_suggestion_source(session_id)?.is_some()))?,
+            "topic suggestion tools are only available to the Main or Topic Chat assistant"
         );
         Ok(())
     }
@@ -115,20 +132,15 @@ impl Daemon {
                     !args.features.is_empty(),
                     "include at least one explicit feature request"
                 );
-                let topic = self.propose_topic_request(
-                    &TopicProposalRequest {
-                        source_session_id: session_id.into(),
-                        name: args.name,
-                        message_ids: args.message_ids,
-                        repo: args.repo,
-                        builder: args.builder,
-                        builder_model: args.builder_model,
-                        reviewer: args.reviewer,
-                        reviewer_model: args.reviewer_model,
-                        features: args.features,
-                    },
-                    true,
-                )?;
+                let topic = self.propose_topic_suggestion(&TopicProposalRequest {
+                    source_session_id: session_id.into(),
+                    name: args.name,
+                    message_ids: args.message_ids,
+                    workspace: args.workspace,
+                    parent_topic_id: args.parent_topic_id,
+                    outline: args.outline,
+                    features: args.features,
+                })?;
                 ensure!(
                     topic.status == TopicStatus::PendingApproval,
                     "topic is not pending approval"
@@ -142,26 +154,37 @@ impl Daemon {
 
 impl Store {
     fn topic_context(&self, session_id: &str) -> Result<Value> {
-        ensure!(
-            self.is_main_chat(session_id)?,
-            "topic context is only available in Main Chat"
-        );
+        let source = self
+            .topic_suggestion_source(session_id)?
+            .context("topic context is only available in Main or Topic Chat")?;
         let session = self
             .get_session(session_id)?
-            .context("Main Chat not found")?;
-        let proposals: Vec<_> = self
-            .list_topics()?
-            .into_iter()
+            .context("source chat not found")?;
+        let topics = self.list_topics()?;
+        let tree: Vec<_> = topics
+            .iter()
+            .map(|topic| {
+                json!({"id": topic.id, "name": topic.name, "parent_topic_id": topic.parent_topic_id,
+                    "status": topic.status})
+            })
+            .collect();
+        let proposals: Vec<_> = topics
+            .iter()
             .filter(|topic| topic.source_session_id == session_id)
             .take(8)
             .map(|topic| {
                 json!({"id": topic.id, "name": topic.name, "status": topic.status,
-                "message_ids": source_ids(&topic)})
+                "message_ids": source_ids(topic), "workspace": proposal_workspace(topic),
+                "parent_topic_id": topic.parent_topic_id})
             })
             .collect();
-        Ok(
-            json!({"cwd": session.cwd, "messages": self.recent_topic_messages(session_id)?, "proposals": proposals}),
-        )
+        Ok(json!({
+            "cwd": session.cwd,
+            "current_topic_id": source.topic_id(),
+            "messages": self.recent_topic_messages(session_id)?,
+            "topics": tree,
+            "proposals": proposals,
+        }))
     }
 
     pub(crate) fn existing_topic_suggestion(
@@ -169,10 +192,13 @@ impl Store {
         proposal: &TopicProposalRequest,
     ) -> Result<Option<TopicInfo>> {
         let source = &proposal.source_session_id;
-        ensure!(
-            self.is_main_chat(source)? && !self.session_deleted(source)?,
-            "topic suggestions must originate in Main Chat"
-        );
+        let source_chat = self
+            .topic_suggestion_source(source)?
+            .context("topic suggestions must originate in Main or Topic Chat")?;
+        let parent = proposal
+            .parent_topic_id
+            .as_deref()
+            .or(source_chat.topic_id());
         let selected: BTreeSet<_> = proposal.message_ids.iter().map(String::as_str).collect();
         ensure!(
             !selected.is_empty() && selected.len() == proposal.message_ids.len(),
@@ -188,13 +214,19 @@ impl Store {
             "every selected source message must have a feature request"
         );
         let mut covered = BTreeSet::new();
-        for topic in self
-            .list_topics()?
-            .into_iter()
-            .filter(|topic| topic.source_session_id == *source)
-        {
+        for topic in self.list_topics()?.into_iter().filter(|topic| {
+            topic.source_session_id == *source
+                && proposal_workspace(topic) == proposal.workspace.as_deref()
+                && topic.parent_topic_id.as_deref() == parent
+        }) {
             let sources = source_ids(&topic);
             if topic.status == TopicStatus::PendingApproval && sources == selected {
+                for step in &proposal.outline {
+                    crate::local_harness::validate_acp_agent(
+                        step.harness,
+                        step.acp_agent.as_deref(),
+                    )?;
+                }
                 return Ok(Some(topic));
             }
             covered.extend(sources.intersection(&selected).copied().map(str::to_owned));
@@ -207,10 +239,27 @@ impl Store {
     }
 }
 
+impl SuggestionSource {
+    fn topic_id(&self) -> Option<&str> {
+        match self {
+            Self::Main => None,
+            Self::Topic(id) => Some(id),
+        }
+    }
+}
+
 fn source_ids(topic: &TopicInfo) -> BTreeSet<&str> {
     topic
         .features
         .iter()
         .map(|feature| feature.source_message_id.as_str())
         .collect()
+}
+
+fn proposal_workspace(topic: &TopicInfo) -> Option<&std::path::Path> {
+    if topic.workspace_kind == WorkspaceKind::Scratch {
+        None
+    } else {
+        topic.workspace.as_deref()
+    }
 }

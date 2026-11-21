@@ -2,6 +2,9 @@
 //! paths as file capabilities. All data and restored databases are disposable.
 use super::*;
 
+#[path = "topic_interaction_tests.rs"]
+mod topic_interaction_tests;
+
 struct Fixture {
     daemon: Option<Arc<Daemon>>,
     root: std::path::PathBuf,
@@ -74,7 +77,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn topic_approval_moves_owned_attachments_without_granting_foreign_artifacts() {
+fn topic_approval_preserves_source_fork_and_topic_attachment_access_without_foreign_grants() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let file = f.paths.data_dir.join("artifacts/nested/topic.txt");
@@ -86,18 +89,18 @@ fn topic_approval_moves_owned_attachments_without_granting_foreign_artifacts() {
         .with_store(|st| Ok(st.create_session(None)?.id))
         .unwrap();
     let foreign = f.record(&file, 16, Some(&foreign_session));
-    let topic = f.daemon().with_store(|st| {
+    let (topic, fork) = f.daemon().with_store(|st| {
         let message = st.append_message_meta(&f.session, "user", "Inspect attached file", Some(json!({
             "attachments":[{"id":id,"path":file,"bytes":16,"mime":"text/plain"},{"id":foreign}]
         }).to_string()))?;
+        let fork = st.fork_session(&f.session, None, None)?.unwrap();
         let proposal = TopicProposalRequest {
+            parent_topic_id: None,
             source_session_id: f.session.clone(), message_ids: vec![message.id], features: vec![],
-            name: "Attachment".into(), repo: std::env::current_dir()?,
-            builder: HarnessKind::Claude, builder_model: None,
-            reviewer: HarnessKind::Codex, reviewer_model: None,
+            name: "Attachment".into(), workspace: Some(std::env::current_dir()?), outline: vec![],
         };
-        let topic = st.propose_topic(&proposal, &"a".repeat(40))?;
-        st.approve_topic(&topic.id)
+        let topic = st.propose_topic(&proposal, WorkspaceKind::Git, Some(&"a".repeat(40)))?;
+        Ok((st.approve_topic(&topic.id)?, fork))
     }).unwrap();
     let topic_session = topic.topic_session_id.unwrap();
     let page: Value = serde_json::from_str(
@@ -111,12 +114,42 @@ fn topic_approval_moves_owned_attachments_without_granting_foreign_artifacts() {
     let attachment =
         json!({"id":id,"path":file,"bytes":16,"_source_session":topic_session,"_source_seq":1});
     assert_eq!(access.read(&attachment, 100).unwrap(), b"topic attachment");
+    let mut fork_attachment = attachment.clone();
+    fork_attachment["_source_session"] = json!(fork.id);
+    assert_eq!(
+        access.read(&fork_attachment, 100).unwrap(),
+        b"topic attachment"
+    );
+    let mut wrong_seq = attachment.clone();
+    wrong_seq["_source_seq"] = json!(2);
+    assert!(access.read(&wrong_seq, 100).is_err());
+    assert!(f
+        .daemon()
+        .read_artifact_impl(&topic_session, &json!({"id":unrelated}))
+        .is_err());
     assert!(f
         .daemon()
         .read_artifact_impl(&topic_session, &json!({"id":foreign}))
         .is_err());
     f.daemon()
         .with_reader(|st| {
+            assert_eq!(
+                st.get_artifact(&id)?.unwrap().0.as_deref(),
+                Some(f.session.as_str())
+            );
+            let snapshot = crate::attachment_access::AttachmentAccess::snapshot(
+                st,
+                &[json!({"_attachments":[attachment,fork_attachment]})],
+            )?
+            .unwrap();
+            assert_eq!(
+                snapshot.read(&attachment, 100).unwrap(),
+                b"topic attachment"
+            );
+            assert_eq!(
+                snapshot.read(&fork_attachment, 100).unwrap(),
+                b"topic attachment"
+            );
             assert_eq!(
                 st.get_artifact(&unrelated)?.unwrap().0.as_deref(),
                 Some(f.session.as_str())
@@ -384,4 +417,449 @@ async fn restored_registry_cannot_authorize_outside_files_and_invalid_owned_targ
         f.assert_denied(&id).await;
     }
     assert_eq!(std::fs::read_to_string(outside).unwrap(), sentinel);
+}
+
+fn topic_fixture_proposal(
+    f: &Fixture,
+    workspace: Option<std::path::PathBuf>,
+) -> TopicProposalRequest {
+    let message = f
+        .daemon()
+        .with_store(|st| st.append_message(&f.session, "user", "Process X and Y"))
+        .unwrap();
+    TopicProposalRequest {
+        parent_topic_id: None,
+        source_session_id: f.session.clone(),
+        message_ids: vec![message.id],
+        features: vec![],
+        name: "Topic fixture".into(),
+        workspace,
+        outline: vec![],
+    }
+}
+
+#[tokio::test]
+async fn topic_fixture_workspace_classification_and_unavailable_start() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let ping = f.daemon().handle(Request::Ping).await.unwrap();
+    assert!(ping["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("topic_orchestration_v2")));
+    let proposal = topic_fixture_proposal(&f, None);
+    let topic = f.daemon().propose_topic_request(&proposal).unwrap();
+    assert_eq!(topic.workspace_kind, WorkspaceKind::Scratch);
+    assert!(topic.workspace.is_none());
+    assert!(topic.base_revision.is_none());
+    assert!(!f
+        .paths
+        .data_dir
+        .join("topic-workspaces")
+        .join(&topic.id)
+        .exists());
+    assert!(f
+        .daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone()
+        })
+        .await
+        .is_err());
+    let approved: TopicInfo = serde_json::from_value(
+        f.daemon()
+            .handle(Request::ApproveTopic {
+                approval: TopicApprovalRequest {
+                    topic_id: topic.id.clone(),
+                },
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let workspace = approved.workspace.clone().unwrap();
+    assert_eq!(
+        workspace,
+        f.paths.data_dir.join("topic-workspaces").join(&topic.id)
+    );
+    assert!(workspace.is_dir());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&workspace).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(
+        f.daemon()
+            .with_store(|st| st.approve_topic(&topic.id))
+            .unwrap()
+            .workspace,
+        Some(workspace)
+    );
+    let session = approved.topic_session_id.unwrap();
+    f.daemon()
+        .with_reader(|st| st.ensure_topic_chat_writable(&session))
+        .unwrap();
+    let message_result = f
+        .daemon()
+        .handle(Request::SendMessage {
+            session_id: session.clone(),
+            content: "Steer this topic".into(),
+            mode: SendMode::Send,
+            client_msg_id: None,
+        })
+        .await;
+    if let Err(error) = message_result {
+        assert!(!error.to_string().contains("read-only"));
+    }
+    for _ in 0..2 {
+        let error = f
+            .daemon()
+            .handle(Request::StartTopicWorkflow {
+                topic_id: topic.id.clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("orchestrator not available yet"));
+        let failed = f
+            .daemon()
+            .with_reader(|st| st.get_topic(&topic.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TopicStatus::Failed);
+        assert_eq!(failed.features[0].status, TopicFeatureStatus::Failed);
+        assert_eq!(
+            failed.features[0].detail.as_deref(),
+            Some("orchestrator not available yet")
+        );
+        assert!(failed.attempts.is_empty());
+        let reply = f
+            .daemon()
+            .handle(Request::RetryTopicFeature {
+                retry: TopicFeatureRetryRequest {
+                    topic_id: topic.id.clone(),
+                    feature_id: failed.features[0].id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["status"], "approved");
+        assert!(reply["attempts"].as_array().unwrap().is_empty());
+    }
+    let directory = f.root.join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let topic = f
+        .daemon()
+        .propose_topic_request(&topic_fixture_proposal(&f, Some(directory.clone())))
+        .unwrap();
+    assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
+    assert!(topic.base_revision.is_none());
+    let directory_topic = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&topic.id))
+        .unwrap();
+    assert_eq!(
+        directory_topic.workspace,
+        Some(directory.canonicalize().unwrap())
+    );
+
+    let repo = f.root.join("git");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--quiet"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--allow-empty",
+        "--quiet",
+        "-m",
+        "Base",
+    ]);
+    let base = git(&["rev-parse", "HEAD"]);
+    let git_proposal = topic_fixture_proposal(&f, Some(repo.clone()));
+    let git_topic = f.daemon().propose_topic_request(&git_proposal).unwrap();
+    assert_eq!(git_topic.workspace_kind, WorkspaceKind::Git);
+    assert_eq!(git_topic.base_revision.as_deref(), Some(base.as_str()));
+    std::fs::write(repo.join("dirty"), "dirty").unwrap();
+    assert!(f
+        .daemon()
+        .propose_topic_request(&git_proposal)
+        .unwrap_err()
+        .to_string()
+        .contains("clean"));
+    for path in [
+        f.root.join("missing"),
+        "relative".into(),
+        repo.join("dirty"),
+    ] {
+        assert!(f
+            .daemon()
+            .propose_topic_request(&topic_fixture_proposal(&f, Some(path)))
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn topic_fixture_scoped_mcp_results_conversations_files_and_cancellation() {
+    use sha2::{Digest, Sha256};
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let pending = f
+        .daemon()
+        .propose_topic_request(&topic_fixture_proposal(&f, None))
+        .unwrap();
+    let topic = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&pending.id))
+        .unwrap();
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let token = "fixture capability".repeat(3);
+    let input = topic.workspace.as_ref().unwrap().join("input.txt");
+    std::fs::write(&input, b"input data").unwrap();
+    let inputs = vec![TopicArtifact::File {
+        path: input.clone(),
+        sha256: format!("{:x}", Sha256::digest(b"input data")),
+    }];
+    let attempt = f
+        .daemon()
+        .with_store(|st| {
+            st.begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Scan",
+                StepAccess::ReadOnly,
+                HarnessKind::Claude,
+                None,
+                None,
+                &inputs,
+                &token,
+                topic.workspace.as_ref().unwrap(),
+            )
+        })
+        .unwrap();
+    let call = |operation| Request::TopicMcp {
+        request: TopicMcpRequest {
+            attempt_id: attempt.id.clone(),
+            capability_token: token.clone(),
+            operation,
+        },
+    };
+    assert!(f
+        .daemon()
+        .handle(Request::TopicMcp {
+            request: TopicMcpRequest {
+                attempt_id: attempt.id.clone(),
+                capability_token: "wrong".into(),
+                operation: TopicMcpOperation::ListConversations
+            }
+        })
+        .await
+        .is_err());
+    let conversations = f
+        .daemon()
+        .handle(call(TopicMcpOperation::ListConversations))
+        .await
+        .unwrap();
+    assert!(conversations
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["id"] == f.session));
+    let conversation = f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadConversation {
+            session_id: f.session.clone(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(conversation["session"]["id"], f.session);
+    assert!(f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadConversation {
+            session_id: "missing".into()
+        }))
+        .await
+        .is_err());
+    let message = f
+        .daemon()
+        .handle(call(TopicMcpOperation::AppendConversation {
+            content: "Scanning".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(message["session_id"], attempt.conversation_session_id);
+    let artifact = f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadArtifact { index: 0 }))
+        .await
+        .unwrap();
+    assert_eq!(artifact["base64"], "aW5wdXQgZGF0YQ==");
+    assert!(f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadArtifact { index: 1 }))
+        .await
+        .is_err());
+    std::fs::write(&input, b"changed").unwrap();
+    assert!(f
+        .daemon()
+        .handle(call(TopicMcpOperation::ReadArtifact { index: 0 }))
+        .await
+        .is_err());
+    for request in [
+        Request::SendMessage {
+            session_id: attempt.conversation_session_id.clone(),
+            content: "No".into(),
+            mode: SendMode::Send,
+            client_msg_id: None,
+        },
+        Request::EditMessage {
+            session_id: attempt.conversation_session_id.clone(),
+            message_id: message["id"].as_str().unwrap().into(),
+            content: "No".into(),
+        },
+        Request::ForkSession {
+            id: attempt.conversation_session_id.clone(),
+            name: None,
+            up_to_seq: None,
+        },
+    ] {
+        assert!(f
+            .daemon()
+            .handle(request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read-only"));
+    }
+    let running = f
+        .daemon()
+        .with_reader(|st| st.get_topic(&topic.id))
+        .unwrap()
+        .unwrap();
+    assert!(f
+        .daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone()
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        f.daemon()
+            .with_reader(|st| st.get_topic(&topic.id))
+            .unwrap()
+            .unwrap(),
+        running
+    );
+
+    let output = f
+        .paths
+        .data_dir
+        .join("topic-attempts")
+        .join(&attempt.id)
+        .join("outputs/report.txt");
+    std::fs::write(&output, b"report").unwrap();
+    let hash = format!("{:x}", Sha256::digest(b"report"));
+    for (path, sha256) in [
+        (input.clone(), hash.clone()),
+        (output.clone(), "wrong".into()),
+    ] {
+        assert!(f
+            .daemon()
+            .handle(call(TopicMcpOperation::ReportResult {
+                status: TopicAttemptStatus::Succeeded,
+                summary: "Report".into(),
+                outputs: vec![TopicArtifact::File { path, sha256 }]
+            }))
+            .await
+            .is_err());
+    }
+    let outputs = vec![
+        TopicArtifact::File {
+            path: output,
+            sha256: hash,
+        },
+        TopicArtifact::Text {
+            title: "Summary".into(),
+            content: "Done".into(),
+        },
+    ];
+    let report: TopicAttemptInfo = serde_json::from_value(
+        f.daemon()
+            .handle(call(TopicMcpOperation::ReportResult {
+                status: TopicAttemptStatus::Succeeded,
+                summary: "Done".into(),
+                outputs: outputs.clone(),
+            }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.outputs, outputs);
+    assert_eq!(report.summary.as_deref(), Some("Done"));
+    assert!(f
+        .daemon()
+        .handle(call(TopicMcpOperation::AppendConversation {
+            content: "stale".into()
+        }))
+        .await
+        .is_err());
+    let second = f
+        .daemon()
+        .with_store(|st| {
+            st.begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Accounting",
+                StepAccess::Write,
+                HarnessKind::Codex,
+                None,
+                None,
+                &[],
+                &token,
+                topic.workspace.as_ref().unwrap(),
+            )
+        })
+        .unwrap();
+    let cancelled: TopicInfo = serde_json::from_value(
+        f.daemon()
+            .handle(Request::CancelTopic {
+                topic_id: topic.id.clone(),
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cancelled.status, TopicStatus::Cancelled);
+    assert_eq!(
+        cancelled
+            .attempts
+            .iter()
+            .find(|a| a.id == second.id)
+            .unwrap()
+            .status,
+        TopicAttemptStatus::Cancelled
+    );
+    assert!(f
+        .daemon()
+        .with_store(|st| st.authenticate_topic_attempt(&second.id, &token))
+        .is_err());
 }

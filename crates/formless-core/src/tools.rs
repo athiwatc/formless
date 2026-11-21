@@ -1219,7 +1219,7 @@ fn definitions(
         .collect();
     let mut defs = builtin_definitions();
     if let Some(session_id) = session_id {
-        if store.is_main_chat(session_id)? {
+        if store.topic_suggestion_source(session_id)?.is_some() {
             defs.extend(main_topic_suggestions::definitions());
         }
     }

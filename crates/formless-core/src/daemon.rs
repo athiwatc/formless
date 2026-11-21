@@ -18,6 +18,9 @@ use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
+#[path = "topic_interactions.rs"]
+mod topic_interactions;
+
 #[path = "transcript_attempts.rs"]
 mod transcript_attempts;
 
@@ -556,7 +559,8 @@ impl EventFilter {
             | Event::SessionUpdated { .. }
             | Event::SessionDeleted { .. }
             | Event::ApprovalRequested { .. }
-            | Event::UserQuestion { .. } => true,
+            | Event::UserQuestion { .. }
+            | Event::HarnessPermissionRequested { .. } => true,
             Event::TranscriptAttempt { .. } if !self.transcript_attempts => false,
             Event::StreamRestarted { .. } if self.transcript_attempts => false,
             Event::MessageDelta { .. } | Event::ReasoningDelta { .. } if !self.deltas => false,
@@ -916,6 +920,9 @@ pub struct Daemon {
     grant_meta: StdMutex<HashMap<(ApprovalScope, String, String), (String, String)>>,
     /// Open `ask_user` questions, by id.
     questions: Arc<StdMutex<HashMap<String, oneshot::Sender<QuestionReply>>>>,
+    harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
+    harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
+    topic_questions: StdMutex<HashMap<String, (String, String)>>,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1157,6 +1164,9 @@ impl Daemon {
             denial_notes: StdMutex::new(Default::default()),
             grant_meta: StdMutex::new(Default::default()),
             questions: Arc::new(StdMutex::new(HashMap::new())),
+            harness_permissions: StdMutex::new(HashMap::new()),
+            harness_always: StdMutex::new(HashMap::new()),
+            topic_questions: StdMutex::new(HashMap::new()),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1765,6 +1775,7 @@ impl Daemon {
             Event::ApprovalRequested { approval_id, .. } => approval_id != id,
             Event::UserQuestion { question_id, .. } => question_id != id,
             Event::PromotionApprovalRequested { promotion_id, .. } => promotion_id != id,
+            Event::HarnessPermissionRequested { permission_id, .. } => permission_id != id,
             _ => true,
         });
     }
@@ -1773,13 +1784,17 @@ impl Daemon {
         match &ev {
             Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. }
-            | Event::PromotionApprovalRequested { .. } => {
+            | Event::PromotionApprovalRequested { .. }
+            | Event::HarnessPermissionRequested { .. } => {
                 self.pending_attention.locked().push(ev.clone())
             }
             Event::ApprovalAnswered { approval_id, .. } | Event::ApprovalClosed { approval_id } => {
                 self.remove_attention(approval_id)
             }
             Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
+            Event::HarnessPermissionClosed { permission_id, .. } => {
+                self.remove_attention(permission_id)
+            }
             Event::PromotionApprovalResolved { promotion_id } => {
                 self.remove_attention(promotion_id)
             }
@@ -1790,6 +1805,7 @@ impl Daemon {
             Event::ApprovalRequested { .. }
                 | Event::PromotionApprovalRequested { .. }
                 | Event::UserQuestion { .. }
+                | Event::HarnessPermissionRequested { .. }
         ) {
             let _ = self.attention.send(());
         }
@@ -1834,18 +1850,72 @@ impl Daemon {
     pub(crate) fn propose_topic_request(
         &self,
         proposal: &TopicProposalRequest,
-        from_main_assistant: bool,
     ) -> Result<TopicInfo> {
-        let (repo, base_revision) = topic_repo_snapshot(&proposal.repo)?;
+        self.persist_topic_proposal(proposal, false)
+    }
+
+    pub(crate) fn propose_topic_suggestion(
+        &self,
+        proposal: &TopicProposalRequest,
+    ) -> Result<TopicInfo> {
+        self.persist_topic_proposal(proposal, true)
+    }
+
+    fn persist_topic_proposal(
+        &self,
+        proposal: &TopicProposalRequest,
+        from_suggestion_tool: bool,
+    ) -> Result<TopicInfo> {
         let mut normalized = proposal.clone();
-        normalized.repo = repo;
+        let (kind, base) = match &proposal.workspace {
+            None => (WorkspaceKind::Scratch, None),
+            Some(path) => {
+                if !path.is_absolute() {
+                    bail!("topic workspace path must be absolute");
+                }
+                let path = path.canonicalize().context("workspace does not exist")?;
+                if !path.is_dir() {
+                    bail!("workspace must be an existing directory");
+                }
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&path)
+                    .args(["rev-parse", "--is-inside-work-tree"])
+                    .output()
+                    .context("could not inspect workspace with git")?;
+                let git_marker = path
+                    .ancestors()
+                    .any(|ancestor| ancestor.join(".git").exists());
+                if !output.status.success() && git_marker {
+                    bail!(
+                        "could not inspect Git workspace: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() != "true"
+                {
+                    bail!("Git workspace must be a working tree, not a bare repository");
+                }
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                {
+                    let (root, base) = topic_repo_snapshot(&path)?;
+                    normalized.workspace = Some(root);
+                    (WorkspaceKind::Git, Some(base))
+                } else {
+                    normalized.workspace = Some(path);
+                    (WorkspaceKind::Directory, None)
+                }
+            }
+        };
         let (topic, created) = self.with_store(|st| {
-            if from_main_assistant {
+            if from_suggestion_tool {
                 if let Some(existing) = st.existing_topic_suggestion(&normalized)? {
                     return Ok((existing, false));
                 }
             }
-            Ok((st.propose_topic(&normalized, &base_revision)?, true))
+            Ok((st.propose_topic(&normalized, kind, base.as_deref())?, true))
         })?;
         if created {
             self.broadcast(Event::TopicChanged {
@@ -1857,8 +1927,9 @@ impl Daemon {
 
     fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
+        self.with_store(|st| st.fail_topic_workflow(&topic.id, "orchestrator not available yet"))?;
         self.broadcast(Event::TopicChanged { topic_id: topic.id });
-        bail!("topic workflow was claimed, but harness execution is not implemented in this build; no child was launched. RecoverTopic releases the claim before retrying with a runner-enabled build")
+        bail!("orchestrator not available yet; topic failed and workspace lock released; no child was launched")
     }
 
     /// Handle one request as a connected client's would be (in-process
@@ -1971,7 +2042,7 @@ impl Daemon {
                 Ok(serde_json::to_value(self.with_store(|st| st.main_chat())?)?)
             }
             Request::ProposeTopic { proposal } => Ok(serde_json::to_value(
-                self.propose_topic_request(&proposal, false)?,
+                self.propose_topic_request(&proposal)?,
             )?),
             Request::ApproveTopic { approval } => {
                 let topic = self.with_store(|st| st.approve_topic(&approval.topic_id))?;
@@ -2015,8 +2086,21 @@ impl Daemon {
                 Ok(serde_json::to_value(attempt)?)
             }
             Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id),
+            Request::CancelTopic { topic_id } => {
+                let topic = self.with_store(|st| st.cancel_topic(&topic_id))?;
+                self.close_topic_interactions(&topic_id, None);
+                if let Some(session) = &topic.topic_session_id {
+                    if let Some(run) = self.runs.locked().get(session) {
+                        run.cancel_flag.store(true, Ordering::SeqCst);
+                        run.cancel.cancel();
+                    }
+                }
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
             Request::RecoverTopic { recovery } => {
                 let topic = self.with_store(|st| st.recover_topic(&recovery.topic_id))?;
+                self.close_topic_interactions(&recovery.topic_id, None);
                 self.broadcast(Event::TopicChanged {
                     topic_id: topic.id.clone(),
                 });
@@ -2031,10 +2115,65 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::TopicMcp { request } => {
-                self.with_reader(|st| {
-                    st.authenticate_topic_attempt(&request.attempt_id, &request.capability_token)
+                if let TopicMcpOperation::AskUser { questions } = &request.operation {
+                    let questions = parse_questions(&json!({"questions": questions}))?;
+                    let handler = self.topic_interaction_handler(
+                        &request.attempt_id,
+                        &request.capability_token,
+                    )?;
+                    let answer = handler.ask_question(questions, &self.shutdown).await;
+                    return Ok(serde_json::to_value(answer)?);
+                }
+                let ending = matches!(&request.operation, TopicMcpOperation::ReportResult { .. });
+                let attempt_id = request.attempt_id.clone();
+                let (value, topic_id, message)=self.with_store(|st| {
+                    st.transaction(|st| {
+                        let attempt=st.authenticate_topic_attempt(&request.attempt_id,&request.capability_token)?;
+                        let mut message=None;
+                        let value=match request.operation {
+                            TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
+                            TopicMcpOperation::ListConversations => serde_json::to_value(st.list_sessions()?)?,
+                            TopicMcpOperation::ReadConversation {session_id} => {
+                                if st.session_deleted(&session_id)? {bail!("conversation is deleted");}
+                                json!({"session":st.get_session(&session_id)?.context("conversation not found")?,
+                                    "messages":st.list_messages(&session_id)?})
+                            }
+                            TopicMcpOperation::AppendConversation {content} => {
+                                let msg=st.append_message(&attempt.conversation_session_id,"assistant",&content)?;
+                                let value=serde_json::to_value(&msg)?;
+                                message=Some(msg);value
+                            }
+                            TopicMcpOperation::ReadArtifact {index} => {
+                                let artifact=attempt.inputs.get(index).context("artifact index out of range")?;
+                                match artifact {
+                                    TopicArtifact::File {path,sha256} => {
+                                        let bytes=st.read_topic_input_file(&attempt.id,path,sha256)?;
+                                        use base64::Engine;
+                                        json!({"artifact":artifact,"base64":base64::engine::general_purpose::STANDARD.encode(bytes)})
+                                    }
+                                    _ => serde_json::to_value(artifact)?,
+                                }
+                            }
+                            TopicMcpOperation::ReportResult {status,summary,outputs} => {
+                                let result=st.report_topic_result(&attempt.id,&request.capability_token,status,&summary,&outputs)?;
+                                message=st.list_messages(&attempt.conversation_session_id)?.pop();
+                                serde_json::to_value(result)?
+                            }
+                        };
+                        Ok((value,attempt.topic_id,message))
+                    })
                 })?;
-                bail!("topic MCP operations are not implemented in this build; no conversation or workflow state was changed")
+                if ending {
+                    self.close_topic_interactions(&topic_id, Some(&attempt_id));
+                }
+                if let Some(message) = message {
+                    self.broadcast(Event::MessageAppended {
+                        session_id: message.session_id.clone(),
+                        message,
+                    });
+                }
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(value)
             }
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,
@@ -3880,6 +4019,10 @@ impl Daemon {
                 self.broadcast(Event::JobsChanged);
                 Ok(json!({"deleted": id}))
             }
+            Request::HarnessPermissionDecision {
+                permission_id,
+                option_id,
+            } => self.answer_harness_permission(&permission_id, option_id),
             Request::AnswerQuestion {
                 question_id,
                 answer,
@@ -4487,7 +4630,13 @@ impl Daemon {
                     .pending_attention
                     .locked()
                     .iter()
-                    .filter(|ev| matches!(ev, Event::ApprovalRequested { .. }))
+                    .filter(|ev| {
+                        matches!(
+                            ev,
+                            Event::ApprovalRequested { .. }
+                                | Event::HarnessPermissionRequested { .. }
+                        )
+                    })
                     .cloned()
                     .collect();
                 Ok(serde_json::to_value(pending)?)
@@ -5573,6 +5722,7 @@ impl Daemon {
         mode: SendMode,
         review: Option<reviewed_send::Review>,
     ) -> Result<Value> {
+        self.with_reader(|st| st.ensure_topic_chat_writable(&session_id))?;
         if let Some(review) = &review {
             reviewed_send::validate(&session_id, &review.expected_attachments)?;
             if mode == SendMode::Queue {
@@ -12600,6 +12750,8 @@ impl Daemon {
             ),
         };
         self.broadcast(Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: question_id.clone(),
             session_id: session_id.to_string(),
             question,
@@ -12941,8 +13093,14 @@ impl Daemon {
     fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
         let (_, path, bytes) = self
-            .with_store(|st| st.get_artifact(id))?
-            .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
+            .with_reader(|st| {
+                let Some(record) = st.get_artifact(id)? else {
+                    return Ok(None);
+                };
+                let allowed = record.0.as_deref() == Some(session_id)
+                    || st.topic_artifact_access(id, session_id, None, record.0.as_deref())?;
+                Ok(allowed.then_some(record))
+            })?
             .with_context(|| {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
@@ -17772,6 +17930,8 @@ fn is_control(req: &Request) -> bool {
             | Request::ApprovalDecision { .. }
             | Request::PromotionDecision { .. }
             | Request::AnswerQuestion { .. }
+            | Request::HarnessPermissionDecision { .. }
+            | Request::CancelTopic { .. }
     )
 }
 

@@ -5918,7 +5918,10 @@ impl App {
         match ev {
             // This client keeps legacy Subscribe. Correlated answer frames
             // belong only to explicit future-attempt consumers.
-            Event::TranscriptAttempt { .. } | Event::TopicChanged { .. } => {}
+            Event::TranscriptAttempt { .. }
+            | Event::TopicChanged { .. }
+            | Event::HarnessPermissionRequested { .. }
+            | Event::HarnessPermissionClosed { .. } => {}
             Event::MessageAppended {
                 session_id,
                 message,
@@ -6413,6 +6416,7 @@ impl App {
                 question,
                 options,
                 mut questions,
+                ..
             } => {
                 // An older daemon sends only the single-question form.
                 if questions.is_empty() {
@@ -21286,6 +21290,8 @@ mod tests {
             memory_mb: 64,
         });
         app.on_event(Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: "old-question".into(),
             session_id: "s1".into(),
             question: "Old question?".into(),
@@ -21397,6 +21403,8 @@ mod tests {
             vec![
                 reconnect_approval("current-approval", "background-session"),
                 Event::UserQuestion {
+                    topic_id: None,
+                    attempt_id: None,
                     question_id: "current-question".into(),
                     session_id: "s1".into(),
                     question: "Current question?".into(),
@@ -21511,6 +21519,8 @@ mod tests {
                     memory_mb: 64,
                 },
                 Event::UserQuestion {
+                    topic_id: None,
+                    attempt_id: None,
                     question_id: "closed-question".into(),
                     session_id: "s1".into(),
                     question: "stale".into(),
@@ -25014,6 +25024,8 @@ mod tests {
         let mut app = test_app();
         app.current = Some("s".into());
         app.on_event(Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: "q".into(),
             session_id: "s".into(),
             question: String::new(),
@@ -26313,6 +26325,8 @@ mod tests {
 
         app.input.clear();
         app.on_event(Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: "question-fixture".into(),
             session_id: "s1".into(),
             question: "Which path?".into(),

@@ -52,12 +52,14 @@ impl Drop for Fixture {
 fn proposal(repo: &std::path::Path, id: &str) -> Value {
     json!({
         "name": "Formless",
-        "repo": repo,
+        "workspace": repo,
         "message_ids": [id],
-        "builder": "claude",
-        "builder_model": "opus",
-        "reviewer": "codex",
-        "reviewer_model": "sol",
+        "outline": [
+            {"title": "Implement", "instructions": "Implement the feature", "harness": "claude",
+                "model": "opus", "access": "write"},
+            {"title": "Review", "instructions": "Review the change", "harness": "codex",
+                "model": "sol", "access": "read_only"},
+        ],
         "features": [
             {"source_message_id": id, "request": "Add X feature"},
             {"source_message_id": id, "request": "Add Y feature"},
@@ -129,7 +131,7 @@ async fn main_topic_tools_are_scoped_and_validate_source_ids() {
         ] {
             let (text, failed) = dispatch(&daemon, session, depth, tool, args).await;
             assert!(
-                failed && text.contains("only available to the Main Chat assistant"),
+                failed && text.contains("only available to the Main or Topic Chat assistant"),
                 "{text}"
             );
         }
@@ -209,7 +211,7 @@ async fn main_topic_chat_suggests_two_features_and_rejection_leaves_the_original
             let messages = body["messages"].as_array().unwrap();
             let system = messages[0]["content"].as_str().unwrap();
             assert!(system.contains("Existing cached prompt"));
-            assert_eq!(system.matches("Main Chat topic suggestions:").count(), 1);
+            assert_eq!(system.matches("Topic suggestions:").count(), 1);
             for tool in [READ_TOPIC_CONTEXT, PROPOSE_TOPIC] {
                 assert!(body["tools"]
                     .as_array()
@@ -303,6 +305,8 @@ async fn main_topic_chat_suggests_two_features_and_rejection_leaves_the_original
         .unwrap();
     assert_eq!(original.2, WORK);
     assert_eq!(topic.source_session_id, main.id);
+    assert_eq!(topic.workspace.as_deref(), Some(repo.as_path()));
+    assert!(topic.parent_topic_id.is_none());
     assert_eq!(topic.status, TopicStatus::PendingApproval);
     assert!(topic.attempts.is_empty());
     assert!(topic.topic_session_id.is_none());
@@ -367,4 +371,166 @@ async fn main_topic_chat_suggests_two_features_and_rejection_leaves_the_original
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn main_topic_suggests_accounting_outline_without_workspace() {
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let request = "Set up accounting: scan receipts, do accounting, then create reports.";
+    let (main, message) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?;
+            let message = st.append_message(&main.id, "user", request)?;
+            Ok((main, message))
+        })
+        .unwrap();
+    let outline = json!([
+        {"title": "Scan receipts", "instructions": "Read and extract receipt details.",
+            "harness": "acp", "acp_agent": "fixture-agent", "access": "read_only"},
+        {"title": "Do accounting", "instructions": "Reconcile entries against receipts.",
+            "harness": "acp", "acp_agent": "fixture-agent", "access": "write"},
+        {"title": "Create reports", "instructions": "Summarize the reconciled entries.",
+            "access": "write"},
+    ]);
+    let mut args = json!({
+        "name": "Accounting",
+        "message_ids": [message.id],
+        "outline": outline,
+        "features": [{"source_message_id": message.id, "request": request}],
+    });
+    let (result, failed) = dispatch(&daemon, &main.id, 0, PROPOSE_TOPIC, args.clone()).await;
+    assert!(!failed, "{result}");
+    let topic: TopicInfo = serde_json::from_str(&result).unwrap();
+    assert_eq!(topic.status, TopicStatus::PendingApproval);
+    assert!(topic.workspace.is_none());
+    assert_eq!(topic.outline.len(), 3);
+    assert_eq!(topic.outline[0].title, "Scan receipts");
+    assert!(topic.outline[0].harness.is_some());
+    assert_eq!(topic.outline[0].harness, topic.outline[1].harness);
+    assert_eq!(topic.outline[0].acp_agent.as_deref(), Some("fixture-agent"));
+    assert_eq!(topic.outline[1].title, "Do accounting");
+    assert_eq!(topic.outline[2].title, "Create reports");
+    assert!(topic.outline[2].harness.is_none());
+    assert!(topic.attempts.is_empty());
+    args["outline"][0]["acp_agent"] = Value::Null;
+    let (result, failed) = dispatch(&daemon, &main.id, 0, PROPOSE_TOPIC, args).await;
+    assert!(failed && result.contains("acp_agent"), "{result}");
+}
+
+#[tokio::test]
+async fn topic_chat_suggests_story_under_current_project() {
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let (main, message) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?;
+            let message = st.append_message(&main.id, "user", "Organize Project A")?;
+            Ok((main, message))
+        })
+        .unwrap();
+    let (result, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        json!({
+            "name": "Project A",
+            "message_ids": [message.id],
+            "features": [{"source_message_id": message.id, "request": message.content}],
+        }),
+    )
+    .await;
+    assert!(!failed, "{result}");
+    let project: TopicInfo = serde_json::from_str(&result).unwrap();
+    assert!(project.outline.is_empty());
+    let approved: TopicInfo = serde_json::from_value(
+        daemon
+            .handle(Request::ApproveTopic {
+                approval: formless_protocol::TopicApprovalRequest {
+                    topic_id: project.id.clone(),
+                },
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let project_chat = approved.topic_session_id.unwrap();
+    let story_message = daemon
+        .with_store(|st| {
+            let defs = toolreg::tool_definitions(st, Some(&project_chat), 30)?;
+            for tool in [READ_TOPIC_CONTEXT, PROPOSE_TOPIC] {
+                assert!(defs.iter().any(|def| def["function"]["name"] == tool));
+            }
+            st.append_message(&project_chat, "user", "Set up Story B in Project A")
+        })
+        .unwrap();
+    let (context, failed) =
+        dispatch(&daemon, &project_chat, 0, READ_TOPIC_CONTEXT, json!({})).await;
+    assert!(!failed, "{context}");
+    let context: Value = serde_json::from_str(&context).unwrap();
+    assert_eq!(context["current_topic_id"], project.id);
+    assert_eq!(
+        context["topics"],
+        json!([{
+            "id": project.id, "name": "Project A", "parent_topic_id": null, "status": "approved",
+        }])
+    );
+    assert_eq!(
+        context["messages"].as_array().unwrap().last().unwrap()["id"],
+        story_message.id
+    );
+    assert!(
+        dispatch(&daemon, &project_chat, 1, READ_TOPIC_CONTEXT, json!({}))
+            .await
+            .1
+    );
+
+    let mut args = json!({
+        "name": "Story B",
+        "message_ids": [story_message.id],
+        "features": [{"source_message_id": story_message.id, "request": story_message.content}],
+    });
+    let (result, failed) = dispatch(&daemon, &project_chat, 0, PROPOSE_TOPIC, args.clone()).await;
+    assert!(!failed, "{result}");
+    let story: TopicInfo = serde_json::from_str(&result).unwrap();
+    assert_eq!(story.source_session_id, project_chat);
+    assert_eq!(story.status, TopicStatus::PendingApproval);
+    assert_eq!(story.parent_topic_id.as_deref(), Some(project.id.as_str()));
+    assert!(story.topic_session_id.is_none());
+    assert!(story.attempts.is_empty());
+    args["parent_topic_id"] = json!(project.id);
+    let (result, failed) = dispatch(&daemon, &project_chat, 0, PROPOSE_TOPIC, args).await;
+    assert!(!failed, "{result}");
+    assert_eq!(
+        serde_json::from_str::<TopicInfo>(&result).unwrap().id,
+        story.id
+    );
+    let attempt_session = daemon
+        .with_store(|st| {
+            st.claim_topic_workflow(&project.id)?;
+            let attempt = st.begin_topic_attempt(
+                &project.id,
+                &project.features[0].id,
+                "Plan",
+                formless_protocol::StepAccess::ReadOnly,
+                formless_protocol::HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                &"fixture".repeat(5),
+                approved.workspace.as_deref().unwrap(),
+            )?;
+            let defs = toolreg::tool_definitions(st, Some(&attempt.conversation_session_id), 30)?;
+            for tool in [READ_TOPIC_CONTEXT, PROPOSE_TOPIC] {
+                assert!(!defs.iter().any(|def| def["function"]["name"] == tool));
+            }
+            Ok(attempt.conversation_session_id)
+        })
+        .unwrap();
+    for tool in [READ_TOPIC_CONTEXT, PROPOSE_TOPIC] {
+        assert!(
+            dispatch(&daemon, &attempt_session, 0, tool, json!({}))
+                .await
+                .1
+        );
+    }
 }
