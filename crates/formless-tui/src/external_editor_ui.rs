@@ -214,11 +214,21 @@ impl App {
                     );
                     return;
                 }
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let mut text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let original = if origin.text.contains('\r') {
+                    std::borrow::Cow::Owned(origin.text.replace("\r\n", "\n").replace('\r', "\n"))
+                } else {
+                    std::borrow::Cow::Borrowed(origin.text.as_str())
+                };
+                // Editors commonly append an end-of-file newline on save.
+                // Preserve additional newlines and existing final newlines.
+                if !original.ends_with('\n') && text.ends_with('\n') {
+                    text.pop();
+                }
                 if !origin.matches(self) {
                     self.notes
                         .push("editor result discarded: the target buffer changed".into());
-                } else if text == origin.text {
+                } else if text == original {
                     self.notes.push(
                         "editor returned no changes; GUI commands must wait until the file closes"
                             .into(),
@@ -861,27 +871,58 @@ mod tests {
     fn unchanged_crlf_tool_keeps_cursor_vim_and_valid_review() {
         let env = credential_env::EnvGuard::isolated();
         env.set("FORMLESS_API_KEY", "private-editor-dummy");
-        let mut app = crate::tests::test_app();
-        app.vim_mode = true;
-        let mut ed = editor("first\r\nsecond", EditMode::Code);
-        ed.cursor = 2;
-        ed.vim.mode = vim::Mode::Normal;
-        app.editor = Some(ed);
-        app.editor_review = Some(EditorReview {
-            scroll: Default::default(),
-            diff: "valid old diff".into(),
-            verdict: "valid checks".into(),
-            ok: true,
-        });
-        let path = fake(&mut app, "unchanged", "");
-        app.key(ctrl_g());
-        assert_clean(&path);
-        let ed = app.editor.as_ref().unwrap();
-        assert_eq!(ed.text(), "first\r\nsecond");
-        assert_eq!(ed.cursor, 2);
-        assert_eq!(ed.vim.mode, vim::Mode::Normal);
-        assert!(app.editor_review.is_some());
+        for (mode, returned) in [
+            ("unchanged", ""),
+            ("replace", "first\nsecond\n"),
+            ("replace", "first\r\nsecond\r\n"),
+        ] {
+            let mut app = crate::tests::test_app();
+            app.vim_mode = true;
+            let mut ed = editor("first\r\nsecond", EditMode::Code);
+            ed.cursor = 2;
+            ed.vim.mode = vim::Mode::Normal;
+            app.editor = Some(ed);
+            app.editor_review = Some(EditorReview {
+                scroll: Default::default(),
+                diff: "valid old diff".into(),
+                verdict: "valid checks".into(),
+                ok: true,
+            });
+            let path = fake(&mut app, mode, returned);
+            app.key(ctrl_g());
+            assert_clean(&path);
+            let ed = app.editor.as_ref().unwrap();
+            assert_eq!(ed.text(), "first\r\nsecond");
+            assert_eq!(ed.cursor, 2);
+            assert_eq!(ed.vim.mode, vim::Mode::Normal);
+            assert!(app.editor_review.is_some());
+            assert!(app
+                .notes
+                .last()
+                .unwrap()
+                .contains("editor returned no changes"));
+        }
     }
+
+    #[test]
+    fn external_composer_edits_preserve_intentional_final_newlines() {
+        let env = credential_env::EnvGuard::isolated();
+        env.set("FORMLESS_API_KEY", "private-editor-dummy");
+        for (original, returned, expected) in [
+            ("before", "edited\n", "edited"),
+            ("before", "edited\r\n", "edited"),
+            ("before", "edited\r\n\r\n", "edited\n"),
+            ("before\n", "edited\r\n", "edited\n"),
+        ] {
+            let mut app = crate::tests::test_app();
+            app.input.set(original);
+            let draft = fake(&mut app, "replace", returned);
+            app.key(ctrl_g());
+            assert_clean(&draft);
+            assert_eq!(app.input.expanded(), expected);
+        }
+    }
+
     #[test]
     fn tool_external_edit_generation_guards_equal_text_and_preserves_original_base_version() {
         let _env = credential_env::EnvGuard::isolated();

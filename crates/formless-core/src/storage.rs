@@ -20,6 +20,10 @@ mod pin_batch_tests;
 #[path = "run_id_lookup_tests.rs"]
 mod run_id_lookup_tests;
 
+#[path = "short_ids.rs"]
+mod short_ids;
+use short_ids::insert_short_id;
+
 /// A usage bucket's key, provider, model, prompt, completion, cache read and
 /// write tokens, reported cost, and whether the cost is explicitly unknown.
 pub type GroupedUsage = (
@@ -33,6 +37,9 @@ pub type GroupedUsage = (
     Option<f64>,
     bool,
 );
+
+#[path = "storage_forecast.rs"]
+mod forecast_storage;
 
 #[path = "forecast_snapshot.rs"]
 mod forecast_snapshot;
@@ -55,6 +62,9 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+
+#[path = "attachment_expiry.rs"]
+mod attachment_expiry;
 
 #[path = "recap_storage.rs"]
 mod recap_storage;
@@ -506,15 +516,6 @@ CREATE INDEX IF NOT EXISTS idx_builtin_calls ON builtin_calls(name, created_at);
 CREATE INDEX IF NOT EXISTS idx_builtin_calls_run ON builtin_calls(run_id);
 ";
 
-/// Applied memory-kind proposals move into the memory store (author
-/// `optimiser`, linked for rollback).
-const SCHEMA_V18: &str = "
-INSERT OR IGNORE INTO memories(id,text,dedup_key,scope,author,enabled,created_at,updated_at,proposal_id)
-  SELECT 'm' || lower(hex(randomblob(4))), trim(content), lower(trim(content)), 'global', 'optimiser', 1,
-         COALESCE(applied_at, created_at), COALESCE(applied_at, created_at), id
-  FROM prompt_proposals WHERE kind='memory' AND status='applied';
-";
-
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -542,6 +543,16 @@ impl ModelStat {
 /// schema v39) and triggers on `messages`/`runs` keep them true, so the
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
+
+fn run_duration_ms(created: &str, updated: &str) -> i64 {
+    match (
+        chrono::DateTime::parse_from_rfc3339(created),
+        chrono::DateTime::parse_from_rfc3339(updated),
+    ) {
+        (Ok(start), Ok(end)) => (end - start).num_milliseconds().max(0),
+        _ => 0,
+    }
+}
 
 /// Schema version this build writes (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: i64 = 70;
@@ -674,7 +685,7 @@ const MIGRATIONS: [(i64, MigrationStep); 68] = [
     (17, |c| Ok(c.execute_batch(SCHEMA_V17)?)),
     (18, |c| {
         add_column(c, "memories", "proposal_id TEXT")?;
-        Ok(c.execute_batch(SCHEMA_V18)?)
+        short_ids::migrate_applied_memories(c, uuid::Uuid::new_v4)
     }),
     // Run-level metrics (SPEC §8.7).
     (19, |c| {
@@ -2514,11 +2525,14 @@ impl Store {
         approved: bool,
         author: &str,
     ) -> Result<formless_protocol::JobInfo> {
-        let id = format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)",
-            params![id, prompt, session_id, cron, next_run, approved, author, now()],
-        )?;
+        let created = now();
+        let id = insert_short_id('j', "job", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, prompt, session_id, cron, next_run, approved, author, created],
+            )
+        })?;
         self.get_job(&id)?.context("job vanished")
     }
 
@@ -2884,12 +2898,14 @@ impl Store {
         tool: &str,
         reason: &str,
     ) -> Result<String> {
-        let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
-        )?;
-        Ok(id)
+        let (before, after, created) = (before.to_string(), after.to_string(), now());
+        insert_short_id('h', "harness change", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, op, target, before, after, tool, reason, created],
+            )
+        })
     }
 
     /// Harness changes, newest first.
@@ -3190,8 +3206,7 @@ impl Store {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
-        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
-        if !exists {
+        if !self.has_forecast_history()? {
             return Ok(Vec::new());
         }
         let mut stmt =
@@ -3264,43 +3279,6 @@ impl Store {
         let rows = stmt.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    pub fn forecast_usage(
-        &self,
-        run_id: &str,
-        cfg: &crate::Config,
-    ) -> Result<(Option<f64>, u64, u64)> {
-        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source,cost_unknown FROM run_usage WHERE run_id=?1")?;
-        let rows = stmt.query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<f64>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, bool>(8)?,
-            ))
-        })?;
-        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
-        let mut any = false;
-        for row in rows {
-            let (p, m, input, output, cache, write, reported, source, unknown) = row?;
-            any = true;
-            // Only the main Session request drives its compaction threshold;
-            // nested llm/sub-agent/summarizer contexts have separate windows.
-            if source == "run" {
-                peak = peak.max(input.max(0) as u64);
-            }
-            cached += cache.max(0) as u64;
-            cost = cost
-                .zip(cfg.cost_of_known(&p, &m, input, output, cache, write, reported, unknown))
-                .map(|(a, b)| a + b);
-        }
-        Ok((cost.filter(|_| any), peak, cached))
-    }
-
     pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
         Ok(self
             .ps("SELECT COUNT(*) FROM runs WHERE session_id=?1")?
@@ -3399,13 +3377,7 @@ impl Store {
         let rows = stmt
             .query_map(params![limit as i64, session_id, since, run_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
-                let duration_ms = match (
-                    chrono::DateTime::parse_from_rfc3339(&created),
-                    chrono::DateTime::parse_from_rfc3339(&updated),
-                ) {
-                    (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
-                    _ => 0,
-                };
+                let duration_ms = run_duration_ms(&created, &updated);
                 let status: String = r.get(2)?;
                 let followup: String = r.get(3)?;
                 let rating: String = r.get(10)?;
@@ -6002,32 +5974,32 @@ impl Store {
         }
         let key = crate::memory::dedup_key(text);
         let t = now();
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
-                params![scope, key],
-                |r| r.get(0),
-            )
-            .ok();
-        let (id, created) = match existing {
-            Some(id) => {
-                self.ex(
+        self.transaction(|st| {
+            let existing: Option<String> = st
+                .conn
+                .query_row(
+                    "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
+                    params![scope, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                st.ex(
                     "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
                     params![id, t],
                 )?;
-                (id, false)
+                return Ok((st.get_memory(&id)?.context("memory vanished")?, false));
             }
-            None => {
-                let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                self.ex(
-                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-                    params![id, crate::memory::clean(text), key, scope, author, session_id, t],
-                )?;
-                (id, true)
-            }
-        };
-        Ok((self.get_memory(&id)?.context("memory vanished")?, created))
+            let text = crate::memory::clean(text);
+            let id = insert_short_id('m', "memory", uuid::Uuid::new_v4, |id| {
+                st.ex(
+                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![id, text, key, scope, author, session_id, t],
+                )
+            })?;
+            Ok((st.get_memory(&id)?.context("memory vanished")?, true))
+        })
     }
 
     pub fn get_memory(&self, id: &str) -> Result<Option<formless_protocol::MemoryInfo>> {
@@ -6645,44 +6617,6 @@ impl Store {
     /// Mark the attachments with these artifact ids as expired in the
     /// messages that carry them, so every client and the model's history
     /// say so instead of pointing at a removed file (#858).
-    pub fn mark_attachments_expired(&self, ids: &[String]) -> Result<usize> {
-        let mut changed = 0;
-        for id in ids {
-            let rows: Vec<(String, String)> = {
-                let mut stmt =
-                    self.ps("SELECT id, meta FROM messages WHERE role='user' AND meta LIKE ?1")?;
-                let rows = stmt
-                    .query_map(params![format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                rows
-            };
-            for (msg_id, meta) in rows {
-                let Ok(mut v) = serde_json::from_str::<Value>(&meta) else {
-                    continue;
-                };
-                let mut hit = false;
-                for a in v["attachments"].as_array_mut().into_iter().flatten() {
-                    if a["id"].as_str() == Some(id.as_str()) && a["expired"] != true {
-                        a["expired"] = json!(true);
-                        hit = true;
-                    }
-                }
-                if hit {
-                    self.ex(
-                        "UPDATE messages SET meta=?1 WHERE id=?2",
-                        params![v.to_string(), msg_id],
-                    )?;
-                    changed += 1;
-                }
-            }
-        }
-        if changed > 0 {
-            self.rewrites
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(changed)
-    }
-
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
         self.ex(
             "DELETE FROM artifacts WHERE session_id=?1",
