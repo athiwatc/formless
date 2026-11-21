@@ -217,6 +217,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    Manage {
+        destination: Destination,
+        request: Request,
+        label: String,
+    },
     UndoDelete(uuid::Uuid),
     ReadRunAction {
         owner: crate::run_actions::Owner,
@@ -646,6 +651,7 @@ impl Client {
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
+                | Command::Manage { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -811,6 +817,11 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    Manage {
+        destination: Destination,
+        label: String,
+        undo: bool,
+    },
     RunReconcile(run_actions::Recovery),
     RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
@@ -1535,16 +1546,18 @@ impl Engine {
         {
             return;
         }
-        let request = match destination {
-            Destination::Tools => Request::ListTools,
-            Destination::Metrics => Request::RunMetrics {
-                limit: Some(100),
-                session_id: None,
-                since: None,
+        let request = match crate::manage::list_request(destination) {
+            Some(request) => request,
+            None => match destination {
+                Destination::Metrics => Request::RunMetrics {
+                    limit: Some(100),
+                    session_id: None,
+                    since: None,
+                },
+                Destination::Proposals => Request::ListProposals,
+                Destination::Settings => Request::GetSettings,
+                _ => return,
             },
-            Destination::Proposals => Request::ListProposals,
-            Destination::Settings => Request::GetSettings,
-            _ => return,
         };
         self.request(request, Pending::Page(destination));
     }
@@ -2107,6 +2120,27 @@ impl Engine {
                 generation,
             } => self.select(session_id, generation),
             Command::Page(page) => self.load_page(page),
+            Command::Manage {
+                destination,
+                request,
+                label,
+            } => {
+                if self.ready {
+                    let undo = matches!(request, Request::UndoRegistryChange);
+                    self.request(
+                        request,
+                        Pending::Manage {
+                            destination,
+                            label,
+                            undo,
+                        },
+                    );
+                } else {
+                    self.updates.push(Update::Notice(format!(
+                        "Could not {label}: Not connected; nothing was sent."
+                    )));
+                }
+            }
             Command::Refresh => {
                 self.recover_run_actions();
                 self.stream_reload();
@@ -2393,6 +2427,21 @@ impl Engine {
         let definite_rejection = run_actions::definite_rejection(&message);
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if let Some(destination) = self.page {
+                    let refresh = matches!(
+                        (destination, &event),
+                        (
+                            Destination::Tools,
+                            Event::RegistryChanged { .. } | Event::ToolUpdated { .. }
+                        ) | (Destination::Mcp, Event::McpServersChanged)
+                            | (Destination::Skills, Event::SkillsChanged)
+                            | (Destination::Memory, Event::MemoryUpdated)
+                            | (Destination::Jobs, Event::JobsChanged)
+                    );
+                    if refresh {
+                        self.load_page(destination);
+                    }
+                }
                 if let Event::CompactionNotice { session_id, .. } = &event {
                     self.pending.retain(|_, p| !matches!(p, Pending::LiveContext(owner) if owner.session == *session_id));
                     self.outgoing.retain(|r| self.pending.contains_key(&r.id));
@@ -3017,6 +3066,27 @@ impl Engine {
                     query,
                     result: result.and_then(profile_search::decode),
                 })
+            }
+            Pending::Manage {
+                destination,
+                label,
+                undo,
+            } => {
+                let notice = match result {
+                    Ok(value) if undo => {
+                        let summary = value
+                            .get("undone")
+                            .and_then(Value::as_str)
+                            .unwrap_or("registry change");
+                        format!("Undone: {summary}")
+                    }
+                    Ok(_) => format!("Done: {label}"),
+                    Err(error) => format!("Could not {label}: {error}"),
+                };
+                self.updates.push(Update::Notice(notice));
+                if self.page == Some(destination) {
+                    self.load_page(destination);
+                }
             }
             Pending::Page(destination) => self.updates.push(Update::Page {
                 destination,
@@ -5354,6 +5424,146 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn managed_pages_use_their_list_requests_and_deduplicate_pending_reads() {
+        for destination in [
+            Destination::Tools,
+            Destination::Mcp,
+            Destination::Skills,
+            Destination::Memory,
+            Destination::Jobs,
+        ] {
+            let mut engine = ready();
+            engine.load_page(destination);
+            engine.load_page(destination);
+            assert_eq!(engine.outgoing.len(), 1);
+            let request = engine.outgoing.pop_front().unwrap();
+            assert_eq!(
+                serde_json::to_value(request.request).unwrap(),
+                serde_json::to_value(crate::manage::list_request(destination).unwrap()).unwrap()
+            );
+            respond(&mut engine, request.id, json!([]));
+            assert!(
+                matches!(engine.updates.last(), Some(Update::Page { destination: d, result: Ok(_), .. }) if *d == destination)
+            );
+        }
+    }
+
+    #[test]
+    fn management_reports_receipts_and_refreshes_only_the_current_destination() {
+        for (success, current) in [
+            (true, Destination::Skills),
+            (false, Destination::Skills),
+            (true, Destination::Jobs),
+        ] {
+            let mut engine = ready();
+            engine.page = Some(current);
+            engine.command(Command::Manage {
+                destination: Destination::Skills,
+                request: Request::RemoveSkill { name: "foo".into() },
+                label: "remove skill foo".into(),
+            });
+            let request = engine.outgoing.pop_front().unwrap();
+            assert!(matches!(request.request, Request::RemoveSkill { name } if name == "foo"));
+            if success {
+                respond(&mut engine, request.id, json!({}));
+            } else {
+                engine
+                    .receive(ServerMessage::err(request.id, "permission denied".into()))
+                    .unwrap();
+            }
+            let expected = if success {
+                "Done: remove skill foo"
+            } else {
+                "Could not remove skill foo: permission denied"
+            };
+            assert!(engine
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::Notice(text) if text == expected)));
+            assert_eq!(
+                engine.outgoing.len(),
+                usize::from(current == Destination::Skills)
+            );
+            if current == Destination::Skills {
+                assert!(matches!(engine.outgoing[0].request, Request::ListSkills));
+            }
+            assert_eq!(engine.page, Some(current));
+        }
+    }
+
+    #[test]
+    fn management_requires_ready_and_undo_names_the_reverted_change() {
+        let mut engine = Engine::default();
+        engine.command(Command::Manage {
+            destination: Destination::Tools,
+            request: Request::UndoRegistryChange,
+            label: "undo last change".into(),
+        });
+        assert!(engine.outgoing.is_empty());
+        assert!(
+            matches!(engine.updates.last(), Some(Update::Notice(text)) if text.contains("Could not undo last change") && text.contains("Not connected"))
+        );
+        let mut engine = ready();
+        engine.page = Some(Destination::Tools);
+        engine.command(Command::Manage {
+            destination: Destination::Tools,
+            request: Request::UndoRegistryChange,
+            label: "undo last change".into(),
+        });
+        let request = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(request.request, Request::UndoRegistryChange));
+        respond(
+            &mut engine,
+            request.id,
+            json!({"undone":"user retired fetch_page", "tool":{"name":"fetch_page"}}),
+        );
+        assert!(
+            matches!(engine.updates.last(), Some(Update::Notice(text)) if text == "Undone: user retired fetch_page")
+        );
+        assert!(matches!(engine.outgoing[0].request, Request::ListTools));
+    }
+
+    #[test]
+    fn resource_events_reload_only_the_matching_page_and_coalesce_reads() {
+        let registry: Event = serde_json::from_value(json!({"type":"registry_changed", "change":{"tool_id":"t","name":"tool","action":"retired","from_version":1,"to_version":1,"author":"user","at":"now"}})).unwrap();
+        let tool: Event = serde_json::from_value(json!({"type":"tool_updated", "tool":{"id":"t","name":"tool","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":1,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}})).unwrap();
+        let cases = [
+            (Destination::Tools, registry),
+            (Destination::Tools, tool),
+            (Destination::Mcp, Event::McpServersChanged),
+            (Destination::Skills, Event::SkillsChanged),
+            (Destination::Memory, Event::MemoryUpdated),
+            (Destination::Jobs, Event::JobsChanged),
+        ];
+        for destination in [
+            Destination::Tools,
+            Destination::Mcp,
+            Destination::Skills,
+            Destination::Memory,
+            Destination::Jobs,
+            Destination::Settings,
+        ] {
+            for (matching, event) in &cases {
+                let mut engine = ready();
+                engine.page = Some(destination);
+                engine.receive(ServerMessage::Event(event.clone())).unwrap();
+                engine.receive(ServerMessage::Event(event.clone())).unwrap();
+                assert_eq!(
+                    engine.outgoing.len(),
+                    usize::from(destination == *matching),
+                    "{destination:?} / {event:?}"
+                );
+                assert_eq!(engine.page, Some(destination));
+            }
+        }
+        let mut engine = ready();
+        engine
+            .receive(ServerMessage::Event(Event::JobsChanged))
+            .unwrap();
+        assert!(engine.outgoing.is_empty());
     }
 
     #[tokio::test]
