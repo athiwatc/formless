@@ -676,6 +676,7 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | `FORMLESS_OAUTH_CLIENT_SECRET` | OAuth mode: client secret for providers that need one (never stored in config) |
 | `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process; trimmed, empty/whitespace-only values ignored |
 | `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR` | relocate state (also how the auto-started daemon inherits them) |
+| `FORMLESS_BIN` | path to the `formless` CLI the desktop app uses to start the daemon; checked after the CLI next to the app and before PATH |
 | `FORMLESS_IDLE_GRACE_SECS` | idle daemon timeout as a nonnegative whole number of seconds; invalid or empty values are errors |
 | `FORMLESS_SECURE` | process override for `security.secure`: `1/true/yes/on` or `0/false/no/off`, case insensitive; blank is ignored, invalid values are errors |
 | `FORMLESS_DAEMON_STAY` | keep the daemon alive as with `daemon serve --stay`; presence enables it |
