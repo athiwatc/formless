@@ -3,7 +3,7 @@
 //! with per-role overrides from `[tui.colors]`.
 
 use ratatui::style::Color;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,7 +11,7 @@ pub enum Kind {
     Dark,
     Light,
     HighContrast,
-    Colorblind,
+    Colorblind { light: bool },
 }
 
 /// One status vocabulary and palette, shared by terminal tables and TUI views.
@@ -21,11 +21,23 @@ pub enum SemanticTone {
     Warn,
     Bad,
 }
-pub const fn colorblind_rgb(tone: SemanticTone) -> (u8, u8, u8) {
-    match tone {
-        SemanticTone::Good => (86, 180, 233),
-        SemanticTone::Warn => (240, 228, 66),
-        SemanticTone::Bad => (230, 159, 0),
+pub fn colorblind_rgb(tone: SemanticTone) -> (u8, u8, u8) {
+    let light = THEME.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|t| matches!(t.kind, Kind::Colorblind { light: true }))
+    });
+    colorblind_rgb_on_background(tone, light)
+}
+
+pub const fn colorblind_rgb_on_background(tone: SemanticTone, light: bool) -> (u8, u8, u8) {
+    match (light, tone) {
+        (false, SemanticTone::Good) => (86, 180, 233),
+        (false, SemanticTone::Warn) => (240, 228, 66),
+        (false, SemanticTone::Bad) => (230, 159, 0),
+        (true, SemanticTone::Good) => (0, 100, 160),
+        (true, SemanticTone::Warn) => (123, 83, 0),
+        (true, SemanticTone::Bad) => (170, 55, 10),
     }
 }
 pub const fn tone_marker(tone: SemanticTone) -> &'static str {
@@ -41,7 +53,7 @@ pub(crate) fn redundant(color: bool) -> bool {
             theme
                 .borrow()
                 .as_ref()
-                .is_some_and(|theme| theme.kind == Kind::Colorblind)
+                .is_some_and(|theme| matches!(theme.kind, Kind::Colorblind { .. }))
         })
 }
 
@@ -65,6 +77,7 @@ impl Default for Theme {
 // other threads keep the plain palette).
 thread_local! {
     static THEME: RefCell<Option<Theme>> = const { RefCell::new(None) };
+    static PROBED_BACKGROUND: Cell<Option<Kind>> = const { Cell::new(None) };
 }
 
 /// Use `theme` from now on.
@@ -72,15 +85,24 @@ pub fn set(theme: Theme) {
     THEME.with(|t| *t.borrow_mut() = Some(theme));
 }
 
-/// The theme for `tui.theme` and `[tui.colors]`. "auto" picks light or
-/// dark from `COLORFGBG` (set by many terminals), else dark.
+/// The theme for `tui.theme` and `[tui.colors]`. The automatic and
+/// colorblind palettes use the detected terminal background.
 pub fn from_config(name: &str, colors: &HashMap<String, String>) -> Theme {
+    let automatic = || {
+        std::env::var("COLORFGBG")
+            .ok()
+            .map(|value| detect(Some(&value)))
+            .or_else(|| PROBED_BACKGROUND.with(Cell::get))
+            .unwrap_or(Kind::Dark)
+    };
     let kind = match name {
         "light" => Kind::Light,
         "high-contrast" => Kind::HighContrast,
-        "colorblind" => Kind::Colorblind,
+        "colorblind" => Kind::Colorblind {
+            light: automatic() == Kind::Light,
+        },
         "dark" => Kind::Dark,
-        _ => detect(std::env::var("COLORFGBG").ok().as_deref()),
+        _ => automatic(),
     };
     let roles = colors
         .iter()
@@ -205,28 +227,26 @@ fn palette(kind: Kind, c: Color) -> Color {
             Color::White => Color::Black,
             other => other,
         },
-        Kind::Colorblind => match c {
+        Kind::Colorblind { light } => match c {
             Color::Green
             | Color::LightGreen
             | Color::Blue
             | Color::LightBlue
             | Color::Cyan
             | Color::LightCyan => {
-                let (r, g, b) = colorblind_rgb(SemanticTone::Good);
+                let (r, g, b) = colorblind_rgb_on_background(SemanticTone::Good, light);
                 Color::Rgb(r, g, b)
             }
             Color::Red | Color::LightRed => {
-                let (r, g, b) = colorblind_rgb(SemanticTone::Bad);
+                let (r, g, b) = colorblind_rgb_on_background(SemanticTone::Bad, light);
                 Color::Rgb(r, g, b)
             }
             Color::Yellow | Color::LightYellow => {
-                let (r, g, b) = colorblind_rgb(SemanticTone::Warn);
+                let (r, g, b) = colorblind_rgb_on_background(SemanticTone::Warn, light);
                 Color::Rgb(r, g, b)
             }
-            Color::Magenta | Color::LightMagenta => Color::Rgb(204, 121, 167),
-            Color::Gray => Color::Rgb(171, 178, 191),
-            Color::DarkGray => Color::Rgb(140, 140, 140),
-            other => other,
+            Color::Magenta | Color::LightMagenta if !light => Color::Rgb(204, 121, 167),
+            other => palette(if light { Kind::Light } else { Kind::Dark }, other),
         },
         // Bright variants for the most contrast on a dark background.
         Kind::HighContrast => match c {
@@ -247,8 +267,8 @@ fn palette(kind: Kind, c: Color) -> Color {
 /// editor grey, darker than which only raises contrast).
 fn background(kind: Kind) -> (u8, u8, u8) {
     match kind {
-        Kind::Light => (255, 255, 255),
-        Kind::Dark | Kind::HighContrast | Kind::Colorblind => (0x1e, 0x1e, 0x1e),
+        Kind::Light | Kind::Colorblind { light: true } => (255, 255, 255),
+        Kind::Dark | Kind::HighContrast | Kind::Colorblind { light: false } => (0x1e, 0x1e, 0x1e),
     }
 }
 
@@ -392,18 +412,58 @@ pub fn query_background(_timeout: std::time::Duration) -> Option<(u8, u8, u8)> {
     None
 }
 
-/// Switch the active theme to `kind`, keeping its overrides.
-pub fn set_kind(kind: Kind) {
+/// Apply an OSC 11 result to the background-dependent active palette.
+pub fn set_background(kind: Kind) {
+    PROBED_BACKGROUND.with(|value| value.set(Some(kind)));
     THEME.with(|t| {
         if let Some(t) = t.borrow_mut().as_mut() {
-            t.kind = kind;
+            t.kind = match t.kind {
+                Kind::Colorblind { .. } => Kind::Colorblind {
+                    light: kind == Kind::Light,
+                },
+                _ => kind,
+            };
         }
     });
+}
+
+/// Pick a background for an interactive CLI table with the same terminal
+/// hints as the TUI. The caller only probes when using terminal colours.
+pub fn terminal_has_light_background() -> bool {
+    if let Ok(value) = std::env::var("COLORFGBG") {
+        return detect(Some(&value)) == Kind::Light;
+    }
+    #[cfg(unix)]
+    {
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            return false;
+        }
+        struct TerminalMode(bool);
+        impl Drop for TerminalMode {
+            fn drop(&mut self) {
+                if self.0 {
+                    let _ = disable_raw_mode();
+                }
+            }
+        }
+        let already_raw = is_raw_mode_enabled().unwrap_or(false);
+        if !already_raw && enable_raw_mode().is_err() {
+            return false;
+        }
+        let _mode = TerminalMode(!already_raw);
+        return query_background(std::time::Duration::from_millis(150))
+            .is_some_and(|color| kind_for_background(color) == Kind::Light);
+    }
+    #[cfg(not(unix))]
+    false
 }
 
 #[cfg(test)]
 pub(crate) fn reset() {
     THEME.with(|t| *t.borrow_mut() = None);
+    PROBED_BACKGROUND.with(|value| value.set(None));
 }
 
 #[cfg(test)]
@@ -425,6 +485,17 @@ pub(crate) fn test_theme(name: &str) -> TestThemeGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_background_updates_colorblind_colors_and_preserves_status_markers() {
+        let _theme = test_theme("colorblind");
+        set_background(Kind::Light);
+        assert!(redundant(true));
+        assert_eq!(colorblind_rgb(SemanticTone::Warn), (123, 83, 0));
+        set_background(Kind::Dark);
+        assert!(redundant(true));
+        assert_eq!(colorblind_rgb(SemanticTone::Warn), (240, 228, 66));
+    }
+
     use super::*;
 
     #[test]
@@ -522,7 +593,12 @@ mod tests {
             Color::Gray,
             Color::DarkGray,
         ];
-        for kind in [Kind::Dark, Kind::Light, Kind::Colorblind] {
+        for kind in [
+            Kind::Dark,
+            Kind::Light,
+            Kind::Colorblind { light: false },
+            Kind::Colorblind { light: true },
+        ] {
             for c in text {
                 let drawn = rgb(palette(kind, c)).unwrap();
                 let ratio = contrast(drawn, background(kind));

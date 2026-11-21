@@ -4,6 +4,7 @@ mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;
@@ -19523,7 +19524,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
-pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use theme::{
+    colorblind_rgb, colorblind_rgb_on_background, terminal_has_light_background, tone_marker,
+    SemanticTone,
+};
 pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
@@ -19568,7 +19572,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         && std::env::var_os("COLORFGBG").is_none()
     {
         if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
-            theme::set_kind(theme::kind_for_background(bg));
+            theme::set_background(theme::kind_for_background(bg));
         }
     }
     let mut out = stdout();
