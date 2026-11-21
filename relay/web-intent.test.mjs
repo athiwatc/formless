@@ -28,7 +28,8 @@ function setup(names, extras = {}) {
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, note() {}, autosize() {},
+    renderChips() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
+    renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
