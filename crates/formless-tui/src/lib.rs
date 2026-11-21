@@ -2,6 +2,7 @@ mod branch_summary;
 pub mod client;
 mod clipimg;
 mod commands;
+mod editor_viewport;
 mod external_editor;
 mod external_editor_ui;
 mod highlight;
@@ -16925,10 +16926,14 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.settings_rows();
     let sel = app.settings_sel.min(rows.len().saturating_sub(1));
+    let panel = ui::panel(" Settings ", app.color, Color::Cyan);
+    let inner = panel.inner(area);
+    let focused = !app.list_wheel_blocked();
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line = 0;
     let mut sel_end = 0;
     let mut section = "";
+    let mut cursor = None;
     for (i, row) in rows.iter().enumerate() {
         if row.section != section {
             if !section.is_empty() {
@@ -16947,9 +16952,16 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         } else {
             ui::dim(app.color)
         };
+        let mut label = format!("{mark}{}", ui::pad(&row.label, 20));
         let value = match &app.settings_edit {
             Some((k, edit)) if *k == row.key => {
-                Span::styled(format!("{}▏", &**edit), bold_fg(app.color, Color::Yellow))
+                let width = usize::from(inner.width);
+                label.truncate(text::take_width(&label, width.saturating_sub(8)).len());
+                let label_width = text::width(&label);
+                let (visible, col) =
+                    editor_viewport::field(edit, width.saturating_sub(label_width), false, true);
+                cursor = Some((lines.len(), label_width + col));
+                Span::styled(visible, bold_fg(app.color, Color::Yellow))
             }
             _ if row.value.is_empty() && matches!(row.kind, settings::Kind::Choice(_)) => {
                 Span::styled("default", ui::dim(app.color))
@@ -16957,10 +16969,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             _ if row.value.is_empty() => Span::raw(""),
             _ => Span::raw(row.value.clone()),
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark}{}", ui::pad(&row.label, 20)), label_style),
-            value,
-        ]));
+        lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
@@ -16990,83 +16999,104 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     // Keep the selection on screen.
-    let height = area.height.saturating_sub(2) as usize;
+    let height = usize::from(inner.height);
     let top = sel_end.saturating_sub(height).min(sel_line);
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(ui::panel(
-            " Settings ",
-            app.color,
-            Color::Cyan,
-        )),
+        Paragraph::new(lines.into_iter().skip(top).take(height).collect::<Vec<_>>()).block(panel),
         area,
     );
     if let Some(form) = &app.settings_form {
-        draw_settings_form(f, form, app.color);
+        draw_settings_form(f, form, app.color, focused);
+    } else if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused && (top..top + height).contains(row) && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
     }
 }
 
-fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
+fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused: bool) {
+    let area = f.area();
+    if area.is_empty() {
+        return;
+    }
+    let w = 72.min(area.width.saturating_sub(2)).max(1);
+    let width = usize::from(w.saturating_sub(2));
     let mut lines = vec![Line::raw("")];
-    let width = f.area().width.saturating_sub(6).min(66).max(1) as usize;
+    let mut cursor = None;
     for text in &form.review {
-        let chars: Vec<char> = text.chars().collect();
-        for part in chars.chunks(width) {
-            lines.push(Line::raw(part.iter().collect::<String>()));
-        }
+        lines.extend(wrap_rows(text, width).into_iter().map(Line::raw));
     }
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
-        let text = if field.masked {
-            "•".repeat(field.input.chars().count())
-        } else {
-            field.input.to_string()
-        };
+        let label = format!("{} {:<12}", if active { "›" } else { " " }, field.label);
+        let label = text::take_width(&label, width.saturating_sub(8)).to_owned();
+        let label_width = text::width(&label);
+        let (visible, col) = editor_viewport::field(
+            &field.input,
+            width.saturating_sub(label_width),
+            field.masked,
+            active,
+        );
+        if active {
+            cursor = Some((lines.len(), label_width + col));
+        }
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                label,
                 if active {
                     bold_fg(color, Color::Green)
                 } else {
                     ui::dim(color)
                 },
             ),
-            Span::raw(if active { format!("{text}▏") } else { text }),
+            Span::raw(visible),
         ]));
         if active {
-            lines.push(Line::styled(
-                format!("               {}", field.hint),
-                ui::dim(color),
-            ));
+            let hint = format!("               {}", field.hint);
+            lines.extend(
+                wrap_rows(&hint, width)
+                    .into_iter()
+                    .map(|line| Line::styled(line, ui::dim(color))),
+            );
         }
     }
     if let Some(e) = &form.error {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}")),
-            fg(color, Color::Red),
-        ));
+        let error = ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}"));
+        lines.extend(
+            wrap_rows(&error, width)
+                .into_iter()
+                .map(|line| Line::styled(line, fg(color, Color::Red))),
+        );
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "  Tab/↑↓ field · Enter next, then save · Esc cancel",
         ui::dim(color),
     ));
-    let area = f.area();
-    let w = 72.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let h = lines.len().saturating_add(2).min(usize::from(area.height)) as u16;
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 3,
         width: w,
         height: h,
     };
+    let panel = ui::panel(format!(" {} ", form.title), color, Color::Cyan);
+    let inner = panel.inner(rect);
+    let height = usize::from(inner.height);
+    let top = cursor
+        .map_or(0, |(row, _)| row.saturating_sub(height.saturating_sub(2)))
+        .min(lines.len().saturating_sub(height));
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(format!(" {} ", form.title), color, Color::Cyan))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines.into_iter().skip(top).take(height).collect::<Vec<_>>()).block(panel),
         rect,
     );
+    if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused && (top..top + height).contains(row) && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
+    }
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -23514,6 +23544,83 @@ mod tests {
         assert!(screen.contains("Downloads and runs code"), "{screen}");
         assert!(!screen.contains("SecretForMcpOnly"));
         assert!(screen.contains("••••"));
+    }
+
+    #[test]
+    fn settings_editors_place_the_hardware_cursor_in_the_focused_field() {
+        use ratatui::backend::{Backend, TestBackend};
+        let mut app = test_app();
+        Config::default().save(&app.paths).unwrap();
+        app.view = View::Settings;
+        let setting = "provider.stall_notice_secs";
+        app.settings_sel = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == setting)
+            .unwrap();
+        app.settings_edit = Some((setting.into(), input::InputLine::from("abc")));
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let caret = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x - 1, caret.y)].symbol(),
+            "a"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "b"
+        );
+        app.key(key(KeyCode::Char('X')));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((caret.x + 1, caret.y));
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "X"
+        );
+
+        app.slash("mcp add postgres");
+        let form = app.settings_form.as_mut().unwrap();
+        form.idx = 1;
+        form.fields[1].input = input::InputLine::from("界e\u{301}S");
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let masked = terminal.backend_mut().get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(masked.x - 1, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x + 1, masked.y)].symbol(), "•");
+        assert_ne!(buffer[(masked.x + 2, masked.y)].symbol(), "•");
+        assert!(!render(&mut app, 80, 25).contains("界e\u{301}S"));
+
+        app.paste(&"a".repeat(30));
+        let mut narrow = Terminal::new(TestBackend::new(16, 9)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let scrolled = narrow.backend_mut().get_cursor_position().unwrap();
+        assert!(scrolled.x > 0 && scrolled.x < 15 && scrolled.y > 0 && scrolled.y < 8);
+        app.pager = Some(Pager {
+            title: "Topmost pager".into(),
+            lines: vec!["visible".into()],
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        narrow.backend_mut().set_cursor_position((0, 0)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        narrow.backend_mut().assert_cursor_position((0, 0));
+        app.pager = None;
+        for size in [1, 2, 3] {
+            let mut tiny = Terminal::new(TestBackend::new(size, size)).unwrap();
+            tiny.draw(|frame| draw_settings(frame, frame.area(), &app))
+                .unwrap();
+            let pos = tiny.backend_mut().get_cursor_position().unwrap();
+            assert!(pos.x < size && pos.y < size);
+        }
     }
 
     #[test]

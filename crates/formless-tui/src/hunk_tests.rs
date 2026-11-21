@@ -75,6 +75,64 @@ fn hunk_open(
 }
 
 #[test]
+fn hunk_comment_draws_the_insertion_point_and_scrolls_escaped_text() {
+    use ratatui::backend::{Backend, TestBackend};
+    let (mut app, tx, sent) = hunk_test_app();
+    hunk_open(&mut app, &tx, &sent, &hunk_fixture());
+    app.key(key(KeyCode::Char('c')));
+    for c in "abc".chars() {
+        app.key(key(KeyCode::Char(c)));
+    }
+    app.key(key(KeyCode::Left));
+    app.key(key(KeyCode::Left));
+    let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let caret = terminal.backend_mut().get_cursor_position().unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(caret.x - 1, caret.y)].symbol(), "a");
+    assert_eq!(buffer[(caret.x, caret.y)].symbol(), "b");
+
+    app.key(key(KeyCode::Char('X')));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    terminal
+        .backend_mut()
+        .assert_cursor_position((caret.x + 1, caret.y));
+    assert_eq!(
+        terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+        "X"
+    );
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    app.paste("界e\u{301}\u{202E}\u{1B}");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let second = terminal.backend_mut().get_cursor_position().unwrap();
+    let rendered = "界e\u{301}⟨U+202E⟩⟨U+001B⟩";
+    assert_eq!(second.y, caret.y + 1);
+    assert_eq!(second.x, 1 + text::width(rendered) as u16);
+    assert_eq!(
+        terminal.backend().buffer()[(second.x, second.y)].symbol(),
+        "b"
+    );
+    assert_eq!(terminal.backend().buffer()[(1, second.y)].symbol(), "界");
+
+    app.paste(&"abc界\n".repeat(4_000));
+    app.hunk_review.error = Some("comment rejected".into());
+    let mut narrow = Terminal::new(TestBackend::new(20, 10)).unwrap();
+    narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+    let visible = narrow.backend_mut().get_cursor_position().unwrap();
+    assert!(visible.x < 19 && visible.y < 8, "{visible:?}");
+    assert!(render(&mut app, 60, 24).contains("Server: comment rejected"));
+    app.hunk_review.busy = true;
+    narrow.backend_mut().set_cursor_position((0, 0)).unwrap();
+    narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+    narrow.backend_mut().assert_cursor_position((0, 0));
+    for size in [1, 2, 3] {
+        let mut tiny = Terminal::new(TestBackend::new(size, size)).unwrap();
+        tiny.draw(|frame| draw(frame, &mut app)).unwrap();
+        tiny.backend_mut().assert_cursor_position((0, 0));
+    }
+}
+
+#[test]
 fn hunk_review_scroll_stops_at_rendered_edges_and_recovers_immediately() {
     use crossterm::event::{MouseEvent, MouseEventKind};
 
