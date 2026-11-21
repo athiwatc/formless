@@ -917,7 +917,10 @@
     if (popover) { popover.remove(); popover = null; }
     popoverTrigger = null;
     // Keep the expanded trigger visible until focus-within takes over.
-    if (restore) focusReturn(trigger);
+    if (restore) {
+      focusReturn(trigger);
+      if (document.activeElement === trigger) revealSessionControl(trigger);
+    }
     if (trigger) {
       trigger.removeAttribute("aria-expanded");
       trigger.removeAttribute("aria-controls");
@@ -930,13 +933,20 @@
       open(e.key === "ArrowUp");
     }
   }
-  /** Measure after insertion: rem-based menus can be taller than the viewport. */
-  function placePopover(btn, alignRight = false, focusLast = false) {
+  function anchorPopover(btn) {
+    if (popoverTrigger && popoverTrigger !== btn) {
+      popoverTrigger.removeAttribute("aria-expanded");
+      popoverTrigger.removeAttribute("aria-controls");
+    }
     popoverTrigger = btn;
     btn.setAttribute("aria-haspopup", "menu");
     btn.setAttribute("aria-expanded", "true");
     btn.setAttribute("aria-controls", "action-menu");
     popover.id = "action-menu";
+  }
+  /** Measure after insertion: rem-based menus can be taller than the viewport. */
+  function placePopover(btn, alignRight = false, focusLast = false) {
+    anchorPopover(btn);
     const items = [...popover.querySelectorAll("button")];
     for (const item of items) { item.setAttribute("role", "menuitem"); item.tabIndex = -1; }
     const available = () => items.filter((item) => !item.disabled && !item.hidden);
@@ -1037,9 +1047,13 @@
       else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
+  function revealSessionControl(control) {
+    const list = $("sessions");
+    if (list.contains(control) && focusVisible(control)) revealViewportControl(control, list, safeViewportBounds());
+  }
   function positionPopover() {
     if (!popover) return;
-    if (!popoverTrigger?.isConnected || !popoverTrigger.getClientRects().length) return closePopover();
+    if (!focusVisible(popoverTrigger)) return closePopover();
     const gap = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16) * .5;
     const bounds = safeViewportBounds(gap);
     popover.style.minWidth = "0";
@@ -1213,23 +1227,27 @@
     if (!r) return;
     const i = S.sessions.findIndex((x) => x.id === r.id);
     if (i >= 0) S.sessions[i] = r;
-    S.sessions.sort((a, b) => (b.pinned - a.pinned) || b.updated_at.localeCompare(a.updated_at));
     renderSessions();
   }
   function sessionMenu(btn, s, focusLast = false) {
     closePopover();
-    btn.setAttribute("aria-expanded", "true");
+    const action = (label, run, attrs = {}) => h("button", { type: "button", ...attrs, onclick: () => {
+      const current = S.sessions.find((session) => session.id === s.id);
+      closePopover();
+      if (current) run(current);
+    } }, label);
     popover = h("div", { class: "popover", role: "menu", "aria-label": "Session actions" },
-      h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
-      h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
-      h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
-      h("button", { type: "button", onclick: () => { closePopover(); suggestName(s); } }, "Suggest name"),
-      h("button", { type: "button", onclick: () => { closePopover(); tagSession(s); } }, "Tags…"),
-      h("button", { type: "button", onclick: () => { closePopover(); editInstructions(s); } }, "Instructions…"),
-      h("button", { type: "button", onclick: () => { closePopover(); forkSession(s.id); } }, "Fork"),
-      h("button", { type: "button", title: S.local ? "" : "The link includes the pairing key", onclick: () => { closePopover(); copySessionLink(s); } }, S.local ? "Copy link" : "Copy link (has the key)"),
-      h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
-      h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
+      action(s.pinned ? "Unpin" : "Pin", pinSession, { "data-session-action": "pin" }),
+      action(s.archived ? "Unarchive" : "Archive", archiveSession, { "data-session-action": "archive" }),
+      action("Rename", renameSession),
+      action("Suggest name", suggestName),
+      action("Tags…", tagSession),
+      action("Instructions…", editInstructions),
+      action("Fork", (session) => forkSession(session.id)),
+      action(S.local ? "Copy link" : "Copy link (has the key)", copySessionLink,
+        { title: S.local ? "" : "The link includes the pairing key" }),
+      action("Export…", (session) => pickExport(session.id)),
+      action("Delete", deleteSession, { class: "danger" }));
     placePopover(btn, false, focusLast);
   }
 
@@ -1521,11 +1539,50 @@
     note(applied.already_applied ? "This summary note was already inserted; no duplicate was added." : "Inserted one branch summary note; no Run was started.");
   }
 
+  function compareSessions(a, b) {
+    // Match the daemon's ORDER BY archived, pinned DESC, updated_at DESC.
+    const group = Number(!!a.archived) - Number(!!b.archived) || Number(!!b.pinned) - Number(!!a.pinned);
+    if (group) return group;
+    const first = a.updated_at ?? "", second = b.updated_at ?? "";
+    return first < second ? 1 : first > second ? -1 : 0;
+  }
+  function renderSessionBulkBar() {
+    const list = $("sessions"), existing = list.querySelector(".bulk-bar");
+    if (!S.marked.size) {
+      existing?.remove();
+      return;
+    }
+    const ids = [...S.marked];
+    const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
+    const bar = h("li", { class: "bulk-bar" },
+      h("span", { class: "muted" }, ids.length + " selected"),
+      btn("Archive", () => bulkSessions("archive", ids)),
+      btn("Export", () => bulkSessions("export", ids)),
+      btn("Tag", () => bulkSessions("tag", ids)),
+      btn("Delete", () => bulkSessions("delete", ids), "danger"),
+      btn("Clear", () => { S.marked.clear(); renderSessions(); }));
+    if (existing) existing.replaceWith(bar);
+    else (list.querySelector(".tag-chips") || list.firstElementChild).after(bar);
+  }
+  function updateSessionTimes() {
+    for (const item of $("sessions").querySelectorAll("[data-session-id]")) {
+      // Some Run events update S.running before a fresh Session summary.
+      if (S.running.has(item.dataset.sessionId) !== !!item.querySelector(".session-open > .running")) {
+        renderSessions();
+        return;
+      }
+      const stamp = item.querySelector(".when");
+      const text = relTime(stamp.dataset.updatedAt);
+      if (stamp.textContent !== text) stamp.textContent = text;
+    }
+  }
   function renderSessions() {
     const list = $("sessions");
     const focused = document.activeElement;
     const focusedRow = focused?.closest("#sessions [data-session-id]");
     const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
+    const menuSession = popoverTrigger?.closest("#sessions [data-session-id]")?.dataset.sessionId;
+    let replacementMenu = null, replacementFocus = null;
     list.replaceChildren();
     S.marked = S.marked || new Set();
     if (S.marked.size) {
@@ -1535,8 +1592,10 @@
     }
     if (!S.sessions.length) {
       list.append(h("li", { class: "muted", style: "padding:0.5rem" }, "No sessions yet."));
+      if (menuSession) closePopover();
       return;
     }
+    S.sessions.sort(compareSessions);
     list.append(h("li", null, h("button", { type: "button", class: "btn small", "aria-pressed": String(!!S.sessionTree), onclick: () => { S.sessionTree = !S.sessionTree; renderSessions(); } }, S.sessionTree ? "Tree on" : "Tree off")));
     // Tag chips filter the list (SPEC §10.4).
     const tags = [...new Set(S.sessions.flatMap((s) => s.tags || []))].sort();
@@ -1546,18 +1605,7 @@
         h("button", { type: "button", class: "chip-btn" + (S.tagFilter === t ? " on" : ""), "aria-pressed": String(S.tagFilter === t),
           onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
     }
-    // Bulk actions on checked Sessions (SPEC §10.4).
-    if (S.marked.size) {
-      const ids = [...S.marked];
-      const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
-      list.append(h("li", { class: "bulk-bar" },
-        h("span", { class: "muted" }, ids.length + " selected"),
-        btn("Archive", () => bulkSessions("archive", ids)),
-        btn("Export", () => bulkSessions("export", ids)),
-        btn("Tag", () => bulkSessions("tag", ids)),
-        btn("Delete", () => bulkSessions("delete", ids), "danger"),
-        btn("Clear", () => { S.marked.clear(); renderSessions(); })));
-    }
+    renderSessionBulkBar();
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
@@ -1579,7 +1627,7 @@
           "data-session-id": s.id,
         },
         h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessionBulkBar(); } }),
         h("button", { class: "session-open", type: "button", "aria-label": s.name,
           "aria-current": s.id === S.current ? "true" : null, "aria-describedby": state ? stateId : null,
           onclick: () => openSession(s.id) },
@@ -1588,14 +1636,12 @@
           h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
             row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
             s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-          h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
+          h("span", { class: "when", "data-updated-at": s.updated_at,
+            title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
         state ? h("span", { id: stateId, class: "sr-only" }, state) : null, menu);
         list.append(item);
-        if (focusedRow?.dataset.sessionId === s.id && focusedControl) {
-          const control = item.querySelector("." + focusedControl);
-          if (focusedControl === "menu" && !focusVisible(control)) item.querySelector(".session-open").focus({ preventScroll: true });
-          control.focus({ preventScroll: true });
-        }
+        if (focusedRow?.dataset.sessionId === s.id && focusedControl) replacementFocus = item;
+        if (menuSession === s.id) replacementMenu = { menu, session: s };
       }
     };
     appendRows(active);
@@ -1605,6 +1651,22 @@
         onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); S.showArchived = !S.showArchived; renderSessions(); } } },
       (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
       if (S.showArchived) appendRows(archived);
+    }
+    if (replacementMenu) {
+      const { menu, session } = replacementMenu;
+      anchorPopover(menu);
+      const pin = popover.querySelector('[data-session-action="pin"]'), archive = popover.querySelector('[data-session-action="archive"]');
+      const pinLabel = session.pinned ? "Unpin" : "Pin", archiveLabel = session.archived ? "Unarchive" : "Archive";
+      if (pin.textContent !== pinLabel) pin.textContent = pinLabel;
+      if (archive.textContent !== archiveLabel) archive.textContent = archiveLabel;
+      revealSessionControl(menu);
+      positionPopover();
+    } else if (menuSession) closePopover();
+    if (replacementFocus) {
+      const control = replacementFocus.querySelector("." + focusedControl);
+      if (focusedControl === "menu" && !focusVisible(control)) replacementFocus.querySelector(".session-open").focus({ preventScroll: true });
+      control.focus({ preventScroll: true });
+      revealSessionControl(document.activeElement);
     }
   }
 
@@ -7890,7 +7952,6 @@
       case "session_updated": {
         const i = S.sessions.findIndex((s) => s.id === ev.session.id);
         if (i >= 0) S.sessions[i] = ev.session; else S.sessions.unshift(ev.session);
-        S.sessions.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
         renderSessions();
         scheduleEventRender({ composer: true });
         break;
@@ -8666,8 +8727,8 @@
   setInterval(() => {
     if (isRunning() || S.liveTools.some((t) => t.status === "running")) updateElapsedTimers();
   }, 1000);
-  // Relative times drift; refresh the sidebar each minute.
-  setInterval(renderSessions, 60000);
+  // Update relative times without replacing the Session controls.
+  setInterval(updateSessionTimes, 60000);
 
   // A new `formless web` link pasted into an open tab only changes the
   // fragment: sign in with it instead of ignoring it.
