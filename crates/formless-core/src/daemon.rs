@@ -928,6 +928,8 @@ pub struct Daemon {
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
     topic_decisions: StdMutex<HashMap<String, topic_interactions::TopicDecision>>,
+    topic_substitutes:
+        StdMutex<HashMap<(String, String, String), topic_interactions::ApprovedSubstitute>>,
     question_answered_by: StdMutex<HashMap<String, String>>,
     #[cfg(test)]
     topic_notifications: StdMutex<Vec<(String, String)>>,
@@ -1181,6 +1183,7 @@ impl Daemon {
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
             topic_decisions: StdMutex::new(HashMap::new()),
+            topic_substitutes: StdMutex::new(HashMap::new()),
             question_answered_by: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             topic_notifications: StdMutex::new(vec![]),
@@ -2169,9 +2172,9 @@ impl Daemon {
                 self.broadcast(Event::TopicChanged { topic_id });
                 Ok(serde_json::to_value(topic)?)
             }
-            Request::ListHarnesses => {
-                bail!("topic control request is not implemented yet");
-            }
+            Request::ListHarnesses => Ok(serde_json::to_value(
+                crate::local_harness::list_harnesses().await,
+            )?),
             Request::CancelTopic { topic_id } => {
                 let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
@@ -8844,6 +8847,15 @@ impl Daemon {
             toolreg::TOPIC_WAIT => match self.wait_topic_steps(session_id, &args, cancel).await {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_wait: {error:#}")),
+            },
+            toolreg::TOPIC_REQUEST_HARNESS_SUBSTITUTE => match self
+                .request_topic_harness_substitute(session_id, &args, cancel)
+                .await
+            {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!(
+                    "error: topic_request_harness_substitute: {error:#}"
+                )),
             },
             toolreg::TOPIC_ANSWER_QUESTION => {
                 match self.answer_topic_question_tool(session_id, &args) {
