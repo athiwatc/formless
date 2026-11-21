@@ -166,6 +166,12 @@ impl Fixture {
                         Request::SetSessionTags { id, tags } => {
                             organization_reply(id, None, tags.is_empty())
                         }
+                        Request::TestModel { model, .. } => provider_model_fixture(model, true),
+                        Request::TestProvider { name } => {
+                            let mut report = provider_list_fixture(name);
+                            report["new_diagnostic"] = json!({"fixture": "private"});
+                            report
+                        }
                         Request::ListModules => module_list(),
                         Request::GetModule { .. } => module_detail(),
                         Request::ListTools if tool_details => json!([
@@ -313,6 +319,21 @@ impl Fixture {
                             envelope.id,
                             formless_protocol::codes::NOT_FOUND,
                             "sub-agent fixture missing".into(),
+                        ))
+                        .unwrap()
+                    } else if matches!(&envelope.request, Request::TestProvider { name } if name == "missing")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "fixture provider missing".into(),
+                        ))
+                        .unwrap()
+                    } else if matches!(&envelope.request, Request::TestModel { model, .. } if model == "request-error")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err(
+                            envelope.id,
+                            "fixture request failure".into(),
                         ))
                         .unwrap()
                     } else if fail {
@@ -1364,6 +1385,150 @@ fn mcp_test_report(name: &str) -> Value {
             json!({"restarted":name,"tools":match name {"ok"=>json!(3),"zero"=>json!(0),_=>Value::Null},"error":match name {"failed"|"missing"=>json!("fixture restart error 日本語"),"empty-error"=>json!(""),"bad-error"=>json!(false),_=>Value::Null},"future":{"retained":true}})
         }
     }
+}
+
+fn provider_model_fixture(model: &str, extra_fields: bool) -> Value {
+    let ok = model != "unavailable";
+    let mut report = json!({
+        "model": model, "ok": ok, "transient": false,
+        "first_token_ms": ok.then_some(12), "total_ms": 27,
+        "streaming": ok, "reasoning": false, "tool_calling": false,
+        "prompt_fallback": ok, "error": (!ok).then_some("fixture probe failed"),
+        "tested_at": "2026-11-01T12:00:00Z",
+        "probe_usage": if ok {
+            json!({
+                "requests_sent": 2, "requests_with_reported_usage": 1,
+                "deadline_exceeded": false, "incomplete_transport": false,
+                "usage_partial": true, "cost_partial": true,
+                "reported_usage": {"prompt_tokens": 0, "completion_tokens": 3,
+                    "reasoning_tokens": 1, "cached_tokens": 4,
+                    "cache_write_tokens": 2, "reported_cost": 0.001}
+            })
+        } else {
+            Value::Null
+        }
+    });
+    if model == "malformed" {
+        report["ok"] = json!("fixture-private-diagnostic");
+    }
+    if extra_fields {
+        report["unknown"] = json!({"fixture": "private"});
+        if ok {
+            report["probe_usage"]["new_diagnostic"] = json!({"fixture": "private"});
+            report["probe_usage"]["reported_usage"]["new_counter"] = json!(999);
+        }
+    }
+    report
+}
+
+fn provider_list_fixture(name: &str) -> Value {
+    let models = if name == "empty" {
+        vec![]
+    } else {
+        vec!["z-model", "モデル", "z-model"]
+    };
+    json!({"provider": name, "models": models})
+}
+
+#[test]
+fn shipped_provider_test_reports_verdict_and_only_known_fields() {
+    let fixture = Fixture::new();
+    for (name, model, code) in [("default", "モデル", 0), ("named", "unavailable", 1)] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["providers", "test", name, "--model", model];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert_eq!(out.status.code(), Some(code));
+            assert!(out.stderr.is_empty());
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    provider_model_fixture(model, false)
+                );
+                assert_eq!(out.stdout.last(), Some(&b'\n'));
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(model));
+                assert!(text.contains("27 ms"));
+                assert_eq!(text.contains("fixture probe failed"), code == 1);
+                assert!(text.ends_with('\n'));
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::TestModel { model: sent, provider }]
+                    if sent == model && provider.as_deref() == (name != "default").then_some(name)
+            ));
+        }
+    }
+    for name in ["named", "empty"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["providers", "test", name];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(out.status.success());
+            assert!(out.stderr.is_empty());
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    provider_list_fixture(name)
+                );
+            } else {
+                let expected = if name == "empty" {
+                    "0 model(s):\n"
+                } else {
+                    "3 model(s):\n  z-model\n  モデル\n  z-model\n"
+                };
+                assert_eq!(out.stdout, expected.as_bytes());
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::TestProvider { name: sent }] if sent == name
+            ));
+        }
+    }
+}
+
+#[test]
+fn shipped_provider_test_keeps_request_and_usage_failures_on_stderr() {
+    let fixture = Fixture::new();
+    for (args, code, diagnostic, count) in [
+        (vec!["--json"], 2, "required", 0),
+        (vec!["missing", "--json"], 2, "fixture provider missing", 1),
+        (
+            vec!["named", "--model", "malformed", "--json"],
+            1,
+            "invalid provider test reply",
+            1,
+        ),
+        (
+            vec!["named", "--model", "request-error", "--json"],
+            1,
+            "fixture request failure",
+            1,
+        ),
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&[vec!["providers", "test"], args].concat());
+        assert_eq!(out.status.code(), Some(code));
+        assert!(out.stdout.is_empty());
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(diagnostic));
+        assert!(!stderr.contains("fixture-private-diagnostic"));
+        assert_eq!(fixture.requests.lock().unwrap().len(), count);
+    }
+    fixture.requests.lock().unwrap().clear();
+    let help = fixture.run(&["providers", "test", "--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("--json") && text.contains("exit 1"));
+    assert!(fixture.requests.lock().unwrap().is_empty());
 }
 
 #[test]

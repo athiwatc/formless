@@ -12,6 +12,7 @@ mod cli_pipeline;
 mod cli_price_import;
 mod cli_prices;
 mod cli_proposal_diff;
+mod cli_provider_test;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_run_memories;
@@ -1033,12 +1034,17 @@ enum ProvidersAction {
     },
     /// Fetch the provider's /models list; with --model, test that model:
     /// latency, streaming, reasoning and tool calls
+    ///
+    /// Model probe reports exit 1 after printing a negative verdict.
     Test {
         /// Configured provider name
         name: String,
         /// Model ID to probe; omit to list the provider's available models
         #[arg(long)]
         model: Option<String>,
+        /// Write one JSON report instead of human-readable output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -7147,38 +7153,53 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
         ProvidersAction::Test {
             name,
             model: Some(model),
+            json,
         } => {
             let provider = (name != formless_core::config::DEFAULT_PROVIDER).then_some(name);
             let t = daemon(Request::TestModel { model, provider })?;
-            let ms = |k: &str| t[k].as_u64().map_or("-".into(), |v| format!("{v} ms"));
-            let yes = |k: &str| if t[k] == true { "yes" } else { "no" };
-            println!("model:       {}", t["model"].as_str().unwrap_or_default());
-            println!(
-                "result:      {}",
-                if t["ok"] == true { "ok" } else { "problems" }
-            );
-            println!(
-                "first token: {}  ·  total {}",
-                ms("first_token_ms"),
-                ms("total_ms")
-            );
-            println!("streaming:   {}", yes("streaming"));
-            println!("reasoning:   {}", yes("reasoning"));
-            println!(
-                "tool calls:  {}{}",
-                yes("tool_calling"),
-                if t["prompt_fallback"] == true {
-                    " (prompt-based fallback only)"
-                } else {
-                    ""
+            let ok = t["ok"] == true;
+            if json {
+                println!("{}", cli_provider_test::model_json(t)?);
+            } else {
+                let ms = |k: &str| t[k].as_u64().map_or("-".into(), |v| format!("{v} ms"));
+                let yes = |k: &str| if t[k] == true { "yes" } else { "no" };
+                println!("model:       {}", t["model"].as_str().unwrap_or_default());
+                println!("result:      {}", if ok { "ok" } else { "problems" });
+                println!(
+                    "first token: {}  ·  total {}",
+                    ms("first_token_ms"),
+                    ms("total_ms")
+                );
+                println!("streaming:   {}", yes("streaming"));
+                println!("reasoning:   {}", yes("reasoning"));
+                println!(
+                    "tool calls:  {}{}",
+                    yes("tool_calling"),
+                    if t["prompt_fallback"] == true {
+                        " (prompt-based fallback only)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(e) = t["error"].as_str() {
+                    println!("error:       {e}");
                 }
-            );
-            if let Some(e) = t["error"].as_str() {
-                println!("error:       {e}");
+            }
+            if !ok {
+                std::io::stdout().flush()?;
+                std::process::exit(1);
             }
         }
-        ProvidersAction::Test { name, model: None } => {
+        ProvidersAction::Test {
+            name,
+            model: None,
+            json,
+        } => {
             let r = daemon(Request::TestProvider { name })?;
+            if json {
+                println!("{}", cli_provider_test::models_json(r)?);
+                return Ok(());
+            }
             let models = r["models"].as_array().cloned().unwrap_or_default();
             println!("{} model(s):", models.len());
             for m in models {
