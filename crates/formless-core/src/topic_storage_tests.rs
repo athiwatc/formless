@@ -286,3 +286,36 @@ fn topic_retry_failed_and_corrupt_status_fail_closed() {
         .unwrap();
     assert!(store.get_topic(&topic.id).is_err());
 }
+
+#[test]
+fn topic_source_can_be_deleted_or_purged_after_rejection() {
+    for purge in [false, true] {
+        let (store, source, _, request) = fixture();
+        let topic = store.propose_topic(&request, &"a".repeat(40)).unwrap();
+        store.reject_topic(&topic.id, "not now").unwrap();
+        if purge {
+            store.soft_delete_session(&source.id).unwrap();
+            assert!(store.sessions_deleted_before("9999").unwrap().contains(&source.id));
+        }
+        assert!(store.delete_session(&source.id).unwrap());
+        assert!(store.get_session(&source.id).unwrap().is_none());
+        assert!(store.get_topic(&topic.id).unwrap().is_none());
+    }
+}
+
+#[test]
+fn topic_source_deletion_cascades_active_attempts_and_repository_lock() {
+    let (store, source, _, request) = fixture();
+    let topic = store.propose_topic(&request, &"a".repeat(40)).unwrap();
+    store.approve_topic(&topic.id).unwrap();
+    store.claim_topic_workflow(&topic.id).unwrap();
+    let attempt = store.begin_topic_attempt(
+        &topic.id, &topic.features[0].id, HarnessRole::Build, HarnessKind::Claude,
+        1, &"token".repeat(8), Path::new("/topic/build"), &"a".repeat(40),
+    ).unwrap();
+    assert!(store.delete_session(&source.id).unwrap());
+    assert!(store.get_topic(&topic.id).unwrap().is_none());
+    assert!(store.get_topic_attempt(&attempt.id).unwrap().is_none());
+    let locks: i64 = store.conn.query_row("SELECT COUNT(*) FROM topic_repo_locks", [], |r| r.get(0)).unwrap();
+    assert_eq!(locks, 0);
+}
