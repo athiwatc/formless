@@ -1278,8 +1278,14 @@ fn apply_extra_body(body: &mut Value, cfg: &ProviderCfg, model: &str) {
             }
         }
     }
-    let ollama = crate::presets::for_url(&cfg.base_url).is_some_and(|p| p.id == "ollama");
-    if ollama && !cfg.anthropic() && obj["options"].get("num_ctx").is_none() {
+    let ollama = crate::presets::for_provider(cfg).is_some_and(|p| p.id == "ollama");
+    if ollama
+        && !cfg.anthropic()
+        && obj
+            .get("options")
+            .and_then(|options| options.get("num_ctx"))
+            .is_none()
+    {
         let options = obj.entry("options").or_insert_with(|| json!({}));
         if let Some(o) = options.as_object_mut() {
             o.insert("num_ctx".into(), json!(cfg.context_for(model)));
@@ -5501,6 +5507,38 @@ mod tests {
         let mut b = json!({"model": "m"});
         apply_extra_body(&mut b, &other, "m");
         assert!(b.get("options").is_none());
+    }
+
+    #[test]
+    fn saved_ollama_preset_uses_model_context_at_a_custom_endpoint() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!("fl-ollama-preset-{}", uuid::Uuid::new_v4()));
+        let paths = crate::Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let mut config = crate::Config::default();
+        let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        config.provider.base_url = format!("http://{}/prefix/v1", endpoint.local_addr().unwrap());
+        config.provider.preset = Some("ollama".into());
+        config
+            .provider
+            .model_context_tokens
+            .insert("llama".into(), 24_000);
+        config.save(&paths).unwrap();
+        let saved = crate::Config::load_file_only(&paths).unwrap();
+        let mut body = json!({"model": "llama"});
+        apply_extra_body(&mut body, &saved.provider, "llama");
+        assert_eq!(body["options"]["num_ctx"], 24_000);
+
+        config.provider.preset = None;
+        config.save(&paths).unwrap();
+        let saved = crate::Config::load_file_only(&paths).unwrap();
+        assert!(crate::presets::for_provider(&saved.provider).is_none());
+        assert_eq!(
+            crate::presets::for_url("http://0.0.0.0:11434/v1")
+                .unwrap()
+                .id,
+            "ollama"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     use super::*;
