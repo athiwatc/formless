@@ -17347,7 +17347,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.ends_with(".jks")
         || name.ends_with(".keystore")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
     secret_file.then_some("a key or secrets file")
 }
 

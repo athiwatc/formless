@@ -366,6 +366,14 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
 
+#[test]
+fn keepass_database_mentions_use_the_credential_classifier() {
+    let root = std::env::temp_dir().join("formless-project");
+    assert!(credential_path(&root.join("passwords.kdbx")).is_some());
+    assert!(credential_path(&root.join("db.KDBX")).is_some());
+    assert!(credential_path(&root.join("db.kdbx.lock")).is_none());
+}
+
 /// Chunked uploads (#909): checked before any byte, taken in order,
 /// attached only when complete; a partial or out-of-order upload attaches
 /// nothing.
