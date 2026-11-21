@@ -214,6 +214,10 @@ pub enum Update {
         error: String,
     },
     Notice(String),
+    ManagementNotice {
+        destination: Destination,
+        notice: String,
+    },
 }
 
 pub enum Command {
@@ -2136,9 +2140,10 @@ impl Engine {
                         },
                     );
                 } else {
-                    self.updates.push(Update::Notice(format!(
-                        "Could not {label}: Not connected; nothing was sent."
-                    )));
+                    self.updates.push(Update::ManagementNotice {
+                        destination,
+                        notice: format!("Could not {label}: Not connected; nothing was sent."),
+                    });
                 }
             }
             Command::Refresh => {
@@ -3083,7 +3088,10 @@ impl Engine {
                     Ok(_) => format!("Done: {label}"),
                     Err(error) => format!("Could not {label}: {error}"),
                 };
-                self.updates.push(Update::Notice(notice));
+                self.updates.push(Update::ManagementNotice {
+                    destination,
+                    notice,
+                });
                 if self.page == Some(destination) {
                     self.load_page(destination);
                 }
@@ -5482,7 +5490,7 @@ mod tests {
             assert!(engine
                 .updates
                 .iter()
-                .any(|u| matches!(u, Update::Notice(text) if text == expected)));
+                .any(|u| matches!(u, Update::ManagementNotice { destination: Destination::Skills, notice } if notice == expected)));
             assert_eq!(
                 engine.outgoing.len(),
                 usize::from(current == Destination::Skills)
@@ -5504,7 +5512,7 @@ mod tests {
         });
         assert!(engine.outgoing.is_empty());
         assert!(
-            matches!(engine.updates.last(), Some(Update::Notice(text)) if text.contains("Could not undo last change") && text.contains("Not connected"))
+            matches!(engine.updates.last(), Some(Update::ManagementNotice { destination: Destination::Tools, notice }) if notice.contains("Could not undo last change") && notice.contains("Not connected"))
         );
         let mut engine = ready();
         engine.page = Some(Destination::Tools);
@@ -5521,7 +5529,7 @@ mod tests {
             json!({"undone":"user retired fetch_page", "tool":{"name":"fetch_page"}}),
         );
         assert!(
-            matches!(engine.updates.last(), Some(Update::Notice(text)) if text == "Undone: user retired fetch_page")
+            matches!(engine.updates.last(), Some(Update::ManagementNotice { destination: Destination::Tools, notice }) if notice == "Undone: user retired fetch_page")
         );
         assert!(matches!(engine.outgoing[0].request, Request::ListTools));
     }

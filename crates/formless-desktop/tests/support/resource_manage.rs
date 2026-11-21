@@ -4,6 +4,71 @@ use formless_protocol::Request;
 use serde_json::json;
 
 #[gpui_kit::test]
+fn resource_secondary_summaries_and_bounded_field_values(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        for (destination, value, expected) in [
+            (
+                Destination::Mcp,
+                json!([{"name":"local","transport":"stdio","target":"/bin/demo"}]),
+                "stdio · /bin/demo",
+            ),
+            (
+                Destination::Jobs,
+                json!([{"id":"j","prompt":"Review","cron":"0 9 * * 1-5","next_run":"2030-01-01T09:00:00Z"}]),
+                "0 9 * * 1-5 · Next: 2030-01-01T09:00:00Z",
+            ),
+            (
+                Destination::Memory,
+                json!([{"id":"m","scope":"project","text":format!("Line one\ncolon: value {}", "界".repeat(700))}]),
+                "Scope: project",
+            ),
+        ] {
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::Page {
+                        destination,
+                        result: Ok(value),
+                    },
+                    window,
+                    cx,
+                );
+                s.run_command(Command::GoTo(destination), window, cx);
+            });
+            settle_frames(window, cx);
+            assert_eq!(
+                window
+                    .find(("resource-row-secondary", 0usize))
+                    .value()
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(window
+            .find("resource-detail-truncated")
+            .value()
+            .unwrap()
+            .contains("500 characters"));
+        let value = window
+            .find(("resource-field-value", 2usize))
+            .value()
+            .unwrap()
+            .to_owned();
+        assert!(value.starts_with("Line one\ncolon: value "));
+        assert!(value.chars().count() > 400 && value.chars().count() <= 500);
+        assert_eq!(
+            window
+                .find(("resource-field-key", 2usize))
+                .value()
+                .as_deref(),
+            Some("text")
+        );
+        assert!(window.try_find(("resource-field-key", 3usize)).is_none());
+    });
+}
+
+#[gpui_kit::test]
 fn resource_jobs_narrow_form_and_actions_stay_inside_without_collapsing_the_list(
     cx: &mut TestAppContext,
 ) {
@@ -29,7 +94,29 @@ fn resource_jobs_narrow_form_and_actions_stay_inside_without_collapsing_the_list
         }
         let row = window.find(("resource-row", 0usize)).bounds();
         let title = window.find("resource-selected").bounds();
-        assert!(title.top() - row.top() >= px(200.));
+        assert!(title.top() - row.top() >= px(48.));
+        assert!(title.top() - row.top() <= px(100.));
+        assert_eq!(
+            window
+                .find(("resource-field-key", 0usize))
+                .value()
+                .as_deref(),
+            Some("ID")
+        );
+        assert_eq!(
+            window
+                .find(("resource-field-value", 0usize))
+                .value()
+                .as_deref(),
+            Some("j")
+        );
+        assert!(window
+            .find(("resource-row-secondary", 0usize))
+            .value()
+            .unwrap()
+            .contains("Next: not scheduled"));
+        let primary = window.find(("resource-row-label", 0usize)).bounds();
+        assert!(primary.left() - row.left() < px(15.));
         for slot in 1..4usize {
             let bounds = window.find(("resource-action", slot)).bounds();
             assert!(bounds.left() >= px(0.) && bounds.right() <= px(560.));
@@ -172,12 +259,64 @@ fn resource_add_form_validates_submits_clears_and_shows_receipts(cx: &mut TestAp
             .unwrap()
             .contains("must not be empty"));
         shell.update(cx, |s, cx| {
-            s.apply_client_update(Update::Notice("Done: add memory".into()), window, cx)
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Done: add memory".into(),
+                },
+                window,
+                cx,
+            )
         });
         window.render_frame(cx);
         assert_eq!(
             window.find("resource-result").value().as_deref(),
             Some("Done: add memory")
+        );
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Notice("Connected · provisional live text".into()),
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("resource-result").value().as_deref(),
+            Some("Done: add memory")
+        );
+        shell.update(cx, |s, cx| {
+            s.run_command(Command::GoTo(Destination::Jobs), window, cx);
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Late memory receipt".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("resource-result").value().as_deref(), Some(""));
+        shell.update(cx, |s, cx| {
+            s.run_command(Command::GoTo(Destination::Memory), window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("resource-result").value().as_deref(), Some(""));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Could not add memory: permission denied".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("resource-result").value().as_deref(),
+            Some("Could not add memory: permission denied")
         );
     });
 }

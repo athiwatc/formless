@@ -801,6 +801,7 @@ pub struct Shell {
     resource_input: Entity<InputState>,
     resource_schedule: Entity<InputState>,
     resource_error: Option<String>,
+    resource_result: Option<String>,
     resource_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
     resource_frames: u8,
     resource_revision: u64,
@@ -955,7 +956,7 @@ impl Shell {
 
         let timeline = cx.new(|cx| MessageScrollerState::new(blocks.len(), cx));
         let resource_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Memory text, skill source or job prompt")
+            InputState::new(window, cx).placeholder("Something the agent should remember")
         });
         let resource_schedule =
             cx.new(|cx| InputState::new(window, cx).placeholder("every weekday at 9am"));
@@ -1075,6 +1076,7 @@ impl Shell {
             resource_input,
             resource_schedule,
             resource_error: None,
+            resource_result: None,
             resource_body,
             resource_focus: None,
             resource_frames: 0,
@@ -1995,6 +1997,7 @@ impl Shell {
         self.resource_pages.clear();
         self.resource_confirm = None;
         self.resource_error = None;
+        self.resource_result = None;
         *self.blocks.borrow_mut() = Timeline::new(Vec::new());
         self.timeline
             .update(cx, |timeline, cx| timeline.reset(0, cx));
@@ -2734,6 +2737,15 @@ impl Shell {
                 }
             }
             ClientUpdate::Notice(notice) => self.client_status = notice,
+            ClientUpdate::ManagementNotice {
+                destination,
+                notice,
+            } => {
+                self.client_status = notice.clone();
+                if self.destination == destination {
+                    self.resource_result = Some(notice);
+                }
+            }
             ClientUpdate::Prepared(prepared) => {
                 // A retired queued update must not cancel a newer forecast.
                 if self.client_identity() != Some((prepared.client, prepared.connection))
@@ -3946,8 +3958,15 @@ impl Shell {
         if previous != destination {
             self.resource_confirm = None;
             self.resource_error = None;
-            self.resource_input
-                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.resource_result = None;
+            self.resource_input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(match destination {
+                    Destination::Memory => "Something the agent should remember",
+                    Destination::Skills => "Folder, git URL or .zip",
+                    Destination::Jobs => "What should the job ask the agent?",
+                    _ => "",
+                })
+            });
             self.resource_schedule
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -5657,7 +5676,44 @@ impl Shell {
                                         .small()
                                         .flex_1()
                                         .min_w_0()
-                                        .label(directory::visual_text(&row.label))
+                                        .h(this.scaled(
+                                            if crate::manage::list_request(destination).is_some() {
+                                                48.
+                                            } else {
+                                                24.
+                                            },
+                                        ))
+                                        .child(
+                                            v_flex()
+                                                .w_full()
+                                                .min_w_0()
+                                                .items_start()
+                                                .child(
+                                                    readable(
+                                                        ("resource-row-label", index),
+                                                        directory::visual_text(&row.label),
+                                                    )
+                                                    .w_full()
+                                                    .text_left()
+                                                    .truncate(),
+                                                )
+                                                .when_some(
+                                                    resource_manage::secondary(destination, row),
+                                                    |body, secondary| {
+                                                        body.child(
+                                                            readable(
+                                                                ("resource-row-secondary", index),
+                                                                secondary,
+                                                            )
+                                                            .w_full()
+                                                            .text_left()
+                                                            .text_xs()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .truncate(),
+                                                        )
+                                                    },
+                                                ),
+                                        )
                                         .accessibility_label(format!(
                                             "{}{}",
                                             directory::visual_text(&row.label),
@@ -5691,11 +5747,20 @@ impl Shell {
                     .collect()
             }),
         )
-        .h(self.scaled(if page_height.is_some() {
-            220.
-        } else {
-            (f32::from(window.viewport_size().height) * 0.3 / self.text_scale.factor()).max(220.)
-        }))
+        .h(self.scaled(
+            (count as f32
+                * if crate::manage::list_request(destination).is_some() {
+                    48.
+                } else {
+                    24.
+                })
+            .min(if page_height.is_some() {
+                220.
+            } else {
+                (f32::from(window.viewport_size().height) * 0.3 / self.text_scale.factor())
+                    .max(220.)
+            }),
+        ))
         .flex_shrink_0()
         .track_scroll(&self.resource_scroll);
         let selected = page.and_then(|page| page.selected.and_then(|index| page.rows.get(index)));
@@ -5766,12 +5831,14 @@ impl Shell {
                             .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(),|title|title.flex_1())).child(actions)
                     })
                     .child(readable("resource-notice", notice))
-                    .child(readable("resource-result", self.client_status.clone()))
+                    .child(readable("resource-result", self.resource_result.clone().unwrap_or_default()))
                     .child(self.render_resource_management(true, window, cx))
                     .child(list)
                     .child(readable("resource-selected", label))
                     .child(self.render_resource_management(false, window, cx))
-                    .child(readable("resource-detail", detail))
+                    .child(if crate::manage::list_request(destination).is_some() {
+                        self.render_resource_fields(selected, cx)
+                    } else { readable("resource-detail", detail).into_any_element() })
                     .child(
                         div().id("resource-copy-anchor").child(Button::new("copy-resource")
                             .track_focus(&self.resource_controls[2])
