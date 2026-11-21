@@ -775,6 +775,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         }
         // Run other programs through options or files they read (#1099).
         match base {
+            _ if stem == "dotnet" => {
+                return Some("dotnet can build and execute repository code")
+            }
             "git" => {
                 return Some(
                     "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
@@ -3953,6 +3956,31 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn dotnet_requires_broad_process_confirmation() {
+        for spec in [
+            "process:dotnet",
+            "process:/usr/bin/dotnet",
+            "process:dotnet.exe",
+            "process:DOTNET",
+            "process:dotnet8",
+            "process:dotnet:run",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("dotnet can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:dotnet-dump",
+            "process:dotnet-trace",
+            "process:dotnet-counters",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
