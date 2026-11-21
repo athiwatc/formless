@@ -19,6 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[path = "support/stream_ordering.rs"]
 mod stream_ordering;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_client_displays_provisional_answer_and_reasoning_before_persistence() {
+    stream_ordering::production_live_stream().await;
+}
+
 #[cfg(unix)]
 type LocalStream = tokio::net::UnixStream;
 #[cfg(windows)]
@@ -171,6 +176,14 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                     format!("profile search {query}: ok={}", result.is_ok())
                 }
                 Update::Connection { ready, notice } => format!("connection {ready}: {notice}"),
+                Update::LiveOverlay {
+                    session_id, view, ..
+                } => format!(
+                    "provisional {session_id}: answer={} reasoning={} unavailable={}",
+                    view.answer.len(),
+                    view.reasoning.len(),
+                    view.unavailable
+                ),
                 Update::Snapshot {
                     generation,
                     snapshot,

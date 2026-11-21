@@ -463,6 +463,61 @@ mod tests {
         assert_eq!(ledger.status(), Status::Unknown);
     }
     #[test]
+    fn acknowledged_cwd_action_preserves_live_deltas_and_provider_activity() {
+        let (mut e, ledger, mut d) = setup(Kind::Cwd);
+        e.live_available = true;
+        let mut value = snapshot();
+        value["running"] = json!(true);
+        value["latest_run"]["status"] = json!("running");
+        d.action.target = Target::decode("s", &value).unwrap();
+        e.receive(ServerMessage::Event(Event::MessageDelta {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            delta: "Live answer".into(),
+        }))
+        .unwrap();
+        e.receive(ServerMessage::Event(Event::ReasoningDelta {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            delta: "Live reasoning".into(),
+        }))
+        .unwrap();
+        e.command(Command::PrepareRunAction(d.clone()));
+        assert!(matches!(
+            reply(&mut e, value.clone()),
+            Request::GetSession { .. }
+        ));
+        e.receive(ServerMessage::Event(Event::ProviderStalled {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            idle_secs: 120,
+        }))
+        .unwrap();
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, value);
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(matches!(request.request, Request::SetSessionCwd { .. }));
+        assert!(e.action_before_write(request.id));
+        e.receive(ServerMessage::ok(request.id, json!({"id":"s","cwd":null})))
+            .unwrap();
+        assert!(matches!(ledger.status(), Status::Applied(_)));
+        e.emit_live_overlay();
+        assert!(e
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::LiveOverlay { view, .. }
+            if view.answer == "Live answer" && view.reasoning == "Live reasoning")));
+        assert!(e.updates.iter().any(|u| matches!(
+            u,
+            Update::RunActivity {
+                event: Event::ProviderStalled { .. },
+                ..
+            }
+        )));
+        assert!(!e.reader.requested);
+    }
+    #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {
         let (mut e, _, _) = setup(Kind::Compact);
         e.context_read();

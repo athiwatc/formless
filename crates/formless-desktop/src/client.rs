@@ -82,6 +82,13 @@ pub enum Update {
         owner: crate::run_actions::Owner,
         event: Event,
     },
+    LiveOverlay {
+        client: uuid::Uuid,
+        connection: u64,
+        generation: u64,
+        session_id: String,
+        view: crate::live_overlay::View,
+    },
     Transcript(StreamBatch),
     ApprovalInventory {
         client: uuid::Uuid,
@@ -965,6 +972,8 @@ impl Preparation {
 #[derive(Default)]
 struct Engine {
     action_work: Option<Box<run_actions::Work>>,
+    live_overlay: crate::live_overlay::Overlay,
+    live_available: bool,
     reference_detach_available: bool,
     session_model_cas_available: bool,
     reviewed_send_available: bool,
@@ -995,6 +1004,19 @@ struct Engine {
 }
 
 impl Engine {
+    fn emit_live_overlay(&mut self) {
+        if let Some(session_id) = self.active.clone() {
+            if let Some(view) = self.live_overlay.take() {
+                self.updates.push(Update::LiveOverlay {
+                    client: self.instance,
+                    connection: self.connection,
+                    generation: self.generation,
+                    session_id,
+                    view,
+                });
+            }
+        }
+    }
     fn reference_current(&self, d: &crate::reference_detach::Dispatch) -> bool {
         let a = d.action();
         self.ready
@@ -1397,7 +1419,7 @@ impl Engine {
         self.request(
             Request::Subscribe {
                 sessions: Some(self.active.iter().cloned().collect()),
-                deltas: false,
+                deltas: self.live_available && !self.reader.requested,
                 client: Some("Desktop".into()),
             },
             Pending::Subscribe,
@@ -1405,6 +1427,7 @@ impl Engine {
     }
 
     fn select(&mut self, session_id: Option<String>, generation: u64) {
+        self.live_overlay = Default::default();
         self.reader.clear();
         self.active = session_id;
         self.generation = generation;
@@ -1419,6 +1442,7 @@ impl Engine {
         if !self.ready {
             return;
         }
+        self.emit_live_overlay();
         if self.dirty_list
             && !self
                 .pending
@@ -2336,6 +2360,15 @@ impl Engine {
                         }
                     }
                 }
+                if self.live_available && !self.reader.requested {
+                    if let Some(session) = self.active.as_deref() {
+                        let reload = self.live_overlay.event(session, &event);
+                        self.dirty_session |= reload;
+                        if reload || matches!(event, Event::RunStarted { .. }) {
+                            self.emit_live_overlay();
+                        }
+                    }
+                }
                 let changed = match &event {
                     Event::SessionUpdated { session } => Some((
                         session.id.as_str(),
@@ -2532,6 +2565,9 @@ impl Engine {
                     result["features"].as_array().is_some_and(|features| {
                         features.iter().any(|f| f == "session_model_compare_set_v1")
                     });
+                self.live_available = result["features"].as_array().is_some_and(|features| {
+                    features.iter().any(|feature| feature == "subscribe_filter")
+                });
                 self.reference_detach_available =
                     result["features"].as_array().is_some_and(|features| {
                         features.iter().any(|f| f == "reviewed_reference_detach_v1")
@@ -2572,8 +2608,12 @@ impl Engine {
                 self.dirty_session = true;
                 self.updates.push(Update::Connection {
                     ready: true,
-                    notice: "Connected · canonical messages · live token streaming unavailable"
-                        .into(),
+                    notice: if self.live_available && !self.reader.requested {
+                        "Connected · provisional live text · canonical history on refresh"
+                    } else {
+                        "Connected · canonical messages · live token streaming unavailable"
+                    }
+                    .into(),
                 });
                 self.emit_questions();
                 if let Some(page) = self.page {
@@ -2620,6 +2660,9 @@ impl Engine {
                     }) {
                         Ok((snapshot, attention)) => {
                             self.context_read();
+                            self.live_overlay
+                                .snapshot(snapshot.steerable_run_id.as_deref(), snapshot.running);
+                            self.emit_live_overlay();
                             self.updates.push(Update::Snapshot {
                                 generation,
                                 snapshot,
@@ -4003,6 +4046,54 @@ mod tests {
         engine.dirty_list = false;
         engine.updates.clear();
         engine
+    }
+
+    #[test]
+    fn production_deltas_require_subscription_capability_and_do_not_enable_future_reader() {
+        for supported in [false, true] {
+            let mut engine = Engine::default();
+            engine.begin();
+            let ping = engine.outgoing.pop_front().unwrap();
+            respond(
+                &mut engine,
+                ping.id,
+                json!({"min_protocol":1,"max_protocol":1,"features":if supported {vec!["subscribe_filter"]} else {vec![]}}),
+            );
+            let subscribe = engine.outgoing.pop_front().unwrap();
+            assert!(matches!(subscribe.request,Request::Subscribe{deltas,..} if deltas==supported));
+            respond(&mut engine, subscribe.id, json!({"subscribed":true}));
+            assert!(engine.updates.iter().any(|u| matches!(u,
+                Update::Connection { ready: true, notice } if notice == if supported {
+                    "Connected · provisional live text · canonical history on refresh"
+                } else {
+                    "Connected · canonical messages · live token streaming unavailable"
+                }
+            )));
+            assert!(!engine.reader.requested);
+            engine.active = Some("s".into());
+            engine
+                .receive(ServerMessage::Event(Event::MessageDelta {
+                    session_id: "s".into(),
+                    run_id: "r".into(),
+                    delta: "live".into(),
+                }))
+                .unwrap();
+            engine.emit_live_overlay();
+            assert_eq!(
+                engine
+                    .updates
+                    .iter()
+                    .any(|u| matches!(u,Update::LiveOverlay{view,..} if view.answer=="live")),
+                supported
+            );
+            engine.updates.clear();
+            engine.select(Some("other".into()), 2);
+            engine.emit_live_overlay();
+            assert!(!engine
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::LiveOverlay { .. })));
+        }
     }
 
     #[test]

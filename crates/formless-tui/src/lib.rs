@@ -6718,7 +6718,7 @@ impl App {
         let paths: Vec<_> = formless_core::files::mentions(&text)
             .iter()
             .map(|p| {
-                let path = mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
+                let path = file_mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
                 let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
                 (path, stamp)
             })
@@ -6740,18 +6740,21 @@ impl App {
             .iter()
             .map(|(name, bytes)| formless_core::forecast::attachment(name.clone(), bytes))
             .collect();
-        let root = self.work_dir();
-        for mention in formless_core::files::mentions(&self.input.expanded()) {
-            let Some(candidate) = mention_path_in(&root, &mention) else {
+        let canonical_root = root.canonicalize().ok();
+        for mention in formless_core::files::mentions(&text) {
+            let Some(candidate) = file_mention_path_in(&root, &mention) else {
                 continue;
             };
             let Ok(path) = candidate.canonicalize() else {
                 continue;
             };
-            let inside = path.starts_with(&root)
-                || (mention.starts_with("~/")
+            let inside = canonical_root
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+                || (formless_core::files::home_path_suffix(&mention).is_some()
                     && directories::BaseDirs::new()
-                        .is_some_and(|b| path.starts_with(b.home_dir())));
+                        .and_then(|base| base.home_dir().canonicalize().ok())
+                        .is_some_and(|home| path.starts_with(home)));
             if !inside
                 || formless_core::daemon::credential_path(&path).is_some()
                 || formless_core::daemon::credential_path(&candidate).is_some()
@@ -7085,7 +7088,7 @@ impl App {
             .into_iter()
             .filter(|p| {
                 root.as_ref()
-                    .is_some_and(|r| mention_path_in(r, p).is_some_and(|p| p.exists()))
+                    .is_some_and(|r| file_mention_path_in(r, p).is_some_and(|p| p.exists()))
             })
             .collect();
         let held = std::mem::take(&mut self.attachments);
@@ -8080,13 +8083,11 @@ impl App {
             }
             cmd if cmd.starts_with("attach ") => {
                 let path = cmd["attach ".len()..].trim().trim_matches(['"', '\'']);
-                let path = match path.strip_prefix("~/") {
-                    Some(rest) => std::env::var("HOME")
-                        .map(|h| format!("{h}/{rest}"))
-                        .unwrap_or_else(|_| path.to_string()),
-                    None => path.to_string(),
-                };
-                self.attach_path_file(std::path::Path::new(&path));
+                if let Some(path) = mention_path_in(std::path::Path::new(""), path) {
+                    self.attach_path_file(&path);
+                } else {
+                    self.notes.push("native home is unavailable for this attachment".into());
+                }
             }
             "paste" => self.paste_image(),
             "tag" | "tags" => self.tag_cmd("", true),
@@ -13153,7 +13154,9 @@ fn draw_input(
     // per file it will attach; removing the @ removes the chip.
     let root = app.work_dir();
     for path in formless_core::files::mentions(&app.input.expanded()) {
-        let full = root.join(&path);
+        let Some(full) = file_mention_path_in(&root, &path) else {
+            continue;
+        };
         if !full.exists() || app.tools.iter().any(|t| t.name == path) {
             continue;
         }
@@ -14792,19 +14795,30 @@ fn short_dir(dir: &str) -> String {
 /// Resolve the same native-home spelling used by daemon AttachPath. Merely
 /// constructing this path grants no access; the daemon still validates intake.
 fn mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
-    Some(match path.strip_prefix("~/") {
-        Some(rest) => directories::BaseDirs::new()?.home_dir().join(rest),
+    Some(match formless_core::files::home_path_suffix(path) {
+        Some(rest) => directories::BaseDirs::new()
+            .filter(|dirs| dirs.home_dir().is_absolute())?
+            .home_dir()
+            .join(rest),
         None => base.join(path),
     })
 }
 
+/// Use the daemon's literal-file precedence for mentions with a location.
+fn file_mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    let candidate = mention_path_in(base, path)?;
+    if formless_core::files::path_and_line(path).1.is_none() {
+        return Some(candidate);
+    }
+    let (requested, _) =
+        formless_core::files::resolve_file_mention(std::path::Path::new(""), candidate).ok()?;
+    Some(requested)
+}
+
 /// A file a chat mentions, resolved against `base` (the Session's working
-/// directory), or absolute, or under `~/`, when it exists.
+/// directory), or absolute, or under the native home, when it exists.
 fn resolve_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
-    let p = match path.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
-        None => base.join(path),
-    };
+    let p = mention_path_in(base, path)?;
     p.is_file().then(|| p.canonicalize().unwrap_or(p))
 }
 
@@ -27753,6 +27767,36 @@ mod tests {
     }
 
     #[test]
+    fn home_mentions_and_explicit_attachments_use_the_native_home() {
+        let base = directories::BaseDirs::new().unwrap();
+        let leaf = format!("fl-mention-{}.txt", uuid::Uuid::new_v4().simple());
+        let file = base.home_dir().join(&leaf);
+        std::fs::write(&file, "fixture").unwrap();
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = RemoveFile(file.clone());
+        let path = format!("~{}{leaf}", std::path::MAIN_SEPARATOR);
+        let mut app = test_app();
+        assert_eq!(mention_path_in(&app.work_dir(), &path).unwrap(), file);
+        assert_eq!(
+            resolve_path_in(&app.work_dir(), &path).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        app.input.set(&format!("@{path}"));
+        assert!(render(&mut app, 140, 24)
+            .contains(&format!("[@~{}fl-mention-", std::path::MAIN_SEPARATOR)));
+        let forecast = app.forecast_input();
+        assert_eq!(forecast.attachments.len(), 1);
+        assert_eq!(forecast.attachments[0].name, leaf);
+        app.slash(&format!("attach {path}"));
+        assert_eq!(app.attachments, [(leaf, b"fixture".to_vec())]);
+    }
+
+    #[test]
     fn list_help_lists_real_bindings_and_preserves_the_view_and_draft() {
         let mut app = test_app();
         let (client, sent) = DaemonClient::recording();
@@ -30152,6 +30196,32 @@ mod tests {
                 .any(|r| matches!(r, Request::AttachPath { .. })),
             "{requests:?}"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cited_file_mentions_preview_the_file_and_submit_the_citation() {
+        let mut app = test_app();
+        let root = app
+            .paths
+            .data_dir
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("report.md"), "fixture").unwrap();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"mention-session","name":"mentions","created_at":"","updated_at":"","cwd":root.to_string_lossy()})).unwrap()];
+        app.current = Some("mention-session".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("read @report.md:42:8");
+        assert!(render(&mut app, 140, 24).contains("[@report.md:42:8]"));
+        assert_eq!(app.forecast_input().attachments[0].name, "report.md");
+        app.submit_chat(false);
+        let attached = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap().request)
+            .any(|request| matches!(request, Request::AttachPath { path, .. } if path == "report.md:42:8"));
+        assert!(attached);
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
