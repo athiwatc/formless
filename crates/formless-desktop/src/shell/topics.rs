@@ -170,9 +170,15 @@ impl Shell {
         }
     }
 
-    fn open_topic_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_topic_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.sidebar.rows().iter().any(|session| session.id == id) {
+            self.topic_ui.state.notice = Some("This conversation is unavailable or archived. Restore archived conversations from Sessions first.".into());
+            cx.notify();
+            return false;
+        }
         self.sidebar.select_id(id);
         self.activate_selected(window, cx);
+        true
     }
 
     fn open_topic(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -184,7 +190,9 @@ impl Shell {
             .find(|t| t.id == id)
             .and_then(|t| t.topic_session_id.clone());
         if let Some(session) = session {
-            self.open_topic_session(&session, window, cx);
+            if !self.open_topic_session(&session, window, cx) {
+                return;
+            }
         }
         self.topic_ui.state.selected = Some(id.to_string());
         self.topic_ui.proposing = false;
