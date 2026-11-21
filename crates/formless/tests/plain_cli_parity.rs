@@ -258,6 +258,20 @@ impl Fixture {
                             json!([])
                         }
                         Request::ListTools => tool_rows.clone(),
+                        Request::SetToolTags { id, tags } => {
+                            let mut tool = tool_rows
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|row| row["id"] == *id)
+                                .unwrap()
+                                .clone();
+                            tool["tags"] = json!(tags
+                                .iter()
+                                .map(|tag| tag.to_ascii_lowercase())
+                                .collect::<Vec<_>>());
+                            tool
+                        }
                         Request::ExportTool { id } => {
                             assert_eq!(id, "full-tool-id");
                             json!({"fixture":"unchanged bundle"})
@@ -2664,6 +2678,45 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn shipped_tool_tag_only_mutates_for_positional_tags_or_explicit_clear() {
+    let mut tool = detail_tool("full-tool-id", "FetchPage", 1);
+    tool["tags"] = json!(["web", "stored\u{202e}tag"]);
+    let fixture = Fixture::with_tools(json!([tool]));
+
+    let conflict = fixture.run(&["tools", "tag", "FetchPage", "web", "--clear"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    let read = fixture.run(&["tools", "tag", "FetchPage"]);
+    assert!(read.status.success(), "{read:?}");
+    assert_eq!(read.stdout, b"FetchPage: web stored\\u{202e}tag\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools]
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let cleared = fixture.run(&["tools", "tag", "FetchPage", "--clear"]);
+    assert!(cleared.status.success(), "{cleared:?}");
+    assert_eq!(cleared.stdout, b"FetchPage: no tags\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags.is_empty()
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let replaced = fixture.run(&["tools", "tag", "full-tool-id", "HTTP", "Docs"]);
+    assert!(replaced.status.success(), "{replaced:?}");
+    assert_eq!(replaced.stdout, b"FetchPage: http docs\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags == &["HTTP", "Docs"]
+    ));
 }
 
 #[test]
