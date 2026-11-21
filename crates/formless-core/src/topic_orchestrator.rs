@@ -258,7 +258,7 @@ impl Daemon {
                     let active = self
                         .topic_steps
                         .locked()
-                        .contains_key(&(topic.id.clone(), attempt.feature_id.clone()));
+                        .contains_key(&(topic.id.clone(), attempt.id.clone()));
                     if !active
                         && attempt.status != TopicAttemptStatus::Running
                         && seen.insert(format!("attempt:{}", attempt.id))
@@ -275,7 +275,7 @@ impl Daemon {
                         || self
                             .topic_steps
                             .locked()
-                            .contains_key(&(topic.id.clone(), a.feature_id.clone()))
+                            .contains_key(&(topic.id.clone(), a.id.clone()))
                         || a.status == TopicAttemptStatus::NeedsUser
                             && current
                                 .features
@@ -364,8 +364,13 @@ impl Daemon {
         Ok(topic)
     }
 
-    pub(super) fn topic_orchestrator_ended(&self, session: &str, status: &str) {
-        match self.with_store(|st| st.finish_topic_orchestrator(session, status)) {
+    pub(super) fn topic_orchestrator_ended<'a>(
+        &self,
+        session: &str,
+        run: &str,
+        status: &'a str,
+    ) -> &'a str {
+        match self.with_store(|st| st.finish_topic_orchestrator(session, run, status)) {
             Ok(Some(topic_id)) => {
                 if status != "completed" {
                     for ((id, _), cancel) in self.topic_steps.locked().iter() {
@@ -376,10 +381,14 @@ impl Daemon {
                     self.close_topic_interactions(&topic_id, None);
                 }
                 self.broadcast(Event::TopicChanged { topic_id });
+                if matches!(status, "paused" | "failed" | "error") {
+                    return "abandoned";
+                }
             }
             Ok(None) => {}
             Err(error) => tracing::warn!("could not finalize topic orchestrator: {error:#}"),
         }
+        status
     }
 
     pub(super) fn finish_topic_feature_tool(
@@ -395,6 +404,19 @@ impl Daemon {
         let detail = args[field]
             .as_str()
             .with_context(|| format!("{field} is required"))?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        let unfinalized = {
+            let steps = self.topic_steps.locked();
+            topic.attempts.iter().any(|attempt| {
+                attempt.feature_id == feature
+                    && steps.contains_key(&(topic.id.clone(), attempt.id.clone()))
+            })
+        };
+        if unfinalized {
+            bail!("feature has a live attempt; wait for CLI exit and output validation");
+        }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
         self.broadcast(Event::TopicChanged {
@@ -445,19 +467,6 @@ impl Daemon {
             bail!("step cancelled before preparation");
         }
         let step_cancel = self.shutdown.child_token();
-        let key = (topic.id.clone(), feature.id.clone());
-        {
-            let mut steps = self.topic_steps.locked();
-            if steps.contains_key(&key) {
-                bail!("feature already has an active attempt");
-            }
-            steps.insert(key.clone(), step_cancel.clone());
-        }
-        let lease = StepLease {
-            daemon: self.clone(),
-            key,
-            token: step_cancel.clone(),
-        };
         let root = private_dir(
             &self.paths.data_dir,
             &PathBuf::from("topic-attempts").join(uuid::Uuid::new_v4().to_string()),
@@ -480,12 +489,12 @@ impl Daemon {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let attempt = {
+        let (attempt, lease) = {
             let _launch = self.topic_launch.locked();
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
             }
-            self.with_store(|st| {
+            let attempt = self.with_store(|st| {
                 st.begin_topic_attempt(
                     &topic.id,
                     &feature.id,
@@ -498,7 +507,17 @@ impl Daemon {
                     &token,
                     &workspace,
                 )
-            })?
+            })?;
+            let key = (topic.id.clone(), attempt.id.clone());
+            self.topic_steps
+                .locked()
+                .insert(key.clone(), step_cancel.clone());
+            let lease = StepLease {
+                daemon: self.clone(),
+                key,
+                token: step_cancel.clone(),
+            };
+            (attempt, lease)
         };
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),

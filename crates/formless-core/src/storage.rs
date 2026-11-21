@@ -2577,13 +2577,20 @@ impl Store {
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
+        self.transaction(|st|{
+        let topic:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1)",[session_id],|row|row.get(0))?;
+        if topic {st.abandon_resumable_runs(session_id)?;}
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.ex(
+        st.ex(
             "INSERT INTO runs(id,session_id,status,created_at,updated_at,start_message_id,start_message_seq) VALUES(?1,?2,'running',?3,?3,(SELECT id FROM messages WHERE session_id=?2 ORDER BY seq DESC,rowid DESC LIMIT 1),(SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?2))",
             params![id, session_id, t],
         )?;
         Ok(id)
+        })
+    }
+    pub(crate) fn abandon_resumable_runs(&self, session: &str) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE runs SET status='abandoned',updated_at=?2 WHERE session_id=?1 AND status IN ('paused','interrupted')",params![session,now()])?)
     }
     pub fn run_status(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self

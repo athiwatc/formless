@@ -453,6 +453,17 @@ async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
         .unwrap();
     assert_eq!(f.state().status, TopicStatus::NeedsUser);
     f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &attempts[0].id,
+                TopicAttemptStatus::NeedsUser,
+                "Need help with X",
+                &[],
+                None,
+            )
+        })
+        .unwrap();
+    f.daemon()
         .handle(Request::HarnessPermissionDecision {
             permission_id,
             option_id: Some("allow".into()),
@@ -704,6 +715,17 @@ async fn topic_permission_fixture_always_is_shared_only_within_one_attempt() {
             },
         })
         .await
+        .unwrap();
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &f.attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "Done",
+                &[],
+                None,
+            )
+        })
         .unwrap();
     let next = f
         .daemon()
