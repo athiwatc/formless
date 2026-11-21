@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::{Paths, Store};
 
-/// MCP server logs larger than this are cut to their last part by `gc`.
-const MCP_LOG_KEEP: u64 = 1_000_000;
 /// Pre-migration database copies kept by `gc` (newest first).
 const MIGRATION_BACKUPS_KEEP: usize = 2;
 /// Recovery points have independent retention from daily snapshots.
@@ -155,6 +153,12 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
     let (artifact_count, artifact_bytes) = crate::artifacts::usage(store)?;
     let inside = store.content_bytes()?;
     let snapshots = store.run_file_usage()?;
+    let oversized_mcp_logs = crate::mcp_log::over_limit(paths);
+    let log_detail = if oversized_mcp_logs == 0 {
+        "daemon and MCP server logs".to_owned()
+    } else {
+        format!("daemon and MCP server logs ({oversized_mcp_logs} MCP logs over 2 MB)")
+    };
     let disk = disk_bytes(paths, path_bytes);
     let rows = vec![
         json!({"kind": "database", "bytes": disk.database, "detail": "formless.db (with its WAL)"}),
@@ -163,7 +167,7 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "tool versions", "bytes": inside["tool_versions"], "detail": "every version's code, inside the database", "inside_db": true}),
         json!({"kind": "file snapshots", "bytes": snapshots.retained_bytes.saturating_add(snapshots.after_state_bytes), "rows": snapshots.rows, "retained_files": snapshots.retained_files, "before_bytes": snapshots.before_bytes, "metadata_bytes": snapshots.metadata_bytes, "after_state_bytes": snapshots.after_state_bytes, "detail": format!("{} recorded paths, {} retained snapshots, inside the database", snapshots.rows, snapshots.retained_files), "inside_db": true}),
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
-        json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + disk.mcp_logs, "detail": "daemon and MCP server logs"}),
+        json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + disk.mcp_logs, "detail": log_detail, "oversized_mcp_logs": oversized_mcp_logs}),
         json!({"kind": "skills", "bytes": disk.skills, "detail": "installed skill files"}),
         json!({"kind": "backups", "bytes": disk.backups, "detail": "daily, pre-migration and before-restore database copies", "before_restore": list_restore_backups(paths), "before_restore_keep": RESTORE_BACKUPS_KEEP}),
     ];
@@ -199,22 +203,7 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
         "remaining_bytes": snapshots.remaining_bytes, "over_budget_bytes": snapshots.over_budget_bytes,
         "detail": format!("keep {} Runs per Session, {} days, {} MiB (run_files.*); active/latest Runs protected; expired paths remain listed", cfg.run_files.keep_runs_per_session, cfg.run_files.max_age_days, cfg.run_files.max_total_mb)}));
     // MCP logs cut to their last part.
-    let (mut n, mut bytes) = (0, 0u64);
-    for e in std::fs::read_dir(paths.data_dir.join("mcp"))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let p = e.path();
-        let len = path_bytes(&p);
-        if p.extension().is_some_and(|x| x == "log") && len > MCP_LOG_KEEP {
-            n += 1;
-            bytes += len - MCP_LOG_KEEP;
-            if !dry_run {
-                keep_tail(&p, MCP_LOG_KEEP)?;
-            }
-        }
-    }
+    let (n, bytes) = crate::mcp_log::compact_logs(paths, crate::mcp_log::KEEP_BYTES, dry_run)?;
     rows.push(json!({"kind": "MCP logs", "items": n, "bytes": bytes,
         "detail": "cut to their last 1 MB"}));
     // Recovery copies are removed only after a newer one has actually passed
@@ -320,18 +309,6 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     );
     let total: u64 = rows.iter().map(|r| r["bytes"].as_u64().unwrap_or(0)).sum();
     Ok(json!({"dry_run": dry_run, "total_bytes": total, "kinds": rows}))
-}
-
-/// Keep only the last `keep` bytes of a file (from a line start).
-fn keep_tail(p: &Path, keep: u64) -> Result<()> {
-    let data = std::fs::read(p)?;
-    let start = data.len().saturating_sub(keep as usize);
-    let start = data[start..]
-        .iter()
-        .position(|b| *b == b'\n')
-        .map_or(start, |i| start + i + 1);
-    std::fs::write(p, &data[start..])?;
-    Ok(())
 }
 
 fn parse_backup_stamp(stamp: &str) -> Option<chrono::NaiveDateTime> {
@@ -1622,7 +1599,7 @@ mod tests {
             "dry run changes nothing"
         );
         gc(&paths, &store, &cfg, false).unwrap();
-        assert!(path_bytes(&paths.data_dir.join("mcp/x.log")) <= MCP_LOG_KEEP);
+        assert!(path_bytes(&paths.data_dir.join("mcp/x.log")) <= crate::mcp_log::KEEP_BYTES);
         assert_eq!(human_bytes(1_500_000), "1.5 MB");
         let _ = std::fs::remove_dir_all(&base);
     }

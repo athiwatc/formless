@@ -31,6 +31,7 @@ pub mod logs;
 pub mod mcp;
 pub mod mcp_auth;
 pub mod mcp_catalog;
+mod mcp_log;
 pub mod memory;
 mod model_test_cache;
 pub mod namer;

@@ -24,6 +24,7 @@ pub enum HistoryMove {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
+    RunAction(crate::run_actions::Kind),
     /// The composer's primary action: Send, or Steer while a Run is going.
     Send,
     /// The composer's second action: Queue, only while a Run is going.
@@ -187,6 +188,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         };
     }
     match command {
+        Command::RunAction(_) => &[],
         Command::ToggleSessions => &[primary!("b")],
         Command::ToggleContext => &[primary!("alt-b")],
         Command::IncreaseTextSize => &[primary!("="), primary!("+")],
@@ -287,6 +289,7 @@ pub fn shortcut_text(key: &str) -> String {
 /// one of them.
 pub fn palette(state: &State) -> Vec<Entry> {
     let mut commands = vec![Command::Send];
+    commands.extend(crate::run_actions::Kind::ALL.map(Command::RunAction));
     if state.has_composer && state.composer.secondary.is_some() {
         commands.push(Command::SendSecondary);
     }
@@ -391,6 +394,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
         ),
         Command::ViewInvocations=>("Invocations", "View unfinished Tool Invocations".into(),Group::Navigation,"Read a Profile-wide snapshot of unfinished Tool work. No cancel, abandon or model call",None,if state.composing {Some(COMPOSING)}else{state.invocations_reason}),
         Command::OpenInvocationSession=>("Open Session", "Open selected Invocation's Session".into(),Group::Navigation,"Navigate to the available unarchived Session associated with the selected read-only record",None,if state.composing {Some(COMPOSING)}else{state.invocation_open_reason}),
+        Command::RunAction(kind) => (kind.label(), kind.label().into(), Group::Run, kind.help(), None, if state.composing { Some(COMPOSING) } else if state.can_edit_session && state.destination == Destination::Chat { None } else { Some("Open a connected Session in Chat first") }),
         Command::ReviewFork=>("Review fork", "Review a new Session fork".into(),Group::Session,"Review copying stored history into a new Session. Confirmation creates it; no model call or Run starts",None,if state.composing {Some(COMPOSING)}else{state.fork_reason}),
         Command::InspectRun => ("Inspect Run", "Inspect selected recorded Run".into(),Group::Navigation,"Read exact persisted Run status, counters and reported spend from Metrics. No Run control or model call",None,state.run_inspection_reason),
         Command::MarkComparisonLeft => (

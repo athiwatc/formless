@@ -45,6 +45,9 @@ async fn mode_lost_ack_case(on: bool) {
                     }
                     Request::Subscribe { deltas: false, .. } => json!({"subscribed":true}),
                     Request::ListSessions => json!([session]),
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::GetSession { id } => {
                         assert_eq!(id, session.id);
                         json!({"session":{"id":id},"messages":[],"running":false,"step_mode":state.load(Ordering::SeqCst),"pending_events":[],"unfinished_run":null,"pending_steps":{"prompts":[],"more":false}})

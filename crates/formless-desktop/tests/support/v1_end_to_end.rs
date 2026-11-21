@@ -477,6 +477,9 @@ fn v1_older_peer_uses_only_canonical_subscription_through_the_actual_view(cx: &m
                         json!({"subscribed":true})
                     }
                     Request::ListSessions => json!([session]),
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::GetSession { id } => {
                         json!({"session":{"id":id},"running":true,"messages":[{"id":"old-message","session_id":id,"seq":1,"role":"assistant","content":"Legacy canonical answer","created_at":"now"}],"pending_events":[]})
                     }

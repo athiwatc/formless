@@ -2510,7 +2510,10 @@ None ship by default (principle 1).
   group with a minimal environment (as `process.run`, §7.4), speaks
   newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`),
   answers the server's `ping`, and writes its stderr to
-  `<data>/mcp/<name>.log`. Servers start on first use, stop after
+  `<data>/mcp/<name>.log`. Before a write would exceed 2 MB, the daemon
+  keeps up to the last 1 MB from a line boundary. Hourly maintenance compacts
+  older oversized logs, which `formless storage` also reports. Log views read up
+  to the final 1 MB. Servers start on first use, stop after
   `idle_secs` without calls, and a crashed server is simply started again
   on the next call (the failed call is a failed Invocation, never a hung
   Run). Cancelling an Invocation sends `notifications/cancelled`.
@@ -4441,6 +4444,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Naming cache.** `formless naming status` lists each cached model and
+  its file sizes, marking the configured model. `formless naming remove
+  [MODEL]` removes weights, the tokenizer and partial downloads for one
+  model. `formless naming remove --all` removes those files for every
+  supported naming model. Removal respects the same lock as downloads and
+  model loading. Automatic downloads can fetch the configured model again
+  unless `naming.auto_download` is disabled.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
@@ -6665,6 +6675,8 @@ nonempty text to BurntToast, falling back to `Formless` if both are empty.
 Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
+`FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
