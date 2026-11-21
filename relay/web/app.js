@@ -1693,6 +1693,7 @@
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
   HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
+  HL.scss = { ...HL.css, lc: ["//"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
@@ -1701,7 +1702,7 @@
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", less: "scss",
   };
   function powershellQuoteEnd(code, from, quote) {
     for (let i = from; i < code.length; i++) {
@@ -1845,7 +1846,15 @@
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;
         if (cls) tok(cls, w); else plain += w;
+        const previous = code[i - 1];
         i += w.length;
+        if (L === HL.scss && w.toLowerCase() === "url" && code[i] === "(" && previous !== "-") {
+          const url = /^\((?:\\[^\r\n]|[^\\()'"\r\n])*\)/.exec(code.slice(i));
+          if (url) {
+            plain += url[0];
+            i += url[0].length;
+          }
+        }
         continue;
       }
       plain += c;

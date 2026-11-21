@@ -439,6 +439,11 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+const SCSS_LESS: Lang = Lang {
+    line_comments: &["//"],
+    ..CSS
+};
+
 /// MySQL requires whitespace or a control character after a double dash.
 const MYSQL: Lang = Lang {
     line_comments: &["--", "#"],
@@ -491,7 +496,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
         "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
-        "css" | "scss" | "less" => &CSS,
+        "css" => &CSS,
+        "scss" | "less" => &SCSS_LESS,
         _ => return None,
     })
 }
@@ -511,6 +517,7 @@ enum Tok {
 
 pub(crate) struct Highlighter {
     lang: &'static Lang,
+    stylesheet_line_comments: bool,
     rust_numbers: bool,
     powershell: bool,
     python_comments: bool,
@@ -644,11 +651,24 @@ fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> boo
         && !matches!(suffix.first(), Some('"' | '\''))
 }
 
+/// Consume an unquoted url(...) argument as a unit so its slashes stay literal.
+fn unquoted_stylesheet_url_end(chars: &[char], mut i: usize) -> Option<usize> {
+    loop {
+        match chars.get(i)? {
+            ')' => return Some(i + 1),
+            '\'' | '"' | '(' => return None,
+            '\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
         lang(&name).map(|lang| Self {
             lang,
+            stylesheet_line_comments: matches!(name.as_str(), "scss" | "less"),
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
@@ -1076,6 +1096,17 @@ impl Highlighter {
                     Tok::Plain
                 };
                 push(tok, &chars[i..j]);
+                if self.stylesheet_line_comments
+                    && word.eq_ignore_ascii_case("url")
+                    && chars.get(j) == Some(&'(')
+                    && (i == 0 || chars[i - 1] != '-')
+                {
+                    if let Some(end) = unquoted_stylesheet_url_end(&chars, j + 1) {
+                        push(Tok::Plain, &chars[j..end]);
+                        i = end;
+                        continue;
+                    }
+                }
                 i = j;
                 continue;
             }
@@ -1579,6 +1610,50 @@ mod tests {
                 *color == Some(Color::DarkGray) && text.contains("outside")
             }));
         }
+    }
+
+    #[test]
+    fn scss_and_less_comments_end_at_newline_and_leave_urls_intact() {
+        for lang in ["scss", "Less"] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            let comment = "// important: skip the /* old sheet";
+            let spans = highlighter.line(comment);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].content, comment);
+            assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+
+            let line = r#"@media { a: URL(https://example.com/a\).png); b: url("//example.test/b"); } // end"#;
+            let spans = highlighter.line(line);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                line
+            );
+            assert!(spans
+                .iter()
+                .any(|span| span.content == "media" && span.style.fg == Some(Color::Magenta)));
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r#""//example.test/b""#
+                    && span.style.fg == Some(Color::Green)));
+            let comments: Vec<_> = spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(comments, ["// end"]);
+        }
+        let mut css = Highlighter::new("css", true).unwrap();
+        assert!(css
+            .line("// import")
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(css.line("/* import */")[0]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
     }
 
     #[test]
