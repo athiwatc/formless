@@ -689,10 +689,10 @@ mod pipeline_daemon_tests;
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
 
-#[path = "reviewed_send.rs"]
-mod reviewed_send;
 #[path = "model_listing_health.rs"]
 mod model_listing_health;
+#[path = "reviewed_send.rs"]
+mod reviewed_send;
 #[cfg(test)]
 #[path = "reviewed_send_tests.rs"]
 mod reviewed_send_tests;
@@ -1049,10 +1049,11 @@ impl Daemon {
         let model_test_cache = Arc::new(crate::model_test_cache::ModelTestCache::new(
             paths.data_dir.join("model_tests.json"),
         ));
-        let model_listing_health = model_listing_health::State::load(&paths).unwrap_or_else(|error| {
-            tracing::warn!("could not read model listing state: {error:#}");
-            Default::default()
-        });
+        let model_listing_health =
+            model_listing_health::State::load(&paths).unwrap_or_else(|error| {
+                tracing::warn!("could not read model listing state: {error:#}");
+                Default::default()
+            });
         Ok(Self {
             paths,
             store: Arc::new(StdMutex::new(store)),
@@ -1854,7 +1855,8 @@ impl Daemon {
                         |s| json!({"conn": s.conn, "queued": s.tx.max_capacity() - s.tx.capacity()})
                     )
                     .collect::<Vec<_>>());
-                let (missing, model_checked_at, model_checks_skipped) = self.model_listing_health.locked().report();
+                let (missing, model_checked_at, model_checks_skipped) =
+                    self.model_listing_health.locked().report();
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
                     "missing_models": missing,
@@ -1893,7 +1895,9 @@ impl Daemon {
                 });
                 Ok(json!({"shutting_down": true}))
             }
-            Request::DismissMissingModel { provider, model } => self.dismiss_missing_model(&provider, &model),
+            Request::DismissMissingModel { provider, model } => {
+                self.dismiss_missing_model(&provider, &model)
+            }
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,
             )?),
@@ -4968,10 +4972,13 @@ impl Daemon {
                 Ok(serde_json::to_value(p)?)
             }
             Request::AcknowledgeApprovalHelp => {
-                crate::onboarding::save(&self.paths, &crate::onboarding::Seen {
-                    approval_help: true,
-                    ..Default::default()
-                })?;
+                crate::onboarding::save(
+                    &self.paths,
+                    &crate::onboarding::Seen {
+                        approval_help: true,
+                        ..Default::default()
+                    },
+                )?;
                 self.broadcast(Event::ApprovalHelpSeen);
                 Ok(json!({"approval_help_seen": true}))
             }
