@@ -1952,7 +1952,10 @@ pub enum Request {
     Ping,
     Status,
     /// Hide one known model-listing warning for this profile.
-    DismissMissingModel { provider: String, model: String },
+    DismissMissingModel {
+        provider: String,
+        model: String,
+    },
     /// Read-only configuration summary for remote clients (no secrets).
     GetSettings,
     Shutdown,
