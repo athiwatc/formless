@@ -31,6 +31,14 @@ fn setup(tag: &str) -> (Paths, String) {
     (paths, sid)
 }
 
+#[test]
+fn putty_keys_are_credential_paths_by_suffix() {
+    let root = std::env::temp_dir().join("formless-project");
+    assert!(credential_path(&root.join("server.ppk")).is_some());
+    assert!(credential_path(&root.join("identity.PPK")).is_some());
+    assert!(credential_path(&root.join("ppk-notes.txt")).is_none());
+}
+
 fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
