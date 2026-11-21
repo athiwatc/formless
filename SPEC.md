@@ -3931,8 +3931,9 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **The first approval** (TUI and web) adds a short explainer: Tools have
   no access by default, what the Capabilities are, Always vs Once vs this
   Session vs Deny, and `/approvals` / `/revoke` to undo. It is shown until
-  the first answer (`<data>/tui-seen.json`; the web remembers it in the
-  browser).
+  a client confirms the first ordinary approval answer. The daemon persists
+  the acknowledgement per profile and shares it with connected clients.
+  Promotion answers do not dismiss this help.
 - **A guided first task.** Once setup finishes, a note offers `/tour`
   (and `/tour skip`, which hides the offer for good); it is offered once.
   `/tour` puts a sample task in the input that makes the agent build a

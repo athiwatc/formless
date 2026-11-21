@@ -113,6 +113,7 @@
     proposals: [],
     settings: null,
     status: null,
+    approvalHelpSeen: undefined,
     notes: [],
     unread: 0,
     showThinking: prefs.get("thinking", true),
@@ -4946,6 +4947,26 @@
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
+  function approvalHelpSeen() {
+    return S.approvalHelpSeen === null ? prefs.get("seen.approvalHelp", false) : S.approvalHelpSeen === true;
+  }
+  async function rememberApprovalHelp() {
+    if (S.approvalHelpSeen === undefined) {
+      const status = await request({ type: "status" });
+      if (S.approvalHelpSeen !== true) {
+        S.approvalHelpSeen = typeof status?.approval_help_seen === "boolean" ? status.approval_help_seen : null;
+      }
+    }
+    if (S.approvalHelpSeen === null) {
+      prefs.set("seen.approvalHelp", true);
+      return;
+    }
+    if (!S.approvalHelpSeen) {
+      const result = await request({ type: "acknowledge_approval_help" });
+      if (result?.approval_help_seen !== true) throw new Error("The daemon did not record the preference");
+      S.approvalHelpSeen = true;
+    }
+  }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
@@ -4965,7 +4986,7 @@
     const body = $("modal-body");
     body.replaceChildren(h("div", null,
       // The first approval ever: what this is and how to undo it (#394).
-      !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
+      !promo && !approvalHelpSeen() ? h("p", { class: "first-approval" },
         tr("First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Allow once covers just this call, This Session covers the current Session, and Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.")) : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
@@ -5287,6 +5308,7 @@
       }
     }
     const req = head;
+    const sawHelp = req.kind !== "promotion" && !approvalHelpSeen();
     req.deciding = true;
     renderApproval();
     let result;
@@ -5315,7 +5337,10 @@
       const answers = (S.batchAnswers = S.batchAnswers || {})[req.batch.batch_id] = S.batchAnswers[req.batch.batch_id] || {};
       answers[req.batch.index] = !approved ? "denied" : scope === "once" ? "once" : scope === "session" ? "this Session" : scope === "hour" ? "for 1 hour" : "always";
     }
-    prefs.set("seen.approvalHelp", true);
+    if (sawHelp) {
+      try { await rememberApprovalHelp(); }
+      catch (error) { note("Could not save the approval help preference (" + error.message + ")", true); }
+    }
     note((approved ? "approved " : "denied ") + (req.kind === "promotion" ? "promotion of " : "") + req.tool_name + (scope === "once" ? " once" : scope === "session" ? " for this Session" : scope === "hour" ? " for an hour" : ""));
     if (!S.approvals.length && isRunning()) setActivity("waiting for model");
     renderApproval();
@@ -7179,7 +7204,13 @@
       }
       case "status": {
         const status = await act({ type: "status" });
-        if (isSettingsConnection(connection)) S.status = status;
+        if (!isSettingsConnection(connection)) return;
+        const helpWasSeen = approvalHelpSeen();
+        S.status = status;
+        if (S.status && S.approvalHelpSeen !== true) {
+          S.approvalHelpSeen = typeof S.status.approval_help_seen === "boolean" ? S.status.approval_help_seen : null;
+        }
+        if (approvalHelpSeen() !== helpWasSeen) renderApproval();
         break;
       }
       case "descriptionReviews":
@@ -7263,6 +7294,7 @@
       S.sessionLoad = { id: S.current, status: "failed" };
     }
     S.approvals = [];
+    S.approvalHelpSeen = undefined;
     clearQuestions();
     S.running.clear();
     S.activity = null;
@@ -8434,6 +8466,10 @@
           S.others = (ev.clients || []).filter((c) => c.conn !== S.conn);
           scheduleEventRender({ status: true });
         }
+        break;
+      case "approval_help_seen":
+        S.approvalHelpSeen = true;
+        renderApproval();
         break;
       case "approval_closed": {
         const before = S.approvals.length;

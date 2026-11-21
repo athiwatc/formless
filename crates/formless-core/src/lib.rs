@@ -35,6 +35,7 @@ mod mcp_log;
 pub mod memory;
 mod model_test_cache;
 pub mod namer;
+pub mod onboarding;
 pub mod optimiser;
 mod optimiser_statistics;
 pub mod path_scope;
