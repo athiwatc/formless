@@ -184,12 +184,8 @@ pub fn resolve_base_url(value: &str) -> Option<String> {
     find(v).map(|p| p.base_url.to_string())
 }
 
-/// The latest Azure OpenAI data-plane API version this build knows.
-pub const AZURE_API_VERSION: &str = "2024-10-21";
-
-/// Azure OpenAI (SPEC §4.2): a deployment's base URL, its `api-version`
-/// query parameter and the `api-key` header, from the resource name (or
-/// its full `https://….openai.azure.com` endpoint) and deployment.
+/// Azure OpenAI (SPEC §4.2) uses the v1 API unless a dated API version
+/// is explicitly supplied for the deployment-scoped route.
 pub fn azure(
     resource: &str,
     deployment: &str,
@@ -199,27 +195,70 @@ pub fn azure(
     std::collections::BTreeMap<String, String>,
     &'static str,
 )> {
-    let resource = resource.trim().trim_end_matches('/');
     let deployment = deployment.trim();
-    if resource.is_empty() || deployment.is_empty() {
-        anyhow::bail!("Azure OpenAI needs the resource name and the deployment name");
+    if deployment.is_empty()
+        || matches!(deployment, "." | "..")
+        || !deployment
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!("Azure deployment names must use letters, digits, '-', '_' or '.'");
     }
-    let host = if resource.starts_with("https://") {
-        resource.to_string()
-    } else {
-        format!("https://{resource}.openai.azure.com")
+    let endpoint = azure_endpoint(resource)?;
+    let (path, query) = match api_version.map(str::trim) {
+        Some("") => anyhow::bail!("--api-version must specify an Azure API version"),
+        Some(version) => (
+            format!("/openai/deployments/{deployment}"),
+            [("api-version".to_owned(), version.to_owned())].into(),
+        ),
+        None => ("/openai/v1".to_owned(), Default::default()),
     };
-    let base = format!("{host}/openai/deployments/{deployment}");
-    let mut q = std::collections::BTreeMap::new();
-    q.insert(
-        "api-version".to_string(),
-        api_version
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or(AZURE_API_VERSION)
-            .to_string(),
-    );
-    Ok((base, q, "api-key"))
+    Ok((format!("{endpoint}{path}"), query, "api-key"))
+}
+
+fn azure_endpoint(resource: &str) -> anyhow::Result<String> {
+    let resource = resource.trim();
+    let resource = resource.strip_suffix('/').unwrap_or(resource);
+    let invalid = || {
+        anyhow::anyhow!(
+        "Azure resource must be a resource name, Azure host, or HTTPS endpoint without a path, credentials, query or fragment"
+    )
+    };
+    let label = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 63
+            && !part.starts_with('-')
+            && !part.ends_with('-')
+            && part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    };
+    let origin = if let Some((scheme, host)) = resource.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https")
+            || host.is_empty()
+            || host.contains(['/', '\\', '@', '?', '#'])
+            || host.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(invalid());
+        }
+        format!("https://{host}")
+    } else if label(resource) {
+        format!("https://{resource}.openai.azure.com")
+    } else {
+        let host = resource.to_ascii_lowercase();
+        if !host.split('.').all(label)
+            || ![
+                ".openai.azure.com",
+                ".cognitiveservices.azure.com",
+                ".services.ai.azure.com",
+            ]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        {
+            return Err(invalid());
+        }
+        format!("https://{host}")
+    };
+    let url = reqwest::Url::parse(&origin).map_err(|_| invalid())?;
+    Ok(url.origin().ascii_serialization())
 }
 
 /// The preset's key from its environment variable, when set.
@@ -233,20 +272,62 @@ pub fn env_key(p: &Preset) -> Option<(&'static str, String)> {
 
 #[cfg(test)]
 mod azure_tests {
+    use super::azure;
+
     #[test]
-    fn azure_builds_the_deployment_url_version_and_key_header() {
-        let (base, q, header) = super::azure("contoso", "gpt4o", None).unwrap();
-        assert_eq!(
-            base,
-            "https://contoso.openai.azure.com/openai/deployments/gpt4o"
-        );
-        assert_eq!(q["api-version"], super::AZURE_API_VERSION);
+    fn azure_uses_v1_for_resource_names_hosts_and_endpoints() {
+        for (resource, host) in [
+            ("contoso", "contoso.openai.azure.com"),
+            ("Contoso.OpenAI.Azure.COM", "contoso.openai.azure.com"),
+            (
+                "contoso.cognitiveservices.azure.com",
+                "contoso.cognitiveservices.azure.com",
+            ),
+            (
+                "https://x.services.ai.azure.com/",
+                "x.services.ai.azure.com",
+            ),
+            (
+                "https://azure-gateway.example:8443/",
+                "azure-gateway.example:8443",
+            ),
+        ] {
+            let (base, query, header) = azure(resource, "deploy_2026.v1", None).unwrap();
+            assert_eq!(base, format!("https://{host}/openai/v1"));
+            assert!(query.is_empty());
+            assert_eq!(header, "api-key");
+        }
+    }
+
+    #[test]
+    fn azure_pins_only_an_explicit_api_version() {
+        let (base, query, header) =
+            azure("https://x.openai.azure.com/", "gpt-4o", Some("2025-01-01")).unwrap();
+        assert_eq!(base, "https://x.openai.azure.com/openai/deployments/gpt-4o");
+        assert_eq!(query, [("api-version".into(), "2025-01-01".into())].into());
         assert_eq!(header, "api-key");
-        let (base, q, _) =
-            super::azure("https://x.openai.azure.com/", "d", Some("2025-01-01")).unwrap();
-        assert_eq!(base, "https://x.openai.azure.com/openai/deployments/d");
-        assert_eq!(q["api-version"], "2025-01-01");
-        assert!(super::azure("", "d", None).is_err());
+        assert!(azure("contoso", "d", Some(" ")).is_err());
+    }
+
+    #[test]
+    fn azure_rejects_invalid_resources_and_deployments() {
+        for resource in [
+            "",
+            "http://contoso.openai.azure.com",
+            "contoso.example",
+            "https://",
+            "https://x.services.ai.azure.com/api/projects/p",
+            "https://x.openai.azure.com/.",
+            "https://x.openai.azure.com?api-version=preview",
+            "https://x.openai.azure.com/#part",
+            "https://@x.openai.azure.com",
+        ] {
+            assert!(azure(resource, "d", None).is_err(), "{resource}");
+        }
+        for deployment in ["", ".", "..", "with space", "with/slash", "with%2fescape"] {
+            assert!(azure("contoso", deployment, None).is_err(), "{deployment}");
+            assert!(azure("contoso", deployment, Some("2025-01-01")).is_err());
+        }
     }
 }
 
