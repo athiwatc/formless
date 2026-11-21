@@ -49,6 +49,7 @@ pub fn tool_verdict(v: &Value) -> (bool, String) {
 /// Most hook output kept (stdout and stderr each); the rest is read and
 /// dropped, so a chatty hook can't grow the daemon (#827).
 pub const MAX_HOOK_OUTPUT: usize = 64 * 1024;
+const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Run a hook command (no shell) with the payload on stdin. Exit 0
 /// allows; otherwise its output is the reason. The payload is written
@@ -60,32 +61,32 @@ pub async fn run_command(
     payload: &Value,
     timeout: std::time::Duration,
 ) -> (bool, String) {
+    use formless_runtime::process_group::SupervisedChild;
+    use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let child = tokio::process::Command::new(cmd)
+
+    let mut command = tokio::process::Command::new(cmd);
+    command
         .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match SupervisedChild::spawn(command) {
+        Ok(child) => child,
         Err(e) => return (false, format!("hook command {cmd} failed to start: {e}")),
     };
     let body = payload.to_string().into_bytes();
-    let stdin = child.stdin.take();
+    let (stdin, stdout, stderr) = child.take_pipes();
     let writer = async move {
         if let Some(mut stdin) = stdin {
             let _ = stdin.write_all(&body).await;
             // Dropped here: the hook sees end of input.
         }
     };
-    // Read everything, keep the first MAX_HOOK_OUTPUT bytes.
-    async fn capped<R: tokio::io::AsyncRead + Unpin>(r: Option<R>) -> Vec<u8> {
-        let Some(mut r) = r else {
-            return Vec::new();
-        };
-        let mut kept = Vec::new();
+    // Keep bytes read before the drain deadline even when a descendant
+    // holds its inherited writer open.
+    async fn capped<R: tokio::io::AsyncRead + Unpin>(r: Option<R>, kept: &mut Vec<u8>) {
+        let Some(mut r) = r else { return };
         let mut buf = [0u8; 8192];
         loop {
             match r.read(&mut buf).await {
@@ -96,26 +97,38 @@ pub async fn run_command(
                 }
             }
         }
-        kept
     }
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let run = async {
-        let ((), out, err, status) =
-            tokio::join!(writer, capped(stdout), capped(stderr), child.wait());
-        (out, err, status)
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let exited = {
+        let capture = async {
+            tokio::join!(writer, capped(stdout, &mut out), capped(stderr, &mut err));
+        };
+        let wait = tokio::time::timeout(timeout, child.exited());
+        tokio::pin!(capture, wait);
+        tokio::select! {
+            result = &mut wait => {
+                if matches!(result, Ok(Ok(()))) {
+                    let _ = tokio::time::timeout(PIPE_DRAIN_GRACE, &mut capture).await;
+                }
+                result
+            }
+            () = &mut capture => wait.await,
+        }
     };
-    match tokio::time::timeout(timeout, run).await {
-        Ok((out, err, Ok(status))) => {
+    let status = match exited {
+        Ok(Ok(())) => child.finish().await,
+        Ok(Err(e)) => Err(e),
+        Err(_) => return (false, format!("hook command {cmd} timed out")),
+    };
+    match status {
+        Ok(status) => {
             let mut text = String::from_utf8_lossy(&out).trim().to_string();
-            let err = String::from_utf8_lossy(&err).trim().to_string();
             if text.is_empty() {
-                text = err;
+                text = String::from_utf8_lossy(&err).trim().to_string();
             }
             (status.success(), text.chars().take(2000).collect())
         }
-        Ok((_, _, Err(e))) => (false, format!("hook command {cmd} failed: {e}")),
-        Err(_) => (false, format!("hook command {cmd} timed out")),
+        Err(e) => (false, format!("hook command {cmd} failed: {e}")),
     }
 }
 
@@ -132,5 +145,44 @@ mod pipe_tests {
         assert!(ok, "{out}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         assert!(out.chars().count() <= 2000);
+    }
+
+    #[tokio::test]
+    async fn a_successful_hook_with_inherited_pipes_finishes_and_reaps_descendants() {
+        use std::time::{Duration, Instant};
+        let temp = std::env::temp_dir().join(format!("formless-hook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temp).unwrap();
+        let marker = temp.join("child-survived");
+        let args = vec![
+            "-c".to_string(),
+            r#"(sleep 1; printf survived > "$1") & printf 'allowed\n'"#.to_string(),
+            "formless-hook-fixture".to_string(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let start = Instant::now();
+        let (ok, out) =
+            super::run_command("sh", &args, &serde_json::json!({}), Duration::from_secs(5)).await;
+        assert!(ok, "{out}");
+        assert_eq!(out, "allowed");
+        assert!(start.elapsed() < Duration::from_millis(850));
+        tokio::time::sleep_until((start + Duration::from_millis(1200)).into()).await;
+        let child_survived = marker.exists();
+        std::fs::remove_dir_all(&temp).unwrap();
+        assert!(!child_survived, "a descendant outlived the hook");
+    }
+
+    #[tokio::test]
+    async fn a_running_hook_still_times_out() {
+        use std::time::Duration;
+        let args = vec!["-c".into(), "sleep 2".into()];
+        let (ok, out) = super::run_command(
+            "sh",
+            &args,
+            &serde_json::json!({}),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(out, "hook command sh timed out");
     }
 }
