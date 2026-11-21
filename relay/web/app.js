@@ -1748,19 +1748,36 @@
   }
   function topicStatusLabel(status) {
     return ({ pending_approval: "Needs approval", approved: "Ready to start", running: "In progress",
-      complete: "Ready for you", pending: "Pending", building: "Building", awaiting_review: "Awaiting review", reviewing: "In review",
+      complete: "Ready for you", pending: "Pending", succeeded: "Succeeded", cancelled: "Cancelled",
       ready: "Ready for you", needs_user: "Needs your input", failed: "Failed", rejected: "Not moved",
-      passed: "Passed", findings: "Changes requested", abandoned: "Interrupted" })[status] || status || "Pending";
+      abandoned: "Interrupted" })[status] || status || "Pending";
   }
   function harnessLabel(kind) {
-    return ({ claude: "Claude", codex: "Codex", pi: "Pi", open_code: "OpenCode", antigravity: "Antigravity" })[kind] || kind;
+    return ({ claude: "Claude", codex: "Codex", pi: "Pi", opencode: "OpenCode", antigravity: "Antigravity", acp: "ACP", muse: "Muse" })[kind] || kind || "Formless chooses";
   }
   function topicBadge(status) {
     return h("span", { class: "topic-badge topic-state-" + status }, topicStatusLabel(status));
   }
   function topicWorkflowLabel(topic) {
-    const label = (kind, model) => harnessLabel(kind) + (model ? " · " + model : "");
-    return label(topic.builder, topic.builder_model) + " → " + label(topic.reviewer, topic.reviewer_model);
+    return (topic.outline || []).map(step => step.title).join(" → ") || "Formless chooses the steps";
+  }
+  function topicPath(topic) {
+    const names = [], seen = new Set();
+    while (topic && !seen.has(topic.id)) {
+      seen.add(topic.id); names.unshift(topic.name);
+      topic = S.topics.find(item => item.id === topic.parent_topic_id);
+    }
+    return names.join(" / ");
+  }
+  function topicArtifacts(outputs) {
+    return (outputs || []).map(output => {
+      if (output.kind === "git_revision") return h("li", null, "Git revision ", h("code", null, output.revision));
+      if (output.kind === "file") return h("li", null, "File ", h("code", null, output.path),
+        h("small", { class: "muted" }, "SHA-256 ", output.sha256));
+      if (output.kind === "text") return h("li", null, h("details", null, h("summary", null, output.title || "Text output"),
+        h("pre", null, output.content)));
+      return h("li", { class: "muted" }, "Unknown output type");
+    });
   }
   function replaceTopicContent(root, signature, children) {
     if (root.topicSignature === signature) return;
@@ -1784,15 +1801,19 @@
       "data-topic-control": "main", "aria-current": S.current === S.mainChat?.id ? "page" : null,
       onclick: () => openSession(S.mainChat.id) }, h("span", { "aria-hidden": "true", class: "topic-icon" }, "◇"), "Main Chat");
     const topics = S.topics.filter(topic => topic.status !== "rejected");
-    const rows = topics.map(topic => {
+    const seen = new Set();
+    const row = topic => {
+      if (seen.has(topic.id)) return null;
+      seen.add(topic.id);
       const active = topicForSession()?.id === topic.id || S.topicFocus === topic.id;
       const collapsed = !!S.topicCollapsed?.[topic.id];
       const attempts = topic.attempts || [];
+      const nested = topics.filter(item => item.parent_topic_id === topic.id);
       const ready = topic.features.filter(feature => feature.status === "ready").length;
       const attention = topic.status === "pending_approval" || topic.features.some(feature => ["needs_user", "failed"].includes(feature.status));
       const childrenId = "topic-attempts-" + topic.id;
       return h("li", { class: "topic-item", "data-topic-id": topic.id },
-        h("div", { class: "topic-nav-row" }, attempts.length ? h("button", { type: "button", class: "icon-btn topic-disclosure",
+        h("div", { class: "topic-nav-row" }, attempts.length || nested.length ? h("button", { type: "button", class: "icon-btn topic-disclosure",
           "aria-label": (collapsed ? "Expand " : "Collapse ") + topic.name, "aria-expanded": String(!collapsed), "aria-controls": childrenId,
           "data-topic-control": "toggle-" + topic.id,
           onclick: () => { (S.topicCollapsed ||= {})[topic.id] = !collapsed; renderTopicNavigation(); } }, collapsed ? "▸" : "▾") : h("span", { class: "topic-disclosure" }),
@@ -1803,15 +1824,18 @@
           h("span", { class: "topic-nav-count" + (attention ? " attention" : ""), "aria-label": attention ? "Needs attention" : ready + " of " + topic.features.length + " ready" }, attention ? "!" : ready + "/" + topic.features.length))),
         h("ul", { id: childrenId, class: "topic-attempt-list", hidden: collapsed }, attempts.map(attempt => {
           const feature = topic.features.find(item => item.id === attempt.feature_id);
-          const name = harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)) + " · " + (attempt.role === "build" ? "Build" : "Review");
+          const name = (attempt.step_title || "Step") + " · " + harnessLabel(attempt.harness);
           return h("li", null, h("button", { type: "button", class: "topic-chat-link attempt-link" + (S.current === attempt.conversation_session_id ? " active" : ""),
             "data-topic-control": "attempt-" + attempt.id, "aria-current": S.current === attempt.conversation_session_id ? "page" : null,
             title: name + " · " + topicStatusLabel(attempt.status) + " · " + (feature?.request || ""),
             onclick: () => openSession(attempt.conversation_session_id) },
             h("span", { class: "attempt-dot topic-state-" + attempt.status, "aria-hidden": "true" }),
-            h("span", { class: "attempt-identity" }, h("span", null, name), h("small", { class: "muted" }, feature?.request || "Feature", " · ", topicStatusLabel(attempt.status)))));
-        })));
-    });
+            h("span", { class: "attempt-identity" }, h("span", null, name), h("small", { class: "muted" }, feature?.request || "Work item", " · ", topicStatusLabel(attempt.status)))));
+        }).concat(nested.map(row).filter(Boolean))));
+    };
+    const rows = topics.filter(topic => !topics.some(parent => parent.id === topic.parent_topic_id)).map(row);
+    // Keep orphaned/corrupt snapshots reachable without following a cycle forever.
+    for (const topic of topics) if (!seen.has(topic.id)) rows.push(row(topic));
     replaceTopicContent(nav, signature, [main,
       h("div", { class: "topic-nav-heading" }, h("h3", { class: "sidebar-label" }, "Topic Chats"),
         h("button", { type: "button", class: "icon-btn", "aria-label": "Create topic from this conversation", "data-topic-control": "new-topic", onclick: () => proposeTopic() }, "+")),
@@ -1835,29 +1859,46 @@
     if (topic) {
       children.push(h("div", { class: "topic-summary" }, h("div", { class: "topic-summary-copy" },
         h("div", { class: "topic-eyebrow" }, attempt ? "Harness conversation · read only" : "Topic workflow", topicBadge(topic.status)),
-        h("strong", { class: "topic-heading" }, topic.name), h("div", { class: "muted topic-workflow" }, topicWorkflowLabel(topic))),
+        h("strong", { class: "topic-heading" }, topicPath(topic)), h("div", { class: "muted topic-workflow" }, topicWorkflowLabel(topic))),
         h("div", { class: "topic-actions" }, attempt ? control("Back to topic", "back", () => openTopic(topic)) : null,
           control("Refresh", "refresh", () => refreshTopicView()))));
       if (attempt) {
-        children.push(h("p", { class: "topic-readonly muted" }, harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)),
-          " · ", topicStatusLabel(attempt.status), " · Formless coordinates handoffs. Continue the conversation in the topic chat."));
+        children.push(h("p", { class: "topic-readonly muted" }, attempt.step_title || "Step", " · ", harnessLabel(attempt.harness),
+          attempt.acp_agent ? " · " + attempt.acp_agent : "", attempt.model ? " · " + attempt.model : "",
+          " · ", attempt.access === "read_only" ? "Read only" : "Can write", " · ", topicStatusLabel(attempt.status),
+          " · Formless coordinates handoffs. Continue the conversation in the topic chat."));
+        if (attempt.summary || attempt.detail) children.push(h("p", null, attempt.summary || attempt.detail));
+        if (attempt.inputs?.length) children.push(h("div", null, h("strong", null, "Inputs"), h("ul", { class: "topic-outputs" }, topicArtifacts(attempt.inputs))));
+        if (attempt.outputs?.length) children.push(h("div", null, h("strong", null, "Outputs"), h("ul", { class: "topic-outputs" }, topicArtifacts(attempt.outputs))));
         if (S.attemptTranscriptError === S.current) children.push(h("p", { class: "error", role: "status" }, "Transcript updates unavailable. Refresh to try again."));
       } else if (topic.status === "pending_approval") {
         children.push(h("p", { class: "muted" }, "These requests stay in the original chat until you agree. Approval moves them here and starts your workflow."),
-          h("p", { class: "topic-repo" }, h("code", null, topic.repo)),
           h("div", { class: "topic-actions" }, control("Keep in original chat", "reject", () => rejectTopic(topic)),
             control("Move & start", "approve", () => approveTopic(topic), true)));
       } else if (topic.status === "approved") {
         children.push(h("div", { class: "topic-actions" }, h("span", { class: "muted" }, "Requests moved. Your workflow has not started."),
           control("Start workflow", "start", () => startTopic(topic), true)));
       }
-      if (!attempt) children.push(h("div", { class: "topic-features", "aria-label": "Feature progress" }, topic.features.map((feature, i) =>
+      if (!attempt) {
+        children.push(h("p", { class: "topic-repo" }, "Workspace: ", topic.workspace ? h("code", null, topic.workspace) : "Private scratch workspace"),
+          h("p", { class: "muted" }, "The outline is a starting point. Formless chooses and adapts the steps and harnesses."));
+        if (topic.outline?.length) children.push(h("ol", { class: "topic-outline-preview" }, topic.outline.map(step => h("li", null,
+          h("strong", null, step.title), " · ", harnessLabel(step.harness), step.acp_agent ? " · " + step.acp_agent : "",
+          step.model ? " · " + step.model : "", " · ", step.access === "read_only" ? "Read only" : "Can write",
+          step.instructions ? h("p", null, step.instructions) : null))));
+        if (["approved", "running", "needs_user"].includes(topic.status)) children.push(h("div", { class: "topic-actions" },
+          control("Cancel workflow", "cancel", () => cancelTopic(topic))));
+        if (topic.status === "needs_user") children.push(h("p", { role: "status" }, "Formless needs your input. Reply in this topic chat to continue."));
+        if (topic.status === "cancelled") children.push(h("p", { role: "status" }, "Workflow cancelled. Retry a work item to resume."));
+        children.push(h("div", { class: "topic-features", "aria-label": "Work item progress" }, topic.features.map((feature, i) =>
         h("article", { class: "topic-feature", "data-feature-id": feature.id }, h("div", { class: "topic-feature-head" },
           h("span", { class: "muted" }, String(i + 1).padStart(2, "0")), h("strong", null, feature.request), topicBadge(feature.status)),
           feature.detail ? h("p", { class: "topic-feature-detail" }, feature.detail) : null,
-          feature.ready_revision ? h("p", { class: "topic-revision" }, "Reviewed revision ", h("code", null, feature.ready_revision)) : null,
-          ["failed", "needs_user"].includes(feature.status) ? control("Retry feature", "retry-" + feature.id, () => retryTopicFeature(topic, feature)) : null))));
-      children.push(h("p", { class: "topic-no-merge muted" }, "Formless handles build → review → fixes. Ready features wait for you; nothing merges automatically."));
+          feature.attempt_count ? h("small", { class: "muted" }, feature.attempt_count + " attempts") : null,
+          feature.outputs?.length ? h("ul", { class: "topic-outputs" }, topicArtifacts(feature.outputs)) : null,
+          ["failed", "needs_user", "complete", "cancelled"].includes(topic.status) ? control("Retry work item", "retry-" + feature.id, () => retryTopicFeature(topic, feature)) : null))));
+      }
+      children.push(h("p", { class: "topic-no-merge muted" }, "Formless orchestrates the work and brings decisions back to you; nothing merges automatically."));
     }
     children.push(...pending.map(item => h("div", { class: "topic-proposal-notice" }, h("span", null, "Move focused work to ", h("strong", null, item.name), "?"),
       topicBadge("pending_approval"), control("Review proposal", "proposal-" + item.id, () => openTopic(item), true))));
@@ -1876,6 +1917,13 @@
     const refresh = { channel, revision };
     refresh.promise = (async () => {
       try {
+        if (initial) {
+          const ping = await request({ type: "ping" });
+          if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
+          if (!Array.isArray(ping?.features) || !ping.features.includes("topic_orchestration_v2")) {
+            throw Object.assign(new Error("Topic orchestration v2 is not supported"), { daemonResponse: true, code: "unsupported" });
+          }
+        }
         const [main, topics] = await Promise.all([initial ? request({ type: "get_main_chat" }) : S.mainChat, request({ type: "list_topics" })]);
         if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
         if (!main?.id || !Array.isArray(topics)) throw new Error("Invalid topic response");
@@ -1950,7 +1998,7 @@
     S.topicBusy = label;
     renderTopicContext();
     try { await action(); }
-    catch (error) { toast(error.message, true); note(error.message, true); }
+    catch (error) { toast(error.message, true); note(error.message, true); await refreshTopics(); }
     finally { S.topicBusy = null; renderTopicContext(); }
   }
   async function startTopic(topic) {
@@ -1979,49 +2027,100 @@
     });
   }
   async function retryTopicFeature(topic, feature) {
-    if (!(await ask({ title: "Retry this feature?", text: feature.request + "\nFormless will start another build/review attempt using this topic’s workflow.", ok: "Retry feature" }))) return;
-    return topicAction("Retrying feature…", async () => {
+    if (!(await ask({ title: "Retry this work item?", text: feature.request + "\nFormless will resume orchestration for this work item.", ok: "Retry work item" }))) return;
+    return topicAction("Retrying work item…", async () => {
       storeTopic(await request({ type: "retry_topic_feature", retry: { topic_id: topic.id, feature_id: feature.id } }));
       storeTopic(await request({ type: "start_topic_workflow", topic_id: topic.id }));
       await refreshTopics();
     });
+  }
+  async function cancelTopic(topic) {
+    if (!(await ask({ title: "Cancel this workflow?", text: "Stop Formless and this topic’s running steps. No further steps will launch. Completed outputs remain available; use Retry to resume.", ok: "Cancel workflow" }))) return;
+    return topicAction("Cancelling workflow…", async () => {
+      storeTopic(await request({ type: "cancel_topic", topic_id: topic.id }));
+      await refreshTopics();
+    });
+  }
+  function topicOutlineEditor(initial = []) {
+    const field = (label, input) => h("label", { class: "topic-form-field" }, h("span", null, label), input);
+    const list = h("div", { class: "topic-outline-editor" });
+    const steps = [];
+    const render = () => list.replaceChildren(...steps.map((step, i) => {
+      const move = delta => { const target = i + delta; [steps[i], steps[target]] = [steps[target], steps[i]]; render(); };
+      return h("fieldset", { class: "topic-outline-step" }, h("legend", null, "Step " + (i + 1)),
+        field("Title", step.title), field("Instructions (optional)", step.instructions),
+        h("div", { class: "topic-form-grid" }, field("Harness", step.harness), field("Model (optional)", step.model), field("Access", step.access)), step.agentField,
+        h("div", { class: "topic-actions" }, h("button", { type: "button", class: "btn small ghost", disabled: i === 0, "aria-label": "Move step " + (i + 1) + " up", onclick: () => move(-1) }, "Up"),
+          h("button", { type: "button", class: "btn small ghost", disabled: i === steps.length - 1, "aria-label": "Move step " + (i + 1) + " down", onclick: () => move(1) }, "Down"),
+          h("button", { type: "button", class: "btn small ghost", "aria-label": "Remove step " + (i + 1), onclick: () => { steps.splice(i, 1); render(); } }, "Remove")));
+    }));
+    const add = (value = {}) => {
+      if (steps.length >= 20) return toast("An outline can have at most 20 steps.", true);
+      const step = {
+        title: h("input", { type: "text", value: value.title || "", "aria-label": "Step title" }),
+        instructions: h("textarea", { rows: 2, value: value.instructions || "", "aria-label": "Step instructions" }),
+        harness: h("select", { "aria-label": "Step harness" }, ["", "claude", "codex", "pi", "opencode", "antigravity", "acp", "muse"].map(kind => h("option", { value: kind }, harnessLabel(kind)))),
+        model: h("input", { type: "text", value: value.model || "", placeholder: "Harness default", "aria-label": "Step model" }),
+        access: h("select", { "aria-label": "Step access" }, h("option", { value: "read_only" }, "Read only"), h("option", { value: "write" }, "Can write")),
+        agent: h("input", { type: "text", value: value.acp_agent || "", placeholder: "Configured ACP agent", "aria-label": "ACP agent" })
+      };
+      step.instructions.value = value.instructions || "";
+      step.harness.value = value.harness || ""; step.access.value = value.access === "write" ? "write" : "read_only";
+      step.agentField = field("ACP agent", step.agent);
+      const syncAgent = () => { step.agentField.hidden = step.harness.value !== "acp"; };
+      step.harness.onchange = syncAgent; syncAgent();
+      steps.push(step);
+    };
+    const preset = values => { steps.splice(0); values.forEach(add); render(); };
+    preset(initial);
+    return {
+      element: h("div", null, h("div", { class: "topic-actions" },
+        h("button", { type: "button", class: "btn small ghost", onclick: () => preset([]) }, "Let Formless plan"),
+        h("button", { type: "button", class: "btn small ghost", onclick: () => preset([
+          { title: "Implement", harness: "claude", access: "write" }, { title: "Review", harness: "codex", access: "read_only" }]) }, "Code preset"),
+        h("button", { type: "button", class: "btn small ghost", onclick: () => preset([
+          { title: "Scan receipts", access: "read_only" }, { title: "Do accounting", access: "write" }, { title: "Create reports", access: "write" }]) }, "Accounting preset")),
+        h("p", { class: "muted" }, "Optional outline. Formless makes the final decisions and may adapt these steps. Any supported harness can handle any step."), list,
+        h("button", { type: "button", class: "btn small", onclick: () => { add(); render(); } }, "Add step")),
+      read: () => steps.map(step => ({ title: recordValue(step.title, "Enter a title for each step."), instructions: step.instructions.value.trim(),
+        harness: step.harness.value || null, acp_agent: step.harness.value === "acp" ? recordValue(step.agent, "Enter the ACP agent name.") : null,
+        model: step.model.value.trim() || null, access: step.access.value }))
+    };
   }
   async function proposeTopic(selectedMessageId) {
     if (!S.topicsAvailable || !S.current || currentTopicAttempt()) return;
     if (S.sessionLoad?.status !== "loaded" || S.sessionLoad.id !== S.current) return toast("Wait for this conversation to load first.", true);
     const source = S.current, channel = S.channel;
     const messages = S.messages.filter(message => message.role === "user" && message.content?.trim());
-    if (!messages.length) return toast("Send your feature requests in this chat first, then move them to a topic.", true);
-    const defaults = prefs.get("topicWorkflow", {}) || {};
+    if (!messages.length) return toast("Send your requests in this chat first, then move them to a topic.", true);
+    const defaults = prefs.get("topicWorkflowV2", {}) || {};
     const field = (label, input) => h("label", { class: "topic-form-field" }, h("span", null, label), input);
-    const name = h("input", { type: "text", required: true, maxlength: 160, value: "", placeholder: "e.g. Formless", "aria-label": "Topic name" });
-    const repo = h("input", { type: "text", required: true, spellcheck: "false", value: defaults.repo || "", placeholder: "/path/to/repository", "aria-label": "Repository on your machine" });
-    const picker = (value, label) => {
-      const select = h("select", { "aria-label": label }, ["claude", "codex"].map(kind => h("option", { value: kind }, harnessLabel(kind))));
-      select.value = ["claude", "codex"].includes(value) ? value : "claude";
-      return select;
-    };
-    const builder = picker(defaults.builder || "claude", "Build with"), reviewer = picker(defaults.reviewer || "codex", "Review with");
-    const builderModel = h("input", { type: "text", spellcheck: "false", value: defaults.builder_model || "", placeholder: "Harness default (e.g. opus)", "aria-label": "Builder model" });
-    const reviewerModel = h("input", { type: "text", spellcheck: "false", value: defaults.reviewer_model || "", placeholder: "Harness default", "aria-label": "Reviewer model" });
+    const name = h("input", { type: "text", required: true, maxlength: 160, value: "", placeholder: "e.g. Monthly accounts", "aria-label": "Topic name" });
+    const workspace = h("input", { type: "text", spellcheck: "false", value: defaults.workspace || "", placeholder: "Leave blank for a private scratch workspace", "aria-label": "Workspace (optional)" });
+    const sourceTopic = S.topics.find(item => item.topic_session_id === source);
+    const parent = h("select", { "aria-label": "Parent topic" },
+      h("option", { value: "" }, sourceTopic ? "This topic (" + topicPath(sourceTopic) + ")" : "Main Chat"),
+      S.topics.filter(item => !["pending_approval", "rejected"].includes(item.status)).map(item => h("option", { value: item.id }, topicPath(item))));
+    parent.value = sourceTopic?.id || "";
+    const outline = topicOutlineEditor(defaults.outline || []);
     const selected = new Set([selectedMessageId || messages[messages.length - 1].id]);
-    const body = h("div", { class: "topic-proposal-form" }, field("Topic name", name), field("Repository on your machine", repo),
-      h("fieldset", { class: "topic-request-picker" }, h("legend", null, "Requests to move · one feature per message"), messages.map(message =>
+    const body = h("div", { class: "topic-proposal-form" }, field("Topic name", name), field("Parent topic", parent), field("Workspace (optional)", workspace),
+      h("fieldset", { class: "topic-request-picker" }, h("legend", null, "Requests to move · one work item per message"), messages.map(message =>
         h("label", null, h("input", { type: "checkbox", checked: selected.has(message.id), onchange: event => {
           if (event.target.checked) selected.add(message.id); else selected.delete(message.id);
         } }), h("span", null, message.content)))),
-      h("div", { class: "topic-form-grid" }, field("Build with", builder), field("Builder model (optional)", builderModel), field("Review with", reviewer), field("Reviewer model (optional)", reviewerModel)),
+      outline.element,
       h("p", { class: "muted" }, "Uses the official harnesses installed on your machine. Review the proposal before anything moves or starts."));
     const topic = await ask({ title: "Create a topic for focused work", text: "Everyday conversation stays in Main Chat. Pick the requests and workflow for this topic.", body, ok: "Review proposal",
       saveRequest: () => {
         if (channel !== S.channel || source !== S.current) throw new Error("This conversation changed. Close and create a fresh proposal.");
         if (!selected.size) throw new Error("Select at least one request to move.");
         return { type: "propose_topic", proposal: { source_session_id: source, message_ids: messages.filter(message => selected.has(message.id)).map(message => message.id),
-          name: recordValue(name, "Enter a topic name."), repo: recordValue(repo, "Enter the repository path on your machine."), builder: builder.value, builder_model: builderModel.value.trim() || null,
-          reviewer: reviewer.value, reviewer_model: reviewerModel.value.trim() || null } };
+          name: recordValue(name, "Enter a topic name."), parent_topic_id: parent.value || sourceTopic?.id || null,
+          workspace: workspace.value.trim() || null, outline: outline.read() } };
       } });
     if (!topic || channel !== S.channel) return;
-    prefs.set("topicWorkflow", { repo: repo.value.trim(), builder: builder.value, builder_model: builderModel.value.trim(), reviewer: reviewer.value, reviewer_model: reviewerModel.value.trim() });
+    prefs.set("topicWorkflowV2", { workspace: workspace.value.trim(), outline: outline.read() });
     storeTopic(topic);
     await openTopic(topic);
   }
@@ -5082,7 +5181,7 @@
     } else mode.classList.add("hidden");
     const s = S.sessions.find((x) => x.id === S.current);
     const attempt = currentTopicAttempt(), topic = topicForSession();
-    $("session-title").textContent = attempt ? harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)) + " · " + (attempt.role === "build" ? "Build" : "Review")
+    $("session-title").textContent = attempt ? (attempt.step_title || "Step") + " · " + harnessLabel(attempt.harness)
       : topic ? topic.name : S.current === S.mainChat?.id ? "Main Chat" : s ? s.name : "No session";
     $("input").disabled = !!attempt;
     $("send-btn").disabled = !!attempt;
@@ -5306,6 +5405,7 @@
     if (alert.textContent !== confirmation) alert.textContent = confirmation;
     $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
+    if (req.kind === "harness") return renderHarnessPermission(req);
     const promo = req.kind === "promotion";
     for (const id of ["modal-approve", "modal-once", "modal-session", "modal-hour", "modal-deny", "modal-deny-always"]) {
       const button = $(id);
@@ -5356,6 +5456,8 @@
     // Always-deny remembers a Tool's Capabilities: not offered on other
     // prompts (an MCP server, a harness change) (#764).
     $("modal-deny-always").classList.toggle("hidden", promo || !req.tool_id);
+    $("modal-approve").classList.remove("hidden");
+    $("modal-deny").classList.remove("hidden");
     for (const [id, key, label] of [
       ["modal-approve", "y", promo ? "Approve" : "Always"],
       ["modal-once", "o", "Allow once"], ["modal-session", "s", "This Session"],
@@ -5372,6 +5474,45 @@
       canDismiss: () => !S.approvals[0]?.deciding,
       onDismiss: () => { S.approvalLater = true; renderApproval(); } });
   }
+  function renderHarnessPermission(req) {
+    $("modal-title").textContent = harnessLabel(req.harness) + " permission";
+    document.querySelector("#modal-backdrop .modal").classList.add("alert");
+    for (const id of ["modal-approve", "modal-once", "modal-session", "modal-hour", "modal-deny-always"]) $(id).classList.add("hidden");
+    $("modal-deny").classList.remove("hidden");
+    $("modal-deny").textContent = "Deny request";
+    $("modal-deny").disabled = !!req.deciding;
+    const body = $("modal-body");
+    body.replaceChildren(h("div", null, h("p", null, req.title), h("p", { class: "muted" },
+      sessionName(req.session_id), req.acp_agent ? " · " + req.acp_agent : "", " · ", req.permissionKind || "Permission"),
+      req.raw_input == null ? null : h("details", null, h("summary", null, "Request details"), h("pre", { class: "diff" }, JSON.stringify(req.raw_input, null, 2))),
+      h("div", { class: "topic-actions" }, (req.options || []).map(option => h("button", {
+        type: "button", class: "btn small", disabled: !!req.deciding,
+        onclick: () => decideHarnessPermission(req, option.option_id)
+      }, option.name, ["allow_always", "reject_always"].includes(option.kind) ? " (this attempt only)" : ""))),
+      h("p", { class: "muted" }, "Only you can grant permission. Choices apply to this harness attempt, not future attempts. Leaving it unanswered does not grant access.")));
+    showBidi(body);
+    $("modal-later").textContent = tr("Later");
+    $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
+    rememberFocus("modal-backdrop");
+    openDialog($("modal-backdrop"), { trigger: focusBefore["modal-backdrop"], initialFocus: $("modal-deny"), background: true,
+      canDismiss: () => !S.approvals[0]?.deciding,
+      onDismiss: () => { S.approvalLater = true; renderApproval(); } });
+  }
+  async function decideHarnessPermission(req, optionId) {
+    if (req.kind !== "harness" || req.deciding || !S.approvals.includes(req)) return;
+    if (optionId !== null && !(req.options || []).some(option => option.option_id === optionId)) return;
+    const channel = S.channel;
+    req.deciding = true; renderApproval();
+    try {
+      await request({ type: "harness_permission_decision", permission_id: req.id, option_id: optionId });
+      if (S.channel === channel) S.approvals = S.approvals.filter(item => item !== req);
+    } catch (error) {
+      if (S.channel === channel) toast("Permission decision was not confirmed: " + error.message, true);
+    } finally {
+      req.deciding = false;
+      if (S.channel === channel) { renderApproval(); renderStatus(); }
+    }
+  }
   /** The agent's open question in a dialog; Cancel keeps it pending (the
    * status bar and `a` bring it back). */
   function queueQuestion(ev) {
@@ -5379,7 +5520,7 @@
     if (questions.some((q) => q.id === ev.question_id)) return;
     const qs = ev.questions && ev.questions.length ? ev.questions
       : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
-    questions.push({ id: ev.question_id, session_id: ev.session_id, qs });
+    questions.push({ id: ev.question_id, session_id: ev.session_id, topic_id: ev.topic_id, attempt_id: ev.attempt_id, qs });
     S.pendingQuestion = questions[0];
     S.questionId = S.pendingQuestion.id;
     showQuestion();
@@ -5398,7 +5539,8 @@
     S.questionOpen = true;
     renderStatus();
     const body = questionForm(q.qs);
-    ask({ title: "The agent asks", body, ok: "Answer", tag: "question:" + q.id }).then(async (done) => {
+    ask({ title: q.attempt_id ? "The harness asks" : "The agent asks", text: q.attempt_id ? sessionName(q.session_id) + " · Formless may also answer; the first answer wins." : undefined,
+      body, ok: "Answer", tag: "question:" + q.id }).then(async (done) => {
       S.questionOpen = false;
       if (!S.pendingQuestion || S.pendingQuestion.id !== q.id) { renderStatus(); showQuestion(); return; }
       if (!done) return renderStatus();
@@ -5628,6 +5770,8 @@
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (!head || head.deciding) return;
+    // Native approval shortcuts must never translate into a harness grant.
+    if (head.kind === "harness") return approved ? undefined : decideHarnessPermission(head, null);
     if (approved && head.kind !== "promotion" && scope !== "once") {
       const broad = (head.capabilities || []).some((c) => !(head.already || []).includes(c) && isBroad(c));
       if (broad && head.broadConfirm !== (scope || "always")) {
@@ -7598,14 +7742,16 @@
   }
 
   function addApproval(ev) {
-    const kind = ev.type === "promotion_approval_requested" ? "promotion" : "tool";
-    const id = kind === "promotion" ? ev.promotion_id : ev.approval_id;
+    const kind = ev.type === "harness_permission_requested" ? "harness" : ev.type === "promotion_approval_requested" ? "promotion" : "tool";
+    const id = kind === "harness" ? ev.permission_id : kind === "promotion" ? ev.promotion_id : ev.approval_id;
     const existing = S.approvals.find((a) => a.kind === kind && a.id === id);
     if (existing) { if (ev.summary) existing.summary = ev.summary; return; }
     S.approvals.push({ kind, id, tool_id: ev.tool_id || null, tool_name: ev.tool_name,
       version: ev.version, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb,
       detail: ev.detail || null, context: ev.context || null, summary: ev.summary, already: ev.already_allowed || [],
       code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
+      topic_id: ev.topic_id, attempt_id: ev.attempt_id, harness: ev.harness, acp_agent: ev.acp_agent,
+      title: ev.title, permissionKind: ev.kind, raw_input: ev.raw_input, options: ev.options || [],
       pathOptions: ev.path_options || [], picks: {} });
   }
   function clearQuestions() {
@@ -7664,9 +7810,11 @@
     for (const ev of result.pending_events.concat(liveEvents)) {
       switch (ev.type) {
         case "approval_requested": pending.set("tool:" + ev.approval_id, ev); break;
+        case "harness_permission_requested": pending.set("harness:" + ev.permission_id, ev); break;
         case "user_question": pending.set("question:" + ev.question_id, ev); break;
         case "promotion_approval_requested": pending.set("promotion:" + ev.promotion_id, ev); break;
         case "approval_closed": case "approval_answered": pending.delete("tool:" + ev.approval_id); break;
+        case "harness_permission_closed": pending.delete("harness:" + ev.permission_id); break;
         case "user_question_closed": pending.delete("question:" + ev.question_id); break;
         case "promotion_approval_resolved": pending.delete("promotion:" + ev.promotion_id); break;
         case "approval_summary": {
@@ -8600,6 +8748,7 @@
       case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120), ev.type, ev.session_id);
       case "provider_stalled": return alertUser("Run stalled", sessionName(ev.session_id) + ": no reply for " + ev.idle_secs + "s", ev.type, ev.session_id);
       case "approval_requested": return alertUser("Approval needed", sessionName(ev.session_id) + ": " + (ev.tool_name || ""), ev.type, ev.session_id);
+      case "harness_permission_requested": return alertUser("Harness permission needed", sessionName(ev.session_id) + ": " + (ev.title || ""), ev.type, ev.session_id);
       case "user_question": {
         const q = (ev.questions && ev.questions[0] && ev.questions[0].question) || ev.question || "";
         return alertUser("Question for you", sessionName(ev.session_id) + ": " + truncate(q, 120), ev.type, ev.session_id);
@@ -8640,7 +8789,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed", "harness_permission_requested", "harness_permission_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -8826,6 +8975,14 @@
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
         removeQuestion(ev.question_id);
+        break;
+      case "harness_permission_closed":
+        S.approvals = S.approvals.filter(item => item.kind !== "harness" || item.id !== ev.permission_id);
+        renderApproval(); scheduleEventRender({ status: true });
+        break;
+      case "harness_permission_requested":
+        addApproval(ev);
+        renderApproval(); scheduleEventRender({ status: true });
         break;
       case "approval_summary": {
         const req = S.approvals.find((a) => a.id === ev.approval_id);

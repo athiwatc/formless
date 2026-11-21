@@ -200,8 +200,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .attempt-identity { display: grid; gap: 0.125rem; min-width: 0; flex: 1; }
 .attempt-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.6875rem; }
 .attempt-dot { width: 0.375rem; height: 0.375rem; flex: none; background: var(--muted); border-radius: 50%; }
-.attempt-dot.topic-state-building, .attempt-dot.topic-state-reviewing { background: var(--warn); }
-.attempt-dot.topic-state-passed { background: var(--accent); }
+.attempt-dot.topic-state-running { background: var(--warn); }
+.attempt-dot.topic-state-succeeded { background: var(--accent); }
 .attempt-dot.topic-state-failed, .attempt-dot.topic-state-needs_user { background: var(--err); }
 .topic-empty, .topic-refresh-error { padding: 0.5rem 0.375rem; font-size: 0.75rem; }
 .topic-context { flex: 0 1 auto; min-height: 0; max-height: 40%; overflow: auto; background: var(--panel); border-bottom: 1px solid var(--line); padding: 0.875rem 1.5rem 0.5rem; font-size: 0.8125rem; }
@@ -213,7 +213,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .topic-workflow { margin-top: 0.25rem; overflow-wrap: anywhere; }
 .topic-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.375rem; }
 .topic-badge { flex: none; display: inline-block; background: var(--panel-2); color: var(--muted); border-radius: 1rem; font-size: 0.6875rem; font-weight: 600; padding: 0.1875rem 0.5rem; }
-.topic-badge.topic-state-ready, .topic-badge.topic-state-complete, .topic-badge.topic-state-passed { background: var(--accent-soft); color: var(--accent-strong, var(--accent)); }
+.topic-badge.topic-state-ready, .topic-badge.topic-state-complete, .topic-badge.topic-state-succeeded { background: var(--accent-soft); color: var(--accent-strong, var(--accent)); }
 .topic-badge.topic-state-needs_user, .topic-badge.topic-state-failed { background: var(--err-soft); color: var(--err); }
 .topic-badge.topic-state-pending_approval { color: var(--warn); }
 .topic-features { margin-top: 0.75rem; display: grid; gap: 0.375rem; }
@@ -227,7 +227,13 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .topic-proposal-notice > span:first-child { flex: 1 1 12rem; overflow-wrap: anywhere; }
 .topic-proposal-form { display: grid; gap: 0.875rem; }
 .topic-form-field { display: grid; gap: 0.375rem; font-size: 0.8125rem; min-width: 0; }
-.topic-form-field input, .topic-form-field select { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 0.4375rem; background: var(--code-bg); padding: 0.5rem 0.625rem; }
+.topic-form-field input, .topic-form-field select, .topic-form-field textarea { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 0.4375rem; background: var(--code-bg); padding: 0.5rem 0.625rem; }
+.topic-form-field[hidden] { display: none; }
+.topic-outline-editor { display: grid; gap: 0.75rem; margin-block: 0.75rem; }
+.topic-outline-step { display: grid; gap: 0.625rem; border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.75rem; min-width: 0; }
+.topic-outline-preview, .topic-outputs { padding-inline-start: 1.25rem; overflow-wrap: anywhere; }
+.topic-outputs small { display: block; }
+.topic-outputs pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 15rem; overflow: auto; }
 .topic-form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.75rem; }
 .topic-request-picker { border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem; max-height: 13rem; overflow: auto; min-width: 0; }
 .topic-request-picker legend { font-size: 0.75rem; color: var(--muted); }
