@@ -160,6 +160,7 @@ pub fn looks_random(w: &str) -> bool {
         && w.chars().any(|c| c.is_ascii_digit())
         && w.chars().any(|c| c.is_ascii_lowercase())
         && w.chars().any(|c| c.is_ascii_uppercase())
+        && !(w.len() == 36 && uuid::Uuid::parse_str(w).is_ok())
 }
 
 fn known_word_kind(w: &str) -> Option<&'static str> {
@@ -365,9 +366,14 @@ mod tests {
             ("my passwd: hunter22", "credential"),
             ("https://x.dev/cb?token=abc123def456&x=1", "credential"),
             ("cookie=sessionid1234", "credential"),
+            ("token=550E8400-E29b-41D4-A716-446655440000", "credential"),
             ("{\"client_secret\": \"s3cr3tvalue\"}", "credential"),
             ("ghp_abcdefghijklmnopqrstuvwxyz0123456789", "GitHub token"),
             ("aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3h", "random-looking token"),
+            (
+                "550G8400-E29b-41D4-A716-446655440000",
+                "random-looking token",
+            ),
         ];
         for (text, kind) in cases {
             let (out, k) = redact(text);
@@ -382,6 +388,10 @@ mod tests {
             "src/main.rs:42",
             "password reset flow",
             "sha 3f2a9c1",
+            "550E8400-E29b-41D4-A716-446655440000",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "{550E8400-E29b-41D4-A716-446655440000}",
         ] {
             assert_eq!(redact(text), (text.to_string(), None), "{text}");
         }

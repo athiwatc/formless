@@ -104,14 +104,38 @@ jobs:
             python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
           fi
 
+      - name: Prepare Cargo cache staging
+        id: cargo-cache-stage
+        continue-on-error: true
+        run: |
+          # Cache versions include the literal input paths. Stage in the
+          # checkout without moving the active, job-private Cargo home.
+          mkdir -m 700 -- "$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Restore Cargo dependency cache
-        uses: actions/cache@v4
+        if: steps.cargo-cache-stage.outputs.ready == 'true'
+        id: cargo-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
         with:
           path: |
-            ${{ env.CARGO_HOME }}/registry
-            ${{ env.CARGO_HOME }}/git
+            .formless-ci-cargo-cache/cache
+            .formless-ci-cargo-cache/index
           key: ci-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ci-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Populate the private Cargo registry
+        if: steps.cargo-cache.outputs.cache-matched-key != ''
+        continue-on-error: true
+        run: |
+          stage="$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          mkdir -p -- "$CARGO_HOME/registry"
+          for entry in cache index; do
+            if [[ -d "$stage/$entry" && ! -L "$stage/$entry" && ! -e "$CARGO_HOME/registry/$entry" && ! -L "$CARGO_HOME/registry/$entry" ]]; then
+              mv -- "$stage/$entry" "$CARGO_HOME/registry/$entry"
+            fi
+          done
 
       - name: Record tool versions
         run: |
@@ -202,6 +226,37 @@ jobs:
       - name: Final storage report
         if: ${{ always() && env.CI_DIR != '' }}
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
+
+      - name: Stage Cargo registry for cache save
+        id: cargo-cache-save
+        continue-on-error: true
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-primary-key != '' }}
+        run: |
+          # Cache crate archives and index, not unpacked sources or binaries.
+          stage="$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          staged=false
+          for entry in cache index; do
+            if [[ -d "$CARGO_HOME/registry/$entry" && ! -L "$CARGO_HOME/registry/$entry" && ! -e "$stage/$entry" && ! -L "$stage/$entry" ]]; then
+              mv -- "$CARGO_HOME/registry/$entry" "$stage/$entry"
+              staged=true
+            fi
+          done
+          echo "staged=$staged" >> "$GITHUB_OUTPUT"
+
+      - name: Save Cargo dependency cache
+        if: steps.cargo-cache-save.outputs.staged == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .formless-ci-cargo-cache/cache
+            .formless-ci-cargo-cache/index
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Clean Cargo cache staging
+        if: ${{ always() && steps.cargo-cache-stage.outputs.ready == 'true' }}
+        continue-on-error: true
+        run: rm -rf -- "$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
 
       - name: Clean private job directories
         if: ${{ always() && env.CI_DIR != '' }}
