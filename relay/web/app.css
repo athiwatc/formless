@@ -232,8 +232,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .topic-request-picker { border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem; max-height: 13rem; overflow: auto; min-width: 0; }
 .topic-request-picker legend { font-size: 0.75rem; color: var(--muted); }
 .topic-request-picker label { display: flex; align-items: baseline; gap: 0.5rem; padding: 0.5rem; cursor: pointer; font-size: 0.8125rem; }
-.topic-request-picker input { flex: none; }
-.topic-request-picker span { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.topic-request-picker input[type="checkbox"] { flex: none; width: auto; margin: 0; padding: 0; }
+.topic-request-picker span { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 @container app (max-width: 42rem) {
   .topic-context { padding-inline: 0.875rem; max-height: 35%; }
   .topic-form-grid { grid-template-columns: minmax(0, 1fr); }
