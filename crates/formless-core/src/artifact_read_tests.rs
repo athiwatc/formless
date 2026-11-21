@@ -580,6 +580,68 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
 }
 
 #[tokio::test]
+async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/retained.txt");
+    std::fs::write(&file, b"retained attachment").unwrap();
+    let id = f.record(&file, 19, Some(&f.session));
+    let discarded = f.paths.data_dir.join("artifacts/nested/discarded.txt");
+    std::fs::write(&discarded, b"discarded").unwrap();
+    let discarded_id = f.record(&discarded, 9, Some(&f.session));
+    let topic = f
+        .daemon()
+        .with_store(|st| {
+            let message = st.append_message_meta(
+                &f.session,
+                "user",
+                "Keep this",
+                Some(json!({"attachments":[{"id":id,"path":file,"bytes":19}]}).to_string()),
+            )?;
+            let topic = st.propose_topic(
+                &TopicProposalRequest {
+                    parent_topic_id: None,
+                    source_session_id: f.session.clone(),
+                    message_ids: vec![message.id],
+                    features: vec![],
+                    name: "Independent".into(),
+                    workspace: Some(f.root.clone()),
+                    outline: vec![],
+                },
+                WorkspaceKind::Directory,
+                None,
+            )?;
+            st.approve_topic(&topic.id)
+        })
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    f.daemon().purge_session(&f.session).await.unwrap();
+    let result: Value = serde_json::from_str(
+        &f.daemon()
+            .read_artifact_impl(&session, &json!({"id":id}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["text"], "retained attachment");
+    let access = crate::attachment_access::AttachmentAccess::profile(&f.paths);
+    assert_eq!(
+        access
+            .read(
+                &json!({"id":id,"path":file,"bytes":19,"_source_session":session,"_source_seq":1}),
+                100
+            )
+            .unwrap(),
+        b"retained attachment"
+    );
+    assert!(!discarded.exists());
+    assert!(f
+        .daemon()
+        .with_reader(|st| st.get_artifact(&discarded_id))
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn topic_fixture_workspace_classification_and_start_failure() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
