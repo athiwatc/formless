@@ -17212,6 +17212,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".netrc",
         ".npmrc",
         ".pypirc",
+        "credentials.tfrc.json",
+        ".terraformrc",
+        "terraform.rc",
         "credentials",
         ".git-credentials",
     ]
