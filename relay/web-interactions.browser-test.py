@@ -498,7 +498,7 @@ def action_dialogs(page):
     retry = page.get_by_role("button", name="Retry with…")
     retry.click()
     picker = page.get_by_role("dialog", name="Retry with a model")
-    model = picker.get_by_role("textbox", name="Filter models")
+    model = picker.get_by_role("combobox", name="Filter models")
     expect(model).to_be_focused()
     expect(picker.get_by_role("button", name="Set as default")).to_have_count(0)
     expect(picker.get_by_role("button", name="Test")).to_have_count(0)

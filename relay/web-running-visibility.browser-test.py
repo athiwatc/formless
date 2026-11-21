@@ -120,10 +120,10 @@ def exercise(page, url, app):
     expect(menu).to_have_attribute("aria-expanded", "true")
     wait_requests(page, 2)
     page.evaluate("() => { __runningFixture.identify(); __runningFixture.syncSidebar(); __runningFixture.hide(false); }")
-    # A new client identity cannot reuse the pending read from the old one.
-    wait_requests(page, 3)
+    assert page.evaluate("__runningFixture.count()") == 2
     page.evaluate("() => { __runningFixture.event('invocation_stalled'); __runningFixture.event('invocation_stalled'); }")
-    assert page.evaluate("__runningFixture.count()") == 3
+    # The first event starts a read for the new identity; the second coalesces.
+    wait_requests(page, 3)
     reply(page, 2, {**ROW, "tool_name": "obsolete snapshot"})
     expect(panel).to_be_hidden()
     # The newer read also needs one follow-up for the coalesced events.
