@@ -295,6 +295,7 @@
       "Recent retained calls": "การเรียกใช้ล่าสุดที่เก็บไว้", "Succeeded": "สำเร็จ", "Failed": "ล้มเหลว",
       "Recent sample trend": "แนวโน้มตัวอย่างล่าสุด", "up": "เพิ่มขึ้น", "down": "ลดลง", "no arrow": "ไม่มีลูกศร",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
+      "Turn started": "เริ่มรอบการสนทนา",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
       "Queued for after this Run": "รอส่งหลังงานนี้",
@@ -371,6 +372,30 @@
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
     return Number.isFinite(t) ? uiFormat(new Date(t), { hour: "2-digit", minute: "2-digit" }) : "";
+  }
+  function turnTimestamp(ts, today) {
+    if (typeof ts !== "number") {
+      // Stored times use RFC 3339. Guard against Date treating incomplete
+      // strings as dates or rolling an impossible day into the next month.
+      const parts = typeof ts === "string" && /^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/i.exec(ts);
+      if (!parts) return null;
+      const [year, month, day, hour, minute, second] = parts.slice(1).map(Number);
+      if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return null;
+      const monthEnd = new Date(0);
+      monthEnd.setUTCFullYear(year, month, 0);
+      if (day > monthEnd.getUTCDate()) return null;
+    }
+    const date = new Date(ts);
+    const year = date.getUTCFullYear();
+    if (!Number.isFinite(year) || year < 1 || year > 9999) return null;
+    const clockOptions = { hour: "2-digit", minute: "2-digit" };
+    const visible = uiFormat(date, date.toDateString() === today
+      ? clockOptions : { ...clockOptions, year: "numeric", month: "short", day: "numeric" });
+    const full = tr("Turn started") + " " + uiFormat(date, {
+      ...clockOptions, year: "numeric", month: "long", day: "numeric", second: "2-digit", timeZoneName: "shortOffset",
+    });
+    return h("time", { datetime: date.toISOString() },
+      h("span", { "aria-hidden": "true" }, visible), h("span", { class: "sr-only" }, full));
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
@@ -3157,6 +3182,10 @@
       const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
       const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
       const active = new Set(), messageIds = new Set();
+      // Recompute the display context on normal renders, including local
+      // midnight and timezone changes, without touching stable turn nodes.
+      const today = new Date().toDateString();
+      const timeContext = [uiLocale(), today, Intl.DateTimeFormat().resolvedOptions().timeZone].join("|");
       let turn = null, group = null;
       const open = (role, when, msg) => {
         const g = speaker(role);
@@ -3167,7 +3196,7 @@
         turn = historyRender.turns.get(key);
         if (!turn) {
           const who = h("div", { class: "who " + g }, WHO[g]);
-          const time = h("time");
+          const time = h("span");
           who.append(time);
           const body = h("div");
           turn = { el: h("div", { class: "turn " + g, "data-turn-id": currentMessage.id }, who, body), who, time, body, edit: null, decorations: null, decorationKey: null };
@@ -3175,9 +3204,13 @@
         }
         turn.items = [];
         turn.message = currentMessage;
-        const stamp = when ? clock(when) : "";
-        if (turn.time.textContent !== stamp) turn.time.textContent = stamp;
-        turn.time.hidden = !when;
+        if (turn.when !== when || turn.timeContext !== timeContext) {
+          const stamp = turnTimestamp(when, today);
+          turn.time.replaceChildren(...(stamp ? [stamp] : []));
+          turn.time.hidden = !stamp;
+          turn.when = when;
+          turn.timeContext = timeContext;
+        }
         const editable = msg && msg === lastUser && !isRunning();
         if (editable && !turn.edit) {
           const entry = turn;
