@@ -2917,6 +2917,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         remember_denial: bool,
     },
+    /// Persist the first approval-help acknowledgement for this profile.
+    AcknowledgeApprovalHelp,
     /// Capabilities the user always denies (`Vec<DenialInfo>`).
     ListDenials,
     /// What the daemon can reach, in one report (SPEC §10.3): grants by
@@ -3272,6 +3274,8 @@ pub enum Event {
     ApprovalClosed {
         approval_id: String,
     },
+    /// The profile has seen the first approval explainer.
+    ApprovalHelpSeen,
     /// An approval was answered, by the client named `by`; the others
     /// close their prompt ("answered in web").
     ApprovalAnswered {
@@ -3495,6 +3499,7 @@ impl Event {
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
             | Event::PromotionApprovalResolved { .. }
+            | Event::ApprovalHelpSeen
             | Event::ApprovalAnswered { .. }
             | Event::ApprovalClosed { .. } => None,
         }

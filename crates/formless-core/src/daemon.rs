@@ -1857,6 +1857,8 @@ impl Daemon {
                     "stale": stale,
                     // The approval mode this daemon enforces now (§10.3).
                     "secure": secure,
+                    "approval_help_seen": crate::onboarding::load(&self.paths)
+                        .map(|seen| seen.approval_help).unwrap_or_default(),
                     "sessions": sessions,
                     "running_sessions": running,
                     "pid": std::process::id(),
@@ -4894,6 +4896,14 @@ impl Daemon {
                     proposal: p.clone(),
                 });
                 Ok(serde_json::to_value(p)?)
+            }
+            Request::AcknowledgeApprovalHelp => {
+                crate::onboarding::save(&self.paths, &crate::onboarding::Seen {
+                    approval_help: true,
+                    ..Default::default()
+                })?;
+                self.broadcast(Event::ApprovalHelpSeen);
+                Ok(json!({"approval_help_seen": true}))
             }
             Request::ApprovalDecision {
                 approval_id,

@@ -26,6 +26,7 @@ pub mod hunk_review;
 pub mod import_url;
 mod invocation_progress;
 pub mod jobs;
+pub mod onboarding;
 pub mod local_servers;
 pub mod logs;
 pub mod mcp;

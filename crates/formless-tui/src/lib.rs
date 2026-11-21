@@ -54,6 +54,7 @@ use crossterm::ExecutableCommand;
 use formless_core::auth::has_provider_credential;
 use formless_core::config::{save_api_key, Config};
 use formless_core::daemon::ensure_daemon;
+use formless_core::onboarding::{load as load_seen, Seen};
 use formless_core::provider::{list_models_blocking, probe_blocking, ProbeResult};
 use formless_core::Paths;
 use formless_protocol::*;
@@ -1191,32 +1192,6 @@ impl Wizard {
     }
 }
 
-/// One-time onboarding moments already shown (#393, #394).
-#[derive(Debug, Default, Clone)]
-struct Seen {
-    /// The first-approval explainer.
-    approval_help: bool,
-    /// The tour was offered, and finished or skipped.
-    tour_offered: bool,
-    tour_done: bool,
-}
-
-fn seen_file(paths: &Paths) -> std::path::PathBuf {
-    paths.data_dir.join("tui-seen.json")
-}
-
-fn load_seen(paths: &Paths) -> Seen {
-    let v: serde_json::Value = std::fs::read_to_string(seen_file(paths))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    Seen {
-        approval_help: v["approval_help"] == true,
-        tour_offered: v["tour_offered"] == true,
-        tour_done: v["tour_done"] == true,
-    }
-}
-
 /// The tour's sample task: small, and it makes the agent build a Tool.
 const TOUR_TASK: &str = "Build a Tool that counts the words, lines and characters of a text, then use it on: \"The quick brown fox jumps over the lazy dog.\"";
 
@@ -1761,6 +1736,7 @@ struct App {
     pending_since: HashMap<u64, Instant>,
     /// `Status.secure` of the daemon this TUI is attached to.
     daemon_secure: Option<bool>,
+    shares_approval_help: bool,
     /// What the last `/revoke` named, for its reply.
     revoking: String,
     tools: Vec<ToolInfo>,
@@ -2135,6 +2111,7 @@ impl App {
             pending: HashMap::new(),
             pending_since: HashMap::new(),
             daemon_secure: None,
+            shares_approval_help: false,
             revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
@@ -2282,7 +2259,7 @@ impl App {
             last_click: None,
             stream_cache: Default::default(),
         };
-        app.seen = load_seen(&app.paths);
+        app.seen = load_seen(&app.paths).unwrap_or_default();
         if oauth_login_required {
             app.notes
                 .push("OAuth login required: run `formless auth login`.".into());
@@ -2327,6 +2304,7 @@ impl App {
         self.reconnect_request = None;
         self.reconnect_events.clear();
         self.daemon_secure = None;
+        self.shares_approval_help = false;
         self.sends.disconnected();
         self.client = Some(client);
         self.inbox = Some(inbox);
@@ -2396,6 +2374,7 @@ impl App {
         self.client = None;
         self.inbox = None;
         self.daemon_secure = None;
+        self.shares_approval_help = false;
         self.pending.clear();
         self.pending_since.clear();
         self.activity = None;
@@ -3145,6 +3124,9 @@ impl App {
                             if !self.seen.approval_help {
                                 self.seen.approval_help = true;
                                 self.save_seen();
+                                if self.shares_approval_help {
+                                    self.fire(Request::AcknowledgeApprovalHelp);
+                                }
                             }
                             self.notes.push(note.clone());
                             if result
@@ -3266,7 +3248,13 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
-                        Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
+                        Pending::DaemonMode => {
+                            self.daemon_secure = result["secure"].as_bool();
+                            if let Some(seen) = result["approval_help_seen"].as_bool() {
+                                self.shares_approval_help = true;
+                                self.seen.approval_help |= seen;
+                            }
+                        }
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
                             if let Ok(v) = serde_json::from_value::<Vec<SessionInfo>>(result) {
@@ -6243,6 +6231,7 @@ impl App {
                         .collect();
                 }
             }
+            Event::ApprovalHelpSeen => self.seen.approval_help = true,
             Event::ApprovalClosed { approval_id } => {
                 let before = self.approvals.len();
                 self.approvals.retain(|a| a.approval_id != approval_id);
@@ -10693,18 +10682,11 @@ impl App {
         ));
     }
 
-    /// Remember how a batch's held call was answered, for the list the
-    /// next prompts of that batch show.
-    fn save_seen(&self) {
-        let _ = std::fs::write(
-            seen_file(&self.paths),
-            serde_json::json!({
-                "approval_help": self.seen.approval_help,
-                "tour_offered": self.seen.tour_offered,
-                "tour_done": self.seen.tour_done,
-            })
-            .to_string(),
-        );
+    fn save_seen(&mut self) {
+        match formless_core::onboarding::save(&self.paths, &self.seen) {
+            Ok(merged) => self.seen = merged,
+            Err(error) => self.notes.push(format!("Could not save onboarding preferences ({error})")),
+        }
     }
 
     /// Tools whose code calls this one, from its loaded detail.
@@ -19803,6 +19785,7 @@ mod tests {
             pending: HashMap::new(),
             pending_since: HashMap::new(),
             daemon_secure: None,
+            shares_approval_help: false,
             revoking: String::new(),
             tools: Vec::new(),
             tool_idx: 0,
