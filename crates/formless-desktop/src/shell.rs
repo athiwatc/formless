@@ -4532,14 +4532,16 @@ impl Shell {
             .when(!modal, |panel| {
                 inert_while(panel, self.background_inert(window))
             })
-            .key_context(SESSION_LIST_CONTEXT)
+            // Topic buttons use their own native focus/activation. Legacy
+            // session-list arrows must not walk rows that are no longer shown.
+            .when(!self.topic_ui.state.supported, |panel| panel.key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
             .on_action(
                 cx.listener(|this, _: &SelectPreviousSession, _, cx| this.move_selection(-1, cx)),
             )
             .on_action(cx.listener(|this, _: &ActivateSession, window, cx| {
                 this.activate_selected(window, cx)
-            }))
+            })))
             .w(self.panel_width(tokens::SIDEBAR_DEFAULT, window))
             .flex_shrink_0()
             .h_full()
