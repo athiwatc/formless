@@ -133,6 +133,39 @@ fn smoke_and_replay_never_request_or_return_credential_bytes() {
 }
 
 #[test]
+fn apache_password_file_uses_existing_exact_read_consent() {
+    let f = Fixture::new();
+    let protected = f.0.join(".HTPASSWD");
+    let ordinary = f.0.join(".htpasswd.bak");
+    std::fs::write(&protected, "private test placeholder").unwrap();
+    std::fs::write(&ordinary, "ordinary test placeholder").unwrap();
+    let code = "function run(input) { return fs.read(input.path); }";
+    let declined = host(PathPolicy::default(), false);
+    let protected_read = f.request(code, &protected);
+    assert!(execute(&protected_read, declined.clone()).is_err());
+    assert_eq!(
+        *declined.paths.locked(),
+        vec![protected.canonicalize().unwrap()]
+    );
+    let allowed = host(PathPolicy::default(), true);
+    assert_eq!(
+        execute(&protected_read, allowed.clone()).unwrap().output,
+        json!("private test placeholder")
+    );
+    assert_eq!(
+        *allowed.paths.locked(),
+        vec![protected.canonicalize().unwrap()]
+    );
+    assert_eq!(
+        execute(&f.request(code, &ordinary), declined.clone())
+            .unwrap()
+            .output,
+        json!("ordinary test placeholder")
+    );
+    assert_eq!(declined.paths.locked().len(), 1);
+}
+
+#[test]
 fn configured_namespace_and_its_ancestor_cannot_be_renamed_out_after_consent() {
     let f = Fixture::new();
     let parent = f.0.join("ordinary-parent");
