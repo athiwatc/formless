@@ -283,7 +283,15 @@ async fn dispatch(
         HarnessKind::Codex => codex_probe(ctx).await,
         HarnessKind::Pi => availability(kind, Some(&ctx.executable)),
         HarnessKind::OpenCode => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Antigravity => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Antigravity => {
+            blocking_probe(
+                kind,
+                Some(ctx.executable.clone()),
+                ctx.environment.clone(),
+                crate::local_harness::antigravity::availability,
+            )
+            .await
+        }
         HarnessKind::Acp => {
             let Some(agent) = agent else {
                 let mut value = availability(kind, None);
