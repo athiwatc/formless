@@ -10,6 +10,125 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::DirBuilderExt;
 
 impl Store {
+    pub(crate) fn set_topic_limits(
+        &self,
+        id: &str,
+        limits: &formless_protocol::TopicLimits,
+    ) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            if st.conn.execute(
+                "UPDATE topics SET limits=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(limits)?, now()],
+            )? != 1
+            {
+                bail!("topic not found");
+            }
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn topic_step_limit(
+        &self,
+        id: &str,
+        feature: &str,
+        title: &str,
+    ) -> Result<Option<bool>> {
+        let topic = topic_info(self, id)?.context("topic not found")?;
+        let feature = topic
+            .features
+            .iter()
+            .find(|f| f.id == feature)
+            .context("feature not found")?;
+        if !matches!(
+            topic.status,
+            formless_protocol::TopicStatus::Running | formless_protocol::TopicStatus::NeedsUser
+        ) || !matches!(
+            feature.status,
+            formless_protocol::TopicFeatureStatus::Pending
+                | formless_protocol::TopicFeatureStatus::NeedsUser
+        ) || feature.active_attempt_id.is_some()
+        {
+            bail!("feature is terminal or has an active attempt");
+        }
+        if topic.attempts.len() as u64 >= u64::from(topic.limits.max_attempts_per_topic) {
+            return Ok(Some(true));
+        }
+        if topic
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.feature_id == feature.id && attempt.step_title == title.trim()
+            })
+            .count() as u64
+            > u64::from(topic.limits.max_retries_per_step)
+        {
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+    pub(crate) fn mark_topic_limit(&self, id: &str, feature: &str) -> Result<()> {
+        self.transaction(|st|{
+            st.conn.execute("UPDATE topic_features SET status='needs_user',detail='topic step limit reached',updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status IN ('pending','needs_user')",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+            Ok(())
+        })
+    }
+    pub(crate) fn raise_topic_limit(&self, id: &str, feature: &str, total: bool) -> Result<()> {
+        self.transaction(|st|{
+            let mut topic=topic_info(st,id)?.context("topic not found")?;
+            if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){bail!("topic no longer active");}
+            if total{topic.limits.max_attempts_per_topic=topic.limits.max_attempts_per_topic.saturating_add(20);}
+            else{topic.limits.max_retries_per_step=topic.limits.max_retries_per_step.saturating_add(3);}
+            st.set_topic_limits(id,&topic.limits)?;
+            st.conn.execute("UPDATE topic_features SET status='pending',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status='needs_user'",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user'",params![id,now()])?;
+            Ok(())
+        })
+    }
+    pub(crate) fn add_topic_permission_rule(
+        &self,
+        id: &str,
+        mut rule: formless_protocol::TopicPermissionRule,
+    ) -> Result<TopicInfo> {
+        if rule.pattern.is_empty() || rule.pattern.chars().count() > 1024 {
+            bail!("permission rule pattern must contain 1..=1024 characters");
+        }
+        if rule
+            .acp_agent
+            .as_ref()
+            .is_some_and(|agent| agent.trim().is_empty())
+            || rule.acp_agent.is_some() && rule.harness.is_some_and(|kind| kind != HarnessKind::Acp)
+        {
+            bail!("acp_agent requires an ACP harness filter");
+        }
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            if topic.permission_rules.len() >= 256 {
+                bail!("topic reached the 256 permission rule limit");
+            }
+            rule.rule_id = uuid::Uuid::new_v4().to_string();
+            topic.permission_rules.push(rule);
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn remove_topic_permission_rule(&self, id: &str, rule: &str) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            let previous = topic.permission_rules.len();
+            topic.permission_rules.retain(|saved| saved.rule_id != rule);
+            if previous == topic.permission_rules.len() {
+                bail!("permission rule not found");
+            }
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
     pub(crate) fn update_topic_message(&self, message: &MessageInfo) -> Result<()> {
         self.note_rewrite();
         self.conn.execute(
@@ -46,6 +165,7 @@ impl Store {
     pub(crate) fn finish_topic_orchestrator(
         &self,
         session: &str,
+        run_id: &str,
         status: &str,
     ) -> Result<Option<String>> {
         self.transaction(|st|{
@@ -53,6 +173,7 @@ impl Store {
             if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){return Ok(None);}
             if matches!(status,"paused"|"failed"|"error") {
                 st.fail_topic_workflow(&topic.id,&format!("orchestrator run ended with {status}"))?;
+                st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?3 WHERE id=?1 AND session_id=?2 AND status IN ('paused','failed','error')",params![run_id,session,now()])?;
             } else if topic.features.iter().any(|feature|matches!(feature.status,formless_protocol::TopicFeatureStatus::Pending|formless_protocol::TopicFeatureStatus::Running|formless_protocol::TopicFeatureStatus::NeedsUser)) {
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
                 if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically. Active harness attempts, if any, keep running.")?;}
@@ -62,9 +183,10 @@ impl Store {
     }
     pub(crate) fn recover_topic_workflows(&self) -> Result<()> {
         self.transaction(|st|{
+            st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND EXISTS(SELECT 1 FROM topics t WHERE t.topic_session_id=runs.session_id AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR (t.status NOT IN ('running','needs_user') AND EXISTS(SELECT 1 FROM messages m WHERE m.id=runs.start_message_id AND m.session_id=t.topic_session_id AND m.generated_by='topic_kickoff'))))",params![now()])?;
             let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in topics {
-                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))",params![id,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,detail='daemon restarted; inspect abandoned attempts before continuing',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![id,now()])?;
                 let topic=topic_row(st,&id)?.context("topic vanished")?;
@@ -86,7 +208,7 @@ impl Store {
         self.transaction(|st|{
             let topic=st.topic_for_session(session)?.context("not a Topic Chat")?;
             if !st.is_topic_orchestrator(session)?{bail!("topic is not running or waiting for input");}
-            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
+            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL AND NOT EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND feature_id=?2 AND status='running')",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
             if changed!=1{bail!("feature is missing, terminal, or has an active attempt");}
             let open:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('pending','running','needs_user'))",[&topic.id],|row|row.get(0))?;
             if !open {
@@ -410,7 +532,7 @@ impl Store {
                 bail!("only a pending topic can be approved");
             }
             let active: bool = st.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status IN ('running','paused'))
+                "SELECT COALESCE((SELECT status IN ('running','paused','interrupted') FROM runs WHERE session_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1),0)
                       OR EXISTS(SELECT 1 FROM queued_messages WHERE session_id=?1)",
                 params![topic.source_session_id],
                 |row| row.get(0),
@@ -590,7 +712,7 @@ impl Store {
                 _ => bail!("only an approved, running or needs-user topic can be cancelled"),
             }
             let timestamp = now();
-            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,timestamp])?;
+            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,timestamp])?;
             st.conn.execute("UPDATE topic_features SET status='cancelled',active_attempt_id=NULL,detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,timestamp])?;
             st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1", [topic_id])?;
             st.conn.execute("UPDATE topics SET status='cancelled',updated_at=?2 WHERE id=?1", params![topic_id,timestamp])?;
@@ -645,11 +767,11 @@ impl Store {
         self.transaction(|st| {
             let topic = topic_row(st, topic_id)?.context("topic not found")?;
             if !matches!(topic.status.as_str(),"running"|"needs_user") { bail!("topic must be running to launch an attempt"); }
-            let (status, count, active): (String, u32, Option<String>) = st.conn.query_row(
+            let (status, _count, active): (String, u32, Option<String>) = st.conn.query_row(
                 "SELECT status,attempt_count,active_attempt_id FROM topic_features WHERE topic_id=?1 AND id=?2",
                 params![topic_id,feature_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             if !matches!(status.as_str(),"pending"|"needs_user") || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
-            if count >= 12 { bail!("work item reached the 12-attempt limit"); }
+            if st.topic_step_limit(topic_id,feature_id,step_title)?.is_some(){bail!("topic step limit reached");}
             let id = uuid::Uuid::new_v4().to_string();
             let session = st.create_session(Some(format!("{}: {}", harness_label(harness), step_title.trim())))?;
             let outputs_dir = st.artifact_root.as_ref().and_then(|root|root.parent())
@@ -733,8 +855,8 @@ impl Store {
             st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,updated_at=?5 WHERE id=?1",
                 params![id,enum_text(status)?,summary,serde_json::to_string(&outputs)?,timestamp])?;
             st.append_message(&attempt.conversation_session_id,"assistant",summary)?;
-            st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,updated_at=?3 WHERE id=?1",
-                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"pending"},timestamp])?;
+            st.conn.execute("UPDATE topic_features SET status=?2,updated_at=?3 WHERE id=?1",
+                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"running"},timestamp])?;
             if status==TopicAttemptStatus::NeedsUser {st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1", params![attempt.topic_id,timestamp])?;}
             topic_attempt(st,id)?.context("attempt vanished")
         })
@@ -744,7 +866,7 @@ impl Store {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
             if topic.status=="running" || topic.status=="needs_user" {
-                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,detail,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,detail,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='failed',active_attempt_id=NULL,detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,detail,now()])?;
                 st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[topic_id])?;
                 st.conn.execute("UPDATE topics SET status='failed',updated_at=?2 WHERE id=?1",params![topic_id,now()])?;
@@ -764,6 +886,8 @@ impl Store {
     pub fn retry_topic_feature(&self, topic_id: &str, feature_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
+            let live:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND active_attempt_id IS NOT NULL) OR EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND status='running')",[topic_id],|row|row.get(0))?;
+            if live{bail!("topic has unfinished attempts; wait for them or cancel/recover before retrying");}
             if !matches!(topic.status.as_str(),"approved"|"failed"|"complete"|"needs_user"|"cancelled") {bail!("topic must be approved or terminal before retry; recover a running topic first");}
             let changed=st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,outputs='[]',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2",params![topic_id,feature_id,now()])?;
             if changed!=1 {bail!("topic feature not found");}
@@ -845,8 +969,16 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
         )
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(TopicInfo {
-        permission_rules: vec![],
-        limits: Default::default(),
+        permission_rules: serde_json::from_str(&st.conn.query_row(
+            "SELECT permission_rules FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
+        limits: serde_json::from_str(&st.conn.query_row(
+            "SELECT limits FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
         allow_external_context: st.conn.query_row(
             "SELECT allow_external_context FROM topics WHERE id=?1",
             [id],

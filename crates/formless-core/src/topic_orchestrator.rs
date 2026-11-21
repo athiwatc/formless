@@ -214,7 +214,9 @@ impl Daemon {
                                 attempt_id.as_ref().is_some_and(|id| ids.contains(id))
                             }) =>
                         {
-                            if !self.questions.locked().contains_key(&question_id) {
+                            if !self.questions.locked().contains_key(&question_id)
+                                && !self.topic_decisions.locked().contains_key(&question_id)
+                            {
                                 continue;
                             }
                             if !user_only || seen.insert(format!("question:{question_id}")) {
@@ -258,7 +260,7 @@ impl Daemon {
                     let active = self
                         .topic_steps
                         .locked()
-                        .contains_key(&(topic.id.clone(), attempt.feature_id.clone()));
+                        .contains_key(&(topic.id.clone(), attempt.id.clone()));
                     if !active
                         && attempt.status != TopicAttemptStatus::Running
                         && seen.insert(format!("attempt:{}", attempt.id))
@@ -275,7 +277,7 @@ impl Daemon {
                         || self
                             .topic_steps
                             .locked()
-                            .contains_key(&(topic.id.clone(), a.feature_id.clone()))
+                            .contains_key(&(topic.id.clone(), a.id.clone()))
                         || a.status == TopicAttemptStatus::NeedsUser
                             && current
                                 .features
@@ -305,6 +307,11 @@ impl Daemon {
             if self.runs.locked().contains_key(&session) {
                 bail!("Topic Chat already has an active model run");
             }
+            let availability=local_harness::list_harnesses().await;
+            if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
+            if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
+            if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
+            let kickoff=format!("{kickoff}\nFresh local harness availability (ready means installed && signed_in != false; unknown auth is ready):\n{}\nNever launch an unready harness. Ask the user through topic_request_harness_substitute to sign in and retry, approve a substitute for one feature+step, or skip. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
@@ -329,6 +336,7 @@ impl Daemon {
             self.with_store(|st| {
                 st.fail_topic_workflow(&topic_id, &format!("orchestrator start failed: {error:#}"))
             })?;
+            self.close_topic_interactions(&topic_id, None);
             self.broadcast(Event::TopicChanged { topic_id });
             return Err(error.context("could not start topic orchestrator"));
         }
@@ -364,8 +372,13 @@ impl Daemon {
         Ok(topic)
     }
 
-    pub(super) fn topic_orchestrator_ended(&self, session: &str, status: &str) {
-        match self.with_store(|st| st.finish_topic_orchestrator(session, status)) {
+    pub(super) fn topic_orchestrator_ended<'a>(
+        &self,
+        session: &str,
+        run: &str,
+        status: &'a str,
+    ) -> &'a str {
+        match self.with_store(|st| st.finish_topic_orchestrator(session, run, status)) {
             Ok(Some(topic_id)) => {
                 if status != "completed" {
                     for ((id, _), cancel) in self.topic_steps.locked().iter() {
@@ -376,10 +389,14 @@ impl Daemon {
                     self.close_topic_interactions(&topic_id, None);
                 }
                 self.broadcast(Event::TopicChanged { topic_id });
+                if matches!(status, "paused" | "failed" | "error") {
+                    return "abandoned";
+                }
             }
             Ok(None) => {}
             Err(error) => tracing::warn!("could not finalize topic orchestrator: {error:#}"),
         }
+        status
     }
 
     pub(super) fn finish_topic_feature_tool(
@@ -395,8 +412,29 @@ impl Daemon {
         let detail = args[field]
             .as_str()
             .with_context(|| format!("{field} is required"))?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        let unfinalized = {
+            let steps = self.topic_steps.locked();
+            topic.attempts.iter().any(|attempt| {
+                attempt.feature_id == feature
+                    && steps.contains_key(&(topic.id.clone(), attempt.id.clone()))
+            })
+        };
+        if unfinalized {
+            bail!("feature has a live attempt; wait for CLI exit and output validation");
+        }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
+        if matches!(
+            topic.status,
+            TopicStatus::Complete | TopicStatus::Failed | TopicStatus::Cancelled
+        ) {
+            self.close_topic_interactions(&topic.id, None);
+        } else {
+            self.close_topic_decisions(&topic.id, Some(feature));
+        }
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),
         });
@@ -418,7 +456,7 @@ impl Daemon {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        let step: Step = serde_json::from_value(args.clone())?;
+        let mut step: Step = serde_json::from_value(args.clone())?;
         local_harness::validate_acp_agent(Some(step.harness), step.acp_agent.as_deref())?;
         if step.title.trim().is_empty() || step.instructions.trim().is_empty() {
             bail!("step title and instructions must not be blank");
@@ -434,6 +472,30 @@ impl Daemon {
             .iter()
             .find(|feature| feature.id == step.feature_id)
             .context("feature does not belong to this topic")?;
+        let substitute_key = (
+            topic.id.clone(),
+            feature.id.clone(),
+            step.title.trim().to_owned(),
+        );
+        let approved = {
+            let approvals = self.topic_substitutes.locked();
+            approvals
+                .get(&substitute_key)
+                .filter(|approval| {
+                    approval.wanted.harness == step.harness
+                        && approval.wanted.acp_agent == step.acp_agent
+                })
+                .cloned()
+        };
+        if let Some(approval) = &approved {
+            step.harness = approval.substitute.harness;
+            step.acp_agent = approval.substitute.acp_agent.clone();
+        }
+        let availability =
+            local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;
+        if !availability.installed || availability.signed_in == Some(false) {
+            bail!("{:?} is not ready: {}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness,availability.detail.as_deref().unwrap_or("not signed in"));
+        }
         if step
             .inputs
             .iter()
@@ -445,19 +507,6 @@ impl Daemon {
             bail!("step cancelled before preparation");
         }
         let step_cancel = self.shutdown.child_token();
-        let key = (topic.id.clone(), feature.id.clone());
-        {
-            let mut steps = self.topic_steps.locked();
-            if steps.contains_key(&key) {
-                bail!("feature already has an active attempt");
-            }
-            steps.insert(key.clone(), step_cancel.clone());
-        }
-        let lease = StepLease {
-            daemon: self.clone(),
-            key,
-            token: step_cancel.clone(),
-        };
         let root = private_dir(
             &self.paths.data_dir,
             &PathBuf::from("topic-attempts").join(uuid::Uuid::new_v4().to_string()),
@@ -480,12 +529,36 @@ impl Daemon {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let attempt = {
+        let (attempt, lease) = {
             let _launch = self.topic_launch.locked();
+            if approved.is_some()
+                && self.topic_substitutes.locked().get(&substitute_key) != approved.as_ref()
+            {
+                bail!("substitute approval was already consumed; ask the user again");
+            }
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
             }
-            self.with_store(|st| {
+            if let Some(total) = self.with_store(|st| {
+                st.transaction(|st| {
+                    let hit = st.topic_step_limit(&topic.id, &feature.id, &step.title)?;
+                    if hit.is_some() {
+                        st.mark_topic_limit(&topic.id, &feature.id)?;
+                    }
+                    Ok(hit)
+                })
+            })? {
+                self.raise_topic_limit_question(&topic, &feature.id, total)?;
+                bail!(
+                    "Limit reached: {}; ask the user to raise the limit or stop",
+                    if total {
+                        "attempts per topic"
+                    } else {
+                        "retries for this feature and step title"
+                    }
+                );
+            }
+            let attempt = self.with_store(|st| {
                 st.begin_topic_attempt(
                     &topic.id,
                     &feature.id,
@@ -498,7 +571,18 @@ impl Daemon {
                     &token,
                     &workspace,
                 )
-            })?
+            })?;
+            let key = (topic.id.clone(), attempt.id.clone());
+            self.topic_substitutes.locked().remove(&substitute_key);
+            self.topic_steps
+                .locked()
+                .insert(key.clone(), step_cancel.clone());
+            let lease = StepLease {
+                daemon: self.clone(),
+                key,
+                token: step_cancel.clone(),
+            };
+            (attempt, lease)
         };
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),

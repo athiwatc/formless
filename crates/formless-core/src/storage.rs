@@ -802,7 +802,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 74;
+pub const SCHEMA_VERSION: i64 = 76;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 72] = [
+const MIGRATIONS: [(i64, MigrationStep); 74] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1284,6 +1284,16 @@ const MIGRATIONS: [(i64, MigrationStep); 72] = [
         add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
     }),
     (74, |c| add_column(c, "messages", "generated_by TEXT")),
+    (75, |c| {
+        add_column(c, "topics", "permission_rules TEXT NOT NULL DEFAULT '[]'")
+    }),
+    (76, |c| {
+        add_column(
+            c,
+            "topics",
+            r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
+        )
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2577,13 +2587,20 @@ impl Store {
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
+        self.transaction(|st|{
+        let topic:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1)",[session_id],|row|row.get(0))?;
+        if topic {st.abandon_resumable_runs(session_id)?;}
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.ex(
+        st.ex(
             "INSERT INTO runs(id,session_id,status,created_at,updated_at,start_message_id,start_message_seq) VALUES(?1,?2,'running',?3,?3,(SELECT id FROM messages WHERE session_id=?2 ORDER BY seq DESC,rowid DESC LIMIT 1),(SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?2))",
             params![id, session_id, t],
         )?;
         Ok(id)
+        })
+    }
+    pub(crate) fn abandon_resumable_runs(&self, session: &str) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE runs SET status='abandoned',updated_at=?2 WHERE session_id=?1 AND status IN ('paused','interrupted')",params![session,now()])?)
     }
     pub fn run_status(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self

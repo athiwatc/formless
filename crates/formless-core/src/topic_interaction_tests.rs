@@ -117,6 +117,290 @@ fn permission(always: bool) -> HarnessPermissionRequest {
 }
 
 #[tokio::test]
+async fn topic_permission_rules_apply_audit_reject_precedence_and_user_only_fallback() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let add = |pattern: &str, decision| Request::AddTopicPermissionRule {
+        topic_id: f.topic.id.clone(),
+        harness: Some(HarnessKind::Claude),
+        acp_agent: None,
+        kind: None,
+        pattern: pattern.into(),
+        decision,
+    };
+    assert!(f
+        .daemon()
+        .handle(add("", TopicRuleDecision::AllowOnce))
+        .await
+        .is_err());
+    let allowed = f
+        .daemon()
+        .handle(add("Read *", TopicRuleDecision::AllowOnce))
+        .await
+        .unwrap();
+    let allow = allowed["permission_rules"][0]["rule_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let handler = f.handler();
+    assert_eq!(
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+            .as_deref(),
+        Some("allow")
+    );
+    let close=next_event(&mut events,|event|matches!(event,Event::HarnessPermissionClosed{by:Some(by),..} if by.starts_with("rule:"))).await;
+    assert!(
+        matches!(close,Event::HarnessPermissionClosed{by:Some(by),..}if by==format!("rule:{allow}"))
+    );
+    assert!(f.daemon().topic_notifications.locked().is_empty());
+    let rejected = f
+        .daemon()
+        .handle(add("*rm *", TopicRuleDecision::Reject))
+        .await
+        .unwrap();
+    let reject = rejected["permission_rules"][1]["rule_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut command = permission(false);
+    command.raw_input = Some(json!({"command":"do rm file"}));
+    assert_eq!(
+        handler
+            .request_permission(command, &CancellationToken::new())
+            .await
+            .as_deref(),
+        Some("reject")
+    );
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.attempt.conversation_session_id))
+        .unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| message.content.contains(&format!("rule:{reject}"))));
+    for trust in [false, true] {
+        if trust {
+            f.daemon()
+                .handle(add("*", TopicRuleDecision::AllowOnce))
+                .await
+                .unwrap();
+            f.daemon()
+                .handle(add("*", TopicRuleDecision::Reject))
+                .await
+                .unwrap();
+        }
+        let mut request = permission(false);
+        if trust {
+            request.kind = "trust_workspace".into();
+        } else {
+            request.title = "Different".into();
+        }
+        let handler = f.handler();
+        let waiting = tokio::spawn(async move {
+            handler
+                .request_permission(request, &CancellationToken::new())
+                .await
+        });
+        let Event::HarnessPermissionRequested { permission_id, .. } =
+            next_event(&mut events, |event| {
+                matches!(event, Event::HarnessPermissionRequested { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        // Earlier automatic decisions are also audited as requested events.
+        let permission_id = if f
+            .daemon()
+            .harness_permissions
+            .locked()
+            .contains_key(&permission_id)
+        {
+            permission_id
+        } else {
+            loop {
+                let Event::HarnessPermissionRequested { permission_id, .. } =
+                    next_event(&mut events, |event| {
+                        matches!(event, Event::HarnessPermissionRequested { .. })
+                    })
+                    .await
+                else {
+                    unreachable!()
+                };
+                if f.daemon()
+                    .harness_permissions
+                    .locked()
+                    .contains_key(&permission_id)
+                {
+                    break permission_id;
+                }
+            }
+        };
+        assert!(!waiting.is_finished());
+        f.daemon()
+            .handle(Request::HarnessPermissionDecision {
+                permission_id,
+                option_id: Some("reject".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap().as_deref(), Some("reject"));
+    }
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: reject.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: reject
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_permission_rules_persist_across_restart_and_remove() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut f = TopicFixture::new(&env);
+    let saved = f
+        .daemon()
+        .handle(Request::AddTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            harness: None,
+            acp_agent: None,
+            kind: Some("read".into()),
+            pattern: "*".into(),
+            decision: TopicRuleDecision::AllowOnce,
+        })
+        .await
+        .unwrap();
+    drop(f.fixture.daemon.take());
+    f.fixture.daemon = Some(Arc::new(Daemon::new(f.fixture.paths.clone()).unwrap()));
+    assert_eq!(
+        serde_json::to_value(f.state().permission_rules).unwrap(),
+        saved["permission_rules"]
+    );
+    let removed = f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: saved["permission_rules"][0]["rule_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed["permission_rules"], json!([]));
+    assert!(f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: "missing".into(),
+            rule_id: "missing".into()
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_reject_rule_without_reject_option_bypasses_cached_allow_and_notifies() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let first = handler.clone();
+    let waiting = tokio::spawn(async move {
+        first
+            .request_permission(permission(true), &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: Some("allow".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.await.unwrap().as_deref(), Some("allow"));
+    f.daemon()
+        .handle(Request::AddTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            harness: None,
+            acp_agent: None,
+            kind: None,
+            pattern: "*".into(),
+            decision: TopicRuleDecision::Reject,
+        })
+        .await
+        .unwrap();
+    let mut request = permission(true);
+    request.options.retain(|option| option.option_id == "allow");
+    let waiting = tokio::spawn(async move {
+        handler
+            .request_permission(request, &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(!waiting.is_finished());
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(waiting.await.unwrap().is_none());
+}
+
+#[test]
+fn topic_permission_globs_are_full_string_and_unicode_safe() {
+    use super::super::topic_interactions::permission_glob;
+    for (pattern, value, expected) in [
+        ("*", "", true),
+        ("a?", "a🦀", true),
+        ("Read *", "read file", false),
+        ("*rm *", "do rm file", true),
+        ("file", "prefix file", false),
+        ("a*b*c", "a xx b yy c", true),
+        ("a*b", "a xx c", false),
+        ("rm *", "rm *.txt", true),
+        ("rm *.*", "rm *.txt", true),
+        ("*", "* literal * and ?", true),
+        ("a*b", "a*literal b", true),
+        ("?x", "?x", true),
+        ("*?", "*", true),
+        ("a?", "a??", false),
+    ] {
+        assert_eq!(permission_glob(pattern, value), expected);
+    }
+}
+
+#[tokio::test]
 async fn topic_away_notifications_are_redacted_and_test_injected() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.remove("FORMLESS_TOPIC_NOTIFICATIONS");
@@ -453,6 +737,17 @@ async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
         .unwrap();
     assert_eq!(f.state().status, TopicStatus::NeedsUser);
     f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &attempts[0].id,
+                TopicAttemptStatus::NeedsUser,
+                "Need help with X",
+                &[],
+                None,
+            )
+        })
+        .unwrap();
+    f.daemon()
         .handle(Request::HarnessPermissionDecision {
             permission_id,
             option_id: Some("allow".into()),
@@ -704,6 +999,17 @@ async fn topic_permission_fixture_always_is_shared_only_within_one_attempt() {
             },
         })
         .await
+        .unwrap();
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &f.attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "Done",
+                &[],
+                None,
+            )
+        })
         .unwrap();
     let next = f
         .daemon()
