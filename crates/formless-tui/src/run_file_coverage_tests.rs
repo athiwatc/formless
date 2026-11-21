@@ -57,7 +57,7 @@ fn recap_coverage_is_visible_collapsed_and_expanded() {
         untracked_writes_possible: true,
     };
     let mut streaming = true;
-    let text = plain::format_event(&event, &mut streaming).unwrap();
+    let text = plain::format_event(&event, &mut streaming, "").unwrap();
     assert!(text.starts_with('\n'));
     assert!(text.contains(RUN_FILES_CAVEAT));
     assert!(!streaming);
@@ -66,7 +66,7 @@ fn recap_coverage_is_visible_collapsed_and_expanded() {
         run_id: "r".into(),
         recap,
     };
-    assert!(plain::format_event(&event, &mut streaming)
+    assert!(plain::format_event(&event, &mut streaming, "")
         .unwrap()
         .contains(RUN_FILES_CAVEAT));
 }
