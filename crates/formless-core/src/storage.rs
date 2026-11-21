@@ -2578,7 +2578,8 @@ impl Store {
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
         self.transaction(|st|{
-        st.abandon_resumable_runs(session_id)?;
+        let topic:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1)",[session_id],|row|row.get(0))?;
+        if topic {st.abandon_resumable_runs(session_id)?;}
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         st.ex(

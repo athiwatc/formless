@@ -407,13 +407,14 @@ impl Daemon {
         let topic = self
             .with_reader(|st| st.topic_for_session(session))?
             .context("not a Topic Chat")?;
-        if {
+        let unfinalized = {
             let steps = self.topic_steps.locked();
             topic.attempts.iter().any(|attempt| {
                 attempt.feature_id == feature
                     && steps.contains_key(&(topic.id.clone(), attempt.id.clone()))
             })
-        } {
+        };
+        if unfinalized {
             bail!("feature has a live attempt; wait for CLI exit and output validation");
         }
         let topic =

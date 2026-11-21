@@ -682,7 +682,17 @@ fn topic_retry_failed_and_corrupt_status_fail_closed() {
 
 #[test]
 fn topic_approval_ignores_historical_paused_runs_and_new_runs_retire_resume_targets() {
-    let (store, source, _, request) = fixture();
+    let (store, _, _, mut request) = fixture();
+    let parent = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    request.source_session_id = parent.topic_session_id.unwrap();
+    request.parent_topic_id = Some(parent.id);
+    let source = store
+        .get_session(&request.source_session_id)
+        .unwrap()
+        .unwrap();
     let topic = store
         .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
         .unwrap();
@@ -709,6 +719,27 @@ fn topic_approval_ignores_historical_paused_runs_and_new_runs_retire_resume_targ
         store.run_status(&old).unwrap().as_deref(),
         Some("abandoned")
     );
+}
+
+#[test]
+fn topic_supersession_cleanup_preserves_ordinary_run_history_and_metrics() {
+    let (store, source, _, _) = fixture();
+    let paused = store.create_run(&source.id).unwrap();
+    store.set_run_status(&paused, "paused").unwrap();
+    let interrupted = store.create_run(&source.id).unwrap();
+    store.set_run_status(&interrupted, "interrupted").unwrap();
+    let latest = store.create_run(&source.id).unwrap();
+    store.set_run_status(&latest, "completed").unwrap();
+    store.recover_topic_workflows().unwrap();
+    assert_eq!(
+        store.run_status(&paused).unwrap().as_deref(),
+        Some("paused")
+    );
+    assert_eq!(
+        store.run_status(&interrupted).unwrap().as_deref(),
+        Some("interrupted")
+    );
+    assert!(store.unfinished_last_run(&source.id).unwrap().is_none());
 }
 
 #[test]

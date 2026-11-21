@@ -64,7 +64,7 @@ impl Store {
     }
     pub(crate) fn recover_topic_workflows(&self) -> Result<()> {
         self.transaction(|st|{
-            st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR EXISTS(SELECT 1 FROM topics t JOIN messages m ON m.id=runs.start_message_id AND m.session_id=t.topic_session_id WHERE t.topic_session_id=runs.session_id AND t.status NOT IN ('running','needs_user') AND m.generated_by='topic_kickoff'))",params![now()])?;
+            st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND EXISTS(SELECT 1 FROM topics t WHERE t.topic_session_id=runs.session_id AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR (t.status NOT IN ('running','needs_user') AND EXISTS(SELECT 1 FROM messages m WHERE m.id=runs.start_message_id AND m.session_id=t.topic_session_id AND m.generated_by='topic_kickoff'))))",params![now()])?;
             let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in topics {
                 st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))",params![id,now()])?;
