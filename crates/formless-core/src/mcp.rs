@@ -124,6 +124,7 @@ enum Io {
     Stdio {
         stdin: Mutex<tokio::process::ChildStdin>,
         child: StdMutex<Option<tokio::process::Child>>,
+        stderr: crate::mcp_log::Stderr,
     },
     /// Streamable HTTP: every message is a POST; an answer comes back as
     /// the JSON body or on an SSE body. The session id rides on a header.
@@ -271,19 +272,13 @@ impl Connection {
         if cfg.command.is_empty() {
             return Err(anyhow!("MCP server '{name}' has no command"));
         }
-        let log_dir = paths.data_dir.join("mcp");
-        std::fs::create_dir_all(&log_dir)?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join(format!("{name}.log")))?;
         let mut cmd = tokio::process::Command::new(&cfg.command);
         cmd.args(&cfg.args)
             .env_clear()
             .envs(server_env(cfg))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(log)
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         if let Some(dir) = &cfg.cwd {
             cmd.current_dir(dir);
@@ -295,6 +290,8 @@ impl Connection {
             .with_context(|| format!("start MCP server '{name}' ({})", cfg.command))?;
         let stdin = child.stdin.take().context("server stdin")?;
         let stdout = child.stdout.take().context("server stdout")?;
+        let stderr = child.stderr.take().context("server stderr")?;
+        let stderr = crate::mcp_log::Stderr::start(crate::mcp_log::LogFiles::new(paths, name), stderr);
         let (pending, alive, changed): (Pending, _, _) = (
             Default::default(),
             Arc::new(AtomicBool::new(true)),
@@ -304,6 +301,7 @@ impl Connection {
             Io::Stdio {
                 stdin: Mutex::new(stdin),
                 child: StdMutex::new(Some(child)),
+                stderr,
             },
             pending.clone(),
             alive.clone(),
@@ -646,7 +644,8 @@ impl Connection {
     pub fn stop(&self) {
         self.alive.store(false, Ordering::SeqCst);
         match &self.io {
-            Io::Stdio { child, .. } => {
+            Io::Stdio { child, stderr, .. } => {
+                stderr.stop();
                 if let Some(mut child) = child.locked().take() {
                     #[cfg(unix)]
                     if let Some(pid) = child.id() {
@@ -703,11 +702,16 @@ pub fn call_result(result: &Value) -> std::result::Result<Value, String> {
 #[derive(Default)]
 pub struct Manager {
     conns: Mutex<HashMap<String, Arc<Connection>>>,
+    administration: Mutex<()>,
     /// The last start/list failure per server, for status views.
     errors: StdMutex<HashMap<String, String>>,
 }
 
 impl Manager {
+    pub(crate) async fn administer(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.administration.lock().await
+    }
+
     /// The server's live connection, (re)starting it if needed: a crashed
     /// server is simply started again on the next call.
     pub async fn connection(
@@ -724,6 +728,9 @@ impl Manager {
         let mut conns = self.conns.lock().await;
         if let Some(c) = conns.get(server).filter(|c| c.is_alive()) {
             return Ok(c.clone());
+        }
+        if let Some(connection) = conns.remove(server) {
+            connection.stop();
         }
         match Connection::start(paths, server, scfg).await {
             Ok(conn) => {
@@ -792,6 +799,15 @@ impl Manager {
         if let Some(c) = self.conns.lock().await.remove(server) {
             c.stop();
         }
+    }
+
+    pub(crate) async fn stop_and_clear_log(&self, paths: &Paths, server: &str) -> Result<()> {
+        let mut conns = self.conns.lock().await;
+        if let Some(connection) = conns.remove(server) {
+            connection.stop();
+        }
+        let files = crate::mcp_log::LogFiles::new(paths, server);
+        tokio::task::spawn_blocking(move || files.remove()).await?
     }
 
     /// Running servers that announced a changed tool list since asked.

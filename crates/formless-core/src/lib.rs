@@ -29,6 +29,7 @@ pub mod jobs;
 pub mod local_servers;
 pub mod logs;
 pub mod mcp;
+mod mcp_log;
 pub mod mcp_auth;
 pub mod mcp_catalog;
 pub mod memory;

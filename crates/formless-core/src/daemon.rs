@@ -3939,6 +3939,7 @@ impl Daemon {
             }
             Request::RemoveMcpServer { name } => self.remove_mcp_server(&name, "user").await,
             Request::RestartMcpServer { name } => {
+                let _admin = self.mcp.administer().await;
                 let cfg = self.config()?;
                 self.mcp.stop(&name).await;
                 let tools = self.sync_mcp_server(&cfg, &name).await;
@@ -3951,23 +3952,17 @@ impl Daemon {
             }
             Request::McpServerLog { name, lines } => {
                 let cfg = self.config()?;
-                if !cfg.mcp.servers.contains_key(&name) {
-                    return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                        "no MCP server '{name}'"
-                    ))));
+                let server = cfg.mcp.servers.get(&name).cloned().with_context(|| {
+                    RequestFailure::not_found(format!("no MCP server '{name}'"))
+                })?;
+                if !matches!(server.transport.as_str(), "" | "stdio") {
+                    return Ok(json!({"name":name,"file":null,"bytes":0,"lines":[],"message":"Remote MCP servers do not expose a stderr log."}));
                 }
-                let file = self.paths.data_dir.join("mcp").join(format!("{name}.log"));
-                let text = std::fs::read(&file)
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let all: Vec<&str> = text.lines().collect();
+                let files = crate::mcp_log::LogFiles::new(&self.paths, &name);
+                let file = files.current.display().to_string();
                 let n = lines.unwrap_or(50).clamp(1, 1000);
-                let server = &cfg.mcp.servers[&name];
-                let tail = all[all.len().saturating_sub(n)..]
-                    .iter()
-                    .map(|line| crate::mcp_catalog::redact_server_text(server, line))
-                    .collect::<Vec<_>>();
-                Ok(json!({"name": name, "file": file.display().to_string(), "lines": tail}))
+                let (tail, bytes, truncated) = tokio::task::spawn_blocking(move || files.tail(&server, n)).await??;
+                Ok(json!({"name":name,"file":file,"bytes":bytes,"lines":tail,"truncated":truncated}))
             }
             Request::ListMcpTools { name } => {
                 let cfg = self.config()?;
@@ -15266,6 +15261,7 @@ impl Daemon {
                 "MCP server names use letters, digits, '-' and '_' (no '__')"
             ));
         }
+        let _admin = self.mcp.administer().await;
         let cfg = self.with_config_edit(|cfg| {
             cfg.mcp.servers.insert(name.to_string(), server);
             Ok(true)
@@ -15281,6 +15277,7 @@ impl Daemon {
 
     /// Remove an MCP server; its tools are retired (metrics kept).
     pub(crate) async fn remove_mcp_server(&self, name: &str, actor: &str) -> Result<Value> {
+        let _admin = self.mcp.administer().await;
         self.with_config_edit(|cfg| {
             if cfg.mcp.servers.remove(name).is_none() {
                 return Err(anyhow::Error::new(RequestFailure::not_found(format!(
@@ -15289,14 +15286,17 @@ impl Daemon {
             }
             Ok(true)
         })?;
-        self.mcp.stop(name).await;
+        let log_error = self.mcp.stop_and_clear_log(&self.paths, name).await.err();
         // Its login goes with it: a server added later under the same name
         // must not inherit it (#866).
         let _ = crate::mcp_auth::logout(&self.paths, name);
         let retired = self.with_store(|st| crate::mcp::sync_registry(st, name, &[]))?;
         let _ = self.with_store(|st| st.audit(actor, "mcp.remove", name));
         self.broadcast(Event::McpServersChanged);
-        Ok(json!({"removed": name, "retired_tools": retired}))
+        if let Some(error) = &log_error {
+            self.broadcast(Event::Note { session_id:None, text:format!("MCP server removed. Could not clear its stderr log ({error:#}).") });
+        }
+        Ok(json!({"removed": name, "retired_tools": retired, "log_error":log_error.map(|error| error.to_string())}))
     }
 
     /// Ask the user to approve something that is not a Tool call (SPEC

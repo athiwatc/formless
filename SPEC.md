@@ -2549,10 +2549,13 @@ None ship by default (principle 1).
 - **State and logs.** `McpServerInfo.state` is `disabled`, `ready`
   (running), `idle` (starts on first use), `failed` (the last start or
   call failed) or `auth needed` (the error is a 401 / missing login).
-  `McpServerLog {name, lines?}` returns the end of the server's stderr
-  log (`formless mcp log NAME`, TUI `/mcp log NAME` in the pager, web Log
-  button); the web shows Login (the `formless mcp login` command) for
-  `auth needed`.
+  Local stdio servers retain up to 1 MiB of stderr in each of the current
+  and previous log files. Oversized lines are omitted. `McpServerLog
+  {name, lines?}` reads at most 128 KiB from the newest complete lines,
+  applies the shared secret redactor, and reports the path and retained
+  bytes. The CLI, TUI and web show that tail and explain when a remote
+  server has no stderr log. Removing a server clears both log files.
+  The web shows Login (the `formless mcp login` command) for `auth needed`.
 - **Turning tools off.** `ListMcpTools {name}` lists a server's tools with
   whether each is on and its approximate token cost in the tool list
   (definition JSON ÷ 4), plus the total for the enabled ones.

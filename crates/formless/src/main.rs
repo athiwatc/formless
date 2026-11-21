@@ -7420,6 +7420,9 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         McpAction::Remove { name } => {
             let r = daemon(Request::RemoveMcpServer { name: name.clone() })?;
             println!("removed: {name} ({} tool(s) retired)", r["retired_tools"]);
+            if let Some(error) = r["log_error"].as_str() {
+                eprintln!("Could not clear the stderr log ({error}).");
+            }
         }
         McpAction::Prompts { json } => {
             cli_mcp_prompts::list(json, daemon, &mut std::io::stdout().lock())?;
@@ -7617,6 +7620,18 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 name,
                 lines: Some(lines),
             })?;
+            if let Some(message) = r["message"].as_str() {
+                println!("{message}");
+                return Ok(());
+            }
+            if let Some(file) = r["file"].as_str() {
+                if let Some(bytes) = r["bytes"].as_u64() {
+                    eprintln!("{file} ({bytes} bytes retained)");
+                }
+            }
+            if r["truncated"] == true {
+                eprintln!("Showing the newest complete lines within the log tail limit.");
+            }
             let tail = r["lines"].as_array().cloned().unwrap_or_default();
             if tail.is_empty() {
                 println!("(no output in {})", r["file"].as_str().unwrap_or_default());

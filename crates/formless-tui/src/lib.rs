@@ -4509,23 +4509,28 @@ impl App {
                             )
                         )),
                         Pending::McpLog => {
-                            let lines: Vec<String> = result["lines"]
+                            let mut lines: Vec<String> = result["lines"]
                                 .as_array()
                                 .into_iter()
                                 .flatten()
                                 .filter_map(|l| l.as_str().map(str::to_string))
                                 .collect();
+                            if lines.is_empty() {
+                                lines.push(result["message"].as_str().unwrap_or("(no output yet)").into());
+                            }
+                            if result["truncated"] == true {
+                                lines.insert(0, "Showing the newest complete lines within the log tail limit.".into());
+                            }
+                            let mut title = format!("MCP {}", result["name"].as_str().unwrap_or_default());
+                            if let Some(file) = result["file"].as_str() {
+                                title.push_str(&format!(" · {file}"));
+                                if let Some(bytes) = result["bytes"].as_u64() {
+                                    title.push_str(&format!(" · {bytes} bytes"));
+                                }
+                            }
                             self.pager = Some(Pager {
-                                title: format!(
-                                    "MCP {} · {}",
-                                    result["name"].as_str().unwrap_or_default(),
-                                    result["file"].as_str().unwrap_or_default()
-                                ),
-                                lines: if lines.is_empty() {
-                                    vec!["(no output yet)".into()]
-                                } else {
-                                    lines
-                                },
+                                title,
+                                lines,
                                 top: 0,
                                 left: 0,
                                 viewport: Default::default(),

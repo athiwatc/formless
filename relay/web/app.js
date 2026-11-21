@@ -5942,7 +5942,12 @@
   async function showMcpLog(name) {
     const trigger = document.activeElement;
     const r = await act({ type: "mcp_server_log", name, lines: 200 });
-    if (r) modal("MCP " + name + " log", h("pre", { class: "diff" }, r.lines.length ? r.lines.join("\n") : "(no output yet)"), { trigger });
+    if (!r) return;
+    const metadata = r.file && Number.isSafeInteger(r.bytes) ? r.file + " · " + r.bytes + " bytes retained" : r.file;
+    modal("MCP " + name + " log", h("div", null,
+      metadata ? h("p", { class: "muted" }, metadata) : null,
+      r.truncated ? h("p", { class: "muted" }, "Showing the newest complete lines within the log tail limit.") : null,
+      h("pre", { class: "diff" }, r.lines.length ? r.lines.join("\n") : r.message || "(no output yet)")), { trigger });
   }
   // Turn an MCP server's tools on or off, with each one's token cost.
   async function showMcpTools(name) {
