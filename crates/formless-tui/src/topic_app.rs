@@ -367,8 +367,24 @@ impl App {
                 raw_input,
                 options,
             }),
-            Event::HarnessPermissionClosed { permission_id, .. } => {
-                self.topic.close_permission(&permission_id)
+            Event::HarnessPermissionClosed {
+                permission_id,
+                option_id,
+                by,
+            } => {
+                let closed = self.topic.close_permission(&permission_id);
+                if let (Some(permission), Some(rule)) = (
+                    closed,
+                    by.as_deref().and_then(|by| by.strip_prefix("rule:")),
+                ) {
+                    let answer = option_id
+                        .and_then(|id| permission.options.into_iter().find(|o| o.option_id == id))
+                        .map_or_else(|| "denied".to_string(), |option| option.name);
+                    self.notes.push(format!(
+                        "Topic rule {rule} answered \"{}\": {answer}.",
+                        permission.title
+                    ));
+                }
             }
             _ => {}
         }
@@ -940,6 +956,7 @@ mod tests {
             content: "Let's add X and Y to Formless".into(),
             created_at: String::new(),
             meta: None,
+            generated_by: None,
         }];
         app.topic_slash("topic", "");
         assert!(app.topic.overlay_open());
@@ -1115,6 +1132,17 @@ mod tests {
             by: None,
         });
         assert!(!app.topic.overlay_open());
+        app.on_event(permission_event("p4"));
+        app.on_event(Event::HarnessPermissionClosed {
+            permission_id: "p4".into(),
+            option_id: None,
+            by: Some("rule:r7".into()),
+        });
+        assert!(!app.topic.overlay_open());
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "Topic rule r7 answered \"Run cargo test\": denied."
+        );
     }
 
     #[test]

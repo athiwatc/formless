@@ -702,9 +702,12 @@ impl State {
         }
     }
 
-    pub fn close_permission(&mut self, permission_id: &str) {
-        self.permissions
-            .retain(|open| open.permission_id != permission_id);
+    pub fn close_permission(&mut self, permission_id: &str) -> Option<HarnessPermission> {
+        let index = self
+            .permissions
+            .iter()
+            .position(|open| open.permission_id == permission_id)?;
+        Some(self.permissions.remove(index))
     }
 
     /// Drops prompts from a daemon that went away; returns how many.
@@ -2478,6 +2481,7 @@ mod tests {
             content: content.into(),
             created_at: String::new(),
             meta: None,
+            generated_by: None,
         }
     }
 
