@@ -530,6 +530,12 @@ impl Paths {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("make daemon socket private: {}", socket.display()))?;
         }
+        let metadata = Self::daemon_socket_metadata(&socket)?
+            .context("daemon socket disappeared while setting permissions")?;
+        anyhow::ensure!(
+            metadata.mode() & 0o7777 == 0o600,
+            "socket ownership or permissions changed during bind"
+        );
         Ok(true)
     }
 
