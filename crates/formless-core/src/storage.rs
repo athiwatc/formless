@@ -6,6 +6,8 @@ use formless_protocol::{
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -255,6 +257,90 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
         if start > 0 { "…" } else { "" },
         core,
         if end < chars.len() { "…" } else { "" }
+    )
+}
+
+/// For multi-term searches, fit as many distinct word-prefix matches as
+/// possible into 100 original characters, plus ellipses. Match from the
+/// start of alphanumeric words with the app's accent-insensitive folding.
+/// Combining marks stay with the preceding word. SQLite still decides which
+/// rows match, using its own tokenizer.
+fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
+    const BUDGET: usize = 100;
+    let max_term_bytes = terms.keys().map(String::len).max().unwrap_or(0);
+    let mut counts = vec![0; terms.len()];
+    let mut covered = 0;
+    let mut window: VecDeque<(usize, usize, Vec<usize>)> = VecDeque::new();
+    let mut folded = String::new();
+    let mut best = ((0, Reverse(0), Reverse(0)), 0, 0, 0);
+    let mut word_start = None;
+    let chars = content.char_indices().chain([(content.len(), '\0')]);
+    for (end_char, (end_byte, ch)) in chars.enumerate() {
+        if ch.is_alphanumeric() {
+            word_start.get_or_insert((end_char, end_byte));
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(ch) {
+            continue;
+        }
+        let Some((start_char, start_byte)) = word_start.take() else {
+            continue;
+        };
+        if end_char - start_char > BUDGET {
+            continue;
+        }
+        folded.clear();
+        let mut matched = Vec::new();
+        for key in crate::fuzzy::fold_chars(&content[start_byte..end_byte]) {
+            if folded.len() + key.len_utf8() > max_term_bytes {
+                break;
+            }
+            folded.push(key);
+            if let Some(&id) = terms.get(&folded) {
+                matched.push(id);
+                covered += usize::from(counts[id] == 0);
+                counts[id] += 1;
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        window.push_back((start_char, start_byte, matched));
+        // Remove out-of-budget words and any redundant leading matches to
+        // find the shortest span with this coverage ending at this word.
+        while window.front().is_some_and(|(start, _, ids)| {
+            end_char - start > BUDGET || ids.iter().all(|&id| counts[id] > 1)
+        }) {
+            let (_, _, ids) = window.pop_front().unwrap();
+            for id in ids {
+                counts[id] -= 1;
+                covered -= usize::from(counts[id] == 0);
+            }
+        }
+        if let Some(&(start, from, _)) = window.front() {
+            let width = end_char - start;
+            let score = (covered, Reverse(width), Reverse(start));
+            if score > best.0 {
+                best = (score, from, end_byte, width);
+            }
+        }
+    }
+    let (_, from, to, width) = best;
+    let mut start = from;
+    let mut after = BUDGET - width;
+    for (index, _) in content[..from].char_indices().rev().take(after.min(40)) {
+        start = index;
+        after -= 1;
+    }
+    let end = content[to..]
+        .char_indices()
+        .nth(after)
+        .map_or(content.len(), |(index, _)| to + index);
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        content[start..end].replace('\n', " "),
+        if end < content.len() { "…" } else { "" }
     )
 }
 
@@ -2078,33 +2164,30 @@ impl Store {
         if let Some(phrase) = phrase {
             args.push(phrase.into());
         }
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-            ))
-        })?;
-        let needle = query
-            .split(|c: char| !c.is_alphanumeric())
-            .find(|w| !w.is_empty())
-            .unwrap_or(query)
-            .to_lowercase();
+        let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
+        let needle = search_words(query).next().unwrap_or(query).to_lowercase();
+        let mut terms = HashMap::new();
+        for word in search_words(query) {
+            let next = terms.len();
+            terms
+                .entry(crate::fuzzy::fold_chars(word).collect())
+                .or_insert(next);
+        }
         let mut hits = Vec::new();
-        for row in rows {
-            let (session_id, session_name, message_id, seq, role, content, created_at) = row?;
+        while let Some(row) = rows.next()? {
+            let content = row.get_ref(5)?.as_str()?;
             hits.push(SearchHit {
-                session_id,
-                session_name,
-                message_id,
-                seq,
-                role,
-                snippet: make_snippet(&content, &needle),
-                created_at,
+                session_id: row.get(0)?,
+                session_name: row.get(1)?,
+                message_id: row.get(2)?,
+                seq: row.get(3)?,
+                role: row.get(4)?,
+                snippet: if terms.len() > 1 {
+                    multi_term_snippet(content, &terms)
+                } else {
+                    make_snippet(content, &needle)
+                },
+                created_at: row.get(6)?,
             });
         }
         Ok(hits)
@@ -7836,14 +7919,15 @@ fn identifier_prefix_phrase(text: &str) -> Option<String> {
     terms.contains(' ').then(|| terms.replace(' ', " + "))
 }
 
+fn search_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 /// An FTS5 query from free text: each word quoted as a prefix term, all
 /// required. None when the text has no word characters.
 pub fn fts_query(text: &str) -> Option<String> {
-    let terms: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{w}\"*"))
-        .collect();
+    let terms: Vec<String> = search_words(text).map(|w| format!("\"{w}\"*")).collect();
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 

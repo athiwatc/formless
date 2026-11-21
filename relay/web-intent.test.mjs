@@ -1016,3 +1016,12 @@ test('Session selection pruning reads each loaded ID once for a large selection'
   assert.equal(c.S.marked.size,4000);
   assert.equal(reads,4000,'one loaded-ID index, independent of selected-ID count');
 });
+test('Pulumi credentials get an approval warning only under the Pulumi directory', () => {
+  const c = setup(['pathNote']);
+  for (const path of ['/work/.PuLuMi/nested/Credentials.json', 'C:\\Users\\fixture\\.pulumi\\credentials.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds Pulumi credentials']);
+  }
+  for (const path of ['/work/credentials.json', '/work/.pulumi/stacks/dev.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [false, 'inside the working folder']);
+  }
+});
