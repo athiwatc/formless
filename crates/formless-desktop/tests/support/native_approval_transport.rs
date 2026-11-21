@@ -37,6 +37,9 @@ async fn approval_lost_ack_retains_unknown_after_fresh_empty_inventory_and_never
                     Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
                     Request::Subscribe { deltas: false, .. } => json!({"subscribed":true}),
                     Request::ListSessions => json!([session]),
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::GetSession { id } => {
                         assert_eq!(id, session.id);
                         json!({"session":{"id":id},"messages":[],"running":false,"step_mode":false,"pending_events":[]})

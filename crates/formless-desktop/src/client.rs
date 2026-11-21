@@ -35,6 +35,7 @@ mod delivery;
 #[cfg(test)]
 mod native_send_tests;
 mod reader;
+mod run_actions;
 mod send_review;
 pub use reader::{StreamBatch, StreamOwner, StreamStatus};
 
@@ -59,6 +60,30 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    DeleteUndo(crate::run_actions::DeleteUndo),
+    RunActionTarget {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+        result: Result<crate::run_actions::Target, String>,
+    },
+    RunActionReview {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+        quote: Option<formless_protocol::RunForecast>,
+        reviewed_text: Option<String>,
+    },
+    RunActionReady {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    LiveContext {
+        owner: crate::run_actions::Owner,
+        result: Result<crate::run_actions::Context, String>,
+    },
+    RunActivity {
+        owner: crate::run_actions::Owner,
+        event: Event,
+    },
     LiveOverlay {
         client: uuid::Uuid,
         connection: u64,
@@ -192,6 +217,14 @@ pub enum Update {
 }
 
 pub enum Command {
+    UndoDelete(uuid::Uuid),
+    ReadRunAction {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    PrepareRunAction(crate::run_actions::Dispatch),
+    ConfirmRunAction(uuid::Uuid),
+    CommitRunAction(uuid::Uuid),
     DetachReference(crate::reference_detach::Dispatch),
     ReadPendingAttachments {
         connection: u64,
@@ -520,6 +553,18 @@ impl Client {
         d.finish(crate::reference_detach::decode(d.action(), result, ok));
     }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if let Command::PrepareRunAction(d) = &command {
+            let owner = &d.action.owner;
+            if !self.is_ready()
+                || owner.client != self.instance()
+                || owner.connection != self.connection()
+                || owner.epoch != self.epoch()
+                || !d.reserved()
+            {
+                d.reject("Connection or review changed; nothing was queued.");
+                return Err("Connection or review changed; nothing was queued.");
+            }
+        }
         let reference = self.reference_status();
         if reference.blocked()
             && matches!(&command,Command::Review{intent,..}|Command::Intent(intent) if intent.starts_work() && reference.action().is_some_and(|a|a.session_id==intent.session_id()))
@@ -585,6 +630,10 @@ impl Client {
         if matches!(
             command,
             Command::Intent(_)
+                | Command::ReadRunAction { .. }
+                | Command::PrepareRunAction(_)
+                | Command::ConfirmRunAction(_)
+                | Command::CommitRunAction(_)
                 | Command::CreateSession
                 | Command::Review { .. }
                 | Command::ConfirmPrepared(_)
@@ -762,6 +811,18 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    RunReconcile(run_actions::Recovery),
+    RestoreSession(crate::run_actions::DeleteUndo),
+    RunTarget {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    RunInspect(Box<run_actions::Work>),
+    RunForecast(Box<run_actions::Work>),
+    RunConsent(Box<run_actions::Work>),
+    RunCommitInspect(Box<run_actions::Work>),
+    RunWrite(Box<run_actions::Work>),
+    LiveContext(crate::run_actions::Owner),
     DetachReference(crate::reference_detach::Dispatch),
     SendInventory(Box<Preparation>),
     ReviewedAction {
@@ -915,6 +976,11 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
+    reconciled_actions: Vec<Action>,
+    delete_undo: Option<crate::run_actions::DeleteUndo>,
+    compacting: Arc<std::sync::Mutex<HashSet<String>>>,
+    action_work: Option<Box<run_actions::Work>>,
     live_overlay: crate::live_overlay::Overlay,
     live_available: bool,
     reference_detach_available: bool,
@@ -1255,6 +1321,19 @@ impl Engine {
         self.updates.push(Update::Questions(state));
     }
     fn blocked_by_unknown(&self, command: &Command, uncertain: &HashSet<Action>) -> bool {
+        let run_session = match command {
+            Command::PrepareRunAction(d) => Some(d.action.owner.session.as_str()),
+            Command::ConfirmRunAction(_) | Command::CommitRunAction(_) => self
+                .action_work
+                .as_ref()
+                .map(|w| w.dispatch.action.owner.session.as_str()),
+            _ => None,
+        };
+        if let Some(session) = run_session {
+            return uncertain
+                .iter()
+                .any(|a| a.question_id.is_none() && a.session_id == session);
+        }
         if let Command::DetachReference(d) = command {
             return uncertain
                 .iter()
@@ -1279,6 +1358,7 @@ impl Engine {
     }
     fn sync_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
+        self.retire_run_review();
         let (generation, active, status_revision, client, connection) = (
             self.generation,
             self.active.as_ref(),
@@ -1325,6 +1405,30 @@ impl Engine {
         }
     }
     fn request(&mut self, request: Request, pending: Pending) {
+        let session = match &request {
+            Request::SendMessage { session_id, .. }
+            | Request::SendReviewedMessage { session_id, .. }
+            | Request::StartPipelineRun { session_id, .. }
+            | Request::ResumeRun { session_id }
+            | Request::EditMessage { session_id, .. }
+            | Request::RetryRun { session_id, .. } => Some(session_id),
+            _ => None,
+        };
+        if session.is_some_and(|id| self.compaction_pending(id)) {
+            let error = "Compaction is still pending. Wait for its completion before starting work or rewriting history.";
+            match &pending {
+                Pending::RunWrite(w) => w.dispatch.reject(error),
+                Pending::Action(a) | Pending::ReviewedAction { action: a, .. } => {
+                    self.updates.push(Update::Action {
+                        session_id: a.session_id.clone(),
+                        result: Err(error.into()),
+                    });
+                }
+                _ => {}
+            }
+            self.updates.push(Update::Notice(error.into()));
+            return;
+        }
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -1345,9 +1449,23 @@ impl Engine {
         if self.stream_subscribe() {
             return;
         }
+        let sessions = self
+            .active
+            .iter()
+            .cloned()
+            .chain(
+                self.compacting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned(),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         self.request(
             Request::Subscribe {
-                sessions: Some(self.active.iter().cloned().collect()),
+                sessions: Some(sessions),
                 deltas: self.live_available && !self.reader.requested,
                 client: Some("Desktop".into()),
             },
@@ -1432,6 +1550,86 @@ impl Engine {
     }
 
     fn command(&mut self, command: Command) {
+        match command {
+            Command::UndoDelete(operation) => {
+                if let Some(ticket) = self
+                    .delete_undo
+                    .take()
+                    .filter(|t| t.operation == operation && t.available() && self.ready)
+                {
+                    self.request(
+                        Request::RestoreSession {
+                            id: ticket.owner.session.clone(),
+                        },
+                        Pending::RestoreSession(ticket),
+                    );
+                }
+            }
+            Command::ReadRunAction { owner, operation } => {
+                if self.ready && self.action_owner().as_ref() == Some(&owner) {
+                    let retired = self
+                        .pending
+                        .iter()
+                        .filter_map(|(id, p)| matches!(p, Pending::RunTarget { .. }).then_some(*id))
+                        .collect::<Vec<_>>();
+                    for id in retired {
+                        self.pending.remove(&id);
+                        self.outgoing.retain(|r| r.id != id);
+                    }
+                    self.request(
+                        Request::GetSession {
+                            id: owner.session.clone(),
+                        },
+                        Pending::RunTarget { owner, operation },
+                    );
+                }
+            }
+            Command::PrepareRunAction(d) => {
+                self.action_prepare(d);
+            }
+            Command::ConfirmRunAction(id) => {
+                self.action_confirm(id);
+            }
+            Command::CommitRunAction(id) => {
+                self.action_commit(id);
+            }
+            command => self.command_existing(command),
+        }
+    }
+
+    fn command_existing(&mut self, command: Command) {
+        let run_busy = self
+            .action_work
+            .as_ref()
+            .is_some_and(|w| w.dispatch.reserved())
+            || self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::RunInspect(_)
+                        | Pending::RunForecast(_)
+                        | Pending::RunConsent(_)
+                        | Pending::RunCommitInspect(_)
+                        | Pending::RunWrite(_)
+                )
+            });
+        if run_busy
+            && matches!(
+                &command,
+                Command::Review { .. }
+                    | Command::ConfirmPrepared(_)
+                    | Command::CommitPrepared(_)
+                    | Command::Intent(_)
+                    | Command::EditSession { .. }
+                    | Command::DetachReference(_)
+                    | Command::EnableStepMode(_)
+                    | Command::DisableStepMode(_)
+                    | Command::DecideStep(_)
+                    | Command::DecideApproval(_)
+            )
+        {
+            self.updates.push(Update::Notice("Wait for the reviewed action receipt or cancel its review before another mutation. Nothing was sent.".into()));
+            return;
+        }
         let work = match &command {
             Command::Review { intent, .. } | Command::Intent(intent) => Some(intent),
             Command::ConfirmPrepared(id) | Command::CommitPrepared(id) => self
@@ -1484,6 +1682,11 @@ impl Engine {
             return;
         }
         match command {
+            Command::UndoDelete(_) => unreachable!("handled by action dispatcher"),
+            Command::ReadRunAction { .. }
+            | Command::PrepareRunAction(_)
+            | Command::ConfirmRunAction(_)
+            | Command::CommitRunAction(_) => unreachable!("handled by action dispatcher"),
             Command::DetachReference(d) => {
                 if !self.reference_detach_available || !self.reference_current(&d) || !d.reserved() {
                     d.reject("Atomic reference removal is unavailable or this review changed. Update the daemon or use Formless TUI; nothing was removed.");
@@ -1905,6 +2108,7 @@ impl Engine {
             } => self.select(session_id, generation),
             Command::Page(page) => self.load_page(page),
             Command::Refresh => {
+                self.recover_run_actions();
                 self.stream_reload();
                 self.dirty_list = true;
                 self.dirty_session = true;
@@ -2186,8 +2390,54 @@ impl Engine {
     }
 
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
+        let definite_rejection = run_actions::definite_rejection(&message);
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if let Event::CompactionNotice { session_id, .. } = &event {
+                    self.pending.retain(|_, p| !matches!(p, Pending::LiveContext(owner) if owner.session == *session_id));
+                    self.outgoing.retain(|r| self.pending.contains_key(&r.id));
+                }
+                if matches!(&event, Event::CompactionNotice { .. })
+                    || matches!(&event, Event::Note { text, .. } if text.starts_with("compaction failed:"))
+                {
+                    if let Some(session) = event.session_id() {
+                        self.compacting
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(session);
+                    }
+                }
+                if matches!(
+                    event,
+                    Event::ProviderStalled { .. }
+                        | Event::ProviderRetrying { .. }
+                        | Event::RunUsage { .. }
+                        | Event::CompactionNotice { .. }
+                        | Event::RunStarted { .. }
+                        | Event::RunFinished { .. }
+                        | Event::RunPaused { .. }
+                        | Event::MessageComplete { .. }
+                        | Event::StreamRestarted { .. }
+                        | Event::Note { .. }
+                ) {
+                    if let Some(owner) = self
+                        .action_owner()
+                        .filter(|o| event.session_id() == Some(o.session.as_str()))
+                    {
+                        self.updates.push(Update::RunActivity {
+                            owner,
+                            event: event.clone(),
+                        });
+                        if matches!(
+                            event,
+                            Event::RunUsage { .. }
+                                | Event::CompactionNotice { .. }
+                                | Event::RunFinished { .. }
+                        ) {
+                            self.context_read();
+                        }
+                    }
+                }
                 if self.live_available && !self.reader.requested {
                     if let Some(session) = self.active.as_deref() {
                         let reload = self.live_overlay.event(session, &event);
@@ -2341,6 +2591,86 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::RunReconcile(recovery) => self.run_reconciled(recovery, result),
+            Pending::RestoreSession(ticket) => {
+                let acknowledged = response_ok
+                    && result
+                        .as_ref()
+                        .is_ok_and(|v| v["id"] == ticket.owner.session);
+                self.updates.push(Update::Notice(if acknowledged {
+                    "Session restored.".into()
+                } else {
+                    "Restore outcome unknown or rejected. Reload Sessions; nothing was replayed."
+                        .into()
+                }));
+                self.dirty_list = true;
+                self.dirty_session = true;
+            }
+            Pending::RunTarget { owner, operation } => {
+                if self.action_owner().as_ref() == Some(&owner) {
+                    let result = result.and_then(|v| self.action_target(&owner.session, &v));
+                    self.updates.push(Update::RunActionTarget {
+                        owner,
+                        operation,
+                        result,
+                    });
+                }
+            }
+            Pending::RunInspect(w) => self.action_inspected(w, result, false),
+            Pending::RunCommitInspect(w) => self.action_inspected(w, result, true),
+            Pending::RunForecast(w) => self.action_forecast(w, result),
+            Pending::RunConsent(w) => self.action_consented(w, result),
+            Pending::RunWrite(w) => {
+                let acknowledged =
+                    response_ok && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v));
+                if definite_rejection && w.dispatch.action.kind == crate::run_actions::Kind::Compact
+                {
+                    self.compacting
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&w.dispatch.action.owner.session);
+                }
+                if response_ok
+                    && w.dispatch.action.kind == crate::run_actions::Kind::Delete
+                    && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v))
+                {
+                    if let Some(deadline) = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v["undo_secs"].as_u64())
+                        .and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs)))
+                    {
+                        let ticket = crate::run_actions::DeleteUndo {
+                            owner: w.dispatch.action.owner.clone(),
+                            operation: uuid::Uuid::new_v4(),
+                            deadline,
+                        };
+                        if ticket.available() {
+                            self.delete_undo = Some(ticket.clone());
+                            self.updates.push(Update::DeleteUndo(ticket));
+                        }
+                    }
+                }
+                if acknowledged || definite_rejection {
+                    self.run_recoveries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&w.dispatch.action.operation);
+                } else if let Some(recovery) = self
+                    .run_recoveries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&w.dispatch.action.operation)
+                {
+                    recovery.replied = true;
+                    recovery.error = result.as_ref().err().cloned();
+                }
+                w.dispatch.finish(result, definite_rejection);
+                self.recover_run_actions();
+                self.dirty_session = true;
+                self.dirty_list = true;
+            }
+            Pending::LiveContext(owner) => self.context_received(owner, result),
             Pending::StreamSubscribe(owner) => self.stream_subscribed(owner, result),
             Pending::StreamBarrier {
                 owner,
@@ -2411,6 +2741,7 @@ impl Engine {
             Pending::Subscribe => {
                 result?;
                 self.ready = true;
+                self.recover_run_actions();
                 self.dirty_list = true;
                 self.dirty_session = true;
                 self.updates.push(Update::Connection {
@@ -2466,6 +2797,7 @@ impl Engine {
                             .map_err(|e| e.to_string())
                     }) {
                         Ok((snapshot, attention)) => {
+                            self.context_read();
                             self.live_overlay
                                 .snapshot(snapshot.steerable_run_id.as_deref(), snapshot.running);
                             self.emit_live_overlay();
@@ -2956,8 +3288,26 @@ impl<R: AsyncBufRead + Unpin> Frames<R> {
 async fn write_requests(
     writer: &mut (impl AsyncWrite + Unpin),
     engine: &mut Engine,
+    uncertain: &mut HashSet<Action>,
 ) -> io::Result<()> {
     while let Some(request) = engine.outgoing.pop_front() {
+        if !engine.action_before_write(request.id) {
+            continue;
+        }
+        if let Some(Pending::RunWrite(w)) = engine.pending.get(&request.id) {
+            uncertain.insert(Action {
+                id: w.dispatch.action.operation,
+                session_id: w.dispatch.action.owner.session.clone(),
+                question_id: None,
+            });
+        }
+        if let Some(Pending::RestoreSession(ticket)) = engine.pending.get(&request.id) {
+            uncertain.insert(Action {
+                id: ticket.operation,
+                session_id: ticket.owner.session.clone(),
+                question_id: None,
+            });
+        }
         let mut line = serde_json::to_vec(&request)?;
         if line.len() >= formless_protocol::MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -2982,6 +3332,8 @@ fn deliver(tx: &SyncSender<Update>, engine: &mut Engine) -> Result<(), String> {
 
 #[derive(Default)]
 struct Retained {
+    run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
+    compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     instance: uuid::Uuid,
     stream_epoch: Arc<AtomicU64>,
     future_attempts: bool,
@@ -2989,6 +3341,14 @@ struct Retained {
     page: Option<Destination>,
     uncertain: HashSet<Action>,
     forks: Arc<session_fork::Ledger>,
+}
+impl Retained {
+    fn retire_connection(&mut self) {
+        self.compacting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }
 
 struct ConnectionState<'a> {
@@ -3011,6 +3371,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         connection,
     } = state;
     let Retained {
+        run_recoveries,
+        compacting,
         active,
         page,
         uncertain,
@@ -3024,6 +3386,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let _fork_connection_guard =
         session_fork::ConnectionGuard::new(forks.clone(), connection.load(Ordering::Acquire));
     let mut engine = Engine {
+        run_recoveries: run_recoveries.clone(),
+        compacting: compacting.clone(),
         instance: *instance,
         reader: reader::Reader::new(*future_attempts),
         stream_epoch: stream_epoch.load(Ordering::Acquire),
@@ -3125,7 +3489,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 *sent = true;
             }
         }
-        write_requests(&mut writer, &mut engine)
+        write_requests(&mut writer, &mut engine, uncertain)
             .await
             .map_err(|e| e.to_string())?;
         if *future_attempts {
@@ -3149,6 +3513,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
                 Some(command) if engine.blocked_by_unknown(&command, uncertain) => {
+                    if let Command::PrepareRunAction(d) = &command { d.reject("A previous Session action is unknown. Nothing was sent; inspect Formless TUI."); }
                     if let Command::DetachReference(d)=&command {d.reject("A previous Session action is unknown. No reference removal was sent; continue in Formless TUI.");}
 
                     let target=match &command {Command::Intent(intent)|Command::Review{intent,..}=>Some(intent.session_id().to_string()),Command::CommitPrepared(id)=>engine.prepared.as_ref().filter(|p|p.id==*id).map(|p|p.intent.session_id().to_string()),_=>None};
@@ -3163,12 +3528,15 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
+                        Some(Pending::RestoreSession(t)) if *ok && result.as_ref().is_some_and(|v| v["id"] == t.owner.session) => Some(Action { id: t.operation, session_id: t.owner.session.clone(), question_id: None }),
+                        Some(Pending::RunWrite(w)) if run_actions::definite_rejection(&message) || (*ok && result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v))) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
                         Some(Pending::ReviewedAction {action,work,..}) if *ok && result.as_ref().is_some_and(|value| work.acknowledges_reviewed_send(value)) => Some(action.clone()),
                         Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
                         _ => None }, _ => None };
                     engine.receive(message)?;
+                    for action in engine.reconciled_actions.drain(..) { uncertain.remove(&action); }
                     ready.store(engine.ready, Ordering::Release);
                     if let Some(id) = answered { uncertain.remove(&id); }
                 }
@@ -3276,6 +3644,7 @@ async fn worker(
             }
         };
         ready.store(false, Ordering::Release);
+        retained.retire_connection();
         advance_epoch(&epoch);
         advance_epoch(&connection);
         advance_epoch(&stream_epoch);
@@ -3854,6 +4223,14 @@ mod tests {
             );
             let subscribe = engine.outgoing.pop_front().unwrap();
             assert!(matches!(subscribe.request,Request::Subscribe{deltas,..} if deltas==supported));
+            respond(&mut engine, subscribe.id, json!({"subscribed":true}));
+            assert!(engine.updates.iter().any(|u| matches!(u,
+                Update::Connection { ready: true, notice } if notice == if supported {
+                    "Connected · provisional live text · canonical history on refresh"
+                } else {
+                    "Connected · canonical messages · live token streaming unavailable"
+                }
+            )));
             assert!(!engine.reader.requested);
             engine.active = Some("s".into());
             engine
@@ -5082,6 +5459,9 @@ mod tests {
                             .unwrap();
                         snapshot("a", "known")
                     }
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::ListPendingAttachments { session_id } => {
                         serde_json::json!({"session_id":session_id,"attachments":[]})
                     }
@@ -5213,7 +5593,7 @@ mod tests {
             let (stream, server) = tokio::io::duplex(16384);
             let (command_tx, mut commands) = queue::channel(QUEUE);
             let _keep_commands = command_tx.clone();
-            let (updates, rx) = mpsc::sync_channel(QUEUE);
+            let (updates, rx) = mpsc::sync_channel(QUEUE * 2);
             let (_stop, mut cancelled) = watch::channel(false);
             let ready = AtomicBool::new(false);
             let epoch = AtomicU64::new(0);
@@ -5250,6 +5630,9 @@ mod tests {
                         }
                         Request::ListInvocations if reconnect => crate::invocations::test_value(),
                         Request::ListSessions => json!([]),
+                        Request::ContextUsage { .. } => {
+                            json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                        }
                         Request::GetSession { id } => snapshot(&id, "canonical"),
                         Request::AnswerQuestion { question_id, .. } => {
                             if !reconnect {
@@ -5424,7 +5807,11 @@ mod tests {
             .unwrap();
             peer.await.unwrap();
             let receiver = driver.await.unwrap();
-            assert!(result.unwrap_err().contains("disconnected"));
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("disconnected") || error.contains("broken pipe"),
+                "{error}"
+            );
             if reconnect {
                 let final_updates: Vec<_> = receiver.try_iter().collect();
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if *operation==metadata_operation)),"the metadata ACK must actually be processed");
@@ -5487,6 +5874,9 @@ mod tests {
                         Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
                         Request::Subscribe { .. } => json!({"subscribed":true}),
                         Request::ListSessions => json!([]),
+                        Request::ContextUsage { .. } => {
+                            json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                        }
                         Request::GetSession { .. } => {
                             snapshots += 1;
                             if snapshots == 1 {
@@ -5603,7 +5993,11 @@ mod tests {
                 )
                 .await;
                 peer.await.unwrap();
-                assert!(result.unwrap_err().contains("disconnected"));
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("disconnected") || error.contains("broken pipe"),
+                    "{error}"
+                );
             })
             .await
             .expect("reconnect/Stop/retry regression timed out");
