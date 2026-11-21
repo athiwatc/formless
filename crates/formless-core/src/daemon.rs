@@ -8208,11 +8208,20 @@ impl Daemon {
         if let Err(error) = self.record_builtin_origin(session_id, run_id, &tc.name, &args) {
             return call_failed(format!("error: could not record data provenance: {error}"));
         }
+        let hook_caps = if cfg
+            .hooks
+            .iter()
+            .any(|hook| matches!(hook.event.as_str(), "pre_tool" | "post_tool"))
+        {
+            self.tool_hook_capabilities(session_id, &tc.name, &args)
+        } else {
+            Vec::new()
+        };
         // pre_tool hooks (SPEC §9.8) may deny the call; the reason goes
         // back to the model.
         if let Some(reason) = self
             .run_tool_hooks(
-                "pre_tool", session_id, run_id, &tc.name, &args, None, cfg, cancel,
+                "pre_tool", session_id, run_id, &tc.name, &args, &hook_caps, None, cfg, cancel,
             )
             .await
         {
@@ -8576,6 +8585,7 @@ impl Daemon {
                 run_id,
                 &tc.name,
                 &args,
+                &hook_caps,
                 Some(&result),
                 cfg,
                 cancel,
@@ -8583,6 +8593,32 @@ impl Daemon {
             .await;
         }
         text
+    }
+
+    fn tool_hook_capabilities(&self, session_id: &str, tool: &str, args: &Value) -> Vec<String> {
+        let Some((_, version)) = self
+            .with_store(|store| store.get_tool_by_name(tool))
+            .ok()
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let resolved = (|| {
+            let caps = Capabilities::parse(&version.capabilities).ok()?;
+            if !caps.has_bindings() {
+                return None;
+            }
+            let mut input = args.clone();
+            let schema =
+                serde_json::from_str(&version.input_schema).unwrap_or(json!({"type": "object"}));
+            toolreg::coerce_json_strings(&schema, &mut input);
+            if let Some(cwd) = self.session_cwd(session_id) {
+                caps.absolutize_inputs(&mut input, std::path::Path::new(&cwd))
+                    .ok()?;
+            }
+            caps.bind(&input).ok().map(|resolved| resolved.to_specs())
+        })();
+        resolved.unwrap_or(version.capabilities)
     }
 
     /// Run the hooks for a Tool call event. Returns a deny reason when a
@@ -8595,6 +8631,7 @@ impl Daemon {
         run_id: &str,
         tool: &str,
         args: &Value,
+        caps: &[String],
         result: Option<&str>,
         cfg: &Config,
         cancel: &CancellationToken,
@@ -8604,12 +8641,6 @@ impl Daemon {
         if hooks.is_empty() {
             return None;
         }
-        let caps = self
-            .with_store(|st| st.get_tool_by_name(tool))
-            .ok()
-            .flatten()
-            .map(|(_, v)| v.capabilities)
-            .unwrap_or_default();
         let mut payload = json!({
             "event": event, "tool": tool, "arguments": args,
             "capabilities": caps, "session_id": session_id, "run_id": run_id,
@@ -8622,7 +8653,7 @@ impl Daemon {
             if cancel.is_cancelled() {
                 return Some("interrupted".into());
             }
-            if !crate::hooks::matches(h, tool, &caps) {
+            if !crate::hooks::matches(h, tool, caps) {
                 continue;
             }
             let (ok, out) = self

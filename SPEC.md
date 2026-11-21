@@ -3814,7 +3814,7 @@ Hooks let users enforce policy and automate workflows. Each is a
 [[hooks]]
 event = "pre_tool"              # pre_tool | post_tool | run_end
 tool = "mcp__*"                 # optional: name, with * wildcards
-capability = "net"              # optional: a declared Capability prefix
+capability = "net"              # optional: a Capability family or scope
 run_tool = "network_policy"     # a registry Tool, or…
 # command = ["/usr/local/bin/check"]   # …a command (no shell)
 # trusted = true                # run the command without asking
@@ -3825,6 +3825,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   Tool's Capabilities, Session and Run. post_tool adds the result
   (clipped to 4000 characters) and `ok`; run_end has the Run's `status`.
   A Tool hook gets it as input, and a command gets it on stdin.
+  For Tool calls, the `capabilities` payload and filter use scopes bound to the
+  call arguments. A binding failure keeps the declared list for the hook.
+  A family such as `net` matches the whole family. A scoped filter uses the
+  same host, port, wildcard and path-component rules as a Capability grant.
   After a command exits, Formless gives its output pipes a short grace
   period to drain and then stops any remaining processes in the hook's
   process group. A hook that reaches its timeout also stops the group.
