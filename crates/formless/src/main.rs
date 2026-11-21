@@ -6286,7 +6286,10 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
                     _ => serde_json::to_string(&row["effective"])?,
                 };
                 let default = if row["default_kind"] == "documentation" {
-                    format!("{} (documented)", row["default_documentation"].as_str().unwrap_or_default())
+                    format!(
+                        "{} (documented)",
+                        row["default_documentation"].as_str().unwrap_or_default()
+                    )
                 } else {
                     serde_json::to_string(&row["default"])?
                 };
