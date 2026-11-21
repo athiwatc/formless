@@ -152,7 +152,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls to the configured provider endpoint.
+5. **Local-first, zero telemetry.** Formless works with a configured provider, can connect to the [Relay](#37-browser-access-via-the-relay-v2) when you enable it, and can automatically download assets for [local session naming](#7-sessions-runs-and-steer). Zero telemetry does not mean zero network traffic.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config and Session checkpoints keep history; destructive actions are user-only and confirmed.
 
@@ -170,10 +170,10 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 └──────────────┘                        └───────┬───────────────┬──────────┘
                                                 │               │
                                     ┌───────────▼─────┐   ┌─────▼──────────┐
-                                    │ QuickJS sandbox │   │ OpenAI-        │
-                                    │ one isolate per │   │ compatible     │
-                                    │ Tool, gated by  │   │ provider       │
-                                    │ Capabilities    │   │ (Chat Compl.)  │
+                                    │ QuickJS sandbox │   │Chat Completions│
+                                    │ one isolate per │   │ Responses      │
+                                    │ Tool, gated by  │   │ Anthropic      │
+                                    │ Capabilities    │   │ Messages       │
                                     └─────────────────┘   └────────────────┘
 ```
 
@@ -202,7 +202,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | Async runtime | [Tokio](https://tokio.rs/) |
 | Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
 | HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |
-| Local session naming | [Candle](https://github.com/huggingface/candle) with [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) |
+| Local session naming | [Candle](https://github.com/huggingface/candle) with [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) by default |
 
 ---
 
@@ -214,7 +214,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 |---|---|
 | A Rust stable toolchain (`rustup` recommended) — **source builds only** | the app is one Rust workspace, edition 2021 |
 | A C compiler (`cc` / `clang` / `gcc`) — **source builds only** | the QuickJS sandbox (`rquickjs`) is compiled from source |
-| An OpenAI-compatible endpoint that **supports tool calling** | it is the only provider Formless talks to |
+| A model endpoint that **supports tool calling** | Formless supports OpenAI-compatible Chat Completions or Responses, and native Anthropic Messages. The Anthropic preset selects Messages. Other built-in presets and custom OpenAI-compatible URLs start with Chat Completions. |
 | A real terminal | the default client is a full-screen TUI |
 
 Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain; if none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
@@ -245,7 +245,7 @@ git clone https://github.com/athiwatc/formless && cd formless
 cargo build --release          # binary at ./target/release/formless
 ```
 
-`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --path crates/formless --locked`.
+`cargo run` (debug) and `cargo test --workspace` work the same way if you are working on the code. You can also `cargo install --git https://github.com/athiwatc/formless --locked formless-bin`.
 
 **Linux packages.** Each release has a `.deb` (`sudo apt install ./formless_<version>_amd64.deb`) and an `.rpm` (`sudo dnf install ./formless-<version>.x86_64.rpm`); Arch users can install `formless-bin` from the AUR once it is published.
 
@@ -270,7 +270,7 @@ With no arguments `formless` launches the **TUI**, which auto-starts the daemon 
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.
-5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue: every Run would fail, and a prompt-mode fallback has to be chosen deliberately ([§3.8](#38-provider-options-v2)).
+5. **Probe** — checks connectivity, streaming and **tool calling**. The probe tries native calls first, then tries prompt-based calls if needed. If the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"` ([§3.8](#38-provider-options-v2)). A result with neither mode demonstrated blocks setup. Probe errors such as authentication failures show their own diagnostics.
 
 The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
 
@@ -486,8 +486,13 @@ formless doctor --json   # the same checks, machine-readable
 
 ```bash
 formless logs --level warn --since 1h      # recent warnings and errors
+formless logs --jsonl --lines 20           # one JSON object per selected entry
 formless logs -f                           # follow as it's written
 ```
+
+`--jsonl` is for snapshots and conflicts with `--follow`. Each record contains
+an RFC 3339 `timestamp` (or `null`), the effective `filter_level` (`info`
+for unknown or missing levels), and the same grouped `text` as raw output.
 
 ### Shell completions
 
@@ -506,6 +511,10 @@ formless config get provider.model --json # one JSON value, with its type preser
 formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
+
+In tmux, `tui.notify` needs `set -g focus-events on` for the TUI to detect
+focus loss. Desktop alerts also need `set -g allow-passthrough on` on tmux
+versions with that option. See [TUI notifications in tmux](docs/troubleshooting.md#tui-notifications-in-tmux).
 
 `config get KEY` reads locally loaded effective configuration, including this
 client's applicable environment overrides. Add `--json` for one compact JSON
@@ -606,11 +615,13 @@ The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host 
 
 ### 3.8 Provider options (v2)
 
-All of these are plain config in `[provider]`; none is a vendor-specific code path.
+Set these options in `[provider]` to select the wire format, Tool calling mode and model routing.
 
 | Setting | Effect |
 |---|---|
-| `api_style = "responses"` | speak the Responses API (`POST {base_url}/responses`) instead of Chat Completions |
+| `api_style = "chat"` | use OpenAI-compatible Chat Completions (`POST {base_url}/chat/completions`), the default |
+| `api_style = "responses"` | use the Responses API (`POST {base_url}/responses`) |
+| `api_style = "anthropic"` | use native Anthropic Messages (`POST {base_url}/messages`) with `x-api-key` by default. The Anthropic preset selects this style. See [SPEC §4.1](SPEC.md#41-scope) for request conversion and caching. |
 | `tool_mode = "prompt"` | describe Tools in the prompt and parse a JSON tool call from the reply, for models without native tool calling (onboarding detects this) |
 | `fallback_models = [...]` | models to fail over to, in order, when the selected one errors |
 | `model = "auto"` + `routing_models = [...]` | pick a model per Run from **measured** local success and latency; `routing_fast_models` / `routing_strong_models` split simple from complex tasks |
@@ -686,7 +697,7 @@ CLI with `formless docs troubleshooting`.
 | Symptom | Fix |
 |---|---|
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
-| "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
+| Onboarding reports neither native nor prompt-based tool calling | Press Enter to pick another model in the wizard. For a saved provider, check a candidate with `/test` or `formless providers test default --model MODEL` and [set `provider.tool_mode = "prompt"`](#38-provider-options-v2) if the model works through the fallback. |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
 
 ### 3.11 CLI reference
@@ -716,7 +727,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
-| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
@@ -1040,7 +1051,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | API | Gated by | Purpose |
 |---|---|---|
 | `fetch(url, {method, headers, body, bodyEncoding, encoding})` → `{status, ok, url, headers, body, text(), json()}` | `net` | HTTP; redirects followed, every hop scope-checked |
-| `fetchChunks(url, opts, size, cb)` | `net` | Stream arbitrarily large bodies in bounded memory |
+| `fetchChunks(url, opts, size, cb)` | `net` | Stream large bodies in bounded memory. The whole request, including body reads, is limited by `tools.fetch_timeout_secs` regardless of chunk size. |
 | `fs.read(path, {encoding})` / `fs.write` / `fs.append` | `fs:read` / `fs:write` | Whole-value access for small data |
 | `fs.exists` / `fs.stat` / `fs.list(dir, {details})` | `fs:read` | Existence, metadata, directory listing |
 | `fs.mkdir` / `fs.remove(path, {recursive})` / `fs.rename(from, to)` | `fs:write` | Tree changes |
@@ -1179,7 +1190,8 @@ formless memory rm m1a2b3c4
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
 * **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
-* **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
+* **Auto-naming** — when a Run finishes, the daemon can give an eligible Session with a provisional title a short name. Naming runs in the background, never replaces a name you set, and uses no provider tokens. The configured naming model runs locally on the CPU.
+  Naming and automatic downloads are enabled by default. In a build with `embedded-llm`, these settings let an eligible Session with naming text fetch its missing configured catalogue model and tokenizer from Hugging Face. These are pinned assets verified with SHA-256 and stored under `<data dir>/models/`. If the model is unavailable, fails, or exceeds `naming.timeout_secs`, the daemon can use a first-words title instead. Set `naming.enabled = false` to turn off automatic naming or `naming.auto_download = false` to disable automatic downloads. These settings do not delete installed assets or disable the explicit `formless naming pull` command.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
@@ -1209,6 +1221,16 @@ in the TUI, or pass `formless run --max-steps N`. Reaching a step threshold
 pauses that Run. See the existing [step-limit and resume/abandon behavior](SPEC.md#54-interruption-and-resumption)
 and [spending-limit rules](SPEC.md#52-run-lifecycle). The client's `--timeout`
 is a separate interruption option.
+
+### Naming model catalogue
+
+| Model ID | Model | GGUF quantization | GGUF weights (bytes) | Upstream license |
+|---|---|---|---:|---|
+| `qwen2.5-0.5b` | Qwen2.5-0.5B-Instruct (default) | Q4_0 | 428,730,208 | [Apache-2.0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/LICENSE) |
+| `lfm2.5-350m` | LFM2.5-350M (alternative) | Q4_K_M | 229,312,224 | [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M/blob/main/LICENSE) |
+
+Weights exclude the separate tokenizer files. The CLI displays whole decimal
+MB by truncating: 428 MB and 229 MB, respectively.
 
 ---
 
@@ -1254,7 +1276,7 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Zero telemetry and no phone-home: nothing leaves the machine except calls to the configured provider endpoint, and `formless update check` only runs when you ask it to ([§3.12](#312-updating)).
+* **Local-first.** Network activity can include provider requests, a [user-enabled Relay](#37-browser-access-via-the-relay-v2), and the [automatic naming asset download](#7-sessions-runs-and-steer). There is no automatic update checker; [`formless update check`](#312-updating) runs only when asked.
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
 
@@ -1398,7 +1420,7 @@ Contributions are welcome, whether it is a bug report, a Tool, a client improvem
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
 
-The optional session-naming model, LFM2.5-230M, is not part of this repository or the binary. It is downloaded at runtime and covered by Liquid AI's [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE) ([§7](#7-sessions-runs-and-steer)).
+Session-naming models are not bundled in this repository or binary. See the [model catalogue](#naming-model-catalogue) for the separate upstream licenses of the default Qwen model and the optional Liquid AI model.
 
 ---
 
@@ -1413,7 +1435,7 @@ The optional session-naming model, LFM2.5-230M, is not part of this repository o
 ## Acknowledgments
 
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template) for the README structure this page follows.
-- [Liquid AI](https://www.liquid.ai/) for LFM2.5-230M, the optional local session-naming model.
+- [Qwen](https://huggingface.co/Qwen) and [Liquid AI](https://www.liquid.ai/) for the local session-naming models.
 - The Rust, [ratatui](https://ratatui.rs/), [rquickjs](https://github.com/DelSkayn/rquickjs), [Tokio](https://tokio.rs/) and SQLite communities.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>

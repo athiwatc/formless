@@ -29,7 +29,8 @@ function setup(names, extras = {}) {
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
-  const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
@@ -63,7 +64,6 @@ test('init and hashchange recover malformed links through pairing guidance', () 
 });
 test('summary close-review labels do not leak into later ordinary dialogs', async () => {
   const c=setup(['ask','showNextAsk','closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];',c);
   const visibility=[];c.$('ask-cancel').classList.toggle=(name,hidden)=>visibility.push([name,hidden]);
   const review=c.ask({title:'Generating branch summary',ok:'Close review',cancelLabel:'Close review',hideCancel:true});
   assert.equal(c.$('ask-ok').textContent,'Close review');assert.equal(c.$('ask-cancel').textContent,'Close review');assert.deepEqual(visibility.at(-1),['hidden',true]);
@@ -75,7 +75,6 @@ test('summary close-review labels do not leak into later ordinary dialogs', asyn
 
 test('overlapping asks preserve typed text and both settle in FIFO order', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const first = c.ask({ title: 'Rename', input: true });
   c.$('ask-input').value = 'typed name';
   const second = c.ask({ title: 'Agent question', input: true });
@@ -89,7 +88,6 @@ test('overlapping asks preserve typed text and both settle in FIFO order', async
 });
 test('secret prompts mask their field and ordinary prompts reset the input type', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const secret = c.ask({ title: 'Connection URL', input: true, secret: true });
   assert.equal(c.$('ask-input').type, 'password');
   c.closeAsk('hidden'); await secret;
@@ -321,7 +319,6 @@ test('parallel questions queue across Sessions; closing queued question preserve
     renderStatus() {}, questionForm: () => ({ querySelector: () => null }),
     readQuestionForm: () => [{ selected: [], text: 'answer' }], act: async () => ({ answered: true }),
   });
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const settings = c.ask({ title: 'Setting', input: true }); c.$('ask-input').value = 'unsaved';
   c.queueQuestion({ question_id: 'one', session_id: 'A', question: 'first' });
   c.queueQuestion({ question_id: 'two', session_id: 'B', question: 'second' });
@@ -826,8 +823,8 @@ test('web tree toggle and row actions operate on the rendered Session identity',
   const toggle=all(list).find(n=>n.tag==='button'&&plainText(n)==='Tree off');assert.ok(toggle);toggle.attrs.onclick();
   const rows=list.children.filter(n=>n.attrs?.class==='session');
   assert.match(plainText(rows[0]),/Parent/);assert.match(plainText(rows[1]),/Child.*fork at seq 3/);assert.match(plainText(rows[2]),/parent unavailable: deleted/);
-  rows[1].attrs.onclick();assert.deepEqual(opened,['child']);
-  all(rows[1]).find(n=>n.tag==='input').attrs.onclick({stopPropagation(){},target:{checked:true}});
+  all(rows[1]).find(n=>n.attrs?.class==='session-open').attrs.onclick();assert.deepEqual(opened,['child']);
+  all(rows[1]).find(n=>n.tag==='input').attrs.onchange({target:{checked:true}});
   assert.equal(c.S.marked.has('child'),true);assert.equal(c.S.marked.has('parent'),false);
 });
 
@@ -969,13 +966,14 @@ test('late old-generation basis cannot cancel a newer summary operation', {timeo
 test('relay reconnect registers only existing push opt-in on the current authenticated room', async () => {
   const subscription={toJSON:()=>({endpoint:'https://push.example/private'})};
   const registration=deferred();
-  const c=setup(['restorePushSubscription'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
-  const frames=[];const ws={readyState:1,send:frame=>frames.push(JSON.parse(frame))};
+  const c=setup(['restorePushSubscription','registerRelayPush'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
+  const frames=[];const ws={readyState:1,addEventListener(){},removeEventListener(){},send:frame=>frames.push(JSON.parse(frame))};
   Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
   const current=c.restorePushSubscription(ws);
   registration.resolve({pushManager:{getSubscription:async()=>subscription}});
   await current;
   assert.deepEqual(frames,[{relay:'push_subscribe',sub:{endpoint:'https://push.example/private'}}]);
+  c.S.pushRegistration.finish(ws);
   for(const change of ['socket','room','channel']){
     const held=deferred();c.navigator.serviceWorker.getRegistration=()=>held.promise;
     Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});

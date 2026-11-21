@@ -18,6 +18,9 @@ use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
+#[path = "transcript_attempts.rs"]
+mod transcript_attempts;
+
 // A std mutex (never held across .await) so broadcast() sends synchronously
 // and every subscriber sees events in emission order.
 type Subs = Arc<StdMutex<Vec<Subscriber>>>;
@@ -224,6 +227,17 @@ fn droppable_scope(ev: &Event) -> Option<(GapScope, DroppedEventKind)> {
             None,
             K::MessageDelta,
         ),
+        Event::TranscriptAttempt { update }
+            if matches!(&update.change, TranscriptAttemptChange::Delta { .. }) =>
+        {
+            (
+                update.session_id.as_str(),
+                update.run_id.as_str(),
+                None,
+                None,
+                K::MessageDelta,
+            )
+        }
         Event::ReasoningDelta {
             session_id, run_id, ..
         } => (
@@ -413,6 +427,7 @@ struct EventFilter {
     /// None = every Session.
     sessions: Option<std::collections::HashSet<String>>,
     deltas: bool,
+    transcript_attempts: bool,
     /// What the client calls itself, shown to the others on its Sessions.
     label: Option<String>,
 }
@@ -422,6 +437,7 @@ impl Default for EventFilter {
         Self {
             sessions: None,
             deltas: true,
+            transcript_attempts: false,
             label: None,
         }
     }
@@ -498,6 +514,8 @@ impl EventFilter {
             | Event::SessionDeleted { .. }
             | Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. } => true,
+            Event::TranscriptAttempt { .. } if !self.transcript_attempts => false,
+            Event::StreamRestarted { .. } if self.transcript_attempts => false,
             Event::MessageDelta { .. } | Event::ReasoningDelta { .. } if !self.deltas => false,
             _ => match (ev.session_id(), &self.sessions) {
                 (Some(id), Some(wanted)) => wanted.contains(id),
@@ -665,7 +683,25 @@ mod pipeline_daemon_tests;
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
 
+#[path = "reviewed_send.rs"]
+mod reviewed_send;
+#[cfg(test)]
+#[path = "reviewed_send_tests.rs"]
+mod reviewed_send_tests;
+
+#[path = "reviewed_reference_detach.rs"]
+mod reviewed_reference_detach;
+#[cfg(test)]
+#[path = "reviewed_reference_detach_tests.rs"]
+mod reviewed_reference_detach_tests;
+
 type SendKey = (Option<u64>, String, String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SendReceiptKind {
+    Legacy,
+    Reviewed,
+    ReviewedSteer,
+}
 type SendOutcome = std::result::Result<Value, CachedSendFailure>;
 #[derive(Clone, Debug)]
 struct CachedSendFailure {
@@ -687,6 +723,7 @@ impl CachedSendFailure {
     }
 }
 struct SentEntry {
+    steer_run_id: Option<String>,
     at: std::time::Instant,
     outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
 }
@@ -801,7 +838,7 @@ pub struct Daemon {
 
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
-    step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
+    step_waiters: StdMutex<HashMap<String, step_inventory::Waiter>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Approvals for one Session only, by (session id, tool id): the
@@ -851,6 +888,7 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, crate::optimiser::PromotionTicket>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    transcript_attempts: Arc<transcript_attempts::Clock>,
     /// One HTTP client (connection pool + TLS sessions) for every provider
     /// call the daemon makes.
     http: reqwest::Client,
@@ -864,8 +902,9 @@ pub struct Daemon {
     config_edit: StdMutex<()>,
     mcp_import_candidates:
         StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
-    /// `SendMessage` keys seen in the last 10 minutes and their outcome.
-    sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
+    /// Legacy/reviewed Send keys seen in the last 10 minutes and their outcome.
+    sent_keys: StdMutex<HashMap<(SendKey, SendReceiptKind), SentEntry>>,
+    reference_detaches: reviewed_reference_detach::Receipts,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -1076,11 +1115,13 @@ impl Daemon {
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
+            transcript_attempts: Arc::new(transcript_attempts::Clock::default()),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
             config_edit: StdMutex::new(()),
             mcp_import_candidates: StdMutex::new(HashMap::new()),
             sent_keys: StdMutex::new(HashMap::new()),
+            reference_detaches: Default::default(),
             mcp: Default::default(),
             modules: StdMutex::new(None),
             // `provider.proxy` applies from start-up (restart to change it).
@@ -1970,48 +2011,14 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
-            Request::GetSession { id } => {
-                let (session, messages, queued, last, latest_run, last_recap, running) = self
-                    .with_store(|st| {
-                        st.read_transaction(|st| {
-                            let s = st
-                                .get_session(&id)?
-                                .filter(|_| !st.session_deleted(&id).unwrap_or(false))
-                                .context(RequestFailure::not_found("session not found"))?;
-                            let m = st.list_messages(&id)?;
-                            let q = (st.queued_items(&id)?, st.session_plan_snapshot(&id)?);
-                            let l = st.unfinished_last_run(&id)?;
-                            let latest = st
-                                .last_run(&id)?
-                                .map(|(rid, _)| st.inspect_run(&rid))
-                                .transpose()?
-                                .flatten();
-                            let last_recap = st.latest_recorded_run_recap(&id)?;
-                            // Hold the writer mutex through this sample: terminal
-                            // capture commits its recap before releasing controls.
-                            #[cfg(test)]
-                            if let Some(hook) = self.session_snapshot_test.locked().clone() {
-                                hook();
-                            }
-                            let running = self.runs.locked().contains_key(&id)
-                                || self.session_is_publishing(&id);
-                            Ok((s, m, q, l, latest, last_recap, running))
-                        })
-                    })?;
-                // An unfinished last Run (interrupted/paused) gets a banner
-                // with Resume / Abandon in clients (SPEC §5.4).
-                let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
-                    json!({"run_id": run_id, "status": status, "error": error})
-                });
-                // `queued`: the texts (as before); `queued_items` adds ids
-                // for editing.
-                let (queued, (plan, plan_state)) = queued;
-                let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
-                Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
-                        "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone() }),
-                )
+            Request::GetTranscriptBarrier { id } => {
+                // No store lock is held while taking the producer clock. A
+                // start after this sample cannot precede the completed read.
+                let snapshot = self.transcript_snapshot(id)?;
+                let barrier = self.transcript_attempts.barrier();
+                Ok(json!({"snapshot":snapshot,"barrier":barrier,"mode":"future_attempts_only_v1"}))
             }
+            Request::GetSession { id } => self.transcript_snapshot(id),
             Request::ForkSession {
                 id,
                 name,
@@ -2154,6 +2161,20 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
+            Request::CompareSetSessionModel {
+                id,
+                expected,
+                desired,
+            } => {
+                let session =
+                    self.with_store(|st| st.compare_set_session_model(&id, &expected, &desired))?;
+                // Explicit metadata API: no optional paid probe, Run or message.
+                // A running Run retains the selection it already sampled.
+                self.broadcast(Event::SessionUpdated {
+                    session: session.clone(),
+                });
+                Ok(serde_json::to_value(session)?)
+            }
             Request::SetSessionModel {
                 id,
                 model,
@@ -2288,77 +2309,51 @@ impl Daemon {
                 mode,
                 client_msg_id,
             } => {
-                let Some(key) = client_msg_id else {
-                    return self.send_message(session_id, content, mode).await;
-                };
-                let who = current_client();
-                let key = (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key);
-                // Claim before executing. A concurrent duplicate gets the same
-                // receiver even while the first send has not finished yet.
-                let (mut outcome, owner) = {
-                    let mut sent = self.sent_keys.locked();
-                    sent.retain(|_, entry| {
-                        entry.outcome.borrow().is_none()
-                            || entry.at.elapsed() < std::time::Duration::from_secs(600)
-                    });
-                    if let Some(entry) = sent.get(&key) {
-                        (entry.outcome.clone(), None)
-                    } else {
-                        let (tx, rx) = tokio::sync::watch::channel(None);
-                        sent.insert(
-                            key.clone(),
-                            SentEntry {
-                                at: std::time::Instant::now(),
-                                outcome: rx.clone(),
-                            },
-                        );
-                        (rx, Some(tx))
-                    }
-                };
-                if let Some(tx) = owner {
-                    let this = self.clone();
-                    // A dropped reply/waiter must not cancel a send after it
-                    // appended the message. Preserve attribution in this task.
-                    tokio::spawn(async move {
-                        use futures_util::FutureExt;
-                        let execute = async {
-                            match std::panic::AssertUnwindSafe(
-                                this.send_message(session_id, content, mode),
-                            )
-                            .catch_unwind()
-                            .await
-                            {
-                                Ok(result) => result.map_err(CachedSendFailure::capture),
-                                Err(panic) => {
-                                    let why = panic_text(&panic);
-                                    tracing::error!("panic while handling SendMessage: {why}");
-                                    Err(CachedSendFailure::capture(
-                                        RequestFailure::internal(format!(
-                                            "internal error while handling SendMessage: {why}"
-                                        ))
-                                        .into(),
-                                    ))
-                                }
-                            }
-                        };
-                        let result = match who {
-                            Some(who) => CLIENT.scope(who, execute).await,
-                            None => execute.await,
-                        };
-                        if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
-                            entry.at = std::time::Instant::now();
-                        }
-                        let _ = tx.send(Some(result));
-                    });
+                self.send_message_once(session_id, content, mode, client_msg_id, None)
+                    .await
+            }
+            Request::SendReviewedMessage {
+                session_id,
+                content,
+                mode,
+                expected_attachments,
+                client_msg_id,
+            } => {
+                reviewed_send::validate_key(&client_msg_id)?;
+                self.send_message_once(
+                    session_id,
+                    content,
+                    mode,
+                    Some(client_msg_id),
+                    Some(reviewed_send::Review {
+                        expected_attachments,
+                        run_id: None,
+                    }),
+                )
+                .await
+            }
+            Request::SendReviewedSteer {
+                session_id,
+                run_id,
+                content,
+                expected_attachments,
+                client_msg_id,
+            } => {
+                reviewed_send::validate_key(&client_msg_id)?;
+                if !formless_protocol::valid_reviewed_run_id(&run_id) {
+                    return Err(RequestFailure::invalid("invalid reviewed Run identity").into());
                 }
-                loop {
-                    if let Some(result) = outcome.borrow().clone() {
-                        return result.map_err(CachedSendFailure::into_error);
-                    }
-                    outcome.changed().await.context(RequestFailure::internal(
-                        "internal error: SendMessage outcome was lost",
-                    ))?;
-                }
+                self.send_message_once(
+                    session_id,
+                    content,
+                    SendMode::Steer,
+                    Some(client_msg_id),
+                    Some(reviewed_send::Review {
+                        expected_attachments,
+                        run_id: Some(run_id),
+                    }),
+                )
+                .await
             }
 
             Request::RunFiles { session_id, run_id } => {
@@ -2623,7 +2618,9 @@ impl Daemon {
                 Ok(json!({"abandoned": abandoned}))
             }
             // Only meaningful per connection (see `handle_conn`).
-            Request::Subscribe { .. } => Err(anyhow!("subscribe applies to a client connection")),
+            Request::Subscribe { .. } | Request::SubscribeTranscriptAttempts { .. } => {
+                Err(anyhow!("subscribe applies to a client connection"))
+            }
             Request::DiffToolVersions { id, from, to } => {
                 let d = self
                     .with_reader(|st| st.tool_detail(&id))?
@@ -2855,6 +2852,33 @@ impl Daemon {
                 let _ = self.with_store(|st| st.audit("user", "relay.disconnect", &cid));
                 Ok(json!({ "disconnected": true }))
             }
+            Request::ListPendingAttachments { session_id } => {
+                let attachments = reviewed_send::inventory(self, &session_id)?;
+                Ok(json!({"session_id":session_id,"attachments":attachments}))
+            }
+            Request::ReadSteerReview { session_id } => {
+                let _admission = self.forecast_admission.locked();
+                let run_id = self
+                    .runs
+                    .locked()
+                    .get(&session_id)
+                    .and_then(reviewed_send::steerable_run_id)
+                    .map(str::to_string)
+                    .context(RequestFailure::busy("Session has no steerable Run"))?;
+                let attachments = reviewed_send::inventory(self, &session_id)?;
+                Ok(json!({"session_id":session_id,"run_id":run_id,"attachments":attachments}))
+            }
+            Request::DetachReviewedReference {
+                session_id,
+                expected_attachments,
+                index,
+                operation_id,
+            } => self.detach_reviewed_reference(
+                session_id,
+                expected_attachments,
+                index,
+                operation_id,
+            ),
             Request::DetachFile { session_id, id } => {
                 let gone = self.with_store(|st| {
                     st.transaction(|st| {
@@ -3329,13 +3353,7 @@ impl Daemon {
                     Some((run_id, _)) => Some(self.usage_info(None, Some(&run_id), &cfg)?),
                     None => None,
                 };
-                let runs = self.with_reader(|st| {
-                    Ok(st
-                        .run_metrics(100_000)?
-                        .into_iter()
-                        .filter(|r| r.session_id == session_id)
-                        .count())
-                })?;
+                let runs = self.with_reader(|st| st.count_runs_for_session(&session_id))?;
                 Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
             }
             Request::GetArtifact { id, offset, length } => {
@@ -3674,32 +3692,55 @@ impl Daemon {
             Request::UsageByDay { since, by } => {
                 let by = by.unwrap_or_default();
                 let cfg = self.config()?;
-                let rows = self.with_reader(|st| st.usage_grouped(since.as_deref(), &by))?;
+                let rows =
+                    self.with_reader(|st| st.usage_grouped_with_labels(since.as_deref(), &by))?;
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
-                let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, provider, model, p, c, cached, cw, reported, unknown) in rows {
+                struct UsageBucket {
+                    key: String,
+                    label: Option<String>,
+                    prompt: i64,
+                    completion: i64,
+                    cached: i64,
+                    cost: Option<f64>,
+                }
+                let mut out: Vec<UsageBucket> = Vec::new();
+                for ((key, provider, model, p, c, cached, cw, reported, unknown), label) in rows {
                     let price =
                         cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
-                    match out.last_mut().filter(|o| o.0 == key) {
-                        Some(o) => {
-                            o.1 += p;
-                            o.2 += c;
-                            o.3 += cached;
-                            o.4 = o.4.zip(price).map(|(a, b)| a + b);
+                    match out.last_mut().filter(|bucket| bucket.key == key) {
+                        Some(bucket) => {
+                            bucket.prompt += p;
+                            bucket.completion += c;
+                            bucket.cached += cached;
+                            bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
-                        None => out.push((key, p, c, cached, price)),
+                        None => out.push(UsageBucket {
+                            key,
+                            label,
+                            prompt: p,
+                            completion: c,
+                            cached,
+                            cost: price,
+                        }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|o| std::cmp::Reverse(o.1 + o.2));
+                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
                 }
                 Ok(json!(out
                     .into_iter()
-                    .map(|(key, p, c, cached, cost)| json!({
-                        "key": key, "prompt_tokens": p, "completion_tokens": c,
-                        "cached_tokens": cached, "cost": cost,
-                    }))
+                    .map(|bucket| {
+                        let mut row = json!({
+                            "key": bucket.label.as_deref().unwrap_or(&bucket.key),
+                            "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
+                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                        });
+                        if bucket.label.is_some() {
+                            row["session_id"] = json!(bucket.key);
+                        }
+                        row
+                    })
                     .collect::<Vec<_>>()))
             }
             Request::ListToolMetrics { since } => {
@@ -4485,11 +4526,10 @@ impl Daemon {
                 Ok(out)
             }
             Request::RetireTool { id } => {
-                let t = self
-                    .with_store(|st| st.set_tool_retired(&id, true))?
-                    .context(RequestFailure::not_found("tool not found"))?;
+                let t = self.change_registry("retired", "user", |st| {
+                    Self::set_registry_retired(st, &id, true)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "tool.retire", &t.name));
-                self.note_registry_change(&t, "retired", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -4531,11 +4571,10 @@ impl Daemon {
                 Ok(serde_json::to_value(t)?)
             }
             Request::RestoreTool { id } => {
-                let t = self
-                    .with_store(|st| st.set_tool_retired(&id, false))?
-                    .context(RequestFailure::not_found("tool not found"))?;
+                let t = self.change_registry("restored", "user", |st| {
+                    Self::set_registry_retired(st, &id, false)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "tool.restore", &t.name));
-                self.note_registry_change(&t, "restored", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -4546,38 +4585,26 @@ impl Daemon {
                 }
                 Ok(json!({"purged": existed}))
             }
-            Request::UndoRegistryChange => {
-                let change: RegistryChange = self
-                    .with_reader(|st| st.kv_get(REGISTRY_NS, LAST_CHANGE))?
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .context("nothing to undo in the Tool registry")?;
-                let id = change.tool_id.as_str();
-                let t = match change.action.as_str() {
-                    // A new Tool is retired, not purged: restorable.
-                    "created" | "restored" => {
-                        self.with_store(|st| st.set_tool_retired(id, true))?
-                    }
-                    "retired" => self.with_store(|st| st.set_tool_retired(id, false))?,
-                    _ => self.with_store(|st| st.rollback_tool(id, change.from_version))?,
-                }
-                .context(RequestFailure::not_found("that Tool no longer exists"))?;
-                self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &Value::Null))?;
-                let undone = change.summary();
-                let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
-                self.broadcast(Event::ToolUpdated { tool: t.clone() });
-                Ok(json!({"undone": undone, "tool": t}))
+            Request::UndoRegistryChange => self.undo_registry_change(None),
+            Request::UndoRegistryChangeIfCurrent { change_id } => {
+                self.undo_registry_change(Some(&change_id))
             }
             Request::RollbackTool { id, version } => {
-                let before = self
-                    .with_reader(|st| st.get_tool_current(&id))?
-                    .map_or(0, |(i, _)| i.current_version);
-                let t = self
-                    .with_store(|st| st.rollback_tool(&id, version))?
-                    .context(RequestFailure::not_found("tool/version not found"))?;
+                let t = self.change_registry("rolled_back", "user", |st| {
+                    let current = st
+                        .tool_info(&id)?
+                        .context(RequestFailure::not_found("tool/version not found"))?;
+                    if current.current_version == version {
+                        return Ok((current, None));
+                    }
+                    let tool = st
+                        .rollback_tool(&id, version)?
+                        .context(RequestFailure::not_found("tool/version not found"))?;
+                    Ok((tool, Some(current.current_version)))
+                })?;
                 let _ = self.with_store(|st| {
                     st.audit("user", "tool.rollback", &format!("{} v{version}", t.name))
                 });
-                self.note_registry_change(&t, "rolled_back", before, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -4704,6 +4731,9 @@ impl Daemon {
                 }
                 Ok(json!({"session_id": session_id, "on": on}))
             }
+            Request::DisableStepModeIfIdle { session_id } => {
+                self.disable_step_mode_if_idle(&session_id)
+            }
             Request::StepDecision {
                 step_id,
                 action,
@@ -4730,7 +4760,7 @@ impl Daemon {
                     .unwrap()
                     .remove(&step_id)
                     .context(RequestFailure::not_found("that step is no longer waiting"))?;
-                let _ = tx.send((action.clone(), arguments));
+                let _ = tx.decision.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
             Request::ImportAll { bundle } => self.import_all(&bundle).await,
@@ -5033,10 +5063,55 @@ impl Daemon {
             .to_string())
     }
 
-    /// Remember the newest registry change, the one `UndoRegistryChange`
-    /// reverts, and tell clients (they offer Undo).
-    fn note_registry_change(&self, t: &ToolInfo, action: &str, from_version: i64, author: &str) {
+    fn set_registry_retired(
+        st: &Store,
+        id: &str,
+        retired: bool,
+    ) -> Result<(ToolInfo, Option<i64>)> {
+        let current = st
+            .tool_info(id)?
+            .context(RequestFailure::not_found("tool not found"))?;
+        if current.retired == retired {
+            return Ok((current, None));
+        }
+        let tool = st
+            .set_tool_retired(id, retired)?
+            .context(RequestFailure::not_found("tool not found"))?;
+        Ok((tool, Some(current.current_version)))
+    }
+
+    fn change_registry(
+        &self,
+        action: &str,
+        author: &str,
+        write: impl FnOnce(&Store) -> Result<(ToolInfo, Option<i64>)>,
+    ) -> Result<ToolInfo> {
+        let (tool, change) = self.with_store(|st| {
+            st.transaction(|st| {
+                let (tool, before) = write(st)?;
+                // Preserve the previous receipt when this request changed no state.
+                let change = before
+                    .map(|version| Self::record_registry_change(st, &tool, action, version, author))
+                    .transpose()?;
+                Ok((tool, change))
+            })
+        })?;
+        if let Some(change) = change {
+            self.broadcast(Event::RegistryChanged { change });
+        }
+        Ok(tool)
+    }
+
+    /// Save the Undo identity in the same transaction as the Tool mutation.
+    fn record_registry_change(
+        st: &Store,
+        t: &ToolInfo,
+        action: &str,
+        from_version: i64,
+        author: &str,
+    ) -> Result<RegistryChange> {
         let change = RegistryChange {
+            change_id: Some(uuid::Uuid::new_v4().to_string()),
             tool_id: t.id.clone(),
             name: t.name.clone(),
             action: action.into(),
@@ -5045,10 +5120,49 @@ impl Daemon {
             author: author.into(),
             at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Ok(v) = serde_json::to_value(&change) {
-            let _ = self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &v));
-        }
-        self.broadcast(Event::RegistryChanged { change });
+        st.kv_set(REGISTRY_NS, LAST_CHANGE, &serde_json::to_value(&change)?)?;
+        Ok(change)
+    }
+
+    fn undo_registry_change(&self, expected: Option<&str>) -> Result<Value> {
+        let (tool, undone) = self.with_store(|st| {
+            st.transaction(|st| {
+                let unavailable = || {
+                    if expected.is_some() {
+                        "Undo is no longer available for that Tool change"
+                    } else {
+                        "nothing to undo in the Tool registry"
+                    }
+                };
+                let change: RegistryChange = st
+                    .kv_get(REGISTRY_NS, LAST_CHANGE)?
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .with_context(unavailable)?;
+                if let Some(expected) = expected {
+                    anyhow::ensure!(change.change_id.as_deref() == Some(expected), unavailable());
+                    let current = st.tool_info(&change.tool_id)?.with_context(unavailable)?;
+                    anyhow::ensure!(current.current_version == change.to_version, unavailable());
+                    match change.action.as_str() {
+                        "retired" => anyhow::ensure!(current.retired, unavailable()),
+                        "created" | "restored" => anyhow::ensure!(!current.retired, unavailable()),
+                        _ => {}
+                    }
+                }
+                let id = change.tool_id.as_str();
+                let tool = match change.action.as_str() {
+                    // A new Tool is retired, not purged: restorable.
+                    "created" | "restored" => st.set_tool_retired(id, true)?,
+                    "retired" => st.set_tool_retired(id, false)?,
+                    _ => st.rollback_tool(id, change.from_version)?,
+                }
+                .context(RequestFailure::not_found("that Tool no longer exists"))?;
+                st.kv_delete(REGISTRY_NS, LAST_CHANGE)?;
+                Ok((tool, change.summary()))
+            })
+        })?;
+        let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
+        self.broadcast(Event::ToolUpdated { tool: tool.clone() });
+        Ok(json!({"undone": undone, "tool": tool}))
     }
 
     /// Attribute only the exact operation result owned by this Run. Reading
@@ -5109,6 +5223,107 @@ impl Daemon {
         tracing::warn!("run for deleted session {session_id} did not stop within 5s");
     }
 
+    /// Share the existing per-connection send receipt and detached execution
+    /// semantics with the explicit attachment-review operation.
+    async fn send_message_once(
+        self: &Arc<Self>,
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        client_msg_id: Option<String>,
+        review: Option<reviewed_send::Review>,
+    ) -> Result<Value> {
+        let Some(key) = client_msg_id else {
+            return self
+                .send_message_with_review(session_id, content, mode, review)
+                .await;
+        };
+        let who = current_client();
+        let steer_run_id = review.as_ref().and_then(|review| review.run_id.as_deref());
+        // Legacy and reviewed operations must never replay one another's ACK.
+        let key = (
+            (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key),
+            match &review {
+                Some(review) if review.run_id.is_some() => SendReceiptKind::ReviewedSteer,
+                Some(_) => SendReceiptKind::Reviewed,
+                None => SendReceiptKind::Legacy,
+            },
+        );
+        // Claim before executing. A concurrent duplicate gets the same
+        // receiver even while the first send has not finished yet.
+        let (mut outcome, owner) = {
+            let mut sent = self.sent_keys.locked();
+            sent.retain(|_, entry| {
+                entry.outcome.borrow().is_none()
+                    || entry.at.elapsed() < std::time::Duration::from_secs(600)
+            });
+            if let Some(entry) = sent.get(&key) {
+                if entry.steer_run_id.as_deref() != steer_run_id {
+                    return Err(RequestFailure::invalid(
+                        "Reviewed Steer action identity already belongs to a different Run",
+                    )
+                    .into());
+                }
+                (entry.outcome.clone(), None)
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                sent.insert(
+                    key.clone(),
+                    SentEntry {
+                        steer_run_id: steer_run_id.map(str::to_string),
+                        at: std::time::Instant::now(),
+                        outcome: rx.clone(),
+                    },
+                );
+                (rx, Some(tx))
+            }
+        };
+        if let Some(tx) = owner {
+            let this = self.clone();
+            // A dropped reply/waiter must not cancel a send after it
+            // appended the message. Preserve attribution in this task.
+            tokio::spawn(async move {
+                use futures_util::FutureExt;
+                let execute = async {
+                    match std::panic::AssertUnwindSafe(
+                        this.send_message_with_review(session_id, content, mode, review),
+                    )
+                    .catch_unwind()
+                    .await
+                    {
+                        Ok(result) => result.map_err(CachedSendFailure::capture),
+                        Err(panic) => {
+                            let why = panic_text(&panic);
+                            tracing::error!("panic while handling SendMessage: {why}");
+                            Err(CachedSendFailure::capture(
+                                RequestFailure::internal(format!(
+                                    "internal error while handling SendMessage: {why}"
+                                ))
+                                .into(),
+                            ))
+                        }
+                    }
+                };
+                let result = match who {
+                    Some(who) => CLIENT.scope(who, execute).await,
+                    None => execute.await,
+                };
+                if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
+                    entry.at = std::time::Instant::now();
+                }
+                let _ = tx.send(Some(result));
+            });
+        }
+        loop {
+            if let Some(result) = outcome.borrow().clone() {
+                return result.map_err(CachedSendFailure::into_error);
+            }
+            outcome.changed().await.context(RequestFailure::internal(
+                "internal error: SendMessage outcome was lost",
+            ))?;
+        }
+    }
+
     /// A Run that stopped mid-batch leaves tool calls without results,
     /// which providers reject. Answer them (never re-run: the outcome is
     /// unknown, SPEC §9.5) before the next Run builds its context.
@@ -5118,11 +5333,48 @@ impl Daemon {
         content: String,
         mode: SendMode,
     ) -> Result<serde_json::Value> {
+        self.send_message_with_review(session_id, content, mode, None)
+            .await
+    }
+
+    async fn send_message_with_review(
+        self: &Arc<Self>,
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        review: Option<reviewed_send::Review>,
+    ) -> Result<Value> {
+        if let Some(review) = &review {
+            reviewed_send::validate(&session_id, &review.expected_attachments)?;
+            if mode == SendMode::Queue {
+                return Err(RequestFailure::invalid(
+                    "reviewed attachment sending does not support Queue; nothing was queued",
+                )
+                .into());
+            }
+        }
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
         self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
         let control = self.runs.locked().get(&session_id).cloned();
+        // A Run can start or finish after the client confirms. Classify under
+        // the same admission lock as the ensuing append and Run admission.
+        if let Some(review) = &review {
+            if let Some(expected_run) = &review.run_id {
+                if control.as_ref().map(|run| &run.run_id) != Some(expected_run) {
+                    return Err(RequestFailure::busy("Reviewed Run is no longer active").into());
+                }
+            }
+            let mismatch = match (mode, control.is_some()) {
+                (SendMode::Send, true) => Some("Session became active. Review a Steer instead."),
+                (SendMode::Steer, false) => Some("Session became idle. Review a new Send instead."),
+                _ => None,
+            };
+            if let Some(reason) = mismatch {
+                return Err(RequestFailure::busy(reason).into());
+            }
+        }
         let queue = mode == SendMode::Queue && control.is_some()
             || control.as_ref().is_some_and(|control| {
                 !control.steering.accepts()
@@ -5131,20 +5383,35 @@ impl Daemon {
             })
             || (control.is_none() && self.session_is_publishing(&session_id));
         if queue {
+            if review.is_some() {
+                return Err(RequestFailure::busy(
+                    "Run cannot accept the reviewed message now; nothing was queued or consumed",
+                )
+                .into());
+            }
             self.with_store(|st| st.enqueue_message(&session_id, &content))?;
             self.queue_changed(&session_id);
             return Ok(json!({"queued":true}));
         }
+        let expected = review
+            .as_ref()
+            .map(|review| review.expected_attachments.as_slice());
         match control {
             Some(control) => {
                 let step = self
                     .with_reader(|st| st.run_steps(&control.run_id))
                     .unwrap_or(0);
-                let msg = self.append_user_message_meta(
-                    &session_id,
-                    &content,
-                    Some(("steer", json!({"step":step,"run_id":control.run_id}))),
-                )?;
+                let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
+                let msg = if let Some(expected) = expected {
+                    self.with_store(|st| {
+                        st.transaction(|st| {
+                            reviewed_send::check(st, &session_id, Some(expected))?;
+                            Self::append_user_message_store(st, &session_id, &content, extra)
+                        })
+                    })?
+                } else {
+                    self.append_user_message_meta(&session_id, &content, extra)?
+                };
                 control.steering.accepted(msg.seq);
                 let _ = control.steer_tx.send(msg.seq);
                 self.broadcast(Event::MessageAppended {
@@ -5163,6 +5430,7 @@ impl Daemon {
                 };
                 let (msg, run_id, admission) = self.with_store(|st| {
                     st.transaction(|st| {
+                        reviewed_send::check(st, &session_id, expected)?;
                         let forecast = self.consented_forecast(st, &cfg, &input)?;
                         #[cfg(test)]
                         if let Some(hook) = self.forecast_admission_test.locked().clone() {
@@ -6524,6 +6792,7 @@ impl Daemon {
             let routing_call = crate::routing_observation::Call::responsible_step(
                 self.routing_recorder.call_sink(),
             );
+            let transcript_turn = uuid::Uuid::new_v4().to_string();
             let outcome=crate::routing_observation::scope(routing_call.clone(),async { 'request: loop {
                 let (sid, rid) = (session_id.to_string(), run_id.to_string());
                 let subs = self.subs.clone();
@@ -6532,6 +6801,11 @@ impl Daemon {
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
                 self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let mut correlated = transcript_attempts::Attempt::start(
+                    self.transcript_attempts.clone(), self.subs.clone(),
+                    session_id, run_id, &transcript_turn, consumed_seq, !hide_candidate,
+                );
+                let correlated_sink = correlated.sink();
                 let (mut request_attempt, mut retry_signal) = retry.begin();
                 let chat_fut = counted(
                     "run",
@@ -6548,6 +6822,11 @@ impl Daemon {
                             got_bytes2.store(true, Ordering::SeqCst);
                             if hide_candidate {
                                 return;
+                            }
+                            match kind {
+                                DeltaKind::Content => correlated_sink.delta(delta),
+                                DeltaKind::Restart => correlated_sink.restart(),
+                                _ => {}
                             }
                             let ev = match kind {
                                 DeltaKind::Bytes => return,
@@ -6578,6 +6857,7 @@ impl Daemon {
                 loop {
                     tokio::select! {
                         r = &mut chat_fut => {
+                            correlated.returned();
                             if !request_attempt.finish() || cancel.is_cancelled() {
                                 break 'request r;
                             }
@@ -6778,7 +7058,15 @@ impl Daemon {
                         )
                         .await
                     {
-                        Ok(_) => continue,
+                        Ok(_) => {
+                            // A successful compaction retries without storing
+                            // this candidate. End its live text before retrying.
+                            self.broadcast(Event::StreamRestarted {
+                                session_id: session_id.to_string(),
+                                run_id: run_id.to_string(),
+                            });
+                            continue;
+                        }
                         // Keep the partial answer (stored below with its
                         // stop reason) rather than fail the Run (#1091).
                         Err(e) => self.broadcast(Event::Note {
@@ -6841,6 +7129,12 @@ impl Daemon {
                 && crate::provider::looks_like_access_refusal(&result.content)
             {
                 nudged_refusal = true;
+                // This candidate is not persisted. Reset live text before the
+                // next provider turn, rather than joining two attempts.
+                self.broadcast(Event::StreamRestarted {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                });
                 let msg = self.with_store(|st| {
                     st.append_message(session_id, "system-note", crate::provider::REFUSAL_NUDGE)
                 })?;
@@ -6859,6 +7153,12 @@ impl Daemon {
                 if !live.is_empty() {
                     if !reminded_pending {
                         reminded_pending = true;
+                        // The premature answer is discarded, not a canonical
+                        // assistant boundary for the next attempt.
+                        self.broadcast(Event::StreamRestarted {
+                            session_id: session_id.to_string(),
+                            run_id: run_id.to_string(),
+                        });
                         let handles: Vec<String> =
                             live.iter().map(|(h, n)| format!("{n} ({h})")).collect();
                         let note = format!(
@@ -7359,33 +7659,44 @@ impl Daemon {
         let mut skipped = std::collections::HashSet::new();
         let count = calls.len();
         for (index, tc) in calls.iter_mut().enumerate() {
-            if !self.step_sessions.locked().contains(session_id) || self.subscriber_count() == 0 {
+            let mode_on = self.step_sessions.locked().contains(session_id);
+            if !mode_on || self.subscriber_count() == 0 {
                 break;
             }
-            let step_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.step_waiters
-                .lock()
-                .unwrap()
-                .insert(step_id.clone(), tx);
-            self.broadcast(Event::StepPending {
-                session_id: session_id.to_string(),
-                run_id: run_id.to_string(),
-                step_id: step_id.clone(),
-                tool_name: tc.name.clone(),
-                arguments: tc.arguments.clone(),
-                index,
-                count,
-            });
+            let (step_id, prompt, rx) = {
+                // Serialize this second mode read and waiter registration with
+                // conditional Step-off without holding mode while taking the subscriber lock.
+                let mode = self.step_sessions.locked();
+                if !mode.contains(session_id) {
+                    break;
+                }
+                let step_id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let prompt = Event::StepPending {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    step_id: step_id.clone(),
+                    tool_name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    index,
+                    count,
+                };
+                self.step_waiters
+                    .locked()
+                    .insert(step_id.clone(), step_inventory::Waiter::new(&prompt, tx));
+                (step_id, prompt, rx)
+            };
+            let waiting = step_inventory::Waiting {
+                daemon: self,
+                session: session_id,
+                id: &step_id,
+            };
+            self.broadcast(prompt);
             let decision = tokio::select! {
                 _ = cancel.cancelled() => None,
                 d = rx => d.ok(),
             };
-            self.step_waiters.locked().remove(&step_id);
-            self.broadcast(Event::StepResolved {
-                session_id: session_id.to_string(),
-                step_id,
-            });
+            drop(waiting);
             let Some((action, arguments)) = decision else {
                 return Err(anyhow!("interrupted"));
             };
@@ -8091,10 +8402,9 @@ impl Daemon {
                 let reason = args["reason"].as_str().unwrap_or_default();
                 match self.with_store(|st| st.get_tool_by_name(name)) {
                     Ok(Some((info, _))) => {
-                        if let Ok(Some(t)) =
-                            self.with_store(|st| st.set_tool_retired(&info.id, true))
-                        {
-                            self.note_registry_change(&t, "retired", t.current_version, "agent");
+                        if let Ok(t) = self.change_registry("retired", "agent", |st| {
+                            Self::set_registry_retired(st, &info.id, true)
+                        }) {
                             self.note_tool_change(
                                 run_id,
                                 ToolChange {
@@ -10088,24 +10398,37 @@ impl Daemon {
             return Err(crate::tool_compatibility::SchemaChangeBlocked(preflight).into());
         }
         let smoke_note = self.smoke_gate(&d, cfg, cancel).await?;
-        let (info, version, compatibility) = self
+        let (info, version, compatibility, change) = self
             .with_store(|st| {
                 let write = |st: &Store| {
-                    st.create_tool_version_with_schema_report(
-                        &d.name,
-                        &d.description,
-                        &d.input_schema.to_string(),
-                        &d.output_schema.to_string(),
-                        &d.code,
-                        &d.caps,
-                        d.memory_mb,
-                        author,
-                        policy,
-                    )
+                    let (mut info, version, compatibility) = st
+                        .create_tool_version_with_schema_report(
+                            &d.name,
+                            &d.description,
+                            &d.input_schema.to_string(),
+                            &d.output_schema.to_string(),
+                            &d.code,
+                            &d.caps,
+                            d.memory_mb,
+                            author,
+                            policy,
+                        )?;
+                    // A new version keeps the Tool's title and tags unless given.
+                    if let Some(title) = tool_title(args) {
+                        info = st.set_tool_title(&info.id, &title)?.unwrap_or(info);
+                    }
+                    if let Some(tags) = args["tags"].as_array() {
+                        let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
+                        info = st.set_tool_tags(&info.id, &tags)?.unwrap_or(info);
+                    }
+                    let before = compatibility.base_version;
+                    let action = if before == 0 { "created" } else { "updated" };
+                    let change = Self::record_registry_change(st, &info, action, before, author)?;
+                    Ok((info, version, compatibility, change))
                 };
                 match expected.as_ref() {
                     Some((id, version)) => st.with_current_tool(id, *version, write),
-                    None => write(st),
+                    None => st.transaction(write),
                 }
             })
             .map_err(|error| {
@@ -10115,26 +10438,9 @@ impl Daemon {
                     error
                 }
             })?;
-        let before = compatibility.base_version;
-        // A new version keeps the Tool's title and tags unless given.
-        let info = match tool_title(args) {
-            Some(title) => self
-                .with_store(|st| st.set_tool_title(&info.id, &title))?
-                .unwrap_or(info),
-            None => info,
-        };
-        let info = match args["tags"].as_array() {
-            Some(tags) => {
-                let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
-                self.with_store(|st| st.set_tool_tags(&info.id, &tags))?
-                    .unwrap_or(info)
-            }
-            None => info,
-        };
         let _ = self
             .with_store(|st| st.audit(author, "tool.create", &format!("{} v{version}", d.name)));
-        let action = if before == 0 { "created" } else { "updated" };
-        self.note_registry_change(&info, action, before, author);
+        self.broadcast(Event::RegistryChanged { change });
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
         Ok((info, version, smoke_note, compatibility))
     }
@@ -12805,6 +13111,7 @@ impl Daemon {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         });
@@ -14639,6 +14946,8 @@ impl Daemon {
                     }
                     let session = match &env.request {
                         Request::SendMessage { session_id, .. }
+                        | Request::SendReviewedMessage { session_id, .. }
+                        | Request::SendReviewedSteer { session_id, .. }
                         | Request::StartPipelineRun { session_id, .. } => Some(session_id.as_str()),
                         _ => None,
                     };
@@ -14650,7 +14959,10 @@ impl Daemon {
                     );
                     if matches!(
                         &env.request,
-                        Request::SendMessage { .. } | Request::StartPipelineRun { .. }
+                        Request::SendMessage { .. }
+                            | Request::SendReviewedMessage { .. }
+                            | Request::SendReviewedSteer { .. }
+                            | Request::StartPipelineRun { .. }
                     ) {
                         if cut.is_some_and(|at| at > arrived) {
                             let resp = ServerMessage::err(
@@ -14734,6 +15046,35 @@ impl Daemon {
                                 env.protocol
                             ),
                         )
+                    } else if let Request::SubscribeTranscriptAttempts { ref session_id } =
+                        env.request
+                    {
+                        if session_id.is_empty()
+                            || session_id.len() > 256
+                            || session_id.chars().any(char::is_control)
+                        {
+                            ServerMessage::err_code(
+                                env.id,
+                                codes::BAD_REQUEST,
+                                "invalid transcript Session identity".into(),
+                            )
+                        } else {
+                            let before = {
+                                let mut f = filter.locked();
+                                let before = f.sessions.take().unwrap_or_default();
+                                f.sessions =
+                                    Some(std::collections::HashSet::from([session_id.clone()]));
+                                f.deltas = false;
+                                f.transcript_attempts = true;
+                                before
+                            };
+                            let now = filter.locked().sessions.clone().unwrap_or_default();
+                            self.broadcast_clients(before.union(&now));
+                            ServerMessage::ok(
+                                env.id,
+                                json!({"subscribed":true,"conn":conn,"mode":"future_attempts_only_v1"}),
+                            )
+                        }
                     } else if let Request::Subscribe {
                         sessions,
                         deltas,
@@ -14757,6 +15098,7 @@ impl Daemon {
                             *f = EventFilter {
                                 sessions: sessions.map(|s| s.into_iter().collect()),
                                 deltas,
+                                transcript_attempts: false,
                                 label: label.or(f.label.take()),
                             };
                             before
@@ -14873,7 +15215,8 @@ impl Daemon {
         while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
-            .retain(|(client, _, _), _| *client != Some(conn));
+            .retain(|((client, _, _), _), _| *client != Some(conn));
+        self.reference_detaches.retire_connection(conn);
         if let Some(writer) = writer {
             writer.abort();
             let _ = writer.await;
@@ -15472,7 +15815,17 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let listener = tokio::net::UnixListener::bind(&sock)
+            .with_context(|| format!("bind {}", sock.display()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(&sock)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
+            bail!("socket ownership or permissions changed during bind");
+        }
+        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -15482,6 +15835,10 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if !unix_peer_is_owner(&stream) {
+                        tracing::warn!("rejecting Unix socket peer without owner credentials");
+                        continue;
+                    }
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(stream).await });
                 }
@@ -17044,9 +17401,59 @@ fn harness_target(op: &str, args: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+fn unix_peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    unix_peer_uid_matches(stream, uid)
+}
+
+#[cfg(unix)]
+fn unix_peer_uid_matches(stream: &tokio::net::UnixStream, uid: libc::uid_t) -> bool {
+    stream.peer_cred().is_ok_and(|peer| peer.uid() == uid)
+}
+
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_and_owner_can_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::Path::new("/tmp").join(format!("fl-ipc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _client = tokio::net::UnixStream::connect(paths.socket_path())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(unix_peer_is_owner(&peer));
+        let actual_uid = peer.peer_cred().unwrap().uid();
+        assert!(!unix_peer_uid_matches(&peer, actual_uid.wrapping_add(1)));
+        drop(listener);
+        drop(daemon);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {
@@ -18922,3 +19329,14 @@ mod model_text_failure_tests;
 #[cfg(test)]
 #[path = "daemon_provider_url_tests.rs"]
 mod provider_url_tests;
+
+#[path = "step_inventory.rs"]
+mod step_inventory;
+
+#[cfg(test)]
+#[path = "pending_attachment_inventory_tests.rs"]
+mod pending_attachment_inventory_tests;
+
+#[cfg(test)]
+#[path = "session_selection_daemon_tests.rs"]
+mod session_selection_daemon_tests;

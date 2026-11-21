@@ -25,6 +25,6 @@ ENV FORMLESS_DATA_DIR=/data \
 VOLUME ["/data", "/config"]
 # Healthy while the daemon answers on its socket.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s \
-    CMD ["sh", "-c", "! formless daemon status | grep -q 'not running'"]
+    CMD ["formless", "daemon", "status", "--check"]
 ENTRYPOINT ["/usr/bin/tini", "--", "formless"]
 CMD ["daemon", "serve", "--stay"]

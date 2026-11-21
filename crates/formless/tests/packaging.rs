@@ -245,6 +245,14 @@ fn release_tags_must_match_the_cargo_version() {
 
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
     assert!(release.contains("scripts/release-check.sh \"$GITHUB_REF_NAME\""));
+    let preflight = release
+        .split_once("\n  version-check:\n")
+        .unwrap()
+        .1
+        .split_once("\n  build:\n")
+        .unwrap()
+        .0;
+    assert!(preflight.contains("scripts/release-notes.sh \"$GITHUB_REF_NAME\""));
     for job in ["build", "linux", "docker"] {
         assert!(
             job_needs_version_check(&release, job),
@@ -256,12 +264,24 @@ fn release_tags_must_match_the_cargo_version() {
             && release.contains("body_path: release-notes.md")
     );
 
+    let notes_script = root().join("scripts/release-notes.sh");
+    let actual_notes = std::process::Command::new(sh())
+        .arg(&notes_script)
+        .arg(&tag)
+        .output()
+        .unwrap();
+    assert!(
+        actual_notes.status.success() && !actual_notes.stdout.is_empty(),
+        "workspace version {tag} has release notes: {}",
+        String::from_utf8_lossy(&actual_notes.stderr)
+    );
+
     let dir = std::env::temp_dir().join(format!("fl-notes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cl = dir.join("CHANGELOG.md");
     std::fs::write(&cl, "## [Unreleased]\n- next\n\n## [0.2.0] - 2026-01-01\n\n### Fixed\n- a bug\n\n## [0.1.0]\n- first\n").unwrap();
     let notes = std::process::Command::new(sh())
-        .arg(root().join("scripts/release-notes.sh"))
+        .arg(&notes_script)
         .args(["v0.2.0", cl.to_str().unwrap()])
         .output()
         .unwrap();
@@ -270,6 +290,78 @@ fn release_tags_must_match_the_cargo_version() {
         "### Fixed\n- a bug\n\n"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_installer_writes_a_complete_optional_manual() {
+    use std::os::unix::fs::PermissionsExt;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("fl source install {}-{unique}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let prefix = dir.join("install prefix");
+    let cargo = dir.join("cargo");
+    std::fs::write(
+        &cargo,
+        r#"#!/bin/sh
+set -eu
+test "$1" = install
+while [ "$1" != --root ]; do shift; done
+destination="$2/bin/formless"
+cat > "$destination" <<'BIN'
+#!/bin/sh
+case "$1" in
+  man)
+    case "$FIXTURE_MAN" in
+      success) printf '.TH FORMLESS 1\n' ;;
+      empty) exit 0 ;;
+      failure) printf 'partial text\n'; exit 2 ;;
+    esac
+    ;;
+  completions) printf '# fixture completion for %s\n' "$2" ;;
+  *) exit 1 ;;
+esac
+BIN
+chmod 755 "$destination"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let install = |mode| {
+        std::process::Command::new(sh())
+            .arg(root().join("scripts/install.sh"))
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("PREFIX", &prefix)
+            .env("FORMLESS_FROM_SOURCE", "1")
+            .env("FIXTURE_MAN", mode)
+            .output()
+            .unwrap()
+    };
+    let page = prefix.join("share/man/man1/formless.1");
+    let output = install("success");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read_to_string(&page).unwrap(), ".TH FORMLESS 1\n");
+    assert_eq!(
+        std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    for mode in ["empty", "failure"] {
+        let output = install(mode);
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("could not install the optional man page"));
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), ".TH FORMLESS 1\n");
+        assert_eq!(
+            std::fs::read_dir(page.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// install.sh under dash with only sha256sum (no shasum) on PATH: accepts
