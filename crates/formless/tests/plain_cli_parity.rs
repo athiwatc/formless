@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/plain_cli_fixture_workers.rs"]
+mod plain_cli_fixture_workers;
 #[path = "support/unix_fixture_io.rs"]
 mod unix_fixture_io;
 use formless_core::Paths;
@@ -96,16 +98,7 @@ impl Fixture {
         let invocation_error = Arc::new(AtomicBool::new(false));
         let fail_invocations = invocation_error.clone();
         let thread = std::thread::spawn(move || {
-            while !stopped.load(Ordering::SeqCst) {
-                let (socket, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(e) => panic!("{e}"),
-                };
-                connected.fetch_add(1, Ordering::SeqCst);
+            let serve = |socket| {
                 let mut socket = FixtureStream::new(
                     socket,
                     stopped.clone(),
@@ -181,6 +174,15 @@ impl Fixture {
                             detail_tool("tool-missing-current", "reader-missing", 99)
                         ]),
                         Request::GetTool { id } if tool_details => detail_report(id),
+                        Request::ListToolMetrics { since: None } if tool_details => {
+                            tool_success_rate_rows()
+                        }
+                        Request::ListBuiltinStats { since: None }
+                        | Request::ListModelStats { since: None }
+                            if tool_details =>
+                        {
+                            json!([])
+                        }
                         Request::ListTools => tool_rows.clone(),
                         Request::ExportTool { id } => {
                             assert_eq!(id, "full-tool-id");
@@ -226,6 +228,30 @@ impl Fixture {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":"run-one", "restored":["dir/a.txt"], "skipped":[{"path":"dir/changed.txt","reason":"changed since Run"}]})
                         }
+                        Request::PreviewSchedule { schedule } => {
+                            match schedule_preview_fixture(schedule) {
+                                Ok(preview) => preview,
+                                Err(error) => {
+                                    seen.lock().unwrap().push(envelope.request);
+                                    let reply = formless_protocol::ServerMessage::err(
+                                        envelope.id,
+                                        error.to_string(),
+                                    );
+                                    let reply = serde_json::to_string(&reply).unwrap();
+                                    if writeln!(socket, "{reply}").is_err() {
+                                        break;
+                                    }
+                                    line.clear();
+                                    continue;
+                                }
+                            }
+                        }
+                        Request::SearchSessions { .. } => timestamp_search_hits(),
+                        Request::ListApprovals => timestamp_grants(),
+                        Request::ListDenials => timestamp_denials(),
+                        Request::ListRelayClients => timestamp_devices(),
+                        Request::ListJobs => timestamp_jobs(),
+                        Request::JobRuns { id, .. } => timestamp_job_runs(id),
                         Request::Gc { dry_run } => gc_report(*dry_run),
                         Request::RestartMcpServer { name } => mcp_test_report(name),
                         Request::AddMcpServer { .. } => {
@@ -327,7 +353,8 @@ impl Fixture {
                     }
                     line.clear();
                 }
-            }
+            };
+            plain_cli_fixture_workers::serve(&listener, &stopped, &connected, serve);
         });
         Self {
             root,
@@ -363,7 +390,17 @@ impl Fixture {
         command
     }
     fn run(&self, args: &[&str]) -> std::process::Output {
-        let mut child = self.command(args).spawn().unwrap();
+        Self::capture(self.command(args))
+    }
+
+    fn run_in_timezone(&self, args: &[&str], timezone: &str) -> std::process::Output {
+        let mut command = self.command(args);
+        command.env("TZ", timezone);
+        Self::capture(command)
+    }
+
+    fn capture(mut command: Command) -> std::process::Output {
+        let mut child = command.spawn().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let out = std::thread::spawn(move || {
@@ -538,7 +575,7 @@ fn shipped_sessions_explain_archive_emptiness_and_present_stored_metadata() {
             args.push("--archived");
         }
         fixture.requests.lock().unwrap().clear();
-        let out = fixture.run(&args);
+        let out = fixture.run_in_timezone(&args, "Asia/Bangkok");
         assert!(out.status.success());
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(
@@ -554,7 +591,7 @@ fn shipped_sessions_explain_archive_emptiness_and_present_stored_metadata() {
                 "work, ไทย\\u{1b}[31m",
                 "preview 日本語",
                 "7",
-                "2026-11-01T12:34",
+                "2026-11-01 19:34 +07:00",
             ] {
                 assert!(text.contains(expected), "{text}");
             }
@@ -890,6 +927,302 @@ fn shipped_session_organization_uses_exact_mutations_and_returned_stored_state()
     }
 }
 
+fn timestamp_jobs() -> Value {
+    json!([
+        {"id":"clock","approved":true,"enabled":true,"cron":"0 9 * * *",
+         "next_run":"2026-11-01T09:00:00+07:00","last_status":"completed","prompt":"clock fixture"},
+        {"id":"legacy","next_run":"unparseable","prompt":"legacy fixture"},
+        {"id":"missing","next_run":null,"prompt":"missing fixture"}
+    ])
+}
+
+fn timestamp_job_runs(id: &str) -> Value {
+    let row = |id, started, finished| {
+        json!({
+            "id":id, "job_id":"clock", "session_id":null, "trigger":"schedule",
+            "status":"completed", "cost":null, "detail":"fixture",
+            "started_at":started, "finished_at":finished
+        })
+    };
+    if id == "fold" {
+        json!([
+            row("first", "2026-11-01T05:30:00Z", None),
+            row("second", "2026-11-01T06:30:00Z", None)
+        ])
+    } else {
+        assert_eq!(id, "clock");
+        json!([row(
+            "done",
+            "2026-11-01T02:00:00Z",
+            Some("2026-11-01T09:00:00.499+07:00")
+        )])
+    }
+}
+
+fn successful_text(output: std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn shipped_jobs_timestamps_share_local_time_and_keep_wire_values() {
+    let fixture = Fixture::new();
+    let timezone = "Asia/Bangkok";
+    for (args, expected_json) in [
+        (&["jobs", "list"][..], timestamp_jobs()),
+        (
+            &["jobs", "history", "clock"][..],
+            timestamp_job_runs("clock"),
+        ),
+    ] {
+        let text = successful_text(fixture.run_in_timezone(args, timezone));
+        assert!(text.contains("2026-11-01 09:00 +07:00"), "{text}");
+        let json_args = args.iter().copied().chain(["--json"]).collect::<Vec<_>>();
+        let text_json = successful_text(fixture.run_in_timezone(&json_args, timezone));
+        assert_eq!(
+            serde_json::from_str::<Value>(&text_json).unwrap(),
+            expected_json
+        );
+        if args[1] == "list" {
+            assert!(text.contains("unparseable") && text.contains("missing"));
+        } else {
+            assert!(text.contains("499ms"), "{text}");
+        }
+    }
+
+    let text =
+        successful_text(fixture.run_in_timezone(&["jobs", "history", "fold"], "America/New_York"));
+    assert!(text.contains("2026-11-01 01:30 -04:00"), "{text}");
+    assert!(text.contains("2026-11-01 01:30 -05:00"), "{text}");
+    let text = successful_text(fixture.run_in_timezone(&["jobs", "list"], "America/New_York"));
+    assert!(text.contains("2026-10-31 22:00 -04:00"), "{text}");
+}
+
+fn timestamp_search_hits() -> Value {
+    json!([{
+        "session_id":"session-clock","session_name":"Clock",
+        "message_id":"message-clock","seq":3,"role":"assistant",
+        "snippet":"matching synthetic result","created_at":"2026-10-31T22:30:00-03:30"
+    }])
+}
+
+fn timestamp_grants() -> Value {
+    json!([{
+        "tool_id":"fixture-tool","tool_name":"Fixture","capability":"net:example.test",
+        "scope":"hour","granted_by":"fixture","trusted":false,"session_id":null,
+        "granted_at":"2026-11-01T02:00:00Z",
+        "expires_at":"2026-11-01T10:00:00+07:00",
+        "last_used":"2026-10-31T23:15:00-03:30"
+    }])
+}
+
+fn timestamp_denials() -> Value {
+    json!([
+        {"capability":"net:example.test","tool_name":"Fixture","denied_by":"fixture",
+         "created_at":"2026-11-01T02:00:00Z"},
+        {"capability":"net:legacy.test","tool_name":"Legacy","denied_by":"",
+         "created_at":"2026-11-01T02:00 legacy"}
+    ])
+}
+
+fn timestamp_devices() -> Value {
+    json!([{
+        "cid":"device-clock","user_agent":"Synthetic Browser",
+        "first_seen":"2026-11-01T02:00:00Z","last_seen":"2026-11-01T10:00:00+07:00"
+    }])
+}
+
+#[test]
+fn shipped_session_run_and_approval_timestamps_use_numeric_local_offsets() {
+    let fixture = Fixture::new();
+    let session = json!({
+        "id":"session-clock","name":"Clock","created_at":"2026-11-01T01:00:00Z",
+        "updated_at":"2026-11-01T02:00:00Z"
+    });
+    *fixture.session_rows.lock().unwrap() = json!([session.clone()]);
+    let parsed: formless_protocol::SessionInfo = serde_json::from_value(session.clone()).unwrap();
+    let timezone = "Asia/Bangkok";
+    for (args, expected, wire) in [
+        (
+            &["sessions", "list"][..],
+            &["2026-11-01 09:00 +07:00"][..],
+            json!([parsed]),
+        ),
+        (
+            &["sessions", "show", "session-clock"][..],
+            &["updated 2026-11-01 09:00 +07:00"][..],
+            session_snapshot(session),
+        ),
+        (
+            &["sessions", "search", "synthetic"][..],
+            &["#3 2026-11-01 09:00 +07:00"][..],
+            timestamp_search_hits(),
+        ),
+        (
+            &["runs", "--limit", "4"][..],
+            &["2026-11-01 19:34:56 +07:00"][..],
+            run_report(),
+        ),
+        (
+            &["approvals", "list"][..],
+            &[
+                "2026-11-01 09:00 +07:00",
+                "2026-11-01 10:00 +07:00",
+                "2026-11-01 09:45 +07:00",
+            ][..],
+            timestamp_grants(),
+        ),
+        (
+            &["approvals", "denials"][..],
+            &["2026-11-01 09:00 +07:00", "Legacy", "2026-11-01 02:00"][..],
+            timestamp_denials(),
+        ),
+    ] {
+        let human = successful_text(fixture.run_in_timezone(args, timezone));
+        for part in expected {
+            assert!(human.contains(part), "{args:?}: {human}");
+        }
+        let args = args.iter().copied().chain(["--json"]).collect::<Vec<_>>();
+        let output = successful_text(fixture.run_in_timezone(&args, timezone));
+        assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), wire);
+    }
+}
+
+#[test]
+fn shipped_relay_device_timestamps_preserve_offsets_in_json() {
+    let fixture = Fixture::new();
+    let run_status = |args: &[&str]| {
+        let mut command = fixture.command(args);
+        // Avoid reading the user's keyring even on a machine with stored relay credentials.
+        command
+            .env("FORMLESS_RELAY_SECRET", "synthetic-timestamp-fixture")
+            .env("TZ", "Asia/Bangkok");
+        successful_text(Fixture::capture(command))
+    };
+    let human = run_status(&["relay", "status"]);
+    assert!(human.contains(
+        "Synthetic Browser  (since 2026-11-01 09:00 +07:00, last seen 2026-11-01 10:00 +07:00)"
+    ));
+    let json = serde_json::from_str::<Value>(&run_status(&["relay", "status", "--json"])).unwrap();
+    assert_eq!(json["devices"], timestamp_devices());
+    assert_eq!(json["daemon_running"], true);
+    assert_eq!(json.as_object().unwrap().len(), 5);
+}
+
+fn schedule_preview_fixture(schedule: &str) -> anyhow::Result<Value> {
+    let cron = formless_core::jobs::to_cron(schedule)?;
+    let next: &[&str] = match cron.as_str() {
+        "0 9 * * 1-5" => &[
+            "2026-11-23T09:00:00+07:00",
+            "2026-11-24T09:00:00+07:00",
+            "2026-11-25T09:00:00+07:00",
+        ],
+        "0 0 29 2 *" => &["2096-02-29T00:00:00+07:00"],
+        "0 0 31 2 *" => &[],
+        _ => panic!("unexpected preview cron: {cron}"),
+    };
+    Ok(json!({"cron":cron,"next":next,"future":"日本語 · เวลา"}))
+}
+
+#[test]
+fn shipped_jobs_preview_requests_only_the_daemons_schedule_preview() {
+    let fixture = Fixture::new();
+    for (schedule, count) in [
+        ("every weekday at 9am", 3),
+        ("0 9 * * 1-5", 3),
+        ("0 0 29 2 *", 1),
+        ("0 0 31 2 *", 0),
+    ] {
+        let expected = schedule_preview_fixture(schedule).unwrap();
+        let next = expected["next"].as_array().unwrap();
+        assert_eq!(next.len(), count);
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["jobs", "preview", schedule];
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            if json_mode {
+                assert_eq!(serde_json::from_str::<Value>(&stdout).unwrap(), expected);
+                assert!(stdout.contains("日本語 · เวลา"));
+            } else {
+                let mut lines = stdout.lines();
+                let cron = expected["cron"].as_str().unwrap();
+                assert_eq!(lines.next(), Some(format!("Cron: {cron}").as_str()));
+                if count == 0 {
+                    assert_eq!(lines.next(), Some("No upcoming times were returned."));
+                    assert!(lines.next().is_none());
+                } else {
+                    assert_eq!(
+                        lines.next(),
+                        Some("Projected from the daemon's current local time:")
+                    );
+                    assert_eq!(
+                        lines.map(str::trim).collect::<Vec<_>>(),
+                        next.iter()
+                            .map(|time| time.as_str().unwrap())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::PreviewSchedule { schedule: sent }] if sent == schedule
+            ));
+        }
+    }
+}
+
+#[test]
+fn shipped_jobs_preview_help_and_parser_errors_leave_jobs_untouched() {
+    let fixture = Fixture::new();
+    let help = fixture.run(&["jobs", "preview", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    for expected in [
+        "recurring schedule",
+        "daemon's current local time",
+        "jobs add",
+        "--json",
+    ] {
+        assert!(help.contains(expected), "{help}");
+    }
+    let invalid_flag = fixture.run(&["jobs", "preview", "--at", "in 30m"]);
+    assert!(!invalid_flag.status.success() && invalid_flag.stdout.is_empty());
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    for schedule in ["60 9 * * *", "in 30m"] {
+        let expected_error = formless_core::jobs::to_cron(schedule)
+            .unwrap_err()
+            .to_string();
+        for extra in [&[][..], &["--json"]] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["jobs", "preview", schedule];
+            args.extend_from_slice(extra);
+            let out = fixture.run(&args);
+            assert!(!out.status.success() && out.stdout.is_empty());
+            assert!(String::from_utf8(out.stderr)
+                .unwrap()
+                .contains(&expected_error));
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::PreviewSchedule { schedule: sent }] if sent == schedule
+            ));
+        }
+    }
+}
+
 fn gc_report(dry_run: bool) -> Value {
     json!({"dry_run":dry_run,"total_bytes":9_007_199_254_740_999_u64,"kinds":[{"kind":"MCP logs","items":2,"bytes":1_234_567,"detail":"รายละเอียด 日本語","verification_error":null,"retained":8},{"kind":"artifacts","items":0,"bytes":9_007_199_253_506_432_u64,"detail":"stored metadata","future":{"kept":true}}],"future":{"unmodified":true}})
 }
@@ -1135,10 +1468,91 @@ fn detail_report(id: &str) -> Value {
         "tool-missing-current" => ("reader-missing", 99),
         _ => ("reader", 1),
     };
+    let metrics = match id {
+        "tool-newline" => fixture_tool_metrics(199, 1, Some(0.995)),
+        "tool-no-newline" => fixture_tool_metrics(9999, 1, Some(0.9999)),
+        _ => fixture_tool_metrics(4, 0, Some(1.0)),
+    };
     json!({"tool":detail_tool(id,name,current),"versions":[
         {"version":2,"author":"agent","created_at":"second","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source ไทย"},
         {"version":1,"author":"user","created_at":"first","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source 日本語\n"}
-    ],"metrics":formless_protocol::ToolMetricsInfo::default(),"recent_calls":[{"id":"call-one","version":1,"status":"failed","input":"PrivateCallInputSentinel","output":"PrivateCallOutputSentinel","error":"fixture call failed","duration_ms":12,"created_at":"call-time"}]})
+    ],"metrics":metrics,"recent_calls":[{"id":"call-one","version":1,"status":"failed","input":"PrivateCallInputSentinel","output":"PrivateCallOutputSentinel","error":"fixture call failed","duration_ms":12,"created_at":"call-time"}]})
+}
+
+fn fixture_tool_metrics(
+    success: i64,
+    failure: i64,
+    success_rate: Option<f64>,
+) -> formless_protocol::ToolMetricsInfo {
+    formless_protocol::ToolMetricsInfo {
+        total: success + failure,
+        success,
+        failure,
+        success_rate,
+        ..Default::default()
+    }
+}
+
+fn tool_success_rate_rows() -> Value {
+    json!([
+        {"tool_id":"unknown","invocations":0,"success_rate":null},
+        {"tool_id":"zero","invocations":3,"success_rate":0.0},
+        {"tool_id":"fraction","invocations":3,"success_rate":2.0 / 3.0},
+        {"tool_id":"near","invocations":200,"success_rate":0.995},
+        {"tool_id":"rare","invocations":10000,"success_rate":0.9999},
+        {"tool_id":"perfect","invocations":4,"success_rate":1.0},
+    ])
+}
+
+#[test]
+fn shipped_tool_detail_success_rate_labels_leave_json_numeric() {
+    let fixture = Fixture::with_tool_details(true);
+    for (name, rate, label) in [
+        ("reader", 0.995, ">99%"),
+        ("reader-no-newline", 0.9999, ">99%"),
+        ("reader-missing", 1.0, "100%"),
+    ] {
+        let json: Value = serde_json::from_str(&successful_text(
+            fixture.run(&["tools", "show", name, "--json"]),
+        ))
+        .unwrap();
+        assert_eq!(json["metrics"]["success_rate"], serde_json::json!(rate));
+        let text = successful_text(fixture.run(&["tools", "show", name]));
+        let calls = text
+            .lines()
+            .find(|line| line.starts_with("calls:"))
+            .unwrap();
+        assert!(
+            calls.contains(&format!("· success {label} · p50 ")),
+            "{calls}"
+        );
+    }
+}
+
+#[test]
+fn shipped_metrics_success_rate_labels_leave_json_numeric() {
+    let fixture = Fixture::with_tool_details(true);
+    let json: Value =
+        serde_json::from_str(&successful_text(fixture.run(&["metrics", "--json"]))).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"models":[],"tools":tool_success_rate_rows(),"builtins":[]})
+    );
+    let text = successful_text(fixture.run(&["metrics"]));
+    for (id, expected) in [
+        ("unknown", "-"),
+        ("zero", "0%"),
+        ("fraction", "67%"),
+        ("near", ">99%"),
+        ("rare", ">99%"),
+        ("perfect", "100%"),
+    ] {
+        let row = text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id))
+            .unwrap();
+        assert_eq!(row.split_whitespace().last(), Some(expected), "{row}");
+    }
 }
 
 #[test]

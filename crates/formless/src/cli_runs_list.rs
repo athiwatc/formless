@@ -24,14 +24,9 @@ pub(crate) fn render(value: &Value, width: Option<usize>) -> Result<String> {
             };
             vec![
                 crate::comparison_terminal_text(row["run_id"].as_str().unwrap_or_default()),
-                // Preserve the existing timestamp projection and fallback.
-                crate::comparison_terminal_text(
-                    row["created_at"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .get(..19)
-                        .unwrap_or_default(),
-                ),
+                crate::comparison_terminal_text(&formless_tui::local_timestamp_seconds(
+                    row["created_at"].as_str().unwrap_or_default(),
+                )),
                 crate::comparison_terminal_text(row["outcome"].as_str().unwrap_or_default()),
                 integer("steps"),
                 integer("tool_calls"),

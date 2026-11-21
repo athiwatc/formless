@@ -51,12 +51,18 @@ fn search_limits_parse_only_the_documented_range_before_dispatch() {
 }
 
 #[test]
-fn search_rows_keep_snippet_unicode_and_add_message_position_and_stored_time() {
+fn search_rows_keep_snippet_unicode_and_show_message_position_and_local_time() {
     let hits = vec![hit()];
     let before = serde_json::to_value(&hits).unwrap();
     let text = session_search_text("deploy", 20, &hits);
+    let local = chrono::DateTime::parse_from_rfc3339(&hits[0].created_at)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M %:z");
     assert!(
-        text.contains("โครงการ 日本語  #42 2026-11-14 12:34 [assistant] staging  was deployed ไทย"),
+        text.contains(&format!(
+            "โครงการ 日本語  #42 {local} [assistant] staging  was deployed ไทย"
+        )),
         "{text}"
     );
     assert!(!text.contains("more matches"));

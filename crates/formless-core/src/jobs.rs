@@ -195,7 +195,7 @@ pub fn to_cron(schedule: &str) -> Result<String> {
     // Natural phrases can also contain five whitespace-separated words,
     // e.g. "every weekday at 9 a.m.". Try them before reporting cron errors.
     if let Some(cron) = natural_to_cron(s) {
-        return Ok(cron);
+        return cron;
     }
     if s.starts_with('@') || s.split_whitespace().count() == 5 {
         bail!("invalid cron expression: {cron_error}");
@@ -266,7 +266,7 @@ fn parse_time(t: &str) -> Option<(u32, u32)> {
     (h < 24 && m < 60).then_some((h, m))
 }
 
-fn natural_to_cron(s: &str) -> Option<String> {
+fn natural_to_cron(s: &str) -> Option<Result<String>> {
     let lower = s.to_lowercase();
     let lower = lower.trim().trim_end_matches('.');
     // "… at TIME" (default midnight for day-based schedules).
@@ -278,20 +278,35 @@ fn natural_to_cron(s: &str) -> Option<String> {
     let (h, m) = time.unwrap_or((0, 0));
     // Interval schedules: "every 15 minutes", "every 2 hours", "hourly".
     let words: Vec<&str> = head.split_whitespace().collect();
-    let interval = |n: u32, unit: &str| -> Option<String> {
-        match unit.trim_end_matches('s') {
-            "minute" | "min" if (1..60).contains(&n) && time.is_none() => Some(if n == 1 {
-                "* * * * *".into()
-            } else {
-                format!("*/{n} * * * *")
-            }),
-            "hour" if (1..24).contains(&n) && time.is_none() => Some(if n == 1 {
-                "0 * * * *".into()
-            } else {
-                format!("0 */{n} * * *")
-            }),
-            "day" if n == 1 => Some(format!("{m} {h} * * *")),
-            _ => None,
+    let interval = |n: u32, unit: &str| {
+        let (cycle, unit, cron) = match unit.trim_end_matches('s') {
+            "minute" | "min" if (1..60).contains(&n) && time.is_none() => (
+                60,
+                "minutes",
+                if n == 1 {
+                    "* * * * *".into()
+                } else {
+                    format!("*/{n} * * * *")
+                },
+            ),
+            "hour" if (1..24).contains(&n) && time.is_none() => (
+                24,
+                "hours",
+                if n == 1 {
+                    "0 * * * *".into()
+                } else {
+                    format!("0 */{n} * * *")
+                },
+            ),
+            "day" if n == 1 => return Some(Ok(format!("{m} {h} * * *"))),
+            _ => return None,
+        };
+        if cycle % n == 0 {
+            Some(Ok(cron))
+        } else {
+            Some(Err(anyhow!(
+                "every {n} {unit} produces uneven cron gaps. Choose an interval that divides {cycle} {unit} evenly or enter an explicit cron expression."
+            )))
         }
     };
     match words.as_slice() {
@@ -299,14 +314,14 @@ fn natural_to_cron(s: &str) -> Option<String> {
         ["minute"] => return interval(1, "minute"),
         ["daily"] | ["day"] | ["night"] | ["morning"] => {
             let (h, m) = time.unwrap_or(if head == "morning" { (9, 0) } else { (0, 0) });
-            return Some(format!("{m} {h} * * *"));
+            return Some(Ok(format!("{m} {h} * * *")));
         }
         [n, unit] if n.parse::<u32>().is_ok() => return interval(n.parse().ok()?, unit),
-        ["weekday"] | ["weekdays"] => return Some(format!("{m} {h} * * 1-5")),
-        ["weekend"] | ["weekends"] => return Some(format!("{m} {h} * * 0,6")),
-        ["week"] | ["weekly"] => return Some(format!("{m} {h} * * 1")),
-        ["month"] | ["monthly"] => return Some(format!("{m} {h} 1 * *")),
-        ["year"] | ["yearly"] | ["annually"] => return Some(format!("{m} {h} 1 1 *")),
+        ["weekday"] | ["weekdays"] => return Some(Ok(format!("{m} {h} * * 1-5"))),
+        ["weekend"] | ["weekends"] => return Some(Ok(format!("{m} {h} * * 0,6"))),
+        ["week"] | ["weekly"] => return Some(Ok(format!("{m} {h} * * 1"))),
+        ["month"] | ["monthly"] => return Some(Ok(format!("{m} {h} 1 * *"))),
+        ["year"] | ["yearly"] | ["annually"] => return Some(Ok(format!("{m} {h} 1 1 *"))),
         _ => {}
     }
     // Named days: "monday", "monday and friday", "mon, wed, fri".
@@ -329,7 +344,7 @@ fn natural_to_cron(s: &str) -> Option<String> {
     }
     days.sort_unstable();
     let list: Vec<String> = days.iter().map(u32::to_string).collect();
-    Some(format!("{m} {h} * * {}", list.join(",")))
+    Some(Ok(format!("{m} {h} * * {}", list.join(","))))
 }
 
 /// How many occurrences of `cron` fell after `due` and up to `now`
@@ -555,6 +570,32 @@ mod schedule_tests {
         }
         assert!(to_cron("whenever you feel like it").is_err());
         assert!(to_cron("every day at 25:00").is_err());
+    }
+
+    #[test]
+    fn natural_minute_and_hour_intervals_have_uniform_gaps_across_clock_boundaries() {
+        let now = Local.with_ymd_and_hms(2026, 1, 14, 23, 35, 0).unwrap();
+        for (cycle, unit, multiplier) in [(60, "minutes", 1), (24, "hours", 60)] {
+            for n in 1..cycle {
+                let text = format!("every {n} {unit}");
+                let cron = to_cron(&text);
+                if cycle % n == 0 {
+                    let runs = next_runs(&cron.unwrap(), now, 6).unwrap();
+                    assert_eq!(runs.len(), 6, "{text}");
+                    assert!(
+                        runs.windows(2)
+                            .all(|pair| (pair[1] - pair[0]).num_minutes() == n * multiplier),
+                        "{text}: {runs:?}"
+                    );
+                } else {
+                    let message = cron.unwrap_err().to_string();
+                    assert!(message.contains("uneven cron gaps"), "{text}: {message}");
+                    assert!(message.contains(&format!("{cycle} {unit}")), "{message}");
+                }
+            }
+        }
+        assert_eq!(to_cron("*/45 * * * *").unwrap(), "*/45 * * * *");
+        assert_eq!(to_cron("0 */7 * * *").unwrap(), "0 */7 * * *");
     }
 
     #[test]
