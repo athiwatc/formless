@@ -15,12 +15,14 @@ class El {
   constructor(tag) { this.tagName = tag.toUpperCase(); this.kids = []; this.attrs = {}; this.cls = new Set(); this.listeners = {}; this.value = ''; }
   set className(v) { this.cls = new Set(String(v).split(/\s+/).filter(Boolean)); }
   get classList() { const c = this.cls; return { add: x => c.add(x), remove: x => c.delete(x), contains: x => c.has(x) }; }
+  get id() { return this.attrs.id || ''; }
   get children() { return this.kids.filter(k => k instanceof El); }
   get textContent() { return this.kids.map(k => (k instanceof El ? k.textContent : k)).join(''); }
   set textContent(v) { this.kids = v === '' ? [] : [String(v)]; }
   append(...k) { this.kids.push(...k); }
   replaceChildren(...k) { this.kids = k; }
   setAttribute(k, v) { this.attrs[k] = v; }
+  removeAttribute(k) { delete this.attrs[k]; }
   addEventListener(k, f) { this.listeners[k] = f; }
   scrollIntoView() {}
 }
@@ -33,14 +35,14 @@ function h(tag, props, ...kids) {
 function fixture() {
   const calls = [], applied = [];
   const c = vm.createContext({
-    h, calls, applied, S: { sessions: [{ id: 's', model: '' }], current: 's' },
+    h, calls, applied, modelPickerSequence: 0, S: { sessions: [{ id: 's', model: '' }], current: 's' },
     act: req => new Promise(resolve => calls.push({ req, resolve })),
     openDialog: node => { node.isConnected = true; c.dialog = node; },
     closeDialog: node => { node.isConnected = false; },
     setSessionModel: (m, e) => applied.push([m, e]), note: () => {}, uiMoney: v => String(v),
     fuzzyMatch: (q, id) => (id.includes(q.trim()) ? [1, []] : null),
   });
-  vm.runInContext(['modelContextLabel', 'modelDetail', 'modelTestText', 'openModelPicker'].map(fn).join('\n'), c);
+  vm.runInContext(['modelContextLabel', 'modelDetail', 'modelTestText', 'storedSessionModel', 'openModelPicker'].map(fn).join('\n'), c);
   c.done = vm.runInContext('openModelPicker()', c);
   const find = (n, pred) => (pred(n) ? n : n.children.map(k => find(k, pred)).find(Boolean));
   c.status = () => find(c.dialog, n => n.cls.has('modal-actions')).children[0];

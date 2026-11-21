@@ -419,8 +419,11 @@ fn onboarding_copy_has_thai_entries_and_uses_catalog_calls() {
                 prefix.ends_with("tr(") || prefix.ends_with("tr_format(")
             });
             let through_offer = core.contains(&literal) && tui.contains("offer_with(tr_format)");
+            let discovery_template = english
+                .replace("OLLAMA_HOST", "{env}")
+                .replace("Ollama", "{app}");
             let discovery_hint = english.contains("OLLAMA_HOST")
-                && core.contains(&literal)
+                && core.contains(&serde_json::to_string(&discovery_template).unwrap())
                 && tui.contains("discovery.hint.as_deref().map(i18n::tr_str)");
             let tour_task = english.starts_with("Build a Tool that counts")
                 && tui.contains("self.input.set(tr(TOUR_TASK))");

@@ -13,6 +13,8 @@ import pathlib
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
 SOURCE = pathlib.Path(os.environ.get('FORMLESS_EDITOR_SOURCE', ROOT / 'web/app.js'))
 
@@ -67,7 +69,7 @@ server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Qui
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+        browser = pw.chromium.launch(executable_path=chromium_executable(pw), headless=True, args=['--no-sandbox'])
         for root_size in [16, 32]:
             page = browser.new_page(viewport={'width': 1200, 'height': 900})
             errors = []

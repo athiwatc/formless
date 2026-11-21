@@ -16,8 +16,10 @@ import tempfile
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '/tmp/formless-display-823')
+OUT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else artifact_dir('/tmp/formless-display-823')
 OUT.mkdir(parents=True, exist_ok=True)
 
 
@@ -79,7 +81,7 @@ def run():
                     prefs = pathlib.Path(profile) / 'Default'
                     prefs.mkdir()
                     (prefs / 'Preferences').write_text(json.dumps({'webkit': {'webprefs': {'default_font_size': default_font}}}))
-                    context = p.chromium.launch_persistent_context(profile, executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'], viewport={'width':1280,'height':900}, color_scheme='dark')
+                    context = p.chromium.launch_persistent_context(profile, executable_path=chromium_executable(p), headless=True, args=['--no-sandbox'], viewport={'width':1280,'height':900}, color_scheme='dark')
                     context.route('**/app.js', expose_script)
                     page = context.pages[0]
                     page.set_default_timeout(5000)

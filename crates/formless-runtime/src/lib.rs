@@ -4,7 +4,11 @@
 
 pub mod caps;
 mod clipboard_diagnostics;
+mod desktop_notification;
 mod dns;
+pub use desktop_notification::desktop_notify;
+#[cfg(any(target_os = "macos", test))]
+pub use desktop_notification::macos_notification_script;
 mod process_executable;
 pub mod process_group;
 mod processes;
@@ -177,6 +181,16 @@ pub fn set_fetch_timeouts(connect_ms: u64, total_ms: u64) {
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
     FETCH_CONNECT_TIMEOUT_MS.store(connect_ms.clamp(1, DAY_MS), Ordering::Relaxed);
     FETCH_TIMEOUT_MS.store(total_ms.clamp(1, DAY_MS), Ordering::Relaxed);
+}
+
+/// Look up a host in the bounded native resolver pool. Callers on an async
+/// executor must run this wait on a blocking worker.
+pub fn resolve_host_until(
+    host: &str,
+    port: u16,
+    deadline: std::time::Instant,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    dns::resolve_host_until(host, port, deadline)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1290,13 +1304,8 @@ const PROCESS_BASE_ENV: &[&str] = &[
 /// A `process:` grant's command and, for `process:git:status|log`, the
 /// first arguments it allows (None = any).
 pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
-    match grant.rsplit_once(':') {
-        // `C:\…` is a Windows path, not a command with sub-commands.
-        Some((cmd, subs)) if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) => {
-            (cmd, Some(subs.split('|').collect()))
-        }
-        _ => (grant, None),
-    }
+    let (cmd, scope) = formless_protocol::split_process_grant(grant);
+    (cmd, scope.map(|scope| scope.split('|').collect()))
 }
 
 fn process_allowed(allowed: &[String], cmd: &str, first_arg: Option<&str>) -> bool {
@@ -1501,7 +1510,7 @@ impl State {
                         Ok(Value::Null)
                     }
                     HostMode::Live => {
-                        notify(
+                        desktop_notify(
                             a["title"].as_str().unwrap_or_default(),
                             a["body"].as_str().unwrap_or_default(),
                         )?;
@@ -3061,28 +3070,6 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
 }
 
-fn notify(title: &str, body: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            esc(body),
-            esc(title)
-        );
-        run_capture("osascript", &["-e", &script], None).map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        run_capture("notify-send", &[title, body], None).map(|_| ())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (title, body);
-        Err("notifications unsupported on this platform".into())
-    }
-}
-
 fn listing_directory<T>(
     path: &Path,
     overlay: bool,
@@ -3434,6 +3421,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     // including on early error paths, as required by rquickjs::Persistent.
     #[derive(Clone)]
     struct Rejection {
+        sequence: u64,
         message: String,
         reason: rquickjs::Persistent<rquickjs::Value<'static>>,
     }
@@ -3449,24 +3437,47 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let unhandled: Rejections = Default::default();
     let _clear_rejections = ClearRejections(unhandled.clone());
     let rejected = unhandled.clone();
+    let next_sequence = std::cell::Cell::new(0);
     runtime.set_host_promise_rejection_tracker(Some(Box::new(
         move |ctx, promise, reason, handled| {
             let promise = rquickjs::Persistent::save(&ctx, promise);
             if handled {
                 rejected.borrow_mut().remove(&promise);
             } else {
+                let sequence = {
+                    let mut rejected = rejected.borrow_mut();
+                    let entry = rejected.entry(promise.clone());
+                    // Re-observing a still-tracked Promise retains its place.
+                    // If handled and later reinserted, it gets a new sequence.
+                    let sequence = match &entry {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.get().sequence,
+                        std::collections::hash_map::Entry::Vacant(_) => {
+                            let sequence = next_sequence.get();
+                            next_sequence.set(sequence + 1);
+                            sequence
+                        }
+                    };
+                    entry.insert_entry(Rejection {
+                        sequence,
+                        message: String::new(),
+                        reason: rquickjs::Persistent::save(&ctx, reason.clone()),
+                    });
+                    sequence
+                };
+                // Reading an Error message can call JS. The observation is
+                // already ordered, and any handling during the read is final.
                 let message = reason
                     .as_exception()
                     .and_then(|e| e.message())
                     .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
                     .unwrap_or_else(|| format!("{reason:?}"));
-                rejected.borrow_mut().insert(
-                    promise,
-                    Rejection {
-                        message,
-                        reason: rquickjs::Persistent::save(&ctx, reason),
-                    },
-                );
+                if let Some(entry) = rejected
+                    .borrow_mut()
+                    .get_mut(&promise)
+                    .filter(|entry| entry.sequence == sequence)
+                {
+                    entry.message = message;
+                }
             }
         },
     )));
@@ -3579,8 +3590,14 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
              tools.call returns a Promise, await every call"
         )));
     }
-    let rejection = unhandled.borrow().values().next().cloned();
-    if let Some(rejection) = rejection {
+    let rejection = {
+        let unhandled = unhandled.borrow();
+        unhandled
+            .values()
+            .min_by_key(|rejection| rejection.sequence)
+            .map(|first| (first.clone(), unhandled.len() - 1))
+    };
+    if let Some((rejection, extras)) = rejection {
         let mut message = format!("unhandled Promise rejection: {}", rejection.message);
         let nested = ctx.with(|ctx| {
             let reason = rejection.reason.clone().restore(&ctx).ok()?;
@@ -3594,6 +3611,19 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             nested_error(&ctx, reason)
         });
         let mut error = err(&message);
+        if extras > 0 && error.kind != ExecErrorKind::Cancelled {
+            if !error.message.ends_with('\n') {
+                error.message.push('\n');
+            }
+            let noun = if extras == 1 {
+                "rejection"
+            } else {
+                "rejections"
+            };
+            error
+                .message
+                .push_str(&format!("and {extras} more unhandled {noun}"));
+        }
         error.nested = nested;
         return Err(error);
     }
@@ -3621,6 +3651,15 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_notifications_put_multiline_messages_on_one_source_line() {
+        let script = macos_notification_script("title\rline", "first\r\nsecond \"quoted\" \\");
+        assert_eq!(
+            script,
+            r#"display notification "first second \"quoted\" \\" with title "title line""#
+        );
+    }
 
     #[test]
     fn log_buffer_counts_empty_lines_and_retains_tool_text() {
@@ -4097,6 +4136,10 @@ mod tests {
         assert_eq!(
             process_grant("C:\\tools\\x.exe"),
             ("C:\\tools\\x.exe", None)
+        );
+        assert_eq!(
+            process_grant("C:/Program Files/git.exe:status|log"),
+            ("C:/Program Files/git.exe", Some(vec!["status", "log"]))
         );
         let allowed = vec!["git:status|log".to_string()];
         assert!(process_allowed(&allowed, "git", Some("log")));
@@ -5052,6 +5095,124 @@ mod tests {
             assert!(e.message.contains("unhandled Promise rejection:"), "{}", e.message);
             assert!(e.message.contains(message), "{}", e.message);
         }
+    }
+
+    #[test]
+    fn unhandled_rejections_follow_observation_order_and_count_only_extras() {
+        for (handle_first, expected, extra_count) in
+            [(false, "first observed", 2), (true, "second observed", 1)]
+        {
+            let mut req = live(
+                "function first() { return new Error('first observed'); }
+                 function second() { return new Error('second observed'); }
+                 function run(input) {
+                   const pending = Promise.reject(first());
+                   Promise.reject(second());
+                   Promise.reject(new Error('third observed'));
+                   if (input.handle_first) pending.catch(() => {});
+                   return 1;
+                 }",
+            );
+            req.input = json!({"handle_first": handle_first});
+            let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with(&format!("unhandled Promise rejection: {expected}\n")),
+                "{}",
+                error.message
+            );
+            let frame = if handle_first { "second" } else { "first" };
+            assert!(error
+                .message
+                .contains(&format!("{frame} (formless-tool.js:")));
+            for other in ["first observed", "second observed", "third observed"] {
+                if other != expected {
+                    assert!(!error.message.contains(other), "{}", error.message);
+                }
+            }
+            assert_eq!(
+                error.message.lines().last().unwrap(),
+                format!(
+                    "and {extra_count} more unhandled rejection{}",
+                    if extra_count == 1 { "" } else { "s" }
+                )
+            );
+            assert!(error.nested.is_none());
+        }
+    }
+
+    #[test]
+    fn rejection_order_is_recorded_before_reading_the_message() {
+        let req = live(
+            "function run() {
+               const first = new Error();
+               Object.defineProperty(first, 'message', { get() {
+                 Promise.reject('observed while reading');
+                 return 'observed first';
+               } });
+               Promise.reject(first);
+               return 1;
+             }",
+        );
+        let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("unhandled Promise rejection: observed first\n"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("observed while reading"));
+    }
+
+    #[test]
+    fn selected_rejection_keeps_its_nested_detail_and_pending_calls_take_precedence() {
+        let nested = live(
+            "async function run() {
+               try { await tools.call('bad', {}); }
+               catch (error) {
+                 Promise.reject(error);
+                 Promise.reject(new Error('other rejection'));
+               }
+               return 1;
+             }",
+        );
+        let error = execute(&nested, Arc::new(SlowOps)).unwrap_err();
+        let detail = error.nested.as_ref().unwrap();
+        assert_eq!((&*detail.tool, &*detail.detail), ("bad", "bad tool"));
+        assert!(error
+            .message
+            .starts_with("unhandled Promise rejection: bad tool\n"));
+        assert!(error.message.contains("run (formless-tool.js:2:"));
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("other rejection"));
+
+        let pending = live(
+            "function run() {
+               Promise.reject(new Error('first'));
+               Promise.reject(new Error('second'));
+               tools.call('t', {});
+               return 1;
+             }",
+        );
+        let error = execute(&pending, Arc::new(SlowOps)).unwrap_err();
+        assert!(
+            error.message.contains("await every call"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("unhandled Promise rejection"));
+        assert!(error.nested.is_none());
+
+        let single = live("function run() { Promise.reject('single'); return 1; }");
+        let error = execute(&single, Arc::new(NoHostOps)).unwrap_err();
+        assert_eq!(error.message, "unhandled Promise rejection: single");
+
+        let early = live("Promise.reject('early floating'); throw new Error('early stop');");
+        let error = execute(&early, Arc::new(NoHostOps)).unwrap_err();
+        assert!(!error.message.contains("unhandled Promise rejection"));
     }
 
     #[test]
