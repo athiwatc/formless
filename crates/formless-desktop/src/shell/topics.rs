@@ -188,7 +188,9 @@ impl Shell {
             .topics
             .iter()
             .find(|t| t.id == id)
-            .and_then(|t| t.topic_session_id.clone());
+            // Pending proposals have no topic transcript yet. Review them in
+            // their source chat, including when opened from another page.
+            .map(|t| t.topic_session_id.clone().unwrap_or_else(|| t.source_session_id.clone()));
         if let Some(session) = session {
             if !self.open_topic_session(&session, window, cx) {
                 return;
