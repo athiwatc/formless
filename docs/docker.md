@@ -55,7 +55,10 @@ base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-5.5"
 ```
 
-copy it into the config volume, restart, and check:
+Copy it into a new config volume, restart, and check. **The copy command
+replaces all of `/config/config.toml`, including any unrelated settings.**
+Follow [the existing-volume instructions](#update-an-existing-provider-configuration)
+if the volume already has settings you want to keep.
 
 ```sh
 docker exec -i formless sh -c 'cat > /config/config.toml' < config.toml
@@ -63,8 +66,36 @@ docker restart formless
 docker exec formless formless doctor
 ```
 
-Later changes: `docker exec formless formless config set provider.model …`
-(the daemon validates and applies them), or edit the file the same way.
+The doctor command can contact the configured provider and report network
+problems or failures from other checks.
+
+### Update an existing provider configuration
+
+To change `provider.base_url`, edit that key in the volume's existing
+`config.toml`, keeping the other settings, and restart the container.
+The endpoint is a file-only setting.
+
+To change the model on a running container, use the daemon-validated
+`config set` command:
+
+```sh
+docker exec formless formless config set provider.model 'anthropic/claude-sonnet-5.5'
+```
+
+Changing the endpoint and model in this order makes two separate updates.
+If the model update fails, the earlier endpoint edit stays saved.
+`FORMLESS_BASE_URL` and `FORMLESS_MODEL` can override the saved settings.
+If an environment override applies to the model, `config set` reports the
+model the daemon uses. To inspect what the CLI loads inside the container,
+including its environment overrides, run:
+
+```sh
+docker exec formless formless config get provider.base_url
+docker exec formless formless config get provider.model
+```
+
+Successful setting validation confirms the configuration values. Provider
+connectivity and model availability still depend on the endpoint.
 
 ## Volumes
 
