@@ -1330,6 +1330,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "directories",
  "formless-core",
  "formless-protocol",
  "formless-runtime",
@@ -1338,6 +1339,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest 0.12.28",
+ "semver",
  "serde_json",
  "shlex",
  "tokio",
@@ -1352,6 +1354,7 @@ name = "formless-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -1418,6 +1421,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
  "windows-sys 0.59.0",
 ]
