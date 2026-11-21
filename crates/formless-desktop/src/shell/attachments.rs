@@ -93,6 +93,7 @@ pub(super) struct State {
     pub(super) pending: Option<Report>,
     operations: HashMap<uuid::Uuid, Vec<String>>,
     mutations: HashSet<uuid::Uuid>,
+    waiting: Vec<Intake>,
 }
 
 impl State {
@@ -190,16 +191,60 @@ impl Shell {
         }
     }
 
-    pub(super) fn stage_composer_attachments(&mut self, intake: Intake, cx: &mut Context<Self>) {
+    pub(super) fn stage_composer_attachments(
+        &mut self,
+        mut intake: Intake,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session_id) = self.sidebar.active_id().map(str::to_owned) else {
             return;
         };
-        let Some(client) = self.client.as_ref().filter(|_| self.client_connected) else {
+        if self.client.is_none() || !self.client_connected {
             self.composer_notice =
                 Some("Connect to the Daemon Core before attaching files.".into());
             cx.notify();
             return;
+        }
+        let count = |intake: &Intake| match intake {
+            Intake::Paths(paths) => paths.len(),
+            Intake::Bytes { .. } => 1,
+            _ => 0,
         };
+        let requested = count(&intake);
+        if requested > 0 {
+            let occupied = self
+                .attachments
+                .pending
+                .as_ref()
+                .map_or(0, |report| report.rows.len())
+                + self
+                    .attachments
+                    .operations
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>()
+                + self.attachments.waiting.iter().map(count).sum::<usize>();
+            let available =
+                formless_protocol::PENDING_ATTACHMENT_MAX_ENTRIES.saturating_sub(occupied);
+            if requested > available {
+                self.composer_notice = Some(format!("Only 64 pending attachments are supported. {} extra attachment(s) were not staged.", requested - available).into());
+                cx.notify();
+                if available == 0 {
+                    return;
+                }
+                if let Intake::Paths(paths) = &mut intake {
+                    paths.truncate(available);
+                }
+            }
+            if self.attachments.pending.is_none() {
+                self.attachments.waiting.push(intake);
+                if self.attachments.operations.is_empty() {
+                    self.refresh_composer_attachments(cx);
+                }
+                return;
+            }
+        }
+        let client = self.client.as_ref().unwrap();
         let names = match &intake {
             Intake::Paths(paths) if paths.is_empty() => return,
             Intake::Paths(paths) => paths
@@ -264,6 +309,12 @@ impl Shell {
         };
         if !errors.is_empty() {
             self.composer_notice = Some(errors.join("\n").into());
+        }
+        let waiting = std::mem::take(&mut self.attachments.waiting);
+        if self.attachments.pending.is_some() {
+            for intake in waiting {
+                self.stage_composer_attachments(intake, cx);
+            }
         }
         cx.notify();
     }

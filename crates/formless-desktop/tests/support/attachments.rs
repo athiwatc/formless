@@ -89,6 +89,40 @@ fn queued(shell: &Entity<Shell>, cx: &mut App) -> Vec<Operation> {
         .collect()
 }
 
+#[gpui_kit::test]
+fn composer_batches_reserve_capacity_and_reject_extras(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| shell.attach_paths(vec!["/seed".into()], cx));
+        let operation = queued(&shell, cx).pop().unwrap();
+        complete(
+            &shell,
+            operation,
+            (0..62)
+                .map(|i| file(&i.to_string(), "seed", "text/plain"))
+                .collect(),
+            window,
+            cx,
+        );
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths((0..100).map(|i| format!("/file-{i}").into()).collect(), cx)
+        });
+        let operations = queued(&shell, cx);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(&operations[0].intake, Intake::Paths(paths) if paths.len() == 2));
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/extra".into()], cx)
+        });
+        assert!(queued(&shell, cx).is_empty());
+        window.render_frame(cx);
+        assert!(window
+            .find("composer-notice")
+            .value()
+            .unwrap()
+            .contains("not staged"));
+    });
+}
+
 fn file(id: &str, name: &str, mime: &str) -> serde_json::Value {
     json!({"id":id,"name":name,"mime":mime,"bytes":2048,"path":format!("/artifacts/{id}")})
 }
