@@ -802,7 +802,14 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 71;
+pub const SCHEMA_VERSION: i64 = 72;
+
+#[path = "topic_schema_v72.rs"]
+mod topic_schema_v72;
+
+#[cfg(test)]
+#[path = "topic_schema_v72_tests.rs"]
+mod topic_schema_v72_tests;
 
 const SCHEMA_V71: &str = "
 CREATE TABLE IF NOT EXISTS profile_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -936,7 +943,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 69] = [
+const MIGRATIONS: [(i64, MigrationStep); 70] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1269,6 +1276,7 @@ const MIGRATIONS: [(i64, MigrationStep); 69] = [
         Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
     }),
     (71, migrate_v71),
+    (72, topic_schema_v72::migrate),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
