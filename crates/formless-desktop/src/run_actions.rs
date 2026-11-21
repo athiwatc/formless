@@ -81,6 +81,7 @@ impl DeleteUndo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub compacting: bool,
+    pub user_oversized: bool,
     pub session: String,
     pub running: bool,
     pub run: Option<String>,
@@ -100,20 +101,19 @@ impl Target {
             return Err(bad.into());
         }
         let messages = value["messages"].as_array().ok_or(bad)?;
+        let mut user_oversized = false;
         let user = messages
             .iter()
             .rev()
             .find(|m| m["role"] == "user")
             .map(|m| {
                 let id = m["id"].as_str().filter(|id| identity(id)).ok_or(bad)?;
-                let text = m["content"]
-                    .as_str()
-                    .filter(|s| s.len() <= MAX_TEXT)
-                    .ok_or(bad)?;
+                let text = m["content"].as_str().ok_or(bad)?;
+                user_oversized = text.len() > MAX_TEXT;
                 if m["session_id"].as_str() != Some(session) {
                     return Err(bad);
                 }
-                Ok((id.to_string(), text.to_string()))
+                Ok((id.to_string(), if user_oversized { String::new() } else { text.to_string() }))
             })
             .transpose()
             .map_err(str::to_string)?;
@@ -126,6 +126,7 @@ impl Target {
         }
         Ok(Self {
             compacting: false,
+            user_oversized,
             session: session.into(),
             running: value["running"].as_bool().ok_or(bad)?,
             run: run["run_id"].as_str().map(str::to_string),
@@ -138,7 +139,7 @@ impl Target {
     pub fn allowed(&self, kind: Kind) -> bool {
         match kind {
             Kind::ProviderRetry => self.running && self.run.is_some(),
-            Kind::Edit => !self.compacting && !self.running && self.user.is_some(),
+            Kind::Edit => !self.user_oversized && !self.compacting && !self.running && self.user.is_some(),
             Kind::Retry => !self.compacting && !self.running && self.user.is_some() && self.run.is_some(),
             Kind::Good | Kind::Bad => {
                 !self.running
@@ -150,6 +151,15 @@ impl Target {
             }
             Kind::Compact => !self.compacting && !self.running && self.last_seq.is_some(),
             Kind::Delete | Kind::Cwd => true,
+        }
+    }
+    pub fn unavailable_reason(&self, kind: Kind) -> &'static str {
+        if kind == Kind::Edit && self.user_oversized {
+            "Edit unavailable: the last user message exceeds the 64 KiB desktop edit limit. Other actions remain available."
+        } else if self.compacting && matches!(kind, Kind::Edit | Kind::Retry | Kind::Compact) {
+            "Compaction is still pending. Wait for its completion before rewriting history or starting work."
+        } else {
+            "Action unavailable for the current Run state. Close and reload after the Run changes."
         }
     }
 }
@@ -415,6 +425,23 @@ impl Context {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oversized_prompt_only_disables_edit_without_retaining_the_prompt() {
+        for size in [0, MAX_TEXT, MAX_TEXT + 1] {
+            let mut value = snapshot();
+            value["messages"][0]["content"] = json!("x".repeat(size));
+            let target = Target::decode("s", &value).unwrap();
+            assert_eq!(target.allowed(Kind::Edit), size <= MAX_TEXT);
+            assert!(target.user.as_ref().unwrap().1.len() <= MAX_TEXT);
+            for kind in [Kind::Retry, Kind::Good, Kind::Bad, Kind::Compact, Kind::Delete, Kind::Cwd] {
+                assert!(target.allowed(kind));
+            }
+            if size > MAX_TEXT {
+                assert!(target.unavailable_reason(Kind::Edit).contains("64 KiB"));
+            }
+        }
+    }
 
     pub(super) fn snapshot() -> Value {
         json!({"session":{"id":"s","cwd":null},"running":false,

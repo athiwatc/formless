@@ -156,7 +156,7 @@ impl Shell {
                 };
                 p.input
                     .update(cx, |input, cx| input.set_value(text, window, cx));
-                p.notice = if target.allowed(p.kind) { "Canonical target loaded. Review the exact action before confirming." } else { "Action unavailable for the current Run state. Close and reload after the Run changes." }.into();
+                p.notice = if target.allowed(p.kind) { "Canonical target loaded. Review the exact action before confirming." } else { target.unavailable_reason(p.kind) }.into();
                 p.target = Some(target);
                 p.stage = Stage::Editing;
             }
@@ -472,7 +472,7 @@ impl Shell {
         p.input.update(cx, |i, cx| i.set_value(text, window, cx));
         p.kind = kind;
         p.operation = uuid::Uuid::new_v4();
-        p.notice = "Review the exact action before confirming.".into();
+        p.notice = p.target.as_ref().filter(|t| !t.allowed(kind)).map_or("Review the exact action before confirming.", |t| t.unavailable_reason(kind)).into();
         cx.notify();
     }
 }
