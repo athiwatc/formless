@@ -156,10 +156,7 @@ async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() 
     assert_eq!(value.acp_agent.as_deref(), Some("grok"));
     assert!(value.installed);
     assert!(value.signed_in.is_none());
-    ctx.environment.insert(
-        "FORMLESS_TOPIC_ACP_EXE".into(),
-        "/missing/acp-fixture".into(),
-    );
+    ctx.environment.clear();
     let missing = probe_environment(
         HarnessKind::Acp,
         Some("grok"),
