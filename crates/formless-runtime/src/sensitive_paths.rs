@@ -319,6 +319,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
+        ".psql_history" | "psql_history" | ".mysql_history"
+    ) {
+        return Some("database client history");
+    }
+    if matches!(
+        name.as_str(),
         "login data"
             | "login data for account"
             | "logins.json"
@@ -338,6 +344,8 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | ".netrc"
             | "_netrc"
             | ".git-credentials"
+            | ".pgpass"
+            | "pgpass.conf"
             | "credentials.tfrc.json"
             | ".terraformrc"
             | "terraform.rc"
@@ -409,6 +417,11 @@ mod tests {
             "server.key",
             ".bash_history",
             "fish_history",
+            ".PSQL_HISTORY",
+            "psql_history",
+            ".mysql_history",
+            ".pgpass",
+            "postgresql/PGPASS.CONF",
             "Profiles/default/logins.json",
             "Chrome/Profile/Login Data",
         ] {

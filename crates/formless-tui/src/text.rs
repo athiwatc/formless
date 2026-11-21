@@ -106,6 +106,25 @@ pub(crate) fn escape_bidi_line(line: ratatui::text::Line<'static>) -> ratatui::t
     ratatui::text::Line { spans, ..line }
 }
 
+/// Display a stored line as text, including visible escapes for terminal
+/// controls, line separators and directional formatting.
+pub(crate) fn escape_terminal_line(s: &str) -> String {
+    let visible = escape_bidi(s);
+    let escape = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
+    if !visible.chars().any(escape) {
+        return visible.into_owned();
+    }
+    let mut out = String::with_capacity(visible.len());
+    for c in visible.chars() {
+        if escape(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
