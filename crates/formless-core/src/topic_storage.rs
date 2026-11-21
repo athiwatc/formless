@@ -31,9 +31,12 @@ impl Store {
                 )
                 .optional()?;
             if let Some(id) = existing {
-                return st.get_session(&id)?.ok_or_else(|| {
-                    anyhow!("main chat session metadata points to a missing session")
-                });
+                if let Some(session) = st.get_session(&id)? {
+                    if st.session_deleted(&id)? {
+                        bail!("Main Chat is pending deletion; restore it within the undo window or wait for it to be purged before opening a new Main Chat");
+                    }
+                    return Ok(session);
+                }
             }
             let session = st.create_session(Some("Main Chat".into()))?;
             st.conn.execute(
@@ -41,7 +44,8 @@ impl Store {
                 params![session.id],
             )?;
             st.conn.execute(
-                "INSERT INTO profile_metadata(key,value) VALUES('main_chat_session_id',?1)",
+                "INSERT INTO profile_metadata(key,value) VALUES('main_chat_session_id',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![session.id],
             )?;
             st.get_session(&session.id)?
@@ -216,6 +220,21 @@ impl Store {
                     .ok_or_else(|| anyhow!("selected source message {message_id} no longer exists"))?;
                 if current.role != "user" || hash_token(&current.content) != *snapshot {
                     bail!("selected source message {message_id} changed since proposal; create a new proposal to approve the edited request");
+                }
+                if let Some(meta) = &current.meta {
+                    let meta: Value = serde_json::from_str(meta)
+                        .context("selected source message has invalid attachment metadata")?;
+                    for attachment in meta["attachments"].as_array().into_iter().flatten() {
+                        if attachment["imported"] == true || attachment["reference"] == true || attachment["expired"] == true {
+                            continue;
+                        }
+                        for id in [attachment["id"].as_str(), attachment["_artifact_id"].as_str()].into_iter().flatten() {
+                            st.conn.execute(
+                                "UPDATE artifacts SET session_id=?2 WHERE id=?1 AND session_id=?3",
+                                params![id, session.id, topic.source_session_id],
+                            )?;
+                        }
+                    }
                 }
                 let changed = st.conn.execute(
                     "UPDATE messages SET session_id=?2,seq=?3 WHERE id=?1 AND session_id=?4",

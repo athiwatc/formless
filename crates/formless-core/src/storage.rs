@@ -809,14 +809,14 @@ CREATE TABLE profile_metadata (
   key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE topics (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL,
-  base_revision TEXT NOT NULL, source_session_id TEXT NOT NULL REFERENCES sessions(id),
-  topic_session_id TEXT REFERENCES sessions(id), status TEXT NOT NULL,
+  base_revision TEXT NOT NULL, source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE, status TEXT NOT NULL,
   builder_kind TEXT NOT NULL, builder_model TEXT, reviewer_kind TEXT NOT NULL,
   reviewer_model TEXT, redirect_message_id TEXT, rejection_reason TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX idx_topics_status_updated ON topics(status, updated_at DESC);
 CREATE TABLE topic_repo_locks (
-  repo TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id),
+  repo TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
   acquired_at TEXT NOT NULL);
 CREATE TABLE topic_source_messages (
   topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
@@ -834,7 +834,7 @@ CREATE TABLE topic_attempts (
   id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
   feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
   round INTEGER NOT NULL, role TEXT NOT NULL, harness_kind TEXT NOT NULL,
-  status TEXT NOT NULL, conversation_session_id TEXT NOT NULL REFERENCES sessions(id),
+  status TEXT NOT NULL, conversation_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   capability_hash TEXT NOT NULL, worktree_path TEXT, base_revision TEXT,
   revision TEXT, test_report TEXT, harness_session_id TEXT, child_pid INTEGER,
   detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -844,7 +844,7 @@ CREATE UNIQUE INDEX idx_topic_active_review_attempt_revision
   WHERE role='review' AND status='reviewing' AND revision IS NOT NULL;
 CREATE TABLE topic_reviews (
   id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
-  attempt_id TEXT NOT NULL REFERENCES topic_attempts(id), revision TEXT NOT NULL,
+  attempt_id TEXT NOT NULL REFERENCES topic_attempts(id) ON DELETE CASCADE, revision TEXT NOT NULL,
   outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
   UNIQUE(feature_id, revision));
 CREATE INDEX idx_topic_reviews_attempt ON topic_reviews(attempt_id);
