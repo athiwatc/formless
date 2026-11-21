@@ -7,9 +7,11 @@ from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
-parser.add_argument('--out', type=Path, default=Path('/tmp/formless-forecast-warnings-1560'))
+parser.add_argument('--out', type=Path, default=artifact_dir('/tmp/formless-forecast-warnings-1560'))
 args = parser.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
 
@@ -43,7 +45,7 @@ server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Qui
 threading.Thread(target=server.serve_forever, daemon=True).start()
 try:
     with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+        browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox'])
         for width, font in [(320, 16), (320, 32), (900, 16)]:
             page = browser.new_page(viewport={'width': width, 'height': 1100}, has_touch=width == 320)
             page.set_default_timeout(5000)

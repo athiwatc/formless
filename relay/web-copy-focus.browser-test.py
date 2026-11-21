@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import chromium_executable
+
 root = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument('--css', type=Path, help='Optional baseline CSS for a negative control')
@@ -15,7 +17,7 @@ def function(name):
     return source[start:source.index('\n  }', start) + 4]
 
 with sync_playwright() as p:
-    browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+    browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox'])
     page = browser.new_page(viewport={'width': 900, 'height': 700})
     page.set_content('<button id="before">Before</button><main></main><button id="after">After</button>')
     page.add_style_tag(content=(args.css or root / 'web/app.css').read_text())

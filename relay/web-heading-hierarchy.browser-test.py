@@ -8,9 +8,11 @@ from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT=Path(__file__).resolve().parent
 parser=argparse.ArgumentParser()
-parser.add_argument('--out',type=Path,default=Path('/tmp/formless-headings-1559'))
+parser.add_argument('--out',type=Path,default=artifact_dir('/tmp/formless-headings-1559'))
 args=parser.parse_args()
 args.out.mkdir(parents=True,exist_ok=True)
 
@@ -38,7 +40,7 @@ thread.start()
 bidi_records=[]
 try:
     with sync_playwright() as p:
-        browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox'])
+        browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox'])
         for width in [320,900]:
             for font in [16,32]:
                 page=browser.new_page(viewport={'width':width,'height':1400})

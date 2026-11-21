@@ -5,6 +5,8 @@ from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import chromium_executable
+
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -14,7 +16,7 @@ def run(root, hook, check, app=None):
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     try:
         with sync_playwright() as p:
-            browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox'])
+            browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox'])
             page=browser.new_page(viewport={'width':1000,'height':900})
             def expose(route):
                 source=(app or root/'web/app.js').read_text();end=source.rfind('\n})();');assert end>0

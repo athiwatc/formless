@@ -61,7 +61,7 @@ jobs:
           "${ci_privilege[@]}" apt-get update
           "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config python3
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -89,7 +89,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
 
@@ -104,14 +104,38 @@ jobs:
             python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
           fi
 
+      - name: Prepare Cargo cache staging
+        id: cargo-cache-stage
+        continue-on-error: true
+        run: |
+          # Cache versions include the literal input paths. Stage in the
+          # checkout without moving the active, job-private Cargo home.
+          mkdir -m 700 -- "$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
       - name: Restore Cargo dependency cache
-        uses: actions/cache@v4
+        if: steps.cargo-cache-stage.outputs.ready == 'true'
+        id: cargo-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
         with:
           path: |
-            ${{ env.CARGO_HOME }}/registry
-            ${{ env.CARGO_HOME }}/git
+            .formless-ci-cargo-cache/cache
+            .formless-ci-cargo-cache/index
           key: ci-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ci-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Populate the private Cargo registry
+        if: steps.cargo-cache.outputs.cache-matched-key != ''
+        continue-on-error: true
+        run: |
+          stage="$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          mkdir -p -- "$CARGO_HOME/registry"
+          for entry in cache index; do
+            if [[ -d "$stage/$entry" && ! -L "$stage/$entry" && ! -e "$CARGO_HOME/registry/$entry" && ! -L "$CARGO_HOME/registry/$entry" ]]; then
+              mv -- "$stage/$entry" "$CARGO_HOME/registry/$entry"
+            fi
+          done
 
       - name: Record tool versions
         run: |
@@ -129,6 +153,48 @@ jobs:
 
       - name: Relay and web regression tests
         run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
+
+      - name: Relay test inventory
+        run: python3 -B relay/browser_suite.py --check-inventory
+
+      - name: Relay Chromium and loopback push regression tests
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          missing_poppler=()
+          for tool in pdftoppm pdftotext; do
+            command -v "$tool" >/dev/null || missing_poppler+=("$tool")
+          done
+          if ((${#missing_poppler[@]})); then
+            printf 'Required Poppler tools missing from PATH (%s).\n' "${missing_poppler[*]}" >&2
+            echo 'See the Linux relay browser checks section in docs/self-hosted-ci.md for runner prerequisites.' >&2
+            exit 1
+          fi
+          python3 -c 'import sys; assert sys.version_info >= (3, 10), "Chromium tests require Python 3.10+"'
+          python3 -m venv "$CI_DIR/browser-python"
+          python="$CI_DIR/browser-python/bin/python"
+          export PLAYWRIGHT_BROWSERS_PATH="$CI_DIR/browser-engines"
+          "$python" -m pip install --disable-pip-version-check --no-cache-dir 'playwright==1.62.0'
+          "$python" -m playwright install chromium --no-shell --no-progress
+          FORMLESS_CHROMIUM_EXECUTABLE=$("$python" - <<'PY'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def chromium_path():
+              async with async_playwright() as playwright:
+                  print(playwright.chromium.executable_path)
+
+          asyncio.run(chromium_path())
+          PY
+          )
+          export FORMLESS_CHROMIUM_EXECUTABLE
+          "$FORMLESS_CHROMIUM_EXECUTABLE" --version
+          settings_fixture="$CI_DIR/browser-settings.json"
+          FORMLESS_SETTINGS_FIXTURE="$settings_fixture" cargo test --locked -p formless-core --test settings_inventory \
+            2>&1 | tee "$CI_DIR/logs/browser-settings-fixture.log"
+          "$python" -B relay/browser_suite.py --settings-fixture "$settings_fixture" \
+            --output "$CI_DIR/browser" --failure-artifacts "$CI_DIR/logs/browser-failures" \
+            2>&1 | tee "$CI_DIR/logs/browser.log"
 
       - name: Relay wire conformance
         run: node relay/conformance.mjs 2>&1 | tee "$CI_DIR/logs/conformance.log"
@@ -183,25 +249,57 @@ jobs:
           fi
 
       - name: Upload tested release binary and generated assets
-        uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
         with:
           name: formless-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           path: ${{ env.CI_DIR }}/dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 2
 
       - name: Upload diagnostic logs
-        if: ${{ always() && env.CI_DIR != '' }}
-        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && env.CI_DIR != '' && (failure() || github.event_name == 'workflow_dispatch') }}
+        uses: actions/upload-artifact@v7
         with:
           name: ci-logs-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.CI_DIR }}/logs/
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 2
 
       - name: Final storage report
         if: ${{ always() && env.CI_DIR != '' }}
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
+
+      - name: Stage Cargo registry for cache save
+        id: cargo-cache-save
+        continue-on-error: true
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' && steps.cargo-cache.outputs.cache-primary-key != '' }}
+        run: |
+          # Cache crate archives and index, not unpacked sources or binaries.
+          stage="$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
+          staged=false
+          for entry in cache index; do
+            if [[ -d "$CARGO_HOME/registry/$entry" && ! -L "$CARGO_HOME/registry/$entry" && ! -e "$stage/$entry" && ! -L "$stage/$entry" ]]; then
+              mv -- "$CARGO_HOME/registry/$entry" "$stage/$entry"
+              staged=true
+            fi
+          done
+          echo "staged=$staged" >> "$GITHUB_OUTPUT"
+
+      - name: Save Cargo dependency cache
+        if: steps.cargo-cache-save.outputs.staged == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .formless-ci-cargo-cache/cache
+            .formless-ci-cargo-cache/index
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Clean Cargo cache staging
+        if: ${{ always() && steps.cargo-cache-stage.outputs.ready == 'true' }}
+        continue-on-error: true
+        run: rm -rf -- "$GITHUB_WORKSPACE/.formless-ci-cargo-cache"
 
       - name: Clean private job directories
         if: ${{ always() && env.CI_DIR != '' }}
