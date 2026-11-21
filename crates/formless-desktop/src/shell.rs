@@ -189,6 +189,7 @@ pub fn bind_keys(cx: &mut App) {
                 Command::GoTo(Destination::Search) => KeyBinding::new(key, FindLoadedText, None),
                 Command::Send
                 | Command::RunAction(_)
+                | Command::MessageQueue
                 | Command::SendSecondary
                 | Command::Stop
                 | Command::ResumeRun
@@ -2271,6 +2272,7 @@ impl Shell {
             .into();
         }
         self.client_snapshot_ready = true;
+        self.run_actions.queue = self.run_action_owner().zip(snapshot.queue.take());
         let prefix = self
             .blocks
             .borrow()
@@ -3271,7 +3273,11 @@ impl Shell {
         if self.client.is_some() && self.client_connected && !self.client_snapshot_ready {
             actions.disabled_reason = Some("Waiting for a current Session snapshot");
         }
-        if self.client.is_some() {
+        if self.client.is_some()
+            && self.run_actions.queue.as_ref().is_none_or(|(owner, _)| {
+                !self.client_snapshot_ready || !self.telemetry_current(owner)
+            })
+        {
             actions.secondary = None;
         }
         actions
@@ -3285,7 +3291,7 @@ impl Shell {
             return;
         }
         if secondary && self.client.is_some() {
-            self.composer_notice = Some("Queue is unavailable until deferred attachment ownership is supported. Use Formless TUI; nothing was queued and the draft was kept.".into());
+            self.composer_notice = Some("Queue requires text-only review during an active Run; nothing was queued and the draft was kept.".into());
             cx.notify();
             return;
         }
@@ -3525,7 +3531,16 @@ impl Shell {
             Command::MoveHistory(direction) => self.move_history(direction, cx),
             Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
+            Command::SendSecondary if self.client.is_some() => self.open_run_action(
+                crate::run_actions::Kind::Queue(crate::message_queue::Operation::Enqueue),
+                window,
+                cx,
+            ),
             Command::SendSecondary => self.submit(true, cx),
+            Command::MessageQueue => {
+                self.run_actions.queue_open = Some(true);
+                cx.notify();
+            }
             Command::Stop => self.stop(cx),
             Command::ResumeRun | Command::AbandonRun => {
                 if let Some(session_id) = self.sidebar.active_id().map(str::to_string) {
@@ -5854,6 +5869,7 @@ impl Shell {
             });
         let modified_enter = commands::shortcut_text(commands::composer_submit_key());
         let primary_label = send_mode_label(self.commands.composer.primary);
+        let queue = self.render_message_queue(inert, window, cx);
         v_flex()
             .id("region-composer")
             .test_support()
@@ -5866,6 +5882,8 @@ impl Shell {
             .border_t_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
+            .when(queue.is_some(), |composer| composer.max_h(window.viewport_size().height).overflow_y_scroll())
+            .children(queue)
             .children(self.client_recovery.as_ref().map(|run| {
                 v_flex().id("run-recovery").test_support().role(Role::Group)
                     .aria_label("Run recovery").gap_2()
@@ -5890,9 +5908,9 @@ impl Shell {
                     .w_full()),
             )
             .child(readable("composer-send-keys", if self.enter_sends && self.client.is_some() {
-                format!("Enter: {primary_label} · Shift+Enter: newline · Queue: TUI · Review: ≤64 KiB")
+                format!("Enter: {primary_label} · Shift+Enter: newline · Queue: review · ≤64 KiB")
             } else if self.client.is_some() {
-                format!("Enter / Shift+Enter: newline · {modified_enter}: {primary_label} · Queue: TUI · Review: ≤64 KiB")
+                format!("Enter / Shift+Enter: newline · {modified_enter}: {primary_label} · Queue: review · ≤64 KiB")
             } else if self.enter_sends {
                 format!("Enter: {primary_label} · Shift+Enter: newline · {modified_enter}: Queue during a Run")
             } else {

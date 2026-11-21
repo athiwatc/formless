@@ -26,6 +26,8 @@ pub(super) struct Panel {
 }
 #[derive(Default)]
 pub(super) struct State {
+    pub queue: Option<(Owner, Vec<crate::message_queue::Item>)>,
+    pub queue_open: Option<bool>,
     pub delete_undo: Option<crate::run_actions::DeleteUndo>,
     pub panel: Option<Panel>,
     pub ledger: Arc<Ledger>,
@@ -35,6 +37,121 @@ pub(super) struct State {
     observed: Status,
 }
 impl Shell {
+    pub(super) fn render_message_queue(
+        &self,
+        inert: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::message_queue::Operation;
+        let (_, items) = self
+            .run_actions
+            .queue
+            .as_ref()
+            .filter(|(o, _)| self.telemetry_current(o) && self.client_snapshot_ready)?;
+        let expanded = self
+            .run_actions
+            .queue_open
+            .unwrap_or(self.effective_width(window) >= crate::model::tokens::THREE_PANE_MIN);
+        let blocked = inert || self.run_actions.ledger.status().blocked();
+        let mut panel = v_flex()
+            .id("message-queue")
+            .test_support()
+            .role(Role::Group)
+            .aria_label("Queued follow-ups")
+            .gap_2()
+            .p_2()
+            .rounded(self.scaled(crate::theme::SURFACE_RADIUS))
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                Button::new("queue-toggle")
+                    .small()
+                    .outline()
+                    .label(format!(
+                        "{} Queue ({})",
+                        if expanded { "Hide" } else { "Show" },
+                        items.len()
+                    ))
+                    .disabled(inert)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_actions.queue_open = Some(!expanded);
+                        cx.notify();
+                    })),
+            );
+        if expanded {
+            let mut list = v_flex()
+                .id("queue-items")
+                .max_h(px(150.))
+                .overflow_y_scroll()
+                .gap_2();
+            if items.is_empty() {
+                list = list.child(
+                    readable(
+                        "queue-empty",
+                        "No queued follow-ups. Queue is available during an active Run.",
+                    )
+                    .text_sm(),
+                );
+            }
+            for (index, item) in items.iter().enumerate() {
+                let id = item.id;
+                let mut row = h_flex().flex_wrap().gap_2().items_center().child(
+                    readable(
+                        ("queue-text", index),
+                        format!(
+                            "{}. {}",
+                            index + 1,
+                            crate::questions::preview(&item.content, 180)
+                        ),
+                    )
+                    .text_sm()
+                    .flex_1()
+                    .min_w_0(),
+                );
+                for (name, label, op, unavailable) in [
+                    (
+                        "queue-edit",
+                        "Edit",
+                        Operation::Edit(id),
+                        item.revision.is_none(),
+                    ),
+                    ("queue-up", "Up", Operation::Up(id), index == 0),
+                    (
+                        "queue-down",
+                        "Down",
+                        Operation::Down(id),
+                        index + 1 == items.len(),
+                    ),
+                    ("queue-remove", "Remove", Operation::Remove(id), false),
+                ] {
+                    row = row.child(
+                        Button::new((name, index))
+                            .small()
+                            .outline()
+                            .label(label)
+                            .accessibility_label(format!("{label} queued message {}", index + 1))
+                            .disabled(blocked || unavailable)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_run_action(Kind::Queue(op), window, cx)
+                            })),
+                    );
+                }
+                if item.revision.is_none() {
+                    row = row.child(
+                        readable(
+                            ("queue-unsupported-edit", index),
+                            "Update the daemon to edit safely.",
+                        )
+                        .text_xs(),
+                    );
+                }
+                list = list.child(row);
+            }
+            panel = panel.child(list);
+        }
+        Some(panel.into_any_element())
+    }
     pub(super) fn undo_deleted_session(&mut self, operation: uuid::Uuid, cx: &mut Context<Self>) {
         if let Some(ticket) = self
             .run_actions
@@ -77,6 +194,17 @@ impl Shell {
         let Some(owner) = self.run_action_owner() else {
             return;
         };
+        if matches!(kind, Kind::Queue(_))
+            && self
+                .run_actions
+                .queue
+                .as_ref()
+                .is_none_or(|(o, _)| !self.telemetry_current(o))
+        {
+            self.composer_notice = Some("Queue inventory is unavailable. Refresh the Session or update the daemon; nothing was sent.".into());
+            cx.notify();
+            return;
+        }
         if self.composer.update(cx, |input, cx| {
             input.marked_text_range(window, cx).is_some()
         }) {
@@ -155,6 +283,15 @@ impl Shell {
         match result {
             Ok(target) => {
                 let text = match p.kind {
+                    Kind::Queue(op) if op.id().is_some() => target
+                        .queue
+                        .as_ref()
+                        .and_then(|items| items.iter().find(|i| Some(i.id) == op.id()))
+                        .map(|i| i.content.clone())
+                        .unwrap_or_default(),
+                    Kind::Queue(crate::message_queue::Operation::Enqueue) => {
+                        self.composer.read(cx).value().to_string()
+                    }
                     Kind::Edit => target
                         .user
                         .as_ref()
@@ -388,7 +525,7 @@ impl Shell {
             )
             .child(readable("run-action-notice", p.notice.clone()).text_sm())
             .child(readable("run-action-status", status.notice()).text_sm());
-        if matches!(p.stage, Stage::Editing) {
+        if matches!(p.stage, Stage::Editing) && !matches!(p.kind, Kind::Queue(_)) {
             body = body.child(h_flex().flex_wrap().gap_2().children(
                 Kind::ALL.into_iter().enumerate().map(|(i, kind)| {
                     Button::new(("run-action-kind", i))
@@ -403,7 +540,16 @@ impl Shell {
             ));
         }
         if matches!(p.stage, Stage::Editing)
-            && !matches!(p.kind, Kind::Delete | Kind::ProviderRetry)
+            && !matches!(
+                p.kind,
+                Kind::Delete
+                    | Kind::ProviderRetry
+                    | Kind::Queue(
+                        crate::message_queue::Operation::Up(_)
+                            | crate::message_queue::Operation::Down(_)
+                            | crate::message_queue::Operation::Remove(_)
+                    )
+            )
         {
             body = body
                 .child(readable("run-action-input-label", p.kind.input_label()).text_sm())
