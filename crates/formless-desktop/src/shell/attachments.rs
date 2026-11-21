@@ -94,7 +94,10 @@ pub(super) struct State {
     pub(super) reference_operation: Option<uuid::Uuid>,
     operations: HashMap<uuid::Uuid, Vec<String>>,
     mutations: HashSet<uuid::Uuid>,
-    waiting: Vec<Intake>,
+    waiting: Vec<(Intake, u64)>,
+    notice: Option<SharedString>,
+    notice_revision: u64,
+    operation_notices: HashMap<uuid::Uuid, u64>,
 }
 
 impl State {
@@ -104,6 +107,13 @@ impl State {
 }
 
 impl Shell {
+    fn attachment_notice(&mut self, notice: impl Into<SharedString>) {
+        let notice = notice.into();
+        self.attachments.notice_revision = self.attachments.notice_revision.wrapping_add(1);
+        self.attachments.notice = Some(notice.clone());
+        self.composer_notice = Some(notice);
+    }
+
     pub fn attach_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if !paths.is_empty() {
             self.stage_composer_attachments(Intake::Paths(paths), cx);
@@ -128,8 +138,9 @@ impl Shell {
                     Ok(Ok(Some(paths))) => this.attach_paths(paths, cx),
                     Ok(Ok(None)) => (),
                     error => {
-                        this.composer_notice =
-                            Some(format!("Could not open attachment picker: {error:?}").into());
+                        this.attachment_notice(format!(
+                            "Could not open attachment picker: {error:?}"
+                        ));
                         cx.notify();
                     }
                 }
@@ -163,8 +174,7 @@ impl Shell {
             _ => None,
         }) {
             if image.bytes().len() > client::attachments::MAX_FILE_BYTES {
-                self.composer_notice =
-                    Some("Cannot attach clipboard image: file is larger than 20 MiB".into());
+                self.attachment_notice("Cannot attach clipboard image: file is larger than 20 MiB");
                 cx.notify();
                 return true;
             }
@@ -174,7 +184,7 @@ impl Shell {
             ) {
                 Ok(encoded) => encoded,
                 Err(error) => {
-                    self.composer_notice = Some(error.into());
+                    self.attachment_notice(error);
                     cx.notify();
                     return true;
                 }
@@ -209,17 +219,21 @@ impl Shell {
         }
     }
 
-    pub(super) fn stage_composer_attachments(
+    pub(super) fn stage_composer_attachments(&mut self, intake: Intake, cx: &mut Context<Self>) {
+        self.stage_attachments_with_notice(intake, self.attachments.notice_revision, cx);
+    }
+
+    fn stage_attachments_with_notice(
         &mut self,
         mut intake: Intake,
+        notice_revision: u64,
         cx: &mut Context<Self>,
     ) {
         let Some(session_id) = self.sidebar.active_id().map(str::to_owned) else {
             return;
         };
         if self.client.is_none() || !self.client_connected {
-            self.composer_notice =
-                Some("Connect to the Daemon Core before attaching files.".into());
+            self.attachment_notice("Connect to the Daemon Core before attaching files.");
             cx.notify();
             return;
         }
@@ -241,11 +255,16 @@ impl Shell {
                     .values()
                     .map(Vec::len)
                     .sum::<usize>()
-                + self.attachments.waiting.iter().map(count).sum::<usize>();
+                + self
+                    .attachments
+                    .waiting
+                    .iter()
+                    .map(|(intake, _)| count(intake))
+                    .sum::<usize>();
             let available =
                 formless_protocol::PENDING_ATTACHMENT_MAX_ENTRIES.saturating_sub(occupied);
             if requested > available {
-                self.composer_notice = Some(format!("Only 64 pending attachments are supported. {} extra attachment(s) were not staged.", requested - available).into());
+                self.attachment_notice(format!("Only 64 pending attachments are supported. {} extra attachment(s) were not staged.", requested - available));
                 cx.notify();
                 if available == 0 {
                     return;
@@ -255,7 +274,7 @@ impl Shell {
                 }
             }
             if self.attachments.pending.is_none() {
-                self.attachments.waiting.push(intake);
+                self.attachments.waiting.push((intake, notice_revision));
                 if self.attachments.operations.is_empty() {
                     self.refresh_composer_attachments(cx);
                 }
@@ -288,14 +307,15 @@ impl Shell {
             Ok(()) => {
                 self.attachments.needs_refresh = false;
                 self.attachments.operations.insert(id, names);
+                self.attachments
+                    .operation_notices
+                    .insert(id, notice_revision);
                 if mutating {
                     self.attachments.mutations.insert(id);
                     self.invalidate_forecast(cx);
                 }
             }
-            Err(error) => {
-                self.composer_notice = Some(format!("Attachments unavailable: {error}").into())
-            }
+            Err(error) => self.attachment_notice(format!("Attachments unavailable: {error}")),
         }
         cx.notify();
     }
@@ -308,14 +328,16 @@ impl Shell {
         if self.client_identity() != Some((outcome.client, outcome.connection))
             || !self.client_connected
             || self.sidebar.active_id() != Some(outcome.session_id.as_str())
-            || self
-                .attachments
-                .operations
-                .remove(&outcome.operation)
-                .is_none()
         {
             return;
         }
+        let Some(names) = self.attachments.operations.remove(&outcome.operation) else {
+            return;
+        };
+        let notice_revision = self
+            .attachments
+            .operation_notices
+            .remove(&outcome.operation);
         self.attachments.mutations.remove(&outcome.operation);
         let mut errors = outcome.errors;
         self.attachments.pending = match outcome.pending {
@@ -326,12 +348,18 @@ impl Shell {
             }
         };
         if !errors.is_empty() {
-            self.composer_notice = Some(errors.join("\n").into());
+            self.attachment_notice(errors.join("\n"));
+        } else if !names.is_empty()
+            && notice_revision == Some(self.attachments.notice_revision)
+            && self.composer_notice == self.attachments.notice
+        {
+            self.composer_notice = None;
+            self.attachments.notice = None;
         }
         let waiting = std::mem::take(&mut self.attachments.waiting);
         if self.attachments.pending.is_some() {
-            for intake in waiting {
-                self.stage_composer_attachments(intake, cx);
+            for (intake, revision) in waiting {
+                self.stage_attachments_with_notice(intake, revision, cx);
             }
         }
         cx.notify();

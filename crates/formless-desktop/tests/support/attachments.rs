@@ -90,6 +90,78 @@ fn queued(shell: &Entity<Shell>, cx: &mut App) -> Vec<Operation> {
 }
 
 #[gpui_kit::test]
+fn successful_attach_clears_only_its_earlier_attachment_notice(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/directory".into()], cx)
+        });
+        let operation = queued(&shell, cx).pop().unwrap();
+        let (client, connection) = shell.read(cx).client_identity().unwrap();
+        let id = operation.session_id.clone();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::AttachmentStaged(Outcome {
+                    client,
+                    connection,
+                    operation: operation.id,
+                    session_id: id.clone(),
+                    errors: vec!["Cannot attach a directory".into()],
+                    pending: Report::decode(&id, json!({"session_id":id,"attachments":[]})),
+                }),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window
+            .find("composer-notice")
+            .value()
+            .unwrap()
+            .contains("directory"));
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/valid".into()], cx)
+        });
+        let operation = queued(&shell, cx).pop().unwrap();
+        complete(
+            &shell,
+            operation,
+            vec![file("valid", "valid.txt", "text/plain")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.try_find("composer-notice").is_none());
+    });
+    cx.write_to_clipboard(ClipboardItem::new_string(
+        "x".repeat(formless_desktop::memory::limits::COMPOSER_MAX_BYTES + 1),
+    ));
+    step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let unrelated = window.find("composer-notice").value().unwrap().to_string();
+        assert!(unrelated.contains("Paste not added"));
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/another-valid".into()], cx)
+        });
+        let operation = queued(&shell, cx).pop().unwrap();
+        complete(
+            &shell,
+            operation,
+            vec![file("valid", "valid.txt", "text/plain")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("composer-notice").value(),
+            Some(unrelated.as_str())
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn oversized_clipboard_images_are_rejected_before_copy_or_conversion(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     for format in [gpui_kit::ImageFormat::Png, gpui_kit::ImageFormat::Tiff] {
