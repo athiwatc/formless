@@ -7019,6 +7019,21 @@ impl Store {
         Ok(self.conn.prepare("SELECT id,session_id FROM artifacts WHERE session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=artifacts.session_id)")?
             .query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     }
+    pub(crate) fn artifact_reference_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id FROM sessions")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn session_references_artifact(
+        &self,
+        id: &str,
+        session: &str,
+        owner: &str,
+    ) -> Result<bool> {
+        crate::attachment_access::session_references_artifact(&self.conn, id, session, owner)
+    }
 
     /// Paths of a Session's artifacts (to delete with it).
     pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {

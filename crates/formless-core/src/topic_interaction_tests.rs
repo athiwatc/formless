@@ -1,5 +1,6 @@
 use super::*;
 use crate::local_harness::{HarnessPermissionRequest, HarnessUpdate, InteractionHandler};
+use std::time::Duration;
 
 struct TopicFixture {
     fixture: Fixture,
@@ -113,6 +114,61 @@ fn permission(always: bool) -> HarnessPermissionRequest {
             },
         ],
     }
+}
+
+#[tokio::test]
+async fn topic_away_notifications_are_redacted_and_test_injected() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_TOPIC_NOTIFICATIONS");
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let cancel = CancellationToken::new();
+    let h = f.handler();
+    let c = cancel.clone();
+    let mut permission = permission(false);
+    permission.title = "Read ledger Bearer abcdefghijklmnopqrstuvwxyz".into();
+    permission.raw_input = Some(json!({"command":"raw-input-must-not-be-notified"}));
+    let waiting = tokio::spawn(async move { h.request_permission(permission, &c).await });
+    next_event(&mut events, |e| {
+        matches!(e, Event::HarnessPermissionRequested { .. })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.daemon().topic_notifications.locked().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let notices = f.daemon().topic_notifications.locked();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].0.starts_with("Formless: "));
+        assert!(notices[0].1.contains("Claude: Read ledger"));
+        assert!(!notices[0].1.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!notices[0].1.contains("raw-input"));
+    }
+    cancel.cancel();
+    assert!(waiting.await.unwrap().is_none());
+    f.daemon().broadcast(Event::UserQuestion {
+        question_id: "user-only-notification".into(),
+        session_id: f.attempt.conversation_session_id.clone(),
+        topic_id: Some(f.topic.id.clone()),
+        attempt_id: Some(f.attempt.id.clone()),
+        user_only: true,
+        question: "Choose a substitute".into(),
+        questions: vec![],
+        options: vec![],
+    });
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon().broadcast(Event::UserQuestionClosed {
+        question_id: "user-only-notification".into(),
+        answered_by: None,
+    });
+    env.set("FORMLESS_TOPIC_NOTIFICATIONS", "0");
+    f.daemon()
+        .notify_topic_attention(Some(&f.topic.id), Some(&f.attempt.id), "Disabled");
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
 }
 
 #[tokio::test]

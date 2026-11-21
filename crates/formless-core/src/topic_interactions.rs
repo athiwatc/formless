@@ -193,6 +193,60 @@ impl Drop for Lease {
 }
 
 impl Daemon {
+    pub(super) fn notify_topic_attention(
+        &self,
+        topic_id: Option<&str>,
+        attempt_id: Option<&str>,
+        prompt: &str,
+    ) {
+        if std::env::var("FORMLESS_TOPIC_NOTIFICATIONS")
+            .ok()
+            .as_deref()
+            == Some("0")
+        {
+            return;
+        }
+        let topic = topic_id.and_then(|id| self.with_reader(|st| st.get_topic(id)).ok().flatten());
+        let harness = attempt_id
+            .and_then(|id| {
+                self.with_reader(|st| st.get_topic_attempt(id))
+                    .ok()
+                    .flatten()
+            })
+            .map(|attempt| format!("{:?}", attempt.harness))
+            .unwrap_or_else(|| "Topic orchestration".into());
+        let title = format!(
+            "Formless: {} needs you",
+            topic.map(|t| t.name).unwrap_or_else(|| "Topic".into())
+        );
+        let body = format!("{harness}: {prompt}");
+        let title = crate::secrets::redact(&title)
+            .0
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(100)
+            .collect::<String>();
+        let body = crate::secrets::redact(&body)
+            .0
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>();
+        #[cfg(test)]
+        self.topic_notifications.locked().push((title, body));
+        #[cfg(not(test))]
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || {
+                formless_runtime::desktop_notify(&title, &body)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("topic notification failed: {error}"),
+                Err(error) => tracing::warn!("topic notification task failed: {error}"),
+            }
+        });
+    }
     pub(super) fn answer_topic_question_tool(&self, session: &str, args: &Value) -> Result<Value> {
         let basis = args["basis"].as_str().context("basis is required")?.trim();
         if basis.is_empty() {
@@ -334,6 +388,7 @@ impl Daemon {
             return Ok(None);
         }
         let permission_id = uuid::Uuid::new_v4().to_string();
+        let notification_title = request.title.clone();
         let (sender, mut receiver) = oneshot::channel();
         self.with_store(|st| {
             st.transaction(|st| {
@@ -362,6 +417,11 @@ impl Daemon {
                 Ok(())
             })
         })?;
+        self.notify_topic_attention(
+            Some(&attempt.topic_id),
+            Some(&attempt.id),
+            &notification_title,
+        );
         let _lease = Lease {
             daemon: self.clone(),
             id: permission_id.clone(),

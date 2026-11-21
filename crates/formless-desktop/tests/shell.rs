@@ -6587,7 +6587,6 @@ fn typed_delta(id: &str, text: &str) -> formless_protocol::Event {
 }
 
 fn typed_message(id: &str, seq: i64, role: &str, text: &str) -> formless_protocol::MessageInfo {
-    generated_by: None,
     formless_protocol::MessageInfo {
         generated_by: None,
         id: format!("m{seq}"),

@@ -55,7 +55,7 @@ impl Store {
                 st.fail_topic_workflow(&topic.id,&format!("orchestrator run ended with {status}"))?;
             } else if topic.features.iter().any(|feature|matches!(feature.status,formless_protocol::TopicFeatureStatus::Pending|formless_protocol::TopicFeatureStatus::Running|formless_protocol::TopicFeatureStatus::NeedsUser)) {
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
-                if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically.")?;}
+                if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically. Active harness attempts, if any, keep running.")?;}
             }
             Ok(Some(topic.id))
         })
