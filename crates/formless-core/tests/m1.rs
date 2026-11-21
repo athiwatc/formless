@@ -407,6 +407,8 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
 
     _env.set("FORMLESS_API_KEY", "test-key");
     let base = mock_server().await;
+    _env.set("FORMLESS_BASE_URL", &base);
+    _env.set("FORMLESS_MODEL", "mock-1");
     let paths = temp_paths("daemon");
     let mut cfg = Config {
         provider: mock_cfg(&base),
@@ -450,8 +452,13 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
             .await
             .unwrap();
         write_half.write_all(b"\n").await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let line = lines.next_line().await.unwrap().unwrap();
+            let line = tokio::time::timeout_at(deadline, lines.next_line())
+                .await
+                .expect("CreateSession response did not arrive within 10 seconds")
+                .unwrap()
+                .expect("daemon closed before CreateSession response");
             if let Ok(ServerMessage::Response { id: 1, result, .. }) =
                 serde_json::from_str::<ServerMessage>(&line)
             {
@@ -477,7 +484,12 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
     write_half.write_all(b"\n").await.unwrap();
     let mut deltas = String::new();
     let mut finished = false;
-    while let Some(line) = lines.next_line().await.unwrap() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while let Some(line) = tokio::time::timeout_at(deadline, lines.next_line())
+        .await
+        .expect("RunFinished event did not arrive within 10 seconds")
+        .unwrap()
+    {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
             match ev {
                 Event::MessageDelta { delta, .. } => deltas.push_str(&delta),
@@ -486,6 +498,7 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
                     finished = true;
                     break;
                 }
+                Event::RunPaused { error, .. } => panic!("run paused: {error}"),
                 _ => {}
             }
         }
@@ -509,7 +522,12 @@ async fn daemon_end_to_end_run_persists_and_two_clients_share() {
         .unwrap();
     wb.write_all(b"\n").await.unwrap();
     let mut got = false;
-    while let Some(line) = lines_b.next_line().await.unwrap() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while let Some(line) = tokio::time::timeout_at(deadline, lines_b.next_line())
+        .await
+        .expect("GetSession response did not arrive within 10 seconds")
+        .unwrap()
+    {
         if let Ok(ServerMessage::Response { id: 9, result, .. }) =
             serde_json::from_str::<ServerMessage>(&line)
         {
