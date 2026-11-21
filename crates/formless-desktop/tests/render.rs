@@ -5,6 +5,7 @@
 //! captures as PNG files for a human to look at. Without it the test only
 //! asserts that each state rendered something other than a flat fill, which
 //! is far short of a visual review.
+//! `FORMLESS_DESKTOP_RENDER_FILTER` selects state names containing the value.
 
 fn main() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -76,7 +77,43 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 53] = [
+    const STATES: [State; 57] = [
+        state(
+            "transcript-attachments-normal-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("transcript-attachments"),
+            WHOLE,
+        ),
+        state(
+            "transcript-attachments-narrow-dark",
+            480.,
+            800.,
+            DARK,
+            100,
+            Some("transcript-attachments"),
+            WHOLE,
+        ),
+        state(
+            "attachments-normal-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("stage-attachments"),
+            WHOLE,
+        ),
+        state(
+            "attachments-narrow-dark",
+            480.,
+            800.,
+            DARK,
+            100,
+            Some("stage-attachments"),
+            WHOLE,
+        ),
         state(
             "session-usage-light",
             1440.,
@@ -1061,6 +1098,52 @@ mod render {
                             .unwrap();
                         shell.focus_section(PageSection::Conversation, window, cx);
                     });
+                } else if control == "stage-attachments" || control == "transcript-attachments" {
+                    use formless_desktop::client::{attachments::Outcome, Command as WireCommand, Update};
+                    use formless_desktop::pending_files::Report;
+                    use serde_json::json;
+                    let sessions = fixture::sessions(3);
+                    let id = sessions[0].id.clone();
+                    shell.update(cx, |shell, cx| {
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection { ready: true, notice: "Connected attachment fixture".into() }, window, cx);
+                        shell.apply_client_update(Update::Sessions(sessions), window, cx);
+                    });
+                    window.render_frame(cx);
+                    if window.try_find(shell::session_row_id(&id)).is_none() {
+                        window.click("toggle-sidebar", cx);
+                        window.render_frame(cx);
+                    }
+                    window.click(shell::session_row_id(&id), cx);
+                    shell.update(cx, |shell, cx| {
+                        if control == "transcript-attachments" {
+                            let meta = json!({"attachments":[
+                                {"name":"desktop-composer-design.png","mime":"image/png","bytes":248312},
+                                {"name":"implementation-notes-and-follow-ups.md","mime":"text/markdown","bytes":4301},
+                                {"name":"workspace-reference","reference":true,"bytes":4096},
+                                {"name":"previous-design.png","mime":"image/png","bytes":10872,"expired":true}
+                            ]}).to_string();
+                            shell.apply_client_update(Update::Snapshot { generation:shell.client_generation(), snapshot:formless_desktop::replies::session_snapshot(&id, &json!({"session":{"id":id},"running":false,"messages":[
+                                {"id":"sent-message","session_id":id,"seq":1,"role":"user","content":"Please review the attached design and implementation notes.","created_at":"now","meta":meta}
+                            ]})).unwrap() }, window, cx);
+                            shell.focus_section(PageSection::Conversation, window, cx);
+                            return;
+                        }
+                        shell.apply_client_update(Update::Snapshot { generation: shell.client_generation(), snapshot: formless_desktop::replies::session_snapshot(&id, &json!({"session":{"id":id},"running":false,"messages":[]})).unwrap() }, window, cx);
+                        shell.attach_paths(vec!["/local/desktop-composer-design.png".into(), "/local/implementation-notes-and-follow-ups.md".into(), "/local/test-results.txt".into()], cx);
+                        let (client, connection) = shell.client_identity().unwrap();
+                        for command in shell.take_client_commands() {
+                            if let WireCommand::StageAttachments(operation) = command {
+                                let report = Report::decode(&id, json!({"session_id":id,"attachments":[
+                                    {"id":"image","name":"desktop-composer-design.png","mime":"image/png","bytes":248312,"path":"/artifacts/image"},
+                                    {"id":"notes","name":"implementation-notes-and-follow-ups.md","mime":"text/markdown","bytes":4301,"path":"/artifacts/notes"},
+                                    {"id":"results","name":"test-results.txt","mime":"text/plain","bytes":827,"path":"/artifacts/results"}
+                                ]})).unwrap();
+                                shell.apply_client_update(Update::AttachmentStaged(Outcome { client, connection, operation: operation.id, session_id: id.clone(), errors: vec![], pending: Ok(report) }), window, cx);
+                            }
+                        }
+                        shell.focus_section(PageSection::Composer, window, cx);
+                    });
                 } else {
                     window.click(control, cx);
                 }
@@ -1908,10 +1991,16 @@ mod render {
 
     pub fn run() {
         let keep = std::env::var("FORMLESS_DESKTOP_RENDER_DIR").ok();
+        let filter = std::env::var("FORMLESS_DESKTOP_RENDER_FILTER").unwrap_or_default();
         let mut sizes = ControlSizes::new();
         let mut captures = 0;
-        let states = STATES.len();
-        for state in STATES {
+        let selected: Vec<_> = STATES
+            .into_iter()
+            .filter(|state| state.name.contains(&filter))
+            .collect();
+        assert!(!selected.is_empty(), "no render states matched");
+        let states = selected.len();
+        for state in selected {
             captures += draw_state(state, keep.as_deref(), &mut sizes);
         }
         println!("render: ok ({states} states, {captures} captures)");

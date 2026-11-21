@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc as queue, watch};
 
+pub mod attachments;
 mod delivery;
 #[cfg(test)]
 mod native_send_tests;
@@ -60,6 +61,7 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    AttachmentStaged(attachments::Outcome),
     DeleteUndo(crate::run_actions::DeleteUndo),
     RunActionTarget {
         owner: crate::run_actions::Owner,
@@ -217,6 +219,7 @@ pub enum Update {
 }
 
 pub enum Command {
+    StageAttachments(attachments::Operation),
     UndoDelete(uuid::Uuid),
     ReadRunAction {
         owner: crate::run_actions::Owner,
@@ -643,6 +646,7 @@ impl Client {
                 | Command::ReadSessionDetails { .. }
                 | Command::ReadModelCatalog { .. }
                 | Command::ReadPendingAttachments { .. }
+                | Command::StageAttachments(_)
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
@@ -811,6 +815,7 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    Attachment(Box<attachments::Work>),
     RunReconcile(run_actions::Recovery),
     RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
@@ -1551,6 +1556,7 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::StageAttachments(operation) => self.stage_attachments(operation),
             Command::UndoDelete(operation) => {
                 if let Some(ticket) = self
                     .delete_undo
@@ -1682,6 +1688,7 @@ impl Engine {
             return;
         }
         match command {
+            Command::StageAttachments(_) => unreachable!("handled by attachment dispatcher"),
             Command::UndoDelete(_) => unreachable!("handled by action dispatcher"),
             Command::ReadRunAction { .. }
             | Command::PrepareRunAction(_)
@@ -2239,7 +2246,6 @@ impl Engine {
                     }
                     if *mode == formless_protocol::SendMode::Queue
                         || content != &draft_basis
-                        || content.trim().is_empty()
                         || content.len() > crate::forecast::MAX_REVIEW_DRAFT_BYTES
                     {
                         self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"Queue attachment ownership is unavailable; Send/Steer require the exact draft within the native 64 KiB review limit. Use Formless TUI for Queue or larger messages".into()});
@@ -2591,6 +2597,7 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::Attachment(work) => self.attachment_reply(work, result),
             Pending::RunReconcile(recovery) => self.run_reconciled(recovery, result),
             Pending::RestoreSession(ticket) => {
                 let acknowledged = response_ok
@@ -3963,6 +3970,74 @@ mod tests {
             serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap(),
         );
         assert!(engine.prepared.is_none());
+    }
+
+    #[test]
+    fn attachment_only_send_reviews_exact_inventory_and_rejects_empty_or_failed_reads() {
+        let attachment = json!({"id":"artifact","name":"image.png","path":"/artifacts/image","mime":"image/png","bytes":3,"future":{"kept":true}});
+        for inventory in [
+            Ok(json!({"session_id":"a","attachments":[attachment.clone()]})),
+            Ok(json!({"session_id":"a","attachments":[]})),
+            Err("inventory unavailable".to_string()),
+        ] {
+            let accepted = inventory
+                .as_ref()
+                .is_ok_and(|value| value["attachments"].as_array().unwrap().len() == 1);
+            let mut engine = ready();
+            engine.active = Some("a".into());
+            engine.command(Command::Review {
+                intent: Intent::SendMessage {
+                    session_id: "a".into(),
+                    content: String::new(),
+                    mode: SendMode::Send,
+                },
+                expected_run_id: None,
+                draft_basis: String::new(),
+                epoch: engine.epoch,
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(matches!(
+                request.request,
+                Request::ListPendingAttachments { .. }
+            ));
+            engine
+                .receive(match inventory {
+                    Ok(value) => ServerMessage::ok(request.id, value),
+                    Err(error) => ServerMessage::err(request.id, error),
+                })
+                .unwrap();
+            if accepted {
+                let request = engine.outgoing.pop_back().unwrap();
+                assert!(matches!(request.request, Request::ForecastRun { .. }));
+                respond(
+                    &mut engine,
+                    request.id,
+                    serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap(),
+                );
+                let prepared = engine
+                    .updates
+                    .iter()
+                    .find_map(|update| match update {
+                        Update::Prepared(prepared) => Some(prepared),
+                        _ => None,
+                    })
+                    .unwrap();
+                let id = prepared.id;
+                assert_eq!(
+                    prepared.attachments.as_ref().unwrap().expected(),
+                    vec![attachment.clone()]
+                );
+                engine.command(Command::ConfirmPrepared(id));
+                engine.command(Command::CommitPrepared(id));
+                assert!(engine.outgoing.iter().any(|request| matches!(&request.request, Request::SendReviewedMessage { content, expected_attachments, .. } if content.is_empty() && expected_attachments == &vec![attachment.clone()])));
+            } else {
+                assert!(engine.outgoing.is_empty());
+                assert!(engine
+                    .updates
+                    .iter()
+                    .any(|update| matches!(update, Update::PreparationFailed { .. })));
+            }
+        }
     }
 
     fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {
