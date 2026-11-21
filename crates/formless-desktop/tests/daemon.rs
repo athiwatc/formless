@@ -126,6 +126,13 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::RunActionTarget { result, .. } => {
+                    format!("action target ok={}", result.is_ok())
+                }
+                Update::RunActionReview { .. } => "run action review".into(),
+                Update::RunActionReady { .. } => "run action ready".into(),
+                Update::LiveContext { result, .. } => format!("context ok={}", result.is_ok()),
+                Update::RunActivity { .. } => "run activity".into(),
                 Update::Transcript(batch) => format!(
                     "live reader generation {} / reload={}",
                     batch.owner.generation, batch.reload

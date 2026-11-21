@@ -45,6 +45,7 @@ mod profile_search;
 mod questions;
 mod reader;
 mod reading_positions;
+mod run_actions;
 mod run_inspection;
 mod session_fork;
 mod sessions;
@@ -99,6 +100,7 @@ gpui_kit::actions!(
         CloseStepReview,
         CloseApprovalReview,
         CloseSessionEditor,
+        CloseRunActions,
         ScrollViewerUp,
         ScrollViewerDown,
         ScrollViewerPageUp,
@@ -186,6 +188,7 @@ pub fn bind_keys(cx: &mut App) {
                 Command::ShowCommands => KeyBinding::new(key, ShowCommands, None),
                 Command::GoTo(Destination::Search) => KeyBinding::new(key, FindLoadedText, None),
                 Command::Send
+                | Command::RunAction(_)
                 | Command::SendSecondary
                 | Command::Stop
                 | Command::ResumeRun
@@ -212,6 +215,7 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new("escape", CloseRunActions, Some("FormlessRunActions")),
         KeyBinding::new(
             "escape",
             CloseApprovalReview,
@@ -589,6 +593,7 @@ fn tooltip(entry: &commands::Entry) -> String {
 /// command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Modal {
+    RunActions,
     Panel(Region),
     Palette,
     /// The full-output view of one block.
@@ -778,6 +783,7 @@ pub struct Shell {
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_steerable_run_id: Option<String>,
     client_sessions: Vec<SessionInfo>,
+    run_actions: run_actions::State,
     forecast: Option<ForecastDialog>,
     forecast_composing: bool,
     forecast_focus: FocusHandle,
@@ -1015,6 +1021,7 @@ impl Shell {
         let inspector_scroll = ScrollHandle::new();
         Self {
             client: None,
+            run_actions: run_actions::State::default(),
             client_connected: false,
             client_snapshot_ready: false,
             client_generation: 0,
@@ -1546,7 +1553,9 @@ impl Shell {
     /// What holds the window modally in `layout`: the palette, which is
     /// always on top, or a panel overlay.
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
-        if self.session_editor.is_some() {
+        if self.run_actions.panel.is_some() {
+            Some(Modal::RunActions)
+        } else if self.session_editor.is_some() {
             Some(Modal::SessionEditor)
         } else if self.approval_panel.is_some() {
             Some(Modal::Approvals)
@@ -2167,6 +2176,7 @@ impl Shell {
     /// Drained on the UI thread, outside render. Selection is checked again
     /// here because a reply can already be queued when navigation happens.
     pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_run_actions(cx);
         self.sync_fork_status(cx);
         self.sync_step_status(cx);
         self.sync_mode_status(cx);
@@ -2300,6 +2310,25 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match update {
+            ClientUpdate::RunActionTarget {
+                owner,
+                operation,
+                result,
+            } => self.run_action_target(owner, operation, result, window, cx),
+            ClientUpdate::RunActionReview {
+                owner,
+                operation,
+                quote,
+            } => self.run_action_review(owner, operation, quote, cx),
+            ClientUpdate::RunActionReady { owner, operation } => {
+                self.run_action_ready(owner, operation, cx)
+            }
+            ClientUpdate::LiveContext { owner, result } => {
+                if self.run_action_owner().as_ref() == Some(&owner) {
+                    self.run_actions.context = result.ok().map(|c| (owner, c));
+                }
+            }
+            ClientUpdate::RunActivity { owner, event } => self.run_activity(owner, event, cx),
             ClientUpdate::ApprovalInventory {
                 client,
                 connection,
@@ -3463,6 +3492,7 @@ impl Shell {
                 }
             }
             Command::ReviewFork => self.review_fork(window, cx),
+            Command::RunAction(kind) => self.open_run_action(kind, window, cx),
             Command::InspectRun => {
                 if let Some((target, source)) = self.selected_run_target() {
                     self.read_run_inspection(
@@ -3937,6 +3967,12 @@ impl Shell {
 
     fn focus_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
         match modal {
+            Modal::RunActions => {
+                if let Some(p) = &self.run_actions.panel {
+                    window.focus(&p.close, cx);
+                }
+                cx.notify();
+            }
             Modal::Panel(region) => self.focus_region(region, window, cx),
             Modal::Palette => {
                 if let Some(palette) = &self.palette {
@@ -3990,7 +4026,8 @@ impl Shell {
             | Modal::Questions
             | Modal::Step
             | Modal::Approvals
-            | Modal::SessionEditor),
+            | Modal::SessionEditor
+            | Modal::RunActions),
         ) = self.current_modal(self.layout(window))
         {
             self.focus_modal(modal, window, cx);
@@ -4651,7 +4688,7 @@ impl Shell {
                     .child(timeline),
             )
             .when(!reflowed, |region| {
-                region.child(self.render_composer(false, cx))
+                region.child(self.render_composer(false, window, cx))
             })
     }
 
@@ -5699,7 +5736,12 @@ impl Shell {
     /// The composer. `inert` takes it out of the accessibility tree; it is
     /// needed only where the composer is not inside the conversation (a
     /// reflowed page), since the conversation's flag covers what is in it.
-    fn render_composer(&self, inert: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_composer(
+        &self,
+        inert: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let button = |id: &'static str, command: Command, cx: &mut Context<Self>| {
             let entry = commands::entry(command, &self.commands);
             Button::new(id)
@@ -5794,6 +5836,7 @@ impl Shell {
                     .flex_wrap()
                     .gap_2()
                     .child(stop)
+                    .when(self.client.is_some() && self.fit(window) != Fit::Reflowed, |row| row.child(Button::new("run-actions-open").small().label("Run actions").outline().disabled(inert || self.run_action_owner().is_none() || self.run_actions.ledger.status().blocked()).on_click(cx.listener(|this, _, window, cx| this.open_run_action(crate::run_actions::Kind::Retry, window, cx)))))
                     .child(div().flex_1())
                     .children(model)
                     .children(secondary)
@@ -5833,6 +5876,18 @@ impl Shell {
             .p_3()
             .gap_3()
             .child(readable("inspector-title", "Context").font_semibold())
+            .children(
+                self.live_context_label()
+                    .map(|label| readable("live-context-meter", label).text_sm()),
+            )
+            .children(
+                self.run_activity_label()
+                    .map(|label| readable("provider-activity", label).text_sm()),
+            )
+            .children(
+                self.run_notice_label()
+                    .map(|label| readable("live-run-usage", label).text_sm()),
+            )
             .child(detail(
                 "inspector-session",
                 "Session",
@@ -6177,6 +6232,10 @@ impl Shell {
                 .child(intent.min_w_0().max_w_full())
                 .child(div().flex_1())
                 .child(readable("status-detail", detail).min_w_0().max_w_full())
+                .children(
+                    self.live_context_label()
+                        .map(|label| readable("status-context", label).min_w_0().max_w_full()),
+                )
         }
     }
 
@@ -6229,7 +6288,11 @@ impl Shell {
                     .child(self.render_header(layout, true, cx))
                     .child(main)
                     .when(chat, |page| {
-                        page.child(self.render_composer(self.current_modal(layout).is_some(), cx))
+                        page.child(self.render_composer(
+                            self.current_modal(layout).is_some(),
+                            window,
+                            cx,
+                        ))
                     })
                     .child(self.render_status(layout, true, window, cx)),
             )
@@ -6239,6 +6302,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.settle_run_actions(cx);
         self.reveal_fork_control(window, cx);
         self.reveal_profile_search(window, cx);
         self.reveal_directory_choice(window, cx);
@@ -6365,6 +6429,9 @@ impl Render for Shell {
             })
             .when(self.session_editor.is_some(), |shell| {
                 shell.child(self.render_session_editor(window, cx))
+            })
+            .when(self.run_actions.panel.is_some(), |shell| {
+                shell.child(self.render_run_actions(window, cx))
             })
     }
 }

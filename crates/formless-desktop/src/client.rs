@@ -35,6 +35,7 @@ mod delivery;
 #[cfg(test)]
 mod native_send_tests;
 mod reader;
+mod run_actions;
 mod send_review;
 pub use reader::{StreamBatch, StreamOwner, StreamStatus};
 
@@ -59,6 +60,28 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    RunActionTarget {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+        result: Result<crate::run_actions::Target, String>,
+    },
+    RunActionReview {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+        quote: Option<formless_protocol::RunForecast>,
+    },
+    RunActionReady {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    LiveContext {
+        owner: crate::run_actions::Owner,
+        result: Result<crate::run_actions::Context, String>,
+    },
+    RunActivity {
+        owner: crate::run_actions::Owner,
+        event: Event,
+    },
     Transcript(StreamBatch),
     ApprovalInventory {
         client: uuid::Uuid,
@@ -185,6 +208,13 @@ pub enum Update {
 }
 
 pub enum Command {
+    ReadRunAction {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    PrepareRunAction(crate::run_actions::Dispatch),
+    ConfirmRunAction(uuid::Uuid),
+    CommitRunAction(uuid::Uuid),
     DetachReference(crate::reference_detach::Dispatch),
     ReadPendingAttachments {
         connection: u64,
@@ -513,6 +543,18 @@ impl Client {
         d.finish(crate::reference_detach::decode(d.action(), result, ok));
     }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if let Command::PrepareRunAction(d) = &command {
+            let owner = &d.action.owner;
+            if !self.is_ready()
+                || owner.client != self.instance()
+                || owner.connection != self.connection()
+                || owner.epoch != self.epoch()
+                || !d.reserved()
+            {
+                d.reject("Connection or review changed; nothing was queued.");
+                return Err("Connection or review changed; nothing was queued.");
+            }
+        }
         let reference = self.reference_status();
         if reference.blocked()
             && matches!(&command,Command::Review{intent,..}|Command::Intent(intent) if intent.starts_work() && reference.action().is_some_and(|a|a.session_id==intent.session_id()))
@@ -578,6 +620,10 @@ impl Client {
         if matches!(
             command,
             Command::Intent(_)
+                | Command::ReadRunAction { .. }
+                | Command::PrepareRunAction(_)
+                | Command::ConfirmRunAction(_)
+                | Command::CommitRunAction(_)
                 | Command::CreateSession
                 | Command::Review { .. }
                 | Command::ConfirmPrepared(_)
@@ -755,6 +801,16 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    RunTarget {
+        owner: crate::run_actions::Owner,
+        operation: uuid::Uuid,
+    },
+    RunInspect(Box<run_actions::Work>),
+    RunForecast(Box<run_actions::Work>),
+    RunConsent(Box<run_actions::Work>),
+    RunCommitInspect(Box<run_actions::Work>),
+    RunWrite(Box<run_actions::Work>),
+    LiveContext(crate::run_actions::Owner),
     DetachReference(crate::reference_detach::Dispatch),
     SendInventory(Box<Preparation>),
     ReviewedAction {
@@ -908,6 +964,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    action_work: Option<Box<run_actions::Work>>,
     reference_detach_available: bool,
     session_model_cas_available: bool,
     reviewed_send_available: bool,
@@ -1233,6 +1290,19 @@ impl Engine {
         self.updates.push(Update::Questions(state));
     }
     fn blocked_by_unknown(&self, command: &Command, uncertain: &HashSet<Action>) -> bool {
+        let run_session = match command {
+            Command::PrepareRunAction(d) => Some(d.action.owner.session.as_str()),
+            Command::ConfirmRunAction(_) | Command::CommitRunAction(_) => self
+                .action_work
+                .as_ref()
+                .map(|w| w.dispatch.action.owner.session.as_str()),
+            _ => None,
+        };
+        if let Some(session) = run_session {
+            return uncertain
+                .iter()
+                .any(|a| a.question_id.is_none() && a.session_id == session);
+        }
         if let Command::DetachReference(d) = command {
             return uncertain
                 .iter()
@@ -1257,6 +1327,7 @@ impl Engine {
     }
     fn sync_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
+        self.retire_run_review();
         let (generation, active, status_revision, client, connection) = (
             self.generation,
             self.active.as_ref(),
@@ -1408,6 +1479,72 @@ impl Engine {
     }
 
     fn command(&mut self, command: Command) {
+        match command {
+            Command::ReadRunAction { owner, operation } => {
+                if self.ready && self.action_owner().as_ref() == Some(&owner) {
+                    let retired = self
+                        .pending
+                        .iter()
+                        .filter_map(|(id, p)| matches!(p, Pending::RunTarget { .. }).then_some(*id))
+                        .collect::<Vec<_>>();
+                    for id in retired {
+                        self.pending.remove(&id);
+                        self.outgoing.retain(|r| r.id != id);
+                    }
+                    self.request(
+                        Request::GetSession {
+                            id: owner.session.clone(),
+                        },
+                        Pending::RunTarget { owner, operation },
+                    );
+                }
+            }
+            Command::PrepareRunAction(d) => {
+                self.action_prepare(d);
+            }
+            Command::ConfirmRunAction(id) => {
+                self.action_confirm(id);
+            }
+            Command::CommitRunAction(id) => {
+                self.action_commit(id);
+            }
+            command => self.command_existing(command),
+        }
+    }
+
+    fn command_existing(&mut self, command: Command) {
+        let run_busy = self
+            .action_work
+            .as_ref()
+            .is_some_and(|w| w.dispatch.reserved())
+            || self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::RunInspect(_)
+                        | Pending::RunForecast(_)
+                        | Pending::RunConsent(_)
+                        | Pending::RunCommitInspect(_)
+                        | Pending::RunWrite(_)
+                )
+            });
+        if run_busy
+            && matches!(
+                &command,
+                Command::Review { .. }
+                    | Command::ConfirmPrepared(_)
+                    | Command::CommitPrepared(_)
+                    | Command::Intent(_)
+                    | Command::EditSession { .. }
+                    | Command::DetachReference(_)
+                    | Command::EnableStepMode(_)
+                    | Command::DisableStepMode(_)
+                    | Command::DecideStep(_)
+                    | Command::DecideApproval(_)
+            )
+        {
+            self.updates.push(Update::Notice("Wait for the reviewed action receipt or cancel its review before another mutation. Nothing was sent.".into()));
+            return;
+        }
         let work = match &command {
             Command::Review { intent, .. } | Command::Intent(intent) => Some(intent),
             Command::ConfirmPrepared(id) | Command::CommitPrepared(id) => self
@@ -1460,6 +1597,10 @@ impl Engine {
             return;
         }
         match command {
+            Command::ReadRunAction { .. }
+            | Command::PrepareRunAction(_)
+            | Command::ConfirmRunAction(_)
+            | Command::CommitRunAction(_) => unreachable!("handled by action dispatcher"),
             Command::DetachReference(d) => {
                 if !self.reference_detach_available || !self.reference_current(&d) || !d.reserved() {
                     d.reject("Atomic reference removal is unavailable or this review changed. Update the daemon or use Formless TUI; nothing was removed.");
@@ -2164,6 +2305,37 @@ impl Engine {
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if matches!(
+                    event,
+                    Event::ProviderStalled { .. }
+                        | Event::ProviderRetrying { .. }
+                        | Event::RunUsage { .. }
+                        | Event::CompactionNotice { .. }
+                        | Event::RunStarted { .. }
+                        | Event::RunFinished { .. }
+                        | Event::RunPaused { .. }
+                        | Event::MessageComplete { .. }
+                        | Event::StreamRestarted { .. }
+                        | Event::Note { .. }
+                ) {
+                    if let Some(owner) = self
+                        .action_owner()
+                        .filter(|o| event.session_id() == Some(o.session.as_str()))
+                    {
+                        self.updates.push(Update::RunActivity {
+                            owner,
+                            event: event.clone(),
+                        });
+                        if matches!(
+                            event,
+                            Event::RunUsage { .. }
+                                | Event::CompactionNotice { .. }
+                                | Event::RunFinished { .. }
+                        ) {
+                            self.context_read();
+                        }
+                    }
+                }
                 let changed = match &event {
                     Event::SessionUpdated { session } => Some((
                         session.id.as_str(),
@@ -2308,6 +2480,27 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::RunTarget { owner, operation } => {
+                if self.action_owner().as_ref() == Some(&owner) {
+                    let result =
+                        result.and_then(|v| crate::run_actions::Target::decode(&owner.session, &v));
+                    self.updates.push(Update::RunActionTarget {
+                        owner,
+                        operation,
+                        result,
+                    });
+                }
+            }
+            Pending::RunInspect(w) => self.action_inspected(w, result, false),
+            Pending::RunCommitInspect(w) => self.action_inspected(w, result, true),
+            Pending::RunForecast(w) => self.action_forecast(w, result),
+            Pending::RunConsent(w) => self.action_consented(w, result),
+            Pending::RunWrite(w) => {
+                w.dispatch.finish(result, response_ok);
+                self.dirty_session = true;
+                self.dirty_list = true;
+            }
+            Pending::LiveContext(owner) => self.context_received(owner, result),
             Pending::StreamSubscribe(owner) => self.stream_subscribed(owner, result),
             Pending::StreamBarrier {
                 owner,
@@ -2426,6 +2619,7 @@ impl Engine {
                             .map_err(|e| e.to_string())
                     }) {
                         Ok((snapshot, attention)) => {
+                            self.context_read();
                             self.updates.push(Update::Snapshot {
                                 generation,
                                 snapshot,
@@ -2913,8 +3107,19 @@ impl<R: AsyncBufRead + Unpin> Frames<R> {
 async fn write_requests(
     writer: &mut (impl AsyncWrite + Unpin),
     engine: &mut Engine,
+    uncertain: &mut HashSet<Action>,
 ) -> io::Result<()> {
     while let Some(request) = engine.outgoing.pop_front() {
+        if !engine.action_before_write(request.id) {
+            continue;
+        }
+        if let Some(Pending::RunWrite(w)) = engine.pending.get(&request.id) {
+            uncertain.insert(Action {
+                id: w.dispatch.action.operation,
+                session_id: w.dispatch.action.owner.session.clone(),
+                question_id: None,
+            });
+        }
         let mut line = serde_json::to_vec(&request)?;
         if line.len() >= formless_protocol::MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -3082,7 +3287,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 *sent = true;
             }
         }
-        write_requests(&mut writer, &mut engine)
+        write_requests(&mut writer, &mut engine, uncertain)
             .await
             .map_err(|e| e.to_string())?;
         if *future_attempts {
@@ -3106,6 +3311,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
                 Some(command) if engine.blocked_by_unknown(&command, uncertain) => {
+                    if let Command::PrepareRunAction(d) = &command { d.reject("A previous Session action is unknown. Nothing was sent; inspect Formless TUI."); }
                     if let Command::DetachReference(d)=&command {d.reject("A previous Session action is unknown. No reference removal was sent; continue in Formless TUI.");}
 
                     let target=match &command {Command::Intent(intent)|Command::Review{intent,..}=>Some(intent.session_id().to_string()),Command::CommitPrepared(id)=>engine.prepared.as_ref().filter(|p|p.id==*id).map(|p|p.intent.session_id().to_string()),_=>None};
@@ -3120,6 +3326,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
+                        Some(Pending::RunWrite(w)) if !ok || result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v)) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
                         Some(Pending::ReviewedAction {action,work,..}) if *ok && result.as_ref().is_some_and(|value| work.acknowledges_reviewed_send(value)) => Some(action.clone()),
@@ -4999,6 +5206,9 @@ mod tests {
                             .unwrap();
                         snapshot("a", "known")
                     }
+                    Request::ContextUsage { .. } => {
+                        json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                    }
                     Request::ListPendingAttachments { session_id } => {
                         serde_json::json!({"session_id":session_id,"attachments":[]})
                     }
@@ -5130,7 +5340,7 @@ mod tests {
             let (stream, server) = tokio::io::duplex(16384);
             let (command_tx, mut commands) = queue::channel(QUEUE);
             let _keep_commands = command_tx.clone();
-            let (updates, rx) = mpsc::sync_channel(QUEUE);
+            let (updates, rx) = mpsc::sync_channel(QUEUE * 2);
             let (_stop, mut cancelled) = watch::channel(false);
             let ready = AtomicBool::new(false);
             let epoch = AtomicU64::new(0);
@@ -5167,6 +5377,9 @@ mod tests {
                         }
                         Request::ListInvocations if reconnect => crate::invocations::test_value(),
                         Request::ListSessions => json!([]),
+                        Request::ContextUsage { .. } => {
+                            json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                        }
                         Request::GetSession { id } => snapshot(&id, "canonical"),
                         Request::AnswerQuestion { question_id, .. } => {
                             if !reconnect {
@@ -5341,7 +5554,11 @@ mod tests {
             .unwrap();
             peer.await.unwrap();
             let receiver = driver.await.unwrap();
-            assert!(result.unwrap_err().contains("disconnected"));
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("disconnected") || error.contains("broken pipe"),
+                "{error}"
+            );
             if reconnect {
                 let final_updates: Vec<_> = receiver.try_iter().collect();
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if *operation==metadata_operation)),"the metadata ACK must actually be processed");
@@ -5404,6 +5621,9 @@ mod tests {
                         Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
                         Request::Subscribe { .. } => json!({"subscribed":true}),
                         Request::ListSessions => json!([]),
+                        Request::ContextUsage { .. } => {
+                            json!({"used_tokens":0,"context_tokens":1000,"measured":false})
+                        }
                         Request::GetSession { .. } => {
                             snapshots += 1;
                             if snapshots == 1 {
@@ -5520,7 +5740,11 @@ mod tests {
                 )
                 .await;
                 peer.await.unwrap();
-                assert!(result.unwrap_err().contains("disconnected"));
+                let error = result.unwrap_err();
+                assert!(
+                    error.contains("disconnected") || error.contains("broken pipe"),
+                    "{error}"
+                );
             })
             .await
             .expect("reconnect/Stop/retry regression timed out");
