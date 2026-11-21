@@ -23,6 +23,8 @@ const PREFIXES: &[(&str, &str)] = &[
     ("glpat-", "GitLab token"),
     ("xoxb-", "Slack token"),
     ("xoxp-", "Slack token"),
+    ("shpat_", "API key"),
+    ("shpss_", "API key"),
     ("AIza", "Google API key"),
     ("AKIA", "AWS access key"),
     ("ASIA", "AWS access key"),
@@ -334,6 +336,19 @@ mod tests {
             assert_eq!(redact(text), (text.to_string(), None), "{text}");
             assert_eq!(scan(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn shopify_admin_tokens_and_shared_secrets_are_redacted_by_exact_prefix() {
+        let suffix = "0123456789abcdef0123456789abcdef";
+        for prefix in ["shpat_", "shpss_"] {
+            assert_eq!(
+                redact(&format!("({prefix}{suffix})")),
+                ("([REDACTED])".into(), Some("API key"))
+            );
+        }
+        let note = format!("examples: shpat_abc shpss_short shp_{suffix}");
+        assert_eq!(redact(&note), (note, None));
     }
 
     #[test]
