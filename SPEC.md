@@ -7136,3 +7136,9 @@ are inserted atomically with generated_by="topic_kickoff". Transcript reads,
 events and forks preserve the marker. Both proposal and approval reject source
 messages with any generated_by value; generated instructions are not new user
 requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.

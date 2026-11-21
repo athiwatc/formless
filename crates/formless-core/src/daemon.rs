@@ -928,6 +928,8 @@ pub struct Daemon {
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
     question_answered_by: StdMutex<HashMap<String, String>>,
+    #[cfg(test)]
+    topic_notifications: StdMutex<Vec<(String, String)>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     topic_activity: tokio::sync::Notify,
@@ -1177,6 +1179,8 @@ impl Daemon {
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
             question_answered_by: StdMutex::new(HashMap::new()),
+            #[cfg(test)]
+            topic_notifications: StdMutex::new(vec![]),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
             topic_activity: tokio::sync::Notify::new(),
@@ -1794,6 +1798,16 @@ impl Daemon {
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
+        if let Event::UserQuestion {
+            user_only: true,
+            topic_id,
+            attempt_id,
+            question,
+            ..
+        } = &ev
+        {
+            self.notify_topic_attention(topic_id.as_deref(), attempt_id.as_deref(), question);
+        }
         match &ev {
             Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. }
