@@ -388,6 +388,8 @@ async fn scripted_flow(
     let workdir = format!("/tmp/fl-{tag}w-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     std::fs::create_dir_all(&workdir).unwrap();
     let base = mock_m2_server(workdir.clone()).await;
+    _env.set("FORMLESS_BASE_URL", &base);
+    _env.set("FORMLESS_MODEL", "mock-1");
     let paths = temp_paths(tag);
     let p = formless_core::config::ProviderCfg {
         base_url: base,
@@ -433,8 +435,13 @@ async fn scripted_flow(
         .await
         .unwrap();
     write_half.write_all(b"\n").await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let session_id = loop {
-        let line = lines.next_line().await.unwrap().unwrap();
+        let line = tokio::time::timeout_at(deadline, lines.next_line())
+            .await
+            .expect("CreateSession response did not arrive within 10 seconds")
+            .unwrap()
+            .expect("daemon closed before CreateSession response");
         if let Ok(ServerMessage::Response { id: 1, result, .. }) =
             serde_json::from_str::<ServerMessage>(&line)
         {
@@ -468,7 +475,12 @@ async fn scripted_flow(
     let mut prompts = 0;
     let mut batches = Vec::new();
     let mut next_id = 100u64;
-    while let Some(line) = lines.next_line().await.unwrap() {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while let Some(line) = tokio::time::timeout_at(deadline, lines.next_line())
+        .await
+        .expect("RunFinished event did not arrive within 10 seconds")
+        .unwrap()
+    {
         if let Ok(ServerMessage::Event(ev)) = serde_json::from_str::<ServerMessage>(&line) {
             match ev {
                 Event::MessageDelta { delta, .. } => final_text.push_str(&delta),
@@ -529,8 +541,13 @@ async fn scripted_flow(
         .await
         .unwrap();
     write_half.write_all(b"\n").await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     let grants = loop {
-        let line = lines.next_line().await.unwrap().unwrap();
+        let line = tokio::time::timeout_at(deadline, lines.next_line())
+            .await
+            .expect("ListApprovals response did not arrive within 10 seconds")
+            .unwrap()
+            .expect("daemon closed before ListApprovals response");
         if let Ok(ServerMessage::Response {
             id: 9_999, result, ..
         }) = serde_json::from_str::<ServerMessage>(&line)
