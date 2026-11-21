@@ -2155,6 +2155,9 @@ pub enum Request {
     /// named "… · original answer" before it is replaced.
     RetryRun {
         session_id: String,
+        /// Reject when the latest Run has changed since the user selected it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_run_id: Option<String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default = "default_true")]

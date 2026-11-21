@@ -6826,6 +6826,7 @@ impl App {
                     Pending::RetryRun,
                     Request::RetryRun {
                         session_id,
+                        expected_run_id: None,
                         model,
                         keep_original,
                     },

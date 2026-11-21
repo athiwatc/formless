@@ -2456,6 +2456,7 @@ impl Daemon {
             }
             Request::RetryRun {
                 session_id,
+                expected_run_id,
                 model,
                 keep_original,
             } => {
@@ -2465,6 +2466,15 @@ impl Daemon {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before retrying",
                     )));
+                }
+                if let Some(expected) = expected_run_id.as_deref() {
+                    let latest = self.with_store(|st| st.last_run(&session_id))?;
+                    if latest.as_ref().map(|(id, _)| id.as_str()) != Some(expected) {
+                        return Err(RequestFailure::invalid(
+                            "the latest Run changed; open Retry again",
+                        )
+                        .into());
+                    }
                 }
                 let cfg = self.config()?;
                 let model = model

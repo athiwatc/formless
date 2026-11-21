@@ -2612,7 +2612,8 @@
       + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
       + (t.error ? " · " + t.error : "");
   }
-  async function openModelPicker() {
+  async function openModelPicker(onPick) {
+    const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
     const efforts = ["", "low", "medium", "high"];
     const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
@@ -2623,15 +2624,17 @@
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
-    const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, "Use in this Session");
+    const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
-    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Model" },
+    const title = selectionOnly ? "Retry with a model" : "Model";
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
-        h("h2", null, "Model"),
+        h("h2", null, title),
         input, list,
-        h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
-        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), test, cancel, asDefault, apply)));
+        selectionOnly ? null : h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }),
+          selectionOnly ? null : test, cancel, selectionOnly ? null : asDefault, apply)));
     let items = [], matches = [], sel = 0;
     const close = () => closeDialog(dialog);
     const choice = () => (matches[sel] && matches[sel].item.id) || input.value.trim();
@@ -2678,6 +2681,7 @@
       if (!model) return;
       const e = effort.value || null;
       close();
+      if (selectionOnly) return onPick(model);
       if (!global) return setSessionModel(model, e);
       // Settings go through the daemon (principle 6).
       if (await act({ type: "set_setting", key: "provider.model", value: model })
@@ -2994,11 +2998,31 @@
   }
 
   // 👍/👎 on the last answer (SPEC §8.7), with an optional comment for 👎.
+  function currentRunTarget() {
+    return { session: S.current, sequence: sessionSeq, run: S.liveRun?.id || null };
+  }
+  function ensureRunTarget(target) {
+    if (target.session && target.session === S.current
+        && target.sequence === sessionSeq && target.run === (S.liveRun?.id || null)) return true;
+    note("The Session or latest Run changed. Open the action again.", true);
+    return false;
+  }
   function rateButtons() {
     const rate = async (rating) => {
-      const comment = rating === "bad" ? (prompt("What was wrong? (optional)") || "") : "";
-      const r = await act({ type: "rate_run", session_id: S.current, rating, comment: comment || null });
-      if (r) { S.rated = { session: S.current, rating: r.rating }; renderHistory(); note(r.rating ? "rated " + (r.rating === "good" ? "👍" : "👎") : "rating cleared"); }
+      const target = currentRunTarget();
+      let comment = null;
+      if (rating === "bad") {
+        const input = h("textarea", { rows: 4, "aria-label": "Optional rating comment" });
+        const save = await ask({ title: "What was wrong?", body: h("div", null, input), ok: "Submit rating" });
+        if (save) comment = input.value || null;
+      }
+      if (!ensureRunTarget(target)) return;
+      const r = await act({ type: "rate_run", session_id: target.session, run_id: target.run, rating, comment });
+      if (r && target.session === S.current && target.run === (S.liveRun?.id || null)) {
+        S.rated = { session: target.session, rating: r.rating };
+        renderHistory();
+        note(r.rating ? "rated " + (r.rating === "good" ? "👍" : "👎") : "rating cleared");
+      }
     };
     const cur = S.rated && S.rated.session === S.current ? S.rated.rating : "";
     const btn = (rating, label, title) => h("button", { class: "btn ghost small" + (cur === rating ? " active" : ""), type: "button", title, "aria-pressed": String(cur === rating),
@@ -3006,18 +3030,20 @@
     return h("div", { class: "rate" }, btn("good", "👍", "Good answer"), btn("bad", "👎", "Bad answer"),
       h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message (/retry)", onclick: () => retryRun("") }, tr("Retry")),
       h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message on another model; this answer stays in a fork", onclick: () => {
-        const m = prompt("Retry on which model?");
-        if (m && m.trim()) retryRun(m.trim());
+        const target = currentRunTarget();
+        openModelPicker(model => retryRun(model, target));
       } }, tr("Retry with…")));
   }
   // Re-run the last user message, on `model` for that Run when given.
-  async function retryRun(model) {
-    const sid = S.current;
+  async function retryRun(model, target = currentRunTarget()) {
+    if (!ensureRunTarget(target)) return;
+    const sid = target.session;
     if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
       try { if (!(await confirmForecast(sid, "", {retry:true,model:model || null,edit_message_id:null}))) return; }
       catch (e) { note("forecast: " + e.message, true); return; }
     }
-    const r = await act({ type: "retry_run", session_id: sid, model: model || null });
+    if (!ensureRunTarget(target)) return;
+    const r = await act({ type: "retry_run", session_id: sid, expected_run_id: target.run, model: model || null });
     if (!r) return;
     note("retrying" + (r.model ? " on " + r.model : "") + (r.original_session ? "; the previous answer is kept in \"… · original answer\"" : ""));
     if (r.original_session) refreshSessions();
@@ -3843,13 +3869,27 @@
       h("span", { class: "muted" }, "⏳ " + tr("Queued for after this Run") + " (" + q.length + ")"),
       h("ol", null, q.map((m, i) => h("li", null,
         h("span", { class: "text", title: m.content }, m.content),
-        btn("✎", "Edit", () => {
-          const text = prompt("Edit the queued message", m.content);
-          if (text != null && text.trim()) act({ type: "edit_queued", session_id: sid, id: m.id, content: text.trim() });
-        }),
+        btn("✎", "Edit", () => editQueuedMessage(sid, m)),
         i > 0 ? btn("↑", "Move up", () => act({ type: "move_queued", session_id: sid, id: m.id, up: true })) : null,
         i < q.length - 1 ? btn("↓", "Move down", () => act({ type: "move_queued", session_id: sid, id: m.id, up: false })) : null,
         btn("✕", "Remove", () => act({ type: "edit_queued", session_id: sid, id: m.id, content: null }))))));
+  }
+  function editQueuedMessage(sid, item) {
+    const sequence = sessionSeq;
+    const input = h("textarea", { rows: 6, "aria-label": "Queued message" });
+    input.value = item.content;
+    const initial = input.value;
+    return ask({
+      title: "Edit the queued message", body: h("div", null, input), ok: "Save",
+      saveRequest: () => {
+        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.content === item.content)) {
+          note("The queued message changed. Open it again.", true);
+          return null;
+        }
+        if (!input.value.trim()) throw Object.assign(new Error("Enter a nonempty message."), { field: input });
+        return { type: "edit_queued", session_id: sid, id: item.id, content: input.value === initial ? item.content : input.value };
+      },
+    });
   }
 
   /** Chips for the Tools the last Run created, updated or retired (SPEC §10.6). */
@@ -7009,9 +7049,10 @@
   async function showRunFiles() {
     const trigger = document.activeElement;
     if (!S.current) return note("open a session first", true);
-    const sid = S.current;
+    const target = currentRunTarget();
+    const sid = target.session;
     const r = await act({ type: "run_files", session_id: sid });
-    if (!r) return;
+    if (!r || !ensureRunTarget(target)) return;
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const rewind = async (path) => {
       const x = await act({ type: "rewind_run", session_id: sid, run_id: r.run_id, path: path || null });
@@ -7026,7 +7067,11 @@
         h("span", { class: "spacer" }),
         f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
       f.diff ? h("pre", { class: "diff" }, renderDiffLines(f.diff, "span")) : null)));
-    const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
+    const all = h("button", { class: "btn small", type: "button", onclick: async () => {
+      const confirmed = await ask({ title: "Revert all tracked paths?", danger: true, ok: "Revert all",
+        text: "Attempt safe restoration of every tracked path. Paths changed since the Run may be skipped." });
+      if (confirmed && dialog.isConnected && ensureRunTarget(target)) await rewind("");
+    } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
         h("div", { class: "modal-actions" }, all, h("span", { class: "spacer" }), close)));
