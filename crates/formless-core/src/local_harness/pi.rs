@@ -543,15 +543,20 @@ impl Dialog {
         question.header = Some(title.to_owned());
         let deadline = event
             .get("timeout")
-            .map(|value| {
+            .map(|value| -> Result<Option<Instant>> {
+                if value.as_f64().is_some_and(|millis| millis <= 0.0) {
+                    return Ok(None);
+                }
                 let millis = value
                     .as_u64()
                     .context("Pi UI timeout was not milliseconds")?;
                 Instant::now()
                     .checked_add(Duration::from_millis(millis))
                     .context("Pi UI timeout too large")
+                    .map(Some)
             })
-            .transpose()?;
+            .transpose()?
+            .flatten();
         Ok(Some(Self {
             id,
             method: method.to_owned(),
@@ -807,6 +812,10 @@ mod rpc_tests {
     use crate::local_harness::{HarnessPermissionRequest, InteractionFuture};
     use tokio::sync::Notify;
 
+    // Concurrent fork/exec can briefly inherit writable shell-fixture descriptors (ETXTBSY).
+    #[cfg(unix)]
+    static FAKE_PROCESS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct RecordingHandler {
         answer: bool,
         wait: bool,
@@ -976,6 +985,25 @@ mod rpc_tests {
         assert_eq!(handler.questions.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn dialog_nonpositive_timeouts_still_ask_the_handler() {
+        for millis in [0, -1] {
+            let mut event = ui("confirm");
+            event["timeout"] = json!(millis);
+            let dialog = Dialog::from_event(&event).unwrap().unwrap();
+            assert!(dialog.deadline.is_none());
+            let handler = RecordingHandler::new(true, false);
+            let (_, response) = timeout(
+                Duration::from_secs(1),
+                dialog.answer(&handler, &CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.unwrap()["confirmed"], true);
+            assert_eq!(handler.questions.lock().unwrap().len(), 1);
+        }
+    }
+
     #[cfg(unix)]
     fn fake_pi(body: &str) -> (PathBuf, PathBuf, HarnessRequest) {
         use std::os::unix::fs::PermissionsExt;
@@ -1009,6 +1037,7 @@ while IFS= read -r remaining; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_relays_answers_none_notifications_and_literal_prompt() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         for answer in [true, false] {
             let mut body = START.to_owned();
             for method in ["confirm", "select", "input", "editor"] {
@@ -1055,6 +1084,7 @@ while IFS= read -r remaining; do :; done
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_drains_stdout_while_handler_pending_and_cancels_all_dialogs_before_abort() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         let body = format!(
             r#"{START}
 printf '%s\n' '{confirm}' '{select}'
@@ -1117,6 +1147,7 @@ printf '%s\n' '{{"type":"response","command":"abort","id":"abort-1","success":tr
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_kills_unresponsive_process_after_abort_deadline() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         let body = format!(
             r#"{START}
 printf '%s\n' '{confirm}'
@@ -1158,6 +1189,7 @@ exec sleep 30
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_terminates_detached_sleep_on_cancel_and_drop() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         for drop_run in [false, true] {
             let executable = std::env::current_exe().unwrap();
             let body = format!(
@@ -1221,6 +1253,7 @@ wait
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_rejects_early_exit_malformed_json_prompt_rejection_and_nonzero_exit() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         let cases = [
             ("IFS= read -r state\nIFS= read -r prompt\nprintf '%s' 'early failure' >&2\nexit 7".to_owned(), "before successful settle"),
             (format!("{START}\nprintf '%s\\n' 'not json'"), "invalid JSONL"),
@@ -1248,6 +1281,7 @@ wait
     #[cfg(unix)]
     #[tokio::test]
     async fn fake_rpc_rejects_handled_or_queued_prompt_without_waiting_for_settle() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         for disposition in ["handled", "queued", "missing"] {
             let response = json!({"id":"prompt-1","type":"response","command":"prompt","success":true,"data":{"disposition":disposition}});
             let body = format!(
@@ -1277,13 +1311,15 @@ while IFS= read -r command; do :; done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn fake_rpc_timeout_sends_no_reply_and_stderr_tail_is_bounded() {
+    async fn fake_rpc_zero_timeout_relays_answer_and_stderr_tail_is_bounded() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         let mut dialog = ui("confirm");
         dialog["timeout"] = json!(0);
         let body = format!(
             r#"{START}
 printf '%s\n' '{dialog}'
-sleep 0.1
+IFS= read -r answer
+printf '{{"type":"received_answer","value":%s}}\n' "$answer"
 printf '%s\n' '{{"type":"extension_ui_request","method":"select","id":"select","title":"Pick","options":["Build","Review"]}}'
 IFS= read -r answer
 printf '{{"type":"received_answer","value":%s}}\n' "$answer"
@@ -1304,8 +1340,10 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
             .iter()
             .filter(|e| e["type"] == "received_answer")
             .collect();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["value"]["id"], "select");
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["value"]["id"], "confirm");
+        assert_eq!(responses[0]["value"]["confirmed"], true);
+        assert_eq!(responses[1]["value"]["id"], "select");
         fs::remove_dir_all(dir).unwrap();
 
         let (dir, extension, request) = fake_pi("IFS= read -r state\nIFS= read -r prompt\ni=0\nwhile [ \"$i\" -lt 2000 ]; do printf '%s' 'stderr buffer probe ' >&2; i=$((i + 1)); done\nprintf '%s' 'TAIL-MARKER' >&2\nexit 1");
@@ -1325,6 +1363,7 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
     #[cfg(unix)]
     #[tokio::test]
     async fn precancelled_rpc_does_not_spawn() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
         let (dir, extension, mut request) = fake_pi("exit 99");
         request.executable = Some(dir.join("nonexistent"));
         let cancel = CancellationToken::new();
