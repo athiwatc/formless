@@ -452,6 +452,79 @@ fn topic_workspace_without_git_executable_is_directory() {
     assert!(topic.base_revision.is_none());
 }
 
+#[test]
+fn topic_attachment_provenance_follows_nested_moves_and_topic_forks() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/inherited.txt");
+    std::fs::write(&file, b"inherited").unwrap();
+    let id = f.record(&file, 9, Some(&f.session));
+    let unrelated = f.record(&file, 9, Some(&f.session));
+    let (child, fork) = f
+        .daemon()
+        .with_store(|st| {
+            let message = st.append_message_meta(
+                &f.session,
+                "user",
+                "Inspect",
+                Some(json!({"attachments":[{"id":id,"path":file,"bytes":9}]}).to_string()),
+            )?;
+            let mut proposal = TopicProposalRequest {
+                parent_topic_id: None,
+                source_session_id: f.session.clone(),
+                message_ids: vec![message.id],
+                features: vec![],
+                name: "Parent".into(),
+                workspace: Some(f.root.clone()),
+                outline: vec![],
+            };
+            let parent = st.propose_topic(&proposal, WorkspaceKind::Directory, None)?;
+            let parent = st.approve_topic(&parent.id)?;
+            let session = parent.topic_session_id.unwrap();
+            let fork = st.fork_session(&session, None, None)?.unwrap();
+            proposal.source_session_id = session;
+            proposal.name = "Child".into();
+            let child = st.propose_topic(&proposal, WorkspaceKind::Directory, None)?;
+            Ok((
+                st.approve_topic(&child.id)?.topic_session_id.unwrap(),
+                fork.id,
+            ))
+        })
+        .unwrap();
+    let access = crate::attachment_access::AttachmentAccess::profile(&f.paths);
+    for session in [child, fork] {
+        let content = f
+            .daemon()
+            .read_artifact_impl(&session, &json!({"id":id}))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&content).unwrap()["text"],
+            "inherited"
+        );
+        let attachment =
+            json!({"id":id,"path":file,"bytes":9,"_source_session":session,"_source_seq":1});
+        assert_eq!(access.read(&attachment, 100).unwrap(), b"inherited");
+        f.daemon()
+            .with_reader(|st| {
+                let snapshot = crate::attachment_access::AttachmentAccess::snapshot(
+                    st,
+                    &[json!({"_attachments":[attachment]})],
+                )?
+                .unwrap();
+                assert_eq!(snapshot.read(&attachment, 100).unwrap(), b"inherited");
+                Ok(())
+            })
+            .unwrap();
+        assert!(f
+            .daemon()
+            .read_artifact_impl(&session, &json!({"id":unrelated}))
+            .is_err());
+        let mut wrong = attachment;
+        wrong["_source_seq"] = json!(2);
+        assert!(access.read(&wrong, 100).is_err());
+    }
+}
+
 #[tokio::test]
 async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
     let env = crate::credential_env::EnvGuard::isolated();
