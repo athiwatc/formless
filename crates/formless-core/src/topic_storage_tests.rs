@@ -96,6 +96,73 @@ fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
 }
 
 #[test]
+fn topic_finalization_preserves_all_terminal_statuses() {
+    for status in [
+        TopicAttemptStatus::Succeeded,
+        TopicAttemptStatus::Failed,
+        TopicAttemptStatus::Cancelled,
+        TopicAttemptStatus::Abandoned,
+    ] {
+        let (store, _, _, request) = fixture();
+        let pending = store
+            .propose_topic(&request, WorkspaceKind::Directory, None)
+            .unwrap();
+        let topic = store.approve_topic(&pending.id).unwrap();
+        store.claim_topic_workflow(&topic.id).unwrap();
+        let token = "c".repeat(64);
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Step",
+                StepAccess::Write,
+                HarnessKind::Pi,
+                None,
+                None,
+                &[],
+                &token,
+                Path::new("/topic/repo"),
+            )
+            .unwrap();
+        match status {
+            TopicAttemptStatus::Succeeded | TopicAttemptStatus::Failed => {
+                store
+                    .report_topic_result(&attempt.id, &token, status, "original report", &[])
+                    .unwrap();
+            }
+            TopicAttemptStatus::Cancelled => {
+                store.cancel_topic(&topic.id).unwrap();
+            }
+            TopicAttemptStatus::Abandoned => {
+                store.recover_topic(&topic.id).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = store.get_topic_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(before.status, status);
+        let next = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            TopicAttemptStatus::Succeeded
+        };
+        let saved = store
+            .finish_topic_step(&attempt.id, next, "late adapter result", &[], None)
+            .unwrap();
+        assert_eq!(saved.status, status);
+        assert_eq!(saved.summary, before.summary);
+        assert_eq!(saved.outputs, before.outputs);
+        assert!(store.get_topic(&topic.id).unwrap().unwrap().features[0]
+            .active_attempt_id
+            .is_none());
+        let again = store
+            .finish_topic_step(&attempt.id, next, "duplicate late result", &[], None)
+            .unwrap();
+        assert_eq!(again.status, status);
+        assert_eq!(again.summary, before.summary);
+    }
+}
+
+#[test]
 fn topic_isolated_workflows_can_share_a_source_workspace() {
     let (store, source, _, mut request) = fixture();
     let first = store

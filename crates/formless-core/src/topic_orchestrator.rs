@@ -6,6 +6,8 @@ use std::os::unix::{
     fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     process::CommandExt,
 };
+#[cfg(windows)]
+use std::os::windows::fs::FileTypeExt;
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -79,6 +81,50 @@ fn private_file(path: &Path) -> Result<std::fs::File> {
     Ok(options.open(path)?)
 }
 
+fn resolve_directory_link(path: &Path) -> Result<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match prefix.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&prefix).is_ok() {
+                    bail!("directory symlink target contains an unresolvable link");
+                }
+                missing.push(
+                    prefix
+                        .components()
+                        .next_back()
+                        .context("missing symlink target prefix")?
+                        .as_os_str()
+                        .to_os_string(),
+                );
+                if !prefix.pop() {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    for component in missing.into_iter().rev() {
+        if component == ".." {
+            resolved.pop();
+        } else if component != "." {
+            resolved.push(component);
+        }
+        match resolved.canonicalize() {
+            Ok(existing) => resolved = existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&resolved).is_ok() {
+                    bail!("directory symlink target contains an unresolvable link");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(resolved)
+}
+
 fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken) -> Result<()> {
     let source = source.canonicalize()?;
     if !source.is_dir() || destination.starts_with(&source) {
@@ -106,28 +152,25 @@ fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken)
             let target = target.join(entry.file_name());
             let kind = entry.file_type()?;
             if kind.is_symlink() {
-                let resolved = path.canonicalize()?;
-                let relative = resolved
-                    .strip_prefix(source_root)
-                    .context("directory symlink escapes the source tree")?;
-                let depth = target
-                    .parent()
-                    .context("missing copy parent")?
-                    .strip_prefix(target_root)?
-                    .components()
-                    .count();
-                let mut link = PathBuf::new();
-                for _ in 0..depth {
-                    link.push("..");
+                let link = std::fs::read_link(&path)?;
+                if link.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    bail!("directory symlink escapes the source tree: absolute targets are not allowed");
                 }
-                link.push(relative);
-                if link.as_os_str().is_empty() {
-                    link.push(".");
+                let resolved = resolve_directory_link(
+                    &path.parent().context("missing source parent")?.join(&link),
+                )?;
+                if !resolved.starts_with(source_root) {
+                    bail!("directory symlink escapes the source tree");
                 }
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(&link, &target)?;
                 #[cfg(windows)]
-                if resolved.is_dir() {
+                if kind.is_symlink_dir() {
                     std::os::windows::fs::symlink_dir(&link, &target)?;
                 } else {
                     std::os::windows::fs::symlink_file(&link, &target)?;
@@ -422,7 +465,7 @@ impl Daemon {
 
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never merge or push. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex, pi; opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from the selected feature's outputs. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex, pi; opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
         let start = async {
             let session = topic
                 .topic_session_id
@@ -822,11 +865,26 @@ impl Daemon {
             execution
         };
         let execution = handler.finish().and(execution);
+        self.finish_topic_attempt_execution(
+            &topic.id,
+            &attempt.id,
+            execution,
+            step_cancel.is_cancelled(),
+        )
+    }
+
+    pub(super) fn finish_topic_attempt_execution(
+        &self,
+        topic_id: &str,
+        attempt_id: &str,
+        execution: Result<(HarnessResult, Vec<TopicArtifact>)>,
+        cancelled: bool,
+    ) -> Result<()> {
+        let saved = self
+            .with_reader(|st| st.get_topic_attempt(attempt_id))?
+            .context("attempt vanished")?;
         let (status, summary, outputs, harness_session) = match execution {
             Ok((result, outputs)) => {
-                let saved = self
-                    .with_reader(|st| st.get_topic_attempt(&attempt.id))?
-                    .context("attempt vanished")?;
                 let status = if saved.summary.is_some()
                     && matches!(
                         saved.status,
@@ -839,28 +897,41 @@ impl Daemon {
                 let summary = saved.summary.unwrap_or(result.message);
                 (status, summary, outputs, result.session_id)
             }
-            Err(error) => (
-                if step_cancel.is_cancelled() {
-                    TopicAttemptStatus::Cancelled
-                } else {
-                    TopicAttemptStatus::Failed
-                },
-                format!("{error:#}"),
-                vec![],
-                None,
-            ),
+            Err(error) => {
+                if matches!(
+                    saved.status,
+                    TopicAttemptStatus::Succeeded
+                        | TopicAttemptStatus::Failed
+                        | TopicAttemptStatus::Cancelled
+                        | TopicAttemptStatus::Abandoned
+                ) {
+                    tracing::warn!(attempt_id,error=%format!("{error:#}"),"harness error after terminal topic attempt report");
+                }
+                (
+                    if cancelled {
+                        TopicAttemptStatus::Cancelled
+                    } else {
+                        TopicAttemptStatus::Failed
+                    },
+                    format!("{error:#}"),
+                    vec![],
+                    None,
+                )
+            }
         };
         self.with_store(|st| {
             st.finish_topic_step(
-                &attempt.id,
+                attempt_id,
                 status,
                 &summary,
                 &outputs,
                 harness_session.as_deref(),
             )
         })?;
-        self.close_topic_interactions(&topic.id, Some(&attempt.id));
-        self.broadcast(Event::TopicChanged { topic_id: topic.id });
+        self.close_topic_interactions(topic_id, Some(attempt_id));
+        self.broadcast(Event::TopicChanged {
+            topic_id: topic_id.into(),
+        });
         Ok(())
     }
 

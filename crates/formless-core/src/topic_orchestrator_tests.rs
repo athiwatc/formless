@@ -85,7 +85,7 @@ if mode in ('directory','directory_read','directory_merge'):
     else:
         assert pathlib.Path('seed.txt').exists()
         pathlib.Path('result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt').write_text(os.getcwd())
-        if pathlib.Path('absolute-link').exists():pathlib.Path('absolute-link').write_text('private copy')
+        if pathlib.Path('internal-link').exists():pathlib.Path('internal-link').write_text('private copy')
 if mode=='directory':
     gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
     gate.with_suffix('.ready').write_text(str(os.getpid()))
@@ -281,6 +281,16 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     assert_eq!(message.role, "user");
     assert!(message.content.contains("Available harness kinds: claude, codex, pi; opencode, antigravity, acp and muse currently return adapter-not-integrated errors."));
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
+    assert!(message
+        .content
+        .contains("Inputs are exact artifact references from any finalized output in this topic."));
+    assert!(message
+        .content
+        .contains("Combine inputs only when intended, in an isolated step."));
+    assert!(message
+        .content
+        .contains("Never push or modify the source workspace or its branch."));
+    assert!(!message.content.contains("selected feature's outputs"));
     let session = topic.topic_session_id.clone().unwrap();
     let wire = f
         .daemon()
@@ -900,7 +910,7 @@ async fn topic_retry_refuses_live_steps_after_normal_model_end_without_losing_re
 }
 
 #[tokio::test]
-async fn topic_reported_result_cannot_complete_feature_before_exit_and_validation() {
+async fn topic_reported_result_waits_for_exit_and_is_not_overwritten_by_validation_errors() {
     let env = crate::credential_env::EnvGuard::isolated();
     for dirty in [false, true] {
         env.set(
@@ -960,21 +970,18 @@ async fn topic_reported_result_cannot_complete_feature_before_exit_and_validatio
             .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
             .await
             .unwrap();
-        assert_eq!(done["status"], if dirty { "failed" } else { "succeeded" });
+        assert_eq!(done["status"], "succeeded");
+        assert_eq!(done["summary"], "provisional result");
         assert_eq!(
             state(&f, &topic.id).features[0].status,
             TopicFeatureStatus::Pending
         );
-        if dirty {
-            assert!(done["summary"].as_str().unwrap().contains("clean worktree"));
-        } else {
-            assert_eq!(
-                f.daemon()
-                    .finish_topic_feature_tool(&session, &args, true)
-                    .unwrap()["status"],
-                "complete"
-            );
-        }
+        assert_eq!(
+            f.daemon()
+                .finish_topic_feature_tool(&session, &args, true)
+                .unwrap()["status"],
+            "complete"
+        );
         f.daemon().request_shutdown();
         ipc.await.unwrap().unwrap();
     }
@@ -1546,7 +1553,7 @@ async fn topic_directory_writes_are_isolated_and_merge_receives_both_copies() {
     let source = f.root.join("source directory");
     std::fs::create_dir(&source).unwrap();
     std::fs::write(source.join("seed.txt"), "source stays unchanged").unwrap();
-    std::os::unix::fs::symlink(source.join("seed.txt"), source.join("absolute-link")).unwrap();
+    std::os::unix::fs::symlink("seed.txt", source.join("internal-link")).unwrap();
     let topic = topic(&f, Some(source.clone()), true);
     assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
     std::fs::create_dir(source.join(".git")).unwrap();
@@ -1580,11 +1587,11 @@ async fn topic_directory_writes_are_isolated_and_merge_receives_both_copies() {
     for workspace in [&a, &b] {
         assert!(!workspace.join(".git").exists());
         assert_eq!(
-            std::fs::read_to_string(workspace.join("absolute-link")).unwrap(),
+            std::fs::read_to_string(workspace.join("internal-link")).unwrap(),
             "private copy"
         );
         assert!(workspace
-            .join("absolute-link")
+            .join("internal-link")
             .canonicalize()
             .unwrap()
             .starts_with(workspace));
@@ -1738,6 +1745,72 @@ async fn topic_directory_read_only_empty_and_symlink_escape_cases() {
 }
 
 #[tokio::test]
+async fn topic_directory_preserves_dangling_internal_links_and_rejects_lexical_escapes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    for (name, relative, accepted) in [
+        ("internal", Some("../build/./generated.txt"), true),
+        ("escape", Some("../../missing/generated.txt"), false),
+        ("absolute", None, false),
+    ] {
+        let source = f.root.join(name);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("links")).unwrap();
+        let link = relative
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.join("missing/generated.txt"));
+        std::os::unix::fs::symlink(&link, source.join("links/pending")).unwrap();
+        let topic = topic(&f, Some(source.clone()), false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let copied = attempt_workspace(&f, result["id"].as_str().unwrap()).join("links/pending");
+        if accepted {
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert!(std::fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_link(&copied).unwrap().as_os_str(),
+                link.as_os_str()
+            );
+            assert!(!copied.exists());
+        } else {
+            assert_eq!(result["status"], "failed", "{result}");
+            assert!(result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("symlink escapes"));
+            assert!(std::fs::symlink_metadata(&copied).is_err());
+        }
+        assert_eq!(
+            std::fs::read_link(source.join("links/pending"))
+                .unwrap()
+                .as_os_str(),
+            link.as_os_str()
+        );
+        assert!(!source.join("links/pending").exists());
+    }
+}
+
+#[tokio::test]
 async fn topic_git_writes_have_distinct_branches_and_explicit_merge_gets_both_revisions() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "git_isolated");
@@ -1870,6 +1943,73 @@ async fn topic_orchestrator_fixture_pi_rpc_launch_and_recorded_outputs() {
     server.abort();
     f.daemon().shutdown.cancel();
     ipc.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn topic_directory_symlink_chains_follow_existing_prefixes_before_parent_components() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let victim = f.root.join("victim");
+    std::fs::write(&victim, "outside").unwrap();
+    for (name, hop, link, accepted) in [
+        ("escape", ".", "hop/../victim", false),
+        ("dangling_escape", ".", "hop/../absent-victim", false),
+        ("internal", "inner", "hop/../seed.txt", true),
+        ("dangling_internal", "inner", "hop/../missing/output", true),
+        ("reentry", "inner", "missing/../hop/../../victim", false),
+    ] {
+        let source = f.root.join(name);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("inner")).unwrap();
+        std::fs::write(source.join("seed.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink(hop, source.join("hop")).unwrap();
+        std::os::unix::fs::symlink(link, source.join("probe")).unwrap();
+        let topic = topic(&f, Some(source.clone()), false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let copied = attempt_workspace(&f, result["id"].as_str().unwrap()).join("probe");
+        if accepted {
+            assert_eq!(result["status"], "succeeded", "{name}: {result}");
+            assert_eq!(
+                std::fs::read_link(&copied).unwrap().as_os_str(),
+                std::ffi::OsStr::new(link)
+            );
+            if name == "internal" {
+                assert_eq!(std::fs::read_to_string(&copied).unwrap(), "inside");
+            } else {
+                assert!(!copied.exists());
+            }
+        } else {
+            assert_eq!(result["status"], "failed", "{name}: {result}");
+            assert!(result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("symlink escapes"));
+            assert!(std::fs::symlink_metadata(copied).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(source.join("seed.txt")).unwrap(),
+            "inside"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "outside");
+    }
 }
 
 #[tokio::test]
