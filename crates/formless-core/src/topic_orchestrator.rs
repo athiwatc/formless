@@ -138,9 +138,165 @@ impl Drop for ProcessGroup {
 }
 
 impl Daemon {
+    pub(super) async fn wait_topic_steps(
+        &self,
+        session: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wait {
+            attempt_ids: Option<Vec<String>>,
+            timeout_secs: Option<u64>,
+        }
+        let args: Wait = serde_json::from_value(args.clone())?;
+        let timeout = args.timeout_secs.unwrap_or(600);
+        if !(1..=600).contains(&timeout) {
+            bail!("timeout_secs must be between 1 and 600");
+        }
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        if !matches!(
+            topic.status,
+            TopicStatus::Running | TopicStatus::NeedsUser | TopicStatus::Cancelled
+        ) {
+            bail!("topic is not active");
+        }
+        if args.attempt_ids.as_ref().is_some_and(|ids| {
+            ids.iter()
+                .any(|id| !topic.attempts.iter().any(|a| &a.id == id))
+        }) {
+            bail!("attempt_ids must belong to this topic");
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+        let mut timed_out = false;
+        loop {
+            let wake = self.topic_activity.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            let current = self
+                .with_reader(|st| st.get_topic(&topic.id))?
+                .context("topic was removed")?;
+            let mut attempts = current
+                .attempts
+                .into_iter()
+                .filter(|a| {
+                    args.attempt_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&a.id))
+                })
+                .collect::<Vec<_>>();
+            attempts.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.id.cmp(&b.id)));
+            let snapshot = |event: &str| json!({"event":event,"topic_status":current.status,"attempts":attempts});
+            if cancel.is_cancelled()
+                || self.shutdown.is_cancelled()
+                || current.status == TopicStatus::Cancelled
+            {
+                return Ok(snapshot("cancelled"));
+            }
+            {
+                let attention = self.pending_attention.locked().clone();
+                let mut cursors = self.topic_wait_seen.locked();
+                let seen = cursors.entry(session.into()).or_default();
+                for event in attention {
+                    match event {
+                        Event::UserQuestion {
+                            question_id,
+                            topic_id,
+                            attempt_id,
+                            questions,
+                            user_only,
+                            ..
+                        } if topic_id.as_deref() == Some(topic.id.as_str())
+                            && args.attempt_ids.as_ref().is_none_or(|ids| {
+                                attempt_id.as_ref().is_some_and(|id| ids.contains(id))
+                            }) =>
+                        {
+                            if !self.questions.locked().contains_key(&question_id) {
+                                continue;
+                            }
+                            if !user_only || seen.insert(format!("question:{question_id}")) {
+                                return Ok(
+                                    json!({"event":"question","question_id":question_id,"attempt_id":attempt_id,"questions":questions,"user_only":user_only}),
+                                );
+                            }
+                        }
+                        Event::HarnessPermissionRequested {
+                            permission_id,
+                            topic_id,
+                            attempt_id,
+                            harness,
+                            acp_agent,
+                            title,
+                            kind,
+                            ..
+                        } if topic_id == topic.id
+                            && args
+                                .attempt_ids
+                                .as_ref()
+                                .is_none_or(|ids| ids.contains(&attempt_id)) =>
+                        {
+                            if !self
+                                .harness_permissions
+                                .locked()
+                                .contains_key(&permission_id)
+                            {
+                                continue;
+                            }
+                            if seen.insert(format!("permission:{permission_id}")) {
+                                return Ok(
+                                    json!({"event":"permission","informational_only":true,"permission_id":permission_id,"attempt_id":attempt_id,"harness":harness,"acp_agent":acp_agent,"title":title,"kind":kind}),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for attempt in &attempts {
+                    let active = self
+                        .topic_steps
+                        .locked()
+                        .contains_key(&(topic.id.clone(), attempt.id.clone()));
+                    if !active
+                        && attempt.status != TopicAttemptStatus::Running
+                        && seen.insert(format!("attempt:{}", attempt.id))
+                    {
+                        return Ok(
+                            json!({"event":"completed","attempt_id":attempt.id,"status":attempt.status,"summary":attempt.summary,"outputs":attempt.outputs,"conversation_session_id":attempt.conversation_session_id}),
+                        );
+                    }
+                }
+            }
+            if timed_out
+                || !attempts.iter().any(|a| {
+                    a.status == TopicAttemptStatus::Running
+                        || self
+                            .topic_steps
+                            .locked()
+                            .contains_key(&(topic.id.clone(), a.id.clone()))
+                        || a.status == TopicAttemptStatus::NeedsUser
+                            && current
+                                .features
+                                .iter()
+                                .any(|f| f.active_attempt_id.as_ref() == Some(&a.id))
+                })
+            {
+                return Ok(snapshot("snapshot"));
+            }
+            tokio::select! {
+                _=cancel.cancelled()=>{},
+                _=self.shutdown.cancelled()=>{},
+                _=&mut wake=>{},
+                _=tokio::time::sleep_until(deadline)=>{timed_out=true;},
+            }
+        }
+    }
+
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Decide how to complete these independent features using topic_run_step, topic_complete_feature, topic_fail_feature and ask_user. The outline is advisory: you decide the steps and harnesses. Inspect failures and choose another harness when an adapter is unavailable. Explicitly finish every feature; a step result is not feature completion. Never merge or push. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex; pi, opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from the selected feature's outputs.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never merge or push. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex; pi, opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from the selected feature's outputs. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
         let start = async {
             let session = topic
                 .topic_session_id
@@ -151,12 +307,16 @@ impl Daemon {
             }
             let daemon = self.clone();
             tokio::spawn(async move {
-                daemon
-                    .handle(Request::SendMessage {
-                        session_id: session,
-                        content: kickoff,
-                        mode: SendMode::Send,
-                        client_msg_id: None,
+                GENERATED_MESSAGE
+                    .scope("topic_kickoff".into(), async move {
+                        daemon
+                            .handle(Request::SendMessage {
+                                session_id: session,
+                                content: kickoff,
+                                mode: SendMode::Send,
+                                client_msg_id: None,
+                            })
+                            .await
                     })
                     .await
             })
@@ -204,20 +364,31 @@ impl Daemon {
         Ok(topic)
     }
 
-    pub(super) fn topic_orchestrator_ended(&self, session: &str, status: &str) {
-        match self.with_store(|st| st.finish_topic_orchestrator(session, status)) {
+    pub(super) fn topic_orchestrator_ended<'a>(
+        &self,
+        session: &str,
+        run: &str,
+        status: &'a str,
+    ) -> &'a str {
+        match self.with_store(|st| st.finish_topic_orchestrator(session, run, status)) {
             Ok(Some(topic_id)) => {
-                for ((id, _), cancel) in self.topic_steps.locked().iter() {
-                    if id == &topic_id {
-                        cancel.cancel();
+                if status != "completed" {
+                    for ((id, _), cancel) in self.topic_steps.locked().iter() {
+                        if id == &topic_id {
+                            cancel.cancel();
+                        }
                     }
+                    self.close_topic_interactions(&topic_id, None);
                 }
-                self.close_topic_interactions(&topic_id, None);
                 self.broadcast(Event::TopicChanged { topic_id });
+                if matches!(status, "paused" | "failed" | "error") {
+                    return "abandoned";
+                }
             }
             Ok(None) => {}
             Err(error) => tracing::warn!("could not finalize topic orchestrator: {error:#}"),
         }
+        status
     }
 
     pub(super) fn finish_topic_feature_tool(
@@ -233,6 +404,19 @@ impl Daemon {
         let detail = args[field]
             .as_str()
             .with_context(|| format!("{field} is required"))?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        let unfinalized = {
+            let steps = self.topic_steps.locked();
+            topic.attempts.iter().any(|attempt| {
+                attempt.feature_id == feature
+                    && steps.contains_key(&(topic.id.clone(), attempt.id.clone()))
+            })
+        };
+        if unfinalized {
+            bail!("feature has a live attempt; wait for CLI exit and output validation");
+        }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
         self.broadcast(Event::TopicChanged {
@@ -279,20 +463,10 @@ impl Daemon {
         {
             bail!("inputs must be exact artifacts from this feature's outputs");
         }
-        let step_cancel = cancel.child_token();
-        let key = (topic.id.clone(), feature.id.clone());
-        {
-            let mut steps = self.topic_steps.locked();
-            if steps.contains_key(&key) {
-                bail!("feature already has an active attempt");
-            }
-            steps.insert(key.clone(), step_cancel.clone());
+        if cancel.is_cancelled() {
+            bail!("step cancelled before preparation");
         }
-        let _lease = StepLease {
-            daemon: self.clone(),
-            key,
-            token: step_cancel.clone(),
-        };
+        let step_cancel = self.shutdown.child_token();
         let root = private_dir(
             &self.paths.data_dir,
             &PathBuf::from("topic-attempts").join(uuid::Uuid::new_v4().to_string()),
@@ -315,12 +489,12 @@ impl Daemon {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let attempt = {
+        let (attempt, lease) = {
             let _launch = self.topic_launch.locked();
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
             }
-            self.with_store(|st| {
+            let attempt = self.with_store(|st| {
                 st.begin_topic_attempt(
                     &topic.id,
                     &feature.id,
@@ -333,14 +507,103 @@ impl Daemon {
                     &token,
                     &workspace,
                 )
-            })?
+            })?;
+            let key = (topic.id.clone(), attempt.id.clone());
+            self.topic_steps
+                .locked()
+                .insert(key.clone(), step_cancel.clone());
+            let lease = StepLease {
+                daemon: self.clone(),
+                key,
+                token: step_cancel.clone(),
+            };
+            (attempt, lease)
         };
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),
         });
+        let launched = json!({"attempt_id":attempt.id,"conversation_session_id":attempt.conversation_session_id});
+        let run_cancel = self
+            .runs
+            .locked()
+            .get(session)
+            .map(|run| run.cancel.clone())
+            .unwrap_or_else(|| cancel.clone());
+        let daemon = self.clone();
+        tokio::spawn(async move {
+            let _lease = lease;
+            let attempt_id = attempt.id.clone();
+            let topic_id = topic.id.clone();
+            use futures_util::FutureExt;
+            let result = std::panic::AssertUnwindSafe(daemon.execute_topic_attempt(
+                topic,
+                step,
+                attempt,
+                token,
+                workspace,
+                root,
+                inputs,
+                step_cancel,
+                run_cancel,
+            ))
+            .catch_unwind()
+            .await;
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(_) => {
+                    Some("attempt worker panicked; inspect its conversation before retrying".into())
+                }
+            };
+            if let Some(error) = error {
+                let saved = daemon.with_store(|st| {
+                    if st.get_topic_attempt(&attempt_id)?.is_some_and(|a| {
+                        matches!(
+                            a.status,
+                            TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
+                        )
+                    }) {
+                        st.finish_topic_step(
+                            &attempt_id,
+                            TopicAttemptStatus::Failed,
+                            &error,
+                            &[],
+                            None,
+                        )?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = saved {
+                    tracing::warn!("could not finalize topic attempt: {error:#}");
+                }
+                daemon.close_topic_interactions(&topic_id, Some(&attempt_id));
+                daemon.broadcast(Event::TopicChanged { topic_id });
+            }
+        });
+        Ok(launched)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_topic_attempt(
+        self: &Arc<Self>,
+        topic: TopicInfo,
+        step: Step,
+        attempt: TopicAttemptInfo,
+        token: String,
+        workspace: PathBuf,
+        root: PathBuf,
+        inputs: Vec<TopicArtifact>,
+        step_cancel: CancellationToken,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let feature = topic
+            .features
+            .iter()
+            .find(|feature| feature.id == step.feature_id)
+            .context("feature vanished")?;
         let handler = self.topic_interaction_handler(&attempt.id, &token)?;
-        let execution = self
-            .execute_topic_step(
+        let execution = {
+            let execution = self.execute_topic_step(
                 &topic,
                 feature,
                 &step,
@@ -351,8 +614,15 @@ impl Daemon {
                 &inputs,
                 handler.as_ref(),
                 &step_cancel,
-            )
-            .await;
+            );
+            tokio::pin!(execution);
+            let execution = tokio::select! {
+                biased;
+                _=cancel.cancelled()=>{step_cancel.cancel();execution.await},
+                result=&mut execution=>result,
+            };
+            execution
+        };
         let execution = handler.finish().and(execution);
         let (status, summary, outputs, harness_session) = match execution {
             Ok((result, outputs)) => {
@@ -382,7 +652,7 @@ impl Daemon {
                 None,
             ),
         };
-        let finished = self.with_store(|st| {
+        self.with_store(|st| {
             st.finish_topic_step(
                 &attempt.id,
                 status,
@@ -393,9 +663,7 @@ impl Daemon {
         })?;
         self.close_topic_interactions(&topic.id, Some(&attempt.id));
         self.broadcast(Event::TopicChanged { topic_id: topic.id });
-        Ok(
-            json!({"status":finished.status,"summary":finished.summary,"outputs":finished.outputs,"conversation_session_id":finished.conversation_session_id}),
-        )
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

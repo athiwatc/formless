@@ -7121,3 +7121,53 @@ requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
 memory, scoped to the current attempt and the exact kind/title/input, never
 persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
 permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.
+
+topic_run_step launches asynchronously and returns {attempt_id,
+conversation_session_id}. Independent features can run concurrently; a feature
+still permits only one active step. topic_wait {attempt_ids?, timeout_secs?}
+waits for a finished attempt, a question or an informational permission notice.
+timeout_secs defaults to 600 and must be in 1..=600. An empty selection or no
+active work returns a snapshot immediately. Attempt IDs are scoped to this
+topic; completion and user-only informational notices are consumed once per
+Topic Chat daemon lifetime. Ordinary harness questions remain pending until
+answered. Cancellation and daemon shutdown unblock waits. There is no child
+model run. Normal model-run completion with open work marks NeedsUser and
+appends a durable "send a message to continue" note; harnesses may continue,
+but no model follow-up is started automatically. Run interruption/error
+cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.

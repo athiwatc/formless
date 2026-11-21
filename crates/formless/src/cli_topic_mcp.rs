@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use formless_core::Paths;
-use formless_protocol::{Request, TopicMcpOperation, TopicMcpRequest};
+use formless_protocol::{Request, ServerMessage, TopicMcpOperation, TopicMcpRequest};
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 
@@ -51,6 +51,39 @@ fn tools() -> Value {
         tools.push(json!({"name":name,"description":description,"inputSchema":schema}));
     }
     json!({"tools":tools})
+}
+
+fn wait_response(receiver: &std::sync::mpsc::Receiver<ServerMessage>, id: u64) -> Result<Value> {
+    loop {
+        match receiver
+            .recv()
+            .context("topic daemon disconnected while waiting for a reply")?
+        {
+            ServerMessage::Response {
+                id: response_id,
+                ok,
+                result,
+                error,
+                ..
+            } if response_id == id => {
+                return if ok {
+                    Ok(result.unwrap_or(Value::Null))
+                } else {
+                    bail!(
+                        "{}",
+                        error.unwrap_or_else(|| "topic daemon request failed".into())
+                    )
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+fn request_operation(paths: &Paths, request: TopicMcpRequest) -> Result<Value> {
+    let (client, receiver) = formless_tui::client::DaemonClient::connect(paths)?;
+    let id = client.send(Request::TopicMcp { request });
+    wait_response(&receiver, id)
 }
 
 fn operation(name: &str, args: &Value) -> Result<TopicMcpOperation> {
@@ -124,14 +157,12 @@ pub(crate) fn serve(paths: &Paths, attempt: &str) -> Result<()> {
         }
         let response = match serde_json::from_slice(&line) {
             Ok(message) => respond(message, |operation| {
-                formless_tui::client::request_once(
+                request_operation(
                     paths,
-                    Request::TopicMcp {
-                        request: TopicMcpRequest {
-                            attempt_id: attempt.into(),
-                            capability_token: token.clone(),
-                            operation,
-                        },
+                    TopicMcpRequest {
+                        attempt_id: attempt.into(),
+                        capability_token: token.clone(),
+                        operation,
                     },
                 )
             }),
@@ -149,6 +180,46 @@ pub(crate) fn serve(paths: &Paths, attempt: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn topic_mcp_waits_for_matching_daemon_reply_or_disconnect() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || wait_response(&rx, 7));
+        tx.send(ServerMessage::Response {
+            id: 6,
+            ok: true,
+            result: Some(json!("unrelated")),
+            error: None,
+        })
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!handle.is_finished());
+        tx.send(ServerMessage::Response {
+            id: 7,
+            ok: true,
+            result: Some(json!("cancelled")),
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(handle.join().unwrap().unwrap(), json!("cancelled"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        assert!(wait_response(&rx, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("disconnected"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ServerMessage::Response {
+            id: 7,
+            ok: false,
+            result: None,
+            error: Some("attempt ended".into()),
+        })
+        .unwrap();
+        assert!(wait_response(&rx, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("attempt ended"));
+    }
     #[test]
     fn topic_mcp_v2_tools_cannot_approve_start_or_decide_permissions() {
         for name in [
