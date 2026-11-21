@@ -2,6 +2,28 @@ use super::*;
 use crate::session_usage::{Report, Target};
 
 impl Shell {
+    pub(super) fn session_usage_command_reason(&self) -> Option<&'static str> {
+        if self.destination != Destination::Chat || self.usage_target().is_none() {
+            Some("Choose a connected Session in Chat first")
+        } else {
+            self.session_usage
+                .pending()
+                .then_some("Wait for the current usage read")
+        }
+    }
+
+    pub(super) fn read_current_session_usage(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = self.usage_target() {
+            self.read_session_usage(target, self.session_usage.revision, window, cx);
+            self.open_panel(false, window, cx);
+            self.usage_controls[0].0.focus(window, cx);
+        }
+    }
+
     fn usage_target(&self) -> Option<Target> {
         let client = self.client.as_ref()?;
         (self.client_connected && client.is_ready() && self.client_snapshot_ready)
