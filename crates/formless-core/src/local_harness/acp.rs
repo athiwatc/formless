@@ -24,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 use super::{HarnessRequest, HarnessResult, HarnessRole};
 
 const PROTOCOL_VERSION: u64 = 1;
-const JSON_RPC_AUTH_REQUIRED: i64 = -32000;
 const CANCELLED: &str = "The harness run was cancelled.";
 const POLL: Duration = Duration::from_millis(50);
 /// How long the agent may take to end a turn after `session/cancel` before it is killed.
@@ -45,8 +44,10 @@ pub struct AgentSpec {
     pub args: fn(&HarnessRequest) -> Vec<OsString>,
     /// Validates the `initialize` result (protocol, version, capabilities).
     pub check_agent: fn(&Value) -> Result<()>,
-    /// Returned when `session/new` reports JSON-RPC -32000 (authentication required).
+    /// Returned when `session/new` reports one of `auth_error_codes`.
     pub not_signed_in: &'static str,
+    /// JSON-RPC session errors that indicate missing authentication or configuration.
+    pub auth_error_codes: &'static [i64],
     /// Read-only session modes for review runs, most preferred first. The first one the
     /// session advertises (a `mode` config option, or `modes.availableModes`) is selected;
     /// if none is advertised, `session/set_mode` is tried with the first candidate.
@@ -324,7 +325,7 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             permissions,
         )?
         .map_err(|code| match code {
-            JSON_RPC_AUTH_REQUIRED => {
+            code if spec.auth_error_codes.contains(&code) => {
                 let methods: Vec<&str> = initialized
                     .get("authMethods")
                     .and_then(Value::as_array)
@@ -491,7 +492,13 @@ fn find_config_option(session: &Value, category: &str, value: &str) -> Option<St
         .get("configOptions")?
         .as_array()?
         .iter()
-        .filter(|option| option.get("category").and_then(Value::as_str) == Some(category))
+        .filter(|option| option.get("id").and_then(Value::as_str) == Some(category))
+        .chain(
+            session.get("configOptions")?.as_array()?.iter().filter(|option| {
+                option.get("id").and_then(Value::as_str) != Some(category)
+                    && option.get("category").and_then(Value::as_str) == Some(category)
+            }),
+        )
         .find(|option| {
             option
                 .get("options")
