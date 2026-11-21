@@ -332,8 +332,7 @@ impl Dispatch {
             return;
         }
         *s = match result {
-            Err(e) if !ok => Status::Rejected(e.chars().take(500).collect()),
-            Ok(v) if receipt(&self.action, &v) => Status::Applied(
+            Ok(v) if ok && receipt(&self.action, &v) => Status::Applied(
                 if self.action.kind == Kind::ProviderRetry && v["retrying"] == false {
                     "No provider request was available; nothing was retried.".into()
                 } else {

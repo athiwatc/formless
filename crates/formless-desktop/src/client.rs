@@ -2578,6 +2578,7 @@ impl Engine {
             Pending::RunForecast(w) => self.action_forecast(w, result),
             Pending::RunConsent(w) => self.action_consented(w, result),
             Pending::RunWrite(w) => {
+                let acknowledged = response_ok && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v));
                 if response_ok && w.dispatch.action.kind == crate::run_actions::Kind::Delete && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v)) {
                     if let Some(deadline) = result.as_ref().ok().and_then(|v| v["undo_secs"].as_u64()).and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs))) {
                         let ticket = crate::run_actions::DeleteUndo { owner: w.dispatch.action.owner.clone(), operation: uuid::Uuid::new_v4(), deadline };
@@ -2590,6 +2591,9 @@ impl Engine {
                 w.dispatch.finish(result, response_ok);
                 self.dirty_session = true;
                 self.dirty_list = true;
+                if !acknowledged {
+                    self.refresh();
+                }
             }
             Pending::LiveContext(owner) => self.context_received(owner, result),
             Pending::StreamSubscribe(owner) => self.stream_subscribed(owner, result),
@@ -3434,7 +3438,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
                         Some(Pending::RestoreSession(t)) if *ok && result.as_ref().is_some_and(|v| v["id"] == t.owner.session) => Some(Action { id: t.operation, session_id: t.owner.session.clone(), question_id: None }),
-                        Some(Pending::RunWrite(w)) if !ok || result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v)) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
+                        Some(Pending::RunWrite(w)) if *ok && result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v)) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
                         Some(Pending::ReviewedAction {action,work,..}) if *ok && result.as_ref().is_some_and(|value| work.acknowledges_reviewed_send(value)) => Some(action.clone()),

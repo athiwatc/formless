@@ -593,6 +593,22 @@ mod tests {
         assert!(e.outgoing.is_empty());
     }
     #[test]
+    fn daemon_mutation_error_is_unknown_and_reloads_canonical_state() {
+        let (mut e, ledger, d) = setup(Kind::Cwd);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        e.receive(ServerMessage::Response { id: request.id, ok: false, result: None, error: Some("persisted CWD, prompt refresh failed".into()) }).unwrap();
+        assert_eq!(ledger.status(), Status::Unknown);
+        assert!(ledger.status().notice().contains("may already have applied"));
+        assert!(e.outgoing.iter().any(|r| matches!(&r.request, Request::GetSession { id } if id == "s")));
+        assert!(!e.outgoing.iter().any(|r| matches!(r.request, Request::SetSessionCwd { .. })));
+        assert!(ledger.reserve(d.action).is_err());
+    }
+    #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {
         let (mut e, _, _) = setup(Kind::Compact);
         e.context_read();
