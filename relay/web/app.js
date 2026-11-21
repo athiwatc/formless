@@ -519,6 +519,7 @@
         (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
+    if (seg.some((part) => part.toLowerCase() === ".azure")) return [true, "holds cloud credentials"];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
     const pulumiWindowsPath = /^(?:[a-z]:|\\\\)/i.test(path);
     const pulumiPath = (pulumiWindowsPath ? path.split(/[\\/]+/) : seg)

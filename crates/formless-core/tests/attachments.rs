@@ -64,6 +64,16 @@ fn detects_vault_token_in_attachment_paths() {
 }
 
 #[test]
+fn detects_azure_cli_cache_in_attachment_paths() {
+    for name in [".azure/accessTokens.json", ".Azure/msal_token_cache.json"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/accessTokens.json", ".azure-example/notes.txt"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn detects_rclone_config_in_attachment_paths() {
     for name in [
         ".config/rclone/rclone.conf",
