@@ -54,6 +54,13 @@ fn local_discovery_first_paint_does_not_wait_for_the_worker_and_keeps_ipv6_url()
     assert_eq!(w.base_url, "http://[::1]:0/prefix/v1");
     assert_eq!(w.credential_endpoint, w.base_url);
     assert_eq!(w.preset.unwrap().id, "ollama");
+    w.apply_provider_endpoint(&mut cfg.provider);
+    cfg.save(&app.paths).unwrap();
+    let restored = Config::load_file_only(&app.paths).unwrap();
+    let mut reopened = Wizard::new(&restored);
+    assert_eq!(reopened.preset.unwrap().id, "ollama");
+    reopened.choose_preset();
+    assert_eq!(reopened.base_url, "http://[::1]:0/prefix/v1");
 }
 
 #[test]

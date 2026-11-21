@@ -268,3 +268,68 @@ mod tests {
         assert!(!error.chars().any(char::is_control));
     }
 }
+
+#[cfg(all(test, unix, not(target_os = "macos")))]
+#[test]
+fn stalled_clipboard_helpers_time_out_and_fallback_continues() {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let large_input = "clipboard fixture\n".repeat(10_000);
+    let output = fallback(WRITE, |cmd, _| {
+        if cmd == WRITE[0].0 {
+            let error = super::run_capture_until(
+                "sh",
+                &["-c", "exec sleep 60"],
+                Some(&large_input),
+                true,
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+            assert_eq!(error, "sh: timed out");
+            Err(error)
+        } else {
+            super::run_capture_impl("sh", &["-c", "printf 'fallback'"], None, true)
+        }
+    })
+    .unwrap();
+    assert_eq!(output, "fallback");
+    assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn helper_timeout_applies_while_stdout_is_open() {
+    let result = super::run_capture_until(
+        "sh",
+        &["-c", "printf 'partial'; exec sleep 60"],
+        None,
+        true,
+        std::time::Duration::from_millis(100),
+    );
+    assert_eq!(result.unwrap_err(), "sh: timed out");
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn powershell_clipboard_write_reads_multiline_utf8_from_stdin() {
+    let path =
+        std::env::temp_dir().join(format!("formless-clipboard-{}.txt", uuid::Uuid::new_v4()));
+    let quoted = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "function Set-Clipboard {{ [CmdletBinding()] param([string] $Value) \
+         [IO.File]::WriteAllText('{quoted}', $Value, [Text.UTF8Encoding]::new($false)) }}; {}",
+        super::POWERSHELL_CLIPBOARD_WRITE
+    );
+    let text = "first line\r\nไทย 日本語\nlast line";
+    super::run_capture_until(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
+        Some(text),
+        true,
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let actual = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(actual, text);
+}
