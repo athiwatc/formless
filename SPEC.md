@@ -1048,7 +1048,7 @@ task, with quality as a gate**.
   the next step boundary without killing in-flight work. **Ctrl+Enter =
   queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
-  `GetSession` lists them (`queued` texts, and `queued_items` with ids).
+  `GetSession` lists them (`queued` texts, and `queued_items` with ids and revisions).
   When idle, Enter simply starts a new Run. Steering extends the Run only
   when its message sequence is newer than the transcript boundary included
   in the actual provider request. A steer already included after a Tool
@@ -1063,10 +1063,12 @@ task, with quality as a gate**.
   removed, reordered). The TUI lists queued messages at the end of the
   chat with `/queue edit|rm|up|down N`; `/queue edit N` loads one into
   the input (`queued ›`), Enter saves, Esc cancels. The web lists them
-  above the composer with edit, ↑/↓ and remove buttons. Requests:
-  `EditQueued {session_id, id, content?}` (no content removes it) and
-  `MoveQueued {session_id, id, up}`. Editing a message that was already
-  sent fails with "no longer queued".
+  above the composer with edit, ↑/↓ and remove buttons. Reordering updates
+  both positions in one transaction and preserves each message ID and text.
+  Editors send the revision they opened with `EditQueuedIfCurrent`.
+  A reorder, edit or removal that intervenes causes a conflict. Removing a
+  message uses `EditQueued` without content. Clients without revisions can
+  still remove messages. `MoveQueued` returns the same message ID when it moves.
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
   recorded as user-cancelled, §8.2). `Ctrl+C` clears a typed message, and a second `Ctrl+C` within 2 s detaches the TUI client only.
 
@@ -1997,8 +1999,9 @@ pattern (§4.4).
 - **Tags:** Tools carry topic tags (`git`, `web`, `finance`).
   - **Setting them:** the agent passes `create_tool`'s optional `tags`; a
     new version without tags keeps the old ones. Users use `SetToolTags`:
-    `formless tools tag NAME [TAG…]`, `/tooltag NAME [TAG…]` in the TUI,
-    or the Tags field in the web Tool detail. None given clears them.
+    `formless tools tag NAME TAG…` or `formless tools tag NAME --clear`,
+    `/tooltag NAME [TAG…]` in the TUI, or the Tags field in the web Tool
+    detail. `formless tools tag NAME` reads the existing tags.
   - **Normalised:** lowercase, without `#`, spaces become `-`, only
     letters, digits, `-` and `_`, at most 24 characters each and 8 per
     Tool.
@@ -2728,11 +2731,12 @@ Tools fill capability gaps; skills say how to use them well.
   enabled state instead of previewing a name beginning with the verb.
   The web "Review" does the same preview. `/skill:NAME [args]`
   (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
-  Session: its instructions and arguments join the chat as a note, and
-  the load counts like the agent's.
+  Session. Once its note is saved, the manual load counts toward skill usage.
+  Run completion metrics count skill loads associated with a Run.
 - **Retired skills say why.** An auto-retired skill keeps
   `retire_reason` ("unused: …" or "unhelpful: N of M Runs that loaded it
-  completed"), shown by `/skills` and the web; enabling it clears it.
+  completed"), shown by `/skills` and the web. Enabling the skill or
+  installing a new version clears the reason.
 
 ### 7.11 User memory
 
@@ -3817,7 +3821,7 @@ Hooks let users enforce policy and automate workflows. Each is a
 [[hooks]]
 event = "pre_tool"              # pre_tool | post_tool | run_end
 tool = "mcp__*"                 # optional: name, with * wildcards
-capability = "net"              # optional: a declared Capability prefix
+capability = "net"              # optional: a Capability family or scope
 run_tool = "network_policy"     # a registry Tool, or…
 # command = ["/usr/local/bin/check"]   # …a command (no shell)
 # trusted = true                # run the command without asking
@@ -3828,6 +3832,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   Tool's Capabilities, Session and Run. post_tool adds the result
   (clipped to 4000 characters) and `ok`; run_end has the Run's `status`.
   A Tool hook gets it as input, and a command gets it on stdin.
+  For Tool calls, the `capabilities` payload and filter use scopes bound to the
+  call arguments. A binding failure keeps the declared list for the hook.
+  A family such as `net` matches the whole family. A scoped filter uses the
+  same host, port, wildcard and path-component rules as a Capability grant.
   After a command exits, Formless gives its output pipes a short grace
   period to drain and then stops any remaining processes in the hook's
   process group. A hook that reaches its timeout also stops the group.
@@ -4561,7 +4569,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached) per UTC day, or with `by` = "model",
+  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -6643,7 +6651,8 @@ under `crates/*/src` against README or SPEC, including test-only references.
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
 Private subprocess fixtures also use these test-only variables (no product
-configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
+configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
+`FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -6794,8 +6803,11 @@ the bounded recent Run list. Default/explicit day sends no group key and keeps
 the daemon's oldest-first day order; other groups keep its descending total-token
 order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
-the complete array and null costs. Cost is the daemon's current estimate, not a
+Human tables show cache writes, total tokens (prompt plus completion), and a
+final total row. Cached and cache-write tokens are included in prompt tokens.
+Unknown costs and unavailable cache-write counts display as `-`, including in
+totals that contain an unknown value. JSON preserves the complete row array,
+including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a
 billing guarantee. Session groups use the ID for attribution and display the
 current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
@@ -6834,6 +6846,11 @@ human-detail layout change leaves fetching, metrics and security fields intact.
 The existing GetTool all-version payload remains until protocol selectors
 are addressed separately (#889).
 
+Run inspection includes recorded cache-read, cache-write and reasoning token
+counts. The human `runs show` report derives duration from the stored timestamps,
+shows estimated USD amounts with six decimal places, and formats spend flags
+and unpriced model names for reading.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
@@ -6842,8 +6859,9 @@ an active Run query exits 0, and cancel exits 0 when its request succeeds.
 `--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
-Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
-returned stalled/abandoned flags and optional progress fraction/label.
+Tool/Session identifiers, optional Invocation ID, compact elapsed/silent
+durations for a minute or longer, returned stalled/abandoned flags and
+optional progress as a clamped whole percentage with its label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
 Outer `runs --json running` is also supported.

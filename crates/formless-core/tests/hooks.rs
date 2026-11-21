@@ -146,3 +146,83 @@ async fn pre_and_post_hooks_around_tool_calls() {
         "{logged}"
     );
 }
+
+#[tokio::test]
+async fn scoped_pre_hook_receives_the_input_bound_host_without_using_the_network() {
+    use formless_runtime::Capabilities;
+    use serde_json::json;
+
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let base = std::env::temp_dir().join(format!("fl-bound-hook-{short}"));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: format!("test-bound-hook-{short}"),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let mut config = Config {
+        hooks: vec![HookCfg {
+            event: "pre_tool".into(),
+            tool: Some("bound_fetch".into()),
+            capability: Some("net:api.sample.invalid".into()),
+            run_tool: Some("bound_policy".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    config.security.secure = false;
+    config.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let caps = Capabilities::parse(&["net:$input.url".into()]).unwrap();
+    store
+        .create_tool_version(
+            "bound_fetch",
+            "Input-bound host fixture",
+            r#"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}"#,
+            "{}",
+            "function run() { return {ran:true}; }",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    store
+        .create_tool_version(
+            "bound_policy",
+            "Checks that hooks receive the scoped host",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(e) { return e.capabilities.includes('net:api.sample.invalid:8443')
+                ? {deny:true, reason:'resolved API host'} : {deny:true, reason:'unexpected scope'}; }",
+            &Capabilities::default(),
+            64,
+            "user",
+        )
+        .unwrap();
+    drop(store);
+
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths).unwrap());
+    let exact = daemon
+        .call_tool_direct(
+            &session,
+            "bound_fetch",
+            json!({"url":"https://api.sample.invalid:8443/list"}),
+        )
+        .await;
+    assert_eq!(exact, "error: denied by a pre_tool hook: resolved API host");
+    let other = daemon
+        .call_tool_direct(
+            &session,
+            "bound_fetch",
+            json!({"url":"https://api.sample.invalid.example:8443/list"}),
+        )
+        .await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&other).unwrap(),
+        json!({"ran":true})
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(base).unwrap();
+}

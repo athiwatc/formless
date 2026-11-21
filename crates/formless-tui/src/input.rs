@@ -392,6 +392,32 @@ impl InputLine {
         &self.text[..self.cursor]
     }
 
+    /// Display expanded pastes except for a label the cursor is editing.
+    /// Borrow each segment so a small viewport never copies a full paste.
+    pub(crate) fn visit_expanded_editor(&self, mut visit: impl FnMut(&str, bool)) {
+        fn raw(input: &InputLine, start: usize, end: usize, visit: &mut impl FnMut(&str, bool)) {
+            let cursor = input.cursor.clamp(start, end);
+            if start < cursor {
+                visit(&input.text[start..cursor], true);
+            }
+            if cursor < end {
+                visit(&input.text[cursor..end], false);
+            }
+        }
+
+        let mut at = 0;
+        for paste in &self.pastes {
+            raw(self, at, paste.range.start, &mut visit);
+            if paste.range.start < self.cursor && self.cursor < paste.range.end {
+                raw(self, paste.range.start, paste.range.end, &mut visit);
+            } else {
+                visit(&paste.payload, paste.range.end <= self.cursor);
+            }
+            at = paste.range.end;
+        }
+        raw(self, at, self.text.len(), &mut visit);
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.before_edit(c != '\n' && self.selection().is_none());
         self.remove_selection();
