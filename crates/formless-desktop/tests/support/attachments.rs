@@ -90,6 +90,29 @@ fn queued(shell: &Entity<Shell>, cx: &mut App) -> Vec<Operation> {
 }
 
 #[gpui_kit::test]
+fn oversized_clipboard_images_are_rejected_before_copy_or_conversion(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    for format in [gpui_kit::ImageFormat::Png, gpui_kit::ImageFormat::Tiff] {
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
+            format,
+            vec![0; formless_desktop::client::attachments::MAX_FILE_BYTES + 1],
+        )));
+        step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+        cx.run_until_parked();
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            assert!(window
+                .find("composer-notice")
+                .value()
+                .unwrap()
+                .contains("larger than 20 MiB"));
+            assert!(queued(&shell, cx).is_empty());
+            assert!(shell.read(cx).draft(cx).is_empty());
+        });
+    }
+}
+
+#[gpui_kit::test]
 fn reconnect_refreshes_pending_chips_for_the_restored_session(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     step(cx, handle, |window, cx| {

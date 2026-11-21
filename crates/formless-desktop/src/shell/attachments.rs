@@ -162,6 +162,12 @@ impl Shell {
             ClipboardEntry::Image(image) => Some(image),
             _ => None,
         }) {
+            if image.bytes().len() > client::attachments::MAX_FILE_BYTES {
+                self.composer_notice =
+                    Some("Cannot attach clipboard image: file is larger than 20 MiB".into());
+                cx.notify();
+                return true;
+            }
             let (bytes, mime) = match client::attachments::clipboard_bytes(
                 image.bytes(),
                 image.format().mime_type(),
