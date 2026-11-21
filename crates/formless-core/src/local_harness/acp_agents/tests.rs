@@ -431,6 +431,45 @@ fn live_acp_agents_initialize_read_only_installed_binaries() {
     live_initialize(StepAccess::ReadOnly);
 }
 
+fn apply_profile_environment(command: &mut Command, spec: &AgentSpec) {
+    for name in spec.strip_env {
+        command.env_remove(name);
+    }
+    command.envs(spec.set_env.iter().copied());
+}
+
+#[test]
+fn live_initialize_environment_strips_before_applying_profile_overrides() {
+    let grok = spec("grok").unwrap();
+    let profile = AgentSpec {
+        strip_env: &["GROK_DISABLE_AUTOUPDATER", "TEST_PRIVATE"],
+        ..super::super::grok::SPEC
+    };
+    let mut command = Command::new("unused");
+    command
+        .env("GROK_DISABLE_AUTOUPDATER", "0")
+        .env("TEST_PRIVATE", "fixture");
+    apply_profile_environment(&mut command, &profile);
+    let environment: BTreeMap<_, _> = command.get_envs().collect();
+    assert_eq!(
+        environment[std::ffi::OsStr::new("GROK_DISABLE_AUTOUPDATER")],
+        Some(std::ffi::OsStr::new("1"))
+    );
+    assert_eq!(environment[std::ffi::OsStr::new("TEST_PRIVATE")], None);
+    assert_eq!(profile.set_env, grok.set_env);
+
+    let mut command = Command::new("unused");
+    command.env("TEST_PRIVATE", "fixture");
+    apply_profile_environment(&mut command, &GEMINI);
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        vec![(
+            std::ffi::OsStr::new("TEST_PRIVATE"),
+            Some(std::ffi::OsStr::new("fixture"))
+        )]
+    );
+}
+
 fn live_initialize(access: StepAccess) {
     let Some(bin_dir) = std::env::var_os("FORMLESS_LIVE_ACP_BIN_DIR") else {
         return;
@@ -463,6 +502,7 @@ fn live_initialize(access: StepAccess) {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        apply_profile_environment(&mut command, spec);
         let mut process = SupervisedProcess::spawn(command).unwrap();
         let (stdin, stdout, _) = process.take_pipes();
         let mut stdin = stdin.unwrap();
