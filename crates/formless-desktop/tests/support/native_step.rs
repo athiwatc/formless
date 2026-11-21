@@ -155,7 +155,12 @@ fn native_step_invalid_edit_preedit_and_editor_enter_never_send(cx: &mut TestApp
         shell.update(cx, |s, cx| {
             s.submit_step_review(Choice::Continue, window, cx)
         });
-        assert!(shell.update(cx, |s, _| s.take_client_commands()).is_empty());
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(
+            matches!(commands.as_slice(), [Wire::StageAttachments(operation)]
+            if operation.session_id == id
+                && matches!(operation.intake, formless_desktop::client::attachments::Intake::Refresh))
+        );
         window.press("escape", cx);
         window.render_frame(cx);
         assert!(window.try_find("step-review-dialog").is_some());
