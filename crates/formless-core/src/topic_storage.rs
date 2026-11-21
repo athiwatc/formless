@@ -31,9 +31,12 @@ impl Store {
                 )
                 .optional()?;
             if let Some(id) = existing {
-                return st.get_session(&id)?.ok_or_else(|| {
-                    anyhow!("main chat session metadata points to a missing session")
-                });
+                if let Some(session) = st.get_session(&id)? {
+                    if st.session_deleted(&id)? {
+                        bail!("Main Chat is pending deletion; restore it within the undo window or wait for it to be purged before opening a new Main Chat");
+                    }
+                    return Ok(session);
+                }
             }
             let session = st.create_session(Some("Main Chat".into()))?;
             st.conn.execute(
@@ -41,7 +44,8 @@ impl Store {
                 params![session.id],
             )?;
             st.conn.execute(
-                "INSERT INTO profile_metadata(key,value) VALUES('main_chat_session_id',?1)",
+                "INSERT INTO profile_metadata(key,value) VALUES('main_chat_session_id',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![session.id],
             )?;
             st.get_session(&session.id)?
