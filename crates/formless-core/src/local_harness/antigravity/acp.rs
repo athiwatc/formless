@@ -9,8 +9,10 @@ use std::{
     ffi::OsString,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{ChildStdin, ChildStdout, Command, Stdio},
 };
+
+use formless_runtime::process_group::SupervisedProcess;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -111,7 +113,8 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
     environment
 }
 
-struct AgentProcess(Child);
+/// `agy acp` and every process it starts (MCP servers, tools); dropping it kills them all.
+struct AgentProcess(SupervisedProcess);
 
 impl AgentProcess {
     fn spawn(request: &HarnessRequest) -> Result<Self> {
@@ -120,7 +123,8 @@ impl AgentProcess {
             .executable
             .clone()
             .unwrap_or_else(|| PathBuf::from("agy"));
-        let child = Command::new(&program)
+        let mut command = Command::new(&program);
+        command
             .args(["acp", "--disable-telemetry"])
             .current_dir(&request.cwd)
             .env_clear()
@@ -133,30 +137,18 @@ impl AgentProcess {
             .envs(agent_environment(request))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to start `agy acp`; is the Antigravity CLI installed and on PATH?")?;
-        Ok(Self(child))
+            .stderr(Stdio::null());
+        let process = SupervisedProcess::spawn(command).map_err(|error| {
+            anyhow!("failed to start `agy acp` ({error}); is the Antigravity CLI installed and on PATH?")
+        })?;
+        Ok(Self(process))
     }
 
-    fn pipes(
-        &mut self,
-    ) -> Result<(
-        BufReader<std::process::ChildStdout>,
-        std::process::ChildStdin,
-    )> {
-        let stdout = self.0.stdout.take().context("agy acp stdout unavailable")?;
-        let stdin = self.0.stdin.take().context("agy acp stdin unavailable")?;
+    fn pipes(&mut self) -> Result<(BufReader<ChildStdout>, ChildStdin)> {
+        let child = self.0.child_mut();
+        let stdout = child.stdout.take().context("agy acp stdout unavailable")?;
+        let stdin = child.stdin.take().context("agy acp stdin unavailable")?;
         Ok((BufReader::new(stdout), stdin))
-    }
-}
-
-impl Drop for AgentProcess {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
     }
 }
 
