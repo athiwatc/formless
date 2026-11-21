@@ -239,7 +239,7 @@
           const bytes = S.relayModule.wireBytes(text, S.relayModule.LIMITS.plaintext);
           // Known serialization/UTF8/GCM/base64/string copies and bounded
           // fragment lookahead. This is not a DOM/application-state RSS cap.
-          lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024);
+          lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024 + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
         }
       } catch (error) { return reject(error); }
       const timer = setTimeout(() => {
