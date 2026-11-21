@@ -38,3 +38,61 @@ test('hover-only visibility does not schedule recovery; actual removal is coales
  c.document.activeElement={};frames.shift()();assert.equal(returns.length,0);
  c.document.activeElement=body;c.scheduleFocusRecovery();frames.shift()();assert.equal(returns[0],removed);
 });
+
+function captureFixture(rows, bounds, visible = true) {
+  const reads = [];
+  let queries = 0;
+  const roots = rows.map(({ top, bottom, height, live }, index) => {
+    const inner = { getBoundingClientRect: () => ({ top: top + 2, bottom, height }), contains: () => false };
+    const block = { getBoundingClientRect: () => ({ top, bottom, height }), contains: child => child === inner };
+    return {
+      dataset: live ? {} : { messageId: String(index) },
+      hasAttribute: attr => live && attr === "data-live-root",
+      getBoundingClientRect: () => { reads.push(index); return { top, bottom, height }; },
+      querySelectorAll: () => [block, inner],
+    };
+  });
+  const box = {
+    scrollTop: 500, getBoundingClientRect: () => ({ top: 10 }),
+    querySelectorAll: () => { queries++; return roots; },
+  };
+  const c = vm.createContext({
+    readingVisible: () => visible, $: () => box, visibleReadingBounds: () => bounds,
+    anchorBlocks: "p, li", readingStreamStamp: message => message.hasAttribute("data-live-root") ? "live" : null,
+  });
+  vm.runInContext(fn("captureReadingAnchor"), c);
+  const capture = c.captureReadingAnchor();
+  return {
+    top: capture?.top,
+    candidates: capture && Array.from(capture.candidates, ({ id, block, offset, stream }) => ({ id, block, offset, stream })),
+    reads, queries,
+  };
+}
+const rect = (top, bottom, height = bottom - top, live = false) => ({ top, bottom, height, live });
+
+test("anchor capture stops measuring roots once four qualify, without changing lower-bound selection", () => {
+  const rows = [rect(0, 41), rect(40, 140, 0), rect(300, 330), rect(45, 140),
+    rect(1000, 1100, 100, true), rect(65, 85), ...Array(1000).fill(rect(100, 120))];
+  const result = captureFixture(rows, { top: 40, bottom: 100 });
+  assert.deepEqual(result.candidates, [
+    { id: "2", block: 1, offset: 292, stream: null },
+    { id: "3", block: 1, offset: 37, stream: null },
+    { id: null, block: 1, offset: 992, stream: "live" },
+    { id: "5", block: 1, offset: 57, stream: null },
+  ]);
+  assert.equal(result.top, 500);
+  assert.equal(result.queries, 1);
+  assert.deepEqual(result.reads, [0, 1, 2, 3, 4, 5]);
+});
+
+test("no matches still measure all roots, while hidden captures do not query them", () => {
+  const rows = Array.from({ length: 50 }, (_, i) => rect(i * 20, i * 20 + 20));
+  const bounds = { top: 1200, bottom: 1300 };
+  const result = captureFixture(rows, bounds);
+  assert.deepEqual(result.candidates, []);
+  assert.equal(result.top, 500);
+  assert.equal(result.reads.length, rows.length);
+  const hidden = captureFixture(rows, bounds, false);
+  assert.equal(hidden.candidates, null);
+  assert.equal(hidden.queries, 0);
+});
