@@ -1,5 +1,6 @@
 use super::*;
 use crate::local_harness::{HarnessPermissionRequest, HarnessUpdate, InteractionHandler};
+use std::time::Duration;
 
 struct TopicFixture {
     fixture: Fixture,
@@ -116,6 +117,656 @@ fn permission(always: bool) -> HarnessPermissionRequest {
 }
 
 #[tokio::test]
+async fn topic_permission_rules_apply_audit_reject_precedence_and_user_only_fallback() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let add = |pattern: &str, decision| Request::AddTopicPermissionRule {
+        topic_id: f.topic.id.clone(),
+        harness: Some(HarnessKind::Claude),
+        acp_agent: None,
+        kind: None,
+        pattern: pattern.into(),
+        decision,
+    };
+    assert!(f
+        .daemon()
+        .handle(add("", TopicRuleDecision::AllowOnce))
+        .await
+        .is_err());
+    let allowed = f
+        .daemon()
+        .handle(add("Read *", TopicRuleDecision::AllowOnce))
+        .await
+        .unwrap();
+    let allow = allowed["permission_rules"][0]["rule_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let handler = f.handler();
+    assert_eq!(
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+            .as_deref(),
+        Some("allow")
+    );
+    let close=next_event(&mut events,|event|matches!(event,Event::HarnessPermissionClosed{by:Some(by),..} if by.starts_with("rule:"))).await;
+    assert!(
+        matches!(close,Event::HarnessPermissionClosed{by:Some(by),..}if by==format!("rule:{allow}"))
+    );
+    assert!(f.daemon().topic_notifications.locked().is_empty());
+    let rejected = f
+        .daemon()
+        .handle(add("*rm *", TopicRuleDecision::Reject))
+        .await
+        .unwrap();
+    let reject = rejected["permission_rules"][1]["rule_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut command = permission(false);
+    command.raw_input = Some(json!({"command":"do rm file"}));
+    assert_eq!(
+        handler
+            .request_permission(command, &CancellationToken::new())
+            .await
+            .as_deref(),
+        Some("reject")
+    );
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.attempt.conversation_session_id))
+        .unwrap();
+    assert!(messages
+        .iter()
+        .any(|message| message.content.contains(&format!("rule:{reject}"))));
+    for trust in [false, true] {
+        if trust {
+            f.daemon()
+                .handle(add("*", TopicRuleDecision::AllowOnce))
+                .await
+                .unwrap();
+            f.daemon()
+                .handle(add("*", TopicRuleDecision::Reject))
+                .await
+                .unwrap();
+        }
+        let mut request = permission(false);
+        if trust {
+            request.kind = "trust_workspace".into();
+        } else {
+            request.title = "Different".into();
+        }
+        let handler = f.handler();
+        let waiting = tokio::spawn(async move {
+            handler
+                .request_permission(request, &CancellationToken::new())
+                .await
+        });
+        let Event::HarnessPermissionRequested { permission_id, .. } =
+            next_event(&mut events, |event| {
+                matches!(event, Event::HarnessPermissionRequested { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        // Earlier automatic decisions are also audited as requested events.
+        let permission_id = if f
+            .daemon()
+            .harness_permissions
+            .locked()
+            .contains_key(&permission_id)
+        {
+            permission_id
+        } else {
+            loop {
+                let Event::HarnessPermissionRequested { permission_id, .. } =
+                    next_event(&mut events, |event| {
+                        matches!(event, Event::HarnessPermissionRequested { .. })
+                    })
+                    .await
+                else {
+                    unreachable!()
+                };
+                if f.daemon()
+                    .harness_permissions
+                    .locked()
+                    .contains_key(&permission_id)
+                {
+                    break permission_id;
+                }
+            }
+        };
+        assert!(!waiting.is_finished());
+        f.daemon()
+            .handle(Request::HarnessPermissionDecision {
+                permission_id,
+                option_id: Some("reject".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap().as_deref(), Some("reject"));
+    }
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: reject.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: reject
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_permission_rules_persist_across_restart_and_remove() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut f = TopicFixture::new(&env);
+    let saved = f
+        .daemon()
+        .handle(Request::AddTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            harness: None,
+            acp_agent: None,
+            kind: Some("read".into()),
+            pattern: "*".into(),
+            decision: TopicRuleDecision::AllowOnce,
+        })
+        .await
+        .unwrap();
+    drop(f.fixture.daemon.take());
+    f.fixture.daemon = Some(Arc::new(Daemon::new(f.fixture.paths.clone()).unwrap()));
+    assert_eq!(
+        serde_json::to_value(f.state().permission_rules).unwrap(),
+        saved["permission_rules"]
+    );
+    let removed = f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            rule_id: saved["permission_rules"][0]["rule_id"]
+                .as_str()
+                .unwrap()
+                .into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed["permission_rules"], json!([]));
+    assert!(f
+        .daemon()
+        .handle(Request::RemoveTopicPermissionRule {
+            topic_id: "missing".into(),
+            rule_id: "missing".into()
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_reject_rule_without_reject_option_bypasses_cached_allow_and_notifies() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let first = handler.clone();
+    let waiting = tokio::spawn(async move {
+        first
+            .request_permission(permission(true), &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: Some("allow".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.await.unwrap().as_deref(), Some("allow"));
+    f.daemon()
+        .handle(Request::AddTopicPermissionRule {
+            topic_id: f.topic.id.clone(),
+            harness: None,
+            acp_agent: None,
+            kind: None,
+            pattern: "*".into(),
+            decision: TopicRuleDecision::Reject,
+        })
+        .await
+        .unwrap();
+    let mut request = permission(true);
+    request.options.retain(|option| option.option_id == "allow");
+    let waiting = tokio::spawn(async move {
+        handler
+            .request_permission(request, &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    assert!(!waiting.is_finished());
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(waiting.await.unwrap().is_none());
+}
+
+#[test]
+fn topic_permission_globs_are_full_string_and_unicode_safe() {
+    use super::super::topic_interactions::permission_glob;
+    for (pattern, value, expected) in [
+        ("*", "", true),
+        ("a?", "a🦀", true),
+        ("Read *", "read file", false),
+        ("*rm *", "do rm file", true),
+        ("file", "prefix file", false),
+        ("a*b*c", "a xx b yy c", true),
+        ("a*b", "a xx c", false),
+        ("rm *", "rm *.txt", true),
+        ("rm *.*", "rm *.txt", true),
+        ("*", "* literal * and ?", true),
+        ("a*b", "a*literal b", true),
+        ("?x", "?x", true),
+        ("*?", "*", true),
+        ("a?", "a??", false),
+    ] {
+        assert_eq!(permission_glob(pattern, value), expected);
+    }
+}
+
+#[tokio::test]
+async fn topic_away_notifications_are_redacted_and_test_injected() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_TOPIC_NOTIFICATIONS");
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let cancel = CancellationToken::new();
+    let h = f.handler();
+    let c = cancel.clone();
+    let mut permission = permission(false);
+    permission.title = "Read ledger Bearer abcdefghijklmnopqrstuvwxyz".into();
+    permission.raw_input = Some(json!({"command":"raw-input-must-not-be-notified"}));
+    let waiting = tokio::spawn(async move { h.request_permission(permission, &c).await });
+    next_event(&mut events, |e| {
+        matches!(e, Event::HarnessPermissionRequested { .. })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.daemon().topic_notifications.locked().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let notices = f.daemon().topic_notifications.locked();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].0.starts_with("Formless: "));
+        assert!(notices[0].1.contains("Claude: Read ledger"));
+        assert!(!notices[0].1.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!notices[0].1.contains("raw-input"));
+    }
+    cancel.cancel();
+    assert!(waiting.await.unwrap().is_none());
+    f.daemon().broadcast(Event::UserQuestion {
+        question_id: "user-only-notification".into(),
+        session_id: f.attempt.conversation_session_id.clone(),
+        topic_id: Some(f.topic.id.clone()),
+        attempt_id: Some(f.attempt.id.clone()),
+        user_only: true,
+        question: "Choose a substitute".into(),
+        questions: vec![],
+        options: vec![],
+    });
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+    f.daemon().broadcast(Event::UserQuestionClosed {
+        question_id: "user-only-notification".into(),
+        answered_by: None,
+    });
+    env.set("FORMLESS_TOPIC_NOTIFICATIONS", "0");
+    f.daemon()
+        .notify_topic_attention(Some(&f.topic.id), Some(&f.attempt.id), "Disabled");
+    assert_eq!(f.daemon().topic_notifications.locked().len(), 2);
+}
+
+#[tokio::test]
+async fn topic_model_answer_requires_basis_posts_chat_and_preserves_first_answer() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single(
+                    "Use CSV?".into(),
+                    vec!["Yes".into(), "No".into()],
+                )],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    let mut args = json!({"question_id":question_id,"answers":[{"selected":["Yes"]}],"basis":" "});
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(session, &args)
+        .unwrap_err()
+        .to_string()
+        .contains("basis"));
+    args["basis"] = json!("User request: use CSV for the ledger");
+    assert_eq!(
+        f.daemon()
+            .answer_topic_question_tool(session, &args)
+            .unwrap()["answered"],
+        true
+    );
+    assert_eq!(waiting.await.unwrap().unwrap()[0].selected, vec!["Yes"]);
+    next_event(
+        &mut events,
+        |event| matches!(event,Event::UserQuestionClosed{answered_by:Some(by),..} if by=="model"),
+    )
+    .await;
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(session))
+        .unwrap();
+    let audit = messages
+        .iter()
+        .filter(|message| message.content.contains("Basis: User request: use CSV"))
+        .collect::<Vec<_>>();
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].content.contains(&f.attempt.id));
+    assert!(audit[0].content.contains("Use CSV?"));
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "No".into(),
+                answers: vec![]
+            })
+            .await
+            .unwrap()["answered"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn topic_model_answer_rejects_user_only_and_empty_answers() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Choose".into(), vec![])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(
+            session,
+            &json!({"question_id":question_id,"answers":[],"basis":"User said yes"})
+        )
+        .is_err());
+    for event in f.daemon().pending_attention.locked().iter_mut() {
+        if let Event::UserQuestion {
+            question_id: id,
+            user_only,
+            ..
+        } = event
+        {
+            if id == &question_id {
+                *user_only = true;
+            }
+        }
+    }
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(
+            session,
+            &json!({"question_id":question_id,"answers":[{"text":"yes"}],"basis":"User said yes"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("user_only"));
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "yes".into(),
+                answers: vec![]
+            })
+            .await
+            .unwrap()["answered"],
+        true
+    );
+    assert_eq!(
+        waiting.await.unwrap().unwrap()[0].text.as_deref(),
+        Some("yes")
+    );
+    next_event(
+        &mut events,
+        |event| matches!(event,Event::UserQuestionClosed{answered_by:Some(by),..} if by=="user"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn topic_shutdown_closes_pending_permission_and_question() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::HarnessPermissionRequested { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::HarnessPermissionClosed {
+                option_id: None,
+                ..
+            }
+        )
+    })
+    .await;
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Proceed?".into(), vec![])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::UserQuestionClosed {
+                answered_by: None,
+                ..
+            }
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let fixture = Fixture::new(&env);
+    let mut proposal = topic_fixture_proposal(&fixture, None);
+    proposal.features = vec![
+        TopicFeatureProposal {
+            source_message_id: proposal.message_ids[0].clone(),
+            request: "X".into(),
+        },
+        TopicFeatureProposal {
+            source_message_id: proposal.message_ids[0].clone(),
+            request: "Y".into(),
+        },
+    ];
+    let topic = fixture.daemon().propose_topic_request(&proposal).unwrap();
+    let topic = fixture
+        .daemon()
+        .with_store(|st| st.approve_topic(&topic.id))
+        .unwrap();
+    fixture
+        .daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let token = "fixture token".repeat(4);
+    let attempts: Vec<_> = topic
+        .features
+        .iter()
+        .map(|feature| {
+            fixture
+                .daemon()
+                .with_store(|st| {
+                    st.begin_topic_attempt(
+                        &topic.id,
+                        &feature.id,
+                        "Step",
+                        StepAccess::Write,
+                        HarnessKind::Claude,
+                        None,
+                        None,
+                        &[],
+                        &token,
+                        topic.workspace.as_ref().unwrap(),
+                    )
+                })
+                .unwrap()
+        })
+        .collect();
+    let f = TopicFixture {
+        fixture,
+        topic,
+        attempt: attempts[1].clone(),
+        token: token.clone(),
+    };
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiter = tokio::spawn(async move {
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+    });
+    let Event::HarnessPermissionRequested { permission_id, .. } =
+        next_event(&mut events, |event| {
+            matches!(event, Event::HarnessPermissionRequested { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    f.daemon()
+        .handle(Request::TopicMcp {
+            request: TopicMcpRequest {
+                attempt_id: attempts[0].id.clone(),
+                capability_token: token,
+                operation: TopicMcpOperation::ReportResult {
+                    status: TopicAttemptStatus::NeedsUser,
+                    summary: "Need help with X".into(),
+                    outputs: vec![],
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.state().status, TopicStatus::NeedsUser);
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &attempts[0].id,
+                TopicAttemptStatus::NeedsUser,
+                "Need help with X",
+                &[],
+                None,
+            )
+        })
+        .unwrap();
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: Some("allow".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiter.await.unwrap().as_deref(), Some("allow"));
+    assert_eq!(f.state().status, TopicStatus::Running);
+    assert_eq!(
+        f.daemon()
+            .with_reader(|st| st.get_topic_attempt(&attempts[1].id))
+            .unwrap()
+            .unwrap()
+            .status,
+        TopicAttemptStatus::Running
+    );
+}
+
+#[tokio::test]
 async fn topic_permission_fixture_round_trip_replay_wrong_option_and_live_updates() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = TopicFixture::new(&env);
@@ -143,7 +794,7 @@ async fn topic_permission_fixture_round_trip_replay_wrong_option_and_live_update
             .with_reader(|st| st.list_messages(&f.attempt.conversation_session_id))
             .unwrap()
             .len(),
-        4
+        3
     );
     let waiter = tokio::spawn(async move {
         handler
@@ -348,6 +999,17 @@ async fn topic_permission_fixture_always_is_shared_only_within_one_attempt() {
             },
         })
         .await
+        .unwrap();
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(
+                &f.attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "Done",
+                &[],
+                None,
+            )
+        })
         .unwrap();
     let next = f
         .daemon()

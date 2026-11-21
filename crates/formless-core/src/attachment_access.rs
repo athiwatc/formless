@@ -17,32 +17,23 @@ type Records = HashMap<String, Record>;
 type Lineage = HashMap<String, Vec<(String, i64)>>;
 const MAX_LINEAGE_DEPTH: usize = 64;
 
-pub(crate) fn topic_provenance(
+pub(crate) fn session_references_artifact(
     conn: &rusqlite::Connection,
     id: &str,
     scope: &str,
-    seq: Option<i64>,
-    owner: Option<&str>,
+    owner: &str,
 ) -> Result<bool> {
-    let Some(owner) = owner else {
-        return Ok(false);
-    };
-    let mut statement = conn.prepare(
-        "SELECT r.source_session_id,r.source_seq,m.meta FROM topic_source_messages r
-         JOIN topics t ON t.id=r.topic_id JOIN messages m ON m.id=r.message_id
-         WHERE t.topic_session_id=?1 AND m.session_id=?1 AND r.moved_at IS NOT NULL
-         AND (?2 IS NULL OR m.seq=?2)",
-    )?;
-    let rows = statement.query_map(rusqlite::params![scope, seq], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
+    if topic_provenance(conn, id, scope, None, Some(owner))? {
+        return Ok(true);
+    }
+    let mut statement =
+        conn.prepare("SELECT seq,meta FROM messages WHERE session_id=?1 AND meta IS NOT NULL")?;
+    let rows = statement.query_map([scope], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
     })?;
     for row in rows {
-        let (source, source_seq, meta) = row?;
-        let Some(meta) = meta.and_then(|m| serde_json::from_str::<Value>(&m).ok()) else {
+        let (seq, meta) = row?;
+        let Ok(meta) = serde_json::from_str::<Value>(&meta) else {
             continue;
         };
         let attached = meta["attachments"]
@@ -55,34 +46,116 @@ pub(crate) fn topic_provenance(
                     && a["expired"] != true
                     && (a["id"].as_str() == Some(id) || a["_artifact_id"].as_str() == Some(id))
             });
-        if !attached {
+        if !attached || seq <= 0 {
             continue;
         }
-        if owner == source {
-            return Ok(true);
-        }
-        let mut current = source;
+        let mut current = scope.to_string();
         let mut cutoff = i64::MAX;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..MAX_LINEAGE_DEPTH {
-            let edge: Option<(Option<String>, Option<i64>)> = conn
+            if !seen.insert(current.clone()) {
+                break;
+            }
+            if current == owner {
+                return Ok(true);
+            }
+            let fork = conn
                 .query_row(
                     "SELECT forked_from,fork_point_seq FROM sessions WHERE id=?1",
                     [&current],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
                 )
                 .optional()?;
-            let Some((Some(parent), Some(point))) = edge else {
+            let Some((Some(parent), Some(point))) = fork else {
                 break;
             };
             cutoff = cutoff.min(point);
-            if source_seq <= 0 || source_seq > cutoff || !seen.insert(parent.clone()) {
+            if seq > cutoff {
                 break;
             }
             if parent == owner {
                 return Ok(true);
             }
             current = parent;
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn topic_provenance(
+    conn: &rusqlite::Connection,
+    id: &str,
+    scope: &str,
+    seq: Option<i64>,
+    owner: Option<&str>,
+) -> Result<bool> {
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    let mut pending = vec![(scope.to_string(), seq, i64::MAX, false)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((scope, seq, cutoff, proven)) = pending.pop() {
+        if !seen.insert((scope.clone(), seq, cutoff, proven)) {
+            continue;
+        }
+        if proven && scope == owner {
+            return Ok(true);
+        }
+        let fork: Option<(Option<String>, Option<i64>)> = conn
+            .query_row(
+                "SELECT forked_from,fork_point_seq FROM sessions WHERE id=?1",
+                [&scope],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((Some(parent), Some(point))) = fork {
+            let cutoff = cutoff.min(point);
+            if cutoff >= 0 && seq.is_none_or(|seq| seq > 0 && seq <= cutoff) {
+                pending.push((parent, seq, cutoff, proven));
+            }
+        }
+        let mut statement = conn.prepare(
+            "SELECT r.source_session_id,r.source_seq,m.meta,
+             CASE WHEN m.session_id=t.topic_session_id THEN m.seq ELSE
+               (SELECT next.source_seq FROM topic_source_messages next
+                WHERE next.message_id=r.message_id AND next.source_session_id=t.topic_session_id
+                AND next.moved_at IS NOT NULL LIMIT 1) END AS target_seq
+             FROM topic_source_messages r JOIN topics t ON t.id=r.topic_id
+             JOIN messages m ON m.id=r.message_id
+             WHERE t.topic_session_id=?1 AND r.moved_at IS NOT NULL",
+        )?;
+        let rows = statement.query_map([&scope], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (source, source_seq, meta, target_seq) = row?;
+            let Some(target_seq) = target_seq.filter(|target| {
+                *target > 0 && *target <= cutoff && seq.is_none_or(|seq| seq == *target)
+            }) else {
+                continue;
+            };
+            let _ = target_seq;
+            let Some(meta) = meta.and_then(|meta| serde_json::from_str::<Value>(&meta).ok()) else {
+                continue;
+            };
+            let attached = meta["attachments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|a| {
+                    a["imported"] != true
+                        && a["reference"] != true
+                        && a["expired"] != true
+                        && (a["id"].as_str() == Some(id) || a["_artifact_id"].as_str() == Some(id))
+                });
+            if attached {
+                pending.push((source, Some(source_seq), i64::MAX, true));
+            }
         }
     }
     Ok(false)

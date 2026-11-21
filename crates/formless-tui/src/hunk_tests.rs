@@ -365,6 +365,7 @@ fn hunk_review_comments_are_literal_and_idle_reply_does_not_start_a_run() {
         if review_id=="opaque-review"&&file_id=="opaque-file"&&hunk_id=="opaque-hunk"&&comment=="/tmp/not-an-upload\nPlease keep ไทย")
     );
     let message = MessageInfo {
+        generated_by: None,
         id: "review-comment".into(),
         session_id: "s1".into(),
         seq: 2,

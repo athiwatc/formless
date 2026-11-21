@@ -6,8 +6,8 @@
 inputs validate `HarnessKind::Acp` selectors against this registry.
 `local_harness::run(request, interaction_handler, cancel)` dispatches ACP and
 Antigravity sessions through the core interaction handler; Antigravity retains
-its own spec. Core v2's topic orchestrator is not yet available, so this adapter
-does not make `StartTopicWorkflow` execute steps.
+its own spec. Core's topic launcher still rejects ACP steps; this adapter alone
+does not make `StartTopicWorkflow` execute them.
 
 `HarnessRequest.access` (`StepAccess::ReadOnly` or `Write`) controls mode/argv
 selection. Permission IDs, names, and kinds reach the interaction handler unchanged;
@@ -76,6 +76,37 @@ its setup hint. Other -32603 errors from Goose also receive that hint. Offered
 `authMethods` IDs are appended to setup errors; credentials/error payloads are
 not echoed by the shared runner.
 
+## Availability
+
+`acp_agents::availability(id, executable, environment)` returns core's
+`HarnessAvailability` for a registry agent. It checks executable presence on PATH
+(the supplied environment's PATH takes precedence), or an explicit absolute
+executable path. Core's ListHarnesses and named-agent readiness checks honor
+`FORMLESS_TOPIC_ACP_EXE` as an absolute executable override; otherwise each
+registry agent's command is resolved separately on PATH. Installed remains true if the CLI is present but cannot
+answer the readiness check.
+
+The probe starts the normal ACP command, sends initialize then `session/new`
+with an empty `mcpServers` list in a fresh private temporary cwd, and kills the
+process group afterward. The combined RPC deadline is eight seconds. No prompt,
+authenticate request, bridge, credential arguments or config edits are made.
+Normal run environment stripping is reused, including bridge variables. Version
+comes from `agentInfo.version`, falling back to `_meta.agentVersion`; Cursor may report no version.
+
+A profile's authentication/configuration error code means `signed_in=false` with
+its sign-in hint. Session creation means `signed_in=true` only for profiles whose
+unauthenticated smoke test failed at that point. Junie, Auggie and Devin open
+unauthenticated sessions, so successful session creation reports unknown: sign-in
+is not verifiable before a prompt. Timeouts, incompatible initialize responses,
+malformed sessions and other errors also report unknown with a diagnostic. This
+does not prove that a future prompt/model call will succeed. The registry entry's
+`session_auth` flag records whether successful session creation is meaningful.
+
+Core's `ListHarnesses` handler expands ACP into one availability entry per registry
+id, each with `kind=Acp` and `acp_agent` set. Registry probes run concurrently on
+blocking workers, capped at ten seconds each (the ACP handshake itself uses its
+eight-second deadline). Single-agent readiness uses the same dispatch.
+
 ## Installation observations
 
 - Use `@moonshot-ai/kimi-code` for Kimi 2.7.2. Its executable is `kimi`, not
@@ -123,3 +154,17 @@ FORMLESS_LIVE_ACP_BIN_DIR=/absolute/path/to/binaries \
 The live test clears the child environment, isolates HOME/XDG, skips missing
 binaries, requires at least one binary, and times out each initialize after 20s.
 It never authenticates, creates an ACP session, or sends a prompt.
+
+The separate ignored **live availability** test runs initialize and session/new
+using the public readiness probe. It clears inherited credentials/environment,
+retains PATH for interpreters, and gives each agent a fresh isolated HOME/XDG tree:
+
+```sh
+FORMLESS_LIVE_ACP_BIN_DIR=/absolute/path/to/binaries \
+  cargo test -p formless-core live_acp_agents_availability_installed_binaries --locked -- --ignored --nocapture
+```
+
+It never sends a prompt or authenticates. Fixture tests cover real captured auth
+errors (including Goose -32603), version reporting, authenticated-shaped success,
+Junie/Auggie/Devin's ambiguous success, missing/non-executable binaries, unknown
+errors, malformed sessions, deadlines, temporary-cwd cleanup and descendant cleanup.

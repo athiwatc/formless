@@ -276,6 +276,156 @@ pub fn open_session(spec: &AgentSpec, request: &HarnessRequest) -> Result<String
     })
 }
 
+/// What an ACP `initialize` handshake says about an installed harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The executable started and answered ACP.
+    pub installed: bool,
+    /// It also passed the spec's protocol and version check.
+    pub compatible: bool,
+    pub version: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[cfg(not(test))]
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(test)]
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Starts the agent and runs ACP `initialize` only: no session, no sign-in, no bridge.
+/// Sign-in is not visible at this step, so callers probe it separately.
+pub fn probe(
+    spec: &AgentSpec,
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Probe {
+    let cwd = std::env::temp_dir();
+    let request = HarnessRequest {
+        kind: super::HarnessKind::Acp,
+        acp_agent: None,
+        model: None,
+        prompt: "probe".into(),
+        access: StepAccess::Write,
+        mcp_command: cwd.clone(),
+        mcp_args: vec![],
+        mcp_env_vars: vec![],
+        cwd,
+        executable,
+        environment: environment.clone(),
+    };
+    let mut agent = match AgentProcess::spawn(spec, &request) {
+        Ok(agent) => agent,
+        Err(error) => {
+            return Probe {
+                installed: false,
+                compatible: false,
+                version: None,
+                detail: Some(format!("{error:#}")),
+            }
+        }
+    };
+    let cancel = CancellationToken::new();
+    let timer = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PROBE_TIMEOUT);
+        timer.cancel();
+    });
+    let initialized = agent
+        .pipes()
+        .and_then(|(reader, writer)| probe_lines(spec, reader, writer, &cancel));
+    drop(agent);
+    probe_result(spec, initialized)
+}
+
+pub(super) struct SessionProbe {
+    pub version: Option<String>,
+    pub session: Result<std::result::Result<Value, i64>>,
+}
+
+/// A bounded readiness check, without a bridge, prompt or authentication request.
+pub(super) fn probe_session(
+    spec: &AgentSpec,
+    request: &HarnessRequest,
+    timeout: Duration,
+) -> SessionProbe {
+    let mut version = None;
+    let cancel = CancellationToken::new();
+    let timer = cancel.clone();
+    let (stop, stopped) = mpsc::channel();
+    std::thread::spawn(move || {
+        if stopped.recv_timeout(timeout).is_err() {
+            timer.cancel();
+        }
+    });
+    let session = (|| {
+        let mut agent = AgentProcess::spawn(spec, request)?;
+        let (reader, writer) = agent.pipes()?;
+        let mut rpc = Rpc::new(spec, reader, writer, &cancel, StepAccess::Write);
+        let initialized = match rpc.initialize_response(spec, &mut RejectAll)? {
+            Ok(initialized) => initialized,
+            Err(code) => return Ok(Err(code)),
+        };
+        version = initialized
+            .pointer("/agentInfo/version")
+            .or_else(|| initialized.pointer("/_meta/agentVersion"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        (spec.check_agent)(&initialized)?;
+        rpc.call(
+            "session/new",
+            json!({"cwd": request.cwd.to_str().context("probe cwd must be UTF-8")?, "mcpServers": []}),
+            &mut RejectAll,
+        )
+    })();
+    let _ = stop.send(());
+    SessionProbe {
+        version,
+        session: if cancel.is_cancelled() {
+            Err(anyhow!("ACP readiness probe timed out."))
+        } else {
+            session
+        },
+    }
+}
+
+fn probe_lines<R: BufRead + Send + 'static, W: Write>(
+    spec: &AgentSpec,
+    reader: R,
+    writer: W,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    Rpc::new(spec, reader, writer, cancel, StepAccess::Write).initialize(spec, &mut RejectAll)
+}
+
+fn probe_result(spec: &AgentSpec, initialized: Result<Value>) -> Probe {
+    let initialized = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            return Probe {
+                installed: false,
+                compatible: false,
+                version: None,
+                detail: Some(format!(
+                    "{} did not answer ACP initialize: {error:#}",
+                    spec.name
+                )),
+            }
+        }
+    };
+    let version = initialized
+        .pointer("/agentInfo/version")
+        .or_else(|| initialized.pointer("/_meta/agentVersion"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let checked = (spec.check_agent)(&initialized);
+    Probe {
+        installed: true,
+        compatible: checked.is_ok(),
+        version,
+        detail: checked.err().map(|error| format!("{error:#}")),
+    }
+}
+
 pub(super) fn validate(request: &HarnessRequest) -> Result<()> {
     if request.prompt.trim().is_empty() {
         bail!("harness prompt must not be empty");
@@ -382,43 +532,8 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     prompt: bool,
 ) -> Result<HarnessResult> {
     validate(request)?;
-    let mut rpc = Rpc {
-        lines: read_lines(reader),
-        writer,
-        cancel: cancel.clone(),
-        name: spec.name,
-        bridge_tool: spec.bridge_tool,
-        vendor_request: spec.vendor_request,
-        prompting: false,
-        cancel_deadline: None,
-        next_id: 0,
-        events: Vec::new(),
-        message: String::new(),
-        session_id: None,
-        access: request.access,
-    };
-
-    let mut client_capabilities = json!({
-        "fs": {"readTextFile": false, "writeTextFile": false},
-        "terminal": false
-    });
-    (spec.client_capabilities)(&mut client_capabilities);
-    let initialized = rpc
-        .call(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": client_capabilities,
-                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
-            }),
-            permissions,
-        )?
-        .map_err(|code| {
-            anyhow!(
-                "{} rejected ACP initialize (JSON-RPC error {code}).",
-                spec.name
-            )
-        })?;
+    let mut rpc = Rpc::new(spec, reader, writer, cancel, request.access);
+    let initialized = rpc.initialize(spec, permissions)?;
     (spec.check_agent)(&initialized)?;
 
     let env: Vec<Value> = request
@@ -724,6 +839,65 @@ struct Rpc<W> {
 }
 
 impl<W: Write> Rpc<W> {
+    fn new<R: BufRead + Send + 'static>(
+        spec: &AgentSpec,
+        reader: R,
+        writer: W,
+        cancel: &CancellationToken,
+        access: StepAccess,
+    ) -> Self {
+        Rpc {
+            lines: read_lines(reader),
+            writer,
+            cancel: cancel.clone(),
+            name: spec.name,
+            bridge_tool: spec.bridge_tool,
+            vendor_request: spec.vendor_request,
+            prompting: false,
+            cancel_deadline: None,
+            next_id: 0,
+            events: Vec::new(),
+            message: String::new(),
+            session_id: None,
+            access,
+        }
+    }
+
+    fn initialize(
+        &mut self,
+        spec: &AgentSpec,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<Value> {
+        self.initialize_response(spec, permissions)?
+            .map_err(|code| {
+                anyhow!(
+                    "{} rejected ACP initialize (JSON-RPC error {code}).",
+                    spec.name
+                )
+            })
+    }
+
+    fn initialize_response(
+        &mut self,
+        spec: &AgentSpec,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<std::result::Result<Value, i64>> {
+        let mut client_capabilities = json!({
+            "fs": {"readTextFile": false, "writeTextFile": false},
+            "terminal": false
+        });
+        (spec.client_capabilities)(&mut client_capabilities);
+        self.call(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": client_capabilities,
+                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
+            }),
+            permissions,
+        )
+    }
+
     fn send(&mut self, message: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(message)?;
         line.push(b'\n');
@@ -1267,6 +1441,51 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot start a write session"));
+    }
+
+    #[test]
+    fn probe_reports_version_and_compatibility_from_initialize() {
+        let probe_input = |line: &str| {
+            let mut written = Vec::new();
+            let initialized = probe_lines(
+                &SPEC,
+                Cursor::new(format!("{line}\n")),
+                &mut written,
+                &CancellationToken::new(),
+            );
+            let sent: Value =
+                serde_json::from_str(String::from_utf8(written).unwrap().lines().next().unwrap())
+                    .unwrap();
+            assert_eq!(sent["method"], "initialize");
+            probe_result(&SPEC, initialized)
+        };
+        assert_eq!(
+            probe_input(LIVE_INITIALIZE),
+            Probe {
+                installed: true,
+                compatible: true,
+                version: Some("1.5.14".into()),
+                detail: None,
+            }
+        );
+        let old = probe_input(&LIVE_INITIALIZE.replace("1.5.14", "1.4.0"));
+        assert!(old.installed && !old.compatible);
+        assert_eq!(old.version.as_deref(), Some("1.4.0"));
+        assert!(old.detail.unwrap().contains("agy update"));
+        let rejected =
+            probe_input(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#);
+        assert!(!rejected.installed && !rejected.compatible);
+    }
+
+    #[test]
+    fn probe_reports_a_missing_executable_as_not_installed() {
+        let probe = probe(
+            &SPEC,
+            Some(PathBuf::from("/nonexistent/formless-test-agy")),
+            &BTreeMap::new(),
+        );
+        assert!(!probe.installed && !probe.compatible);
+        assert!(probe.version.is_none());
     }
 
     #[test]

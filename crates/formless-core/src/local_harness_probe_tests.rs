@@ -1,0 +1,292 @@
+use super::*;
+use std::os::unix::fs::PermissionsExt;
+
+fn fixture() -> (ProbeDirectory, ProbeContext) {
+    let root = ProbeDirectory::new().unwrap();
+    let path = root.0.join("fixture");
+    std::fs::write(&path,r#"#!/usr/bin/env python3
+import sys,os,json,time,pathlib,subprocess
+if '--version' in sys.argv:
+    if os.environ.get('PROBE_GATE'):
+        gate=pathlib.Path(os.environ['PROBE_GATE'])
+        (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
+        while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
+    print('fixture 1.0');sys.exit()
+mode=os.environ.get('PROBE_MODE','ok')
+if mode=='hang':time.sleep(120)
+if sys.argv[1:]==['auth','status']:
+    print(json.dumps({'loggedIn':mode!='auth'}));sys.exit()
+if sys.argv[1:]==['login','status']:
+    if mode=='auth':print('Not logged in',file=sys.stderr);sys.exit(1)
+    print('Logged in');sys.exit()
+for line in sys.stdin:
+    request=json.loads(line)
+    with open(os.environ['PROBE_REQUESTS'],'a') as f:f.write(request['method']+'\n')
+    if request['method']=='session/new':
+        assert request['params']['mcpServers']==[]
+        assert pathlib.Path(request['params']['cwd']).is_dir()
+        if mode=='auth':
+            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32001,'message':'auth required'}}),flush=True);continue
+        if mode=='other':
+            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-1,'message':'other'}}),flush=True);continue
+        child=subprocess.Popen(['sleep','120'])
+        pathlib.Path(os.environ['PROBE_PID']).write_text(str(child.pid))
+    print(json.dumps({'jsonrpc':'2.0','method':'notification','params':{}}),flush=True)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{}}),flush=True)
+"#).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    environment.insert(
+        "PROBE_REQUESTS".into(),
+        root.0.join("requests").into_os_string(),
+    );
+    environment.insert("PROBE_PID".into(), root.0.join("pid").into_os_string());
+    let ctx = ProbeContext {
+        executable: path,
+        environment,
+        timeout: Duration::from_secs(2),
+    };
+    (root, ctx)
+}
+
+#[tokio::test]
+async fn official_probes_report_version_and_explicit_auth_status() {
+    let (_root, mut ctx) = fixture();
+    for kind in [HarnessKind::Claude, HarnessKind::Codex] {
+        let ready = dispatch(kind, None, &ctx).await;
+        assert!(ready.installed);
+        assert_eq!(ready.signed_in, Some(true));
+        assert_eq!(ready.version.as_deref(), Some("fixture 1.0"));
+        ctx.environment.insert("PROBE_MODE".into(), "auth".into());
+        assert_eq!(dispatch(kind, None, &ctx).await.signed_in, Some(false));
+        ctx.environment.remove(std::ffi::OsStr::new("PROBE_MODE"));
+    }
+}
+
+#[tokio::test]
+async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
+    let (root, mut ctx) = fixture();
+    for kind in [
+        HarnessKind::Claude,
+        HarnessKind::Codex,
+        HarnessKind::Pi,
+        HarnessKind::OpenCode,
+        HarnessKind::Antigravity,
+        HarnessKind::Acp,
+        HarnessKind::Muse,
+    ] {
+        let target = root.0.join(kind_name(kind));
+        std::fs::copy(&ctx.executable, &target).unwrap();
+        ctx.environment.insert(
+            format!(
+                "FORMLESS_TOPIC_{}_EXE",
+                kind_name(kind).to_ascii_uppercase()
+            )
+            .into(),
+            target.into_os_string(),
+        );
+    }
+    ctx.environment
+        .insert("PROBE_GATE".into(), root.0.clone().into_os_string());
+    let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
+    assert_eq!(
+        values.len(),
+        6 + super::super::acp_agents::agent_ids().len()
+    );
+    assert!(values.iter().all(|value| value.installed));
+    assert!(values[..2]
+        .iter()
+        .all(|value| value.version.as_deref() == Some("fixture 1.0")
+            && value.signed_in == Some(true)));
+    assert!(values[2..]
+        .iter()
+        .all(|value| value.signed_in.is_none() && value.version.is_none()));
+}
+
+#[tokio::test]
+async fn muse_pi_overrides_and_missing_or_relative_executables() {
+    let (_root, mut ctx) = fixture();
+    for kind in [HarnessKind::Muse, HarnessKind::Pi] {
+        let key: OsString = format!(
+            "FORMLESS_TOPIC_{}_EXE",
+            kind_name(kind).to_ascii_uppercase()
+        )
+        .into();
+        ctx.environment
+            .insert(key.clone(), ctx.executable.clone().into_os_string());
+        let value = probe_environment(kind, &ctx.environment, Duration::from_secs(1), None).await;
+        assert!(value.installed);
+        assert_eq!(value.signed_in, None);
+        ctx.environment.insert(key.clone(), "relative".into());
+        assert!(
+            !probe_environment(kind, &ctx.environment, Duration::from_secs(1), None)
+                .await
+                .installed
+        );
+        ctx.environment
+            .insert(key, "/missing/formless-fixture".into());
+        assert!(
+            !probe_environment(kind, &ctx.environment, Duration::from_secs(1), None)
+                .await
+                .installed
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_harnesses_expands_acp_registry_with_missing_binaries() {
+    let root = ProbeDirectory::new().unwrap();
+    let values = list_environment(
+        BTreeMap::from([("PATH".into(), root.0.clone().into_os_string())]),
+        Duration::from_secs(1),
+    )
+    .await;
+    let acp: Vec<_> = values
+        .iter()
+        .filter(|value| value.kind == HarnessKind::Acp)
+        .collect();
+    let ids = super::super::acp_agents::agent_ids();
+    assert_eq!(values.len(), 6 + ids.len());
+    assert_eq!(acp.len(), ids.len());
+    for id in ids {
+        let matches: Vec<_> = acp
+            .iter()
+            .filter(|value| value.acp_agent.as_deref() == Some(*id))
+            .collect();
+        assert_eq!(matches.len(), 1, "{id}");
+        assert!(!matches[0].installed);
+        assert_eq!(matches[0].signed_in, None);
+        assert_eq!(matches[0].version, None);
+        assert!(matches[0].detail.is_some());
+    }
+}
+
+#[tokio::test]
+async fn named_acp_probe_uses_registry_and_executable_override() {
+    let (_root, mut ctx) = fixture();
+    let captured: serde_json::Value =
+        serde_json::from_str(include_str!("local_harness/acp_agents/captured.json")).unwrap();
+    std::fs::write(
+        &ctx.executable,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r request
+printf '%s\n' "$ACP_INITIALIZE"
+IFS= read -r request
+printf '%s\n' "$ACP_SESSION"
+"#,
+    )
+    .unwrap();
+    ctx.environment.insert(
+        "ACP_INITIALIZE".into(),
+        captured["gemini"]["initialize"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "ACP_SESSION".into(),
+        captured["gemini"]["session_new"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "FORMLESS_TOPIC_ACP_EXE".into(),
+        ctx.executable.clone().into_os_string(),
+    );
+    let result = probe_environment(
+        HarnessKind::Acp,
+        &ctx.environment,
+        ctx.timeout,
+        Some("gemini"),
+    )
+    .await;
+    assert_eq!(result.kind, HarnessKind::Acp);
+    assert_eq!(result.acp_agent.as_deref(), Some("gemini"));
+    assert!(result.installed);
+    assert_eq!(result.signed_in, Some(false));
+    assert_eq!(result.version.as_deref(), Some("0.70.0"));
+    assert_eq!(
+        result.detail.as_deref(),
+        Some(
+            super::super::acp_agents::spec("gemini")
+                .unwrap()
+                .not_signed_in
+        )
+    );
+
+    let result = dispatch(HarnessKind::Acp, None, &ctx).await;
+    assert!(!result.installed);
+    assert!(result.detail.unwrap().contains("requires an acp_agent"));
+    let result = dispatch(HarnessKind::Acp, Some("unknown"), &ctx).await;
+    assert!(!result.installed);
+    assert_eq!(result.acp_agent.as_deref(), Some("unknown"));
+    assert!(result.detail.unwrap().contains("available agents:"));
+    for invalid in ["", "relative"] {
+        ctx.environment
+            .insert("FORMLESS_TOPIC_ACP_EXE".into(), invalid.into());
+        let result = dispatch(HarnessKind::Acp, Some("gemini"), &ctx).await;
+        assert!(!result.installed);
+        assert!(result.detail.unwrap().contains("absolute"));
+    }
+}
+
+#[tokio::test]
+async fn official_probe_timeout_is_unknown_and_bounded() {
+    assert_eq!(ProbeContext::default().timeout, Duration::from_secs(10));
+    let (_root, mut ctx) = fixture();
+    ctx.environment.insert("PROBE_MODE".into(), "hang".into());
+    ctx.timeout = Duration::from_millis(100);
+    let value = tokio::time::timeout(Duration::from_secs(1), claude_probe(&ctx))
+        .await
+        .unwrap();
+    assert!(value.installed);
+    assert_eq!(value.signed_in, None);
+    assert_eq!(value.detail.as_deref(), Some("probe timed out"));
+}
+
+#[tokio::test]
+async fn acp_probe_initializes_without_turns_and_distinguishes_auth_errors() {
+    let (root, mut ctx) = fixture();
+    let value = acp_probe(&ctx, Some(&["--version"]), &["--acp"], &[-32001]).await;
+    assert_eq!(value.signed_in, Some(true));
+    assert_eq!(value.version.as_deref(), Some("fixture 1.0"));
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("requests")).unwrap(),
+        "initialize\nsession/new\n"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::fs::read_to_string(root.0.join("pid")).unwrap();
+        let path = PathBuf::from(format!("/proc/{pid}/stat"));
+        for _ in 0..100 {
+            if std::fs::read_to_string(&path).map_or(true, |stat| {
+                stat.split(')')
+                    .nth(1)
+                    .is_some_and(|state| state.trim_start().starts_with('Z'))
+            }) {
+                return_auth_tests(&mut ctx).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("ACP probe left a live descendant");
+    }
+    #[cfg(not(target_os = "linux"))]
+    return_auth_tests(&mut ctx).await;
+}
+async fn return_auth_tests(ctx: &mut ProbeContext) {
+    ctx.environment.insert("PROBE_MODE".into(), "auth".into());
+    assert_eq!(
+        acp_probe(ctx, None, &["--acp"], &[-32001]).await.signed_in,
+        Some(false)
+    );
+    ctx.environment.insert("PROBE_MODE".into(), "other".into());
+    let value = acp_probe(ctx, None, &["--acp"], &[-32001]).await;
+    assert_eq!(value.signed_in, None);
+    assert!(value.detail.is_some());
+    ctx.environment.insert("PROBE_MODE".into(), "hang".into());
+    ctx.timeout = Duration::from_millis(100);
+    assert_eq!(
+        acp_probe(ctx, None, &["--acp"], &[-32001])
+            .await
+            .detail
+            .as_deref(),
+        Some("probe timed out")
+    );
+}

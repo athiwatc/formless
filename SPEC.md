@@ -6723,10 +6723,12 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
-`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored `live_acp_agents_initialize_installed_binaries`
-test. It names a directory of installed ACP CLI executables (or symlinks); the test
-uses isolated HOME/XDG directories, sends only ACP initialize, and skips absent binaries.
-It is not a product configuration override and does not authenticate or send prompts.
+`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored ACP initialize and availability tests.
+It names a directory of installed ACP CLI executables (or symlinks). These tests
+use isolated HOME/XDG directories and skip absent binaries. Initialize-only tests
+send only ACP initialize; the availability test also sends session/new without
+MCP servers, with an eight-second deadline. It is not a product configuration
+override and does not authenticate or send prompts.
 
 The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
 opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.
@@ -7079,10 +7081,40 @@ resets only the selected feature to Pending and the topic to Approved; it does
 not start anything or move messages again. Start on a Running topic errors
 without changing it.
 
-Phase A does not launch an orchestrator: an approved StartTopicWorkflow claim
-immediately fails with `orchestrator not available yet`, records feature failure
-details and releases its lock. No harness process starts. Pi, OpenCode and
-Antigravity return `adapter not integrated yet`; their adapters are not wired.
+StartTopicWorkflow claims the topic and sends a kickoff to a normal Formless
+model Run in Topic Chat. Its tool snapshot includes topic_run_step,
+topic_complete_feature and topic_fail_feature only for Running/NeedsUser topics.
+The outline is advisory; the model chooses each independent step. A normal
+Run end with open work yields NeedsUser; a Run error fails the topic. User
+messages resume normal model Runs. No merge or push is performed. Start
+failures persist detail, fail features and release the workspace lock.
+
+Git steps use private worktrees under profile data: Write branches from the
+latest feature revision (or the base); ReadOnly detaches at the exact selected
+input revision. A successful Write must produce a clean new descendant HEAD.
+Each attempt has a private staging directory, including Git attempts.
+Directory/Scratch steps use private directories with copied read-only file
+inputs. File/text outputs are reported through scoped MCP. A failed step is
+returned to the model without automatically failing the feature; it can choose
+another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+actionable adapter-not-integrated step results.
+
+CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
+on Unix (the direct child on Windows). The last launch check is serialized
+with cancellation. On restart live attempts become Abandoned and Running
+topics become NeedsUser, with durable detail and no automatic restart.
+
+The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
+It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
+`FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
+must never be included in prompts, argv or transcripts. The bridge exposes
+AskUser and RequestPermission in addition to the scoped conversation/artifact
+operations. RequestPermission only raises a user request; it cannot decide one.
+An undecided or cancelled permission is denied. The bridge uses the existing
+five-minute IPC request deadline; cancellation closes pending requests.
 
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
@@ -7097,6 +7129,15 @@ Topic Chat defaults to that topic as parent; other sources create roots.
 ListTopics includes all levels and their parent IDs. Cyclic parent chains are
 rejected. Permanent deletion/purge removes descendant topics and their canonical
 conversations; cancellation affects only the selected topic, not its children.
+Purging a source removes pending/rejected proposals, not approved topics.
+Source-owned attachments referenced by surviving moved topic messages are retained.
+
+Harness and topic-model conversation tools default to the topic branch: the
+topic and all ancestor Topic Chats and their attempt transcripts, not Main
+Chat, siblings or unrelated sessions. The user-only SetTopicContextAccess
+sets persisted allow_external_context (default false); opting in permits all
+non-deleted conversations. List/read/search share this scope. Search is a
+case-insensitive substring match returning at most 40 bounded snippets.
 
 The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
 in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
@@ -7119,3 +7160,100 @@ requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
 memory, scoped to the current attempt and the exact kind/title/input, never
 persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
 permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.
+
+topic_run_step launches asynchronously and returns {attempt_id,
+conversation_session_id}. Independent features can run concurrently; a feature
+still permits only one active step. topic_wait {attempt_ids?, timeout_secs?}
+waits for a finished attempt, a question or an informational permission notice.
+timeout_secs defaults to 600 and must be in 1..=600. An empty selection or no
+active work returns a snapshot immediately. Attempt IDs are scoped to this
+topic; completion and user-only informational notices are consumed once per
+Topic Chat daemon lifetime. Ordinary harness questions remain pending until
+answered. Cancellation and daemon shutdown unblock waits. There is no child
+model run. Normal model-run completion with open work marks NeedsUser and
+appends a durable "send a message to continue" note; harnesses may continue,
+but no model follow-up is started automatically. Run interruption/error
+cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.
+
+SetTopicLimits is a user/client-only persisted control. Defaults allow three
+retries after the first attempt of a feature+trimmed step title, and twenty
+attempts across a topic. Both values accept the full u32 range; zero retries
+still allows the first attempt, while zero total attempts blocks all launches.
+Caps are checked atomically at launch, including concurrent launches. Hitting
+a cap refuses launch, marks the topic and feature NeedsUser, and raises a
+user_only question: "Raise limit and continue" or "Stop". Model answers are
+rejected. Raising increments the hit cap by its default (3 or 20, saturating)
+and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
+a model or harness automatically. SetTopicLimits itself changes limits only.
+
+ListHarnesses refreshes all seven kinds concurrently, expanding ACP into one
+entry per ACP registry id with acp_agent set. Every probe is capped at
+10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
+detail "probe timed out". A harness is ready iff installed and signed_in is
+not Some(false): unknown auth is ready. Planning receives fresh availability,
+and each step refreshes its selected harness before launching. Claude uses
+--version and auth status; Codex uses --version and login status. Neither sends
+a model turn, and no auth output is copied into detail or logs.
+
+Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
+and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). FORMLESS_TOPIC_ACP_EXE applies
+to each ACP registry probe; without it each agent's own command is looked up on
+PATH. ACP dispatch runs the registry's bounded availability probe on a blocking
+worker, including initialize version (agentInfo.version, then _meta.agentVersion)
+and session/new sign-in checks. Pi, OpenCode, Antigravity,
+and Muse have dedicated dispatch arms currently reporting lookup-only
+availability with unknown auth. Adapter owners can replace those fallbacks
+with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+probe initializes and creates a session with no MCP servers in a private
+temporary cwd, never prompts, maps configured auth errors, and kills its
+process group on success, failure or timeout.
+
+topic_request_harness_substitute raises a user_only question with "Sign in and
+retry", "Use <substitute>", and "Skip step". Model answers are rejected.
+Only a user's Use answer records an approval for that topic, feature and
+trimmed step title; the next successful launch consumes it. A request to run
+the wanted harness then uses the explicitly approved substitute, which must
+itself be ready. Formless never substitutes without that approval. Other
+answers and cancellation record no approval and start no work.
+
+Terminal topic transitions close pending limit/substitute decisions with
+UserQuestionClosed answered_by=None. Finalizing one feature also closes its
+own decisions while leaving sibling work alone. Closed decisions no longer
+keep the daemon busy or leave stale user prompts.
