@@ -21,7 +21,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::{HarnessRequest, HarnessResult, HarnessRole};
+use super::{
+    HarnessPermissionRequest, HarnessRequest, HarnessResult, HarnessUpdate, InteractionHandler,
+    StepAccess,
+};
 
 const PROTOCOL_VERSION: u64 = 1;
 const JSON_RPC_AUTH_REQUIRED: i64 = -32000;
@@ -120,6 +123,92 @@ pub trait PermissionHandler {
     /// Returns the answer, or `None` when unanswered or once `cancel` fires.
     fn ask_question(&mut self, _question: &Value, _cancel: &CancellationToken) -> Option<Value> {
         None
+    }
+}
+
+/// Forwards ACP approvals, questions and updates to the daemon's [`InteractionHandler`].
+///
+/// [`run`] is blocking, so each request is driven to completion on `runtime`; call `run`
+/// from a blocking thread (for example `spawn_blocking`), never from inside the runtime.
+pub struct Interactions<'a> {
+    pub handler: &'a dyn InteractionHandler,
+    pub runtime: tokio::runtime::Handle,
+}
+
+impl PermissionHandler for Interactions<'_> {
+    fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String> {
+        let options = request
+            .options
+            .iter()
+            .filter_map(|option| serde_json::from_value::<WireOption>(option.clone()).ok())
+            .map(|option| formless_protocol::HarnessPermissionOption {
+                option_id: option.option_id,
+                name: option.name,
+                kind: option.kind,
+            })
+            .collect();
+        let text = |key: &str| {
+            request
+                .tool_call
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let permission = HarnessPermissionRequest {
+            title: text("title"),
+            kind: text("kind"),
+            raw_input: request.tool_call.get("rawInput").cloned(),
+            options,
+        };
+        self.runtime
+            .block_on(self.handler.request_permission(permission, request.cancel))
+    }
+
+    fn on_update(&mut self, update: &Value) {
+        if let Some(update) = harness_update(&update["update"]) {
+            let _ = self.handler.on_update(update);
+        }
+    }
+
+    fn ask_question(&mut self, questions: &Value, cancel: &CancellationToken) -> Option<Value> {
+        let questions: Vec<formless_protocol::Question> =
+            serde_json::from_value(questions.clone()).ok()?;
+        let answers = self
+            .runtime
+            .block_on(self.handler.ask_question(questions, cancel))?;
+        serde_json::to_value(answers).ok()
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireOption {
+    option_id: String,
+    name: String,
+    kind: formless_protocol::HarnessPermissionOptionKind,
+}
+
+/// Maps an ACP `session/update` payload to the daemon's live update, when it has one.
+fn harness_update(update: &Value) -> Option<HarnessUpdate> {
+    let text = || update["content"]["text"].as_str().map(str::to_owned);
+    match update["sessionUpdate"].as_str()? {
+        "agent_message_chunk" => Some(HarnessUpdate::Message { content: text()? }),
+        "agent_thought_chunk" => Some(HarnessUpdate::Thought { content: text()? }),
+        "tool_call" => Some(HarnessUpdate::ToolCall {
+            name: update["title"].as_str().unwrap_or_default().to_owned(),
+            input: update.get("rawInput").cloned().unwrap_or(Value::Null),
+        }),
+        "plan" => {
+            let entries = update["entries"].as_array()?;
+            let content = entries
+                .iter()
+                .filter_map(|entry| entry["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(HarnessUpdate::Plan { content })
+        }
+        _ => None,
     }
 }
 
@@ -288,7 +377,7 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
         events: Vec::new(),
         message: String::new(),
         session_id: None,
-        role: request.role,
+        access: request.access,
     };
 
     let mut client_capabilities = json!({
@@ -375,7 +464,7 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
         .to_owned();
     rpc.session_id = Some(session_id.clone());
 
-    if request.role == HarnessRole::Review {
+    if request.access == StepAccess::ReadOnly {
         let purpose = "keep a review session read-only";
         let fail_closed = spec.read_only_fail_closed;
         let modes = spec.read_only_modes;
@@ -603,7 +692,7 @@ struct Rpc<W> {
     events: Vec<Value>,
     message: String,
     session_id: Option<String>,
-    role: HarnessRole,
+    access: StepAccess,
 }
 
 impl<W: Write> Rpc<W> {
@@ -785,7 +874,7 @@ impl<W: Write> Rpc<W> {
             None
         } else if (self.bridge_tool)(tool_call) {
             option_of_kind(options, &["allow_once", "allow_always"])
-        } else if self.role == HarnessRole::Review && writes {
+        } else if self.access == StepAccess::ReadOnly && writes {
             option_of_kind(options, &["reject_once", "reject_always"])
         } else {
             permissions
@@ -823,13 +912,14 @@ mod tests {
     // Fixture (not observed live): ACP v1 schema shapes for an authenticated session.
     const SESSION_NEW: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1","configOptions":[{"id":"mode","category":"mode","type":"select","currentValue":"accept-edits","options":[{"value":"accept-edits","name":"Accept edits"},{"value":"plan","name":"Plan"}]},{"id":"model","category":"model","type":"select","currentValue":"m1","options":[{"value":"m1","name":"M1"},{"value":"model-secret","name":"Requested"}]}]}}"#;
 
-    fn request(role: HarnessRole) -> HarnessRequest {
+    fn request(access: StepAccess) -> HarnessRequest {
         HarnessRequest {
             kind: HarnessKind::Antigravity,
+            acp_agent: None,
             model: None,
             cwd: PathBuf::from("/work/repo"),
             prompt: "prompt text".into(),
-            role,
+            access,
             mcp_command: PathBuf::from("/opt/formless/bin/formless"),
             mcp_args: vec!["mcp".into(), "--run".into(), "run-7".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
@@ -914,7 +1004,7 @@ mod tests {
             stop(3, "end_turn"),
         ];
         let mut handler = Choose("allow", 0);
-        let (result, sent) = drive_lines(&request(HarnessRole::Build), &lines, &mut handler);
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut handler);
         let result = result.unwrap();
         assert_eq!(result.session_id.as_deref(), Some("sess-1"));
         assert_eq!(result.message, "Hello world");
@@ -954,7 +1044,7 @@ mod tests {
             update("done"),
             stop(3, "end_turn"),
         ];
-        let (result, sent) = drive_lines(&request(HarnessRole::Build), &lines, &mut RejectAll);
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut RejectAll);
         result.unwrap();
         assert_eq!(sent[3]["result"]["outcome"]["optionId"], "deny");
     }
@@ -969,7 +1059,7 @@ mod tests {
             stop(3, "end_turn"),
         ];
         let (_, sent) = drive_lines(
-            &request(HarnessRole::Build),
+            &request(StepAccess::Write),
             &lines,
             &mut Choose("not-offered", 0),
         );
@@ -987,7 +1077,7 @@ mod tests {
             stop(4, "end_turn"),
         ];
         let mut handler = Choose("allow", 0);
-        let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut handler);
+        let (result, sent) = drive_lines(&request(StepAccess::ReadOnly), &lines, &mut handler);
         result.unwrap();
         assert_eq!(
             sent[2],
@@ -1003,7 +1093,7 @@ mod tests {
         let refused =
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown mode"}}"#;
         let lines = [LIVE_INITIALIZE.into(), session.into(), refused.into()];
-        let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut RejectAll);
+        let (result, sent) = drive_lines(&request(StepAccess::ReadOnly), &lines, &mut RejectAll);
         assert!(result
             .unwrap_err()
             .to_string()
@@ -1048,7 +1138,7 @@ mod tests {
             update("ok"),
             stop(3, "end_turn"),
         ];
-        let (result, sent) = drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut Answer);
+        let (result, sent) = drive_spec(&spec, &request(StepAccess::Write), &lines, &mut Answer);
         result.unwrap();
         let reply = |id: u64| {
             sent.iter()
@@ -1080,8 +1170,12 @@ mod tests {
             update("done"),
             stop(4, "end_turn"),
         ];
-        let (result, sent) =
-            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        let (result, sent) = drive_spec(
+            &spec,
+            &request(StepAccess::ReadOnly),
+            &lines,
+            &mut RejectAll,
+        );
         result.unwrap();
         let answer = |id: u64| {
             sent.iter()
@@ -1101,7 +1195,8 @@ mod tests {
             update("done"),
             stop(4, "end_turn"),
         ];
-        let (result, sent) = drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut handler);
+        let (result, sent) =
+            drive_spec(&spec, &request(StepAccess::ReadOnly), &lines, &mut handler);
         result.unwrap();
         assert_eq!(handler.1, 1, "execute in review is the user's decision");
         let answer = sent.iter().find(|message| message["id"] == 91).unwrap();
@@ -1125,8 +1220,7 @@ mod tests {
             update("done"),
             stop(4, "end_turn"),
         ];
-        let (result, sent) =
-            drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut RejectAll);
+        let (result, sent) = drive_spec(&spec, &request(StepAccess::Write), &lines, &mut RejectAll);
         result.unwrap();
         assert_eq!(
             sent[0]["params"]["clientCapabilities"]["elicitation"],
@@ -1140,11 +1234,81 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown mode"}}"#;
         let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#;
         let lines = [LIVE_INITIALIZE.into(), session.into(), refused.into()];
-        let (result, _) = drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut RejectAll);
+        let (result, _) = drive_spec(&spec, &request(StepAccess::Write), &lines, &mut RejectAll);
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("cannot start a write session"));
+    }
+
+    #[test]
+    fn interactions_forward_permissions_questions_and_updates_to_the_daemon() {
+        use crate::local_harness::InteractionFuture;
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Daemon {
+            permissions: Mutex<Vec<HarnessPermissionRequest>>,
+            updates: Mutex<Vec<HarnessUpdate>>,
+        }
+        impl InteractionHandler for Daemon {
+            fn request_permission<'a>(
+                &'a self,
+                request: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                let choice = request.options[1].option_id.clone();
+                self.permissions.lock().unwrap().push(request);
+                Box::pin(async move { Some(choice) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                questions: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async move {
+                    Some(vec![formless_protocol::QuestionAnswer {
+                        selected: vec![],
+                        text: Some(questions[0].question.clone()),
+                    }])
+                })
+            }
+            fn on_update(&self, update: HarnessUpdate) -> Result<()> {
+                self.updates.lock().unwrap().push(update);
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let daemon = Daemon::default();
+        let mut interactions = Interactions {
+            handler: &daemon,
+            runtime: runtime.handle().clone(),
+        };
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            permission(90, "execute"),
+            update("done"),
+            stop(3, "end_turn"),
+        ];
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut interactions);
+        result.unwrap();
+        let answer = sent.iter().find(|message| message["id"] == 90).unwrap();
+        assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
+        let permissions = daemon.permissions.lock().unwrap();
+        assert_eq!(permissions[0].kind, "execute");
+        assert_eq!(permissions[0].title, "tool");
+        assert_eq!(
+            permissions[0].options[0].kind,
+            formless_protocol::HarnessPermissionOptionKind::AllowOnce
+        );
+        assert!(matches!(
+            daemon.updates.lock().unwrap().as_slice(),
+            [HarnessUpdate::Message { content }] if content == "done"
+        ));
+        let answers = interactions
+            .ask_question(&json!([{"question": "which?"}]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(answers, json!([{"selected": [], "text": "which?"}]));
     }
 
     #[test]
@@ -1166,7 +1330,7 @@ mod tests {
             stop(3, "end_turn"),
         ];
         let mut handler = Collect(Vec::new());
-        let (result, _) = drive_lines(&request(HarnessRole::Build), &lines, &mut handler);
+        let (result, _) = drive_lines(&request(StepAccess::Write), &lines, &mut handler);
         assert_eq!(result.unwrap().message, "ab");
         let texts: Vec<_> = handler
             .0
@@ -1190,8 +1354,12 @@ mod tests {
             update("done"),
             stop(4, "end_turn"),
         ];
-        let (result, sent) =
-            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        let (result, sent) = drive_spec(
+            &spec,
+            &request(StepAccess::ReadOnly),
+            &lines,
+            &mut RejectAll,
+        );
         result.unwrap();
         assert_eq!(sent[2]["method"], "session/set_mode");
         assert_eq!(sent[2]["params"]["modeId"], "plan");
@@ -1211,8 +1379,12 @@ mod tests {
             update("done"),
             stop(3, "end_turn"),
         ];
-        let (result, sent) =
-            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        let (result, sent) = drive_spec(
+            &spec,
+            &request(StepAccess::ReadOnly),
+            &lines,
+            &mut RejectAll,
+        );
         result.unwrap();
         assert_eq!(sent[2]["method"], "session/prompt");
 
@@ -1222,7 +1394,7 @@ mod tests {
         };
         let (result, _) = drive_spec(
             &strict,
-            &request(HarnessRole::Review),
+            &request(StepAccess::ReadOnly),
             &lines,
             &mut RejectAll,
         );
@@ -1244,7 +1416,7 @@ mod tests {
             stop(4, "end_turn"),
         ];
         let mut handler = Choose("allow", 0);
-        let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut handler);
+        let (result, sent) = drive_lines(&request(StepAccess::ReadOnly), &lines, &mut handler);
         result.unwrap();
         assert_eq!(sent[2]["method"], "session/set_mode");
         assert_eq!(handler.1, 0, "review runs never ask about edits");
@@ -1254,7 +1426,7 @@ mod tests {
 
     #[test]
     fn selects_requested_model_or_fails() {
-        let mut with_model = request(HarnessRole::Build);
+        let mut with_model = request(StepAccess::Write);
         with_model.model = Some("model-secret".into());
         let lines = [
             LIVE_INITIALIZE.into(),
@@ -1279,7 +1451,7 @@ mod tests {
     #[test]
     fn unauthenticated_session_asks_user_to_sign_in_with_agy() {
         let lines = [LIVE_INITIALIZE.into(), LIVE_AUTH_REQUIRED.into()];
-        let (result, sent) = drive_lines(&request(HarnessRole::Build), &lines, &mut RejectAll);
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut RejectAll);
         let error = result.unwrap_err().to_string();
         assert!(error.contains("not signed in"));
         assert!(error.contains("Run `agy`"));
@@ -1307,7 +1479,7 @@ mod tests {
             ),
         ] {
             let (result, sent) =
-                drive_lines(&request(HarnessRole::Build), &[initialize], &mut RejectAll);
+                drive_lines(&request(StepAccess::Write), &[initialize], &mut RejectAll);
             assert!(
                 result.unwrap_err().to_string().contains(expected),
                 "{expected}"
@@ -1339,7 +1511,7 @@ mod tests {
         ] {
             let mut all = vec![LIVE_INITIALIZE.to_string(), SESSION_NEW.to_string()];
             all.extend(lines);
-            let (result, _) = drive_lines(&request(HarnessRole::Build), &all, &mut RejectAll);
+            let (result, _) = drive_lines(&request(StepAccess::Write), &all, &mut RejectAll);
             assert!(
                 result.unwrap_err().to_string().contains(expected),
                 "{expected}"
@@ -1357,7 +1529,7 @@ mod tests {
             update("ok"),
             stop(3, "end_turn"),
         ];
-        let (result, sent) = drive_lines(&request(HarnessRole::Build), &lines, &mut RejectAll);
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut RejectAll);
         result.unwrap();
         assert_eq!(sent[3]["id"], 91);
         assert_eq!(sent[3]["error"]["code"], -32601);
@@ -1410,7 +1582,7 @@ mod tests {
             &SPEC,
             std::io::BufReader::new(Channel(receiver, Vec::new())),
             &mut written,
-            &request(HarnessRole::Build),
+            &request(StepAccess::Write),
             permissions,
             cancel,
             true,
@@ -1478,18 +1650,18 @@ mod tests {
     #[test]
     fn review_runs_use_the_agy_sandbox() {
         assert_eq!(
-            (SPEC.args)(&request(HarnessRole::Build)),
+            (SPEC.args)(&request(StepAccess::Write)),
             ["acp", "--disable-telemetry"]
         );
         assert_eq!(
-            (SPEC.args)(&request(HarnessRole::Review)),
+            (SPEC.args)(&request(StepAccess::ReadOnly)),
             ["acp", "--disable-telemetry", "--sandbox"]
         );
     }
 
     #[test]
     fn capability_stays_out_of_agy_environment() {
-        let request = request(HarnessRole::Build);
+        let request = request(StepAccess::Write);
         let environment = agent_environment(&request);
         assert!(!environment.contains_key(&OsString::from("FORMLESS_TOPIC_CAPABILITY")));
         assert_eq!(environment[&OsString::from("HOME")], "/home/user");
@@ -1497,13 +1669,13 @@ mod tests {
 
     #[test]
     fn validates_bridge_environment() {
-        let mut missing = request(HarnessRole::Build);
+        let mut missing = request(StepAccess::Write);
         missing.environment.clear();
         assert!(validate(&missing)
             .unwrap_err()
             .to_string()
             .contains("has no value"));
-        let mut relative = request(HarnessRole::Build);
+        let mut relative = request(StepAccess::Write);
         relative.mcp_command = PathBuf::from("formless");
         assert!(validate(&relative).is_err());
     }
@@ -1522,7 +1694,7 @@ mod tests {
             std::env::temp_dir().join(format!("formless-live-agy-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).unwrap();
         let marker = workspace.join("bridge-started");
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.cwd = workspace.clone();
         request.executable = std::env::var_os("FORMLESS_AGY_BIN").map(PathBuf::from);
         request.mcp_command = PathBuf::from("/bin/sh");

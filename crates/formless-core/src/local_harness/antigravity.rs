@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 
 use super::acp::{self, AgentSpec, PermissionHandler};
-use super::{CommandSpec, HarnessRequest, HarnessResult, HarnessRole};
+use super::{CommandSpec, HarnessRequest, HarnessResult, StepAccess};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ pub fn open_session(request: &HarnessRequest) -> Result<String> {
 /// `agy acp` flags; review runs also get agy's terminal sandbox.
 fn agent_args(request: &HarnessRequest) -> Vec<OsString> {
     let mut args = vec!["acp".into(), "--disable-telemetry".into()];
-    if request.role == HarnessRole::Review {
+    if request.access == StepAccess::ReadOnly {
         args.push("--sandbox".into());
     }
     args
@@ -245,7 +245,7 @@ fn required_response(value: &Value) -> Result<String> {
 mod tests {
     use super::super::{
         command_spec as dispatch_command_spec, parse_output as dispatch_parse_output, HarnessKind,
-        HarnessRequest, HarnessRole,
+        HarnessRequest, StepAccess,
     };
     use super::parse_output;
     use std::{
@@ -279,10 +279,11 @@ mod tests {
     fn request(workspace: &Path) -> HarnessRequest {
         HarnessRequest {
             kind: HarnessKind::Antigravity,
+            acp_agent: None,
             model: Some("model-secret".into()),
             cwd: workspace.to_path_buf(),
             prompt: "prompt-secret".into(),
-            role: HarnessRole::Build,
+            access: StepAccess::Write,
             mcp_command: PathBuf::from("/secret/mcp-command"),
             mcp_args: vec!["mcp-argument-secret".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],

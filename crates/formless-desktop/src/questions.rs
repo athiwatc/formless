@@ -41,6 +41,7 @@ impl Open {
             question,
             options,
             questions,
+            ..
         } = event
         else {
             return Err("Not a user question");
@@ -288,6 +289,8 @@ mod tests {
     use super::*;
     fn event() -> Event {
         Event::UserQuestion {
+            topic_id: None,
+            attempt_id: None,
             question_id: "q".into(),
             session_id: "other-session".into(),
             question: "Legacy ไทย?".into(),
