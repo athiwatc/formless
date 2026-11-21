@@ -742,7 +742,13 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
                 )
             }
+            _ if stem == "go" => {
+                return Some("the Go tool can build and execute repository code")
+            }
             "find" => return Some("find can run any program (-exec)"),
+            _ if stem == "pip" => {
+                return Some("pip can execute code from package build backends")
+            }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
@@ -805,6 +811,24 @@ pub fn sensitive_read_warning(spec: &str) -> Option<&'static str> {
     })
 }
 
+/// The credential file in a conventional Composer configuration directory.
+pub fn is_composer_auth_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter().rev();
+    let matches = |part: Option<&std::ffi::OsStr>, expected: &str| {
+        part.is_some_and(|part| {
+            let name = part.to_string_lossy();
+            #[cfg(windows)]
+            let name = name.split(':').next().unwrap_or_default();
+            name.eq_ignore_ascii_case(expected)
+        })
+    };
+    if !matches(parts.next(), "auth.json") {
+        return false;
+    }
+    let parent = parts.next();
+    matches(parent, ".composer") || matches(parent, "composer") && matches(parts.next(), ".config")
+}
+
 /// Where an `fs:` Capability's path lies (SPEC §10.3), for approval
 /// prompts: `(warn, note)`. Credential reads always warn, including inside
 /// the working folder. Other secret folders and paths outside it warn too.
@@ -815,6 +839,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     let path = spec
         .strip_prefix("fs:read:")
         .or_else(|| spec.strip_prefix("fs:write:"))?;
+    if is_composer_auth_path(std::path::Path::new(path)) {
+        return Some((true, "holds Composer credentials".into()));
+    }
     let (path, windows) = approval_path(path);
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     const SECRET_DIRS: [(&str, &str); 7] = [
@@ -3862,6 +3889,53 @@ mod tests {
     }
 
     #[test]
+    fn go_requires_broad_process_confirmation() {
+        for spec in [
+            "process:go",
+            "process:/usr/local/go/bin/go",
+            "process:go.exe",
+            "process:GO",
+            "process:go1.22.5",
+            "process:go:test",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("the Go tool can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:gofmt",
+            "process:godoc",
+            "process:goreleaser",
+            "process:golangci-lint",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn pip_requires_broad_process_confirmation() {
+        for spec in [
+            "process:pip",
+            "process:pip3",
+            "process:pip3.11",
+            "process:/usr/bin/pip3",
+            "process:pip.exe",
+            "process:pip:install",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("pip can execute code from package build backends"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:pipx", "process:pipenv", "process:piper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
     fn windows_drive_and_home_write_scopes_are_broad() {
         for path in [
             r"C:\",
@@ -4074,6 +4148,29 @@ mod tests {
             "env:LANG",
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
+        }
+    }
+
+    #[test]
+    fn composer_auth_warnings_are_limited_to_config_locations() {
+        for path in [
+            "/work/.composer/auth.json",
+            "/work/.config/Composer/AUTH.JSON",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((true, "holds Composer credentials".into()))
+            );
+        }
+        for path in [
+            "/work/auth.json",
+            "/work/.composer/cache/auth.json",
+            "/work/.config/composer/config.json",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((false, "inside the working folder".into()))
+            );
         }
     }
 
