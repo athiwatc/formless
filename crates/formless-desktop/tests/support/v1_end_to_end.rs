@@ -688,26 +688,43 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         });
     };
     let save = |cx: &mut TestAppContext, field: &'static str, value: &str| {
+        // Field selection, typing and Save are separate event-loop turns.
+        // A previous Save's success notice is not this mutation's receipt.
         step(cx, h, |window, cx| {
             window.click(field, cx);
+        });
+        step(cx, h, |window, cx| {
             let i = shell.read(cx).session_edit_input().unwrap();
             i.update(cx, |i, cx| i.set_value(value, window, cx));
+        });
+        let revision = step(cx, h, |window, cx| {
+            let revision = shell.read(cx).session_edit_revision().unwrap();
             assert!(window.find("session-model-paid-footer").visible());
             window.click("session-edit-save", cx);
+            revision
         });
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             pump(cx, h, &shell);
-            let done = step(cx, h, |window, _| {
-                window.find("session-edit-notice").value().is_some_and(|n| {
-                    n.starts_with("Saved and acknowledged")
-                        || n.starts_with("The current model/effort pair already matches")
-                })
+            let (done, notice) = step(cx, h, |window, cx| {
+                let notice = window
+                    .find("session-edit-notice")
+                    .value()
+                    .map(str::to_owned);
+                let done = shell.read(cx).session_edit_revision() != Some(revision)
+                    && notice.as_ref().is_some_and(|n| {
+                        n.starts_with("Saved and acknowledged")
+                            || n.starts_with("The current model/effort pair already matches")
+                    });
+                (done, notice)
             });
             if done {
                 break;
             }
-            assert!(Instant::now() < deadline, "model save receipt");
+            assert!(
+                Instant::now() < deadline,
+                "model save receipt for {field}={value:?}: {notice:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     };
