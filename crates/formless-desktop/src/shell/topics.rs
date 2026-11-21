@@ -838,7 +838,7 @@ impl Shell {
                 panel = panel.child(
                     readable(
                         "topic-recovery-help",
-                        "If launch failed, recover the workflow claim before retrying. Requests stay in this topic; recovery does not move them again.",
+                        "Recovery does not reset or start work. Reset an item for retry below, then choose Start workflow; recovery does not move them again.",
                     )
                     .text_sm(),
                 );
@@ -847,7 +847,7 @@ impl Shell {
                         .small()
                         .outline()
                         .label("Recover topic")
-                        .tooltip("Release the workflow claim so you can retry starting. Requests are not moved again.")
+                        .tooltip("Recovery does not reset or start work. Reset an item for retry, then explicitly start the workflow.")
                         .disabled(busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.topic_action(Action::Recover(id.clone()), cx)
@@ -913,6 +913,7 @@ impl Shell {
                             .small()
                             .outline()
                             .label("Reset item for retry")
+                            .tooltip("Return the workflow to Approved without starting it or moving requests again.")
                             .disabled(busy || topic.status == TopicStatus::Running)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.topic_action(

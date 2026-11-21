@@ -484,7 +484,7 @@ fn failed_topic_can_recover_then_retry_without_another_move(cx: &mut TestAppCont
             attempt.status = formless_protocol::TopicAttemptStatus::Abandoned;
         }
         for feature in &mut topic.features {
-            feature.status = formless_protocol::TopicFeatureStatus::Pending;
+            feature.status = formless_protocol::TopicFeatureStatus::Failed;
         }
         shell.update(cx, |s, cx| {
             s.apply_client_update(
@@ -530,13 +530,14 @@ fn failed_topic_can_recover_then_retry_without_another_move(cx: &mut TestAppCont
             panic!("one explicit recovery")
         };
         assert!(matches!(action, Action::Recover(id) if id == "topic-formless"));
-        topic.status = formless_protocol::TopicStatus::Approved;
+        // The real v2 daemon returns Failed after recovery. Only resetting an
+        // item changes it to Approved; neither operation starts any work.
         shell.update(cx, |s, cx| {
             s.apply_client_update(
                 Update::Topics {
                     connection: 0,
                     operation: Some(*operation),
-                    result: Ok(Reply::Topic(Box::new(topic))),
+                    result: Ok(Reply::Topic(Box::new(topic.clone()))),
                 },
                 window,
                 cx,
@@ -546,6 +547,62 @@ fn failed_topic_can_recover_then_retry_without_another_move(cx: &mut TestAppCont
                 .iter()
                 .all(|c| !matches!(c, WireCommand::Topic { .. })));
         });
+        window.render_frame(cx);
+        assert!(window.try_find("topic-start").is_none());
+        assert!(window
+            .find("topic-recovery-help")
+            .value()
+            .unwrap()
+            .contains("Reset an item for retry below, then choose Start workflow"));
+        let feature = topic.features[0].id.clone();
+        window.scroll(
+            "topic-workbench",
+            ScrollDelta::Pixels(point(px(0.), px(-400.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click(SharedString::from(format!("topic-retry-{feature}")), cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(operation),
+                    action,
+                    ..
+                } => Some((*operation, action)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(operation, action)] = actions.as_slice() else {
+            panic!("one explicit reset")
+        };
+        assert!(
+            matches!(action, Action::Retry {topic, feature: id} if topic == "topic-formless" && id == &feature)
+        );
+        topic.status = formless_protocol::TopicStatus::Approved;
+        topic.features[0].status = formless_protocol::TopicFeatureStatus::Pending;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(*operation),
+                    result: Ok(Reply::Topic(Box::new(topic.clone()))),
+                },
+                window,
+                cx,
+            );
+            assert!(s
+                .take_client_commands()
+                .iter()
+                .all(|c| !matches!(c, WireCommand::Topic { .. })));
+        });
+        window.render_frame(cx);
+        window.scroll(
+            "topic-workbench",
+            ScrollDelta::Pixels(point(px(0.), px(400.))),
+            cx,
+        );
         window.render_frame(cx);
         window.click("topic-start", cx);
         let commands = shell.update(cx, |s, _| s.take_client_commands());

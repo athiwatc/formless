@@ -292,6 +292,8 @@ fn failed_start_preserves_the_move_receipt_and_recovery_never_approves_again() {
         e.outgoing.is_empty(),
         "start failures never replay a mutation"
     );
+    topic.status = formless_protocol::TopicStatus::Failed;
+    topic.features[0].status = formless_protocol::TopicFeatureStatus::Failed;
     e.command(command(
         TopicAction::Recover(topic.id.clone()),
         uuid::Uuid::new_v4(),
@@ -306,6 +308,26 @@ fn failed_start_preserves_the_move_receipt_and_recovery_never_approves_again() {
     assert!(
         e.outgoing.is_empty(),
         "recovery does not automatically start or move"
+    );
+    e.command(command(
+        TopicAction::Retry {
+            topic: topic.id.clone(),
+            feature: topic.features[0].id.clone(),
+        },
+        uuid::Uuid::new_v4(),
+    ));
+    let retry = e.outgoing.pop_front().unwrap();
+    assert!(matches!(retry.request, Request::RetryTopicFeature { .. }));
+    topic.status = formless_protocol::TopicStatus::Approved;
+    topic.features[0].status = formless_protocol::TopicFeatureStatus::Pending;
+    e.receive(ServerMessage::ok(
+        retry.id,
+        serde_json::to_value(&topic).unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        e.outgoing.is_empty(),
+        "resetting an item never starts or moves"
     );
     e.command(command(TopicAction::Start(topic.id), uuid::Uuid::new_v4()));
     assert!(matches!(
