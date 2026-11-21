@@ -1,6 +1,7 @@
 //! Safe, testable command construction for supported local coding CLIs.
 
 pub mod acp;
+pub mod acp_agents;
 pub mod antigravity;
 
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};

@@ -490,7 +490,7 @@ pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
-/// The id of a select config option in `category` that offers `value`.
+/// The id of a select option offering `value`, preferring its id over its category.
 fn find_config_option(session: &Value, category: &str, value: &str) -> Option<String> {
     session
         .get("configOptions")?
@@ -498,10 +498,14 @@ fn find_config_option(session: &Value, category: &str, value: &str) -> Option<St
         .iter()
         .filter(|option| option.get("id").and_then(Value::as_str) == Some(category))
         .chain(
-            session.get("configOptions")?.as_array()?.iter().filter(|option| {
-                option.get("id").and_then(Value::as_str) != Some(category)
-                    && option.get("category").and_then(Value::as_str) == Some(category)
-            }),
+            session
+                .get("configOptions")?
+                .as_array()?
+                .iter()
+                .filter(|option| {
+                    option.get("id").and_then(Value::as_str) != Some(category)
+                        && option.get("category").and_then(Value::as_str) == Some(category)
+                }),
         )
         .find(|option| {
             option

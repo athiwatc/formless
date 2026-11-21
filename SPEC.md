@@ -6697,6 +6697,17 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
+`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored `live_acp_agents_initialize_installed_binaries`
+test. It names a directory of installed ACP CLI executables (or symlinks); the test
+uses isolated HOME/XDG directories, sends only ACP initialize, and skips absent binaries.
+It is not a product configuration override and does not authenticate or send prompts.
+
+The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
+opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.
+`FORMLESS_TOPIC_CAPABILITY` is the private bridge capability used in local-harness
+fixtures (including that live test); it is scoped to the MCP child, not agent argv
+or the agent process environment.
+
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
 the underlying file instead of atomically replacing the alias. The shipped
