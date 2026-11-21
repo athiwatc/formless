@@ -11,7 +11,7 @@ if '--version' in sys.argv:
         gate=pathlib.Path(os.environ['PROBE_GATE'])
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
         while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
-    print('fixture 1.0');sys.exit()
+    print('opencode v2.3.2' if pathlib.Path(sys.argv[0]).name=='opencode' else 'fixture 1.0');sys.exit()
 mode=os.environ.get('PROBE_MODE','ok')
 if mode=='hang':time.sleep(120)
 if sys.argv[1:]==['auth','status']:
@@ -64,7 +64,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
-async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
+async fn list_probes_run_concurrently_and_opencode_uses_adapter() {
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -95,9 +95,46 @@ async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
         .iter()
         .all(|value| value.version.as_deref() == Some("fixture 1.0")
             && value.signed_in == Some(true)));
+    assert!(root.0.join("opencode.ready").is_file());
+    let opencode = &values[3];
+    assert_eq!(opencode.kind, HarnessKind::OpenCode);
+    assert_eq!(opencode.version.as_deref(), Some("2.3.2"));
+    assert_eq!(opencode.signed_in, None);
+    assert!(opencode
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("free default model"));
     assert!(values[2..]
         .iter()
+        .filter(|value| value.kind != HarnessKind::OpenCode)
         .all(|value| value.signed_in.is_none() && value.version.is_none()));
+}
+
+#[tokio::test]
+async fn opencode_uses_path_lookup_and_respects_invalid_override() {
+    let (root, mut ctx) = fixture();
+    let executable = root.0.join("opencode");
+    std::fs::copy(&ctx.executable, &executable).unwrap();
+    let mut path = vec![root.0.clone()];
+    path.extend(std::env::split_paths(
+        &ctx.environment[std::ffi::OsStr::new("PATH")],
+    ));
+    ctx.environment
+        .insert("PATH".into(), std::env::join_paths(path).unwrap());
+    ctx.environment
+        .remove(std::ffi::OsStr::new("FORMLESS_TOPIC_OPENCODE_EXE"));
+    let value = probe_environment(HarnessKind::OpenCode, &ctx.environment, ctx.timeout).await;
+    assert!(value.installed);
+    assert_eq!(value.version.as_deref(), Some("2.3.2"));
+    assert_eq!(value.signed_in, None);
+    ctx.environment.insert(
+        "FORMLESS_TOPIC_OPENCODE_EXE".into(),
+        root.0.join("missing").into_os_string(),
+    );
+    let value = probe_environment(HarnessKind::OpenCode, &ctx.environment, ctx.timeout).await;
+    assert!(!value.installed);
+    assert_eq!(value.version, None);
 }
 
 #[tokio::test]
