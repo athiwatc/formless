@@ -46,31 +46,11 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
             if e.depth() == 0 {
                 return true;
             }
-            if e.file_type().is_some_and(|t| t.is_dir())
-                && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
-            {
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            if is_dir && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()) {
                 return false;
             }
-            // Check each entry too: an alias may have been replaced since
-            // its parent was admitted, so descendants must remain contained.
-            let Ok(target) = e.path().canonicalize() else {
-                return false;
-            };
-            let Ok(relative) = target.strip_prefix(&canonical_root) else {
-                return false;
-            };
-            // A visible alias must not bypass the hidden/build exclusions.
-            let directories = if e.file_type().is_some_and(|t| t.is_dir()) {
-                relative
-            } else {
-                relative.parent().unwrap_or_else(|| Path::new(""))
-            };
-            !relative
-                .components()
-                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
-                && !directories
-                    .components()
-                    .any(|part| SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref()))
+            allowed_target(e.path(), is_dir, &canonical_root)
         })
         .build();
     let mut out = Vec::new();
@@ -99,14 +79,47 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
     (out, false)
 }
 
+fn allowed_target(path: &Path, is_dir: bool, canonical_root: &Path) -> bool {
+    // An alias may have changed since its parent was admitted. Resolve each
+    // descendant again before checking containment and hidden/build exclusions.
+    let Ok(target) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(relative) = target.strip_prefix(canonical_root) else {
+        return false;
+    };
+    let directories = if is_dir {
+        relative
+    } else {
+        relative.parent().unwrap_or_else(|| Path::new(""))
+    };
+    !relative
+        .components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+        && !directories
+            .components()
+            .any(|part| SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref()))
+}
+
 /// The best `limit` entries for `query`. An empty query lists the top
-/// level; a query ending in `/` lists that directory's children, so
-/// `@dir/` completes step by step. Otherwise entries are ranked by fuzzy
+/// level. Either path separator is accepted, and a trailing separator lists
+/// that directory's children. Otherwise entries are ranked by fuzzy
 /// match on the path, with a bonus when the file name itself matches.
 /// Directory spelling is exact first, then uniquely canonical-equivalent.
 /// Ambiguous canonical spellings require an exact spelling; children are
 /// never merged. Directory fallback remains case/accent-sensitive.
 pub fn search<'a>(entries: &'a [FileEntry], query: &str, limit: usize) -> Vec<&'a FileEntry> {
+    // FileEntry paths are indexed with forward slashes. Normalize only
+    // the search text, never the path or filesystem access.
+    let query = if query.contains('\\') {
+        Cow::Owned(query.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(query)
+    };
+    let query = match query.as_ref() {
+        "/" => "",
+        query => query,
+    };
     // A delimited mention can supply an indexed directory whose first
     // component starts with whitespace. Prefer that exact spelling before
     // applying the existing hand-typed-query trimming fallback.
@@ -279,6 +292,40 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn descendants_are_rechecked_when_an_admitted_alias_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let root = tree();
+        let outside = tree();
+        let canonical_root = root.canonicalize().unwrap();
+        let alias = root.join("changing");
+        let candidate = alias.join("main.rs");
+        let inside = root.join("src");
+        symlink(&inside, &alias).unwrap();
+        assert!(allowed_target(&alias, true, &canonical_root));
+        assert!(allowed_target(&candidate, false, &canonical_root));
+        for target in [
+            outside.join("src"),
+            root.join(".hidden"),
+            root.join("target"),
+        ] {
+            std::fs::write(target.join("main.rs"), "replacement").unwrap();
+            let replacement = root.join("replacement");
+            symlink(&target, &replacement).unwrap();
+            std::fs::rename(&replacement, &alias).unwrap();
+            assert!(
+                !allowed_target(&candidate, false, &canonical_root),
+                "the child routes through the replacement alias to {target:?}"
+            );
+            let (entries, truncated) = walk(&root);
+            assert!(!truncated);
+            assert!(search(&entries, "changing/", 10).is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn in_root_directory_links_are_searchable_without_escaping_or_looping() {
         use std::os::unix::fs::symlink;
         let root = tree();
@@ -346,6 +393,43 @@ mod tests {
         }
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn windows_separators_match_the_indexed_path_spelling() {
+        let entry = |path: &str, dir| FileEntry {
+            path: path.into(),
+            dir,
+            bytes: 0,
+        };
+        let entries = [
+            entry("src", true),
+            entry("src/ui", true),
+            entry("src/ui/view.rs", false),
+            entry("src/main.rs", false),
+            entry("src/lib.rs", false),
+            entry("README.md", false),
+            entry(" docs", true),
+            entry(" docs/index.md", false),
+        ];
+        for (typed, indexed) in [
+            (r"\", ""),
+            (r"src\", "src/"),
+            (r"src\main", "src/main"),
+            (r"src\ui/", "src/ui/"),
+            (r" docs\", " docs/"),
+            (r"missing\", "missing/"),
+        ] {
+            for limit in [0, 1, 10] {
+                assert_eq!(
+                    search(&entries, typed, limit),
+                    search(&entries, indexed, limit)
+                );
+            }
+        }
+        assert_eq!(search(&entries, r"src\main", 1)[0].path, "src/main.rs");
+        assert_eq!(search(&entries, r"src\ui\", 1)[0].path, "src/ui/view.rs");
+        assert_eq!(search(&entries, "/", 10), search(&entries, "", 10));
     }
 
     #[test]
