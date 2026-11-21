@@ -15,6 +15,18 @@
 pub mod net_scope;
 use serde::{Deserialize, Serialize};
 
+/// Substitute positional display placeholders while preserving inserted text.
+pub fn fill_display_template(template: &str, values: &[&str]) -> String {
+    let mut values = values.iter();
+    let mut segments = template.split("{}");
+    let mut text = segments.next().unwrap_or_default().to_string();
+    for segment in segments {
+        text.push_str(values.next().copied().unwrap_or("{}"));
+        text.push_str(segment);
+    }
+    text
+}
+
 /// The newest protocol this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest protocol this build still accepts.

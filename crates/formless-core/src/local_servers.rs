@@ -116,14 +116,18 @@ pub struct LocalServer {
 
 impl LocalServer {
     pub fn offer(&self) -> String {
+        self.offer_with(formless_protocol::fill_display_template)
+    }
+
+    pub fn offer_with(&self, render: impl FnOnce(&'static str, &[&str]) -> String) -> String {
         if self.models == 0 {
             if self.preset_id == "ollama" {
-                "Ollama's model API is available but has no models. Run `ollama pull MODEL`, then retry /setup, or choose another provider.".into()
+                render("Ollama's model API is available but has no models. Run `ollama pull MODEL`, then retry /setup, or choose another provider.", &[])
             } else {
-                format!("Local model API at {} has no models. Load a model in the local server, then retry /setup, or choose another provider.",self.base_url)
+                render("Local model API at {} has no models. Load a model in the local server, then retry /setup, or choose another provider.", &[&self.base_url])
             }
         } else {
-            format!("Local model API at {} offers {} model(s). Press Enter to select one, or choose another provider.",self.base_url,self.models)
+            render("Local model API at {} offers {} model(s). Press Enter to select one, or choose another provider.", &[&self.base_url, &self.models.to_string()])
         }
     }
 }
