@@ -212,6 +212,39 @@ pub(super) struct Work {
     index: u64,
 }
 
+pub(super) struct ClipboardJob {
+    work: Box<Work>,
+    number: u64,
+    bytes: Vec<u8>,
+    mime: String,
+}
+
+pub(super) struct ConvertedClipboard {
+    work: Box<Work>,
+    file: Result<File, String>,
+}
+
+impl ClipboardJob {
+    pub(super) fn convert(self) -> ConvertedClipboard {
+        self.convert_with(clipboard_bytes)
+    }
+
+    fn convert_with(
+        self,
+        convert: impl FnOnce(&[u8], &str) -> Result<(Vec<u8>, String), String>,
+    ) -> ConvertedClipboard {
+        let file = convert(&self.bytes, &self.mime).map(|(bytes, mime)| File {
+            name: clipboard_image_name(self.number, &mime),
+            bytes,
+            mime: Some(mime),
+        });
+        ConvertedClipboard {
+            work: self.work,
+            file,
+        }
+    }
+}
+
 impl Engine {
     pub(super) fn stage_attachments(&mut self, operation: Operation) {
         let mut work = Box::new(Work {
@@ -256,14 +289,15 @@ impl Engine {
                 number,
                 bytes,
                 mime,
-            } => match clipboard_bytes(&bytes, &mime) {
-                Ok((bytes, mime)) => work.sources.push_back(Source::Bytes(File {
-                    name: clipboard_image_name(number, &mime),
+            } => {
+                self.attachment_conversions.push_back(ClipboardJob {
+                    work,
+                    number,
                     bytes,
-                    mime: Some(mime),
-                })),
-                Err(error) => work.outcome.errors.push(error),
-            },
+                    mime,
+                });
+                return;
+            }
             Intake::Detach { id } => {
                 work.phase = Phase::Detach;
                 self.request(
@@ -276,6 +310,21 @@ impl Engine {
                 return;
             }
             Intake::Refresh => {}
+        }
+        self.next_attachment(work);
+    }
+
+    pub(super) fn complete_clipboard_conversion(&mut self, converted: ConvertedClipboard) {
+        let mut work = converted.work;
+        if !self.ready
+            || work.outcome.client != self.instance
+            || work.outcome.connection != self.connection
+        {
+            return;
+        }
+        match converted.file {
+            Ok(file) => work.sources.push_back(Source::Bytes(file)),
+            Err(error) => work.outcome.errors.push(error),
         }
         self.next_attachment(work);
     }
@@ -424,6 +473,66 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn daemon_replies_are_processed_while_clipboard_conversion_is_pending() {
+        let mut e = engine(Intake::Refresh);
+        let operation = Operation::clipboard_image(
+            "chosen".into(),
+            1,
+            solid_tiff(128, 128),
+            "image/tiff".into(),
+        );
+        e.command(Command::StageAttachments(operation));
+        let job = e
+            .attachment_conversions
+            .pop_front()
+            .expect("conversion deferred by dispatcher");
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            job.convert_with(|bytes, mime| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                clipboard_bytes(bytes, mime)
+            })
+        });
+        started.await.unwrap();
+        assert!(!worker.is_finished());
+        assert!(refreshed(&mut e).pending.unwrap().rows.is_empty());
+        assert!(e.outgoing.is_empty());
+        assert!(!worker.is_finished());
+        e.active = Some("another-session".into());
+        release.send(()).unwrap();
+        e.complete_clipboard_conversion(worker.await.unwrap());
+        assert!(
+            matches!(&e.outgoing.front().unwrap().request, Request::AttachBegin { session_id, name, mime: Some(mime), .. } if session_id == "chosen" && name == "pasted-image-1.png" && mime == "image/png")
+        );
+    }
+
+    #[test]
+    fn stale_clipboard_conversion_cannot_start_an_upload() {
+        for stale_owner in 0..3 {
+            let mut e = engine(Intake::Refresh);
+            refreshed(&mut e);
+            e.command(Command::StageAttachments(Operation::clipboard_image(
+                "chosen".into(),
+                1,
+                vec![],
+                "image/png".into(),
+            )));
+            let converted = e.attachment_conversions.pop_front().unwrap().convert();
+            match stale_owner {
+                0 => e.connection += 1,
+                1 => e.instance = uuid::Uuid::new_v4(),
+                _ => e.ready = false,
+            }
+            e.complete_clipboard_conversion(converted);
+            assert!(e.outgoing.is_empty());
+            assert!(e.updates.is_empty());
+        }
+    }
 
     #[test]
     fn client_task_converts_clipboard_images_before_upload_and_reports_decode_errors() {
@@ -623,6 +732,9 @@ mod tests {
             ..Engine::default()
         };
         engine.command(Command::StageAttachments(operation(intake)));
+        while let Some(job) = engine.attachment_conversions.pop_front() {
+            engine.complete_clipboard_conversion(job.convert());
+        }
         engine
     }
     fn reply(engine: &mut Engine, value: Result<Value, &str>) -> Request {

@@ -981,6 +981,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    attachment_conversions: VecDeque<attachments::ClipboardJob>,
     run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
     reconciled_actions: Vec<Action>,
     delete_undo: Option<crate::run_actions::DeleteUndo>,
@@ -3417,9 +3418,15 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let flush_timer = tokio::time::sleep(Duration::from_secs(86400));
     tokio::pin!(flush_timer);
     let mut armed_deadline = None;
+    let mut attachment_conversions = tokio::task::JoinSet::new();
     loop {
         engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
         engine.sync_epoch(epoch.load(Ordering::Acquire));
+        if attachment_conversions.is_empty() {
+            if let Some(job) = engine.attachment_conversions.pop_front() {
+                attachment_conversions.spawn_blocking(move || job.convert());
+            }
+        }
         if *future_attempts {
             delivery.before_io(
                 tx,
@@ -3549,6 +3556,9 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 }
                 None => return Err("Daemon disconnected. Run state is unknown; reconnecting.".into()),
             },
+            Some(converted) = attachment_conversions.join_next(), if !attachment_conversions.is_empty() => {
+                engine.complete_clipboard_conversion(converted.map_err(|error| format!("Clipboard image conversion worker failed: {error}"))?);
+            }
             _ = tick.tick() => {
                 if last_poll.elapsed() >= Duration::from_secs(2) {
                     engine.dirty_session = true;
