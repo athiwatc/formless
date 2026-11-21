@@ -415,30 +415,34 @@ fn install_script_is_atomic_and_preflights() {
     }
     symlink(&sha256sum, bin.join("sha256sum")).unwrap();
 
-    // A fake release v0.9.0 for a made-up target.
     let release = dir.join("releases/v0.9.0");
-    let pkg = dir.join("build/formless-v0.9.0-test-target");
-    std::fs::create_dir_all(&pkg).unwrap();
     std::fs::create_dir_all(&release).unwrap();
-    std::fs::write(pkg.join("formless"), "#!/bin/sh\necho new\n").unwrap();
-    std::fs::write(pkg.join("formless.1"), ".TH FORMLESS 1\n").unwrap();
-    let asset = "formless-v0.9.0-test-target.tar.gz";
-    assert!(std::process::Command::new("tar")
-        .args([
-            "-czf",
-            release.join(asset).to_str().unwrap(),
-            "formless-v0.9.0-test-target"
-        ])
-        .current_dir(dir.join("build"))
-        .status()
-        .unwrap()
-        .success());
-    let sum = std::process::Command::new(&sha256sum)
-        .arg(asset)
-        .current_dir(&release)
-        .output()
-        .unwrap();
-    std::fs::write(release.join(format!("{asset}.sha256")), &sum.stdout).unwrap();
+    let make_asset = |target: &str| {
+        let archive_dir = format!("formless-v0.9.0-{target}");
+        let pkg = dir.join("build").join(&archive_dir);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("formless"), "#!/bin/sh\necho new\n").unwrap();
+        std::fs::write(pkg.join("formless.1"), ".TH FORMLESS 1\n").unwrap();
+        let asset = format!("{archive_dir}.tar.gz");
+        assert!(std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(release.join(&asset))
+            .arg(&archive_dir)
+            .current_dir(dir.join("build"))
+            .status()
+            .unwrap()
+            .success());
+        let sum = std::process::Command::new(&sha256sum)
+            .arg(&asset)
+            .current_dir(&release)
+            .output()
+            .unwrap();
+        assert!(sum.status.success());
+        std::fs::write(release.join(format!("{asset}.sha256")), &sum.stdout).unwrap();
+        asset
+    };
+    let asset = make_asset("test-target");
+    make_asset("aarch64-unknown-linux-gnu");
 
     let prefix = dir.join("prefix");
     std::fs::create_dir_all(prefix.join("bin")).unwrap();
@@ -509,6 +513,19 @@ fn install_script_is_atomic_and_preflights() {
     assert!(guidance.contains("API key or a local model"));
     let mode = std::fs::metadata(&target).unwrap().permissions().mode();
     assert_eq!(mode & 0o111, 0o111, "executable");
+
+    for target in ["Linux/aarch64", "Linux/arm64"] {
+        let prefix = dir.join(format!("prefix-{}", target.replace('/', "-")));
+        let out = install(
+            &[("FORMLESS_VERSION", "v0.9.0"), ("FORMLESS_TARGET", target)],
+            Some(&prefix),
+        );
+        assert!(out.status.success(), "{target}: {out:?}");
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("bin/formless")).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+    }
 
     // No HOME and no PREFIX: a clear error, not an unbound variable.
     let out = std::process::Command::new(sh())

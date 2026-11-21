@@ -11,6 +11,83 @@ use ratatui::prelude::*;
 
 use super::fg;
 
+struct YamlScalar {
+    header_indent: usize,
+    content_indent: Option<usize>,
+}
+
+fn yaml_mapping_value(key: &str) -> Option<&str> {
+    let mut bytes = key.bytes().enumerate().peekable();
+    let mut quote = bytes
+        .peek()
+        .map(|&(_, byte)| byte)
+        .filter(|byte| matches!(byte, b'\'' | b'"'));
+    if quote.is_some() {
+        bytes.next();
+    }
+    while let Some((i, byte)) = bytes.next() {
+        if let Some(q) = quote {
+            if q == b'"' && byte == b'\\' {
+                bytes.next();
+            } else if byte == q {
+                if q == b'\'' && bytes.peek().is_some_and(|&(_, next)| next == q) {
+                    bytes.next();
+                } else {
+                    quote = None;
+                }
+            }
+        } else if byte == b'#' && (i == 0 || key.as_bytes()[i - 1].is_ascii_whitespace()) {
+            break;
+        } else if i > 0
+            && byte == b':'
+            && bytes
+                .peek()
+                .is_some_and(|&(_, next)| matches!(next, b' ' | b'\t'))
+        {
+            return Some(key[i + 1..].trim_start_matches([' ', '\t']));
+        }
+    }
+    None
+}
+
+fn yaml_scalar_header(line: &str) -> Option<YamlScalar> {
+    let line = line.trim_end_matches('\r');
+    let mut rest = line.trim_start_matches(' ');
+    let mut header_indent = line.len() - rest.len();
+    while let Some(after_dash) = rest
+        .strip_prefix('-')
+        .filter(|value| value.starts_with([' ', '\t']))
+    {
+        header_indent = line.len() - rest.len();
+        rest = after_dash.trim_start_matches([' ', '\t']);
+    }
+    if !rest.starts_with(['|', '>']) {
+        header_indent = line.len() - rest.len();
+        rest = yaml_mapping_value(rest)?;
+    }
+    let suffix = rest.strip_prefix(['|', '>'])?;
+    let (modifiers, tail) = suffix.split_at(suffix.find([' ', '\t']).unwrap_or(suffix.len()));
+    let tail = tail.trim_start_matches([' ', '\t']);
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return None;
+    }
+    let mut content_indent = None;
+    let mut chomp = false;
+    for byte in modifiers.bytes() {
+        match byte {
+            b'1'..=b'9' if content_indent.is_none() => {
+                content_indent = Some(header_indent + usize::from(byte - b'0'))
+            }
+            b'+' | b'-' if !chomp => chomp = true,
+            _ => return None,
+        }
+    }
+    Some(YamlScalar {
+        header_indent,
+        content_indent,
+    })
+}
+
 struct Lang {
     line_comments: &'static [&'static str],
     block_comment: Option<(&'static str, &'static str)>,
@@ -441,6 +518,11 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+const SCSS_LESS: Lang = Lang {
+    line_comments: &["//"],
+    ..CSS
+};
+
 /// MySQL requires whitespace or a control character after a double dash.
 const MYSQL: Lang = Lang {
     line_comments: &["--", "#"],
@@ -493,7 +575,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
         "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
-        "css" | "scss" | "less" => &CSS,
+        "css" => &CSS,
+        "scss" | "less" => &SCSS_LESS,
         _ => return None,
     })
 }
@@ -513,6 +596,7 @@ enum Tok {
 
 pub(crate) struct Highlighter {
     lang: &'static Lang,
+    stylesheet_line_comments: bool,
     rust_numbers: bool,
     powershell: bool,
     python_comments: bool,
@@ -522,12 +606,30 @@ pub(crate) struct Highlighter {
     mysql_comments: bool,
     php_comments: bool,
     json5_strings: bool,
+    shell_literal_quotes: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
+    yaml: bool,
+    yaml_scalar: Option<YamlScalar>,
     js_typescript: bool,
+    postgres_dollar_quotes: bool,
+}
+
+fn postgres_dollar_delimiter(chars: &[char]) -> Option<&[char]> {
+    let end = match chars.get(1)? {
+        '$' => 1,
+        first if first.is_ascii_alphabetic() || *first == '_' || !first.is_ascii() => {
+            2 + chars[2..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_' || !c.is_ascii())
+                .count()
+        }
+        _ => return None,
+    };
+    (chars.get(end) == Some(&'$')).then(|| &chars[..=end])
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1033,11 +1135,24 @@ fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> boo
         && !matches!(suffix.first(), Some('"' | '\''))
 }
 
+/// Consume an unquoted url(...) argument as a unit so its slashes stay literal.
+fn unquoted_stylesheet_url_end(chars: &[char], mut i: usize) -> Option<usize> {
+    loop {
+        match chars.get(i)? {
+            ')' => return Some(i + 1),
+            '\'' | '"' | '(' => return None,
+            '\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
         lang(&name).map(|lang| Self {
             lang,
+            stylesheet_line_comments: matches!(name.as_str(), "scss" | "less"),
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
@@ -1060,10 +1175,17 @@ impl Highlighter {
             mysql_comments: name == "mysql",
             php_comments: name == "php",
             json5_strings: name == "json5",
+            shell_literal_quotes: matches!(
+                name.as_str(),
+                "sh" | "bash" | "zsh" | "shell" | "console"
+            ),
             color,
             in_block: 0,
+            yaml: matches!(name.as_str(), "yaml" | "yml"),
+            yaml_scalar: None,
             in_str: None,
             js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
+            postgres_dollar_quotes: matches!(name.as_str(), "sql" | "postgres" | "postgresql"),
         })
     }
 
@@ -1090,6 +1212,19 @@ impl Highlighter {
             .is_some_and(|shell| shell.literal_line(line))
         {
             return vec![Span::raw(line.to_owned())];
+        }
+        if self.yaml {
+            if let Some(scalar) = &mut self.yaml_scalar {
+                let indent = line.len() - line.trim_start_matches(' ').len();
+                let blank = line.trim().is_empty();
+                if blank || indent >= scalar.content_indent.unwrap_or(scalar.header_indent + 1) {
+                    if !blank {
+                        scalar.content_indent.get_or_insert(indent);
+                    }
+                    return vec![Span::styled(line.to_owned(), self.style(Tok::Str))];
+                }
+            }
+            self.yaml_scalar = yaml_scalar_header(line);
         }
         let l = self.lang;
         let toml = self.toml_strings;
@@ -1176,6 +1311,10 @@ impl Highlighter {
                     (i == 0 && at(0, &close)).then_some(2)
                 } else if self.powershell {
                     powershell_quote_end(&chars, i, close.chars().next().unwrap())
+                } else if self.postgres_dollar_quotes {
+                    (i..chars.len())
+                        .find(|&j| at(j, &close))
+                        .map(|j| j + close.chars().count())
                 } else {
                     close_at(i, &close, ansi_quote)
                 };
@@ -1221,6 +1360,21 @@ impl Highlighter {
             }
             let c = chars[i];
             let word_start = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+            if self.postgres_dollar_quotes && c == '$' && word_start {
+                if let Some(delimiter) = postgres_dollar_delimiter(&chars[i..]) {
+                    let from = i + delimiter.len();
+                    let stop = (from..chars.len())
+                        .find(|&j| chars[j..].starts_with(delimiter))
+                        .map(|j| j + delimiter.len());
+                    if stop.is_none() {
+                        self.in_str = Some(delimiter.iter().collect());
+                    }
+                    let end = stop.unwrap_or(chars.len());
+                    push(Tok::Str, &chars[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
             // Rust raw strings, including byte and C strings.
             if l.raw_strings
                 && word_start
@@ -1418,13 +1572,10 @@ impl Highlighter {
                 continue;
             }
             if !shell && l.quotes.contains(&c) {
+                let literal = toml && c == '\'';
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
-                    j += if chars[j] == '\\' && !(toml && c == '\'') {
-                        2
-                    } else {
-                        1
-                    };
+                    j += if !literal && chars[j] == '\\' { 2 } else { 1 };
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
@@ -1514,6 +1665,17 @@ impl Highlighter {
                     Tok::Plain
                 };
                 push(tok, &chars[i..j]);
+                if self.stylesheet_line_comments
+                    && word.eq_ignore_ascii_case("url")
+                    && chars.get(j) == Some(&'(')
+                    && (i == 0 || chars[i - 1] != '-')
+                {
+                    if let Some(end) = unquoted_stylesheet_url_end(&chars, j + 1) {
+                        push(Tok::Plain, &chars[j..end]);
+                        i = end;
+                        continue;
+                    }
+                }
                 i = j;
                 continue;
             }
@@ -1725,6 +1887,47 @@ mod tests {
             highlighter.line("// comment")[0].style.fg,
             Some(Color::DarkGray)
         );
+    }
+
+    #[test]
+    fn postgres_dollar_quotes_keep_comments_and_other_tags_inside_strings() {
+        for lang in ["sql", "postgres", "PostgreSQL"] {
+            for delimiter in ["$$", "$Body_2$", "$λ$"] {
+                let mut highlighter = Highlighter::new(lang, true).unwrap();
+                let opener = format!("AS {delimiter}");
+                let spans = highlighter.line(&opener);
+                assert_eq!(spans.last().unwrap().content, delimiter);
+                assert_eq!(spans.last().unwrap().style.fg, Some(Color::Green));
+                let body = "/* open-looking -- ' $another_tag$";
+                let spans = highlighter.line(body);
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].content, body);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+
+                let closer = format!(r"\{delimiter}");
+                let line = format!("{closer}; SELECT $1 -- tail");
+                let spans = highlighter.line(&line);
+                assert_eq!(spans[0].content, closer);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+                assert!(spans
+                    .iter()
+                    .any(|span| span.content == "SELECT" && span.style.fg == Some(Color::Magenta)));
+                assert!(spans
+                    .last()
+                    .unwrap()
+                    .style
+                    .add_modifier
+                    .contains(Modifier::ITALIC));
+            }
+        }
+        for lang in ["sqlite", "mysql"] {
+            assert!(!toks(lang, "$$ /* block */ $$")
+                .iter()
+                .any(|(_, color)| *color == Some(Color::Green)));
+        }
+        assert!(toks("postgres", "SELECT col$tag$ FROM t")
+            .iter()
+            .any(|(text, color)| text == "FROM" && *color == Some(Color::Magenta)));
     }
 
     #[test]
@@ -2134,6 +2337,50 @@ mod tests {
     }
 
     #[test]
+    fn scss_and_less_comments_end_at_newline_and_leave_urls_intact() {
+        for lang in ["scss", "Less"] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            let comment = "// important: skip the /* old sheet";
+            let spans = highlighter.line(comment);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].content, comment);
+            assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+
+            let line = r#"@media { a: URL(https://example.com/a\).png); b: url("//example.test/b"); } // end"#;
+            let spans = highlighter.line(line);
+            assert_eq!(
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                line
+            );
+            assert!(spans
+                .iter()
+                .any(|span| span.content == "media" && span.style.fg == Some(Color::Magenta)));
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r#""//example.test/b""#
+                    && span.style.fg == Some(Color::Green)));
+            let comments: Vec<_> = spans
+                .iter()
+                .filter(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(comments, ["// end"]);
+        }
+        let mut css = Highlighter::new("css", true).unwrap();
+        assert!(css
+            .line("// import")
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::ITALIC)));
+        assert!(css.line("/* import */")[0]
+            .style
+            .add_modifier
+            .contains(Modifier::ITALIC));
+    }
+
+    #[test]
     fn tokenizes_common_shapes() {
         let t = toks("rust", "let x = foo(\"hi\", 42); // done");
         assert!(t.contains(&("let".into(), Some(Color::Magenta))));
@@ -2147,6 +2394,56 @@ mod tests {
         let t = toks("rust", "fn f<'a>(x: &'a str) -> Vec<u8>");
         assert!(t.contains(&("Vec".into(), Some(Color::Cyan))));
         assert!(Highlighter::new("brainfuck", true).is_none());
+    }
+
+    #[test]
+    fn yaml_block_scalars_keep_indented_punctuation_in_string_spans() {
+        for alias in ["YAML", "yml"] {
+            let mut highlighter = Highlighter::new(alias, true).unwrap();
+            let header = highlighter.line("msg: | # header");
+            assert_eq!(header.last().unwrap().content, "# header");
+            assert!(header
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC));
+            for line in [
+                "",
+                "  keep # literal",
+                "    nested: text",
+                "  # still literal",
+            ] {
+                let spans = highlighter.line(line);
+                assert_eq!(
+                    (spans[0].content.as_ref(), spans[0].style.fg),
+                    (line, Some(Color::Green))
+                );
+                assert_eq!(spans.len(), 1);
+            }
+            assert!(highlighter
+                .line("next: after")
+                .iter()
+                .any(|span| { span.content == "next" && span.style.fg == Some(Color::Blue) }));
+        }
+
+        let mut highlighter = Highlighter::new("yaml", true).unwrap();
+        highlighter.line("- 'with: colon': >+2");
+        assert_eq!(
+            highlighter.line("    body # still text")[0].style.fg,
+            Some(Color::Green)
+        );
+        let next = highlighter.line("  next: \"quoted # value\" # tail");
+        assert!(next
+            .iter()
+            .any(|span| span.content == "next" && span.style.fg == Some(Color::Blue)));
+        assert_eq!(next.last().unwrap().content, "# tail");
+
+        assert!(yaml_scalar_header("bad: |22").is_none());
+        assert!(yaml_scalar_header("quoted: '|'").is_none());
+        assert!(yaml_scalar_header("# fake: >").is_none());
+        assert!(yaml_scalar_header("flow: {key: >}").is_none());
+        assert!(yaml_scalar_header("- |- ").is_some());
     }
 
     #[test]
@@ -2452,6 +2749,29 @@ mod tests {
                     "{lang}: {source}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shell_quotes_keep_literal_backslashes_and_supported_escapes() {
+        fn check(lang: &str, input: &str, quoted: &str) {
+            let spans = toks(lang, input);
+            assert!(
+                spans.contains(&(quoted.to_owned(), Some(Color::Green))),
+                "{lang}: {spans:?}"
+            );
+            assert!(
+                spans.contains(&("if".into(), Some(Color::Magenta))),
+                "{lang}: {spans:?}"
+            );
+        }
+        for lang in ["sh", "Bash", "zsh", "shell", "console"] {
+            check(lang, r"echo 'path\'; if true; then echo hi; fi", r"'path\'");
+            check(lang, r#"echo "say \"hi\""; if true"#, r#""say \"hi\"""#);
+            check(lang, r"echo $'it\'s'; if true", r"'it\'s'");
+        }
+        for lang in ["fish", "ruby", "perl"] {
+            check(lang, r"echo 'it\'s'; if true", r"'it\'s'");
         }
     }
 

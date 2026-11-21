@@ -37,7 +37,7 @@ fn session_selection_cas_rejects_external_companion_change_and_preserves_unrelat
             a.conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            67
+            SCHEMA_VERSION
         );
     }
     std::fs::remove_dir_all(root).unwrap();
