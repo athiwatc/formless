@@ -7009,3 +7009,76 @@ their existing precedence. The complete semantic-colour audit is recorded in
 The Metrics token-usage chart distinguishes cached, fresh and completion tokens
 with `░`, `▒` and `█` patterns and a legend. Colorblind and NO_COLOR views also
 show the component counts, so coincident palette colours carry no unique data.
+
+## Topic orchestration contract v2
+
+The daemon advertises `topic_orchestration_v2` in Ping. A human proposes selected
+messages with an optional workspace and an advisory outline (zero to twenty
+steps, each with a nonblank title, optional harness/model and ReadOnly or Write
+access). Features may decompose a single original request into independent work
+items. Approval moves each selected message once, preserves attachment
+provenance, and creates the canonical Topic Chat. Attempt conversations are
+read-only to chat clients; Topic Chat remains sendable.
+
+A clean Git workspace records its base commit. A non-Git directory uses the
+existing directory; an omitted workspace creates a private
+`<profile-data>/topic-workspaces/<topic-id>` directory at approval, not proposal.
+Each attempt has a child conversation and a private
+`<profile-data>/topic-attempts/<attempt-id>/outputs` directory. Results contain
+GitRevision, File (path and SHA-256), or Text artifacts, a summary and a
+succeeded/failed/needs_user status. The Formless orchestrator, not the outline or
+an individual harness, decides when a feature is complete. There are at most
+twelve attempts per work item.
+
+The scoped harness operations are ListConversations, ReadConversation,
+AppendConversation (own attempt only), ReadArtifact (input index), and
+ReportResult. Tokens are authenticated against the active attempt and topic;
+no approval, rejection, start, merge or push operation is exposed. File input
+reads return base64 content after scope, size and SHA-256 checks.
+
+CancelTopic cancels approved, running or needs-user work and releases its
+workspace lock. Pending proposals use RejectTopic instead. RetryTopicFeature
+resets only the selected feature to Pending and the topic to Approved; it does
+not start anything or move messages again. Start on a Running topic errors
+without changing it.
+
+Phase A does not launch an orchestrator: an approved StartTopicWorkflow claim
+immediately fails with `orchestrator not available yet`, records feature failure
+details and releases its lock. No harness process starts. Pi, OpenCode and
+Antigravity return `adapter not integrated yet`; their adapters are not wired.
+
+Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
+its read-only sandbox. On every harness the isolated worktree/private outputs
+directory is the real boundary. Pi ReadOnly is tool-restricted (`--tools`
+allowlist); OpenCode ReadOnly is permission-restricted (agent rules). Neither
+Pi nor OpenCode has an OS sandbox. Harness-specific permissions are not an
+OS-level boundary, and permission denials must be retained in attempt output.
+
+Topics form an arbitrary hierarchy. An explicit `parent_topic_id` must name an
+existing topic that has been approved. Otherwise a proposal from an existing
+Topic Chat defaults to that topic as parent; other sources create roots.
+ListTopics includes all levels and their parent IDs. Cyclic parent chains are
+rejected. Permanent deletion/purge removes descendant topics and their canonical
+conversations; cancellation affects only the selected topic, not its children.
+
+The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
+in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
+are otherwise opaque until adapter integration. It is retained in advisory
+steps and attempt metadata.
+
+Harness questions reuse UserQuestion, AnswerQuestion and UserQuestionClosed on
+the canonical attempt conversation. Topic MCP AskUser and InteractionHandler
+ask_question accept 1–4 existing Question objects (labeled options and
+multi_select) and return an ordered optional list of QuestionAnswer; cancellation
+returns None. Pending questions and permissions pause their attempt and feature
+in NeedsUser and resume them when answered, without reviving terminal work.
+
+HarnessPermissionRequested/Closed and the user-only HarnessPermissionDecision
+request handle permissions. Only offered option IDs are accepted; None rejects.
+PendingApprovals and subscription attention replay include open permissions.
+No model tool or scoped MCP operation can decide a permission. Cancellation,
+attempt termination, shutdown and dropped interaction futures close undecided
+requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
+memory, scoped to the current attempt and the exact kind/title/input, never
+persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
+permission/question/update hooks; updates append structured canonical messages.

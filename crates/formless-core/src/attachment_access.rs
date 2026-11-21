@@ -2,6 +2,7 @@
 //! Only an owned artifact record plus a rooted native file handle permits reads.
 use crate::{Paths, Store};
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -15,6 +16,77 @@ type Record = (Option<String>, String, i64);
 type Records = HashMap<String, Record>;
 type Lineage = HashMap<String, Vec<(String, i64)>>;
 const MAX_LINEAGE_DEPTH: usize = 64;
+
+pub(crate) fn topic_provenance(
+    conn: &rusqlite::Connection,
+    id: &str,
+    scope: &str,
+    seq: Option<i64>,
+    owner: Option<&str>,
+) -> Result<bool> {
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    let mut statement = conn.prepare(
+        "SELECT r.source_session_id,r.source_seq,m.meta FROM topic_source_messages r
+         JOIN topics t ON t.id=r.topic_id JOIN messages m ON m.id=r.message_id
+         WHERE t.topic_session_id=?1 AND m.session_id=?1 AND r.moved_at IS NOT NULL
+         AND (?2 IS NULL OR m.seq=?2)",
+    )?;
+    let rows = statement.query_map(rusqlite::params![scope, seq], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (source, source_seq, meta) = row?;
+        let Some(meta) = meta.and_then(|m| serde_json::from_str::<Value>(&m).ok()) else {
+            continue;
+        };
+        let attached = meta["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| {
+                a["imported"] != true
+                    && a["reference"] != true
+                    && a["expired"] != true
+                    && (a["id"].as_str() == Some(id) || a["_artifact_id"].as_str() == Some(id))
+            });
+        if !attached {
+            continue;
+        }
+        if owner == source {
+            return Ok(true);
+        }
+        let mut current = source;
+        let mut cutoff = i64::MAX;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_LINEAGE_DEPTH {
+            let edge: Option<(Option<String>, Option<i64>)> = conn
+                .query_row(
+                    "SELECT forked_from,fork_point_seq FROM sessions WHERE id=?1",
+                    [&current],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((Some(parent), Some(point))) = edge else {
+                break;
+            };
+            cutoff = cutoff.min(point);
+            if source_seq <= 0 || source_seq > cutoff || !seen.insert(parent.clone()) {
+                break;
+            }
+            if parent == owner {
+                return Ok(true);
+            }
+            current = parent;
+        }
+    }
+    Ok(false)
+}
 
 fn prefix(messages: &[Value]) -> impl Iterator<Item = &Value> {
     messages
@@ -46,7 +118,11 @@ fn snapshot_records(
 #[derive(Clone)]
 enum Resolver {
     Profile(PathBuf),
-    Snapshot(Arc<Records>, Arc<Lineage>),
+    Snapshot(
+        Arc<Records>,
+        Arc<Lineage>,
+        Arc<std::collections::HashSet<(String, String, i64)>>,
+    ),
 }
 
 #[derive(Clone)]
@@ -71,6 +147,7 @@ impl AttachmentAccess {
         };
         let records = snapshot_records(messages, |id| store.get_artifact(id))?;
         let mut lineage = Lineage::new();
+        let mut topic_grants = std::collections::HashSet::new();
         for attachment in prefix(messages) {
             let Some(id) = attachment["id"].as_str() else {
                 continue;
@@ -79,6 +156,16 @@ impl AttachmentAccess {
                 continue;
             }
             if let Some(scope) = attachment["_source_session"].as_str() {
+                if let Some(seq) = attachment["_source_seq"].as_i64() {
+                    if store.topic_artifact_access(
+                        id,
+                        scope,
+                        Some(seq),
+                        records[id].0.as_deref(),
+                    )? {
+                        topic_grants.insert((id.into(), scope.into(), seq));
+                    }
+                }
                 if !lineage.contains_key(scope) {
                     let mut chain = Vec::new();
                     let mut current = scope.to_string();
@@ -106,7 +193,11 @@ impl AttachmentAccess {
         }
         Ok(Some(Self {
             root,
-            resolver: Resolver::Snapshot(Arc::new(records), Arc::new(lineage)),
+            resolver: Resolver::Snapshot(
+                Arc::new(records),
+                Arc::new(lineage),
+                Arc::new(topic_grants),
+            ),
         }))
     }
 
@@ -121,10 +212,11 @@ impl AttachmentAccess {
                     }))
         };
         match &self.resolver {
-            Resolver::Snapshot(records, lineage) => {
+            Resolver::Snapshot(records, lineage, topic_grants) => {
                 let record = records.get(id)?;
-                allowed(&record.0, lineage.get(scope).map_or(&[], Vec::as_slice))
-                    .then(|| record.clone())
+                (allowed(&record.0, lineage.get(scope).map_or(&[], Vec::as_slice))
+                    || topic_grants.contains(&(id.into(), scope.into(), seq)))
+                .then(|| record.clone())
             }
             Resolver::Profile(db) => {
                 let conn = rusqlite::Connection::open_with_flags(
@@ -141,6 +233,9 @@ impl AttachmentAccess {
                     )
                     .ok()?;
                 if record.0.as_deref() == Some(scope) {
+                    return Some(record);
+                }
+                if topic_provenance(&conn, id, scope, Some(seq), record.0.as_deref()).ok()? {
                     return Some(record);
                 }
                 if seq <= 0 {
