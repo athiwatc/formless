@@ -34,6 +34,7 @@ fn entry(value: &Value) -> Option<Attachment> {
         .unwrap_or(name);
     let mime = value
         .get("mime")
+        .filter(|value| !value.is_null())
         .map_or(Some("application/octet-stream"), |value| {
             text(value, MAX_MIME_BYTES)
         })?;
@@ -67,6 +68,22 @@ pub(crate) fn decode(meta: Option<&str>) -> Vec<Attachment> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn imported_references_with_null_or_missing_mime_remain_visible() {
+        let rows = decode(Some(
+            &json!({"attachments":[
+                {"name":"imported","reference":true,"mime":null,"bytes":42},
+                {"name":"legacy","reference":true}
+            ]})
+            .to_string(),
+        ));
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row.reference && row.mime == "application/octet-stream"));
+        assert_eq!(rows[0].bytes, 42);
+    }
 
     #[test]
     fn projects_files_images_references_and_expired_or_unavailable_tombstones() {
