@@ -485,7 +485,7 @@ impl Paths {
                 .with_context(|| format!("open daemon directory {}", dir.display()))?;
             let metadata = directory.metadata()?;
             anyhow::ensure!(
-                metadata.uid() == unsafe { libc::getuid() },
+                metadata.uid() == unsafe { libc::geteuid() },
                 "daemon directory {} must be owned by this user",
                 dir.display()
             );
@@ -504,7 +504,8 @@ impl Paths {
         match std::fs::symlink_metadata(socket) {
             Ok(metadata) => {
                 anyhow::ensure!(
-                    metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::getuid() },
+                    metadata.file_type().is_socket()
+                        && metadata.uid() == unsafe { libc::geteuid() },
                     "daemon endpoint {} must be a socket owned by this user",
                     socket.display()
                 );
@@ -547,7 +548,7 @@ impl Paths {
             match metadata {
                 Ok(metadata) => {
                     anyhow::ensure!(
-                        metadata.is_dir() && metadata.uid() == unsafe { libc::getuid() },
+                        metadata.is_dir() && metadata.uid() == unsafe { libc::geteuid() },
                         "daemon directory {} must be a folder owned by this user",
                         dir.display()
                     );
@@ -603,6 +604,28 @@ mod pipe_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_directory_secures_supported_data_alias() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let base = std::path::Path::new("/tmp").join(format!("fl-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        symlink(base.join("real"), base.join("alias")).unwrap();
+        let paths = Paths::from_dirs(base.join("alias"), base.join("config")).unwrap();
+        std::fs::set_permissions(base.join("real"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        paths.prepare_socket_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(base.join("real"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn a_long_data_dir_gets_a_short_socket_path() {
