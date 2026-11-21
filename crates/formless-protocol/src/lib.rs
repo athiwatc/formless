@@ -42,6 +42,7 @@ pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
 pub enum HarnessKind {
     Claude,
     Codex,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,5 +1,7 @@
 //! Safe, testable command construction for supported local coding CLIs.
 
+pub mod antigravity;
+
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
 use anyhow::{bail, Context, Result};
@@ -87,6 +89,9 @@ impl fmt::Debug for HarnessResult {
 }
 
 pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
+    if request.kind == HarnessKind::Antigravity {
+        return antigravity::command_spec(request);
+    }
     if request.prompt.trim().is_empty() {
         bail!("harness prompt must not be empty");
     }
@@ -120,6 +125,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         .unwrap_or_else(|| match request.kind {
             HarnessKind::Claude => PathBuf::from("claude"),
             HarnessKind::Codex => PathBuf::from("codex"),
+            HarnessKind::Antigravity => PathBuf::from("agy"),
         });
     let mut args = Vec::<OsString>::new();
     match request.kind {
@@ -186,6 +192,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             }
             args.push(request.prompt.as_str().into());
         }
+        HarnessKind::Antigravity => unreachable!(),
     }
 
     Ok(CommandSpec {
@@ -217,6 +224,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
     match kind {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
+        HarnessKind::Antigravity => antigravity::parse_output(stdout),
     }
 }
 
