@@ -99,32 +99,67 @@ pub fn usage_usd(cfg: &Config, provider: &str, model: &str, usage: &Usage) -> Op
     )
     .filter(|v| v.is_finite() && *v >= 0.0)
 }
-fn candidates(cfg: &ProviderCfg, complex: bool) -> Vec<String> {
-    let resolve = |list: &[String]| {
-        let mut out = Vec::new();
-        for m in list {
-            let m = cfg.resolve_alias(m);
-            if !m.is_empty() && !ProviderCfg::is_auto_model(&m) && !out.contains(&m) {
-                out.push(m);
+fn resolved_models(cfg: &ProviderCfg, models: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in models {
+        let model = cfg.resolve_alias(name);
+        if !model.is_empty() && !ProviderCfg::is_auto_model(&model) && !out.contains(&model) {
+            out.push(model);
+        }
+    }
+    out
+}
+
+fn routing_subset(cfg: &ProviderCfg, complex: bool) -> (&'static str, &[String]) {
+    if complex {
+        ("strong", &cfg.routing_strong_models)
+    } else {
+        ("fast", &cfg.routing_fast_models)
+    }
+}
+
+pub fn routing_subset_warnings(cfg: &ProviderCfg) -> Vec<String> {
+    let all = resolved_models(cfg, &cfg.routing_candidates());
+    let mut warnings = Vec::new();
+    for complex in [false, true] {
+        let (kind, names) = routing_subset(cfg, complex);
+        let setting = format!("provider.routing_{kind}_models");
+        let mut matched = false;
+        for name in names {
+            if all.contains(&cfg.resolve_alias(name)) {
+                matched = true;
+            } else {
+                warnings.push(format!(
+                    "{setting} includes {name:?} outside the configured candidate list."
+                ));
             }
         }
-        out
-    };
-    let all = resolve(&cfg.routing_candidates());
-    let subset = resolve(if complex {
-        &cfg.routing_strong_models
-    } else {
-        &cfg.routing_fast_models
-    });
+        if !names.is_empty() && !matched {
+            warnings.push(match all.first() {
+                Some(first) => format!("{setting} matches no candidates. Automatic routing for this subset will use the first candidate, {first:?}."),
+                None => format!("{setting} matches no candidates. Configure routing_models or fallback_models before using auto routing."),
+            });
+        }
+    }
+    warnings
+}
+
+fn candidates(cfg: &ProviderCfg, complex: bool) -> (Vec<String>, Option<&'static str>) {
+    let all = resolved_models(cfg, &cfg.routing_candidates());
+    let (kind, names) = routing_subset(cfg, complex);
+    if names.is_empty() {
+        return (all, None);
+    }
+    let subset = resolved_models(cfg, names);
     let filtered = all
         .iter()
-        .filter(|m| subset.is_empty() || subset.contains(m))
+        .filter(|m| subset.contains(m))
         .cloned()
         .collect::<Vec<_>>();
     if filtered.is_empty() {
-        all
+        (all.into_iter().take(1).collect(), Some(kind))
     } else {
-        filtered
+        (filtered, None)
     }
 }
 fn best_legacy(candidates: &[String], stats: &[Stat]) -> Option<String> {
@@ -249,14 +284,22 @@ fn choose(
     }))
 }
 pub fn select_auto(cfg: &ProviderCfg, stats: &[Stat], complex: bool) -> Result<Option<Choice>> {
-    choose(
-        &candidates(cfg, complex),
+    let (candidates, subset_fallback) = candidates(cfg, complex);
+    let mut choice = choose(
+        &candidates,
         stats,
         cfg.routing_min_samples,
         cfg.routing_quality_bar,
         false,
         true,
-    )
+    )?;
+    if let (Some(choice), Some(kind)) = (&mut choice, subset_fallback) {
+        choice.explanation["subset_fallback"] = json!(kind);
+        choice.explanation["reason"] = json!(format!(
+            "The {kind} subset matched no candidates. Using the first configured candidate."
+        ));
+    }
+    Ok(choice)
 }
 pub fn select_task(
     candidates: &[String],
@@ -358,6 +401,34 @@ mod tests {
             .unwrap();
         assert_eq!(c.model, "premium");
         assert_eq!(c.reason, Reason::Explore);
+    }
+
+    #[test]
+    fn unmatched_routing_subsets_are_reported_and_fall_back_to_one_candidate() {
+        let mut cfg = config();
+        cfg.fallback_models = vec!["fallback-only".into()];
+        cfg.aliases.insert("quick".into(), "cheap".into());
+        cfg.routing_fast_models = vec!["quick".into(), "typo".into()];
+        cfg.routing_strong_models = vec!["fallback-only".into()];
+        let warnings = routing_subset_warnings(&cfg);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("routing_fast_models") && warnings[0].contains("typo"));
+        assert!(warnings[1].contains("fallback-only") && warnings[1].contains("candidate list"));
+        assert!(warnings[2].contains("matches no candidates") && warnings[2].contains("premium"));
+        let stats = [
+            stat("premium", Some(20.0), 1.0, 1.0),
+            stat("cheap", Some(1.0), 1.0, 1.0),
+        ];
+        let fast = select_auto(&cfg, &stats, false).unwrap().unwrap();
+        assert_eq!(fast.model, "cheap");
+        assert!(fast.explanation.get("subset_fallback").is_none());
+        let strong = select_auto(&cfg, &stats, true).unwrap().unwrap();
+        assert_eq!(strong.model, "premium");
+        assert_eq!(strong.explanation["subset_fallback"], "strong");
+        assert_eq!(
+            strong.explanation["candidates"].as_array().unwrap().len(),
+            1
+        );
     }
     #[test]
     fn partial_tokens_stay_unknown_reported_usd_wins_and_cache_is_priced() {

@@ -1,6 +1,7 @@
 //! Invocation-owned processes. Pipes are backpressured in bounded native queues;
 //! the supervisor remains able to enforce deadlines while JavaScript is idle.
 use super::{encode, utf8_cut, Enc, LockExt};
+use crate::process_group as platform;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -162,7 +163,7 @@ impl Process {
             group: None,
             terminated: false,
         };
-        owned.group = Some(platform::Group::attach(&owned.child)?);
+        owned.group = Some(platform::attach(&owned.child)?);
         let shared = Arc::new(Shared::default());
         let watched = shared.clone();
         let cancelled = cancel.clone();
@@ -289,10 +290,9 @@ impl ChildOwner {
         if !self.terminated {
             self.terminated = true;
             if let Some(group) = &self.group {
-                group.kill(&mut self.child);
-            } else {
-                let _ = self.child.kill();
+                group.kill();
             }
+            let _ = self.child.kill();
         }
     }
 }
@@ -472,176 +472,6 @@ fn completion(status: ExitStatus, timed_out: bool, killed: bool) -> Completion {
         signal,
         timed_out,
         killed,
-    }
-}
-
-#[cfg(unix)]
-mod platform {
-    use super::*;
-    pub(super) fn prepare(command: &mut Command) -> Result<(), String> {
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        // Read the parent policy without changing a global signal handler.
-        // Auto-reaping makes it impossible to retain the leader's PID safely.
-        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
-            return Err("process supervision requires waitable children; SIGCHLD auto-reaping is enabled, so no child was started".into());
-        }
-        std::os::unix::process::CommandExt::process_group(command, 0);
-        Ok(())
-    }
-    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: valid initialized native output, our own still-waitable child,
-        // and WNOWAIT deliberately retains its identity until group termination.
-        if unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(unsafe { info.si_pid() } != 0)
-    }
-    pub(super) struct Group(u32);
-    impl Group {
-        pub(super) fn attach(child: &Child) -> Result<Self, String> {
-            Ok(Self(child.id()))
-        }
-        pub(super) fn kill(&self, child: &mut Child) {
-            // SAFETY: this Invocation created the group with its own child PID.
-            unsafe {
-                libc::killpg(self.0 as libc::pid_t, libc::SIGKILL);
-            }
-            let _ = child.kill();
-        }
-    }
-}
-#[cfg(not(any(unix, windows)))]
-mod platform {
-    use super::*;
-    pub(super) fn prepare(_: &mut Command) -> Result<(), String> {
-        Err("supervised processes are unsupported on this platform".into())
-    }
-    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
-        child.try_wait().map(|status| status.is_some())
-    }
-    pub(super) struct Group;
-    impl Group {
-        pub(super) fn attach(_: &Child) -> Result<Self, String> {
-            Err("supervised processes are unsupported on this platform".into())
-        }
-        pub(super) fn kill(&self, child: &mut Child) {
-            let _ = child.kill();
-        }
-    }
-}
-
-#[cfg(windows)]
-mod platform {
-    use super::*;
-    use std::os::windows::{
-        io::{AsRawHandle, FromRawHandle, OwnedHandle},
-        process::CommandExt,
-    };
-    use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD,
-                THREADENTRY32,
-            },
-            JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            },
-            Threading::{OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME},
-        },
-    };
-    pub(super) fn prepare(command: &mut Command) -> Result<(), String> {
-        command.creation_flags(CREATE_SUSPENDED);
-        Ok(())
-    }
-    pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
-        // The private Job handle retains group identity after the process exits.
-        child.try_wait().map(|status| status.is_some())
-    }
-    pub(super) struct Group(OwnedHandle);
-    impl Group {
-        pub(super) fn attach(child: &Child) -> Result<Self, String> {
-            // Start suspended: no descendant can escape before the Job owns it.
-            // Nested jobs are supported on Windows 8+ (the supported baseline).
-            // https://learn.microsoft.com/windows/win32/procthread/job-objects
-            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if raw.is_null() {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            // SAFETY: successful native creation transfers one owned HANDLE.
-            let group = Self(unsafe { OwnedHandle::from_raw_handle(raw) });
-            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            // SAFETY: live owned job/child handles and an initialized native
-            // structure of exactly the size passed to the native function.
-            if unsafe {
-                SetInformationJobObject(
-                    group.0.as_raw_handle(),
-                    JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                    std::mem::size_of_val(&limits) as u32,
-                )
-            } == 0
-                || unsafe {
-                    AssignProcessToJobObject(group.0.as_raw_handle(), child.as_raw_handle())
-                } == 0
-            {
-                return Err(format!(
-                    "isolate child process: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            // std::process preserves Windows argument quoting and environment
-            // handling but does not expose the primary thread handle. The
-            // suspended child has not run; enumerate its thread and resume only
-            // after assignment. If isolation/resumption fails, ChildOwner kills
-            // and reaps the still-owned child rather than running uncontained.
-            let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-            if raw == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
-            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-            entry.dwSize = std::mem::size_of_val(&entry) as u32;
-            let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
-            while more {
-                if entry.th32OwnerProcessID == child.id() {
-                    let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-                    if raw.is_null() {
-                        return Err(std::io::Error::last_os_error().to_string());
-                    }
-                    let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
-                    if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
-                        return Err("cannot resume the isolated child thread".into());
-                    }
-                    return Ok(group);
-                }
-                more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
-            }
-            Err("cannot find the suspended child thread".into())
-        }
-        pub(super) fn kill(&self, child: &mut Child) {
-            // SAFETY: a private owned Job handle; all processes in this Job
-            // belong to this Invocation, with breakaway flags left disabled.
-            unsafe {
-                TerminateJobObject(self.0.as_raw_handle(), 1);
-            }
-            let _ = child.kill();
-        }
     }
 }
 
