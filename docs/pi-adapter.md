@@ -49,9 +49,9 @@ secret-manager commands and ambient cloud authentication; absence of that file
 does not mean signed out. The probe does not read credentials, refresh OAuth,
 run credential commands, or change the user's agent directory/configuration.
 
-The merged core currently defines `HarnessAvailability` and `ListHarnesses` but
-still rejects `ListHarnesses` as unimplemented; calling this adapter probe from
-that endpoint remains core-owned.
+Core's `ListHarnesses` dispatch calls this adapter after resolving its executable
+override/PATH lookup. Core retains its ten-second overall deadline and concurrent
+probes; Pi's version subprocess additionally has its own three-second timeout.
 
 References: [configuration](https://docs.pi.dev/latest/configuration),
 [providers](https://docs.pi.dev/latest/providers), and

@@ -11,7 +11,7 @@ if '--version' in sys.argv:
         gate=pathlib.Path(os.environ['PROBE_GATE'])
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
         while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
-    print('fixture 1.0');sys.exit()
+    print('1.6.0' if pathlib.Path(sys.argv[0]).name=='pi' else 'fixture 1.0');sys.exit()
 mode=os.environ.get('PROBE_MODE','ok')
 if mode=='hang':time.sleep(120)
 if sys.argv[1:]==['auth','status']:
@@ -64,7 +64,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
-async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
+async fn list_probes_run_concurrently_and_pi_uses_adapter_availability() {
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -95,7 +95,15 @@ async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
         .iter()
         .all(|value| value.version.as_deref() == Some("fixture 1.0")
             && value.signed_in == Some(true)));
-    assert!(values[2..]
+    assert_eq!(values[2].kind, HarnessKind::Pi);
+    assert_eq!(values[2].version.as_deref(), Some("1.6.0"));
+    assert_eq!(values[2].signed_in, None);
+    assert!(values[2]
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("Sign-in unknown"));
+    assert!(values[3..]
         .iter()
         .all(|value| value.signed_in.is_none() && value.version.is_none()));
 }
