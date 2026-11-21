@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload tested release binary and generated assets
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: formless-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           path: ${{ env.CI_DIR }}/dist/
@@ -217,7 +217,7 @@ jobs:
 
       - name: Upload diagnostic logs
         if: ${{ !cancelled() && env.CI_DIR != '' && (failure() || github.event_name == 'workflow_dispatch') }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ci-logs-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.CI_DIR }}/logs/

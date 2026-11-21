@@ -117,7 +117,7 @@ jobs:
           Copy-Item README.md,SPEC.md,LICENSE $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: formless-${{ matrix.target }}
           path: |
@@ -215,7 +215,7 @@ jobs:
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
           dpkg -I ./*.deb | sed -n '/Depends/p'
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: formless-linux
           path: dist/*
@@ -391,7 +391,7 @@ jobs:
           echo "RELEASE_IMAGE_ARCHIVE=$archive_dir" >> "$GITHUB_ENV"
           docker image save --output "$archive_dir/image.tar" "$RELEASE_IMAGE"
           printf 'image=%s\n' "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: image-upload
         with:
           name: docker-image-${{ github.run_attempt }}
