@@ -199,6 +199,11 @@ const SHELL: Lang = Lang {
     regex: false,
 };
 
+const POWERSHELL: Lang = Lang {
+    block_comment: Some(("<#", "#>")),
+    ..SHELL
+};
+
 const C_LIKE: Lang = Lang {
     line_comments: &["//"],
     block_comment: Some(("/*", "*/")),
@@ -464,9 +469,11 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "js" | "javascript" | "jsx" | "mjs" | "cjs" | "ts" | "typescript" | "tsx" => &JS,
         "py" | "python" | "python3" => &PYTHON,
         "go" | "golang" => &GO,
-        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" | "ps" | "powershell"
-        | "dockerfile" | "docker" | "make" | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir"
-        | "ex" | "exs" | "perl" | "pl" => &SHELL,
+        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" | "dockerfile" | "docker" | "make"
+        | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir" | "ex" | "exs" | "perl" | "pl" => {
+            &SHELL
+        }
+        "ps" | "powershell" => &POWERSHELL,
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
         | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "zig" | "objc" => &C_LIKE,
         "php" => &PHP,
@@ -500,6 +507,7 @@ enum Tok {
 pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
+    powershell: bool,
     python_comments: bool,
     mysql_comments: bool,
     php_comments: bool,
@@ -592,6 +600,19 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
 
 // After a contextual `await`, an apparent closing slash can instead be the
 // second division operator. Check the flags and the next operand token.
+fn powershell_quote_end(chars: &[char], mut i: usize, quote: char) -> Option<usize> {
+    while let Some(&c) = chars.get(i) {
+        if (quote == '"' && c == '`') || (c == quote && chars.get(i + 1) == Some(&quote)) {
+            i += 2;
+        } else if c == quote {
+            return Some(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> bool {
     if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
         return false;
@@ -622,6 +643,7 @@ impl Highlighter {
         lang(&name).map(|lang| Self {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
+            powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
             mysql_comments: name == "mysql",
             php_comments: name == "php",
@@ -713,6 +735,10 @@ impl Highlighter {
                     (i..chars.len())
                         .find(|&j| at(j, &close))
                         .map(|j| j + close.chars().count())
+                } else if self.powershell && close.ends_with('@') {
+                    (i == 0 && at(0, &close)).then_some(2)
+                } else if self.powershell {
+                    powershell_quote_end(&chars, i, close.chars().next().unwrap())
                 } else {
                     close_at(i, &close)
                 };
@@ -790,7 +816,11 @@ impl Highlighter {
                 || if php {
                     chars.get(i + 1) != Some(&'[')
                 } else {
-                    self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace()
+                    self.python_comments
+                        || mysql
+                        || self.powershell
+                        || i == 0
+                        || chars[i - 1].is_whitespace()
                 };
             if hash_comment
                 && l.line_comments.iter().any(|p| {
@@ -813,6 +843,15 @@ impl Highlighter {
                 push(Tok::Comment, &chars[i..end]);
                 i = end;
                 continue;
+            }
+            if self.powershell && c == '@' {
+                if let Some(quote @ ('"' | '\'')) = chars.get(i + 1) {
+                    if chars[i + 2..].iter().all(|c| c.is_whitespace()) {
+                        self.in_str = Some(format!("{quote}@"));
+                        push(Tok::Str, &chars[i..]);
+                        break;
+                    }
+                }
             }
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
@@ -909,6 +948,16 @@ impl Highlighter {
                     self.in_str = Some(delim.to_string());
                 }
                 i = stop.unwrap_or(chars.len());
+                continue;
+            }
+            if self.powershell && l.quotes.contains(&c) {
+                let stop = powershell_quote_end(&chars, i + 1, c);
+                if stop.is_none() {
+                    self.in_str = Some(c.to_string());
+                }
+                let end = stop.unwrap_or(chars.len());
+                push(Tok::Str, &chars[i..end]);
+                i = end;
                 continue;
             }
             if l.quotes.contains(&c) {
@@ -1544,6 +1593,61 @@ mod tests {
     }
 
     /// Strings that run across lines stay strings until they close (#876).
+    #[test]
+    fn powershell_quotes_and_comments_do_not_colour_following_code() {
+        for lang in ["ps", "PowerShell"] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            let line = r#"Write-Host "say `"hello`""; if ($true) { echo hi }"#;
+            let spans = highlighter.line(line);
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r#""say `"hello`"""#
+                    && span.style.fg == Some(Color::Green)));
+            assert!(spans
+                .iter()
+                .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+
+            let spans = highlighter.line(r"echo 'it''s\'; if true");
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r"'it''s\'" && span.style.fg == Some(Color::Green)));
+            let spans = highlighter.line("echo# tail");
+            assert!(spans
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC));
+
+            highlighter.line("<#");
+            let spans = highlighter.line("if ($true) { echo hi }");
+            assert_eq!(spans.len(), 1);
+            assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+            assert!(highlighter
+                .line("#> if true")
+                .iter()
+                .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+
+            for quote in ['\'', '"'] {
+                let opener = format!("@{quote}");
+                let closer = format!("{quote}@");
+                assert_eq!(highlighter.line(&opener)[0].style.fg, Some(Color::Green));
+                assert_eq!(
+                    highlighter.line(&format!("  {closer}"))[0].style.fg,
+                    Some(Color::Green)
+                );
+                assert_eq!(
+                    highlighter.line("<# still data")[0].style.fg,
+                    Some(Color::Green)
+                );
+                assert!(highlighter
+                    .line(&format!("{closer}; if true"))
+                    .iter()
+                    .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+            }
+        }
+    }
+
     #[test]
     fn multi_line_strings_carry_across_lines() {
         let mut h = Highlighter::new("python", true).unwrap();
