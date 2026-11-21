@@ -102,9 +102,16 @@ impl Fixture {
             .unwrap()
     }
     fn wait(&self, label: &str, mut test: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // The first real Tool run includes cold sandbox startup on CI runners.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !test() {
-            assert!(Instant::now() < deadline, "{label}");
+            assert!(
+                Instant::now() < deadline,
+                "{label}; provider calls={}; session={}; pending={}",
+                self.calls.load(Ordering::SeqCst),
+                self.snapshot(),
+                self.pending()
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
