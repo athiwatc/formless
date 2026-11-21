@@ -589,7 +589,7 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
     let discarded = f.paths.data_dir.join("artifacts/nested/discarded.txt");
     std::fs::write(&discarded, b"discarded").unwrap();
     let discarded_id = f.record(&discarded, 9, Some(&f.session));
-    let topic = f
+    let (topic, sibling) = f
         .daemon()
         .with_store(|st| {
             let message = st.append_message_meta(
@@ -598,6 +598,7 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
                 "Keep this",
                 Some(json!({"attachments":[{"id":id,"path":file,"bytes":19}]}).to_string()),
             )?;
+            let fork = st.fork_session(&f.session, None, None)?.unwrap();
             let topic = st.propose_topic(
                 &TopicProposalRequest {
                     parent_topic_id: None,
@@ -611,7 +612,21 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
                 WorkspaceKind::Directory,
                 None,
             )?;
-            st.approve_topic(&topic.id)
+            let topic = st.approve_topic(&topic.id)?;
+            let sibling = st.propose_topic(
+                &TopicProposalRequest {
+                    parent_topic_id: None,
+                    source_session_id: fork.id.clone(),
+                    message_ids: vec![st.list_messages(&fork.id)?[0].id.clone()],
+                    features: vec![],
+                    name: "Another reference".into(),
+                    workspace: Some(f.root.clone()),
+                    outline: vec![],
+                },
+                WorkspaceKind::Directory,
+                None,
+            )?;
+            Ok((topic, st.approve_topic(&sibling.id)?))
         })
         .unwrap();
     let session = topic.topic_session_id.unwrap();
@@ -637,6 +652,21 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
     assert!(f
         .daemon()
         .with_reader(|st| st.get_artifact(&discarded_id))
+        .unwrap()
+        .is_none());
+    f.daemon().purge_session(&session).await.unwrap();
+    assert!(file.exists());
+    let sibling_session = sibling.topic_session_id.unwrap();
+    assert!(f
+        .daemon()
+        .read_artifact_impl(&sibling_session, &json!({"id":id}))
+        .unwrap()
+        .contains("retained attachment"));
+    f.daemon().purge_session(&sibling_session).await.unwrap();
+    assert!(!file.exists());
+    assert!(f
+        .daemon()
+        .with_reader(|st| st.get_artifact(&id))
         .unwrap()
         .is_none());
 }

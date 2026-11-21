@@ -328,6 +328,50 @@ pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
     store.delete_artifact_rows(&doomed.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
 }
 
+pub(crate) fn remove_retained_for_topic_purge(store: &Store, family: &[String]) -> Result<()> {
+    let sessions = store
+        .list_topics()?
+        .into_iter()
+        .filter_map(|topic| topic.topic_session_id)
+        .collect::<Vec<_>>();
+    if !sessions.iter().any(|session| family.contains(session)) {
+        return Ok(());
+    }
+    let mut doomed = std::collections::HashSet::new();
+    for (id, owner) in store.orphaned_artifact_records()? {
+        let mut referenced_by_doomed = false;
+        let mut referenced_by_survivor = false;
+        for session in &sessions {
+            if store.topic_artifact_access(&id, session, None, Some(&owner))? {
+                if family.contains(session) {
+                    referenced_by_doomed = true;
+                } else {
+                    referenced_by_survivor = true;
+                }
+            }
+        }
+        if referenced_by_doomed && !referenced_by_survivor {
+            doomed.insert(id);
+        }
+    }
+    let records = store.list_artifacts()?;
+    let retained_paths = records
+        .iter()
+        .filter(|(id, _, _, _)| !doomed.contains(id))
+        .map(|(_, path, _, _)| path)
+        .collect::<std::collections::HashSet<_>>();
+    for (id, path, _, _) in &records {
+        if doomed.contains(id) {
+            if retained_paths.contains(path) {
+                store.delete_artifact_rows(std::slice::from_ref(id))?;
+            } else {
+                remove_record(store, id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delete one recorded artifact; metadata from held/imported JSON is never
 /// authority. Unknown verification/deletion errors preserve the durable row.
 pub(crate) fn remove_record(store: &Store, id: &str) -> Result<()> {

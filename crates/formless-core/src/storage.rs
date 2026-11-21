@@ -6996,6 +6996,10 @@ impl Store {
             .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
+    pub(crate) fn orphaned_artifact_records(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.conn.prepare("SELECT id,session_id FROM artifacts WHERE session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=artifacts.session_id)")?
+            .query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
 
     /// Paths of a Session's artifacts (to delete with it).
     pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {

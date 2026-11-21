@@ -11145,7 +11145,10 @@ impl Daemon {
         for session in &family {
             self.with_store(|st| crate::artifacts::remove_for_session(st, session))?;
         }
-        self.with_store(|st| st.delete_session(id))?;
+        self.with_store(|st| {
+            crate::artifacts::remove_retained_for_topic_purge(st, &family)?;
+            st.delete_session(id)
+        })?;
         for session in &family {
             self.contexts.locked().remove(session);
         }
