@@ -61,9 +61,9 @@ without redesign.
   Permissions are user-answered through the shared handler; vendor tool metadata
   remains in raw input and `allow_always` is attempt-scoped. Native
   `_x.ai/ask_user_question` requests translate to the same user question types as
-  the Formless bridge, with explicit accepted/cancelled replies. Prompt steering
-  toward bridge `AskUser` or a turn-end question is secondary, not enforcement.
-  Profile hooks are prepared separately from shared ACP dispatch; see
+  the Formless bridge, with explicit accepted/cancelled replies. Questions may
+  also use bridge `AskUser` or a turn-end message. The profile uses shared ACP
+  dispatch without registry or topic-enum wiring; see
   `docs/grok-adapter.md` for the current integration boundary and live evidence.
 
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).

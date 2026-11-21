@@ -12,9 +12,8 @@ Unknown versions and prereleases fail closed.
 Its final registry location is `local_harness/acp/`, agent id `grok`.
 It is not wired into `HarnessKind` or command/result dispatch and cannot yet
 run a topic step. No Grok-specific ACP transport or permission engine is
-duplicated here. `grok::run` prepares prompt/environment overrides and delegates
-to shared `acp::run`; registry integration must preserve this preparation
-(AgentSpec currently has no environment override hook).
+duplicated here. `grok::run` delegates directly to shared `acp::run`.
+`SPEC.set_env` forces `GROK_DISABLE_AUTOUPDATER=1` after user overrides.
 The current `HarnessRole::Review` maps to read-only access;
 the shared contract's planned `StepAccess::ReadOnly` will replace that mapping.
 
@@ -90,11 +89,11 @@ failed: Failed to reach the client for user question: ...`. A result lacking
 `chat_about_this`, `skip_interview`, `cancelled`. All can still lead to `end_turn`,
 so completion alone is not evidence that the answer was accepted.
 
-The secondary `prompt` helper steers toward the bridge `AskUser` MCP tool or a
-turn-end question. The shared prompt path must use it explicitly. Do not rely on
+Questions may also use bridge `AskUser` or a turn-end message. Do not rely on
 top-level `--disallowed-tools ask_user_question` or `--rules` in ACP: a live probe
 with both still received the native question request. The vendor hook remains
-necessary even with prompt steering. This profile does not grant arbitrary MCP
+necessary even with prompt steering; no prompt wrapper is needed with this hook.
+This profile does not grant arbitrary MCP
 `kind:other` calls an exemption in read-only mode.
 
 Other observed custom methods were notifications (no request id):

@@ -14,7 +14,6 @@ pub const MIN_VERSION: (u64, u64, u64) = (1, 0, 92);
 pub const AUTH_HINT: &str =
     "Grok Build requires authentication. Run `grok login` or set XAI_API_KEY in the harness environment, then retry.";
 pub const READ_ONLY_MODE: &str = "plan";
-pub const QUESTION_RULES: &str = "When you need an answer from the user, use the Formless bridge AskUser MCP tool. If it is unavailable, end your turn with the question in your response. Do not use the native ask_user_question tool.";
 
 pub const SPEC: AgentSpec = AgentSpec {
     name: "Grok Build",
@@ -25,6 +24,7 @@ pub const SPEC: AgentSpec = AgentSpec {
     read_only_modes: &[READ_ONLY_MODE],
     read_only_fail_closed: true,
     strip_env: &[],
+    set_env: &[("GROK_DISABLE_AUTOUPDATER", "1")],
     bridge_tool: acp::no_bridge_tools,
     vendor_request,
 };
@@ -34,22 +34,7 @@ pub fn run(
     handler: &mut dyn PermissionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    acp::validate(request)?;
-    let mut overrides = request.environment.clone();
-    overrides.insert("GROK_DISABLE_AUTOUPDATER".into(), "1".into());
-    let prepared = HarnessRequest {
-        kind: request.kind,
-        model: request.model.clone(),
-        cwd: request.cwd.clone(),
-        prompt: prompt(request),
-        role: request.role,
-        mcp_command: request.mcp_command.clone(),
-        mcp_args: request.mcp_args.clone(),
-        mcp_env_vars: request.mcp_env_vars.clone(),
-        executable: request.executable.clone(),
-        environment: overrides,
-    };
-    acp::run(&SPEC, &prepared, handler, cancel)
+    acp::run(&SPEC, request, handler, cancel)
 }
 
 pub fn program(request: &HarnessRequest) -> PathBuf {
@@ -63,10 +48,6 @@ pub fn args(request: &HarnessRequest) -> Vec<&'static str> {
     }
     args.extend(["agent", "--no-leader", "stdio"]);
     args
-}
-
-pub fn prompt(request: &HarnessRequest) -> String {
-    format!("{QUESTION_RULES}\n\n{}", request.prompt)
 }
 
 /// Overrides layered onto the launcher's inherited, bridge-filtered environment.
@@ -453,6 +434,7 @@ mod tests {
 
     #[test]
     fn empty_environment_still_disables_updates() {
+        assert_eq!(SPEC.set_env, &[("GROK_DISABLE_AUTOUPDATER", "1")]);
         let env = environment(&request(HarnessRole::Build));
         assert_eq!(env.len(), 1);
         assert_eq!(env[&OsString::from("GROK_DISABLE_AUTOUPDATER")], "1");
@@ -498,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn native_question_fixture_is_custom_and_launch_steers_to_bridge_or_turn_end() {
+    fn native_question_fixture_is_custom_and_translates_the_user_answer() {
         let fixture = r#"{"jsonrpc":"2.0","id":0,"method":"_x.ai/ask_user_question","params":{"sessionId":"smoke-session","toolCallId":"question_call","questions":[{"question":"Which smoke option should be used?","options":[{"label":"Local (Recommended)","description":"Use the local smoke fixture"},{"label":"Skip","description":"Skip the smoke fixture"}],"multiSelect":false}],"mode":"default"}}"#;
         let message: Value = serde_json::from_reader(Cursor::new(fixture)).unwrap();
         assert_eq!(message["method"], "_x.ai/ask_user_question");
@@ -524,16 +506,6 @@ mod tests {
             .unwrap(),
             json!({"outcome":"accepted", "answers":{"Which smoke option should be used?":"Local (Recommended)"}})
         );
-        for role in [HarnessRole::Build, HarnessRole::Review] {
-            let request = request(role);
-            let prompt = prompt(&request);
-            assert!(prompt.starts_with(QUESTION_RULES));
-            assert!(prompt.ends_with(&request.prompt));
-        }
-        assert!(QUESTION_RULES.contains("AskUser") && QUESTION_RULES.contains("end your turn"));
-        let mut request = request(HarnessRole::Build);
-        request.prompt.clear();
-        assert_eq!(prompt(&request), format!("{QUESTION_RULES}\n\n"));
     }
 
     struct Answers(Option<Value>);
