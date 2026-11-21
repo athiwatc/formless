@@ -198,6 +198,11 @@ fn is_model_failure(error: &anyhow::Error) -> bool {
             .is_none()
 }
 
+fn run_cancelled(cancel: &CancellationToken, cancel_flag: &AtomicBool) -> bool {
+    // The Run controller sets the sandbox flag before waking token waiters.
+    cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst)
+}
+
 /// Unknown errors remain uncoded rather than guessing from their prose.
 fn error_reply(id: u64, e: &anyhow::Error) -> ServerMessage {
     match e.downcast_ref::<RequestFailure>() {
@@ -3716,6 +3721,7 @@ impl Daemon {
                     prompt: i64,
                     completion: i64,
                     cached: i64,
+                    cache_write: i64,
                     cost: Option<f64>,
                 }
                 let mut out: Vec<UsageBucket> = Vec::new();
@@ -3727,6 +3733,7 @@ impl Daemon {
                             bucket.prompt += p;
                             bucket.completion += c;
                             bucket.cached += cached;
+                            bucket.cache_write += cw;
                             bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
                         None => out.push(UsageBucket {
@@ -3735,12 +3742,15 @@ impl Daemon {
                             prompt: p,
                             completion: c,
                             cached,
+                            cache_write: cw,
                             cost: price,
                         }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
+                    out.sort_by_key(|bucket| {
+                        std::cmp::Reverse(i128::from(bucket.prompt) + i128::from(bucket.completion))
+                    });
                 }
                 Ok(json!(out
                     .into_iter()
@@ -3748,7 +3758,8 @@ impl Daemon {
                         let mut row = json!({
                             "key": bucket.label.as_deref().unwrap_or(&bucket.key),
                             "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
-                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                            "cached_tokens": bucket.cached, "cache_write_tokens": bucket.cache_write,
+                            "cost": bucket.cost,
                         });
                         if bucket.label.is_some() {
                             row["session_id"] = json!(bucket.key);
@@ -4261,6 +4272,8 @@ impl Daemon {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
                         run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
                     }
+                } else {
+                    run["spend_error"] = json!("configuration could not be loaded");
                 }
                 Ok(run)
             }
@@ -5950,8 +5963,11 @@ impl Daemon {
                     }
                     // Steered messages continue the same Run (next step boundary).
                     while steer_rx.try_recv().is_ok() {}
-                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
-                    {
+                    match self.extend_or_close_steering(
+                        &session_id,
+                        &run_id,
+                        run_cancelled(&cancel, &cancel_flag),
+                    ) {
                         steering_daemon::SteeringOutcome::Extend => continue,
                         steering_daemon::SteeringOutcome::Completed => {}
                         steering_daemon::SteeringOutcome::Interrupted => {
@@ -5962,7 +5978,7 @@ impl Daemon {
                     }
                     break;
                 }
-                Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
+                Err(_) if run_cancelled(&cancel, &cancel_flag) => {
                     final_status = "interrupted";
                     self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
@@ -10236,7 +10252,7 @@ impl Daemon {
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
-            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            let interrupted = outcome.is_err() && run_cancelled(cancel, cancel_flag);
             if let Some((r, task, identity)) =
                 role.as_ref().filter(|_| !interrupted).and_then(|r| {
                     let task = routing_task.as_ref()?;
@@ -17306,6 +17322,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
         "credentials.tfrc.json",
@@ -17323,11 +17340,15 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || private_key_name
+        || name.ends_with(".p8")
         || name.ends_with(".pem")
         || name.ends_with(".ppk")
         || name.ends_with(".key")
+        || name.ends_with(".jks")
+        || name.ends_with(".keystore")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
     secret_file.then_some("a key or secrets file")
 }
 

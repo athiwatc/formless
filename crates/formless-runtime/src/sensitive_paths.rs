@@ -288,9 +288,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
             return Some("credential directory");
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
+            || name.ends_with(".p8")
             || name.ends_with(".pem")
             || name.ends_with(".ppk")
             || name.ends_with(".key")
+            || name.ends_with(".jks")
+            || name.ends_with(".keystore")
         {
             return Some("credential-shaped filename");
         }
@@ -343,6 +346,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "relay_secret"
             | ".netrc"
             | "_netrc"
+            | ".htpasswd"
             | ".git-credentials"
             | ".pgpass"
             | "pgpass.conf"
@@ -352,6 +356,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
     ) || name == "credentials.toml"
         || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
+        || name.ends_with(".kdbx")
     {
         return Some("credential store file");
     }
@@ -416,6 +421,8 @@ mod tests {
             "identity.PPK",
             "server.key",
             ".bash_history",
+            "www/.htpasswd",
+            "site/.HTPASSWD",
             "fish_history",
             ".PSQL_HISTORY",
             "psql_history",
@@ -435,6 +442,51 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn apache_password_file_checks_both_path_spellings_and_requires_exact_name() {
+        let root = std::env::temp_dir().join("project");
+        let policy = PathPolicy::default();
+        let secret = root.join(".HTPASSWD");
+        let alias = root.join("alias.txt");
+        for (requested, resolved) in [(&alias, &secret), (&secret, &alias)] {
+            assert!(matches!(
+                policy.classify(requested, resolved).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for name in ["htpasswd", "htpasswd.txt", ".htpasswd.bak"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+    #[test]
+    fn keepass_databases_are_sensitive_by_suffix() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for name in ["passwords.kdbx", "db.KDBX"] {
+            let path = root.join(name);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["db.kdbx.lock", "notes.txt"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn composer_auth_file_is_classified_before_ordinary_config_files() {
         let root = std::env::temp_dir().join("formless-project");

@@ -788,6 +788,9 @@ list (conflicting with positional tags). Tags reach storage unchanged for its
 existing normalization; confirmation shows returned stored values. These three
 actions accept `--json` for the selected/returned Session object.
 
+`tools tag NAME` reads the Tool's stored tags. Pass positional tags to replace
+the entire list, or `--clear` to remove all tags.
+
 Ambiguous Session prefixes/names remain usage errors and display up to ten
 matching full IDs, bounded names and archive labels. Extra matches are counted,
 with commands for both archive states. Prefix errors suggest extending the ID;
