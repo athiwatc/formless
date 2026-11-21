@@ -3,6 +3,7 @@ pub mod client;
 mod clipboard_write;
 mod clipimg;
 mod commands;
+mod editor_viewport;
 mod external_editor;
 pub use external_editor::windows_editor_command;
 mod external_editor_ui;
@@ -12137,7 +12138,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // and other modal overlays below keep their existing priority.
     if app.view == View::Settings {
         if let Some(form) = &app.settings_form {
-            draw_settings_form(f, form, app.color);
+            draw_settings_form(f, form, app.color, false);
         }
     }
     if app.view == View::Chat && app.renaming.is_none() {
@@ -17277,10 +17278,14 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.settings_rows();
     let sel = app.settings_sel.min(rows.len().saturating_sub(1));
+    let panel = ui::panel(" Settings ", app.color, Color::Cyan);
+    let inner = panel.inner(area);
+    let focused = !app.list_wheel_blocked();
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line = 0;
     let mut sel_end = 0;
     let mut section = "";
+    let mut cursor = None;
     for (i, row) in rows.iter().enumerate() {
         if row.section != section {
             if !section.is_empty() {
@@ -17299,9 +17304,16 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         } else {
             ui::dim(app.color)
         };
+        let mut label = format!("{mark}{}", ui::pad(&row.label, 20));
         let value = match &app.settings_edit {
             Some((k, edit)) if *k == row.key => {
-                Span::styled(format!("{}▏", &**edit), bold_fg(app.color, Color::Yellow))
+                let width = usize::from(inner.width);
+                label.truncate(text::take_width(&label, width.saturating_sub(8)).len());
+                let label_width = text::width(&label);
+                let (visible, col) =
+                    editor_viewport::field(edit, width.saturating_sub(label_width), false, true);
+                cursor = Some((lines.len(), label_width + col));
+                Span::styled(visible, bold_fg(app.color, Color::Yellow))
             }
             _ if row.value.is_empty() && matches!(row.kind, settings::Kind::Choice(_)) => {
                 Span::styled("default", ui::dim(app.color))
@@ -17309,10 +17321,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             _ if row.value.is_empty() => Span::raw(""),
             _ => Span::raw(row.value.clone()),
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark}{}", ui::pad(&row.label, 20)), label_style),
-            value,
-        ]));
+        lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
@@ -17342,16 +17351,19 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     // Keep the selection on screen.
-    let height = area.height.saturating_sub(2) as usize;
+    let height = usize::from(inner.height);
     let top = sel_end.saturating_sub(height).min(sel_line);
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(ui::panel(
-            " Settings ",
-            app.color,
-            Color::Cyan,
-        )),
+        Paragraph::new(lines.into_iter().skip(top).take(height).collect::<Vec<_>>()).block(panel),
         area,
     );
+    if let Some(form) = &app.settings_form {
+        draw_settings_form(f, form, app.color, focused);
+    } else if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused && (top..top + height).contains(row) && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
+    }
 }
 
 /// The normal word wrapper can overhang the last column with a wide
@@ -17383,7 +17395,9 @@ fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
+fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused: bool) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         form.viewport.set(Default::default());
@@ -17403,10 +17417,11 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
         }
     }
     let mut active_rows = None;
+    let mut cursor = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
         let mut text = if field.masked {
-            "•".repeat(field.input.chars().count())
+            "•".repeat(field.input.graphemes(true).count())
         } else {
             field.input.to_string()
         };
@@ -17414,6 +17429,23 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
             text.push('▏');
         }
         let start = body.len();
+        if active {
+            let (before, _) = field.input.split_at(field.input.cursor_byte());
+            let before = if field.masked {
+                "•".repeat(before.graphemes(true).count())
+            } else {
+                before.to_owned()
+            };
+            let prefix = format!("› {:<12}{before}", field.label);
+            let rows = wrap(Line::raw(prefix));
+            let last_width = rows.last().map_or(0, Line::width);
+            cursor = Some((
+                start
+                    + rows.len().saturating_sub(1)
+                    + usize::from(last_width == usize::from(inner_width)),
+                last_width % usize::from(inner_width),
+            ));
+        }
         for (row, line) in text.split('\n').enumerate() {
             if row == 0 {
                 body.extend(wrap(Line::from(vec![
@@ -17505,6 +17537,13 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
         .chain(footer)
         .collect();
     f.render_widget(review_wrap::Rows(rows), inner);
+    if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused
+            && (viewport.top..viewport.top + viewport.page).contains(row)
+            && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - viewport.top) as u16));
+    }
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -24031,7 +24070,7 @@ mod tests {
         app.settings_form = Some(form);
 
         let first = render(&mut app, 65, 9);
-        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("••••▏"), "{first}");
         assert!(first.contains("Enter next, then save"), "{first}");
         assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
         assert!(!first.contains("ab界"), "{first}");
@@ -24068,11 +24107,11 @@ mod tests {
 
         app.key(key(KeyCode::Left));
         let followed = render(&mut app, 65, 9);
-        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(followed.contains("••••▏"), "{followed}");
         assert!(!followed.contains("ab界"), "{followed}");
         app.paste("X");
         let edited = render(&mut app, 65, 9);
-        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(edited.contains("•••••▏"), "{edited}");
         assert!(!edited.contains("ab界"), "{edited}");
         app.key(key(KeyCode::Tab));
         let next_field = render(&mut app, 65, 9);
@@ -24085,7 +24124,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_settings_form(frame, form, false))
+            .draw(|frame| draw_settings_form(frame, form, false, true))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -24420,6 +24459,83 @@ mod tests {
         assert!(screen.contains("Downloads and runs code"), "{screen}");
         assert!(!screen.contains("SecretForMcpOnly"));
         assert!(screen.contains("••••"));
+    }
+
+    #[test]
+    fn settings_editors_place_the_hardware_cursor_in_the_focused_field() {
+        use ratatui::backend::{Backend, TestBackend};
+        let mut app = test_app();
+        Config::default().save(&app.paths).unwrap();
+        app.view = View::Settings;
+        let setting = "provider.stall_notice_secs";
+        app.settings_sel = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == setting)
+            .unwrap();
+        app.settings_edit = Some((setting.into(), input::InputLine::from("abc")));
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let caret = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x - 1, caret.y)].symbol(),
+            "a"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "b"
+        );
+        app.key(key(KeyCode::Char('X')));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((caret.x + 1, caret.y));
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "X"
+        );
+
+        app.slash("mcp add postgres");
+        let form = app.settings_form.as_mut().unwrap();
+        form.idx = 1;
+        form.fields[1].input = input::InputLine::from("界e\u{301}S");
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let masked = terminal.backend_mut().get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(masked.x - 1, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x + 1, masked.y)].symbol(), "•");
+        assert_ne!(buffer[(masked.x + 2, masked.y)].symbol(), "•");
+        assert!(!render(&mut app, 80, 25).contains("界e\u{301}S"));
+
+        app.paste(&"a".repeat(30));
+        let mut narrow = Terminal::new(TestBackend::new(16, 9)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let scrolled = narrow.backend_mut().get_cursor_position().unwrap();
+        assert!(scrolled.x > 0 && scrolled.x < 15 && scrolled.y > 0 && scrolled.y < 8);
+        app.pager = Some(Pager {
+            title: "Topmost pager".into(),
+            lines: vec!["visible".into()],
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        narrow.backend_mut().set_cursor_position((0, 0)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        narrow.backend_mut().assert_cursor_position((0, 0));
+        app.pager = None;
+        for size in [1, 2, 3] {
+            let mut tiny = Terminal::new(TestBackend::new(size, size)).unwrap();
+            tiny.draw(|frame| draw_settings(frame, frame.area(), &app))
+                .unwrap();
+            let pos = tiny.backend_mut().get_cursor_position().unwrap();
+            assert!(pos.x < size && pos.y < size);
+        }
     }
 
     #[test]
