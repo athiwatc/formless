@@ -592,9 +592,11 @@ async fn rpc_session(
                     },
                     Some("extension_ui_request") => {
                         if event["method"] == "notify" {
-                            handler.on_update(HarnessUpdate::Message {
+                            if handler.on_update(HarnessUpdate::Message {
                                 content: event["message"].as_str().context("Pi notification missing message")?.to_owned(),
-                            })?;
+                            }).is_err() {
+                                tracing::warn!("Pi notification update handler failed");
+                            }
                         } else if let Some(dialog) = Dialog::from_event(&event)? {
                             if cancelling {
                                 send(dialog.cancelled())?;
@@ -613,7 +615,11 @@ async fn rpc_session(
                     _ => {}
                 }
                 if !cancelling {
-                    for update in stream_updates(&event) { handler.on_update(update)?; }
+                    for update in stream_updates(&event) {
+                        if handler.on_update(update).is_err() {
+                            tracing::warn!("Pi stream update handler failed");
+                        }
+                    }
                 }
                 events.push(event);
                 if settled && prompt_accepted && state_received && !cancel.is_cancelled() {
@@ -956,6 +962,7 @@ mod rpc_tests {
         wait: bool,
         questions: Mutex<Vec<Question>>,
         updates: Mutex<Vec<HarnessUpdate>>,
+        reject_updates: bool,
         asked: Notify,
     }
 
@@ -966,6 +973,7 @@ mod rpc_tests {
                 wait,
                 questions: Mutex::new(Vec::new()),
                 updates: Mutex::new(Vec::new()),
+                reject_updates: false,
                 asked: Notify::new(),
             }
         }
@@ -1020,6 +1028,9 @@ mod rpc_tests {
 
         fn on_update(&self, update: HarnessUpdate) -> Result<()> {
             self.updates.lock().unwrap().push(update);
+            if self.reject_updates {
+                bail!("update rejected");
+            }
             Ok(())
         }
     }
@@ -1283,6 +1294,32 @@ printf '%s\n' '{"type":"message_end","message":{"role":"custom","customType":"fo
 printf '%s\r\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}' '{"type":"agent_end","willRetry":false}' '{"type":"agent_settled","aborted":false}'
 while IFS= read -r remaining; do :; done
 "#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_succeeds_when_update_handler_always_errors() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let body = format!("{START}\nprintf '%s\\n' '{{\"type\":\"extension_ui_request\",\"id\":\"notice\",\"method\":\"notify\",\"message\":\"notification\"}}'\n{FINISH}");
+        let (dir, extension, request) = fake_pi(&body);
+        let mut handler = RecordingHandler::new(true, false);
+        handler.reject_updates = true;
+        let result = timeout(
+            Duration::from_secs(10),
+            run(&request, &extension, &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.message, "done");
+        assert_eq!(result.session_id.as_deref(), Some("rpc-session"));
+        let updates = handler.updates.lock().unwrap();
+        for text in ["notification", "done"] {
+            assert!(updates.iter().any(
+                |update| matches!(update, HarnessUpdate::Message { content } if content == text)
+            ));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]
