@@ -69,7 +69,8 @@ impl Engine {
             || match action.kind {
                 crate::run_actions::Kind::Cwd => {
                     target.cwd != action.target.cwd
-                        && target.cwd.as_deref() == Some(action.text.trim())
+                        && target.cwd.as_deref()
+                            == (!action.text.trim().is_empty()).then_some(action.text.trim())
                 }
                 crate::run_actions::Kind::Edit => {
                     changed_run && target.user.as_ref().is_some_and(|u| u.1 == action.text)
@@ -85,6 +86,12 @@ impl Engine {
             .then_some(recovery.error.as_deref())
             .flatten();
         recovery.dispatch.reconcile(unchanged_error);
+        if action.kind == crate::run_actions::Kind::Compact && recovery.error.is_some() {
+            self.compacting
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&action.owner.session);
+        }
         self.reconciled_actions.push(Action {
             id: action.operation,
             session_id: action.owner.session.clone(),
@@ -823,7 +830,8 @@ mod tests {
     #[test]
     fn prewrite_rejections_and_unchanged_cwd_fail_definitely() {
         for code in [Some(formless_protocol::codes::INVALID), None] {
-            let (mut e, ledger, d) = setup(Kind::Cwd);
+            let (mut e, ledger, mut d) = setup(Kind::Cwd);
+            d.action.text = "/missing".into();
             review(&mut e, d.clone(), false);
             e.command(Command::ConfirmRunAction(d.action.operation));
             e.command(Command::CommitRunAction(d.action.operation));
@@ -847,7 +855,8 @@ mod tests {
     }
     #[test]
     fn canonical_recovery_requires_valid_state_and_never_replays_a_write() {
-        let (mut e, ledger, d) = setup(Kind::Cwd);
+        let (mut e, ledger, mut d) = setup(Kind::Cwd);
+        d.action.text = "/persisted".into();
         review(&mut e, d.clone(), false);
         e.command(Command::ConfirmRunAction(d.action.operation));
         e.command(Command::CommitRunAction(d.action.operation));
@@ -876,6 +885,39 @@ mod tests {
         .unwrap();
         assert_eq!(ledger.status(), Status::Unknown);
         assert!(e.outgoing.is_empty());
+        e.recover_run_actions();
+        let mut canonical = snapshot();
+        canonical["session"]["cwd"] = json!("/persisted");
+        reply(&mut e, canonical);
+        assert_eq!(ledger.status(), Status::Reconciled);
+        assert!(e.outgoing.is_empty());
+    }
+    #[test]
+    fn rejected_compaction_does_not_keep_history_locked() {
+        for code in [Some(formless_protocol::codes::BUSY), None] {
+            let (mut e, ledger, d) = setup(Kind::Compact);
+            review(&mut e, d.clone(), false);
+            e.command(Command::ConfirmRunAction(d.action.operation));
+            e.command(Command::CommitRunAction(d.action.operation));
+            reply(&mut e, snapshot());
+            let request = e.outgoing.pop_front().unwrap();
+            assert!(e.action_before_write(request.id));
+            e.receive(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: code.map(|c| json!({"code":c})),
+                error: Some("compaction was not started".into()),
+            })
+            .unwrap();
+            if code.is_none() {
+                assert!(e.compaction_pending("s"));
+                reply(&mut e, snapshot());
+                assert_eq!(ledger.status(), Status::Reconciled);
+            } else {
+                assert!(matches!(ledger.status(), Status::Rejected(_)));
+            }
+            assert!(!e.compaction_pending("s"));
+        }
     }
     #[test]
     fn completed_compaction_replaces_precompaction_context_reads() {
@@ -892,7 +934,7 @@ mod tests {
         assert_ne!(old.id, fresh.id);
         e.receive(ServerMessage::ok(
             old.id,
-            json!({"used_tokens":90,"context_limit":100,"measured":false}),
+            json!({"used_tokens":90,"context_tokens":100,"measured":false}),
         ))
         .unwrap();
         assert!(!e
@@ -901,7 +943,7 @@ mod tests {
             .any(|u| matches!(u, Update::LiveContext { .. })));
         e.receive(ServerMessage::ok(
             fresh.id,
-            json!({"used_tokens":12,"context_limit":100,"measured":false}),
+            json!({"used_tokens":12,"context_tokens":100,"measured":false}),
         ))
         .unwrap();
         assert!(e.updates.iter().any(|u| matches!(u, Update::LiveContext { result: Ok(c), .. } if c.used == 12 && !c.measured)));

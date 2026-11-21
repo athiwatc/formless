@@ -2622,6 +2622,13 @@ impl Engine {
             Pending::RunWrite(w) => {
                 let acknowledged =
                     response_ok && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v));
+                if definite_rejection && w.dispatch.action.kind == crate::run_actions::Kind::Compact
+                {
+                    self.compacting
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&w.dispatch.action.owner.session);
+                }
                 if response_ok
                     && w.dispatch.action.kind == crate::run_actions::Kind::Delete
                     && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v))
