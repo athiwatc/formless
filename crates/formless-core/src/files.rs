@@ -251,9 +251,86 @@ pub use file_mentions::{
     MentionInsertion,
 };
 
+/// Parse a numeric line or line/column suffix, preserving colons in the path.
+pub fn path_and_line(word: &str) -> (&str, Option<u32>) {
+    let Some((head, last)) = word.rsplit_once(':') else {
+        return (word, None);
+    };
+    let Ok(number) = last.parse::<u32>() else {
+        return (word, None);
+    };
+    if let Some((path, line)) = head.rsplit_once(':') {
+        if let Ok(line) = line.parse::<u32>() {
+            return (path, Some(line));
+        }
+    }
+    (head, Some(number))
+}
+
+/// Return the requested path and its canonical destination. A literal file
+/// takes precedence over a line citation. Interpret only the final path
+/// component, so directory names and Windows prefixes stay intact.
+pub fn resolve_file_mention(
+    base: &Path,
+    path: std::path::PathBuf,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::io::ErrorKind;
+
+    let error = match base.join(&path).canonicalize() {
+        Ok(full) => return Ok((path, full)),
+        Err(error) => error,
+    };
+    if error.kind() != ErrorKind::NotFound
+        && !(cfg!(windows) && error.kind() == ErrorKind::InvalidInput)
+    {
+        return Err(error);
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(error);
+    };
+    let (name, line) = path_and_line(name);
+    if line.is_none() || name.is_empty() {
+        return Err(error);
+    }
+    let cited_path = path.with_file_name(name);
+    let full = base.join(&cited_path).canonicalize()?;
+    if !full.is_file() {
+        return Err(error);
+    }
+    Ok((cited_path, full))
+}
+
+/// The suffix of a path that explicitly names the native home directory.
+pub fn home_path_suffix(path: &str) -> Option<&str> {
+    if path == "~" {
+        return Some("");
+    }
+    #[cfg(windows)]
+    if let Some(suffix) = path.strip_prefix("~\\") {
+        return Some(suffix);
+    }
+    path.strip_prefix("~/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_path_prefixes_follow_native_path_separators() {
+        assert_eq!(home_path_suffix("~"), Some(""));
+        assert_eq!(
+            home_path_suffix("~/Documents/notes.txt"),
+            Some("Documents/notes.txt")
+        );
+        assert_eq!(home_path_suffix("~other/file"), None);
+        let windows_path = r"~\Documents\notes.txt";
+        assert_eq!(mentions(&format!("@{windows_path}")), [windows_path]);
+        assert_eq!(
+            home_path_suffix(windows_path),
+            cfg!(windows).then_some(r"Documents\notes.txt")
+        );
+    }
 
     fn tree() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("fl-files-{}", uuid::Uuid::new_v4().simple()));

@@ -84,7 +84,9 @@ impl PathPolicy {
         if from.is_dir()
             && (self.classify(raw_from, from)? != PathDecision::Ordinary
                 || directory_namespace_prefix(raw_from)
-                || directory_namespace_prefix(from))
+                || directory_namespace_prefix(from)
+                || ((in_pulumi_directory(raw_from) || in_pulumi_directory(from))
+                    && !in_pulumi_directory(to)))
         {
             // A directory consent covers only that directory's listing or
             // metadata. It cannot authorize declassifying its descendants.
@@ -218,6 +220,11 @@ const DIRECTORY_SEQUENCES: &[&[&str]] = &[
     &["etc", "ssl", "private"],
 ];
 
+fn in_pulumi_directory(path: &Path) -> bool {
+    path.components()
+        .any(|part| matches!(part, Component::Normal(name) if credential_name(name) == ".pulumi"))
+}
+
 /// Removing a prefix of a recognized sequence also removes the descendants'
 /// classification: Library -> Ordinary would wash Library/Keychains/files.
 /// This deliberately rejects such directory names even if currently empty;
@@ -267,6 +274,12 @@ pub fn is_env_template_file(path: &Path) -> bool {
 }
 
 fn builtin(path: &Path) -> Option<&'static str> {
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("Pulumi credentials file");
+    }
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     let parts: Vec<_> = path
         .components()
         .filter_map(|part| {
@@ -286,6 +299,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
             || name.ends_with(".pem")
+            || name.ends_with(".ppk")
             || name.ends_with(".key")
         {
             return Some("credential-shaped filename");
@@ -328,8 +342,18 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
-    ) || name.ends_with(".keychain")
+        "api_key"
+            | "oauth_tokens.json"
+            | "relay_secret"
+            | ".netrc"
+            | "_netrc"
+            | ".git-credentials"
+            | "rclone.conf"
+            | ".rclone.conf"
+            | ".yarnrc"
+            | ".yarnrc.yml"
+    ) || name == "credentials.toml"
+        || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
         return Some("credential store file");
@@ -341,12 +365,49 @@ fn builtin(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
     #[test]
+    fn cargo_credential_files_are_sensitive_without_classifying_the_cache() {
+        let home = std::env::temp_dir().join("formless-home");
+        let policy = PathPolicy::default();
+        for relative in [".cargo/credentials.toml", "custom-cargo/CREDENTIALS.TOML"] {
+            let path = home.join(relative);
+            assert!(matches!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            ".cargo/registry/cache.txt",
+            ".cargo/credentials.toml.example",
+            "notes.txt",
+        ] {
+            let path = home.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_paths_stay_quiet_and_all_required_shapes_are_sensitive() {
         let root = std::env::temp_dir();
         let policy = PathPolicy::default();
         let project = root.join("project").join("notes.txt");
         assert_eq!(
             policy.classify(&project, &project).unwrap(),
+            PathDecision::Ordinary
+        );
+        for relative in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+        let note = root.join("project/ppk-notes.txt");
+        assert_eq!(
+            policy.classify(&note, &note).unwrap(),
             PathDecision::Ordinary
         );
         for relative in [
@@ -361,7 +422,11 @@ mod tests {
             "Microsoft/Credentials/store",
             ".env",
             ".env.local",
+            ".yarnrc",
+            "project/.YARNRC.YML",
             "server.pem",
+            "server.ppk",
+            "identity.PPK",
             "server.key",
             ".bash_history",
             "fish_history",
@@ -378,6 +443,93 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pulumi_credential_reads_require_consent_without_covering_the_whole_directory() {
+        let root = std::env::temp_dir().join(format!("fl-pulumi-{}", uuid::Uuid::new_v4()));
+        let directory = root.join(".PuLuMi");
+        std::fs::create_dir_all(&directory).unwrap();
+        let policy = PathPolicy::default();
+        let credential = directory.join("credentials.json");
+        for (raw, resolved) in [
+            (&credential, &credential),
+            (&root.join("alias"), &credential),
+        ] {
+            assert_eq!(
+                policy.classify(raw, resolved).unwrap(),
+                PathDecision::Sensitive("Pulumi credentials file".into())
+            );
+        }
+        for ordinary in [
+            &directory,
+            &directory.join("stacks/dev.json"),
+            &root.join("credentials.json"),
+        ] {
+            assert_eq!(
+                policy.classify(ordinary, ordinary).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+        let relocation = policy.relocation_allowed(&directory, &directory, &root.join("ordinary"));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!relocation.unwrap());
+    }
+    #[test]
+    fn composer_auth_file_is_classified_before_ordinary_config_files() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for relative in [".composer/auth.json", ".config/composer/auth.json"] {
+            let path = root.join(relative);
+            let alias = root.join("alias.txt");
+            assert!(matches!(
+                policy.classify(&alias, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            "auth.json",
+            ".composer/cache/auth.json",
+            ".config/composer/config.json",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
+    #[test]
+    fn protects_rclone_config_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".config/rclone/rclone.conf",
+            ".rclone.conf",
+            "AppData/Roaming/rclone/RCLONE.CONF",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            ".config/rclone/notes.txt",
+            ".config/rclone/rclone.conf.example",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
     #[test]
     fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
         struct Owned(PathBuf);
