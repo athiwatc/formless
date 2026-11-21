@@ -570,7 +570,7 @@ impl Store {
             bail!("invalid topic attempt capability");
         }
         let attempt = topic_attempt(self, id)?.context("attempt not found")?;
-        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status='running')", [id], |r|r.get(0))?;
+        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status IN ('running','needs_user'))", [id], |r|r.get(0))?;
         if !matches!(
             attempt.status,
             TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
