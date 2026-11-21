@@ -4351,6 +4351,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Naming cache.** `formless naming status` lists each cached model and
+  its file sizes, marking the configured model. `formless naming remove
+  [MODEL]` removes weights, the tokenizer and partial downloads for one
+  model. `formless naming remove --all` removes those files for every
+  supported naming model. Removal respects the same lock as downloads and
+  model loading. Automatic downloads can fetch the configured model again
+  unless `naming.auto_download` is disabled.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
