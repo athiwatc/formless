@@ -12296,9 +12296,10 @@ impl Daemon {
         let active = self.with_reader(|st| st.has_active_jobs()).ok()?;
         let stays = cfg.daemon.keep_alive_for_jobs || std::env::var_os(STAY_ENV).is_some();
         (active && !stays).then(|| {
-            "jobs run only while Formless is running (the daemon stops when idle). To run them \
-             on schedule, run `formless daemon install-service` (starts it at login) or set \
-             daemon.keep_alive_for_jobs = true (/settings or config.toml)."
+            "jobs run only while Formless is running (the daemon stops when idle). To prevent \
+             idle exit, install a login service with `formless daemon install-service` or set \
+             daemon.keep_alive_for_jobs = true (/settings or config.toml). Linux user services \
+             also need systemd lingering to continue after logout."
                 .to_string()
         })
     }

@@ -3287,9 +3287,12 @@ such as `read_file`, `read_text_file` and `file_read`.
   are also refused because its command parser cannot represent them; this
   restriction does not apply to data, config or log paths.
   The service runs `formless daemon serve --stay`, which prevents idle exit
-  while the daemon is running. Scheduled delivery still depends on host,
-  daemon and network availability; logout, sleep, shutdown or reboot without
-  login can prevent it (Linux lifecycle guidance: [#1406](https://github.com/athiwatc/formless/issues/1406)). `uninstall-service` unloads and removes it; `formless doctor`
+  while the daemon is running. On Linux, installation and dry-run output
+  report whether systemd user lingering is enabled. To start before login
+  and continue after logout on a headless host, run
+  `loginctl enable-linger "$(id -u)"` separately. Scheduled delivery still
+  depends on host, daemon and network availability. `uninstall-service`
+  unloads and removes it. `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.
 - **Back-pressure (#605).** A request line over 32 MB closes the
   connection while it is being read (nothing larger is buffered). Each

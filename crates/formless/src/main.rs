@@ -3064,7 +3064,10 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 || formless_core::service::install(&plan),
             )?;
             println!("installed: {} ({})", plan.file.display(), plan.manager);
-            println!("the daemon now starts at login and stays up, so jobs run on schedule");
+            println!("the daemon is configured to start at login and stay active while the user service manager is running");
+            if let Some(guidance) = formless_core::service::systemd_lingering_guidance(&plan) {
+                println!("{guidance}");
+            }
             println!("remove it: formless daemon uninstall-service");
             Ok(())
         }
