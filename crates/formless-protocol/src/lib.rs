@@ -36,35 +36,75 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
-pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v1";
+pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessKind {
     Claude,
     Codex,
+    Pi,
+    #[serde(rename = "opencode")]
+    OpenCode,
     Antigravity,
+    Acp,
+    Muse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HarnessRole {
-    Build,
-    Review,
+pub enum StepAccess {
+    ReadOnly,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicStepOutline {
+    pub title: String,
+    pub instructions: String,
+    pub harness: Option<HarnessKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent: Option<String>,
+    pub model: Option<String>,
+    pub access: StepAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    Git,
+    Directory,
+    Scratch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TopicArtifact {
+    GitRevision {
+        revision: String,
+    },
+    File {
+        path: std::path::PathBuf,
+        sha256: String,
+    },
+    Text {
+        title: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicProposalRequest {
+    #[serde(default)]
+    pub parent_topic_id: Option<String>,
     pub source_session_id: String,
     pub message_ids: Vec<String>,
     #[serde(default)]
     pub features: Vec<TopicFeatureProposal>,
     pub name: String,
-    pub repo: std::path::PathBuf,
-    pub builder: HarnessKind,
-    pub builder_model: Option<String>,
-    pub reviewer: HarnessKind,
-    pub reviewer_model: Option<String>,
+    pub workspace: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub outline: Vec<TopicStepOutline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +149,7 @@ pub struct TopicFeatureRetryRequest {
     pub feature_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicMcpRequest {
     pub attempt_id: String,
     pub capability_token: String,
@@ -123,19 +163,21 @@ pub enum TopicStatus {
     Approved,
     Rejected,
     Running,
+    NeedsUser,
     Complete,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicFeatureStatus {
     Pending,
-    Building,
-    Reviewing,
+    Running,
     Ready,
     NeedsUser,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,24 +188,24 @@ pub struct TopicFeatureInfo {
     pub request: String,
     pub status: TopicFeatureStatus,
     pub active_attempt_id: Option<String>,
-    pub ready_revision: Option<String>,
-    pub review_round: u32,
+    pub outputs: Vec<TopicArtifact>,
+    pub attempt_count: u32,
     pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicInfo {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_topic_id: Option<String>,
     pub name: String,
-    pub repo: std::path::PathBuf,
-    pub base_revision: String,
+    pub workspace: Option<std::path::PathBuf>,
+    pub workspace_kind: WorkspaceKind,
+    pub base_revision: Option<String>,
+    pub outline: Vec<TopicStepOutline>,
     pub source_session_id: String,
     pub topic_session_id: Option<String>,
     pub status: TopicStatus,
-    pub builder: HarnessKind,
-    pub builder_model: Option<String>,
-    pub reviewer: HarnessKind,
-    pub reviewer_model: Option<String>,
     pub features: Vec<TopicFeatureInfo>,
     pub attempts: Vec<TopicAttemptInfo>,
     pub created_at: String,
@@ -173,14 +215,12 @@ pub struct TopicInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicAttemptStatus {
-    Building,
-    AwaitingReview,
-    Reviewing,
-    Passed,
-    Findings,
+    Running,
+    Succeeded,
     NeedsUser,
     Failed,
     Abandoned,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,29 +228,29 @@ pub struct TopicAttemptInfo {
     pub id: String,
     pub topic_id: String,
     pub feature_id: String,
-    pub round: u32,
-    pub role: HarnessRole,
+    pub step_title: String,
+    pub access: StepAccess,
+    pub model: Option<String>,
+    pub inputs: Vec<TopicArtifact>,
+    pub outputs: Vec<TopicArtifact>,
+    pub summary: Option<String>,
     pub harness: HarnessKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent: Option<String>,
     pub status: TopicAttemptStatus,
     pub conversation_session_id: String,
-    pub revision: Option<String>,
     pub harness_session_id: Option<String>,
     pub detail: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum TopicReviewOutcome {
-    Passed,
-    Findings { detail: String },
-    NeedsUser { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TopicMcpOperation {
+    AskUser {
+        questions: Vec<Question>,
+    },
     ListConversations,
     ReadConversation {
         session_id: String,
@@ -218,15 +258,34 @@ pub enum TopicMcpOperation {
     AppendConversation {
         content: String,
     },
-    ReadyForReview {
-        revision: String,
-        test_report: String,
+    ReadArtifact {
+        index: usize,
     },
-    SubmitReview {
-        revision: String,
-        outcome: TopicReviewOutcome,
+    ReportResult {
+        status: TopicAttemptStatus,
+        summary: String,
+        outputs: Vec<TopicArtifact>,
     },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessPermissionOption {
+    #[serde(alias = "optionId")]
+    pub option_id: String,
+    pub name: String,
+    pub kind: HarnessPermissionOptionKind,
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
 /// Disable Step mode only if the Session is still idle at the daemon.
 pub const IDLE_STEP_OFF_FEATURE: &str = "idle_step_off_v1";
 
@@ -2301,8 +2360,11 @@ pub enum Request {
     GetTopic {
         topic_id: String,
     },
-    /// Start the approved topic workflow in the daemon. Repeated calls are idempotent.
+    /// Start an approved topic workflow. An already-running topic returns an error.
     StartTopicWorkflow {
+        topic_id: String,
+    },
+    CancelTopic {
         topic_id: String,
     },
     ListTopicAttempts {
@@ -3112,6 +3174,10 @@ pub enum Request {
     /// Answer an `ask_user` question (first answer wins). `answers` holds
     /// one entry per `UserQuestion.questions`, in order; clients that only
     /// know `answer` send free text and leave it empty.
+    HarnessPermissionDecision {
+        permission_id: String,
+        option_id: Option<String>,
+    },
     AnswerQuestion {
         question_id: String,
         #[serde(default)]
@@ -3659,6 +3725,10 @@ pub enum Event {
     /// structured form (1–4); `question`/`options` summarise it for
     /// clients that predate it.
     UserQuestion {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
         question_id: String,
         session_id: String,
         question: String,
@@ -3666,6 +3736,24 @@ pub enum Event {
         options: Vec<String>,
         #[serde(default)]
         questions: Vec<Question>,
+    },
+    HarnessPermissionRequested {
+        permission_id: String,
+        session_id: String,
+        topic_id: String,
+        attempt_id: String,
+        harness: HarnessKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acp_agent: Option<String>,
+        title: String,
+        kind: String,
+        raw_input: Option<serde_json::Value>,
+        options: Vec<HarnessPermissionOption>,
+    },
+    HarnessPermissionClosed {
+        permission_id: String,
+        option_id: Option<String>,
+        by: Option<String>,
     },
     /// A question was answered (or abandoned): clients close their prompt.
     UserQuestionClosed {
@@ -3874,6 +3962,7 @@ impl Event {
             | Event::ToolCallFinished { session_id, .. }
             | Event::ApprovalRequested { session_id, .. }
             | Event::UserQuestion { session_id, .. }
+            | Event::HarnessPermissionRequested { session_id, .. }
             | Event::RunUsage { session_id, .. }
             | Event::RunToolChanges { session_id, .. }
             | Event::InvocationPending { session_id, .. }
@@ -3898,6 +3987,7 @@ impl Event {
             | Event::MemoryUpdated
             | Event::JobsChanged
             | Event::UserQuestionClosed { .. }
+            | Event::HarnessPermissionClosed { .. }
             | Event::ToolUpdated { .. }
             | Event::ModuleUpdated { .. }
             | Event::ModuleDeleted { .. }
@@ -5241,5 +5331,109 @@ mod session_selection_cas_tests {
         }
         assert!(FEATURES.contains(&"session_model_compare_set_v1"));
         assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod topic_v2_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn topic_v2_wire_contract() {
+        assert!(FEATURES.contains(&"topic_orchestration_v2"));
+        let proposal: TopicProposalRequest = serde_json::from_value(json!({
+            "source_session_id":"main","message_ids":["m"],"name":"Accounting","workspace":null
+        }))
+        .unwrap();
+        assert!(proposal.features.is_empty());
+        assert!(proposal.outline.is_empty());
+        assert!(proposal.workspace.is_none());
+        assert_eq!(
+            serde_json::to_value(HarnessKind::OpenCode).unwrap(),
+            "opencode"
+        );
+        assert_eq!(
+            serde_json::to_value(StepAccess::ReadOnly).unwrap(),
+            "read_only"
+        );
+        let cancel = Request::CancelTopic {
+            topic_id: "t".into(),
+        };
+        let wire = serde_json::to_value(cancel).unwrap();
+        assert_eq!(wire["type"], "cancel_topic");
+        let result = TopicMcpOperation::ReportResult {
+            status: TopicAttemptStatus::Succeeded,
+            summary: "Done".into(),
+            outputs: vec![TopicArtifact::Text {
+                title: "Report".into(),
+                content: "Balance".into(),
+            }],
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["operation"], "report_result");
+        assert_eq!(wire["status"], "succeeded");
+        assert_eq!(wire["outputs"][0]["kind"], "text");
+        assert_eq!(
+            serde_json::from_value::<TopicMcpOperation>(wire).unwrap(),
+            result
+        );
+        assert!(
+            serde_json::from_value::<TopicMcpOperation>(json!({"operation":"approve_topic"}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<TopicMcpOperation>(
+            json!({"operation":"ready_for_review","revision":"x","test_report":""})
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod topic_interaction_wire_tests {
+    use super::*;
+    #[test]
+    fn acp_permission_options_preserve_opaque_metadata() {
+        let acp = serde_json::json!({"optionId":"allow","name":"Allow once","kind":"allow_once","_meta":{"vendor":"opaque"},"extra":[1,2]});
+        let option: HarnessPermissionOption = serde_json::from_value(acp.clone()).unwrap();
+        assert_eq!(option.option_id, "allow");
+        let mut wire = serde_json::to_value(option).unwrap();
+        let id = wire.as_object_mut().unwrap().remove("option_id").unwrap();
+        wire.as_object_mut().unwrap().insert("optionId".into(), id);
+        assert_eq!(wire, acp);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"optionId":"a","name":"Allow","kind":"unknown"}),
+        ] {
+            assert!(serde_json::from_value::<HarnessPermissionOption>(invalid).is_err());
+        }
+    }
+    #[test]
+    fn topic_v2_acp_muse_and_user_permissions_wire() {
+        for (kind, name) in [(HarnessKind::Acp, "acp"), (HarnessKind::Muse, "muse")] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<HarnessKind>(serde_json::json!(name)).unwrap(),
+                kind
+            );
+        }
+        for (kind, name) in [
+            (HarnessPermissionOptionKind::AllowOnce, "allow_once"),
+            (HarnessPermissionOptionKind::AllowAlways, "allow_always"),
+            (HarnessPermissionOptionKind::RejectOnce, "reject_once"),
+            (HarnessPermissionOptionKind::RejectAlways, "reject_always"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
+        let request = serde_json::from_value::<Request>(
+            serde_json::json!({"type":"harness_permission_decision","permission_id":"p","option_id":null}),
+        );
+        assert!(matches!(
+            request.unwrap(),
+            Request::HarnessPermissionDecision {
+                option_id: None,
+                ..
+            }
+        ));
+        assert!(serde_json::from_value::<TopicMcpOperation>(serde_json::json!({"operation":"harness_permission_decision","permission_id":"p","option_id":"allow"})).is_err());
     }
 }

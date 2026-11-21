@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::acp::{self, AgentSpec, PermissionHandler};
-use super::{HarnessRequest, HarnessResult, HarnessRole};
+use super::{HarnessRequest, HarnessResult, StepAccess};
 
 fn check_identity(initialized: &Value, expected: Option<&str>) -> Result<()> {
     if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
@@ -37,7 +37,7 @@ macro_rules! agents {
             program: $program,
             args: |request| {
                 let mut args: Vec<OsString> = vec![$($arg.into()),*];
-                if request.role == HarnessRole::Review {
+                if request.access == StepAccess::ReadOnly {
                     let review_args: &[&str] = &[$($review_arg),*];
                     args.extend(review_args.iter().map(|arg| OsString::from(*arg)));
                 }

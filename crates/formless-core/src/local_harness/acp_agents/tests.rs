@@ -20,13 +20,14 @@ fn captured(id: &str) -> Value {
     serde_json::from_str::<Value>(include_str!("captured.json")).unwrap()[id].clone()
 }
 
-fn request(role: HarnessRole) -> HarnessRequest {
+fn request(access: StepAccess) -> HarnessRequest {
     HarnessRequest {
-        kind: HarnessKind::Antigravity,
+        kind: HarnessKind::Acp,
+        acp_agent: Some("gemini".into()),
         model: None,
         cwd: std::env::current_dir().unwrap(),
         prompt: "fixture prompt".into(),
-        role,
+        access,
         mcp_command: std::env::current_exe().unwrap(),
         mcp_args: vec!["mcp".into()],
         mcp_env_vars: vec![],
@@ -37,7 +38,7 @@ fn request(role: HarnessRole) -> HarnessRequest {
 
 fn drive_spec(
     spec: &AgentSpec,
-    role: HarnessRole,
+    access: StepAccess,
     lines: &[Value],
     handler: &mut dyn PermissionHandler,
 ) -> (Result<HarnessResult>, Vec<Value>) {
@@ -52,7 +53,7 @@ fn drive_spec(
         spec,
         Cursor::new(input),
         &mut output,
-        &request(role),
+        &request(access),
         handler,
         &CancellationToken::new(),
         true,
@@ -122,7 +123,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
     let spec = spec(id).unwrap();
     assert_eq!(spec.program, program);
     assert_eq!(
-        (spec.args)(&request(HarnessRole::Build)),
+        (spec.args)(&request(StepAccess::Write)),
         args.iter()
             .map(|arg| OsString::from(*arg))
             .collect::<Vec<_>>()
@@ -132,7 +133,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
         .chain(review_args)
         .map(|arg| OsString::from(*arg))
         .collect();
-    assert_eq!((spec.args)(&request(HarnessRole::Review)), expected);
+    assert_eq!((spec.args)(&request(StepAccess::ReadOnly)), expected);
     assert!(spec.set_env.is_empty());
     let fixture = captured(id);
     let initialized = &fixture["initialize"]["result"];
@@ -162,7 +163,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
     };
     let (result, _) = drive_spec(
         spec,
-        HarnessRole::Build,
+        StepAccess::Write,
         &[fixture["initialize"].clone(), auth_error],
         &mut RejectAll,
     );
@@ -176,7 +177,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
     }
     let (result, _) = drive_spec(
         spec,
-        HarnessRole::Build,
+        StepAccess::Write,
         &[
             fixture["initialize"].clone(),
             json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"private error payload"}}),
@@ -206,7 +207,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
     lines.extend(updates.clone());
     lines.push(reply(prompt_id, json!({"stopReason":"end_turn"})));
     let mut handler = Handler::default();
-    let (result, sent) = drive_spec(spec, HarnessRole::Build, &lines, &mut handler);
+    let (result, sent) = drive_spec(spec, StepAccess::Write, &lines, &mut handler);
     assert_eq!(result.unwrap().message, "done");
     assert_eq!(handler.decisions, 1);
     assert_eq!(
@@ -226,7 +227,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
         empty_turn.push(reply(3, json!({})));
     }
     empty_turn.push(reply(prompt_id, json!({"stopReason":"end_turn"})));
-    let (result, _) = drive_spec(spec, HarnessRole::Build, &empty_turn, &mut RejectAll);
+    let (result, _) = drive_spec(spec, StepAccess::Write, &empty_turn, &mut RejectAll);
     assert!(result
         .unwrap_err()
         .to_string()
@@ -252,7 +253,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
         json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"review"}}),
     ));
     lines.push(reply(prompt_id, json!({"stopReason":"end_turn"})));
-    let (result, sent) = drive_spec(spec, HarnessRole::Review, &lines, &mut RejectAll);
+    let (result, sent) = drive_spec(spec, StepAccess::ReadOnly, &lines, &mut RejectAll);
     assert_eq!(result.unwrap().message, "review");
     let response = sent.iter().find(|value| value["id"] == 90).unwrap();
     assert_eq!(response["result"]["outcome"]["optionId"], "no");
@@ -297,7 +298,7 @@ fn registry_and_unknown_ids() {
     }
     for id in ["", "missing", "Gemini"] {
         assert!(spec(id).is_none());
-        let request = request(HarnessRole::Build);
+        let request = request(StepAccess::Write);
         assert!(run(id, &request, &mut RejectAll, &CancellationToken::new())
             .unwrap_err()
             .to_string()
@@ -322,7 +323,7 @@ fn junie_prefers_mode_id_over_category_and_never_selects_brave_mode() {
         .push(json!({"value":"plan","name":"Decoy"}));
     let (result, sent) = drive_spec(
         &JUNIE,
-        HarnessRole::Review,
+        StepAccess::ReadOnly,
         &[
             fixture["initialize"].clone(),
             session,
@@ -359,7 +360,7 @@ fn category_mode_fallback_preserves_antigravity_and_filters_candidates() {
         ),
         reply(4, json!({"stopReason":"end_turn"})),
     ];
-    let (result, sent) = drive_spec(&JUNIE, HarnessRole::Review, &lines, &mut RejectAll);
+    let (result, sent) = drive_spec(&JUNIE, StepAccess::ReadOnly, &lines, &mut RejectAll);
     result.unwrap();
     assert_eq!(sent[2]["params"]["configId"], "execution");
     assert_eq!(sent[2]["params"]["value"], "plan");
@@ -380,7 +381,7 @@ fn strict_profiles_fail_closed_and_devin_can_select_ask() {
         );
         let (result, sent) = drive_spec(
             spec,
-            HarnessRole::Review,
+            StepAccess::ReadOnly,
             &[
                 fixture["initialize"].clone(),
                 session,
@@ -398,7 +399,7 @@ fn strict_profiles_fail_closed_and_devin_can_select_ask() {
     );
     let (result, sent) = drive_spec(
         &DEVIN,
-        HarnessRole::Review,
+        StepAccess::ReadOnly,
         &[
             fixture["initialize"].clone(),
             session,
@@ -420,11 +421,25 @@ fn strict_profiles_fail_closed_and_devin_can_select_ask() {
 #[test]
 #[ignore = "live ACP initialize; requires FORMLESS_LIVE_ACP_BIN_DIR"]
 fn live_acp_agents_initialize_installed_binaries() {
+    live_initialize(StepAccess::Write);
+}
+
+/// Live read-only argv acceptance only; does not verify prompt enforcement.
+#[test]
+#[ignore = "live read-only ACP initialize; requires FORMLESS_LIVE_ACP_BIN_DIR"]
+fn live_acp_agents_initialize_read_only_installed_binaries() {
+    live_initialize(StepAccess::ReadOnly);
+}
+
+fn live_initialize(access: StepAccess) {
     let Some(bin_dir) = std::env::var_os("FORMLESS_LIVE_ACP_BIN_DIR") else {
         return;
     };
     let bin_dir = PathBuf::from(bin_dir);
-    let root = std::env::temp_dir().join(format!("formless-live-acp-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "formless-live-acp-{}-{access:?}",
+        std::process::id()
+    ));
     let mut checked = 0;
     for id in agent_ids() {
         let spec = spec(id).unwrap();
@@ -436,7 +451,7 @@ fn live_acp_agents_initialize_installed_binaries() {
         std::fs::create_dir_all(&home).unwrap();
         let mut command = Command::new(binary);
         command
-            .args((spec.args)(&request(HarnessRole::Build)))
+            .args((spec.args)(&request(access)))
             .env_clear()
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join("config"))
@@ -474,7 +489,7 @@ fn live_acp_agents_initialize_installed_binaries() {
             .recv_timeout(Duration::from_secs(20))
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         (spec.check_agent)(&response["result"]).unwrap_or_else(|error| panic!("{id}: {error}"));
-        println!("live initialize: {id} OK");
+        println!("live initialize {access:?}: {id} OK");
         checked += 1;
     }
     std::fs::remove_dir_all(root).unwrap();

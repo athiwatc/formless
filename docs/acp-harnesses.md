@@ -2,8 +2,19 @@
 
 `local_harness::acp_agents` supplies specs and a single-entry registry for these
 13 harnesses. `agent_ids()`, `spec(id)`, `run(id, request, handler, cancel)` and
-`open_session(id, request)` are available to callers. Topic-step/HarnessKind
-wiring is intentionally separate. Antigravity retains its own spec.
+`open_session(id, request)` are available to callers. Topic outlines and attempt
+inputs validate `HarnessKind::Acp` selectors against this registry.
+`local_harness::run(request, interaction_handler, cancel)` dispatches ACP and
+Antigravity sessions through the core interaction handler; Antigravity retains
+its own spec. Core v2's topic orchestrator is not yet available, so this adapter
+does not make `StartTopicWorkflow` execute steps.
+
+`HarnessRequest.access` (`StepAccess::ReadOnly` or `Write`) controls mode/argv
+selection. Permission IDs, names, kinds, and opaque option metadata reach the
+interaction handler unchanged. An unanswered permission is rejected. The adapter
+does not cache approvals; core's AllowAlways cache is scoped to the attempt, and
+each run starts a fresh agent process/session. Text messages/thoughts, tool calls,
+and plans are mapped to core updates; update-handler failures stop the run.
 
 Install each vendor's CLI separately and put its executable on PATH, or supply
 `HarnessRequest.executable`. Formless never installs agents, handles credentials,
@@ -97,6 +108,10 @@ and run:
 ```sh
 FORMLESS_LIVE_ACP_BIN_DIR=/absolute/path/to/binaries \
   cargo test -p formless-core live_acp_agents_initialize_installed_binaries --locked -- --ignored --nocapture
+
+# Also check that each CLI accepts the read-only argv in ACP mode:
+FORMLESS_LIVE_ACP_BIN_DIR=/absolute/path/to/binaries \
+  cargo test -p formless-core live_acp_agents_initialize_read_only_installed_binaries --locked -- --ignored --nocapture
 ```
 
 The live test clears the child environment, isolates HOME/XDG, skips missing

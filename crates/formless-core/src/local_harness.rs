@@ -3,20 +3,56 @@
 pub mod acp;
 pub mod acp_agents;
 pub mod antigravity;
+mod interaction;
+
+pub use interaction::run;
 
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-pub use formless_protocol::{HarnessKind, HarnessRole};
+pub use formless_protocol::{HarnessKind, StepAccess};
+
+pub struct HarnessPermissionRequest {
+    pub title: String,
+    pub kind: String,
+    pub raw_input: Option<Value>,
+    pub options: Vec<formless_protocol::HarnessPermissionOption>,
+}
+
+#[derive(Debug, Clone)]
+pub enum HarnessUpdate {
+    Message { content: String },
+    Thought { content: String },
+    ToolCall { name: String, input: Value },
+    Plan { content: String },
+}
+
+pub type InteractionFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+pub trait InteractionHandler: Send + Sync {
+    fn request_permission<'a>(
+        &'a self,
+        request: HarnessPermissionRequest,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> InteractionFuture<'a, Option<String>>;
+    fn ask_question<'a>(
+        &'a self,
+        questions: Vec<formless_protocol::Question>,
+        cancel: &'a tokio_util::sync::CancellationToken,
+    ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>>;
+    fn on_update(&self, update: HarnessUpdate) -> Result<()>;
+}
 
 pub struct HarnessRequest {
     pub kind: HarnessKind,
+    pub acp_agent: Option<String>,
     pub model: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
-    pub role: HarnessRole,
+    pub access: StepAccess,
     pub mcp_command: PathBuf,
     pub mcp_args: Vec<String>,
     pub mcp_env_vars: Vec<String>,
@@ -28,10 +64,11 @@ impl fmt::Debug for HarnessRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HarnessRequest")
             .field("kind", &self.kind)
+            .field("acp_agent", &self.acp_agent)
             .field("model", &self.model)
             .field("cwd", &self.cwd)
             .field("prompt_bytes", &self.prompt.len())
-            .field("role", &self.role)
+            .field("access", &self.access)
             .field("mcp_command", &self.mcp_command)
             .field("mcp_args", &self.mcp_args)
             .field("mcp_env_vars", &self.mcp_env_vars)
@@ -90,9 +127,43 @@ impl fmt::Debug for HarnessResult {
     }
 }
 
+pub(crate) fn validate_acp_agent(kind: Option<HarnessKind>, agent: Option<&str>) -> Result<()> {
+    if (kind == Some(HarnessKind::Acp)) != agent.is_some()
+        || agent.is_some_and(|id| id.trim().is_empty())
+    {
+        bail!("acp_agent is required and must be nonempty exactly when the harness is acp");
+    }
+    if let Some(id) = agent {
+        if acp_agents::spec(id).is_none() {
+            bail!(
+                "Unknown ACP agent `{id}`; available agents: {}",
+                acp_agents::agent_ids().join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
+    validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
     if request.kind == HarnessKind::Antigravity {
         return antigravity::command_spec(request);
+    }
+    if request.kind == HarnessKind::Acp {
+        bail!("ACP is interactive; use local_harness::run instead of command_spec");
+    }
+    if matches!(
+        request.kind,
+        HarnessKind::Pi
+            | HarnessKind::OpenCode
+            | HarnessKind::Antigravity
+            | HarnessKind::Acp
+            | HarnessKind::Muse
+    ) {
+        bail!(
+            "{:?} adapter not integrated yet; use Claude or Codex for now",
+            request.kind
+        );
     }
     if request.prompt.trim().is_empty() {
         bail!("harness prompt must not be empty");
@@ -127,7 +198,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         .unwrap_or_else(|| match request.kind {
             HarnessKind::Claude => PathBuf::from("claude"),
             HarnessKind::Codex => PathBuf::from("codex"),
-            HarnessKind::Antigravity => PathBuf::from("agy"),
+            _ => unreachable!("unsupported adapters rejected above"),
         });
     let mut args = Vec::<OsString>::new();
     match request.kind {
@@ -140,6 +211,14 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
                 "--mcp-config".into(),
                 claude_mcp_config(request)?.into(),
             ]);
+            if request.access == StepAccess::ReadOnly {
+                args.extend([
+                    "--permission-mode".into(),
+                    "plan".into(),
+                    "--tools".into(),
+                    "Read,Glob,Grep".into(),
+                ]);
+            }
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
             }
@@ -151,9 +230,9 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
                 "exec".into(),
                 "--json".into(),
                 "--sandbox".into(),
-                match request.role {
-                    HarnessRole::Build => "workspace-write".into(),
-                    HarnessRole::Review => "read-only".into(),
+                match request.access {
+                    StepAccess::Write => "workspace-write".into(),
+                    StepAccess::ReadOnly => "read-only".into(),
                 },
                 "-c".into(),
                 format!(
@@ -196,9 +275,8 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             args.push("--".into());
             args.push(request.prompt.as_str().into());
         }
-        HarnessKind::Antigravity => unreachable!(),
+        _ => unreachable!("unsupported adapters rejected above"),
     }
-
     Ok(CommandSpec {
         program,
         args,
@@ -229,6 +307,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
         HarnessKind::Antigravity => antigravity::parse_output(stdout),
+        _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
     }
 }
 
@@ -325,13 +404,14 @@ fn parse_codex(stdout: &str) -> Result<HarnessResult> {
 mod tests {
     use super::*;
 
-    fn request(kind: HarnessKind, role: HarnessRole) -> HarnessRequest {
+    fn request(kind: HarnessKind, access: StepAccess) -> HarnessRequest {
         HarnessRequest {
             kind,
+            acp_agent: None,
             model: Some("configured-model".into()),
             cwd: PathBuf::from("/tmp/repo"),
             prompt: "do the work".into(),
-            role,
+            access,
             mcp_command: PathBuf::from("/usr/bin/formless"),
             mcp_args: vec![
                 "topics".into(),
@@ -347,7 +427,7 @@ mod tests {
 
     #[test]
     fn claude_command_uses_print_json_and_only_the_explicit_mcp_config() {
-        let spec = command_spec(&request(HarnessKind::Claude, HarnessRole::Build)).unwrap();
+        let spec = command_spec(&request(HarnessKind::Claude, StepAccess::Write)).unwrap();
         let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert_eq!(spec.program, PathBuf::from("/opt/test/harness"));
         assert_eq!(
@@ -366,7 +446,7 @@ mod tests {
 
     #[test]
     fn codex_command_uses_scoped_config_and_role_sandbox() {
-        let mut build_request = request(HarnessKind::Codex, HarnessRole::Build);
+        let mut build_request = request(HarnessKind::Codex, StepAccess::Write);
         build_request.environment.insert(
             OsString::from("FORMLESS_TOPIC_CAPABILITY"),
             OsString::from("must-not-appear-in-argv"),
@@ -383,7 +463,7 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy())
             .collect();
-        let review = command_spec(&request(HarnessKind::Codex, HarnessRole::Review)).unwrap();
+        let review = command_spec(&request(HarnessKind::Codex, StepAccess::ReadOnly)).unwrap();
         let review: Vec<_> = review
             .args
             .iter()
@@ -463,7 +543,7 @@ mod tests {
 
     #[test]
     fn command_builder_rejects_non_absolute_paths_and_blank_prompts() {
-        let mut request = request(HarnessKind::Claude, HarnessRole::Build);
+        let mut request = request(HarnessKind::Claude, StepAccess::Write);
         request.prompt.clear();
         assert!(command_spec(&request).is_err());
         request.prompt = "ok".into();
@@ -474,12 +554,71 @@ mod tests {
     #[test]
     fn leading_dash_prompts_are_after_an_end_of_options_separator() {
         for kind in [HarnessKind::Claude, HarnessKind::Codex] {
-            let mut request = request(kind, HarnessRole::Build);
+            let mut request = request(kind, StepAccess::Write);
             request.prompt = "- implement X".into();
             let spec = command_spec(&request).unwrap();
             let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
             assert_eq!(args[args.len() - 2], "--");
             assert_eq!(args.last().unwrap(), "- implement X");
+        }
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn topic_access_restrictions_and_unintegrated_adapters() {
+        for kind in [
+            HarnessKind::Claude,
+            HarnessKind::Codex,
+            HarnessKind::Pi,
+            HarnessKind::OpenCode,
+            HarnessKind::Antigravity,
+            HarnessKind::Acp,
+            HarnessKind::Muse,
+        ] {
+            let request = HarnessRequest {
+                kind,
+                acp_agent: (kind == HarnessKind::Acp).then(|| "gemini".into()),
+                model: None,
+                cwd: std::env::current_dir().unwrap(),
+                prompt: "inspect".into(),
+                access: StepAccess::ReadOnly,
+                mcp_command: std::env::current_exe().unwrap(),
+                mcp_args: vec![],
+                mcp_env_vars: vec![],
+                executable: None,
+                environment: BTreeMap::new(),
+            };
+            if matches!(kind, HarnessKind::Claude | HarnessKind::Codex) {
+                let args = command_spec(&request).unwrap().args;
+                if kind == HarnessKind::Claude {
+                    assert!(args.windows(2).any(|p| p == ["--permission-mode", "plan"]));
+                    assert!(args.windows(2).any(|p| p == ["--tools", "Read,Glob,Grep"]));
+                } else {
+                    assert!(args.windows(2).any(|p| p == ["--sandbox", "read-only"]));
+                }
+            } else if kind == HarnessKind::Acp {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("local_harness::run"));
+            } else if kind == HarnessKind::Antigravity {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("antigravity::run"));
+            } else {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("adapter not integrated yet"));
+                assert!(parse_output(kind, "{}")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("adapter not integrated yet"));
+            }
         }
     }
 }

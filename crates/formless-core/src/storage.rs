@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
-    HarnessKind, MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
+    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo, TopicAttemptInfo, TopicFeatureInfo,
     TopicInfo,
 };
@@ -805,49 +805,37 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 pub const SCHEMA_VERSION: i64 = 71;
 
 const SCHEMA_V71: &str = "
-CREATE TABLE profile_metadata (
-  key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE topics (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL,
-  base_revision TEXT NOT NULL, source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE, status TEXT NOT NULL,
-  builder_kind TEXT NOT NULL, builder_model TEXT, reviewer_kind TEXT NOT NULL,
-  reviewer_model TEXT, redirect_message_id TEXT, rejection_reason TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE INDEX idx_topics_status_updated ON topics(status, updated_at DESC);
-CREATE TABLE topic_repo_locks (
-  repo TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-  acquired_at TEXT NOT NULL);
-CREATE TABLE topic_source_messages (
-  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-  source_session_id TEXT NOT NULL, message_id TEXT NOT NULL,
-  source_seq INTEGER NOT NULL, source_content TEXT NOT NULL, source_content_hash TEXT NOT NULL, moved_at TEXT,
-  PRIMARY KEY(topic_id, message_id));
-CREATE TABLE topic_features (
-  id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-  source_message_id TEXT NOT NULL, source_seq INTEGER NOT NULL, request TEXT NOT NULL,
-  status TEXT NOT NULL, active_attempt_id TEXT, ready_revision TEXT,
-  review_round INTEGER NOT NULL DEFAULT 0, detail TEXT,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE INDEX idx_topic_features_status ON topic_features(topic_id, status, source_seq);
-CREATE TABLE topic_attempts (
-  id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
-  feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
-  round INTEGER NOT NULL, role TEXT NOT NULL, harness_kind TEXT NOT NULL,
-  status TEXT NOT NULL, conversation_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-  capability_hash TEXT NOT NULL, worktree_path TEXT, base_revision TEXT,
-  revision TEXT, test_report TEXT, harness_session_id TEXT, child_pid INTEGER,
-  detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE INDEX idx_topic_attempts_feature ON topic_attempts(feature_id, created_at);
-CREATE UNIQUE INDEX idx_topic_active_review_attempt_revision
-  ON topic_attempts(feature_id, revision)
-  WHERE role='review' AND status='reviewing' AND revision IS NOT NULL;
-CREATE TABLE topic_reviews (
-  id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
-  attempt_id TEXT NOT NULL REFERENCES topic_attempts(id) ON DELETE CASCADE, revision TEXT NOT NULL,
-  outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
-  UNIQUE(feature_id, revision));
-CREATE INDEX idx_topic_reviews_attempt ON topic_reviews(attempt_id);
+CREATE TABLE IF NOT EXISTS profile_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS topics (
+ id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
+ workspace TEXT,workspace_kind TEXT NOT NULL,
+ base_revision TEXT,outline TEXT NOT NULL DEFAULT '[]',
+ source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,status TEXT NOT NULL,
+ redirect_message_id TEXT,rejection_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topics_status_updated ON topics(status,updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topics_parent ON topics(parent_topic_id);
+CREATE TABLE IF NOT EXISTS topic_repo_locks (
+ workspace TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,acquired_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS topic_source_messages (
+ topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,source_session_id TEXT NOT NULL,
+ message_id TEXT NOT NULL,source_seq INTEGER NOT NULL,source_content TEXT NOT NULL,
+ source_content_hash TEXT NOT NULL,moved_at TEXT,PRIMARY KEY(topic_id,message_id));
+CREATE TABLE IF NOT EXISTS topic_features (
+ id TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+ source_message_id TEXT NOT NULL,source_seq INTEGER NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,
+ active_attempt_id TEXT,outputs TEXT NOT NULL DEFAULT '[]',attempt_count INTEGER NOT NULL DEFAULT 0,
+ detail TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topic_features_status ON topic_features(topic_id,status,source_seq);
+CREATE TABLE IF NOT EXISTS topic_attempts (
+ id TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+ feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,step_title TEXT NOT NULL,
+ access TEXT NOT NULL,harness_kind TEXT NOT NULL,model TEXT,acp_agent TEXT,inputs TEXT NOT NULL DEFAULT '[]',
+ outputs TEXT NOT NULL DEFAULT '[]',summary TEXT,status TEXT NOT NULL,
+ conversation_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ capability_hash TEXT NOT NULL,worktree_path TEXT,outputs_dir TEXT,harness_session_id TEXT,child_pid INTEGER,
+ detail TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topic_attempts_feature ON topic_attempts(feature_id,created_at);
 ";
 
 fn migrate_v71(c: &Connection) -> Result<()> {
@@ -2055,10 +2043,22 @@ impl Store {
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         self.note_rewrite();
         self.transaction(|st| {
-            st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![id])?;
-            st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![id])?;
-            st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![id])?;
-            Ok(st.ex("DELETE FROM sessions WHERE id=?1", params![id])? > 0)
+            let descendants=st.conn.prepare(
+                "WITH RECURSIVE family(id) AS (SELECT id FROM sessions WHERE id=?1 UNION
+                 SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
+                 WHERE s.session_kind IN ('topic','topic_attempt') UNION
+                 SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
+                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family"
+            )?.query_map([id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut deleted=false;
+            for session_id in descendants {
+                st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
+                st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
+                st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;
+                let changed=st.ex("DELETE FROM sessions WHERE id=?1",params![session_id])?>0;
+                deleted|=session_id==id && changed;
+            }
+            Ok(deleted)
         })
     }
 
@@ -2356,6 +2356,7 @@ impl Store {
         name: Option<String>,
         up_to_seq: Option<i64>,
     ) -> Result<Option<SessionInfo>> {
+        self.ensure_topic_chat_writable(id)?;
         self.transaction(|st| st.fork_session_locked(id, name, up_to_seq))
     }
 
@@ -2496,6 +2497,7 @@ impl Store {
         message_id: &str,
         content: &str,
     ) -> Result<Option<MessageInfo>> {
+        self.ensure_topic_chat_writable(session_id)?;
         let found = self.get_message(session_id, message_id)?;
         let Some(mut msg) = found else {
             return Ok(None);
