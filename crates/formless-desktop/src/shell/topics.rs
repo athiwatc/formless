@@ -209,17 +209,13 @@ impl Shell {
         self.topic_ui.source = self.sidebar.active_id().map(str::to_string);
         self.topic_ui.selected.clear();
         self.topic_ui.state.notice = None;
-        if let Some(session) = self
+        let cwd = self
             .client_sessions
             .iter()
             .find(|s| Some(s.id.as_str()) == self.sidebar.active_id())
-        {
-            if let Some(cwd) = &session.cwd {
-                self.topic_ui
-                    .repo
-                    .update(cx, |input, cx| input.set_value(cwd.clone(), window, cx));
-            }
-        }
+            .and_then(|s| s.cwd.clone())
+            .unwrap_or_default();
+        self.topic_ui.repo.update(cx, |input, cx| input.set_value(cwd, window, cx));
         cx.notify();
     }
 
