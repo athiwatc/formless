@@ -7,14 +7,14 @@ platform app-dirs (SPEC §9.4).
 ## Cutting a release
 
 1. Bump `version` in the root `Cargo.toml` (`[workspace.package]`), and
-   move the `CHANGELOG.md` entries under `## [X.Y.Z] - date`.
+   move the `CHANGELOG.md` entries under `## X.Y.Z - date`.
 2. Run `cargo test --workspace --locked`, and
-   `scripts/release-check.sh vX.Y.Z`.
+   run `scripts/release-check.sh vX.Y.Z` and `scripts/release-notes.sh vX.Y.Z`.
 3. Tag and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 4. `.github/workflows/release.yml` then:
-   - first checks the tag names the Cargo.toml version
-     (`scripts/release-check.sh`) and stops before any build if not, so
-     asset names, `formless --version` and `formless update` agree;
+   - checks before any build that the tag names the Cargo.toml version
+     (`scripts/release-check.sh`) and has a nonempty changelog section
+     (`scripts/release-notes.sh`);
    - builds macOS (arm64/x86_64) and Windows (x86_64) archives with
      SHA-256 files;
    - builds the Linux archive, `.deb` and `.rpm` (`cargo-deb`,
@@ -33,23 +33,37 @@ platform app-dirs (SPEC §9.4).
    - installs the packages in clean Debian, Ubuntu and Rocky containers
       and runs `formless --version`, checking that all three completion files
       are nonempty, mode 644 and owned by the installed package;
-    - waits for native builds/tests and Linux package install checks before
-      building the Docker image, running it and checking the daemon answers, then
-     pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
-     [docs/docker.md](../docs/docker.md)); nothing is published if that
-     fails. The push tags the same immutable local image used by the smoke
-     check; it does not rebuild the image for publication;
+   - waits for native builds/tests and Linux package install checks before
+     building the Docker image and checking that its daemon answers. The
+     smoke-tested image is archived for seven days for publication. If the
+     archive expires before publication, start a fresh release workflow run
+     for the same version tag to rebuild and smoke-test the image. A rebuild
+     with a different image preserves an existing version tag and requires
+     review before promotion. Reruns use the workflow at the original tag
+     commit, so these safeguards apply to tags that include them;
    - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
-     for the version (`scripts/render-packaging.sh`, which fails on a
+     for stable releases (`scripts/render-packaging.sh`, which fails on a
      missing checksum, an unfilled placeholder, a version that isn't
      Cargo.toml's, or a Windows zip without the path the manifest names) and attaches them to the GitHub Release,
      whose notes (what `formless update` shows) are the version's
      `CHANGELOG.md` section (`scripts/release-notes.sh`) followed by
      GitHub's generated list of changes;
-   - publishes to the tap, winget and the AUR **only when their secrets
-     exist** (below), each on its own: one failing doesn't stop the
+   - publishes the archived Docker image after the GitHub Release and its
+     assets succeed. A version tag with a different image is preserved.
+     Only the highest stable repository tag can advance `:latest`
+     ([Docker guide](../docs/docker.md));
+   - publishes stable releases to the tap, winget and the AUR **only when
+     their secrets exist** (below). One failing doesn't stop the
      others, the job summary lists each channel's result, and a re-run
      is safe.
+
+A tag such as `v0.2.0-rc.1` publishes a GitHub prerelease with binaries,
+packages and checksums and a versioned Docker image. Debian and RPM package
+metadata use `0.2.0~rc.1` with the normal revision so it sorts before
+`0.2.0`. Download filenames and checksums use the tag's `0.2.0-rc.1`
+spelling. The GitHub latest release and Docker `:latest` stay on stable
+versions. The workflow skips the Homebrew tap, winget and the AUR for
+prereleases.
 
 ## Test-only release timing baseline
 

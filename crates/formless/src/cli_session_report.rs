@@ -61,7 +61,7 @@ pub(super) fn list_table(shown: &[&SessionInfo]) -> Table {
     for s in shown {
         table.row(vec![
             t(s.id.chars().take(8).collect::<String>(), Tone::Dim),
-            c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
+            c(formless_tui::local_timestamp(&s.updated_at)),
             c(s.message_count.to_string()),
             t(
                 format!("{}{}", if s.pinned { "★ " } else { "" }, s.name),
