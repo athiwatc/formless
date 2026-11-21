@@ -42,6 +42,8 @@ HOOK = """
       S.local = true;
       S.daemonOnline = true;
       renderChrome();
+      // Mirror loadAll's connection-bootstrap snapshot without its other reads.
+      if (runningPanelExposed()) refreshRunning('exposure');
     },
     disconnect() {
       S.ws = null;
