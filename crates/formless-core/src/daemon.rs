@@ -2197,6 +2197,15 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::RetryTopicFeature { retry } => {
+                let _launch = self.topic_launch.locked();
+                if self
+                    .topic_steps
+                    .locked()
+                    .keys()
+                    .any(|(id, _)| id == &retry.topic_id)
+                {
+                    return Err(RequestFailure::busy("topic still has live harness steps; wait for them to finish or explicitly cancel/recover the topic before retrying").into());
+                }
                 let topic = self
                     .with_store(|st| st.retry_topic_feature(&retry.topic_id, &retry.feature_id))?;
                 self.broadcast(Event::TopicChanged {

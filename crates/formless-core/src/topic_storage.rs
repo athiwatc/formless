@@ -767,6 +767,8 @@ impl Store {
     pub fn retry_topic_feature(&self, topic_id: &str, feature_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
+            let live:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND active_attempt_id IS NOT NULL) OR EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND status='running')",[topic_id],|row|row.get(0))?;
+            if live{bail!("topic has unfinished attempts; wait for them or cancel/recover before retrying");}
             if !matches!(topic.status.as_str(),"approved"|"failed"|"complete"|"needs_user"|"cancelled") {bail!("topic must be approved or terminal before retry; recover a running topic first");}
             let changed=st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,outputs='[]',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2",params![topic_id,feature_id,now()])?;
             if changed!=1 {bail!("topic feature not found");}

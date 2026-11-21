@@ -723,6 +723,79 @@ async fn topic_idle_watcher_keeps_live_harnesses_and_pending_interactions_alive(
         .unwrap();
     assert!(f.daemon().shutdown.is_cancelled());
 }
+
+#[tokio::test]
+async fn topic_retry_refuses_live_steps_after_normal_model_end_without_losing_results() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "release");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let launched = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let id = launched["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+    f.daemon()
+        .topic_orchestrator_ended(&session, "", "completed");
+    for feature in &topic.features {
+        assert!(f
+            .daemon()
+            .handle(Request::RetryTopicFeature {
+                retry: TopicFeatureRetryRequest {
+                    topic_id: topic.id.clone(),
+                    feature_id: feature.id.clone()
+                }
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("live harness"));
+        assert!(f
+            .daemon()
+            .with_store(|st| st.retry_topic_feature(&topic.id, &feature.id))
+            .is_err());
+    }
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
+    std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    let retried = f
+        .daemon()
+        .handle(Request::RetryTopicFeature {
+            retry: TopicFeatureRetryRequest {
+                topic_id: topic.id.clone(),
+                feature_id: topic.features[0].id.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(retried["status"], "approved");
+    assert_eq!(retried["attempts"][0]["status"], "succeeded");
+    assert!(f.daemon().runs.locked().is_empty());
+    assert!(f.daemon().topic_steps.locked().is_empty());
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();
