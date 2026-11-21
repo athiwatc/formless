@@ -3511,10 +3511,18 @@
     if (!readingVisible()) return null;
     const box = $("transcript"), bounds = visibleReadingBounds();
     const origin = box.getBoundingClientRect().top;
-    const messages = [...box.querySelectorAll("[data-message-id], [data-live-root]")];
-    const visible = messages.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
+    // These are the first four eligible roots in DOM order, not necessarily
+    // inside the viewport. Skip the remaining rectangle reads, but keep the
+    // same lower bound and do not assume the roots are sorted by geometry.
+    const messages = [];
+    for (const node of box.querySelectorAll("[data-message-id], [data-live-root]")) {
+      const r = node.getBoundingClientRect();
+      if (!(r.height && r.bottom > bounds.top + 1)) continue;
+      messages.push(node);
+      if (messages.length === 4) break;
+    }
     const candidates = [];
-    for (const message of visible.slice(0, 4)) {
+    for (const message of messages) {
       const blocks = [...message.querySelectorAll(anchorBlocks)];
       const visibleBlocks = blocks.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
       let block = visibleBlocks[0] || message;
