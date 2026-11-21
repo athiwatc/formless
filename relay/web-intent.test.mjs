@@ -254,9 +254,9 @@ test('send completion clears only the original Session attachments', async () =>
 test('tool, search and audit ignore out-of-order resolutions', async () => {
   for (const name of ['selectTool', 'search', 'loadAudit']) {
     const replies = [deferred(), deferred()]; let call = 0; const renders = [];
-    const c = setup([name], { act: () => replies[call++].promise, request: () => replies[call++].promise,
+    const c = setup(name === 'loadAudit' ? ['ownsAudit', name] : [name], { act: () => replies[call++].promise, request: () => replies[call++].promise,
       renderView() {}, renderSearch: (...x) => renders.push(x) });
-    vm.runInContext('let toolSeq = 0, searchSeq = 0, auditSeq = 0;', c);
+    vm.runInContext('let toolSeq = 0, searchSeq = 0, auditRequest = null, auditOwner = null;', c);
     let a, b;
     if (name === 'loadAudit') { c.S.auditFilter = 'A'; a = c.loadAudit(false); c.S.auditFilter = 'B'; b = c.loadAudit(false); }
     else { a = c[name]('A'); b = c[name]('B'); }
