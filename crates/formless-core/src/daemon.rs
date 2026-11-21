@@ -44,6 +44,7 @@ const CLIENT_QUEUE: usize = 4096;
 /// Largest request line (an attachment's base64 plus room), enforced while
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
+const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
@@ -912,9 +913,9 @@ pub struct Daemon {
     naming: Arc<tokio::sync::Semaphore>,
     /// One skill distillation at a time (SPEC §7.10).
     auto_skill: Arc<tokio::sync::Semaphore>,
-    /// Set while (or after a failed) naming-model download, so it is
-    /// attempted once per daemon lifetime.
-    model_download: Arc<AtomicBool>,
+    /// Held by the active model download. A failed attempt records the
+    /// next eligible retry time before releasing the lock.
+    model_download: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     /// Context windows the endpoints' `/models` listings report, per base
     /// URL then model id; a base URL is listed once per daemon (or again
     /// when the model picker lists it).
@@ -1128,7 +1129,7 @@ impl Daemon {
             http,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
-            model_download: Arc::new(AtomicBool::new(false)),
+            model_download: Default::default(),
             model_windows: StdMutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             build: build_id(),
@@ -6531,7 +6532,10 @@ impl Daemon {
     }
 
     fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
-        if self.model_download.swap(true, Ordering::SeqCst) {
+        let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
+            return;
+        };
+        if retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
             return;
         }
         let this = self.clone();
@@ -6541,21 +6545,25 @@ impl Daemon {
                 spec.id,
                 spec.gguf_bytes / 1_000_000
             );
-            match namer::download(&this.paths, &spec).await {
-                Ok(()) => {
-                    tracing::info!("session-naming model {} installed", spec.id);
-                    this.model_download.store(false, Ordering::SeqCst);
-                    // Sessions titled by the heuristic while it downloaded
-                    // get a real title now (#871).
-                    let ids = this
-                        .with_reader(|st| st.provisionally_named_sessions(100))
-                        .unwrap_or_default();
-                    for id in ids {
-                        this.maybe_name_session(&id);
-                    }
-                }
-                // Stays set: no retry storm on every new Session.
-                Err(e) => tracing::warn!("session-naming model download failed: {e:#}"),
+            let result = tokio::select! {
+                _ = this.shutdown.cancelled() => return,
+                result = namer::download(&this.paths, &spec) => result,
+            };
+            if let Err(e) = result {
+                *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
+                tracing::warn!("session-naming model download failed: {e:#}");
+                return;
+            }
+            *retry_at = None;
+            drop(retry_at);
+            tracing::info!("session-naming model {} installed", spec.id);
+            // Sessions titled by the heuristic while it downloaded
+            // get a real title now (#871).
+            let ids = this
+                .with_reader(|st| st.provisionally_named_sessions(100))
+                .unwrap_or_default();
+            for id in ids {
+                this.maybe_name_session(&id);
             }
         });
     }
@@ -18948,6 +18956,87 @@ mod mcp_approval_redaction_tests {
                 "denied review must not install or start code"
             );
         }
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod model_download_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Instant};
+
+    #[tokio::test]
+    async fn a_failed_naming_model_download_retries_after_cooldown() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::env::temp_dir().join(format!("fl-download-retry-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let weights = b"verified weights";
+        let app = axum::Router::new()
+            .route("/tokenizer", axum::routing::get(|| async { "{}" }))
+            .route(
+                "/weights",
+                axum::routing::get({
+                    let (calls, requested, release) =
+                        (calls.clone(), requested.clone(), release.clone());
+                    move || {
+                        let (requested, release) = (requested.clone(), release.clone());
+                        let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                        async move {
+                            if first {
+                                requested.notify_one();
+                                release.notified().await;
+                                (axum::http::StatusCode::SERVICE_UNAVAILABLE, b"".as_slice())
+                            } else {
+                                (axum::http::StatusCode::OK, weights.as_slice())
+                            }
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = ModelSpec {
+            id: "fixture",
+            tokenizer_url: Box::leak(format!("http://{addr}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(format!("{:x}", Sha256::digest(b"{}")).into_boxed_str()),
+            gguf_url: Box::leak(format!("http://{addr}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(format!("{:x}", Sha256::digest(weights)).into_boxed_str()),
+            gguf_bytes: weights.len() as u64,
+            ..namer::QWEN2_5_0_5B
+        };
+        let wait = Duration::from_secs(5);
+        daemon.spawn_model_download(spec);
+        timeout(wait, requested.notified()).await.unwrap();
+        daemon.spawn_model_download(spec);
+        let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
+        release.notify_one();
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.unwrap() >= earliest_retry);
+        assert!(!spec.installed(&paths));
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Move the retry deadline to the present without a real five-minute wait.
+        *retry_at = Some(Instant::now());
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(spec.installed(&paths));
+        drop(retry_at);
+        server.abort();
         drop(daemon);
         let _ = std::fs::remove_dir_all(base);
     }

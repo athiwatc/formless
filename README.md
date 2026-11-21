@@ -152,7 +152,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Formless works with a configured provider, can connect to the [Relay](#37-browser-access-via-the-relay-v2) when you enable it, and can automatically download assets for [local session naming](#7-sessions-runs-and-steer). Zero telemetry does not mean zero network traffic.
+5. **Local-first.** The daemon stores Sessions and Tools locally. See [network activity, naming controls and telemetry](#10-security-and-privacy).
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config and Session checkpoints keep history; destructive actions are user-only and confirmed.
 
@@ -202,7 +202,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | Async runtime | [Tokio](https://tokio.rs/) |
 | Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
 | HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |
-| Local session naming | [Candle](https://github.com/huggingface/candle) with [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) by default |
+| Local session naming | [Candle](https://github.com/huggingface/candle) with [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) by default, or [LFM2.5-350M](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF) |
 
 ---
 
@@ -1195,9 +1195,19 @@ formless memory rm m1a2b3c4
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
 * **Auto-naming** — when a Run finishes, the daemon can give an eligible Session with a provisional title a short name. Naming runs in the background, never replaces a name you set, and uses no provider tokens. The configured naming model runs locally on the CPU.
   Naming and automatic downloads are enabled by default. In a build with `embedded-llm`, these settings let an eligible Session with naming text fetch its missing configured catalogue model and tokenizer from Hugging Face. These are pinned assets verified with SHA-256 and stored under `<data dir>/models/`. If the model is unavailable, fails, or exceeds `naming.timeout_secs`, the daemon can use a first-words title instead. Set `naming.enabled = false` to turn off automatic naming or `naming.auto_download = false` to disable automatic downloads. These settings do not delete installed assets or disable the explicit `formless naming pull` command.
+  Downloads time out after 60 seconds without data or two hours per file. After a failed automatic download, a later naming attempt can retry once five minutes have passed. Builds without the default `embedded-llm` Cargo feature use first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
+
+#### Local naming models
+
+Set `naming.model` to select a model. Sizes are decimal MB rounded to two places and cover the GGUF weights only. The tokenizer is downloaded separately.
+
+| Model ID | Model | Quantization | Weights | License |
+| --- | --- | --- | --- | --- |
+| `qwen2.5-0.5b` | Qwen2.5-0.5B-Instruct (default) | `Q4_0` | 428.73 MB | [Apache-2.0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/9217f5db79a29953eb74d5343926648285ec7e67/LICENSE) |
+| `lfm2.5-350m` | LFM2.5-350M | `Q4_K_M` | 229.31 MB | [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/blob/657e078c94084481950a2d555a941481f715536b/LICENSE) |
 
 ### Context and compaction
 
@@ -1279,7 +1289,8 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Network activity can include provider requests, a [user-enabled Relay](#37-browser-access-via-the-relay-v2), and the [automatic naming asset download](#7-sessions-runs-and-steer). There is no automatic update checker; [`formless update check`](#312-updating) runs only when asked.
+* **Local-first.** Network activity includes calls to configured providers, connections to a [user-enabled relay](#37-browser-access-via-the-relay-v2), and [local naming model](#local-naming-models) downloads. In builds with embedded model support, automatic naming and downloads are enabled by default. Naming an untitled or provisionally named Session with suitable user text can trigger a background download if the selected catalogue model needs weights or a tokenizer. Set `naming.auto_download = false` to disable automatic downloads or `naming.enabled = false` to disable automatic naming.
+* **Zero telemetry.** There is no automatic update checker; `formless update check` runs on request ([§3.12](#312-updating)).
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
 
@@ -1423,7 +1434,7 @@ Contributions are welcome, whether it is a bug report, a Tool, a client improvem
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
 
-Session-naming models are not bundled in this repository or binary. See the [model catalogue](#naming-model-catalogue) for the separate upstream licenses of the default Qwen model and the optional Liquid AI model.
+Formless downloads model weights at runtime. The [local naming models](#local-naming-models) table links to the Apache-2.0 license for Qwen2.5-0.5B-Instruct and the LFM Open License v1.0 for LFM2.5-350M, which has terms for commercial use.
 
 ---
 
@@ -1438,7 +1449,7 @@ Session-naming models are not bundled in this repository or binary. See the [mod
 ## Acknowledgments
 
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template) for the README structure this page follows.
-- [Qwen](https://huggingface.co/Qwen) and [Liquid AI](https://www.liquid.ai/) for the local session-naming models.
+- [Qwen](https://huggingface.co/Qwen) for Qwen2.5-0.5B-Instruct and [Liquid AI](https://www.liquid.ai/) for LFM2.5-350M, the local session-naming models.
 - The Rust, [ratatui](https://ratatui.rs/), [rquickjs](https://github.com/DelSkayn/rquickjs), [Tokio](https://tokio.rs/) and SQLite communities.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
