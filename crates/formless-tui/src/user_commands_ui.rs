@@ -74,7 +74,8 @@ pub(super) fn unavailable(snapshot: &Snapshot, name: &str) -> Option<String> {
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.path.extension() == Some(std::ffi::OsStr::new("md"))
+            !diagnostic.warning
+                && diagnostic.path.extension() == Some(std::ffi::OsStr::new("md"))
                 && diagnostic
                     .path
                     .file_stem()
