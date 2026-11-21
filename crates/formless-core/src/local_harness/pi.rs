@@ -86,7 +86,7 @@ fn find_pi_executable(program: &Path, search_path: Option<&OsStr>) -> Option<Pat
                 return None;
             }
         }
-        fs::canonicalize(path).ok()
+        Some(path.to_owned())
     }
 
     if program.as_os_str().is_empty() {
@@ -1169,6 +1169,26 @@ printf 'private diagnostic' >&2"#,
         assert_eq!(result.version.as_deref(), Some("1.6.0"));
         assert_eq!(result.signed_in, None);
         assert_eq!(result.detail.as_deref(), Some(SIGN_IN_UNKNOWN));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_availability_preserves_symlink_shim_name() {
+        use std::os::unix::fs::symlink;
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let (dir, _, request) = fake_pi(
+            r#"[ "${0##*/}" = pi ] || exit 9
+printf '1.6.0\n'"#,
+        );
+        let shim = dir.join("pi");
+        symlink(request.executable.unwrap(), &shim).unwrap();
+        assert_eq!(find_pi_executable(&shim, None), Some(shim.clone()));
+        for explicit in [Some(shim.as_path()), None] {
+            let result = availability_with_path(explicit, None, Some(dir.as_os_str())).await;
+            assert!(result.installed);
+            assert_eq!(result.version.as_deref(), Some("1.6.0"));
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
