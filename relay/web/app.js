@@ -6076,11 +6076,12 @@
   let auditSeq = 0;
   async function loadAudit(older) {
     const seq = ++auditSeq;
+    const ws = S.ws, channel = S.channel;
     const filter = S.auditFilter || null;
     const last = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1] : null;
     const before = last ? (last.cursor || last.created_at) : null;
     const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
-    if (seq !== auditSeq || filter !== (S.auditFilter || null)) return;
+    if (seq !== auditSeq || filter !== (S.auditFilter || null) || ws !== S.ws || channel !== S.channel) return;
     S.audit = older ? (S.audit || []).concat(page) : page;
     S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
     renderView();
@@ -6525,26 +6526,88 @@
     } });
     if (saved) { toast("Saved role " + name.value.trim()); refreshSettings(); }
   }
-  async function refreshSettings() {
-    S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
-    S.providers = (await request({ type: "list_providers" }).catch(() => null)) || { providers: [], roles: {} };
-    S.harness = (await request({ type: "list_harness_changes" }).catch(() => null)) || [];
-    S.relayClients = (await request({ type: "list_relay_clients" }).catch(() => null)) || [];
-    S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
-    await refreshDescriptionReviews();
-    S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
-    S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
-    if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
-    try {
-      S.settings = await request({ type: "get_settings" });
-    } catch (e) {
-      S.settings = { error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here." };
+  const settingsLists = {
+    mcpServers: "list_mcp_servers",
+    providers: "list_providers",
+    harness: "list_harness_changes",
+    relayClients: "list_relay_clients",
+    skills: "list_skills",
+    memories: "list_memories",
+    jobs: "list_jobs",
+  };
+  const settingsBackground = ["settings", "status", "descriptionReviews"];
+  const settingsDomains = [...settingsBackground, ...Object.keys(settingsLists), "audit"];
+  let settingsRefresh = null;
+  function settingsConnectionReady() {
+    return S.ws?.readyState === 1 && !!S.channel && (S.local || S.relayReady);
+  }
+  function isSettingsConnection(connection) {
+    return settingsConnectionReady() && connection?.ws === S.ws && connection?.channel === S.channel;
+  }
+  function refreshSettings() {
+    return requestSettingsRefresh(settingsDomains);
+  }
+  function requestSettingsRefresh(domains) {
+    if (!settingsConnectionReady()) return Promise.resolve();
+    if (!isSettingsConnection(settingsRefresh)) {
+      settingsRefresh = { ws: S.ws, channel: S.channel, dirty: new Set(), pending: null };
     }
-    applyMotion();
-    const languageChanged = applyLanguage();
-    S.status = await act({ type: "status" });
-    if (languageChanged) renderAll();
-    else { renderView(); renderStatus(); }
+    const refresh = settingsRefresh;
+    for (const domain of domains) refresh.dirty.add(domain);
+    // Collect arrivals in the same turn before choosing the first request.
+    refresh.pending ||= Promise.resolve().then(() => drainSettingsRefresh(refresh));
+    return refresh.pending;
+  }
+  async function drainSettingsRefresh(refresh) {
+    const allowed = (domain) => settingsBackground.includes(domain)
+      || (S.view === "settings" && !$("app").classList.contains("hidden"));
+    try {
+      while (isSettingsConnection(refresh)) {
+        const batch = settingsDomains.filter(domain => allowed(domain) && refresh.dirty.has(domain));
+        if (!batch.length) return;
+        for (const domain of batch) {
+          if (!allowed(domain)) continue;
+          // Invalidate again only if a trigger arrives after this fetch starts.
+          refresh.dirty.delete(domain);
+          await loadSettingsDomain(domain, refresh);
+          if (!isSettingsConnection(refresh)) return;
+        }
+        renderView();
+        renderStatus();
+      }
+    } finally {
+      refresh.pending = null;
+    }
+  }
+  async function loadSettingsDomain(domain, connection) {
+    switch (domain) {
+      case "settings": {
+        const settings = await request({ type: "get_settings" }).catch(e => ({
+          error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here.",
+        }));
+        if (!isSettingsConnection(connection)) return;
+        S.settings = settings;
+        applyMotion();
+        if (applyLanguage()) renderAll();
+        break;
+      }
+      case "status": {
+        const status = await act({ type: "status" });
+        if (isSettingsConnection(connection)) S.status = status;
+        break;
+      }
+      case "descriptionReviews":
+        await refreshDescriptionReviews();
+        break;
+      case "audit":
+        if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
+        break;
+      default: {
+        const list = await request({ type: settingsLists[domain] }).catch(() => null);
+        if (isSettingsConnection(connection)) S[domain] = list || (domain === "providers" ? { providers: [], roles: {} } : []);
+        break;
+      }
+    }
   }
   // "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
   function usageText(u) {
@@ -7921,11 +7984,19 @@
         break;
       }
       case "settings_changed":
-      case "mcp_servers_changed":
-      case "skills_changed":
-      case "memory_updated":
-      case "jobs_changed":
         refreshSettings();
+        break;
+      case "mcp_servers_changed":
+        requestSettingsRefresh([...settingsBackground, "mcpServers", "harness", "audit"]);
+        break;
+      case "skills_changed":
+        requestSettingsRefresh([...settingsBackground, "skills", "harness", "audit"]);
+        break;
+      case "memory_updated":
+        requestSettingsRefresh([...settingsBackground, "memories", "harness", "audit"]);
+        break;
+      case "jobs_changed":
+        requestSettingsRefresh([...settingsBackground, "jobs", "harness", "audit"]);
         break;
       case "subagent_started":
         if (here) {
