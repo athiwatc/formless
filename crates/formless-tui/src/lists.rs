@@ -200,7 +200,13 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
             let r = |i: usize| tools[i].success_rate.unwrap_or(-1.0);
             r(b).total_cmp(&r(a))
         }),
-        2 => idx.sort_by(|&a, &b| tools[b].updated_at.cmp(&tools[a].updated_at)),
+        2 => idx.sort_by(|&a, &b| {
+            tools[b]
+                .last_used_at
+                .cmp(&tools[a].last_used_at)
+                .then_with(|| tools[a].name.cmp(&tools[b].name))
+                .then_with(|| tools[a].id.cmp(&tools[b].id))
+        }),
         3 => idx.sort_by_key(|&i| std::cmp::Reverse(tools[i].invocations)),
         _ => idx.sort_by(|&a, &b| tools[a].name.cmp(&tools[b].name)),
     }
@@ -672,9 +678,32 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: format!("2026-01-0{calls}"),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         }
+    }
+
+    #[test]
+    fn last_used_order_uses_retained_times_and_places_missing_times_last() {
+        let mut rows = [
+            tool("missing", Some(1.0), 9, false),
+            tool("zeta", Some(1.0), 1, false),
+            tool("older", Some(1.0), 5, true),
+            tool("alpha", Some(1.0), 2, false),
+        ];
+        rows[1].last_used_at = Some("2026-01-03T00:00:00+00:00".into());
+        rows[2].last_used_at = Some("2026-01-02T00:00:00+00:00".into());
+        rows[3].last_used_at = rows[1].last_used_at.clone();
+        let filter = ListFilter {
+            sort: 2,
+            ..ListFilter::default()
+        };
+        let names: Vec<_> = tools(&rows, &filter)
+            .into_iter()
+            .map(|i| rows[i].name.as_str())
+            .collect();
+        assert_eq!(names, ["alpha", "zeta", "older", "missing"]);
     }
 
     #[test]

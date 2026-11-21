@@ -1,7 +1,7 @@
 use super::*;
 
 fn insert(store: &Store, id: &str, date: &str, status: &str, kind: &str) -> PromptProposalInfo {
-    store.conn.execute("INSERT INTO prompt_proposals(id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at) VALUES(?1,?2,?3,'เหตุผล',?4,0.4,0.9,7,13,?5,?6)",params![id,kind,format!(" {id} 日本語 "),status,date,if status=="applied" { Some("applied fixture") } else { None }]).unwrap();
+    store.conn.execute("INSERT INTO prompt_proposals(id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at) VALUES(?1,?2,?3,'เหตุผล',?4,0.4,0.9,7,13,?5,?6)",params![id,kind,format!(" {id} 日本語 "),status,date,if status=="applied" { Some(date) } else { None }]).unwrap();
     store.get_proposal(id).unwrap().unwrap()
 }
 
@@ -60,6 +60,57 @@ fn applied_proposal_timestamp_ties_use_descending_rowid_even_with_another_index(
         expected
     );
     assert_eq!(store.effective_system_prompt("BASE").unwrap(), prompt);
+}
+
+#[test]
+fn applying_an_older_proposal_appends_after_newer_proposals() {
+    let store = Store::open_in_memory().unwrap();
+    let old = insert(
+        &store,
+        "created-first",
+        "2000-01-01T00:00:00+00:00",
+        "measured",
+        "prompt",
+    );
+    let newer = insert(
+        &store,
+        "created-second",
+        "2000-02-01T00:00:00+00:00",
+        "applied",
+        "prompt",
+    );
+    let legacy = insert(
+        &store,
+        "legacy",
+        "2000-01-15T00:00:00+00:00",
+        "applied",
+        "prompt",
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE prompt_proposals SET applied_at=NULL WHERE id=?1",
+            [&legacy.id],
+        )
+        .unwrap();
+
+    let before = store.effective_system_prompt("BASE").unwrap();
+    assert_eq!(before, "BASE\n\nLearned guidance (v1): legacy 日本語\n\nLearned guidance (v2): created-second 日本語");
+    store
+        .set_proposal_status(&old.id, "applied")
+        .unwrap()
+        .unwrap();
+    let ids: Vec<_> = store
+        .applied_proposals()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(ids, [legacy.id, newer.id, old.id]);
+    assert_eq!(
+        store.effective_system_prompt("BASE").unwrap(),
+        before + "\n\nLearned guidance (v3): created-first 日本語",
+    );
 }
 
 #[test]

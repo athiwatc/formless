@@ -14,6 +14,7 @@ pub struct View {
     pub hunk: Vec<Line<'static>>,
     pub selected: Option<Position>,
     pub total_hunks: usize,
+    pub pending_hunks: usize,
 }
 
 /// Preserve joiners and combining marks while exposing terminal control data.
@@ -46,6 +47,40 @@ pub fn navigate(files: &[ReviewFile], index: usize, forward: bool) -> usize {
         index.saturating_add(1).min(last)
     } else {
         index.min(last).saturating_sub(1)
+    }
+}
+
+pub fn navigate_pending(files: &[ReviewFile], index: usize, forward: bool) -> Option<usize> {
+    let positions = positions(files);
+    let count = positions.len();
+    let index = index.min(count.saturating_sub(1));
+    (1..=count)
+        .map(|step| {
+            if forward {
+                (index + step) % count
+            } else {
+                (index + count - step) % count
+            }
+        })
+        .find(|&next| {
+            let position = positions[next];
+            files[position.file].hunks[position.hunk].decision == "pending"
+        })
+}
+
+#[derive(Default)]
+struct Decisions {
+    pending: usize,
+    accepted: usize,
+    rejected: usize,
+}
+
+impl Decisions {
+    fn summary(&self) -> String {
+        format!(
+            "{} pending · {} kept · {} rejected",
+            self.pending, self.accepted, self.rejected
+        )
     }
 }
 
@@ -101,27 +136,44 @@ fn diff_line(line: &ReviewLine, color: bool) -> Line<'static> {
 pub fn render(files: &[ReviewFile], index: usize, color: bool) -> View {
     let all = positions(files);
     let selected = all.get(index.min(all.len().saturating_sub(1))).copied();
-    let mut overview = vec![Line::raw(format!(
-        "{} files · {} editable hunks",
-        files.len(),
-        all.len()
-    ))];
+    let mut overview = vec![Line::default()];
+    let mut total = Decisions::default();
     for file in files {
-        overview.push(Line::raw(format!(
-            "{} {}{}",
+        let label = format!(
+            "{} {}",
             display_text(&file.status),
-            display_text(&crate::text::escape_approval_controls(&file.path)),
-            file.exclusion_reason
-                .as_ref()
-                .map(|reason| format!(" · {}", display_text(reason)))
-                .unwrap_or_default()
-        )));
+            display_text(&crate::text::escape_approval_controls(&file.path))
+        );
+        let row = if let Some(reason) = &file.exclusion_reason {
+            format!("{label} · excluded · {}", display_text(reason))
+        } else {
+            let mut count = Decisions::default();
+            for hunk in &file.hunks {
+                match hunk.decision.as_str() {
+                    "pending" => count.pending += 1,
+                    "accepted" => count.accepted += 1,
+                    "rejected" => count.rejected += 1,
+                    _ => {}
+                }
+            }
+            total.pending += count.pending;
+            total.accepted += count.accepted;
+            total.rejected += count.rejected;
+            format!("{} · {label}", count.summary())
+        };
+        overview.push(Line::raw(row));
         overview.extend(
             file.warnings
                 .iter()
                 .map(|warning| Line::raw(format!("  {}", display_text(warning)))),
         );
     }
+    overview[0] = Line::raw(format!(
+        "{} files · {} editable hunks · {}",
+        files.len(),
+        all.len(),
+        total.summary()
+    ));
     let hunk = match selected {
         None => vec![Line::raw(
             "No editable hunks. Binary/generated and other excluded files remain listed above.",
@@ -151,6 +203,7 @@ pub fn render(files: &[ReviewFile], index: usize, color: bool) -> View {
         hunk,
         selected,
         total_hunks: all.len(),
+        pending_hunks: total.pending,
     }
 }
 
@@ -185,12 +238,56 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(overview.contains("binary.dat · Binary file"));
-        assert!(overview.contains("generated.rs · Generated file"));
+        assert!(overview.contains("binary.dat · excluded · Binary file"));
+        assert!(overview.contains("generated.rs · excluded · Generated file"));
         assert_eq!(view.total_hunks, 2);
         let excluded = render(&[file("binary.dat", Some("Binary file"))], 0, true);
         assert_eq!(excluded.selected, None);
         assert_eq!(excluded.total_hunks, 0);
+    }
+
+    #[test]
+    fn decision_counts_and_pending_navigation_only_include_editable_hunks() {
+        let mut files = vec![
+            file("first.rs", None),
+            file("excluded", Some("Binary file")),
+            file("second.rs", None),
+            file("third.rs", None),
+        ];
+        files[2].hunks[0].decision = "accepted".into();
+        let mut rejected = files[3].hunks[0].clone();
+        rejected.decision = "rejected".into();
+        files[3].hunks.push(rejected);
+        let view = render(&files, 1, false);
+        let rows: Vec<_> = view.overview.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rows[0],
+            "4 files · 4 editable hunks · 2 pending · 1 kept · 1 rejected"
+        );
+        assert_eq!(
+            rows[1],
+            "1 pending · 0 kept · 0 rejected · modified first.rs"
+        );
+        assert!(rows[2].contains("excluded · Binary file"));
+        assert_eq!(
+            rows[3],
+            "0 pending · 1 kept · 0 rejected · modified second.rs"
+        );
+        assert_eq!(
+            rows[4],
+            "1 pending · 0 kept · 1 rejected · modified third.rs"
+        );
+        assert_eq!(navigate_pending(&files, 0, true), Some(2));
+        assert_eq!(navigate_pending(&files, 2, true), Some(0));
+        assert_eq!(navigate_pending(&files, 0, false), Some(2));
+        assert_eq!(navigate_pending(&files, 2, false), Some(0));
+        assert_eq!(navigate_pending(&files, 1, true), Some(2));
+        files[0].hunks[0].decision = "accepted".into();
+        assert_eq!(navigate_pending(&files, 2, true), Some(2));
+        files[3].hunks[0].decision = "accepted".into();
+        assert_eq!(navigate_pending(&files, 1, true), None);
+        assert_eq!(navigate_pending(&files, 1, false), None);
+        assert_eq!(navigate_pending(&[], 0, true), None);
     }
 
     #[test]

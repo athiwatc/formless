@@ -59,6 +59,7 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
     assert_eq!(days.len(), 1, "all today");
     assert_eq!(days[0]["prompt_tokens"], 1_000_010);
     assert!(days[0]["cost"].is_null(), "a model without a price");
+    assert!(days[0].get("session_id").is_none());
 
     let models = daemon.handle(by(Some("model"))).await.unwrap();
     assert_eq!(models[0]["key"], "cheap");
@@ -85,6 +86,81 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
         .unwrap();
     assert!(none.as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn session_usage_groups_keep_identity_when_names_match_or_disappear() {
+    use serde_json::{json, Value};
+
+    let root = std::env::temp_dir().join(format!("fl-usage-group-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
+    cfg.provider.model = "priced".into();
+    cfg.provider.prices.insert(
+        "priced".into(),
+        ModelPrice {
+            input: 1.0,
+            ..Default::default()
+        },
+    );
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let first = store.create_session(Some("Work".into())).unwrap().id;
+    let second = store.create_session(Some("Work".into())).unwrap().id;
+    let deleted = store.create_session(Some("Gone".into())).unwrap().id;
+    let same_label = store.create_session(Some(deleted.clone())).unwrap().id;
+
+    let tokens = |prompt_tokens, completion_tokens, cost| Usage {
+        prompt_tokens,
+        completion_tokens,
+        cost,
+        ..Default::default()
+    };
+    for (session, provider, model, usage) in [
+        (&first, "default", "priced", tokens(1_000_000, 0, None)),
+        (&first, "other", "another-model", tokens(10, 20, Some(2.5))),
+        (&second, "default", "unpriced", tokens(4, 5, None)),
+        (&deleted, "default", "unpriced", tokens(6, 7, Some(1.0))),
+        (&same_label, "default", "unpriced", tokens(8, 9, Some(2.0))),
+    ] {
+        store
+            .record_usage_full(session, "record", provider, model, &usage, "run")
+            .unwrap();
+    }
+    assert!(store.delete_session(&deleted).unwrap());
+
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths).unwrap());
+    let request = || Request::UsageByDay {
+        since: None,
+        by: Some("session".into()),
+    };
+    let expected = |id: &str, key: &str, prompt_tokens, completion_tokens, cost: Value| {
+        json!({
+            "session_id": id, "key": key, "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens, "cached_tokens": 0, "cost": cost,
+        })
+    };
+    let before = daemon.handle(request()).await.unwrap();
+    assert_eq!(
+        before,
+        json!([
+            expected(&first, "Work", 1_000_010, 20, json!(3.5)),
+            expected(&same_label, &deleted, 8, 9, json!(2.0)),
+            expected(&deleted, &deleted, 6, 7, json!(1.0)),
+            expected(&second, "Work", 4, 5, Value::Null),
+        ])
+    );
+
+    store.rename_session(&first, "Renamed").unwrap().unwrap();
+    let after = daemon.handle(request()).await.unwrap();
+    let mut changed_label = before;
+    changed_label[0]["key"] = json!("Renamed");
+    assert_eq!(after, changed_label);
+    drop(daemon);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Cache writes are priced at their own rate, both reporting styles give
