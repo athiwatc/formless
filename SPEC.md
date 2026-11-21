@@ -6697,10 +6697,12 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
 
-`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored `live_acp_agents_initialize_installed_binaries`
-test. It names a directory of installed ACP CLI executables (or symlinks); the test
-uses isolated HOME/XDG directories, sends only ACP initialize, and skips absent binaries.
-It is not a product configuration override and does not authenticate or send prompts.
+`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored ACP initialize and availability tests.
+It names a directory of installed ACP CLI executables (or symlinks). These tests
+use isolated HOME/XDG directories and skip absent binaries. Initialize-only tests
+send only ACP initialize; the availability test also sends session/new without
+MCP servers, with an eight-second deadline. It is not a product configuration
+override and does not authenticate or send prompts.
 
 The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
 opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.

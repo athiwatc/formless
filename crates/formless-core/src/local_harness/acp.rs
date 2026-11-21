@@ -337,6 +337,56 @@ pub fn probe(
     probe_result(spec, initialized)
 }
 
+pub(super) struct SessionProbe {
+    pub version: Option<String>,
+    pub session: Result<std::result::Result<Value, i64>>,
+}
+
+/// A bounded readiness check, without a bridge, prompt or authentication request.
+pub(super) fn probe_session(
+    spec: &AgentSpec,
+    request: &HarnessRequest,
+    timeout: Duration,
+) -> SessionProbe {
+    let mut version = None;
+    let cancel = CancellationToken::new();
+    let timer = cancel.clone();
+    let (stop, stopped) = mpsc::channel();
+    std::thread::spawn(move || {
+        if stopped.recv_timeout(timeout).is_err() {
+            timer.cancel();
+        }
+    });
+    let session = (|| {
+        let mut agent = AgentProcess::spawn(spec, request)?;
+        let (reader, writer) = agent.pipes()?;
+        let mut rpc = Rpc::new(spec, reader, writer, &cancel, StepAccess::Write);
+        let initialized = match rpc.initialize_response(spec, &mut RejectAll)? {
+            Ok(initialized) => initialized,
+            Err(code) => return Ok(Err(code)),
+        };
+        version = initialized
+            .pointer("/agentInfo/version")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        (spec.check_agent)(&initialized)?;
+        rpc.call(
+            "session/new",
+            json!({"cwd": request.cwd.to_str().context("probe cwd must be UTF-8")?, "mcpServers": []}),
+            &mut RejectAll,
+        )
+    })();
+    let _ = stop.send(());
+    SessionProbe {
+        version,
+        session: if cancel.is_cancelled() {
+            Err(anyhow!("ACP readiness probe timed out."))
+        } else {
+            session
+        },
+    }
+}
+
 fn probe_lines<R: BufRead + Send + 'static, W: Write>(
     spec: &AgentSpec,
     reader: R,
@@ -817,6 +867,20 @@ impl<W: Write> Rpc<W> {
         spec: &AgentSpec,
         permissions: &mut dyn PermissionHandler,
     ) -> Result<Value> {
+        self.initialize_response(spec, permissions)?
+            .map_err(|code| {
+                anyhow!(
+                    "{} rejected ACP initialize (JSON-RPC error {code}).",
+                    spec.name
+                )
+            })
+    }
+
+    fn initialize_response(
+        &mut self,
+        spec: &AgentSpec,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<std::result::Result<Value, i64>> {
         let mut client_capabilities = json!({
             "fs": {"readTextFile": false, "writeTextFile": false},
             "terminal": false
@@ -830,13 +894,7 @@ impl<W: Write> Rpc<W> {
                 "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
             }),
             permissions,
-        )?
-        .map_err(|code| {
-            anyhow!(
-                "{} rejected ACP initialize (JSON-RPC error {code}).",
-                spec.name
-            )
-        })
+        )
     }
 
     fn send(&mut self, message: &Value) -> Result<()> {
