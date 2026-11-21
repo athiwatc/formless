@@ -93,6 +93,12 @@
     chips: {},
     view: prefs.get("view", "chat"),
     sessions: [],
+    topics: [],
+    mainChat: null,
+    topicsAvailable: false,
+    topicsUnsupported: false,
+    topicRevision: 0,
+    topicFocus: null,
     current: null,
     messages: [],
     sessionLoad: null, // { id, status: pending | failed | loaded }
@@ -1625,6 +1631,7 @@
     }
   }
   function renderSessions() {
+    renderTopicNavigation();
     const list = $("sessions");
     const focused = document.activeElement;
     const focusedRow = focused?.closest("#sessions [data-session-id]");
@@ -1656,8 +1663,9 @@
     renderSessionBulkBar();
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
-    const archived = S.sessions.filter((s) => s.archived && tagged(s));
-    const active = S.sessions.filter((s) => !s.archived && tagged(s));
+    const topicSessions = topicSessionIds();
+    const archived = S.sessions.filter((s) => (!topicSessions.size || !topicSessions.has(s.id)) && s.archived && tagged(s));
+    const active = S.sessions.filter((s) => (!topicSessions.size || !topicSessions.has(s.id)) && !s.archived && tagged(s));
     const appendRows = (visible) => {
       for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
         const s = row.session;
@@ -1716,6 +1724,306 @@
       control.focus({ preventScroll: true });
       revealSessionControl(document.activeElement);
     }
+  }
+
+  // ------------------------------------------------ topic orchestration
+  // Topics and attempt transcripts are daemon-owned. Never infer lineage from
+  // titles, external harness IDs, or browser-local session preferences.
+  function topicSessionIds() {
+    const ids = new Set();
+    if (!S.topicsAvailable) return ids;
+    if (S.mainChat) ids.add(S.mainChat.id);
+    for (const topic of S.topics) {
+      if (topic.topic_session_id) ids.add(topic.topic_session_id);
+      for (const attempt of topic.attempts || []) ids.add(attempt.conversation_session_id);
+    }
+    return ids;
+  }
+  function topicForSession(id = S.current) {
+    return S.topics.find(topic => topic.topic_session_id === id
+      || (topic.attempts || []).some(attempt => attempt.conversation_session_id === id));
+  }
+  function currentTopicAttempt() {
+    return topicForSession()?.attempts?.find(attempt => attempt.conversation_session_id === S.current);
+  }
+  function topicStatusLabel(status) {
+    return ({ pending_approval: "Needs approval", approved: "Ready to start", running: "In progress",
+      complete: "Ready for you", pending: "Pending", building: "Building", awaiting_review: "Awaiting review", reviewing: "In review",
+      ready: "Ready for you", needs_user: "Needs your input", failed: "Failed", rejected: "Not moved",
+      passed: "Passed", findings: "Changes requested", abandoned: "Interrupted" })[status] || status || "Pending";
+  }
+  function harnessLabel(kind) {
+    return ({ claude: "Claude", codex: "Codex", pi: "Pi", open_code: "OpenCode", antigravity: "Antigravity" })[kind] || kind;
+  }
+  function topicBadge(status) {
+    return h("span", { class: "topic-badge topic-state-" + status }, topicStatusLabel(status));
+  }
+  function topicWorkflowLabel(topic) {
+    const label = (kind, model) => harnessLabel(kind) + (model ? " · " + model : "");
+    return label(topic.builder, topic.builder_model) + " → " + label(topic.reviewer, topic.reviewer_model);
+  }
+  function replaceTopicContent(root, signature, children) {
+    if (root.topicSignature === signature) return;
+    const focused = root.contains(document.activeElement) && document.activeElement.dataset.topicControl;
+    root.replaceChildren(...children);
+    root.topicSignature = signature;
+    if (focused) {
+      const replacement = [...root.querySelectorAll("[data-topic-control]")].find(node => node.dataset.topicControl === focused);
+      (replacement || root.querySelector("button"))?.focus({ preventScroll: true });
+    }
+  }
+  function renderTopicNavigation() {
+    const nav = $("topic-nav");
+    if (!nav) return;
+    nav.classList.toggle("hidden", !S.topicsAvailable);
+    $("other-chats-label").classList.toggle("hidden", !S.topicsAvailable);
+    if (!S.topicsAvailable) return;
+    const signature = JSON.stringify([S.mainChat, S.topics, S.current, S.topicFocus, S.topicCollapsed, S.topicsError]);
+    if (nav.topicSignature === signature) return;
+    const main = h("button", { type: "button", class: "topic-chat-link main-chat-link" + (S.current === S.mainChat?.id ? " active" : ""),
+      "data-topic-control": "main", "aria-current": S.current === S.mainChat?.id ? "page" : null,
+      onclick: () => openSession(S.mainChat.id) }, h("span", { "aria-hidden": "true", class: "topic-icon" }, "◇"), "Main Chat");
+    const topics = S.topics.filter(topic => topic.status !== "rejected");
+    const rows = topics.map(topic => {
+      const active = topicForSession()?.id === topic.id || S.topicFocus === topic.id;
+      const collapsed = !!S.topicCollapsed?.[topic.id];
+      const attempts = topic.attempts || [];
+      const ready = topic.features.filter(feature => feature.status === "ready").length;
+      const attention = topic.status === "pending_approval" || topic.features.some(feature => ["needs_user", "failed"].includes(feature.status));
+      const childrenId = "topic-attempts-" + topic.id;
+      return h("li", { class: "topic-item", "data-topic-id": topic.id },
+        h("div", { class: "topic-nav-row" }, attempts.length ? h("button", { type: "button", class: "icon-btn topic-disclosure",
+          "aria-label": (collapsed ? "Expand " : "Collapse ") + topic.name, "aria-expanded": String(!collapsed), "aria-controls": childrenId,
+          "data-topic-control": "toggle-" + topic.id,
+          onclick: () => { (S.topicCollapsed ||= {})[topic.id] = !collapsed; renderTopicNavigation(); } }, collapsed ? "▸" : "▾") : h("span", { class: "topic-disclosure" }),
+        h("button", { type: "button", class: "topic-chat-link" + (active && !currentTopicAttempt() ? " active" : ""),
+          "data-topic-control": "topic-" + topic.id, "aria-current": active && !currentTopicAttempt() ? "page" : null,
+          onclick: () => openTopic(topic), title: topic.name + " · " + topicStatusLabel(topic.status) },
+          h("span", { class: "topic-nav-name" }, topic.name),
+          h("span", { class: "topic-nav-count" + (attention ? " attention" : ""), "aria-label": attention ? "Needs attention" : ready + " of " + topic.features.length + " ready" }, attention ? "!" : ready + "/" + topic.features.length))),
+        h("ul", { id: childrenId, class: "topic-attempt-list", hidden: collapsed }, attempts.map(attempt => {
+          const feature = topic.features.find(item => item.id === attempt.feature_id);
+          const name = harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)) + " · " + (attempt.role === "build" ? "Build" : "Review");
+          return h("li", null, h("button", { type: "button", class: "topic-chat-link attempt-link" + (S.current === attempt.conversation_session_id ? " active" : ""),
+            "data-topic-control": "attempt-" + attempt.id, "aria-current": S.current === attempt.conversation_session_id ? "page" : null,
+            title: name + " · " + topicStatusLabel(attempt.status) + " · " + (feature?.request || ""),
+            onclick: () => openSession(attempt.conversation_session_id) },
+            h("span", { class: "attempt-dot topic-state-" + attempt.status, "aria-hidden": "true" }),
+            h("span", { class: "attempt-identity" }, h("span", null, name), h("small", { class: "muted" }, feature?.request || "Feature", " · ", topicStatusLabel(attempt.status)))));
+        })));
+    });
+    replaceTopicContent(nav, signature, [main,
+      h("div", { class: "topic-nav-heading" }, h("h3", { class: "sidebar-label" }, "Topic Chats"),
+        h("button", { type: "button", class: "icon-btn", "aria-label": "Create topic from this conversation", "data-topic-control": "new-topic", onclick: () => proposeTopic() }, "+")),
+      h("ul", { class: "topic-list" }, rows.length ? rows : h("li", { class: "topic-empty muted" }, "Give focused work its own space.")),
+      S.topicsError ? h("div", { class: "topic-refresh-error", role: "status" }, "Topic updates unavailable. Showing last known state. ",
+        h("button", { type: "button", class: "btn small ghost", "data-topic-control": "refresh", onclick: () => refreshTopics() }, "Retry")) : null].filter(Boolean));
+  }
+  function renderTopicContext() {
+    const root = $("topic-context");
+    if (!root) return;
+    const attempt = currentTopicAttempt();
+    const topic = S.topics.find(item => item.id === S.topicFocus) || topicForSession();
+    const pending = S.topics.filter(item => item.source_session_id === S.current && item.status === "pending_approval" && item.id !== topic?.id);
+    root.classList.toggle("hidden", !S.topicsAvailable || !topic && !pending.length);
+    if (!S.topicsAvailable) return;
+    const signature = JSON.stringify([topic, attempt?.id, pending, S.topicBusy, S.topicsError, S.attemptTranscriptError]);
+    if (root.topicSignature === signature) return;
+    const control = (label, key, action, primary = false) => h("button", { type: "button", class: "btn small" + (primary ? " primary" : " ghost"),
+      disabled: !!S.topicBusy, "data-topic-control": key, onclick: action }, label);
+    const children = [];
+    if (topic) {
+      children.push(h("div", { class: "topic-summary" }, h("div", { class: "topic-summary-copy" },
+        h("div", { class: "topic-eyebrow" }, attempt ? "Harness conversation · read only" : "Topic workflow", topicBadge(topic.status)),
+        h("strong", { class: "topic-heading" }, topic.name), h("div", { class: "muted topic-workflow" }, topicWorkflowLabel(topic))),
+        h("div", { class: "topic-actions" }, attempt ? control("Back to topic", "back", () => openTopic(topic)) : null,
+          control("Refresh", "refresh", () => refreshTopicView()))));
+      if (attempt) {
+        children.push(h("p", { class: "topic-readonly muted" }, harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)),
+          " · ", topicStatusLabel(attempt.status), " · Formless coordinates handoffs. Continue the conversation in the topic chat."));
+        if (S.attemptTranscriptError === S.current) children.push(h("p", { class: "error", role: "status" }, "Transcript updates unavailable. Refresh to try again."));
+      } else if (topic.status === "pending_approval") {
+        children.push(h("p", { class: "muted" }, "These requests stay in the original chat until you agree. Approval moves them here and starts your workflow."),
+          h("p", { class: "topic-repo" }, h("code", null, topic.repo)),
+          h("div", { class: "topic-actions" }, control("Keep in original chat", "reject", () => rejectTopic(topic)),
+            control("Move & start", "approve", () => approveTopic(topic), true)));
+      } else if (topic.status === "approved") {
+        children.push(h("div", { class: "topic-actions" }, h("span", { class: "muted" }, "Requests moved. Your workflow has not started."),
+          control("Start workflow", "start", () => startTopic(topic), true)));
+      }
+      if (!attempt) children.push(h("div", { class: "topic-features", "aria-label": "Feature progress" }, topic.features.map((feature, i) =>
+        h("article", { class: "topic-feature", "data-feature-id": feature.id }, h("div", { class: "topic-feature-head" },
+          h("span", { class: "muted" }, String(i + 1).padStart(2, "0")), h("strong", null, feature.request), topicBadge(feature.status)),
+          feature.detail ? h("p", { class: "topic-feature-detail" }, feature.detail) : null,
+          feature.ready_revision ? h("p", { class: "topic-revision" }, "Reviewed revision ", h("code", null, feature.ready_revision)) : null,
+          ["failed", "needs_user"].includes(feature.status) ? control("Retry feature", "retry-" + feature.id, () => retryTopicFeature(topic, feature)) : null))));
+      children.push(h("p", { class: "topic-no-merge muted" }, "Formless handles build → review → fixes. Ready features wait for you; nothing merges automatically."));
+    }
+    children.push(...pending.map(item => h("div", { class: "topic-proposal-notice" }, h("span", null, "Move focused work to ", h("strong", null, item.name), "?"),
+      topicBadge("pending_approval"), control("Review proposal", "proposal-" + item.id, () => openTopic(item), true))));
+    if (S.topicBusy) children.push(h("p", { class: "muted", role: "status" }, S.topicBusy));
+    if (S.topicsError) children.push(h("p", { class: "error", role: "status" }, "Could not refresh topics. Status may be out of date."));
+    replaceTopicContent(root, signature, children);
+  }
+  let topicRefresh = null;
+  async function refreshTopics(initial = false) {
+    const channel = S.channel;
+    if (!channel || !S.daemonOnline) return;
+    if (initial) S.topicsUnsupported = false;
+    initial = initial || !S.mainChat;
+    const revision = S.topicRevision || 0;
+    if (topicRefresh?.channel === channel && topicRefresh.revision === revision) return topicRefresh.promise;
+    const refresh = { channel, revision };
+    refresh.promise = (async () => {
+      try {
+        const [main, topics] = await Promise.all([initial ? request({ type: "get_main_chat" }) : S.mainChat, request({ type: "list_topics" })]);
+        if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
+        if (!main?.id || !Array.isArray(topics)) throw new Error("Invalid topic response");
+        S.mainChat = main;
+        S.topics = topics;
+        S.topicsAvailable = true;
+        S.topicsUnsupported = false;
+        S.topicsError = false;
+        if (!S.sessions.some(session => session.id === main.id)) S.sessions.unshift(main);
+      } catch (error) {
+        if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
+        if (initial && error.daemonResponse && ["bad_request", "unsupported"].includes(error.code)) {
+          S.topicsUnsupported = true;
+          S.topicsAvailable = false; S.mainChat = null; S.topics = [];
+        }
+        else S.topicsError = true;
+      }
+      if (S.channel === channel) { renderSessions(); renderComposer(); }
+    })().finally(() => { if (topicRefresh === refresh) topicRefresh = null; });
+    topicRefresh = refresh;
+    return refresh.promise;
+  }
+  let attemptRefresh = null;
+  async function refreshAttemptTranscript() {
+    if (!currentTopicAttempt() || S.sessionLoad?.id !== S.current || S.sessionLoad.status !== "loaded") return;
+    const id = S.current, channel = S.channel, sequence = sessionSeq;
+    if (attemptRefresh?.id === id && attemptRefresh.channel === channel) return attemptRefresh.promise;
+    const refresh = { id, channel };
+    const current = () => id === S.current && channel === S.channel && sequence === sessionSeq;
+    refresh.promise = (async () => {
+      try {
+        const result = await request({ type: "get_session", id });
+        if (!current()) return;
+        if (!Array.isArray(result.messages)) throw new Error("Invalid transcript response");
+        S.attemptTranscriptError = null;
+        const next = result.messages;
+        const unchanged = next.length === S.messages.length && next.every((message, i) => {
+          const old = S.messages[i];
+          return message.id === old.id && message.content === old.content && message.meta === old.meta;
+        });
+        if (!unchanged) { S.messages = next; renderHistory({ newContent: true }); }
+      } catch (_) {
+        if (current()) S.attemptTranscriptError = id;
+      }
+      if (current()) renderTopicContext();
+    })().finally(() => { if (attemptRefresh === refresh) attemptRefresh = null; });
+    attemptRefresh = refresh;
+    return refresh.promise;
+  }
+  async function refreshTopicView() {
+    await refreshTopics();
+    await refreshAttemptTranscript();
+  }
+  async function openTopic(topic) {
+    const id = topic.topic_session_id || topic.source_session_id;
+    if (id !== S.current) await openSession(id);
+    S.topicFocus = topic.id;
+    if (S.view !== "chat") setView("chat");
+    closeSidebar();
+    renderTopicNavigation();
+    renderTopicContext();
+  }
+  function storeTopic(topic) {
+    S.topicRevision = (S.topicRevision || 0) + 1;
+    S.topics = [topic, ...S.topics.filter(item => item.id !== topic.id)];
+    renderSessions();
+    renderComposer();
+  }
+  async function topicAction(label, action) {
+    if (S.topicBusy) return;
+    S.topicRevision = (S.topicRevision || 0) + 1;
+    S.topicBusy = label;
+    renderTopicContext();
+    try { await action(); }
+    catch (error) { toast(error.message, true); note(error.message, true); }
+    finally { S.topicBusy = null; renderTopicContext(); }
+  }
+  async function startTopic(topic) {
+    return topicAction("Starting workflow…", async () => {
+      storeTopic(await request({ type: "start_topic_workflow", topic_id: topic.id }));
+      await refreshTopics();
+    });
+  }
+  async function approveTopic(topic) {
+    return topicAction("Moving requests and starting workflow…", async () => {
+      // The explicit Move & start click is consent. Proposing never moves or
+      // launches; a failed launch leaves an approved topic with a Retry action.
+      const approved = await request({ type: "approve_topic", approval: { topic_id: topic.id } });
+      storeTopic(approved);
+      await refreshSessions();
+      await openTopic(approved);
+      storeTopic(await request({ type: "start_topic_workflow", topic_id: topic.id }));
+      await refreshTopics();
+    });
+  }
+  async function rejectTopic(topic) {
+    return topicAction("Keeping requests in the original chat…", async () => {
+      storeTopic(await request({ type: "reject_topic", rejection: { topic_id: topic.id, reason: "User chose to keep the requests in the original chat." } }));
+      S.topicFocus = null;
+      renderSessions(); renderTopicContext();
+    });
+  }
+  async function retryTopicFeature(topic, feature) {
+    if (!(await ask({ title: "Retry this feature?", text: feature.request + "\nFormless will start another build/review attempt using this topic’s workflow.", ok: "Retry feature" }))) return;
+    return topicAction("Retrying feature…", async () => {
+      storeTopic(await request({ type: "retry_topic_feature", retry: { topic_id: topic.id, feature_id: feature.id } }));
+      storeTopic(await request({ type: "start_topic_workflow", topic_id: topic.id }));
+      await refreshTopics();
+    });
+  }
+  async function proposeTopic(selectedMessageId) {
+    if (!S.topicsAvailable || !S.current || currentTopicAttempt()) return;
+    if (S.sessionLoad?.status !== "loaded" || S.sessionLoad.id !== S.current) return toast("Wait for this conversation to load first.", true);
+    const source = S.current, channel = S.channel;
+    const messages = S.messages.filter(message => message.role === "user" && message.content?.trim());
+    if (!messages.length) return toast("Send your feature requests in this chat first, then move them to a topic.", true);
+    const defaults = prefs.get("topicWorkflow", {}) || {};
+    const field = (label, input) => h("label", { class: "topic-form-field" }, h("span", null, label), input);
+    const name = h("input", { type: "text", required: true, maxlength: 160, value: "", placeholder: "e.g. Formless", "aria-label": "Topic name" });
+    const repo = h("input", { type: "text", required: true, spellcheck: "false", value: defaults.repo || "", placeholder: "/path/to/repository", "aria-label": "Repository on your machine" });
+    const picker = (value, label) => {
+      const select = h("select", { "aria-label": label }, ["claude", "codex"].map(kind => h("option", { value: kind }, harnessLabel(kind))));
+      select.value = ["claude", "codex"].includes(value) ? value : "claude";
+      return select;
+    };
+    const builder = picker(defaults.builder || "claude", "Build with"), reviewer = picker(defaults.reviewer || "codex", "Review with");
+    const builderModel = h("input", { type: "text", spellcheck: "false", value: defaults.builder_model || "", placeholder: "Harness default (e.g. opus)", "aria-label": "Builder model" });
+    const reviewerModel = h("input", { type: "text", spellcheck: "false", value: defaults.reviewer_model || "", placeholder: "Harness default", "aria-label": "Reviewer model" });
+    const selected = new Set([selectedMessageId || messages[messages.length - 1].id]);
+    const body = h("div", { class: "topic-proposal-form" }, field("Topic name", name), field("Repository on your machine", repo),
+      h("fieldset", { class: "topic-request-picker" }, h("legend", null, "Requests to move · one feature per message"), messages.map(message =>
+        h("label", null, h("input", { type: "checkbox", checked: selected.has(message.id), onchange: event => {
+          if (event.target.checked) selected.add(message.id); else selected.delete(message.id);
+        } }), h("span", null, message.content)))),
+      h("div", { class: "topic-form-grid" }, field("Build with", builder), field("Builder model (optional)", builderModel), field("Review with", reviewer), field("Reviewer model (optional)", reviewerModel)),
+      h("p", { class: "muted" }, "Uses the official harnesses installed on your machine. Review the proposal before anything moves or starts."));
+    const topic = await ask({ title: "Create a topic for focused work", text: "Everyday conversation stays in Main Chat. Pick the requests and workflow for this topic.", body, ok: "Review proposal",
+      saveRequest: () => {
+        if (channel !== S.channel || source !== S.current) throw new Error("This conversation changed. Close and create a fresh proposal.");
+        if (!selected.size) throw new Error("Select at least one request to move.");
+        return { type: "propose_topic", proposal: { source_session_id: source, message_ids: messages.filter(message => selected.has(message.id)).map(message => message.id),
+          name: recordValue(name, "Enter a topic name."), repo: recordValue(repo, "Enter the repository path on your machine."), builder: builder.value, builder_model: builderModel.value.trim() || null,
+          reviewer: reviewer.value, reviewer_model: reviewerModel.value.trim() || null } };
+      } });
+    if (!topic || channel !== S.channel) return;
+    prefs.set("topicWorkflow", { repo: repo.value.trim(), builder: builder.value, builder_model: builderModel.value.trim(), reviewer: reviewer.value, reviewer_model: reviewerModel.value.trim() });
+    storeTopic(topic);
+    await openTopic(topic);
   }
 
   function renderSearch(hits, query) {
@@ -3284,6 +3592,7 @@
   }
 
   async function setSessionModel(model, effort) {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     if (!S.current) return toast("No current session.", true);
     const req = { type: "set_session_model", id: S.current, model };
     if (effort !== undefined) req.reasoning_effort = effort;
@@ -3338,6 +3647,7 @@
   }
   let modelPickerSequence = 0;
   async function openModelPicker(onPick) {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
     const model = storedSessionModel(session);
@@ -3561,11 +3871,14 @@
       const f = c.function || {};
       items.push(item("Copy " + (f.name || "tool") + " input", () => copy(f.arguments || "", "the input")));
     }
-    if (m.role === "user" && !isRunning()) {
+    if (m.role === "user" && S.topicsAvailable && !currentTopicAttempt()) {
+      items.push(item("Move to topic…", () => proposeTopic(m.id)));
+    }
+    if (m.role === "user" && !isRunning() && !currentTopicAttempt()) {
       const last = [...S.messages].reverse().find((x) => x.role === "user") === m;
       items.push(item(last ? "Edit & re-run" : "Edit & re-run (drops the later turns)", () => beginEdit(m)));
     }
-    items.push(item("Fork from here", async () => {
+    if (!currentTopicAttempt()) items.push(item("Fork from here", async () => {
       const s = await act({ type: "fork_session", id: S.current, name: null, up_to_seq: m.seq }, "Forked from this message");
       if (s && s.id) { S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)]; await openSession(s.id); }
     }));
@@ -3677,7 +3990,7 @@
           turn.when = when;
           turn.timeContext = timeContext;
         }
-        const editable = msg && msg === lastUser && !isRunning();
+        const editable = msg && msg === lastUser && !isRunning() && !(S.topicsAvailable && currentTopicAttempt());
         if (editable && !turn.edit) {
           const entry = turn;
           turn.edit = h("button", { class: "btn ghost small edit", type: "button", title: "Edit and re-run (/edit)", onclick: () => beginEdit(entry.message) }, "Edit");
@@ -3723,7 +4036,8 @@
       }
       for (const [key, entry] of historyRender.turns) {
         if (!active.has(key)) { entry.el.remove(); historyRender.turns.delete(key); continue; }
-        const answerHere = lastAnswer && entry.items.includes(rendered.get(lastAnswer.id)) && !isRunning();
+        const answerHere = lastAnswer && entry.items.includes(rendered.get(lastAnswer.id)) && !isRunning()
+          && !(S.topicsAvailable && currentTopicAttempt());
         if (answerHere) {
           const decorationKey = JSON.stringify([S.recap, S.rated, lastAnswer.id]);
           if (!entry.decorations) entry.decorations = h("div", { class: "turn-actions" });
@@ -3748,6 +4062,7 @@
     return { session: S.current, sequence: sessionSeq, run: S.liveRun?.id || null };
   }
   function ensureRunTarget(target) {
+    if (S.topicsAvailable && currentTopicAttempt()) return false;
     if (target.session && target.session === S.current
         && target.sequence === sessionSeq && target.run === (S.liveRun?.id || null)) return true;
     note("The Session or latest Run changed. Open the action again.", true);
@@ -3796,6 +4111,7 @@
   }
 
   async function resumeRun() {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     const sid = S.current;
     if (!sid) return;
     if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
@@ -4696,7 +5012,7 @@
     clearTimeout(forecastTimer);
     renderForecastPreview(null);
     const draft = $("input").value.trim();
-    if (!S.daemonOnline || !S.current || !draft || draft.startsWith("/") || isRunning()) return;
+    if (!S.daemonOnline || !S.current || !draft || draft.startsWith("/") || isRunning() || currentTopicAttempt()) return;
     const sid = S.current;
     forecastTimer = setTimeout(async () => {
       try {
@@ -4765,7 +5081,21 @@
         h("button", { class: "btn ghost small", type: "button", onclick: cancelEdit }, "Cancel"));
     } else mode.classList.add("hidden");
     const s = S.sessions.find((x) => x.id === S.current);
-    $("session-title").textContent = s ? s.name : "No session";
+    const attempt = currentTopicAttempt(), topic = topicForSession();
+    $("session-title").textContent = attempt ? harnessLabel(attempt.harness || (attempt.role === "build" ? topic.builder : topic.reviewer)) + " · " + (attempt.role === "build" ? "Build" : "Review")
+      : topic ? topic.name : S.current === S.mainChat?.id ? "Main Chat" : s ? s.name : "No session";
+    $("input").disabled = !!attempt;
+    $("send-btn").disabled = !!attempt;
+    $("attach-btn").disabled = !!attempt;
+    $("fork-btn").disabled = !!attempt;
+    $("status-model").disabled = !!attempt;
+    $("propose-topic").hidden = !S.topicsAvailable || !S.current || !!attempt;
+    if (attempt) {
+      $("input").placeholder = "Read-only harness transcript · continue in the topic chat";
+      $("stop-btn").hidden = true;
+      $("compose-hint").textContent = "Formless manages this harness conversation and its handoffs.";
+    }
+    renderTopicContext();
     $("show-thinking").checked = S.showThinking;
   }
 
@@ -7366,6 +7696,7 @@
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
   async function openSession(id, stay) {
+    S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
     cancelEventRender();
     resetReadingSession(id);
@@ -7594,6 +7925,7 @@
     if (i >= 0) S.sessions[i] = r;
   }
   async function forkSession(id) {
+    if (S.topicsAvailable && id === S.current && currentTopicAttempt()) return;
     if (!id) return;
     const s = await act({ type: "fork_session", id, name: null, up_to_seq: null }, "Forked session");
     if (s && s.id) { S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)]; await openSession(s.id); }
@@ -7659,6 +7991,7 @@
   }
 
   function beginEdit(msg) {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     S.editMessageId = msg.id;
     $("input").value = msg.content;
     autosize();
@@ -8052,6 +8385,7 @@
 
   const attachmentDrafts = {};
   async function submit(queued) {
+    if (currentTopicAttempt()) return;
     const input = $("input");
     const text = input.value.trim();
     if (!text) return;
@@ -8136,6 +8470,7 @@
     if (r && mode === "steer") note("steering the current run");
   }
   function stop() {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     if (S.current && isRunning()) act({ type: "interrupt_run", session_id: S.current });
   }
   let searchSeq = 0;
@@ -8675,11 +9010,12 @@
   async function loadAll() {
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
+    await refreshTopics(true);
     const saved = prefs.get("session", null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
     if (S.linkedSession && !linked) note("That Session link points to a Session that no longer exists.", true);
     S.linkedSession = null;
-    const target = linked || S.sessions.find((s) => s.id === S.current) || S.sessions.find((s) => s.id === saved) || S.sessions[0];
+    const target = linked || S.sessions.find((s) => s.id === S.current) || S.sessions.find((s) => s.id === saved) || S.mainChat || S.sessions[0];
     if (target) await openSession(target.id, true);
     else renderAll();
     if (S.view !== "chat") setView(S.view);
@@ -9037,6 +9373,7 @@
   $("new-session").onclick = pickNewSession;
   $("import-session").onclick = importSession;
   $("fork-btn").onclick = () => forkSession(S.current);
+  $("propose-topic").onclick = () => proposeTopic();
   $("export-session").onclick = () => pickExport(S.current);
   $("show-thinking").onchange = (e) => setThinking(e.target.checked);
   $("search-form").addEventListener("submit", (e) => { e.preventDefault(); search($("search").value); });
@@ -9108,6 +9445,7 @@
     }
   }
   async function attachFiles(files) {
+    if (currentTopicAttempt()) return;
     const sid = S.current;
     if (!sid) { note("Open a session first", true); return; }
     for (const file of files) {
@@ -9291,6 +9629,11 @@
   }, 1000);
   // Update relative times without replacing the Session controls.
   setInterval(updateSessionTimes, 60000);
+  // Topic execution is independent of the open chat. Poll the small topic
+  // index even while Main Chat is open; never subscribe to every transcript.
+  setInterval(() => {
+    if (!S.topicsUnsupported && S.daemonOnline && !document.hidden && S.view === "chat" && !S.topicBusy) refreshTopicView();
+  }, 4000);
 
   // A new `formless web` link pasted into an open tab only changes the
   // fragment: sign in with it instead of ignoring it.

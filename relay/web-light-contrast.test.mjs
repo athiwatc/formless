@@ -71,13 +71,14 @@ test('shared brand, status and dark tokens are unchanged', () => {
   assert.equal(dark['--accent-strong'], undefined, 'dark keeps its accent via the var() fallback');
 });
 
-test('only enabled primary buttons and the current tab use the strong accent', () => {
+test('primary controls and topic navigation/status use the strong accent', () => {
   assert.deepEqual(rule('.btn.primary'), { background: 'var(--accent)', color: 'var(--accent-ink)', 'border-color': 'transparent' });
   assert.deepEqual(rule('.btn:disabled'), { opacity: '.45', cursor: 'default' });
   assert.deepEqual(rule('.btn.primary:not(:disabled)'), { background: 'var(--accent-strong, var(--accent))' });
   assert.deepEqual(rule('.tabs button[aria-current="page"]'), { color: 'var(--accent-strong, var(--accent))', background: 'var(--accent-soft)' });
   const uses = [...top, ...media.flatMap(m => m.rules)].filter(r => r.body.includes('var(--accent-strong'));
-  assert.deepEqual(uses.flatMap(r => r.selectors).sort(), ['.btn.primary:not(:disabled)', '.tabs button[aria-current="page"]']);
+  assert.deepEqual(uses.flatMap(r => r.selectors).sort(), ['.btn.primary:not(:disabled)', '.tabs button[aria-current="page"]',
+    '.topic-badge.topic-state-complete', '.topic-badge.topic-state-passed', '.topic-badge.topic-state-ready', '.topic-chat-link.active', '.topic-icon']);
   // Same specificity as .tabs button:hover, later in the sheet: a hovered current tab keeps its colours.
   assert.ok(css.indexOf('.tabs button[aria-current="page"]') > css.indexOf('.tabs button:hover'));
 });
