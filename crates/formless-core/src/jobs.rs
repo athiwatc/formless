@@ -479,20 +479,13 @@ pub async fn deliver(
 
 fn notify(title: &str, body: &str) -> std::result::Result<(), String> {
     #[cfg(target_os = "macos")]
-    let (cmd, args) = {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        (
-            "osascript",
-            vec![
-                "-e".to_string(),
-                format!(
-                    "display notification \"{}\" with title \"{}\"",
-                    esc(body),
-                    esc(title)
-                ),
-            ],
-        )
-    };
+    let (cmd, args) = (
+        "osascript",
+        vec![
+            "-e".to_string(),
+            formless_runtime::macos_notification_script(title, body),
+        ],
+    );
     #[cfg(all(unix, not(target_os = "macos")))]
     let (cmd, args) = ("notify-send", vec![title.to_string(), body.to_string()]);
     #[cfg(not(unix))]
