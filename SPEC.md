@@ -7057,8 +7057,9 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
-actionable adapter-not-integrated step results.
+another harness. Muse Code uses its interactive session protocol and requires
+one-run workspace trust from the user. Pi, OpenCode, Antigravity and ACP
+currently return actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7067,7 +7068,7 @@ topics become NeedsUser, with durable detail and no automatic restart.
 
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
-CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
