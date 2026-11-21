@@ -320,8 +320,17 @@ impl Directory {
     pub fn event(&mut self, event: &Event) {
         self.changed();
         match event {
-            Event::UserQuestionClosed { question_id } => self.close(question_id),
-            Event::HarnessPermissionClosed { permission_id, .. } => self.close(permission_id),
+            Event::UserQuestionClosed { question_id, .. } => self.close(question_id),
+            Event::HarnessPermissionClosed {
+                permission_id, by, ..
+            } => {
+                self.close(permission_id);
+                if let Some(rule) = by.as_deref().and_then(|by| by.strip_prefix("rule:")) {
+                    self.notice = Some(format!(
+                        "Permission decided by your saved topic rule {rule}."
+                    ));
+                }
+            }
             Event::UserQuestion { question_id, .. }
             | Event::HarnessPermissionRequested {
                 permission_id: question_id,
@@ -526,6 +535,25 @@ mod tests {
         assert!(directory.get("native-permission").is_none());
         assert!(directory.get("q").is_some());
     }
+    #[test]
+    fn saved_rule_permission_closure_is_identified_without_reviving_the_prompt() {
+        let mut directory = Directory::default();
+        directory.event(&crate::fixture::harness_permission("codex-chat"));
+        directory.event(&Event::HarnessPermissionClosed {
+            permission_id: "native-permission".into(),
+            option_id: Some("allow-once-id".into()),
+            by: Some("rule:tests-in-this-topic".into()),
+        });
+        assert!(directory.get("native-permission").is_none());
+        assert!(directory
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("saved topic rule tests-in-this-topic"));
+        directory.event(&crate::fixture::harness_permission("codex-chat"));
+        assert!(directory.get("native-permission").is_none());
+    }
+
     #[test]
     fn a_late_session_snapshot_cannot_erase_replayed_permissions() {
         let mut directory = Directory::default();

@@ -104,6 +104,11 @@ fn harness_permissions_have_no_default_or_text_grant_and_exact_allow_or_explicit
                     .value()
                     .unwrap()
                     .contains("only to this attempt"));
+                assert!(window
+                    .find("question-position")
+                    .value()
+                    .unwrap()
+                    .contains("Only you set saved topic rules"));
                 let origin = window.find("question-session").value().unwrap().to_string();
                 assert!(
                     origin.contains("Codex")
