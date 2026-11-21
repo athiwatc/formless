@@ -350,6 +350,8 @@ impl Fixture {
                         }
                         Request::SessionUsage { .. } => session_usage_report(),
                         Request::ContextUsage { .. } => session_context_report(),
+                        Request::ListMemories => json!([memory_note_for_display()]),
+                        Request::UpsertMemory { .. } => memory_note_for_display(),
                         Request::ListSubagents { session_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!([
@@ -2315,6 +2317,40 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+#[test]
+fn human_memory_list_add_and_edit_escape_stored_controls() {
+    let fixture = Fixture::new();
+    for args in [
+        &["memory", "list"][..],
+        &["memory", "add", "fixture"],
+        &["memory", "edit", "memory-fixture", "--disable"],
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains("off") && text.contains("note\\u{d}\\u{1b}\\u{9b}\\u{202e}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("project:/fixture\\u{202e}") && text.contains("from session ไทย"),
+            "{text}"
+        );
+        assert!(!text.contains(['\r', '\u{1b}', '\u{9b}', '\u{202e}']));
+    }
+    let output = fixture.run(&["memory", "list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([memory_note_for_display()])
+    );
+}
+
+fn memory_note_for_display() -> Value {
+    json!({"id":"memory-fixture","enabled":false,"scope":"project:/fixture\u{202e}","text":"note\r\u{1b}\u{9b}\u{202e}","session_id":"ไทยabcdef","author":"agent"})
 }
 
 #[test]

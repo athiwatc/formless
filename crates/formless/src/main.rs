@@ -7635,15 +7635,19 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
         formless_tui::client::request_once(&paths, req)
     };
     let show = |m: &serde_json::Value| {
+        let field = |key: &str| comparison_terminal_text(m[key].as_str().unwrap_or_default());
         println!(
             "{:<10} {:<8} {:<20} {}{}",
-            m["id"].as_str().unwrap_or_default(),
+            field("id"),
             if m["enabled"] == true { "on" } else { "off" },
-            m["scope"].as_str().unwrap_or_default(),
-            m["text"].as_str().unwrap_or_default(),
+            field("scope"),
+            field("text"),
             match m["session_id"].as_str() {
-                Some(s) => format!("  (from session {})", &s[..s.len().min(8)]),
-                None => format!("  ({})", m["author"].as_str().unwrap_or_default()),
+                Some(s) => format!(
+                    "  (from session {})",
+                    comparison_terminal_text(&s.chars().take(8).collect::<String>())
+                ),
+                None => format!("  ({})", field("author")),
             }
         )
     };
