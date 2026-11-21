@@ -155,7 +155,7 @@ impl PermissionHandler for Interactions<'_> {
         let permission = HarnessPermissionRequest {
             title: text("title"),
             kind: text("kind"),
-            raw_input: request.tool_call.get("rawInput").cloned(),
+            raw_input: permission_raw_input(request.tool_call),
             options,
         };
         self.runtime
@@ -177,6 +177,22 @@ impl PermissionHandler for Interactions<'_> {
             .block_on(self.handler.ask_question(questions, cancel))?;
         serde_json::to_value(answers).ok()
     }
+}
+
+/// The tool call's `rawInput`, with any vendor `_meta` kept under `_meta`; a non-object
+/// input is wrapped as `{"input": ...}` so the metadata has somewhere to go.
+fn permission_raw_input(tool_call: &Value) -> Option<Value> {
+    let input = tool_call.get("rawInput").cloned();
+    let Some(meta) = tool_call.get("_meta").cloned() else {
+        return input;
+    };
+    let mut raw = match input {
+        Some(Value::Object(object)) => object,
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(other) => serde_json::Map::from_iter([("input".to_owned(), other)]),
+    };
+    raw.insert("_meta".into(), meta);
+    Some(Value::Object(raw))
 }
 
 /// Maps an ACP `session/update` payload to the daemon's live update, when it has one.
@@ -1239,6 +1255,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot start a write session"));
+    }
+
+    #[test]
+    fn permission_raw_input_keeps_vendor_meta() {
+        let meta = json!({"x.ai/tool": {"read_only": false}});
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": {"a": 1}, "_meta": meta})),
+            Some(json!({"a": 1, "_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": "ls", "_meta": meta})),
+            Some(json!({"input": "ls", "_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"_meta": meta})),
+            Some(json!({"_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": [1]})),
+            Some(json!([1]))
+        );
+        assert_eq!(permission_raw_input(&json!({})), None);
     }
 
     #[test]
