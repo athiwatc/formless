@@ -46,7 +46,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Require a fresh job-local Cargo home and target
@@ -155,7 +155,7 @@ jobs:
         run: |
           test ! -L "$GITHUB_WORKSPACE"
           echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Record source, image and cold state
@@ -240,7 +240,7 @@ jobs:
             dpkg -I dist/*.deb | sed -n '/Depends/p'
           }
       - name: Transfer fixtures only to this run's install jobs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: baseline-linux
           retention-days: 1
@@ -378,7 +378,7 @@ jobs:
       DOCKER_BUILD_RECORD_UPLOAD: "false"
       DOCKER_BUILD_SUMMARY: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Isolate Docker client configuration
@@ -465,7 +465,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Require and record cold source state
