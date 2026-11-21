@@ -9,10 +9,11 @@ Unknown versions and prereleases fail closed.
 
 `local_harness::grok` supplies `program`, `args`, `environment`, `check_agent`,
 `AUTH_HINT`, and `READ_ONLY_MODE`, wired into `grok::SPEC: acp::AgentSpec`.
-Its final registry location is `local_harness/acp/`, agent id `grok`.
-It is not wired into `HarnessKind` or command/result dispatch and cannot yet
-run a topic step. No Grok-specific ACP transport or permission engine is
-duplicated here. `grok::run` delegates directly to shared `acp::run`.
+The hand-written spec is registered in `local_harness/acp_agents.rs` as `grok`.
+Topic steps select it with `HarnessKind::Acp` and `acp_agent: "grok"`; core's
+interactive wire dispatch resolves this registry entry. No Grok-specific ACP
+transport or permission engine is duplicated here. `grok::run` delegates directly
+to shared `acp::run`.
 `SPEC.set_env` forces `GROK_DISABLE_AUTOUPDATER=1` after user overrides.
 `StepAccess::ReadOnly` selects the read-only sandbox and plan mode; write steps
 use `StepAccess::Write`. Access is independent of the harness selection.
@@ -114,8 +115,10 @@ No other non-standard client request was observed in these probes.
 
 Unit fixtures validate launch/access flags, environment handling, and captured
 ACP initialization metadata, including empty and invalid responses. They
-exercise `grok::SPEC` through the shared ACP driver. Question fixtures
-also cover supplied user answers, multi-select/free text, decline, cancellation,
+resolve the `grok` registry selector and exercise its spec through the shared ACP
+driver, including read-only `session/set_mode` fallback when Grok advertises no
+mode config option. Question fixtures cover supplied user answers,
+multi-select/free text, decline, cancellation,
 unknown methods, and malformed request/answer rejection.
 
 ```sh

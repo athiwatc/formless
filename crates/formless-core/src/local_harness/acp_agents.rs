@@ -57,12 +57,13 @@ macro_rules! agents {
         };)*
 
         pub fn agent_ids() -> &'static [&'static str] {
-            &[$($id),*]
+            &[$($id,)* "grok"]
         }
 
         pub fn spec(id: &str) -> Option<&'static AgentSpec> {
             match id {
                 $($id => Some(&$symbol),)*
+                "grok" => Some(&super::grok::SPEC),
                 _ => None,
             }
         }

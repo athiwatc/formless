@@ -63,7 +63,7 @@ without redesign.
   `_x.ai/ask_user_question` requests translate to the same user question types as
   the Formless bridge, with explicit accepted/cancelled replies. Questions may
   also use bridge `AskUser` or a turn-end message. The profile uses shared ACP
-  dispatch without registry or topic-enum wiring; see
+  dispatch, selected as harness `acp` with `acp_agent: "grok"`; see
   `docs/grok-adapter.md` for the current integration boundary and live evidence.
 
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).

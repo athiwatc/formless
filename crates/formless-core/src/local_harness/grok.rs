@@ -21,6 +21,7 @@ pub const SPEC: AgentSpec = AgentSpec {
     args: |request| args(request).into_iter().map(OsString::from).collect(),
     check_agent,
     not_signed_in: AUTH_HINT,
+    auth_error_codes: &[-32000],
     read_only_modes: &[READ_ONLY_MODE],
     read_only_fail_closed: true,
     write_modes: &[],
@@ -213,8 +214,12 @@ mod tests {
             .join("\n")
             + "\n";
         let mut written = Vec::new();
+        crate::local_harness::validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())
+            .unwrap();
+        let spec =
+            crate::local_harness::acp_agents::spec(request.acp_agent.as_deref().unwrap()).unwrap();
         let result = acp::drive(
-            &SPEC,
+            spec,
             Cursor::new(input),
             &mut written,
             &request,
@@ -468,6 +473,18 @@ mod tests {
     #[test]
     fn launch_hooks_are_access_scoped_and_keep_credentials_out_of_argv() {
         let mut request = request(StepAccess::Write);
+        assert!(crate::local_harness::acp_agents::agent_ids().contains(&"grok"));
+        let spec = crate::local_harness::acp_agents::spec("grok").unwrap();
+        assert_eq!(spec.program, "grok");
+        assert_eq!(spec.auth_error_codes, &[-32000]);
+        assert_eq!(spec.set_env, &[("GROK_DISABLE_AUTOUPDATER", "1")]);
+        assert_eq!(
+            (spec.args)(&request),
+            args(&request)
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
         request.environment.extend([
             ("XAI_API_KEY".into(), "fixture-key".into()),
             ("GROK_HOME".into(), "/private/grok".into()),
