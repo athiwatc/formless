@@ -1051,7 +1051,7 @@ task, with quality as a gate**.
   the next step boundary without killing in-flight work. **Ctrl+Enter =
   queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
-  `GetSession` lists them (`queued` texts, and `queued_items` with ids).
+  `GetSession` lists them (`queued` texts, and `queued_items` with ids and revisions).
   When idle, Enter simply starts a new Run. Steering extends the Run only
   when its message sequence is newer than the transcript boundary included
   in the actual provider request. A steer already included after a Tool
@@ -1066,10 +1066,12 @@ task, with quality as a gate**.
   removed, reordered). The TUI lists queued messages at the end of the
   chat with `/queue edit|rm|up|down N`; `/queue edit N` loads one into
   the input (`queued ›`), Enter saves, Esc cancels. The web lists them
-  above the composer with edit, ↑/↓ and remove buttons. Requests:
-  `EditQueued {session_id, id, content?}` (no content removes it) and
-  `MoveQueued {session_id, id, up}`. Editing a message that was already
-  sent fails with "no longer queued".
+  above the composer with edit, ↑/↓ and remove buttons. Reordering updates
+  both positions in one transaction and preserves each message ID and text.
+  Editors send the revision they opened with `EditQueuedIfCurrent`.
+  A reorder, edit or removal that intervenes causes a conflict. Removing a
+  message uses `EditQueued` without content. Clients without revisions can
+  still remove messages. `MoveQueued` returns the same message ID when it moves.
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
   recorded as user-cancelled, §8.2). `Ctrl+C` clears a typed message, and a second `Ctrl+C` within 2 s detaches the TUI client only.
 

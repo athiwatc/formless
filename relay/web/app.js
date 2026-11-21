@@ -4015,19 +4015,21 @@
         btn("✕", "Remove", () => act({ type: "edit_queued", session_id: sid, id: m.id, content: null }))))));
   }
   function editQueuedMessage(sid, item) {
+    if (!Number.isSafeInteger(item.revision)) return toast("Update the daemon to edit queued messages safely.", true);
     const sequence = sessionSeq;
+    const revision = item.revision;
     const input = h("textarea", { rows: 6, "aria-label": "Queued message" });
     input.value = item.content;
     const initial = input.value;
     return ask({
       title: "Edit the queued message", body: h("div", null, input), ok: "Save",
       saveRequest: () => {
-        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.content === item.content)) {
+        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.revision === revision)) {
           note("The queued message changed. Open it again.", true);
           return null;
         }
         if (!input.value.trim()) throw Object.assign(new Error("Enter a nonempty message."), { field: input });
-        return { type: "edit_queued", session_id: sid, id: item.id, content: input.value === initial ? item.content : input.value };
+        return { type: "edit_queued_if_current", session_id: sid, id: item.id, revision, content: input.value === initial ? item.content : input.value };
       },
     });
   }

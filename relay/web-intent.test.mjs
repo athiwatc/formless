@@ -40,6 +40,33 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('queued edits submit the revision opened by the editor', () => {
+  const notices = [];
+  let rendered, dialog, input;
+  const c = setup(['renderQueue', 'editQueuedMessage'], {
+    sessionSeq: 1,
+    tr: text => text, h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+    toast: notice => notices.push(notice), note: notice => notices.push(notice),
+    ask: options => { dialog = options; input = options.body.children[0]; },
+  });
+  c.$('queue').replaceChildren = (...tree) => { rendered = tree; };
+  const edit = () => rendered[1].children[0][0].children.find(node => node?.attrs?.title === 'Edit').attrs.onclick();
+  c.S.queued = [{ id: 7, revision: 12, content: 'original' }];
+  c.renderQueue();
+  edit();
+  input.value = 'my edit';
+  assert.deepEqual({ ...dialog.saveRequest() }, { type: 'edit_queued_if_current', session_id: 'A', id: 7, revision: 12, content: 'my edit' });
+  input.value = ' ';
+  assert.throws(() => dialog.saveRequest(), /nonempty/);
+  input.value = 'my edit';
+  c.S.queued = [{ id: 7, revision: 13, content: 'original' }];
+  assert.equal(dialog.saveRequest(), null);
+  assert.match(notices.pop(), /changed/);
+  c.S.queued = [{ id: 7, content: 'legacy' }];
+  c.renderQueue();
+  edit();
+  assert.match(notices.pop(), /Update the daemon/);
+});
 test('wrapped file mentions attach and highlight the same paths without matching email addresses', () => {
   const c = setup(['mentionMatches', 'mentionsIn', 'withMentions', 'mentionAtCaret'], {
     h: (tag, attrs, text) => ({ tag, attrs, text }),
