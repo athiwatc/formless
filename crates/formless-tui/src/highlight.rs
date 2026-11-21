@@ -518,6 +518,7 @@ pub(crate) struct Highlighter {
     mysql_comments: bool,
     php_comments: bool,
     json5_strings: bool,
+    shell_literal_quotes: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -655,6 +656,10 @@ impl Highlighter {
             mysql_comments: name == "mysql",
             php_comments: name == "php",
             json5_strings: name == "json5",
+            shell_literal_quotes: matches!(
+                name.as_str(),
+                "sh" | "bash" | "zsh" | "shell" | "console"
+            ),
             color,
             in_block: 0,
             in_str: None,
@@ -979,13 +984,12 @@ impl Highlighter {
                 continue;
             }
             if l.quotes.contains(&c) {
+                // Shell $'…' strings interpret escapes. Ordinary single quotes do not.
+                let literal = c == '\''
+                    && (toml || (self.shell_literal_quotes && (i == 0 || chars[i - 1] != '$')));
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
-                    j += if chars[j] == '\\' && !(toml && c == '\'') {
-                        2
-                    } else {
-                        1
-                    };
+                    j += if !literal && chars[j] == '\\' { 2 } else { 1 };
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
@@ -1831,6 +1835,29 @@ mod tests {
                     "{lang}: {source}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn shell_quotes_keep_literal_backslashes_and_supported_escapes() {
+        fn check(lang: &str, input: &str, quoted: &str) {
+            let spans = toks(lang, input);
+            assert!(
+                spans.contains(&(quoted.to_owned(), Some(Color::Green))),
+                "{lang}: {spans:?}"
+            );
+            assert!(
+                spans.contains(&("if".into(), Some(Color::Magenta))),
+                "{lang}: {spans:?}"
+            );
+        }
+        for lang in ["sh", "Bash", "zsh", "shell", "console"] {
+            check(lang, r"echo 'path\'; if true; then echo hi; fi", r"'path\'");
+            check(lang, r#"echo "say \"hi\""; if true"#, r#""say \"hi\"""#);
+            check(lang, r"echo $'it\'s'; if true", r"'it\'s'");
+        }
+        for lang in ["fish", "ruby", "perl"] {
+            check(lang, r"echo 'it\'s'; if true", r"'it\'s'");
         }
     }
 

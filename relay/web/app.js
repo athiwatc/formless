@@ -1724,6 +1724,7 @@
     if (!L) return null;
     const toml = lang === "toml";
     const php = L === HL.php;
+    const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
     const out = [];
     let plain = "";
     const powershell = L === HL.powershell;
@@ -1810,7 +1811,7 @@
       if (L.q.includes(c)) {
         const multiline = toml && code.startsWith(c.repeat(3), i);
         const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = !(toml && c === "'" || L.mysqlComments && c === "`");
+        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
         let j = i + delimiter.length;
         while (j < code.length && !code.startsWith(delimiter, j) &&
             (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
