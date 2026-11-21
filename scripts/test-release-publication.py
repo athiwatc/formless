@@ -132,7 +132,7 @@ class ReleasePublication(unittest.TestCase):
 
     def test_prerelease_binary_packages_use_versions_that_sort_before_stable(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        packages = workflow.split("      - name: Packages\n", 1)[1].split("      - uses:", 1)[0]
+        packages = re.split(r"(?m)^      - ", workflow.split("      - name: Packages\n", 1)[1], maxsplit=1)[0]
         run = dedent(packages.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
