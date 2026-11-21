@@ -1931,6 +1931,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const kotlin = lang === "kotlin" || lang === "kt";
     const toml = lang === "toml";
     const php = L === HL.php;
     const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
@@ -2037,6 +2038,21 @@
         i = stop;
         continue;
       }
+      const prevWord = i > 0 && word.test(code[i - 1]);
+      if (L === HL.rust && !prevWord &&
+          (c === "r" || ((c === "b" || c === "c") && code[i + 1] === "r"))) {
+        const prefixEnd = i + (c === "r" ? 1 : 2);
+        let opener = prefixEnd;
+        while (code[opener] === "#") opener++;
+        if (code[opener] === '"') {
+          const delimiter = '"' + code.slice(prefixEnd, opener);
+          const end = code.indexOf(delimiter, opener + 1);
+          const stop = end < 0 ? code.length : end + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
       if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
         const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
         if (opener) {
@@ -2049,17 +2065,21 @@
         }
       }
       if (L.q.includes(c)) {
-        const multiline = toml && code.startsWith(c.repeat(3), i);
-        const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
+        const triple = (toml || L === HL.py || (c === '"' && (lang === "java" || kotlin))) &&
+          code.startsWith(c.repeat(3), i);
+        const delimiter = triple ? c.repeat(3) : c;
+        const multiline = triple || c === "`" || L.mysqlComments;
+        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) &&
+          !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$")) &&
+          !(L.mysqlComments && c === "`");
         let j = i + delimiter.length;
-        while (j < code.length && !code.startsWith(delimiter, j) &&
-            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
-          j += code[j] === "\\" && escapes ? 2 : 1;
+        while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
+          j += escapes && code[j] === "\\" ? 2 : 1;
         }
         let stop = Math.min(j + delimiter.length, code.length);
-        // Include up to two quotes immediately before the TOML closing delimiter.
-        if (multiline) {
+        // Kotlin includes any content quotes adjacent to the raw closer.
+        if (kotlin && triple) while (code[stop] === '"') stop++;
+        if (toml && triple) {
           const trailing = stop + 2;
           while (stop < trailing && code[stop] === c) stop++;
         }
@@ -2067,11 +2087,13 @@
         i = stop;
         continue;
       }
-      const prevWord = i > 0 && word.test(code[i - 1]);
       if (/\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
-        tok("tok-num", m[0]);
-        i += m[0].length;
+        // A raw literal can start immediately after a Rust range operator.
+        const range = L === HL.rust ? m[0].indexOf("..") : -1;
+        const number = range < 0 ? m[0] : m[0].slice(0, range);
+        tok("tok-num", number);
+        i += number.length;
         continue;
       }
       if (L.tags && c === "<") {
