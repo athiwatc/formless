@@ -2883,9 +2883,11 @@ fn upgrade_command_for_exe(exe: &str) -> &'static str {
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh";
 const INSTALL_COMMAND: &str = concat!(
+    "sh -c 'install_tmp=$(mktemp -d \"${TMPDIR:-/tmp}/formless-install.XXXXXXXXXX\") || exit; ",
+    "cleanup() { rm -f \"$install_tmp/install.sh\"; rmdir \"$install_tmp\"; }; trap cleanup EXIT; ",
     "curl -fsSL ",
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
-    " -o /tmp/formless-install.sh && sh /tmp/formless-install.sh"
+    " -o \"$install_tmp/install.sh\" && sh \"$install_tmp/install.sh\"'"
 );
 
 /// `formless update`: what's newer than this build and what changed in
@@ -10306,6 +10308,64 @@ mod tests {
             !cmd.contains("| sh"),
             "a failed download must not be piped into sh: {cmd}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upgrade_download_uses_a_private_temporary_path_and_runs_only_on_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fl-install-{}-{stamp}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let tools = root.join("bin");
+        let temporary = root.join("temporary downloads");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&temporary).unwrap();
+        let fake_curl = tools.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+while [ "$#" -gt 1 ] && [ "$1" != "-o" ]; do shift; done
+[ "$1" = "-o" ] || exit 2
+printf '%s\n' "$2" > "$FORMLESS_FIXTURE_INSTALL_TARGET"
+printf '%s\n' 'printf "ran\n" > "$FORMLESS_FIXTURE_INSTALL_MARKER"' > "$2"
+exit "$FORMLESS_FIXTURE_CURL_STATUS"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths([tools, "/usr/bin".into(), "/bin".into()]).unwrap();
+        let target = root.join("target");
+        let marker = root.join("executed");
+        let mut downloads = Vec::new();
+        for (curl_status, installed) in [("19", false), ("0", true)] {
+            let result = std::process::Command::new("sh")
+                .args(["-c", super::INSTALL_COMMAND])
+                .env("PATH", &path)
+                .env("TMPDIR", &temporary)
+                .env("FORMLESS_FIXTURE_INSTALL_TARGET", &target)
+                .env("FORMLESS_FIXTURE_INSTALL_MARKER", &marker)
+                .env("FORMLESS_FIXTURE_CURL_STATUS", curl_status)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.success(), installed, "{result:?}");
+            assert_eq!(marker.exists(), installed);
+            let downloaded =
+                std::path::PathBuf::from(std::fs::read_to_string(&target).unwrap().trim());
+            assert!(downloaded.starts_with(&temporary));
+            assert!(!downloaded.parent().unwrap().exists());
+            downloads.push(downloaded);
+        }
+        assert_ne!(downloads[0], downloads[1]);
     }
 
     #[test]
