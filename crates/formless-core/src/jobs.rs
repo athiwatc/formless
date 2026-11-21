@@ -96,37 +96,73 @@ impl Cron {
         })
     }
 
-    fn matches(&self, t: &DateTime<Local>) -> bool {
-        let day = self.dom[t.day() as usize];
-        let wd = self.dow[t.weekday().num_days_from_sunday() as usize];
+    fn matches_date(&self, date: &impl Datelike) -> bool {
+        let day = self.dom[date.day() as usize];
+        let wd = self.dow[date.weekday().num_days_from_sunday() as usize];
         // Cron rule: with both day fields restricted, either may match.
         let day_ok = match (self.dom_any, self.dow_any) {
             (false, false) => day || wd,
             _ => day && wd,
         };
-        self.minute[t.minute() as usize]
-            && self.hour[t.hour() as usize]
-            && self.month[t.month() as usize]
-            && day_ok
+        self.month[date.month() as usize] && day_ok
     }
 
-    /// The first matching minute strictly after `after` (within ~4 years).
+    fn matches(&self, t: &DateTime<Local>) -> bool {
+        self.minute[t.minute() as usize] && self.hour[t.hour() as usize] && self.matches_date(t)
+    }
+
+    /// The first matching local minute strictly after `after`.
     pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
-        let start = after.with_second(0)?.with_nanosecond(0)? + Duration::minutes(1);
-        let mut t = start;
-        for _ in 0..(4 * 366 * 24 * 60) {
-            if self.matches(&t) {
-                return Some(t);
+        let mut t = next_local_minute(&after)?;
+        // Month, day, and weekday patterns repeat over a Gregorian cycle.
+        // An extra UTC date covers the partial day at the start.
+        const SEARCH_DAYS: usize = 146_097 + 1;
+        for _ in 0..SEARCH_DAYS {
+            let utc_date = t.naive_utc().date();
+            let tomorrow = utc_date.succ_opt();
+            // All supported UTC offsets are shorter than a day. If none of
+            // these local dates can match, even a clock change cannot make
+            // this UTC date contain a matching local minute.
+            let possible = [utc_date.pred_opt(), Some(utc_date), tomorrow]
+                .into_iter()
+                .flatten()
+                .any(|date| self.matches_date(&date));
+            if !possible {
+                let midnight = tomorrow?.and_hms_opt(0, 0, 0)?.and_utc();
+                let before = (midnight - Duration::seconds(1)).with_timezone(&Local);
+                t = next_local_minute(&before)?;
+                continue;
             }
-            // Skip whole hours/days that cannot match, minute by minute otherwise.
-            t = if !self.hour[t.hour() as usize] {
-                (t + Duration::hours(1)).with_minute(0)?
-            } else {
-                t + Duration::minutes(1)
-            };
+            while t.naive_utc().date() == utc_date {
+                if self.matches(&t) {
+                    return Some(t);
+                }
+                t = next_local_minute(&t)?;
+            }
         }
         None
     }
+}
+
+// Work from absolute seconds. Rebuilding a wall-clock value would discard
+// both occurrences of a repeated local minute as ambiguous.
+fn next_local_minute(after: &DateTime<Local>) -> Option<DateTime<Local>> {
+    let seconds = i64::from(60 - after.second());
+    let candidate = Local
+        .timestamp_opt(after.timestamp().checked_add(seconds)?, 0)
+        .single()?;
+    if candidate.second() == 0 {
+        return Some(candidate);
+    }
+    // A historical offset change can include seconds. Look for the next
+    // local minute boundary without skipping over it on the new offset.
+    let mut current = Local
+        .timestamp_opt(after.timestamp().checked_add(1)?, 0)
+        .single()?;
+    while current.second() != 0 {
+        current = current.checked_add_signed(Duration::seconds(1))?;
+    }
+    Some(current)
 }
 
 /// When a one-shot job runs: strictly future RFC 3339/local time, or a
@@ -231,11 +267,13 @@ const DAYS: [(&str, u32); 7] = [
     ("friday", 5),
     ("saturday", 6),
 ];
+const MORNING: (u32, u32) = (9, 0);
 
-/// "9am", "9:30 p.m.", "18:30", "noon", "midnight" → (hour, minute).
+/// "9am", "9:30 p.m.", "18:30", "morning", "noon", "midnight" → (hour, minute).
 fn parse_time(t: &str) -> Option<(u32, u32)> {
     let t = t.trim().replace(' ', "").to_ascii_lowercase();
     match t.as_str() {
+        "morning" => return Some(MORNING),
         "noon" | "midday" => return Some((12, 0)),
         "midnight" => return Some((0, 0)),
         _ => {}
@@ -275,7 +313,14 @@ fn natural_to_cron(s: &str) -> Option<Result<String>> {
         None => (lower, None),
     };
     let head = head.strip_prefix("every ").unwrap_or(head).trim();
-    let (h, m) = time.unwrap_or((0, 0));
+    let morning_days = head.strip_suffix(" morning").filter(|_| time.is_none());
+    let head = morning_days.map(str::trim_end).unwrap_or(head);
+    let default = if head == "morning" || morning_days.is_some() {
+        MORNING
+    } else {
+        (0, 0)
+    };
+    let (h, m) = time.unwrap_or(default);
     // Interval schedules: "every 15 minutes", "every 2 hours", "hourly".
     let words: Vec<&str> = head.split_whitespace().collect();
     let interval = |n: u32, unit: &str| {
@@ -309,19 +354,23 @@ fn natural_to_cron(s: &str) -> Option<Result<String>> {
             )))
         }
     };
-    match words.as_slice() {
-        ["hourly"] | ["hour"] => return interval(1, "hour"),
-        ["minute"] => return interval(1, "minute"),
-        ["daily"] | ["day"] | ["night"] | ["morning"] => {
-            let (h, m) = time.unwrap_or(if head == "morning" { (9, 0) } else { (0, 0) });
-            return Some(Ok(format!("{m} {h} * * *")));
+    if morning_days.is_none() {
+        match words.as_slice() {
+            ["hourly"] | ["hour"] => return interval(1, "hour"),
+            ["minute"] => return interval(1, "minute"),
+            ["daily"] | ["day"] | ["night"] | ["morning"] => {
+                return Some(Ok(format!("{m} {h} * * *")));
+            }
+            [n, unit] if n.parse::<u32>().is_ok() => return interval(n.parse().ok()?, unit),
+            ["week"] | ["weekly"] => return Some(Ok(format!("{m} {h} * * 1"))),
+            ["month"] | ["monthly"] => return Some(Ok(format!("{m} {h} 1 * *"))),
+            ["year"] | ["yearly"] | ["annually"] => return Some(Ok(format!("{m} {h} 1 1 *"))),
+            _ => {}
         }
-        [n, unit] if n.parse::<u32>().is_ok() => return interval(n.parse().ok()?, unit),
+    }
+    match words.as_slice() {
         ["weekday"] | ["weekdays"] => return Some(Ok(format!("{m} {h} * * 1-5"))),
         ["weekend"] | ["weekends"] => return Some(Ok(format!("{m} {h} * * 0,6"))),
-        ["week"] | ["weekly"] => return Some(Ok(format!("{m} {h} * * 1"))),
-        ["month"] | ["monthly"] => return Some(Ok(format!("{m} {h} 1 * *"))),
-        ["year"] | ["yearly"] | ["annually"] => return Some(Ok(format!("{m} {h} 1 1 *"))),
         _ => {}
     }
     // Named days: "monday", "monday and friday", "mon, wed, fri".
