@@ -379,6 +379,12 @@ enum Pending {
         topic_id: String,
         feature_id: String,
     },
+    TopicCancel {
+        topic_id: String,
+    },
+    TopicPermission {
+        permission_id: String,
+    },
     ReconnectSession,
     CreateSession,
     ForkSession,
@@ -483,6 +489,8 @@ fn attention_key(event: &Event) -> Option<(u8, &str)> {
         }
         Event::PromotionApprovalRequested { promotion_id, .. }
         | Event::PromotionApprovalResolved { promotion_id } => Some((2, promotion_id)),
+        Event::HarnessPermissionRequested { permission_id, .. }
+        | Event::HarnessPermissionClosed { permission_id, .. } => Some((3, permission_id)),
         _ => None,
     }
 }
@@ -493,6 +501,7 @@ fn attention_request(event: &Event) -> bool {
         Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. }
             | Event::PromotionApprovalRequested { .. }
+            | Event::HarnessPermissionRequested { .. }
     )
 }
 
@@ -2566,6 +2575,12 @@ impl App {
                 self.questions.len()
             ));
         }
+        let permissions = self.topic.clear_permissions();
+        if permissions > 0 {
+            self.notes.push(format!(
+                "{permissions} harness permission request(s) from the old daemon discarded"
+            ));
+        }
         self.approvals.clear();
         self.promotions.clear();
         self.questions.clear();
@@ -3405,7 +3420,9 @@ impl App {
                         | Pending::TopicStart { .. }
                         | Pending::TopicReject { .. }
                         | Pending::TopicRecover { .. }
-                        | Pending::TopicRetry { .. } => {
+                        | Pending::TopicRetry { .. }
+                        | Pending::TopicCancel { .. }
+                        | Pending::TopicPermission { .. } => {
                             unreachable!("topic replies handled above")
                         }
                         Pending::HunkReview { reply, action } => {
@@ -5981,9 +5998,9 @@ impl App {
         match ev {
             // This client keeps legacy Subscribe. Correlated answer frames
             // belong only to explicit future-attempt consumers.
-            Event::TranscriptAttempt { .. }
-            | Event::HarnessPermissionRequested { .. }
-            | Event::HarnessPermissionClosed { .. } => {}
+            Event::TranscriptAttempt { .. } => {}
+            ev @ (Event::HarnessPermissionRequested { .. }
+            | Event::HarnessPermissionClosed { .. }) => self.topic_permission_event(ev),
             Event::TopicChanged { topic_id } => self.topic_changed(topic_id),
             Event::MessageAppended {
                 session_id,
@@ -12363,7 +12380,15 @@ fn draw(f: &mut Frame, app: &mut App) {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
         if let Some(q) = question.filter(|_| palette.is_empty() && modal.is_none()) {
-            draw_question_panel(f, chunks[1], q, !app.input.is_empty(), app.color);
+            let context = app.topic.harness_label_for_session(&q.session_id);
+            draw_question_panel(
+                f,
+                chunks[1],
+                q,
+                context.as_deref(),
+                !app.input.is_empty(),
+                app.color,
+            );
         } else if !palette.is_empty() {
             draw_palette(f, chunks[2], &palette, app.palette_sel, app.color);
         } else if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
@@ -12774,12 +12799,22 @@ fn mention_line(text: &str, color: bool) -> Line<'static> {
 
 /// An open `ask_user` question (SPEC §5.5), at the bottom of the chat
 /// area just above the input.
-fn draw_question_panel(f: &mut Frame, chat: Rect, open: &OpenQuestion, typing: bool, color: bool) {
+fn draw_question_panel(
+    f: &mut Frame,
+    chat: Rect,
+    open: &OpenQuestion,
+    context: Option<&str>,
+    typing: bool,
+    color: bool,
+) {
     let q = open.current();
     let total = open.questions.len();
     let mut title = String::from(" Question");
     if total > 1 {
         title.push_str(&format!(" {}/{total}", open.answers.len() + 1));
+    }
+    if let Some(context) = context {
+        title.push_str(&format!(" · {context}"));
     }
     if let Some(h) = &q.header {
         title.push_str(&format!(" · {h}"));

@@ -73,7 +73,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/sessions` | list and switch Sessions (T toggles lineage tree) |
 | `/main` | open the canonical Main Chat |
 | `/topics` | browse Main Chat and topic conversations |
-| `/topic [ID\|start\|recover\|retry TOPIC FEATURE\|reject TOPIC REASON]` | propose, review, or manage a Topic Chat |
+| `/topic [ID\|start\|cancel\|recover\|retry TOPIC FEATURE\|reject TOPIC REASON]` | propose, review, or manage a Topic Chat |
 | `/fork` | fork the current Session |
 | `/search` | search all Sessions |
 | `/editor` | compose the current buffer in $VISUAL/$EDITOR (also Ctrl+G) |

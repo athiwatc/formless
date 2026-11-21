@@ -1,8 +1,9 @@
 use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use formless_protocol::{
-    HarnessKind, MessageInfo, SessionInfo, TopicAttemptInfo, TopicAttemptStatus,
-    TopicFeatureStatus, TopicInfo, TopicProposalRequest, TopicStatus,
+    HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MessageInfo, SessionInfo,
+    StepAccess, TopicArtifact, TopicAttemptInfo, TopicAttemptStatus, TopicFeatureStatus, TopicInfo,
+    TopicProposalRequest, TopicStatus, TopicStepOutline, WorkspaceKind,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::prelude::*;
@@ -10,7 +11,7 @@ use ratatui::widgets::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-pub const CAPABILITY: &str = "topic_orchestration_v1";
+pub const CAPABILITY: &str = formless_protocol::TOPIC_ORCHESTRATION_FEATURE;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
@@ -38,6 +39,7 @@ pub enum ConfirmedAction {
     Approve,
     ApproveAndStart,
     Start,
+    Cancel,
     Recover,
     Retry { feature_id: String },
 }
@@ -61,7 +63,27 @@ pub enum Action {
         topic_id: String,
         reason: String,
     },
+    /// `option_id: None` denies.
+    PermissionDecision {
+        permission_id: String,
+        option_id: Option<String>,
+    },
     Refresh,
+}
+
+/// A harness asking the user for permission. Only the user answers it.
+#[derive(Clone, Debug)]
+pub struct HarnessPermission {
+    pub permission_id: String,
+    pub session_id: String,
+    pub topic_id: String,
+    pub attempt_id: String,
+    pub harness: HarnessKind,
+    pub acp_agent: Option<String>,
+    pub title: String,
+    pub kind: String,
+    pub raw_input: Option<serde_json::Value>,
+    pub options: Vec<HarnessPermissionOption>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,21 +94,180 @@ enum ProposalStep {
     Sending,
 }
 
+/// Starting outlines. The outline is advice: the Formless model in the
+/// Topic Chat decides the actual steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    Open,
+    Code,
+    Accounting,
+}
+
+impl Preset {
+    const ALL: [Preset; 3] = [Preset::Open, Preset::Code, Preset::Accounting];
+
+    fn label(self) -> &'static str {
+        match self {
+            Preset::Open => "None (Formless plans the steps)",
+            Preset::Code => "Code: Implement → Review",
+            Preset::Accounting => "Accounting: Scan receipts → Do accounting → Create reports",
+        }
+    }
+
+    fn steps(self) -> Vec<StepForm> {
+        use HarnessKind::{Claude, Codex};
+        use StepAccess::{ReadOnly, Write};
+        let steps: &[(&str, &str, Option<HarnessKind>, StepAccess)] = match self {
+            Preset::Open => &[],
+            Preset::Code => &[
+                (
+                    "Implement",
+                    "Make the requested change, with tests, and commit it.",
+                    Some(Claude),
+                    Write,
+                ),
+                (
+                    "Review",
+                    "Review the change against the request and report findings.",
+                    Some(Codex),
+                    ReadOnly,
+                ),
+            ],
+            Preset::Accounting => &[
+                (
+                    "Scan receipts",
+                    "Extract vendor, date, amount and category from each receipt.",
+                    None,
+                    Write,
+                ),
+                (
+                    "Do accounting",
+                    "Record the entries and reconcile the totals.",
+                    None,
+                    Write,
+                ),
+                (
+                    "Create reports",
+                    "Produce the requested reports from the reconciled entries.",
+                    None,
+                    Write,
+                ),
+            ],
+        };
+        steps
+            .iter()
+            .map(|(title, instructions, harness, access)| {
+                StepForm::new(title, instructions, *harness, *access)
+            })
+            .collect()
+    }
+}
+
+/// Harness choices for a step; `None` lets the orchestrator pick.
+const HARNESSES: [Option<HarnessKind>; 7] = [
+    None,
+    Some(HarnessKind::Claude),
+    Some(HarnessKind::Codex),
+    Some(HarnessKind::Pi),
+    Some(HarnessKind::OpenCode),
+    Some(HarnessKind::Antigravity),
+    Some(HarnessKind::Muse),
+];
+
+struct StepForm {
+    title: InputLine,
+    instructions: InputLine,
+    harness: Option<HarnessKind>,
+    model: InputLine,
+    access: StepAccess,
+}
+
+impl StepForm {
+    fn new(
+        title: &str,
+        instructions: &str,
+        harness: Option<HarnessKind>,
+        access: StepAccess,
+    ) -> Self {
+        let mut step = Self {
+            title: InputLine::default(),
+            instructions: InputLine::default(),
+            harness,
+            model: InputLine::default(),
+            access,
+        };
+        step.title.set(title);
+        step.instructions.set(instructions);
+        step
+    }
+
+    fn outline(&self) -> Option<TopicStepOutline> {
+        let title = self.title.expanded().trim().to_string();
+        (!title.is_empty()).then(|| TopicStepOutline {
+            title,
+            instructions: self.instructions.expanded().trim().to_string(),
+            harness: self.harness,
+            acp_agent: None,
+            model: nonblank(&self.model.expanded()),
+            access: self.access,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepField {
+    Title,
+    Instructions,
+    Harness,
+    Model,
+    Access,
+}
+
+const STEP_FIELDS: [StepField; 5] = [
+    StepField::Title,
+    StepField::Instructions,
+    StepField::Harness,
+    StepField::Model,
+    StepField::Access,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Name,
+    Workspace,
+    Parent,
+    Preset,
+    Step(usize, StepField),
+}
+
+const HEAD_FIELDS: usize = 4;
+
 struct ProposalForm {
     source_session_id: String,
     messages: Vec<MessageInfo>,
     selected: HashSet<String>,
     message_index: usize,
     step: ProposalStep,
-    fields: [InputLine; 4],
+    name: InputLine,
+    workspace: InputLine,
+    /// `(parent_topic_id, label)`; the first entry is Main Chat.
+    parents: Vec<(Option<String>, String)>,
+    parent_index: usize,
+    preset: Preset,
+    steps: Vec<StepForm>,
     field_index: usize,
-    builder: HarnessKind,
-    reviewer: HarnessKind,
     scroll: u16,
 }
 
 impl ProposalForm {
-    fn new(source: &SessionInfo, messages: &[MessageInfo], repo: &str, name: &str) -> Self {
+    fn new(
+        source: &SessionInfo,
+        messages: &[MessageInfo],
+        workspace: &str,
+        name: &str,
+        parents: Vec<(Option<String>, String)>,
+        parent: Option<&str>,
+    ) -> Self {
         let mut user_messages: Vec<_> = messages
             .iter()
             .filter(|message| message.role == "user" && message.session_id == source.id)
@@ -97,52 +278,140 @@ impl ProposalForm {
             .last()
             .map(|message| HashSet::from([message.id.clone()]))
             .unwrap_or_default();
-        let mut fields: [InputLine; 4] = std::array::from_fn(|_| InputLine::default());
-        fields[0].set(name);
-        fields[1].set(repo);
+        let mut name_line = InputLine::default();
+        name_line.set(name);
+        let mut workspace_line = InputLine::default();
+        workspace_line.set(workspace);
+        let parent_index = parents
+            .iter()
+            .position(|(id, _)| id.as_deref() == parent)
+            .unwrap_or(0);
         Self {
             source_session_id: source.id.clone(),
             messages: user_messages,
             selected,
             message_index: 0,
             step: ProposalStep::Messages,
-            fields,
+            name: name_line,
+            workspace: workspace_line,
+            parents,
+            parent_index,
+            preset: Preset::Open,
+            steps: Vec::new(),
             field_index: 0,
-            builder: HarnessKind::Claude,
-            reviewer: HarnessKind::Codex,
             scroll: 0,
         }
     }
 
     fn request(&self) -> Option<TopicProposalRequest> {
-        let name = self.fields[0].expanded().trim().to_string();
-        let repo = self.fields[1].expanded().trim().to_string();
+        let name = self.name.expanded().trim().to_string();
         let message_ids: Vec<_> = self
             .messages
             .iter()
             .filter(|message| self.selected.contains(&message.id))
             .map(|message| message.id.clone())
             .collect();
-        if name.is_empty() || repo.is_empty() || message_ids.is_empty() {
+        if name.is_empty() || message_ids.is_empty() {
             return None;
         }
         Some(TopicProposalRequest {
+            parent_topic_id: self
+                .parents
+                .get(self.parent_index)
+                .and_then(|(id, _)| id.clone()),
             source_session_id: self.source_session_id.clone(),
             message_ids,
+            // Manual proposals submit an empty feature list. The daemon
+            // interprets that as one work item per selected message.
             features: vec![],
             name,
-            repo: PathBuf::from(repo),
-            builder: self.builder,
-            builder_model: nonblank(&self.fields[2].expanded()),
-            reviewer: self.reviewer,
-            reviewer_model: nonblank(&self.fields[3].expanded()),
+            workspace: nonblank(&self.workspace.expanded()).map(PathBuf::from),
+            outline: self.steps.iter().filter_map(StepForm::outline).collect(),
         })
+    }
+
+    fn parent_label(&self) -> &str {
+        self.parents
+            .get(self.parent_index)
+            .map(|(_, label)| label.as_str())
+            .unwrap_or("Main Chat")
     }
 
     fn selected_messages(&self) -> impl Iterator<Item = &MessageInfo> {
         self.messages
             .iter()
             .filter(|message| self.selected.contains(&message.id))
+    }
+
+    fn field_count(&self) -> usize {
+        HEAD_FIELDS + self.steps.len() * STEP_FIELDS.len()
+    }
+
+    fn field(&self) -> Field {
+        match self.field_index {
+            0 => Field::Name,
+            1 => Field::Workspace,
+            2 => Field::Parent,
+            3 => Field::Preset,
+            n => {
+                let n = n - HEAD_FIELDS;
+                Field::Step(n / STEP_FIELDS.len(), STEP_FIELDS[n % STEP_FIELDS.len()])
+            }
+        }
+    }
+
+    fn cycle(&mut self, forward: bool) -> bool {
+        fn next(index: usize, len: usize, forward: bool) -> usize {
+            if forward {
+                (index + 1) % len
+            } else {
+                (index + len - 1) % len
+            }
+        }
+        match self.field() {
+            Field::Parent => {
+                self.parent_index = next(self.parent_index, self.parents.len().max(1), forward);
+            }
+            Field::Preset => {
+                let index = Preset::ALL
+                    .iter()
+                    .position(|p| *p == self.preset)
+                    .unwrap_or(0);
+                self.preset = Preset::ALL[next(index, Preset::ALL.len(), forward)];
+                self.steps = self.preset.steps();
+            }
+            Field::Step(step, StepField::Harness) => {
+                let harness = &mut self.steps[step].harness;
+                let index = HARNESSES.iter().position(|h| h == harness).unwrap_or(0);
+                *harness = HARNESSES[next(index, HARNESSES.len(), forward)];
+            }
+            Field::Step(step, StepField::Access) => {
+                let access = &mut self.steps[step].access;
+                *access = match access {
+                    StepAccess::ReadOnly => StepAccess::Write,
+                    StepAccess::Write => StepAccess::ReadOnly,
+                };
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn add_step(&mut self) {
+        let at = match self.field() {
+            Field::Step(step, _) => step + 1,
+            _ => self.steps.len(),
+        };
+        self.steps
+            .insert(at, StepForm::new("", "", None, StepAccess::Write));
+        self.field_index = HEAD_FIELDS + at * STEP_FIELDS.len();
+    }
+
+    fn remove_step(&mut self) {
+        if let Field::Step(step, _) = self.field() {
+            self.steps.remove(step);
+            self.field_index = self.field_index.min(self.field_count() - 1);
+        }
     }
 
     fn key(&mut self, key: KeyEvent) -> Action {
@@ -173,35 +442,24 @@ impl ProposalForm {
                 _ => Action::None,
             },
             ProposalStep::Fields => {
-                if key.code == KeyCode::Esc {
-                    return Action::Close;
-                }
+                let count = self.field_count();
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
+                    KeyCode::Esc => return Action::Close,
+                    KeyCode::Char('n') if ctrl => self.add_step(),
+                    KeyCode::Char('d') if ctrl => self.remove_step(),
                     KeyCode::Tab | KeyCode::Down => {
-                        self.field_index = (self.field_index + 1) % 6;
+                        self.field_index = (self.field_index + 1) % count;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        self.field_index = (self.field_index + 5) % 6;
+                        self.field_index = (self.field_index + count - 1) % count;
                     }
-                    KeyCode::Left | KeyCode::Right if self.field_index == 2 => {
-                        self.builder = if self.builder == HarnessKind::Claude {
-                            HarnessKind::Codex
-                        } else {
-                            HarnessKind::Claude
-                        };
-                    }
-                    KeyCode::Left | KeyCode::Right if self.field_index == 4 => {
-                        self.reviewer = if self.reviewer == HarnessKind::Claude {
-                            HarnessKind::Codex
-                        } else {
-                            HarnessKind::Claude
-                        };
-                    }
+                    KeyCode::Left | KeyCode::Right if self.cycle(key.code == KeyCode::Right) => {}
                     KeyCode::Enter => {
-                        if self.field_index == 5 {
+                        if self.field_index + 1 >= count {
                             self.step = ProposalStep::Review;
                         } else {
-                            self.field_index = (self.field_index + 1) % 6;
+                            self.field_index += 1;
                         }
                     }
                     KeyCode::Backspace => {
@@ -253,6 +511,14 @@ impl ProposalForm {
                     self.step = ProposalStep::Fields;
                     Action::None
                 }
+                KeyCode::Up => {
+                    self.scroll = self.scroll.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    self.scroll = self.scroll.saturating_add(1);
+                    Action::None
+                }
                 KeyCode::Enter => match self.request() {
                     Some(request) => {
                         self.step = ProposalStep::Sending;
@@ -267,13 +533,52 @@ impl ProposalForm {
     }
 
     fn text_field_mut(&mut self) -> Option<&mut InputLine> {
-        match self.field_index {
-            0 => Some(&mut self.fields[0]),
-            1 => Some(&mut self.fields[1]),
-            3 => Some(&mut self.fields[2]),
-            5 => Some(&mut self.fields[3]),
+        match self.field() {
+            Field::Name => Some(&mut self.name),
+            Field::Workspace => Some(&mut self.workspace),
+            Field::Step(step, StepField::Title) => Some(&mut self.steps[step].title),
+            Field::Step(step, StepField::Instructions) => Some(&mut self.steps[step].instructions),
+            Field::Step(step, StepField::Model) => Some(&mut self.steps[step].model),
             _ => None,
         }
+    }
+
+    fn field_lines(&self) -> Vec<(bool, String, String)> {
+        let mut rows = vec![
+            ("Topic name".to_string(), self.name.expanded()),
+            (
+                "Workspace (blank = scratch folder)".to_string(),
+                self.workspace.expanded(),
+            ),
+            ("Under".to_string(), format!("‹ {} ›", self.parent_label())),
+            (
+                "Outline preset".to_string(),
+                format!("‹ {} ›", self.preset.label()),
+            ),
+        ];
+        for (index, step) in self.steps.iter().enumerate() {
+            let n = index + 1;
+            rows.extend([
+                (format!("Step {n} title"), step.title.expanded()),
+                (
+                    format!("Step {n} instructions"),
+                    step.instructions.expanded(),
+                ),
+                (
+                    format!("Step {n} harness"),
+                    format!("‹ {} ›", step_harness_label(step.harness, None)),
+                ),
+                (format!("Step {n} model (optional)"), step.model.expanded()),
+                (
+                    format!("Step {n} access"),
+                    format!("‹ {} ›", access_label(step.access)),
+                ),
+            ]);
+        }
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, (label, value))| (index == self.field_index, label, value))
+            .collect()
     }
 }
 
@@ -312,7 +617,7 @@ pub struct State {
     overlay: Option<Overlay>,
     proposal: Option<ProposalForm>,
     pending_reviewed: HashSet<String>,
-    start_attempted: HashSet<String>,
+    permissions: Vec<HarnessPermission>,
     last_refresh: Option<std::time::Instant>,
 }
 
@@ -326,7 +631,7 @@ impl Default for State {
             overlay: None,
             proposal: None,
             pending_reviewed: HashSet::new(),
-            start_attempted: HashSet::new(),
+            permissions: Vec::new(),
             last_refresh: None,
         }
     }
@@ -361,6 +666,9 @@ impl State {
             .chars()
             .filter(|c| !c.is_control())
             .collect();
+        if !self.permissions.is_empty() {
+            return;
+        }
         match self.overlay.as_mut() {
             Some(Overlay::Proposal) => {
                 if let Some(proposal) = self.proposal.as_mut() {
@@ -377,7 +685,49 @@ impl State {
     }
 
     pub fn overlay_open(&self) -> bool {
-        self.overlay.is_some()
+        self.overlay.is_some() || !self.permissions.is_empty()
+    }
+
+    pub fn push_permission(&mut self, permission: HarnessPermission) {
+        if !self
+            .permissions
+            .iter()
+            .any(|open| open.permission_id == permission.permission_id)
+        {
+            self.permissions.push(permission);
+        }
+    }
+
+    pub fn close_permission(&mut self, permission_id: &str) {
+        self.permissions
+            .retain(|open| open.permission_id != permission_id);
+    }
+
+    /// Drops prompts from a daemon that went away; returns how many.
+    pub fn clear_permissions(&mut self) -> usize {
+        std::mem::take(&mut self.permissions).len()
+    }
+
+    fn permission_key(&mut self, key: KeyEvent) -> Action {
+        let Some(permission) = self.permissions.first() else {
+            return Action::None;
+        };
+        let decide = |option_id: Option<String>| Action::PermissionDecision {
+            permission_id: permission.permission_id.clone(),
+            option_id,
+        };
+        let action = match key.code {
+            KeyCode::Esc | KeyCode::Char('d' | 'D') => decide(None),
+            KeyCode::Char(c @ '1'..='9') => {
+                match permission.options.get(c as usize - '1' as usize) {
+                    Some(option) => decide(Some(option.option_id.clone())),
+                    None => return Action::None,
+                }
+            }
+            _ => return Action::None,
+        };
+        self.permissions.remove(0);
+        action
     }
 
     #[cfg(test)]
@@ -499,14 +849,6 @@ impl State {
         session_id.is_some_and(|id| self.is_harness_session(id))
     }
 
-    pub fn claim_start(&mut self, topic_id: &str) -> bool {
-        self.start_attempted.insert(topic_id.to_string())
-    }
-
-    pub fn release_start(&mut self, topic_id: &str) {
-        self.start_attempted.remove(topic_id);
-    }
-
     pub fn open_picker(&mut self) {
         self.overlay = Some(Overlay::Picker);
     }
@@ -553,10 +895,30 @@ impl State {
         &mut self,
         source: &SessionInfo,
         messages: &[MessageInfo],
-        repo: &str,
+        workspace: &str,
         name: &str,
+        parent: Option<&str>,
     ) {
-        self.proposal = Some(ProposalForm::new(source, messages, repo, name));
+        let mut parents = vec![(None, "Main Chat".to_string())];
+        parents.extend(
+            self.topics
+                .iter()
+                .filter(|topic| {
+                    !matches!(
+                        topic.status,
+                        TopicStatus::PendingApproval | TopicStatus::Rejected
+                    )
+                })
+                .map(|topic| {
+                    (
+                        Some(topic.id.clone()),
+                        self.topic_path(&topic.id).join(" / "),
+                    )
+                }),
+        );
+        self.proposal = Some(ProposalForm::new(
+            source, messages, workspace, name, parents, parent,
+        ));
         self.overlay = Some(Overlay::Proposal);
     }
 
@@ -594,6 +956,11 @@ impl State {
             ConfirmedAction::Approve | ConfirmedAction::ApproveAndStart
         ) && topic.status != TopicStatus::PendingApproval
             || matches!(action, ConfirmedAction::Start) && topic.status != TopicStatus::Approved
+            || matches!(action, ConfirmedAction::Cancel)
+                && !matches!(
+                    topic.status,
+                    TopicStatus::Approved | TopicStatus::Running | TopicStatus::NeedsUser
+                )
         {
             return false;
         }
@@ -627,6 +994,11 @@ impl State {
             ["start"] => self.open_action_for_selected(ConfirmedAction::Start),
             ["start", topic_id] => self
                 .open_action(topic_id, ConfirmedAction::Start)
+                .then_some(())
+                .ok_or_else(|| self.unavailable_action(topic_id)),
+            ["cancel"] => self.open_action_for_selected(ConfirmedAction::Cancel),
+            ["cancel", topic_id] => self
+                .open_action(topic_id, ConfirmedAction::Cancel)
                 .then_some(())
                 .ok_or_else(|| self.unavailable_action(topic_id)),
             ["recover"] => self.open_action_for_selected(ConfirmedAction::Recover),
@@ -677,7 +1049,8 @@ impl State {
                 .then_some(())
                 .ok_or_else(|| self.unavailable_action(topic_id)),
             _ => Err(
-                "Usage: /topic [ID|start|recover|retry TOPIC FEATURE|reject TOPIC REASON]".into(),
+                "Usage: /topic [ID|start|cancel|recover|retry TOPIC FEATURE|reject TOPIC REASON]"
+                    .into(),
             ),
         }
     }
@@ -718,6 +1091,9 @@ impl State {
     }
 
     pub fn key(&mut self, key: KeyEvent) -> Action {
+        if !self.permissions.is_empty() {
+            return self.permission_key(key);
+        }
         let Some(overlay) = self.overlay.clone() else {
             return Action::None;
         };
@@ -805,12 +1181,18 @@ impl State {
                         self.open_action(&topic_id, ConfirmedAction::Recover);
                         Action::None
                     }
+                    KeyCode::Char('k') if !review => {
+                        self.open_action(&topic_id, ConfirmedAction::Cancel);
+                        Action::None
+                    }
                     KeyCode::Char('x') if !review => {
                         if let Some(feature) = self.topic(&topic_id).and_then(|topic| {
                             topic.features.iter().find(|feature| {
                                 matches!(
                                     feature.status,
-                                    TopicFeatureStatus::Failed | TopicFeatureStatus::NeedsUser
+                                    TopicFeatureStatus::Failed
+                                        | TopicFeatureStatus::NeedsUser
+                                        | TopicFeatureStatus::Cancelled
                                 )
                             })
                         }) {
@@ -971,33 +1353,96 @@ impl State {
             status: String::new(),
             section: true,
         });
+        let mut seen = HashSet::new();
         for topic in &self.topics {
-            rows.push(TreeRow {
-                node: Some(Node::Topic(topic.id.clone())),
-                depth: 0,
-                label: topic.name.clone(),
-                status: topic_status_label(topic),
-                section: false,
-            });
-            for attempt in &topic.attempts {
-                rows.push(TreeRow {
-                    node: Some(Node::Attempt {
-                        topic_id: topic.id.clone(),
-                        attempt_id: attempt.id.clone(),
-                    }),
-                    depth: 1,
-                    label: format!(
-                        "{} {} · round {}",
-                        harness_label(attempt.harness),
-                        role_label(attempt.role),
-                        attempt.round
-                    ),
-                    status: attempt_status_label(attempt),
-                    section: false,
-                });
+            let parent_known = topic
+                .parent_topic_id
+                .as_deref()
+                .is_some_and(|parent| self.topic(parent).is_some());
+            if !parent_known {
+                self.push_topic_rows(&mut rows, topic, 0, &mut seen);
             }
         }
+        // A cycle has no root; still list every topic once.
+        for topic in &self.topics {
+            self.push_topic_rows(&mut rows, topic, 0, &mut seen);
+        }
         rows
+    }
+
+    fn push_topic_rows(
+        &self,
+        rows: &mut Vec<TreeRow>,
+        topic: &TopicInfo,
+        depth: usize,
+        seen: &mut HashSet<String>,
+    ) {
+        if !seen.insert(topic.id.clone()) {
+            return;
+        }
+        rows.push(TreeRow {
+            node: Some(Node::Topic(topic.id.clone())),
+            depth,
+            label: topic.name.clone(),
+            status: topic_status_label(topic),
+            section: false,
+        });
+        for attempt in &topic.attempts {
+            rows.push(TreeRow {
+                node: Some(Node::Attempt {
+                    topic_id: topic.id.clone(),
+                    attempt_id: attempt.id.clone(),
+                }),
+                depth: depth + 1,
+                label: attempt_label(attempt),
+                status: attempt_status_label(attempt),
+                section: false,
+            });
+        }
+        for child in self
+            .topics
+            .iter()
+            .filter(|child| child.parent_topic_id.as_deref() == Some(topic.id.as_str()))
+        {
+            self.push_topic_rows(rows, child, depth + 1, seen);
+        }
+    }
+
+    /// `Topic / Step · Harness` for a harness conversation, so its
+    /// questions say who is asking.
+    pub fn harness_label_for_session(&self, session_id: &str) -> Option<String> {
+        self.topics.iter().find_map(|topic| {
+            topic
+                .attempts
+                .iter()
+                .find(|attempt| attempt.conversation_session_id == session_id)
+                .map(|attempt| {
+                    format!(
+                        "{} / {}",
+                        self.topic_path(&topic.id).join(" / "),
+                        attempt_label(attempt)
+                    )
+                })
+        })
+    }
+
+    /// Topic names from the outermost ancestor down to `topic_id`.
+    pub fn topic_path(&self, topic_id: &str) -> Vec<&str> {
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let mut next = self.topic(topic_id);
+        while let Some(topic) = next {
+            if !seen.insert(topic.id.as_str()) {
+                break;
+            }
+            path.push(topic.name.as_str());
+            next = topic
+                .parent_topic_id
+                .as_deref()
+                .and_then(|parent| self.topic(parent));
+        }
+        path.reverse();
+        path
     }
 
     fn move_selection(&mut self, down: bool) {
@@ -1109,7 +1554,7 @@ impl State {
             ChatContext::Main => "Main Chat".into(),
             ChatContext::Topic(topic_id) => self
                 .topic(&topic_id)
-                .map(|topic| format!("Main Chat / Topic Chats / {}", topic.name))
+                .map(|_| format!("Main Chat / {}", self.topic_path(&topic_id).join(" / ")))
                 .unwrap_or_else(|| "Topic Chat".into()),
             ChatContext::Harness {
                 topic_id,
@@ -1121,20 +1566,23 @@ impl State {
                         .attempts
                         .iter()
                         .find(|attempt| attempt.id == attempt_id)
-                        .map(|attempt| {
-                            format!(
-                                "Main Chat / Topic Chats / {} / {} {} · read-only",
-                                topic.name,
-                                harness_label(attempt.harness),
-                                role_label(attempt.role)
-                            )
-                        })
+                })
+                .map(|attempt| {
+                    format!(
+                        "Main Chat / {} / {} · read-only",
+                        self.topic_path(&topic_id).join(" / "),
+                        attempt_label(attempt)
+                    )
                 })
                 .unwrap_or_else(|| "Harness conversation · read-only".into()),
         }
     }
 
     pub fn draw_overlay(&self, frame: &mut Frame, color: bool) {
+        if let Some(permission) = self.permissions.first() {
+            self.draw_permission(frame, permission, color);
+            return;
+        }
         let Some(overlay) = self.overlay.as_ref() else {
             return;
         };
@@ -1156,6 +1604,76 @@ impl State {
                 self.draw_reject(frame, area, topic_id, reason, color)
             }
         }
+    }
+
+    fn draw_permission(&self, frame: &mut Frame, permission: &HarnessPermission, color: bool) {
+        let area = centered(frame.area(), 80, 70);
+        frame.render_widget(Clear, area);
+        let harness = harness_name(permission.harness, permission.acp_agent.as_deref());
+        let step = self
+            .topic(&permission.topic_id)
+            .and_then(|topic| {
+                topic
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == permission.attempt_id)
+            })
+            .map(|attempt| format!(" / {}", attempt.step_title))
+            .unwrap_or_default();
+        let topic = self.topic_path(&permission.topic_id).join(" / ");
+        let mut lines = vec![
+            Line::from(format!(
+                "{}{step} · {harness}",
+                if topic.is_empty() {
+                    &permission.topic_id
+                } else {
+                    &topic
+                }
+            )),
+            Line::styled(
+                permission.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(
+                "Kind: {} · conversation {}",
+                permission.kind, permission.session_id
+            )),
+        ];
+        if let Some(input) = &permission.raw_input {
+            let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
+            lines.extend(
+                pretty
+                    .lines()
+                    .take(12)
+                    .map(|line| Line::from(format!("  {line}"))),
+            );
+        }
+        lines.push(Line::default());
+        for (index, option) in permission.options.iter().enumerate() {
+            let note = match option.kind {
+                HarnessPermissionOptionKind::AllowAlways => " (this attempt only)",
+                _ => "",
+            };
+            lines.push(Line::from(format!("{}. {}{note}", index + 1, option.name)));
+        }
+        if self.permissions.len() > 1 {
+            lines.push(Line::from(format!(
+                "{} more permission request(s) waiting.",
+                self.permissions.len() - 1
+            )));
+        }
+        let block = crate::ui::panel(
+            format!(" {harness} asks for permission "),
+            color,
+            Color::Yellow,
+        )
+        .title_bottom(crate::ui::hint(
+            "1-9 choose · Esc/d deny · only you can answer; no answer means denied",
+            color,
+        ));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     fn draw_picker(&self, frame: &mut Frame, area: Rect, color: bool) {
@@ -1230,7 +1748,7 @@ impl State {
                 match proposal.step {
                     ProposalStep::Messages => "Space select · Enter fields · Esc cancel",
                     ProposalStep::Fields => {
-                        "Tab move · Enter next/review · ←/→ harness · Esc cancel"
+                        "Tab move · ←/→ choose · Ctrl+N add step · Ctrl+D remove step · Enter next · Esc cancel"
                     }
                     ProposalStep::Review => "Enter propose only · Backspace edit · Esc cancel",
                     ProposalStep::Sending => {
@@ -1272,29 +1790,28 @@ impl State {
                 );
             }
             ProposalStep::Fields => {
-                let items = [
-                    ("Topic name", proposal.fields[0].expanded()),
-                    ("Repository", proposal.fields[1].expanded()),
-                    ("Builder", harness_label(proposal.builder).to_string()),
-                    ("Builder model (optional)", proposal.fields[2].expanded()),
-                    ("Reviewer", harness_label(proposal.reviewer).to_string()),
-                    ("Reviewer model (optional)", proposal.fields[3].expanded()),
-                ];
-                let mut lines = vec![Line::from("Configure the isolated workflow:")];
-                for (index, (label, value)) in items.iter().enumerate() {
-                    let prefix = if proposal.field_index == index { "› " } else { "  " };
-                    let style = if proposal.field_index == index {
+                let mut lines = vec![Line::from(
+                    "Name the topic and outline the work. The outline is advice; Formless decides.",
+                )];
+                let mut focused_line = 0;
+                for (focused, label, value) in proposal.field_lines() {
+                    let style = if focused {
+                        focused_line = lines.len();
                         Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)
                     } else {
                         Style::default()
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(prefix, style),
+                        Span::styled(if focused { "› " } else { "  " }, style),
                         Span::styled(format!("{label}: "), style),
                         Span::raw(value),
                     ]));
                 }
-                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+                let scroll = (focused_line + 1).saturating_sub(inner.height as usize);
+                frame.render_widget(
+                    Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+                    inner,
+                );
             }
             ProposalStep::Review => {
                 let request = proposal.request();
@@ -1305,12 +1822,20 @@ impl State {
                 if let Some(request) = request {
                     lines.extend([
                         Line::from(format!("Topic: {}", request.name)),
-                        Line::from(format!("Repository: {}", request.repo.display())),
-                        Line::from(format!("Builder: {}{}", harness_label(request.builder), model_suffix(request.builder_model.as_deref()))),
-                        Line::from(format!("Reviewer: {}{}", harness_label(request.reviewer), model_suffix(request.reviewer_model.as_deref()))),
-                        Line::from(format!("Selected requests: {}", request.message_ids.join(", "))),
-                        Line::from("Workflow: approval moves only the selected request rows. Start runs only after a separate explicit confirmation."),
-                        Line::from("Ready revisions are shown for review; nothing is automatically merged."),
+                        Line::from(format!("Under: {}", proposal.parent_label())),
+                        Line::from(format!(
+                            "Workspace: {}",
+                            request.workspace.as_ref().map_or_else(
+                                || "Scratch folder".to_string(),
+                                |path| path.display().to_string()
+                            )
+                        )),
+                        Line::from("Outline (advice; Formless decides the steps):"),
+                    ]);
+                    lines.extend(outline_lines(&request.outline, "  "));
+                    lines.extend([
+                        Line::from("Approval moves only the selected requests. Starting needs a separate confirmation."),
+                        Line::from("Nothing is merged or pushed automatically."),
                         Line::from("Requests to move:"),
                     ]);
                     for message in proposal.selected_messages() {
@@ -1318,7 +1843,7 @@ impl State {
                         lines.push(Line::from(message.content.clone()));
                     }
                 } else {
-                    lines.push(Line::from("Choose a topic name, repository and at least one request."));
+                    lines.push(Line::from("Choose a topic name and at least one request."));
                 }
                 frame.render_widget(
                     Paragraph::new(lines)
@@ -1398,6 +1923,7 @@ impl State {
                 "Approve, move the requests, and start the workflow"
             }
             ConfirmedAction::Start => "Start topic workflow",
+            ConfirmedAction::Cancel => "Cancel topic",
             ConfirmedAction::Recover => "Recover topic workflow",
             ConfirmedAction::Retry { .. } => "Retry topic feature",
         };
@@ -1415,17 +1941,22 @@ impl State {
                     "Moves the selected requests into this topic. Harness work does not start yet."
                 }
                 ConfirmedAction::ApproveAndStart => {
-                    "Moves the selected requests, then starts the builder and reviewer once."
+                    "Moves the selected requests, then starts the Formless orchestrator once."
                 }
                 ConfirmedAction::Start => {
-                    "Starts the builder and reviewer for every pending feature."
+                    "The Formless model runs the work in the Topic Chat, using the outline as advice."
+                }
+                ConfirmedAction::Cancel => {
+                    "Stops the orchestrator and any running harness work. Nothing starts again until you start it."
                 }
                 ConfirmedAction::Recover => {
-                    "Resumes interrupted harness work from the last recorded state."
+                    "Resumes interrupted work from the last recorded state."
                 }
-                ConfirmedAction::Retry { .. } => "Starts a new attempt for this feature only.",
+                ConfirmedAction::Retry { .. } => {
+                    "Resets this work item to pending. Start the topic again to run it."
+                }
             }),
-            Line::from("No automatic merge will occur; inspect ready revisions in Topic Details."),
+            Line::from("Nothing is merged or pushed automatically; outputs are listed in Topic Details."),
             Line::from("Enter/y confirm · Esc/n cancel"),
         ]);
         frame.render_widget(Clear, area);
@@ -1472,53 +2003,38 @@ pub struct TreeRow {
 }
 
 pub fn topic_status_label(topic: &TopicInfo) -> String {
-    if topic
-        .features
-        .iter()
-        .any(|feature| feature.status == TopicFeatureStatus::NeedsUser)
-    {
+    let any = |status| {
+        topic
+            .features
+            .iter()
+            .any(|feature| feature.status == status)
+    };
+    if any(TopicFeatureStatus::NeedsUser) {
         return "Needs you".into();
     }
-    if topic
-        .features
-        .iter()
-        .any(|feature| feature.status == TopicFeatureStatus::Failed)
-    {
+    if any(TopicFeatureStatus::Failed) {
         return "Failed".into();
     }
-    if topic
-        .features
-        .iter()
-        .any(|feature| feature.status == TopicFeatureStatus::Building)
-    {
-        return "Building".into();
-    }
-    if topic
-        .features
-        .iter()
-        .any(|feature| feature.status == TopicFeatureStatus::Reviewing)
-    {
-        return "Reviewing".into();
-    }
     match topic.status {
-        TopicStatus::PendingApproval => "Needs approval".into(),
-        TopicStatus::Approved => "Ready".into(),
-        TopicStatus::Rejected => "Rejected".into(),
-        TopicStatus::Running => "Building".into(),
-        TopicStatus::Complete => "Ready".into(),
-        TopicStatus::Failed => "Failed".into(),
+        TopicStatus::PendingApproval => "Needs approval",
+        TopicStatus::Approved => "Ready to start",
+        TopicStatus::Rejected => "Rejected",
+        TopicStatus::Running => "Running",
+        TopicStatus::NeedsUser => "Needs you",
+        TopicStatus::Complete => "Complete",
+        TopicStatus::Failed => "Failed",
+        TopicStatus::Cancelled => "Cancelled",
     }
+    .into()
 }
 
 fn attempt_status_label(attempt: &TopicAttemptInfo) -> String {
     match attempt.status {
-        TopicAttemptStatus::Building => "Building",
-        TopicAttemptStatus::AwaitingReview => "Awaiting review",
-        TopicAttemptStatus::Reviewing => "Reviewing",
-        TopicAttemptStatus::Passed => "Ready",
-        TopicAttemptStatus::Findings => "Reviewing",
+        TopicAttemptStatus::Running => "Running",
+        TopicAttemptStatus::Succeeded => "Done",
         TopicAttemptStatus::NeedsUser => "Needs you",
         TopicAttemptStatus::Failed | TopicAttemptStatus::Abandoned => "Failed",
+        TopicAttemptStatus::Cancelled => "Cancelled",
     }
     .into()
 }
@@ -1526,42 +2042,114 @@ fn attempt_status_label(attempt: &TopicAttemptInfo) -> String {
 fn feature_status_label(status: TopicFeatureStatus) -> &'static str {
     match status {
         TopicFeatureStatus::Pending => "Pending",
-        TopicFeatureStatus::Building => "Building",
-        TopicFeatureStatus::Reviewing => "Reviewing",
+        TopicFeatureStatus::Running => "Running",
         TopicFeatureStatus::Ready => "Ready",
         TopicFeatureStatus::NeedsUser => "Needs you",
         TopicFeatureStatus::Failed => "Failed",
+        TopicFeatureStatus::Cancelled => "Cancelled",
     }
 }
 
-fn harness_label(harness: HarnessKind) -> &'static str {
+pub fn harness_label(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "Claude",
         HarnessKind::Codex => "Codex",
+        HarnessKind::Pi => "Pi",
+        HarnessKind::OpenCode => "OpenCode",
+        HarnessKind::Antigravity => "Antigravity",
+        HarnessKind::Acp => "ACP",
+        HarnessKind::Muse => "Muse",
     }
 }
 
-fn role_label(role: formless_protocol::HarnessRole) -> &'static str {
-    match role {
-        formless_protocol::HarnessRole::Build => "Build",
-        formless_protocol::HarnessRole::Review => "Review",
+/// `ACP (agent)` for ACP harnesses, the plain name otherwise.
+pub fn harness_name(harness: HarnessKind, acp_agent: Option<&str>) -> String {
+    match acp_agent {
+        Some(agent) if harness == HarnessKind::Acp => format!("ACP ({agent})"),
+        _ => harness_label(harness).to_string(),
     }
+}
+
+fn step_harness_label(harness: Option<HarnessKind>, acp_agent: Option<&str>) -> String {
+    harness.map_or_else(
+        || "Formless picks".to_string(),
+        |harness| harness_name(harness, acp_agent),
+    )
+}
+
+fn access_label(access: StepAccess) -> &'static str {
+    match access {
+        StepAccess::ReadOnly => "read-only",
+        StepAccess::Write => "can write",
+    }
+}
+
+fn attempt_label(attempt: &TopicAttemptInfo) -> String {
+    format!(
+        "{} · {}",
+        attempt.step_title,
+        harness_name(attempt.harness, attempt.acp_agent.as_deref())
+    )
 }
 
 fn model_suffix(model: Option<&str>) -> String {
     model.map(|model| format!(" · {model}")).unwrap_or_default()
 }
 
+fn artifact_label(artifact: &TopicArtifact) -> String {
+    match artifact {
+        TopicArtifact::GitRevision { revision } => format!("revision {revision}"),
+        TopicArtifact::File { path, sha256 } => {
+            format!(
+                "file {} ({})",
+                path.display(),
+                &sha256[..sha256.len().min(12)]
+            )
+        }
+        TopicArtifact::Text { title, content } => {
+            format!("{title}: {}", content.replace('\n', " "))
+        }
+    }
+}
+
+fn outline_lines(outline: &[TopicStepOutline], indent: &str) -> Vec<Line<'static>> {
+    if outline.is_empty() {
+        return vec![Line::from(format!(
+            "{indent}No outline: the Formless model plans the steps."
+        ))];
+    }
+    let mut lines = Vec::new();
+    for (index, step) in outline.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "{indent}{}. {} · {}{} · {}",
+            index + 1,
+            step.title,
+            step_harness_label(step.harness, step.acp_agent.as_deref()),
+            model_suffix(step.model.as_deref()),
+            access_label(step.access)
+        )));
+        if !step.instructions.is_empty() {
+            lines.push(Line::from(format!("{indent}   {}", step.instructions)));
+        }
+    }
+    lines
+}
+
 fn status_color(status: &str) -> Color {
     match status {
         "Needs you" | "Needs approval" | "Failed" => Color::Red,
-        "Building" | "Reviewing" | "Awaiting review" => Color::Yellow,
-        "Ready" => Color::Green,
+        "Running" => Color::Yellow,
+        "Ready" | "Ready to start" | "Complete" | "Done" => Color::Green,
         _ => Color::Gray,
     }
 }
 
 fn topic_lines(topic: &TopicInfo, color: bool) -> Vec<Line<'static>> {
+    let workspace = match (&topic.workspace, topic.workspace_kind) {
+        (Some(path), WorkspaceKind::Git) => format!("{} (git)", path.display()),
+        (Some(path), _) => path.display().to_string(),
+        (None, _) => "Scratch folder".into(),
+    };
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1574,34 +2162,28 @@ fn topic_lines(topic: &TopicInfo, color: bool) -> Vec<Line<'static>> {
             ),
             Span::raw(format!("  · {}", topic_status_label(topic))),
         ]),
-        Line::from(format!("Repository: {}", topic.repo.display())),
-        Line::from(format!("Base revision: {}", topic.base_revision)),
-        Line::from(format!(
-            "Builder: {}{}",
-            harness_label(topic.builder),
-            model_suffix(topic.builder_model.as_deref())
-        )),
-        Line::from(format!(
-            "Reviewer: {}{}",
-            harness_label(topic.reviewer),
-            model_suffix(topic.reviewer_model.as_deref())
-        )),
-        Line::from("Requests / features:"),
+        Line::from(format!("Workspace: {workspace}")),
     ];
+    if let Some(revision) = &topic.base_revision {
+        lines.push(Line::from(format!("Base revision: {revision}")));
+    }
+    lines.push(Line::from("Outline (advice; Formless decides the steps):"));
+    lines.extend(outline_lines(&topic.outline, "  "));
+    lines.push(Line::from("Work items:"));
     if topic.features.is_empty() {
-        lines.push(Line::from("  No feature requests."));
+        lines.push(Line::from("  None."));
     }
     for feature in &topic.features {
         lines.push(Line::from(format!(
-            "  #{} · source {} · {} · review round {}",
+            "  #{} · {} · {} · {} attempt(s)",
             feature.source_seq,
-            feature.source_message_id,
+            feature.id,
             feature_status_label(feature.status),
-            feature.review_round
+            feature.attempt_count
         )));
         lines.push(Line::from(format!("  Request: {}", feature.request)));
-        if let Some(revision) = &feature.ready_revision {
-            lines.push(Line::from(format!("  Ready revision: {revision}")));
+        for output in &feature.outputs {
+            lines.push(Line::from(format!("  Output: {}", artifact_label(output))));
         }
         if let Some(detail) = &feature.detail {
             lines.push(Line::from(format!("  Details: {detail}")));
@@ -1612,15 +2194,20 @@ fn topic_lines(topic: &TopicInfo, color: bool) -> Vec<Line<'static>> {
             .filter(|attempt| attempt.feature_id == feature.id)
         {
             lines.push(Line::from(format!(
-                "    {} {} · round {} · {} · conversation {}",
-                harness_label(attempt.harness),
-                role_label(attempt.role),
-                attempt.round,
+                "    {}{} · {} · {}",
+                attempt_label(attempt),
+                model_suffix(attempt.model.as_deref()),
+                access_label(attempt.access),
                 attempt_status_label(attempt),
-                attempt.conversation_session_id
             )));
-            if let Some(revision) = &attempt.revision {
-                lines.push(Line::from(format!("    Revision: {revision}")));
+            if let Some(summary) = &attempt.summary {
+                lines.push(Line::from(format!("    Summary: {summary}")));
+            }
+            for output in &attempt.outputs {
+                lines.push(Line::from(format!(
+                    "    Output: {}",
+                    artifact_label(output)
+                )));
             }
             if let Some(detail) = &attempt.detail {
                 lines.push(Line::from(format!("    Details: {detail}")));
@@ -1629,7 +2216,7 @@ fn topic_lines(topic: &TopicInfo, color: bool) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::default(),
-        Line::from("No automatic merge: ready revisions remain available for manual review."),
+        Line::from("Nothing is merged or pushed automatically."),
     ]);
     lines
 }
@@ -1681,16 +2268,15 @@ mod tests {
     fn topic(id: &str, status: TopicStatus) -> TopicInfo {
         TopicInfo {
             id: id.into(),
+            parent_topic_id: None,
             name: format!("Topic {id}"),
-            repo: PathBuf::from("/repo"),
-            base_revision: "base".into(),
+            workspace: Some(PathBuf::from("/repo")),
+            workspace_kind: formless_protocol::WorkspaceKind::Git,
+            base_revision: Some("base".into()),
+            outline: vec![],
             source_session_id: "main".into(),
             topic_session_id: Some(format!("topic-session-{id}")),
             status,
-            builder: HarnessKind::Claude,
-            builder_model: None,
-            reviewer: HarnessKind::Codex,
-            reviewer_model: None,
             features: vec![],
             attempts: vec![],
             created_at: String::new(),
@@ -1703,11 +2289,15 @@ mod tests {
             id: id.into(),
             topic_id: "t1".into(),
             feature_id: "f1".into(),
-            round: 1,
-            role: formless_protocol::HarnessRole::Build,
+            step_title: "Implement".into(),
+            access: StepAccess::Write,
+            model: None,
+            inputs: vec![],
+            outputs: vec![],
+            summary: None,
             harness: HarnessKind::Claude,
-            status: TopicAttemptStatus::Building,
-            revision: None,
+            acp_agent: None,
+            status: TopicAttemptStatus::Running,
             harness_session_id: None,
             conversation_session_id: session_id.into(),
             detail: None,
@@ -1736,12 +2326,78 @@ mod tests {
             message("a1", 2, "assistant", "Answer"),
             message("u2", 3, "user", "Second request"),
         ];
-        let form = ProposalForm::new(&source, &messages, "/repo", "Work");
+        let parents = vec![(None, "Main Chat".to_string())];
+        let form = ProposalForm::new(&source, &messages, "/repo", "Work", parents, None);
         let request = form.request().unwrap();
         assert_eq!(request.message_ids, ["u2"]);
         assert_eq!(request.source_session_id, "main");
-        assert_eq!(request.builder, HarnessKind::Claude);
-        assert_eq!(request.reviewer, HarnessKind::Codex);
+        assert_eq!(request.workspace, Some(PathBuf::from("/repo")));
+        assert!(request.outline.is_empty(), "Formless plans by default");
+        assert_eq!(request.parent_topic_id, None);
+    }
+
+    #[test]
+    fn presets_fill_any_outline_and_blank_workspace_means_scratch() {
+        let source = session("main");
+        let messages = [message("u1", 1, "user", "Do my books")];
+        let parents = vec![(None, "Main Chat".to_string())];
+        let mut form = ProposalForm::new(&source, &messages, "", "Books", parents, None);
+        form.step = ProposalStep::Fields;
+        form.field_index = 3;
+        form.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(form.preset, Preset::Accounting);
+        form.field_index = HEAD_FIELDS + 2;
+        form.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        for c in "Email".chars() {
+            form.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let request = form.request().unwrap();
+        assert_eq!(request.workspace, None);
+        let titles: Vec<_> = request
+            .outline
+            .iter()
+            .map(|step| step.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["Scan receipts", "Email", "Do accounting", "Create reports"]
+        );
+        assert_eq!(request.outline[0].harness, Some(HarnessKind::Claude));
+        assert_eq!(request.outline[1].harness, None);
+    }
+
+    #[test]
+    fn topics_nest_to_any_depth_under_main_chat() {
+        let mut state = State::default();
+        let mut story = topic("story", TopicStatus::Running);
+        story.parent_topic_id = Some("project".into());
+        story.attempts.push(attempt("a1", "harness-1"));
+        story.attempts[0].topic_id = "story".into();
+        let mut orphan = topic("orphan", TopicStatus::Approved);
+        orphan.parent_topic_id = Some("deleted".into());
+        state.update_topics(vec![story, topic("project", TopicStatus::Running), orphan]);
+        let rows: Vec<_> = state
+            .rows()
+            .into_iter()
+            .filter(|row| !row.section)
+            .map(|row| (row.depth, row.label))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (0, "Main Chat".to_string()),
+                (0, "Topic project".to_string()),
+                (1, "Topic story".to_string()),
+                (2, "Implement · Claude".to_string()),
+                (0, "Topic orphan".to_string()),
+            ]
+        );
+        assert_eq!(
+            state.breadcrumb(Some("harness-1")),
+            "Main Chat / Topic project / Topic story / Implement · Claude · read-only"
+        );
     }
 
     #[test]
@@ -1766,7 +2422,7 @@ mod tests {
         assert!(state
             .rows()
             .iter()
-            .any(|row| row.label.contains("Claude Build")));
+            .any(|row| row.label.contains("Implement · Claude")));
         assert!(state.is_harness_session("harness-1"));
     }
 
@@ -1799,12 +2455,12 @@ mod tests {
     fn paste_edits_the_focused_proposal_field_only() {
         let mut state = State::default();
         let messages = vec![message("m1", 1, "user", "add X")];
-        state.open_proposal(&session("main"), &messages, "/repo", "");
+        state.open_proposal(&session("main"), &messages, "/repo", "", None);
         state.paste("ignored on the message step");
         state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         state.paste("formless\n");
         let proposal = state.proposal.as_ref().unwrap();
-        assert_eq!(proposal.fields[0].expanded(), "formless ");
+        assert_eq!(proposal.name.expanded(), "formless ");
     }
 
     #[test]
@@ -1820,10 +2476,14 @@ mod tests {
     }
 
     #[test]
-    fn one_topic_start_is_claimed_once_even_across_refreshes() {
+    fn cancel_is_offered_only_while_a_topic_can_still_run() {
         let mut state = State::default();
-        assert!(state.claim_start("t1"));
-        assert!(!state.claim_start("t1"));
+        state.update_topics(vec![
+            topic("p", TopicStatus::PendingApproval),
+            topic("r", TopicStatus::Running),
+        ]);
+        assert!(state.open_topic_command("cancel p").is_err());
+        assert!(state.open_topic_command("cancel r").is_ok());
     }
 
     #[test]
@@ -1842,8 +2502,16 @@ mod tests {
             "Needs approval"
         );
         assert_eq!(
-            topic_status_label(&topic("ready", TopicStatus::Complete)),
-            "Ready"
+            topic_status_label(&topic("done", TopicStatus::Complete)),
+            "Complete"
+        );
+        assert_eq!(
+            topic_status_label(&topic("asks", TopicStatus::NeedsUser)),
+            "Needs you"
+        );
+        assert_eq!(
+            topic_status_label(&topic("stopped", TopicStatus::Cancelled)),
+            "Cancelled"
         );
         assert_eq!(
             topic_status_label(&topic("failed", TopicStatus::Failed)),

@@ -70,14 +70,14 @@ impl App {
         if self.topic.enabled() {
             return false;
         }
-        self.notes.push(
-            if self.topic.capability_known() {
-                "Topic Chats need a daemon with topic_orchestration_v1; /sessions still lists every session."
-            } else {
-                "Checking Topic Chat support with the daemon; try again in a moment."
-            }
-            .into(),
-        );
+        self.notes.push(if self.topic.capability_known() {
+            format!(
+                "Topic Chats need a daemon with {}; /sessions still lists every session.",
+                topic::CAPABILITY
+            )
+        } else {
+            "Checking Topic Chat support with the daemon; try again in a moment.".into()
+        });
         true
     }
 
@@ -125,7 +125,11 @@ impl App {
                 .push("This session is still loading; try /topic again.".into());
             return;
         };
-        let repo = source
+        let parent = match self.topic.topic_for_session(&current) {
+            Some(Node::Topic(topic_id)) => Some(topic_id),
+            _ => None,
+        };
+        let workspace = source
             .cwd
             .clone()
             .filter(|cwd| !cwd.trim().is_empty())
@@ -135,12 +139,13 @@ impl App {
                     .map(|dir| dir.to_string_lossy().into_owned())
             })
             .unwrap_or_default();
-        let name = std::path::Path::new(&repo)
+        let name = std::path::Path::new(&workspace)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let messages = self.messages.clone();
-        self.topic.open_proposal(&source, &messages, &repo, &name);
+        self.topic
+            .open_proposal(&source, &messages, &workspace, &name, parent.as_deref());
     }
 
     /// Always asks the daemon: a purged Main Chat is replaced there, so a
@@ -189,6 +194,18 @@ impl App {
                 self.request(Pending::TopicPropose, Request::ProposeTopic { proposal });
             }
             Action::Confirm { topic_id, action } => self.confirm_topic_action(topic_id, action),
+            Action::PermissionDecision {
+                permission_id,
+                option_id,
+            } => self.request(
+                Pending::TopicPermission {
+                    permission_id: permission_id.clone(),
+                },
+                Request::HarnessPermissionDecision {
+                    permission_id,
+                    option_id,
+                },
+            ),
             Action::Reject { topic_id, reason } => {
                 if self.claim_topic_action(format!("reject:{topic_id}")) {
                     self.request(
@@ -247,6 +264,16 @@ impl App {
                 );
             }
             ConfirmedAction::Start => self.start_topic(topic_id),
+            ConfirmedAction::Cancel => {
+                if self.claim_topic_action(format!("cancel:{topic_id}")) {
+                    self.request(
+                        Pending::TopicCancel {
+                            topic_id: topic_id.clone(),
+                        },
+                        Request::CancelTopic { topic_id },
+                    );
+                }
+            }
             ConfirmedAction::Recover => {
                 if self.claim_topic_action(format!("recover:{topic_id}")) {
                     self.request(
@@ -279,9 +306,19 @@ impl App {
     }
 
     fn start_topic(&mut self, topic_id: String) {
-        if !self.topic.claim_start(&topic_id) {
-            self.notes
-                .push("The workflow start was already requested for this topic.".into());
+        if let Some(topic) = self
+            .topic
+            .topic(&topic_id)
+            .filter(|topic| topic.status != TopicStatus::Approved)
+        {
+            self.notes.push(format!(
+                "“{}” is {}; only an approved topic can start.",
+                topic.name,
+                topic::topic_status_label(topic)
+            ));
+            return;
+        }
+        if !self.claim_topic_action(format!("start:{topic_id}")) {
             return;
         }
         self.request(
@@ -290,6 +327,38 @@ impl App {
             },
             Request::StartTopicWorkflow { topic_id },
         );
+    }
+
+    pub(crate) fn topic_permission_event(&mut self, event: Event) {
+        match event {
+            Event::HarnessPermissionRequested {
+                permission_id,
+                session_id,
+                topic_id,
+                attempt_id,
+                harness,
+                acp_agent,
+                title,
+                kind,
+                raw_input,
+                options,
+            } => self.topic.push_permission(topic::HarnessPermission {
+                permission_id,
+                session_id,
+                topic_id,
+                attempt_id,
+                harness,
+                acp_agent,
+                title,
+                kind,
+                raw_input,
+                options,
+            }),
+            Event::HarnessPermissionClosed { permission_id, .. } => {
+                self.topic.close_permission(&permission_id)
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn topic_changed(&mut self, topic_id: String) {
@@ -432,19 +501,37 @@ impl App {
                     )),
                 }
             }
-            Pending::TopicStart { topic_id } => match parse!(TopicInfo, ok, result) {
-                Some(topic) => {
-                    let name = topic.name.clone();
-                    self.topic.upsert_topic(topic, false);
+            Pending::TopicStart { topic_id } => {
+                self.pending_topic_actions
+                    .remove(&format!("start:{topic_id}"));
+                match parse!(TopicInfo, ok, result) {
+                    Some(topic) => {
+                        let name = topic.name.clone();
+                        self.topic.upsert_topic(topic, false);
+                        self.notes.push(format!(
+                            "Started “{name}”. Formless runs it from the Topic Chat; nothing merges or pushes automatically."
+                        ));
+                    }
+                    None => self.notes.push(format!("Workflow start failed: {reason}")),
+                }
+            }
+            Pending::TopicCancel { topic_id } => {
+                self.pending_topic_actions
+                    .remove(&format!("cancel:{topic_id}"));
+                self.topic_updated(
+                    ok,
+                    result,
+                    &reason,
+                    "Topic cancelled; running harness work was stopped.",
+                );
+            }
+            Pending::TopicPermission { permission_id } => {
+                if !ok {
                     self.notes.push(format!(
-                        "Workflow started for “{name}”. Ready features wait for you; nothing merges automatically."
+                        "Permission answer for {permission_id} failed: {reason}. The harness treats it as denied."
                     ));
                 }
-                None => {
-                    self.topic.release_start(&topic_id);
-                    self.notes.push(format!("Workflow start failed: {reason}"));
-                }
-            },
+            }
             Pending::TopicReject { topic_id } => {
                 self.pending_topic_actions
                     .remove(&format!("reject:{topic_id}"));
@@ -461,7 +548,12 @@ impl App {
             } => {
                 self.pending_topic_actions
                     .remove(&format!("retry:{topic_id}:{feature_id}"));
-                self.topic_updated(ok, result, &reason, "Feature retry requested.");
+                self.topic_updated(
+                    ok,
+                    result,
+                    &reason,
+                    "Work item reset. Start the topic again to run it (/topic start).",
+                );
             }
             _ => {}
         }
@@ -518,6 +610,8 @@ impl Pending {
                 | Pending::TopicReject { .. }
                 | Pending::TopicRecover { .. }
                 | Pending::TopicRetry { .. }
+                | Pending::TopicCancel { .. }
+                | Pending::TopicPermission { .. }
         )
     }
 }
@@ -572,8 +666,8 @@ mod tests {
             request: request.into(),
             status,
             active_attempt_id: None,
-            ready_revision: None,
-            review_round: 0,
+            outputs: vec![],
+            attempt_count: 0,
             detail: None,
         }
     }
@@ -581,16 +675,15 @@ mod tests {
     fn topic(id: &str, status: TopicStatus) -> TopicInfo {
         TopicInfo {
             id: id.into(),
+            parent_topic_id: None,
             name: format!("Topic {id}"),
-            repo: "/repo".into(),
-            base_revision: "base".into(),
+            workspace: Some("/repo".into()),
+            workspace_kind: formless_protocol::WorkspaceKind::Git,
+            base_revision: Some("base".into()),
+            outline: vec![],
             source_session_id: "main".into(),
             topic_session_id: Some(format!("session-{id}")),
             status,
-            builder: HarnessKind::Claude,
-            builder_model: Some("opus".into()),
-            reviewer: HarnessKind::Codex,
-            reviewer_model: Some("sol".into()),
             features: vec![
                 feature("x", "Add X", TopicFeatureStatus::Pending),
                 feature("y", "Add Y", TopicFeatureStatus::Pending),
@@ -601,21 +694,26 @@ mod tests {
         }
     }
 
-    fn attempt(topic_id: &str, session: &str, role: HarnessRole) -> TopicAttemptInfo {
+    fn attempt(topic_id: &str, session: &str, harness: HarnessKind) -> TopicAttemptInfo {
         TopicAttemptInfo {
             id: format!("attempt-{session}"),
             topic_id: topic_id.into(),
             feature_id: "x".into(),
-            round: 1,
-            role,
-            harness: if role == HarnessRole::Build {
-                HarnessKind::Claude
+            step_title: if harness == HarnessKind::Claude {
+                "Implement"
             } else {
-                HarnessKind::Codex
-            },
-            status: TopicAttemptStatus::Building,
+                "Review"
+            }
+            .into(),
+            access: formless_protocol::StepAccess::Write,
+            model: None,
+            inputs: vec![],
+            outputs: vec![],
+            summary: None,
+            harness,
+            acp_agent: None,
+            status: TopicAttemptStatus::Running,
             conversation_session_id: session.into(),
-            revision: None,
             harness_session_id: None,
             detail: None,
             created_at: String::new(),
@@ -648,6 +746,7 @@ mod tests {
                             | Request::StartTopicWorkflow { .. }
                             | Request::RecoverTopic { .. }
                             | Request::RetryTopicFeature { .. }
+                            | Request::CancelTopic { .. }
                     )
                 })
                 .collect()
@@ -802,7 +901,12 @@ mod tests {
         assert!(wire.topic_requests().is_empty());
 
         app.topic_slash("topic", "");
-        for _ in 0..7 {
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        press(&mut app, KeyCode::Right);
+        for _ in 0..11 {
             press(&mut app, KeyCode::Enter);
         }
         assert!(
@@ -817,9 +921,23 @@ mod tests {
         };
         assert_eq!(proposal.message_ids, ["m1"]);
         assert_eq!(proposal.name, "formless");
-        assert_eq!(proposal.repo, std::path::PathBuf::from("/work/formless"));
-        assert_eq!(proposal.builder, HarnessKind::Claude);
-        assert_eq!(proposal.reviewer, HarnessKind::Codex);
+        assert_eq!(
+            proposal.workspace,
+            Some(std::path::PathBuf::from("/work/formless"))
+        );
+        assert_eq!(proposal.parent_topic_id, None);
+        let steps: Vec<_> = proposal
+            .outline
+            .iter()
+            .map(|step| (step.title.as_str(), step.harness, step.access))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("Implement", Some(HarnessKind::Claude), StepAccess::Write),
+                ("Review", Some(HarnessKind::Codex), StepAccess::ReadOnly),
+            ]
+        );
         wire.respond(
             &mut app,
             requests[0].id,
@@ -879,12 +997,108 @@ mod tests {
         assert!(wire.topic_requests().is_empty());
     }
 
+    fn permission_event(id: &str) -> Event {
+        Event::HarnessPermissionRequested {
+            permission_id: id.into(),
+            session_id: "claude-1".into(),
+            topic_id: "t1".into(),
+            attempt_id: "attempt-claude-1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run cargo test".into(),
+            kind: "execute".into(),
+            raw_input: Some(serde_json::json!({ "command": "cargo test" })),
+            options: vec![
+                formless_protocol::HarnessPermissionOption {
+                    option_id: "allow".into(),
+                    name: "Allow once".into(),
+                    kind: formless_protocol::HarnessPermissionOptionKind::AllowOnce,
+                },
+                formless_protocol::HarnessPermissionOption {
+                    option_id: "always".into(),
+                    name: "Always allow".into(),
+                    kind: formless_protocol::HarnessPermissionOptionKind::AllowAlways,
+                },
+            ],
+        }
+    }
+
+    fn permission_decisions(wire: &Wire) -> Vec<(String, Option<String>)> {
+        wire.requests()
+            .into_iter()
+            .filter_map(|sent| match sent.request {
+                Request::HarnessPermissionDecision {
+                    permission_id,
+                    option_id,
+                } => Some((permission_id, option_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn harness_permissions_wait_for_the_user_and_esc_denies() {
+        let mut running = topic("t1", TopicStatus::Running);
+        running
+            .attempts
+            .push(attempt("t1", "claude-1", HarnessKind::Claude));
+        let (mut app, wire) = connected(vec![running]);
+        app.on_event(permission_event("p1"));
+        app.on_event(permission_event("p1"));
+        app.on_event(permission_event("p2"));
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("Run cargo test"), "{screen}");
+        assert!(screen.contains("Topic t1 / Implement · Claude"), "{screen}");
+        assert!(screen.contains("1 more permission"), "{screen}");
+        assert!(
+            permission_decisions(&wire).is_empty(),
+            "nothing is auto-answered"
+        );
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            permission_decisions(&wire),
+            [("p1".into(), Some("always".into())), ("p2".into(), None)]
+        );
+        assert!(!app.topic.overlay_open());
+        app.on_event(permission_event("p3"));
+        app.on_event(Event::HarnessPermissionClosed {
+            permission_id: "p3".into(),
+            option_id: None,
+            by: None,
+        });
+        assert!(!app.topic.overlay_open());
+    }
+
+    #[test]
+    fn cancel_asks_first_then_sends_cancel_topic() {
+        let (mut app, wire) = connected(vec![topic("t1", TopicStatus::Running)]);
+        app.topic_slash("topic", "cancel t1");
+        assert!(wire.topic_requests().is_empty());
+        press(&mut app, KeyCode::Enter);
+        let requests = wire.topic_requests();
+        assert!(matches!(
+            &requests[..],
+            [sent] if matches!(&sent.request, Request::CancelTopic { topic_id } if topic_id == "t1")
+        ));
+        wire.respond(
+            &mut app,
+            requests[0].id,
+            serde_json::to_value(topic("t1", TopicStatus::Cancelled)).unwrap(),
+        );
+        assert!(app.notes.last().unwrap().contains("cancelled"));
+        assert_eq!(
+            app.topic.topic("t1").unwrap().status,
+            TopicStatus::Cancelled
+        );
+    }
+
     #[test]
     fn harness_conversations_are_read_only_but_accept_commands() {
         let mut running = topic("t1", TopicStatus::Running);
         running
             .attempts
-            .push(attempt("t1", "claude-1", HarnessRole::Build));
+            .push(attempt("t1", "claude-1", HarnessKind::Claude));
         let (mut app, wire) = connected(vec![running]);
         app.current = Some("claude-1".into());
         app.input.set("please change this");
@@ -902,7 +1116,7 @@ mod tests {
         let mut running = topic("t1", TopicStatus::Running);
         running
             .attempts
-            .push(attempt("t1", "codex-1", HarnessRole::Review));
+            .push(attempt("t1", "codex-1", HarnessKind::Codex));
         let (mut app, _wire) = connected(vec![running.clone()]);
         app.topic.set_main(session("main"));
         app.current = Some("main".into());
@@ -939,7 +1153,7 @@ mod tests {
         assert!(wire.requests().is_empty());
         app.topic_slash("topics", "");
         assert!(!app.topic.overlay_open());
-        assert!(app.notes.last().unwrap().contains("topic_orchestration_v1"));
+        assert!(app.notes.last().unwrap().contains("topic_orchestration_v2"));
     }
 
     fn render(app: &mut App, width: u16) -> String {
@@ -960,13 +1174,13 @@ mod tests {
     fn wide_terminals_show_the_hierarchy_and_narrow_ones_a_breadcrumb() {
         let _env = credential_env::EnvGuard::isolated();
         let mut running = topic("t1", TopicStatus::Running);
-        running.features[0].status = TopicFeatureStatus::Building;
+        running.features[0].status = TopicFeatureStatus::Running;
         running
             .attempts
-            .push(attempt("t1", "claude-1", HarnessRole::Build));
+            .push(attempt("t1", "claude-1", HarnessKind::Claude));
         running
             .attempts
-            .push(attempt("t1", "codex-1", HarnessRole::Review));
+            .push(attempt("t1", "codex-1", HarnessKind::Codex));
         let (mut app, _wire) = connected(vec![topic("t0", TopicStatus::PendingApproval), running]);
         app.current = Some("claude-1".into());
         let wide = render(&mut app, 140);
@@ -976,19 +1190,19 @@ mod tests {
             "Topic t0",
             "Needs approval",
             "Topic t1",
-            "Building",
-            "Claude Build",
-            "Codex Review",
+            "Running",
+            "Implement · Claude",
+            "Review · Codex",
             "read-only",
         ] {
             assert!(wide.contains(expected), "missing {expected}:\n{wide}");
         }
         let narrow = render(&mut app, 80);
         assert!(!narrow.contains("Topic Chats\n"));
-        assert!(narrow.contains("Topic t1 / Claude Build"), "{narrow}");
+        assert!(narrow.contains("Topic t1 / Implement · Claude"), "{narrow}");
         assert!(narrow.contains("/topics"));
         app.topic.open_picker();
         let picker = render(&mut app, 80);
-        assert!(picker.contains("Codex Review"), "{picker}");
+        assert!(picker.contains("Review · Codex"), "{picker}");
     }
 }
