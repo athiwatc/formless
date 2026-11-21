@@ -17,6 +17,7 @@ pub(super) struct Panel {
     target: Option<Target>,
     stage: Stage,
     frozen: String,
+    typed: Option<String>,
     input: Entity<TextareaState>,
     notice: String,
     focus: FocusHandle,
@@ -91,6 +92,7 @@ impl Shell {
             target: None,
             stage: Stage::Loading,
             frozen: String::new(),
+            typed: None,
             input,
             notice: "Reading the current canonical action target…".into(),
             focus: cx.focus_handle(),
@@ -232,6 +234,7 @@ impl Shell {
         owner: Owner,
         operation: uuid::Uuid,
         quote: Option<formless_protocol::RunForecast>,
+        reviewed_text: Option<String>,
         cx: &mut Context<Self>,
     ) {
         if self.run_action_owner().as_ref() != Some(&owner) {
@@ -240,6 +243,10 @@ impl Shell {
         if let Some(p) = self.run_actions.panel.as_mut().filter(|p| {
             p.owner == owner && p.operation == operation && matches!(p.stage, Stage::Preparing)
         }) {
+            if let Some(text) = reviewed_text.filter(|_| p.kind == Kind::Cwd) {
+                p.typed = (p.frozen != text).then(|| p.frozen.clone());
+                p.frozen = text;
+            }
             p.stage = Stage::Review(quote.map(Box::new));
         }
         cx.notify();
@@ -419,6 +426,18 @@ impl Shell {
                     .into_iter()
                     .enumerate()
                     .map(|(i, text)| div().id(("run-action-quote", i)).text_sm().child(text)),
+            );
+        }
+        if let Some(typed) = &p.typed {
+            body = body.child(
+                readable(
+                    "run-action-typed",
+                    format!(
+                        "Typed input (JSON): {}",
+                        serde_json::to_string(typed).unwrap()
+                    ),
+                )
+                .text_sm(),
             );
         }
         let dialog = v_flex().id("run-action-dialog").test_support().role(Role::Dialog).aria_label(p.kind.label()).aria_description("Modal action review. Escape cancels. Review the exact Session, Run and input before confirming. Writes are acknowledged and never replayed.").map(modal_dialog)

@@ -2340,7 +2340,8 @@ impl Shell {
                 owner,
                 operation,
                 quote,
-            } => self.run_action_review(owner, operation, quote, cx),
+                reviewed_text,
+            } => self.run_action_review(owner, operation, quote, reviewed_text, cx),
             ClientUpdate::RunActionReady { owner, operation } => {
                 self.run_action_ready(owner, operation, cx)
             }

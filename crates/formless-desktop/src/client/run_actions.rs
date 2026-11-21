@@ -25,6 +25,7 @@ pub(super) fn definite_rejection(message: &ServerMessage) -> bool {
 
 #[derive(Debug)]
 pub(super) struct Work {
+    cwd_input: Option<String>,
     pub(super) sent_at: Option<std::time::Instant>,
     pub dispatch: Dispatch,
     revision: u64,
@@ -32,6 +33,22 @@ pub(super) struct Work {
     consent: bool,
     confirmed: bool,
     pub sent: bool,
+}
+impl Work {
+    fn verify_cwd(&self) -> Result<(), String> {
+        if let Some(input) = &self.cwd_input {
+            let mut current = self.dispatch.action.clone();
+            current.text = input.clone();
+            current.canonicalize_cwd()?;
+            if current.text != self.dispatch.action.text {
+                return Err(
+                    "Working directory changed after review. Review again; nothing was sent."
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for Work {
     fn drop(&mut self) {
@@ -194,6 +211,8 @@ impl Engine {
         }
         let id = dispatch.action.owner.session.clone();
         let work = Box::new(Work {
+            cwd_input: (dispatch.action.kind == crate::run_actions::Kind::Cwd)
+                .then(|| dispatch.action.text.clone()),
             sent_at: None,
             dispatch,
             revision: self.status_revision,
@@ -229,7 +248,7 @@ impl Engine {
                     .reject("Forecast consent was not completed. Nothing was sent.");
                 return;
             }
-            if let Err(error) = work.dispatch.action.canonicalize_cwd() {
+            if let Err(error) = work.verify_cwd() {
                 work.dispatch.reject(&error);
                 return;
             }
@@ -243,6 +262,10 @@ impl Engine {
                 Pending::RunForecast(work),
             );
         } else {
+            if let Err(error) = work.dispatch.action.canonicalize_cwd() {
+                work.dispatch.reject(&error);
+                return;
+            }
             self.action_review(work);
         }
     }
@@ -254,6 +277,12 @@ impl Engine {
             owner: work.dispatch.action.owner.clone(),
             operation: work.dispatch.action.operation,
             quote: work.quote.clone(),
+            reviewed_text: (work.dispatch.action.kind == crate::run_actions::Kind::Cwd).then(
+                || match work.dispatch.action.request() {
+                    Request::SetSessionCwd { cwd, .. } => cwd.unwrap_or_default(),
+                    _ => unreachable!(),
+                },
+            ),
         });
         self.action_work = Some(work);
     }
@@ -372,6 +401,11 @@ impl Engine {
         let Some(Pending::RunWrite(w)) = self.pending.get_mut(&id) else {
             return false;
         };
+        if let Err(error) = w.verify_cwd() {
+            w.dispatch.reject(&error);
+            self.pending.remove(&id);
+            return false;
+        }
         if !w.dispatch.before_write() {
             self.pending.remove(&id);
             return false;
@@ -973,13 +1007,69 @@ mod tests {
         ] {
             let (mut e, ledger, mut d) = setup(Kind::Cwd);
             d.action.text = input;
-            review(&mut e, d.clone(), false);
-            e.command(Command::ConfirmRunAction(d.action.operation));
-            e.command(Command::CommitRunAction(d.action.operation));
+            e.command(Command::PrepareRunAction(d));
             reply(&mut e, snapshot());
             assert!(matches!(ledger.status(), Status::Rejected(e) if e.contains(reason)));
             assert!(e.outgoing.is_empty());
             assert!(e.run_recoveries.lock().unwrap().is_empty());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cwd_review_freezes_the_symlink_destination_and_rejects_changes() {
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        for change in 0..4 {
+            let root = Directory(
+                std::env::temp_dir().join(format!("fl-reviewed-cwd-{}", uuid::Uuid::new_v4())),
+            );
+            std::fs::create_dir_all(root.0.join("destination")).unwrap();
+            std::fs::create_dir(root.0.join("other")).unwrap();
+            let link = root.0.join("link");
+            std::os::unix::fs::symlink(root.0.join("destination"), &link).unwrap();
+            let destination = link.canonicalize().unwrap().to_str().unwrap().to_string();
+            let (mut e, ledger, mut d) = setup(Kind::Cwd);
+            let mut before = snapshot();
+            before["session"]["cwd"] = json!(root.0.canonicalize().unwrap().to_str().unwrap());
+            d.action.target = Target::decode("s", &before).unwrap();
+            d.action.text = "link".into();
+            e.command(Command::PrepareRunAction(d.clone()));
+            reply(&mut e, before.clone());
+            assert!(e.updates.iter().any(|u| matches!(u, Update::RunActionReview { reviewed_text: Some(text), .. } if text == &destination)));
+            assert_eq!(
+                e.action_work.as_ref().unwrap().dispatch.action.text,
+                destination
+            );
+            if change == 1 {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink(root.0.join("other"), &link).unwrap();
+            } else if change == 2 {
+                std::fs::remove_dir(root.0.join("destination")).unwrap();
+            }
+            e.command(Command::ConfirmRunAction(d.action.operation));
+            e.command(Command::CommitRunAction(d.action.operation));
+            reply(&mut e, before);
+            if change == 1 || change == 2 {
+                assert!(e.outgoing.is_empty());
+                assert!(matches!(ledger.status(), Status::Rejected(_)));
+            } else {
+                let request = e.outgoing.pop_front().unwrap();
+                assert!(
+                    matches!(&request.request, Request::SetSessionCwd { cwd: Some(path), .. } if path == &destination)
+                );
+                if change == 3 {
+                    std::fs::remove_file(&link).unwrap();
+                    std::os::unix::fs::symlink(root.0.join("other"), &link).unwrap();
+                    assert!(!e.action_before_write(request.id));
+                    assert!(matches!(ledger.status(), Status::Rejected(_)));
+                } else {
+                    assert!(e.action_before_write(request.id));
+                }
+            }
         }
     }
     #[test]

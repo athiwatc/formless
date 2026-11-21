@@ -45,6 +45,60 @@ fn open_action(
 }
 
 #[gpui_kit::test]
+fn cwd_review_shows_the_frozen_destination_and_original_typed_path(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        select(&shell, &sessions[0].id, window, cx);
+        let (owner, operation) = open_action(&shell, Kind::Cwd, window, cx);
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::RunActionTarget {
+                    owner: owner.clone(),
+                    operation,
+                    result: Ok(
+                        Target::decode(&owner.session, &value(&owner.session, false)).unwrap(),
+                    ),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.press("shift-tab", cx);
+        window.input("link", cx);
+        window.click("run-action-prepare", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, Wire::PrepareRunAction(d) if d.action.text == "link")));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::RunActionReview {
+                    owner,
+                    operation,
+                    quote: None,
+                    reviewed_text: Some("/canonical/destination".into()),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window
+            .find("run-action-frozen")
+            .value()
+            .unwrap()
+            .contains("/canonical/destination"));
+        assert!(window
+            .find("run-action-typed")
+            .value()
+            .unwrap()
+            .contains("\"link\""));
+        assert_eq!(window.find("run-action-confirm").disabled(), None);
+    });
+}
+#[gpui_kit::test]
 fn every_run_action_control_reviews_exact_target_and_requires_explicit_confirmation(
     cx: &mut TestAppContext,
 ) {
@@ -103,6 +157,7 @@ fn every_run_action_control_reviews_exact_target_and_requires_explicit_confirmat
                     Update::RunActionReview {
                         owner: owner.clone(),
                         operation,
+                        reviewed_text: None,
                         quote: matches!(kind, Kind::Edit | Kind::Retry)
                             .then(|| fixture::run_forecast(&owner.session, true)),
                     },
@@ -209,6 +264,7 @@ fn cancelled_stale_or_disconnected_action_reviews_cannot_commit(cx: &mut TestApp
                     owner,
                     operation,
                     quote: None,
+                    reviewed_text: None,
                 },
                 window,
                 cx,

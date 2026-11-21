@@ -70,6 +70,7 @@ pub enum Update {
         owner: crate::run_actions::Owner,
         operation: uuid::Uuid,
         quote: Option<formless_protocol::RunForecast>,
+        reviewed_text: Option<String>,
     },
     RunActionReady {
         owner: crate::run_actions::Owner,
