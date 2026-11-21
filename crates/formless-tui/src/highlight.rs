@@ -267,6 +267,12 @@ const C_LIKE: Lang = Lang {
     regex: false,
 };
 
+// PHP hash comments are distinct from C preprocessor directives.
+const PHP: Lang = Lang {
+    line_comments: &["//", "#"],
+    ..C_LIKE
+};
+
 const JSON: Lang = Lang {
     line_comments: NONE,
     block_comment: None,
@@ -280,6 +286,17 @@ const JSON: Lang = Lang {
     nested: false,
     raw_strings: false,
     regex: false,
+};
+
+// Strict JSON stays comment-free; the extensions opt into their own grammar.
+const JSONC: Lang = Lang {
+    line_comments: &["//"],
+    block_comment: Some(("/*", "*/")),
+    ..JSON
+};
+const JSON5: Lang = Lang {
+    quotes: &['"', '\''],
+    ..JSONC
 };
 
 /// YAML and TOML: `#` comments only, so `key: a;b` keeps its `;` (#877).
@@ -413,6 +430,14 @@ const CSS: Lang = Lang {
     regex: false,
 };
 
+/// MySQL requires whitespace or a control character after a double dash.
+const MYSQL: Lang = Lang {
+    line_comments: &["--", "#"],
+    quotes: &['\'', '"', '`'],
+    multiline: &["'", "\"", "`"],
+    ..SQL
+};
+
 /// `--` comments: Lua, Haskell.
 const SQL_DASH: Lang = Lang {
     line_comments: &["--"],
@@ -443,12 +468,16 @@ fn lang(name: &str) -> Option<&'static Lang> {
         | "dockerfile" | "docker" | "make" | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir"
         | "ex" | "exs" | "perl" | "pl" => &SHELL,
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
-        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "php" | "zig" | "objc" => &C_LIKE,
+        | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "zig" | "objc" => &C_LIKE,
+        "php" => &PHP,
         "lua" | "haskell" | "hs" => &SQL_DASH,
-        "json" | "jsonc" | "json5" => &JSON,
+        "json" => &JSON,
+        "jsonc" => &JSONC,
+        "json5" => &JSON5,
         "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
-        "sql" | "sqlite" | "postgres" | "postgresql" | "mysql" => &SQL,
+        "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
+        "mysql" => &MYSQL,
         "html" | "xml" | "svg" | "vue" | "svelte" => &MARKUP,
         "css" | "scss" | "less" => &CSS,
         _ => return None,
@@ -472,6 +501,9 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    mysql_comments: bool,
+    php_comments: bool,
+    json5_strings: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -591,6 +623,9 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            mysql_comments: name == "mysql",
+            php_comments: name == "php",
+            json5_strings: name == "json5",
             color,
             in_block: 0,
             in_str: None,
@@ -616,7 +651,11 @@ impl Highlighter {
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
+        let mysql = self.mysql_comments;
+        let php = self.php_comments;
         let chars: Vec<char> = line.chars().collect();
+        let continues_string =
+            self.json5_strings && line.bytes().rev().take_while(|&b| b == b'\\').count() % 2 != 0;
         let at = |i: usize, pat: &str| {
             (i..)
                 .zip(pat.chars())
@@ -656,7 +695,7 @@ impl Highlighter {
         let close_at = |from: usize, close: &str| -> Option<usize> {
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' {
+                if chars[j] == '\\' && !(mysql && close == "`") {
                     j += 2;
                     continue;
                 }
@@ -747,11 +786,33 @@ impl Highlighter {
                     continue;
                 }
             }
-            if l.line_comments.iter().any(|p| at(i, p))
-                && (c != '#' || self.python_comments || i == 0 || chars[i - 1].is_whitespace())
+            let hash_comment = c != '#'
+                || if php {
+                    chars.get(i + 1) != Some(&'[')
+                } else {
+                    self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace()
+                };
+            if hash_comment
+                && l.line_comments.iter().any(|p| {
+                    at(i, p)
+                        && (!mysql
+                            || *p != "--"
+                            || chars
+                                .get(i + 2)
+                                .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control()))
+                })
             {
-                push(Tok::Comment, &chars[i..]);
-                break;
+                // A PHP closing tag ends a line comment as well as the code.
+                let end = if php {
+                    (i..chars.len())
+                        .find(|&j| at(j, "?>"))
+                        .unwrap_or(chars.len())
+                } else {
+                    chars.len()
+                };
+                push(Tok::Comment, &chars[i..end]);
+                i = end;
+                continue;
             }
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
@@ -857,6 +918,9 @@ impl Highlighter {
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
+                if continues_string && j >= chars.len() {
+                    self.in_str = Some(c.to_string());
+                }
                 i = stop;
                 continue;
             }
@@ -942,6 +1006,11 @@ impl Highlighter {
             }
             push(Tok::Plain, &chars[i..i + 1]);
             i += 1;
+        }
+        // JSON5 needs a fresh escape on every physical line of a
+        // continued string, including when the next line is empty.
+        if self.json5_strings && !continues_string {
+            self.in_str = None;
         }
         toks.into_iter()
             .map(|(t, s)| Span::styled(s, self.style(t)))
@@ -1067,6 +1136,127 @@ mod tests {
             .into_iter()
             .map(|s| (s.content.to_string(), s.style.fg))
             .collect()
+    }
+
+    #[test]
+    fn json_extensions_keep_comments_and_strings_separate() {
+        for lang in ["jsonc", "json5"] {
+            let source = r#"// keep "draft": true /*"#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+            let mut h = Highlighter::new(lang, true).unwrap();
+            h.line(r#"/* "draft": true"#);
+            let next = h.line("// keep */ null");
+            assert_eq!(next[0].style.fg, Some(Color::DarkGray));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "null" && s.style.fg != Some(Color::DarkGray)));
+            let source = r#""https://example.com/ /* \" true""#;
+            assert_eq!(
+                toks(lang, source),
+                vec![(source.into(), Some(Color::Green))]
+            );
+            let non_nested = toks(lang, "/* outer /* inner */ true");
+            assert!(non_nested
+                .iter()
+                .any(|(s, c)| s == "true" && *c != Some(Color::DarkGray)));
+        }
+        let source = r"'it\'s // /* true'";
+        assert_eq!(
+            toks("json5", source),
+            vec![(source.into(), Some(Color::Green))]
+        );
+        for lang in ["json", "jsonc"] {
+            assert!(!toks(lang, "'formless'")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::Green)));
+        }
+        assert!(!toks("json", r#"// "draft": true /* false */"#)
+            .iter()
+            .any(|(_, c)| *c == Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn json5_string_continuation_keeps_comment_markers_literal() {
+        for quote in ['"', '\''] {
+            let first = format!("{{{quote}message{quote}: {quote}first\\");
+            let mut highlighter = Highlighter::new("json5", true).unwrap();
+            highlighter.line(&first);
+            let middle = "// continued \\";
+            let second = highlighter.line(middle);
+            assert_eq!(second[0].style.fg, Some(Color::Green));
+            assert_eq!(second[0].content, middle);
+            let last = format!("/* literal */{quote}, ok: true}}");
+            let third = highlighter.line(&last);
+            assert_eq!(third[0].content, format!("/* literal */{quote}"));
+            assert_eq!(third[0].style.fg, Some(Color::Green));
+            assert!(third.iter().any(|span| {
+                span.content == "true" && span.style.fg == Some(Color::LightMagenta)
+            }));
+        }
+
+        let mut highlighter = Highlighter::new("json5", true).unwrap();
+        highlighter.line(r"'even slashes \\");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
+        highlighter.line(r"'continued \");
+        highlighter.line("");
+        assert_eq!(
+            highlighter.line("// comment")[0].style.fg,
+            Some(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn mysql_comments_do_not_change_generic_sql() {
+        let tokens = toks("mysql", "SELECT 1;# keep /* false");
+        assert!(tokens.contains(&("# keep /* false".into(), Some(Color::DarkGray))));
+        let tokens = toks("mysql", "SELECT 1--2 AS n");
+        assert!(!tokens.iter().any(|(_, c)| *c == Some(Color::DarkGray)));
+        assert!(tokens
+            .iter()
+            .any(|(s, c)| s == "AS" && *c == Some(Color::Magenta)));
+        for source in ["--", "-- comment", "--\tcomment"] {
+            assert_eq!(
+                toks("mysql", source),
+                vec![(source.into(), Some(Color::DarkGray))]
+            );
+        }
+        for quoted in ["'# -- /*'", r##""# -- /*""##, "`# -- /*`", "`a\\`"] {
+            assert_eq!(
+                toks("mysql", quoted),
+                vec![(quoted.into(), Some(Color::Green))]
+            );
+        }
+        let mut h = Highlighter::new("mysql", true).unwrap();
+        h.line("# keep /* false");
+        assert!(h.line("SELECT 1").iter().any(|s| s.content == "SELECT"));
+        h.line("/* real block");
+        assert!(h
+            .line("# --")
+            .iter()
+            .all(|s| s.style.fg == Some(Color::DarkGray)));
+        assert!(h.line("*/ SELECT 2").iter().any(|s| s.content == "SELECT"));
+        h.line(r#"SELECT "first"#);
+        let closing = h.line(r##"# continued" AS label # comment"##);
+        assert_eq!(closing[0].content, "# continued\"");
+        assert_eq!(closing[0].style.fg, Some(Color::Green));
+        assert!(closing
+            .iter()
+            .any(|s| s.content == "# comment" && s.style.fg == Some(Color::DarkGray)));
+        assert!(
+            toks("mysql", "`a\\`# comment").contains(&("# comment".into(), Some(Color::DarkGray)))
+        );
+        for lang in ["sql", "sqlite", "postgres", "postgresql"] {
+            assert!(toks(lang, "1--2 AS n").contains(&("--2 AS n".into(), Some(Color::DarkGray))));
+            assert!(!toks(lang, "# drop table")
+                .iter()
+                .any(|(_, c)| *c == Some(Color::DarkGray)));
+        }
     }
 
     #[test]
@@ -1248,6 +1438,71 @@ mod tests {
                     .contains(&("# comment".into(), Some(Color::DarkGray))),
                 "{lang}"
             );
+        }
+    }
+
+    #[test]
+    fn php_hash_comments_do_not_open_blocks_or_consume_attributes() {
+        for lang in ["php", "PHP"] {
+            for first in ["# note: /* not a block", "foo();# /* note"] {
+                let mut h = Highlighter::new(lang, true).unwrap();
+                let spans = h.line(first);
+                assert_eq!(
+                    spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+                    first
+                );
+                let comments: String = spans
+                    .iter()
+                    .filter(|s| s.style.fg == Some(Color::DarkGray))
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                assert_eq!(comments, &first[first.find('#').unwrap()..]);
+                assert_eq!(h.in_block, 0);
+                for line in [r#"return "hi";"#, "class User {}"] {
+                    let spans = h.line(line);
+                    assert!(spans.iter().all(|s| s.style.fg != Some(Color::DarkGray)));
+                    assert!(spans.iter().any(|s| {
+                        s.content == line.split_whitespace().next().unwrap()
+                            && s.style.fg == Some(Color::Magenta)
+                    }));
+                }
+            }
+            for line in [r##"#[Route("/users")]"##, r##""# not a comment""##] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+            assert!(toks(lang, "// return").contains(&("// return".into(), Some(Color::DarkGray))));
+        }
+        for lang in ["c", "cpp", "java", "rust"] {
+            for line in ["#include <stdio.h>", "#define VALUE 1"] {
+                assert!(toks(lang, line)
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)));
+            }
+        }
+        assert!(toks("python", "x=1# note").contains(&("# note".into(), Some(Color::DarkGray))));
+        assert!(toks("yaml", "key: foo#bar")
+            .iter()
+            .all(|(_, color)| *color != Some(Color::DarkGray)));
+    }
+
+    #[test]
+    fn php_line_comments_stop_before_a_closing_tag() {
+        for opener in ["#", "//"] {
+            let line = format!("<?php foo();{opener} note ?> <p>outside</p>");
+            let tokens = toks("php", &line);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                line
+            );
+            assert!(tokens.contains(&(format!("{opener} note "), Some(Color::DarkGray))));
+            assert!(!tokens.iter().any(|(text, color)| {
+                *color == Some(Color::DarkGray) && text.contains("outside")
+            }));
         }
     }
 

@@ -126,6 +126,66 @@ pub(crate) fn pad(s: &str, width: usize) -> String {
     format!("{out}{}", " ".repeat(width.saturating_sub(w)))
 }
 
+/// Format an RFC 3339 instant in the client's local time, to the minute.
+/// Legacy values keep their byte-boundary-safe date prefix when possible.
+pub fn local_timestamp(ts: &str) -> String {
+    local_timestamp_in(ts, &Local, "%Y-%m-%d %H:%M %:z")
+        .unwrap_or_else(|| ts.get(..16).unwrap_or(ts).to_string())
+}
+
+/// As in the minute view, with seconds for the Run list. A malformed Run
+/// timestamp keeps the list's historical prefix-or-empty fallback.
+pub fn local_timestamp_seconds(ts: &str) -> String {
+    local_timestamp_in(ts, &Local, "%Y-%m-%d %H:%M:%S %:z")
+        .unwrap_or_else(|| ts.get(..19).unwrap_or_default().to_string())
+}
+
+fn local_timestamp_in(ts: &str, zone: &impl chrono::TimeZone, format: &str) -> Option<String> {
+    let instant = DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(
+        instant
+            .with_timezone(zone)
+            .fixed_offset()
+            .format(format)
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn local_timestamps_convert_from_the_wire_offset_and_preserve_legacy_fallbacks() {
+    let bangkok = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+    for stamp in [
+        "2026-07-01T02:00:33Z",
+        "2026-07-01T09:00:33+07:00",
+        "2026-06-30T22:30:33-03:30",
+    ] {
+        assert_eq!(
+            local_timestamp_in(stamp, &bangkok, "%Y-%m-%d %H:%M %:z").as_deref(),
+            Some("2026-07-01 09:00 +07:00")
+        );
+    }
+    let west = chrono::FixedOffset::west_opt(3 * 3600 + 1800).unwrap();
+    assert_eq!(
+        local_timestamp_in("2026-07-01T02:00:33+00:00", &west, "%Y-%m-%d %H:%M:%S %:z").as_deref(),
+        Some("2026-06-30 22:30:33 -03:30")
+    );
+    assert_eq!(
+        local_timestamp("2026-07-01T02:00 legacy"),
+        "2026-07-01T02:00"
+    );
+    assert_eq!(
+        local_timestamp("123456789012345界tail"),
+        "123456789012345界tail"
+    );
+    assert_eq!(
+        local_timestamp_seconds("2026-07-01T02:00:33 legacy"),
+        "2026-07-01T02:00:33"
+    );
+    assert_eq!(local_timestamp_seconds(""), "");
+    assert_eq!(local_timestamp_seconds("bad time"), "");
+}
+
 pub(crate) fn relative_time(ts: &str, now: DateTime<Utc>) -> String {
     let Ok(t) = DateTime::parse_from_rfc3339(ts) else {
         return ts.to_string();
