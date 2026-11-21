@@ -743,6 +743,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 )
             }
             "find" => return Some("find can run any program (-exec)"),
+            _ if stem == "pip" => {
+                return Some("pip can execute code from package build backends")
+            }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
@@ -3880,6 +3883,27 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+    }
+
+    #[test]
+    fn pip_requires_broad_process_confirmation() {
+        for spec in [
+            "process:pip",
+            "process:pip3",
+            "process:pip3.11",
+            "process:/usr/bin/pip3",
+            "process:pip.exe",
+            "process:pip:install",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("pip can execute code from package build backends"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:pipx", "process:pipenv", "process:piper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
