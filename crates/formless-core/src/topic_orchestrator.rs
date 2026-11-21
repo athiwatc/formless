@@ -81,6 +81,50 @@ fn private_file(path: &Path) -> Result<std::fs::File> {
     Ok(options.open(path)?)
 }
 
+fn resolve_directory_link(path: &Path) -> Result<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match prefix.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&prefix).is_ok() {
+                    bail!("directory symlink target contains an unresolvable link");
+                }
+                missing.push(
+                    prefix
+                        .components()
+                        .next_back()
+                        .context("missing symlink target prefix")?
+                        .as_os_str()
+                        .to_os_string(),
+                );
+                if !prefix.pop() {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    for component in missing.into_iter().rev() {
+        if component == ".." {
+            resolved.pop();
+        } else if component != "." {
+            resolved.push(component);
+        }
+        match resolved.canonicalize() {
+            Ok(existing) => resolved = existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&resolved).is_ok() {
+                    bail!("directory symlink target contains an unresolvable link");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(resolved)
+}
+
 fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken) -> Result<()> {
     let source = source.canonicalize()?;
     if !source.is_dir() || destination.starts_with(&source) {
@@ -109,24 +153,17 @@ fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken)
             let kind = entry.file_type()?;
             if kind.is_symlink() {
                 let link = std::fs::read_link(&path)?;
-                let mut resolved = path
-                    .parent()
-                    .context("missing source parent")?
-                    .to_path_buf();
-                for component in link.components() {
-                    match component {
-                        std::path::Component::Normal(part) => resolved.push(part),
-                        std::path::Component::CurDir => {}
-                        std::path::Component::ParentDir => {
-                            if !resolved.pop() {
-                                bail!("directory symlink escapes the source tree");
-                            }
-                        }
-                        std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                            bail!("directory symlink escapes the source tree: absolute targets are not allowed");
-                        }
-                    }
+                if link.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    bail!("directory symlink escapes the source tree: absolute targets are not allowed");
                 }
+                let resolved = resolve_directory_link(
+                    &path.parent().context("missing source parent")?.join(&link),
+                )?;
                 if !resolved.starts_with(source_root) {
                     bail!("directory symlink escapes the source tree");
                 }

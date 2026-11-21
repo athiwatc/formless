@@ -7235,7 +7235,10 @@ No operation changes the source checkout or moves the user's branch.
 Directory Write and ReadOnly steps recursively copy the source into their
 private workspace; a selected Directory input becomes the starting copy.
 Copies skip .git and reject special files, absolute symlink targets and
-targets escaping the source tree lexically. Relative internal links are
+targets escaping the source tree. Containment follows symlinks in the longest
+existing target prefix before resolving the remaining nonexistent components;
+existing prefixes reached again through .. are resolved as well.
+Unresolvable existing links are rejected. Relative internal links are
 preserved as-is, including dangling links. File data copying
 runs off the async executor and checks cancellation. The attempt area must
 be outside the source tree to avoid recursive/self-copying. Scratch steps
