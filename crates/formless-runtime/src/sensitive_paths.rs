@@ -493,8 +493,11 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         assert!(!relocation.unwrap());
     }
+
+    #[test]
     fn apache_password_file_checks_both_path_spellings_and_requires_exact_name() {
         let root = std::env::temp_dir().join("project");
+        let policy = PathPolicy::default();
         let secret = root.join(".HTPASSWD");
         let alias = root.join("alias.txt");
         for (requested, resolved) in [(&alias, &secret), (&secret, &alias)] {
@@ -502,9 +505,15 @@ mod tests {
                 policy.classify(requested, resolved).unwrap(),
                 PathDecision::Sensitive(_)
             ));
+        }
         for name in ["htpasswd", "htpasswd.txt", ".htpasswd.bak"] {
             let path = root.join(name);
+            assert_eq!(
                 policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
     #[test]
     fn composer_auth_file_is_classified_before_ordinary_config_files() {
         let root = std::env::temp_dir().join("formless-project");
