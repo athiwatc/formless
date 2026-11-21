@@ -76,6 +76,9 @@ def check(page):
         ('HMACKEY', 'session'),
         ('PRIMARY_KEY_TOKEN', 'session'),
         ('SSH_AUTH_SOCK', 'hour'),
+        ('DATABASE_URL', 'session'),
+        ('redis_url', 'hour'),
+        ('MONGODB_URI', 'always'),
     ]:
         queue(name)
         assert labels.all_text_contents() == [f'env:{name}'], name
@@ -86,7 +89,8 @@ def check(page):
         decided(scope)
 
     for name in ('MONKEY', 'TURKEY', 'DONKEY', 'HOCKEY', 'JOCKEY', 'HOTKEY', 'PRIMARY_KEY',
-                 'foreign_key', 'UNIQUE_KEY', 'CANDIDATE_KEY', 'SORT_KEY', 'PARTITION_KEY', 'HOME'):
+                 'foreign_key', 'UNIQUE_KEY', 'CANDIDATE_KEY', 'SORT_KEY', 'PARTITION_KEY', 'HOME',
+                 'PUBLIC_URL', 'DATABASE_URL_SAMPLE'):
         queue(name)
         assert labels.count() == 0, name
         click('always')
