@@ -2092,7 +2092,7 @@
     // Default to reject. A rule is never inferred from a one-time decision.
     const decision = h("select", { "aria-label": "Rule decision" }, h("option", { value: "reject" }, "Reject"), h("option", { value: "allow_once" }, "Allow once per matching request"));
     decision.value = "reject";
-    return saveTopicControl({ title: "Add a topic permission rule", text: "Applies only to this topic. Patterns match the full permission title OR command, case-sensitively. * matches any characters; ? matches one. Reject takes precedence. A matching allow rule will answer future matching requests without another prompt; it does not grant permanent harness access.",
+    return saveTopicControl({ title: "Add a topic permission rule", text: "Applies only to this topic. Patterns match the full permission title OR command, case-sensitively. * matches any characters; ? matches one. Reject takes precedence. A matching allow rule will answer future matching requests without another prompt; it does not grant permanent harness access. Workspace trust always needs a separate decision.",
       body: h("div", { class: "topic-outline-editor" }, field("Harness", harness), agentField, field("Permission kind (optional)", kind), field("Pattern", pattern), field("Decision", decision)), ok: "Add rule",
       saveRequest: () => {
         if (!pattern.value.trim()) throw new Error("Enter a permission title or command pattern.");
