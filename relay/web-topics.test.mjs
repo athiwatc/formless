@@ -277,6 +277,100 @@ test('authoritative snapshots replay permissions and racing closure cannot resur
   assert.equal(c.S.approvals.length, 0);
 });
 
+test('topic context access changes only through explicit consent and persists daemon state', async () => {
+  let options;
+  const c = setup(['editTopicContext', 'saveTopicControl', 'storeTopic'], { ask: async opts => { options = opts; return null; } });
+  await c.editTopicContext(topic('approved'));
+  assert.equal(c.S.topics[0].allow_external_context, undefined, 'opening or cancelling does not grant access');
+  assert.equal(options.ok, 'Allow external context');
+  assert.deepEqual(json(options.saveRequest()), { type: 'set_topic_context_access', topic_id: 'topic', allow: true });
+  const widened = { ...topic('approved'), allow_external_context: true };
+  c.ask = async opts => { options = opts; return widened; };
+  await c.editTopicContext(topic('approved'));
+  assert.equal(c.S.topics[0].allow_external_context, true);
+  await c.editTopicContext(widened);
+  assert.deepEqual(json(options.saveRequest()), { type: 'set_topic_context_access', topic_id: 'topic', allow: false });
+});
+
+test('topic control cannot dispatch or store across a changed daemon connection', async () => {
+  let options;
+  const wait = defer();
+  const c = setup(['saveTopicControl', 'storeTopic'], { ask: opts => { options = opts; return wait.promise; } });
+  const saving = c.saveTopicControl({ saveRequest: () => { throw new Error('must not dispatch'); } });
+  c.S.channel = {};
+  assert.throws(() => options.saveRequest(), /connection changed/);
+  wait.resolve({ ...topic(), allow_external_context: true }); await saving;
+  assert.equal(c.S.topics[0].allow_external_context, undefined);
+});
+
+test('run limits preserve zero and defaults, reject fractions and out-of-range u32s, and never start', async () => {
+  let options;
+  const c = setup(['editTopicLimits'], { h: element, saveTopicControl: opts => { options = opts; } });
+  await c.editTopicLimits(topic('approved'));
+  assert.deepEqual(json(options.saveRequest()), { type: 'set_topic_limits', topic_id: 'topic', limits: { max_retries_per_step: 3, max_attempts_per_topic: 20 } });
+  const fields = descendants(options.body).filter(node => node.tag === 'input');
+  fields.forEach(node => { node.value = '0'; });
+  assert.deepEqual(json(options.saveRequest().limits), { max_retries_per_step: 0, max_attempts_per_topic: 0 });
+  for (const invalid of ['-1', '1.5', '4294967296', '1e2', '']) {
+    fields[0].value = invalid; assert.throws(() => options.saveRequest(), /whole numbers/);
+  }
+  fields[0].value = '4294967295';
+  assert.equal(options.saveRequest().limits.max_retries_per_step, 4294967295);
+});
+
+test('topic rules default to rejection, preserve exact glob and optional filters, and remove by server id', async () => {
+  let options;
+  const c = setup(['addTopicPermissionRule', 'removeTopicPermissionRule', 'harnessLabel'], { h: element, saveTopicControl: opts => { options = opts; } });
+  await c.addTopicPermissionRule(topic('approved'));
+  const fields = Object.fromEntries(descendants(options.body).filter(node => node.props?.['aria-label']).map(node => [node.props['aria-label'], node]));
+  assert.throws(() => options.saveRequest(), /pattern/);
+  fields['Permission pattern'].value = ' Read * ? ';
+  assert.deepEqual(json(options.saveRequest()), { type: 'add_topic_permission_rule', topic_id: 'topic', harness: null, acp_agent: null, kind: null, pattern: ' Read * ? ', decision: 'reject' });
+  fields['Rule harness'].value = 'acp'; fields['Rule ACP agent'].value = 'agent';
+  fields['Permission kind'].value = 'execute'; fields['Rule decision'].value = 'allow_once';
+  assert.equal(options.saveRequest().acp_agent, 'agent'); assert.equal(options.saveRequest().kind, 'execute');
+  assert.equal(options.saveRequest().decision, 'allow_once');
+  fields['Rule harness'].value = 'codex'; assert.equal(options.saveRequest().acp_agent, null);
+  await c.removeTopicPermissionRule(topic('approved'), { rule_id: 'server-id', decision: 'reject', pattern: '*' });
+  assert.deepEqual(json(options.saveRequest()), { type: 'remove_topic_permission_rule', topic_id: 'topic', rule_id: 'server-id' });
+});
+
+test('readiness never equates an installed executable with verified sign-in', async () => {
+  const calls = []; let options;
+  const c = setup(['showHarnessStatus', 'harnessAvailabilityLabel', 'harnessLabel'], { h: element, request: async req => { calls.push(json(req)); return [
+    { kind: 'claude', installed: false }, { kind: 'codex', installed: true, signed_in: false },
+    { kind: 'muse', installed: true, signed_in: null }, { kind: 'acp', acp_agent: 'local', installed: true, signed_in: true }]; },
+    ask: async opts => { options = opts; } });
+  await c.showHarnessStatus();
+  assert.deepEqual(calls, [{ type: 'list_harnesses' }]);
+  const text = JSON.stringify(options.body);
+  assert.match(text, /Not installed/); assert.match(text, /sign in required/);
+  assert.match(text, /sign-in status unknown/); assert.match(text, /signed in/);
+  c.request = async () => { throw new Error('topic control request is not implemented yet'); };
+  let error; c.toast = message => { error = message; };
+  await c.showHarnessStatus(); assert.match(error, /not implemented/);
+});
+
+test('user-only harness questions never suggest that the model may answer', async () => {
+  let options;
+  const c = setup(['queueQuestion', 'showQuestion'], { renderStatus() {}, questionForm: () => element('form'), sessionName: () => 'Attempt',
+    ask: async opts => { options = opts; return null; } });
+  c.queueQuestion({ question_id: 'q', session_id: 'transcript', attempt_id: 'attempt', user_only: true, questions: [{ question: 'Raise the cap?' }] });
+  assert.equal(c.S.pendingQuestion.user_only, true);
+  assert.equal(options.title, 'Your decision is needed'); assert.match(options.text, /Only you/); assert.doesNotMatch(options.text, /may answer/);
+  await Promise.resolve();
+  c.S.questionOpen = false; c.S.pendingQuestion.user_only = false; c.showQuestion();
+  assert.match(options.text, /cited basis posted in Topic Chat/);
+});
+
+test('directory outputs render as literal copied-workspace paths, not executable links', () => {
+  const c = setup(['topicArtifacts'], { h: element });
+  const nodes = c.topicArtifacts([{ kind: 'directory', path: '<script>copy</script>' }]);
+  assert.equal(nodes[0].children[0], 'Directory copy ');
+  assert.equal(nodes[0].children[1].tag, 'code');
+  assert.equal(nodes[0].children[1].children[0], '<script>copy</script>');
+});
+
 test('a topic snapshot from before rejection cannot restore a rejected proposal', async () => {
   const reads = [];
   const c = setup(['refreshTopics', 'topicAction', 'storeTopic', 'rejectTopic'], { request: req => {

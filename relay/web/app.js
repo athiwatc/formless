@@ -1771,6 +1771,7 @@
   }
   function topicArtifacts(outputs) {
     return (outputs || []).map(output => {
+      if (output.kind === "directory") return h("li", null, "Directory copy ", h("code", null, output.path));
       if (output.kind === "git_revision") return h("li", null, "Git revision ", h("code", null, output.revision));
       if (output.kind === "file") return h("li", null, "File ", h("code", null, output.path),
         h("small", { class: "muted" }, "SHA-256 ", output.sha256));
@@ -1865,7 +1866,7 @@
       if (attempt) {
         children.push(h("p", { class: "topic-readonly muted" }, attempt.step_title || "Step", " · ", harnessLabel(attempt.harness),
           attempt.acp_agent ? " · " + attempt.acp_agent : "", attempt.model ? " · " + attempt.model : "",
-          " · ", attempt.access === "read_only" ? "Read only" : "Can write", " · ", topicStatusLabel(attempt.status),
+          " · ", attempt.access === "read_only" ? "Read only" : "Can write in isolated copy", " · ", topicStatusLabel(attempt.status),
           " · Formless coordinates handoffs. Continue the conversation in the topic chat."));
         if (attempt.summary || attempt.detail) children.push(h("p", null, attempt.summary || attempt.detail));
         if (attempt.inputs?.length) children.push(h("div", null, h("strong", null, "Inputs"), h("ul", { class: "topic-outputs" }, topicArtifacts(attempt.inputs))));
@@ -1881,14 +1882,25 @@
       }
       if (!attempt) {
         children.push(h("p", { class: "topic-repo" }, "Workspace: ", topic.workspace ? h("code", null, topic.workspace) : "Private scratch workspace"),
-          h("p", { class: "muted" }, "The outline is a starting point. Formless chooses and adapts the steps and harnesses."));
+          h("p", { class: "muted" }, "The outline is a starting point. Formless adapts the steps, but asks you before substituting an unavailable harness. Write steps use separate copies, never the source workspace."));
+        if (!["pending_approval", "rejected"].includes(topic.status)) children.push(h("div", { class: "topic-controls" },
+          h("p", { class: "muted" }, topic.allow_external_context ? "Context: all Formless conversations (you allowed external context)." : "Context: this topic branch and its ancestors only.",
+            " · Limits: ", String(topic.limits?.max_retries_per_step ?? 3), " retries per step; ", String(topic.limits?.max_attempts_per_topic ?? 20), " attempts per topic."),
+          h("div", { class: "topic-actions" }, control("Context access", "context", () => editTopicContext(topic)),
+            control("Run limits", "limits", () => editTopicLimits(topic)), control("Add permission rule", "add-rule", () => addTopicPermissionRule(topic)),
+            control("Harness status", "harness-status", () => showHarnessStatus())),
+          h("p", { class: "muted" }, "Only you can change context access, permission rules, or limits. Unmatched permissions need your decision; reject rules take precedence."),
+          (topic.permission_rules || []).map(rule => h("div", { class: "topic-permission-rule" },
+            h("span", null, rule.decision === "reject" ? "Reject" : "Allow once per matching request", " · ", rule.harness ? harnessLabel(rule.harness) : "Any harness",
+              rule.acp_agent ? " · " + rule.acp_agent : "", " · ", rule.kind || "Any permission kind", " · ", h("code", null, rule.pattern)),
+            control("Remove rule", "remove-rule-" + rule.rule_id, () => removeTopicPermissionRule(topic, rule))))));
         if (topic.outline?.length) children.push(h("ol", { class: "topic-outline-preview" }, topic.outline.map(step => h("li", null,
           h("strong", null, step.title), " · ", harnessLabel(step.harness), step.acp_agent ? " · " + step.acp_agent : "",
           step.model ? " · " + step.model : "", " · ", step.access === "read_only" ? "Read only" : "Can write",
           step.instructions ? h("p", null, step.instructions) : null))));
         if (["approved", "running", "needs_user"].includes(topic.status)) children.push(h("div", { class: "topic-actions" },
           control("Cancel workflow", "cancel", () => cancelTopic(topic))));
-        if (topic.status === "needs_user") children.push(h("p", { role: "status" }, "Formless needs your input. Reply in this topic chat to continue."));
+        if (topic.status === "needs_user") children.push(h("p", { role: "status" }, "Formless needs your input. Answer the pending question or permission request; you can also reply in this topic chat."));
         if (topic.status === "cancelled") children.push(h("p", { role: "status" }, "Workflow cancelled. Retry a work item to resume."));
         children.push(h("div", { class: "topic-features", "aria-label": "Work item progress" }, topic.features.map((feature, i) =>
         h("article", { class: "topic-feature", "data-feature-id": feature.id }, h("div", { class: "topic-feature-head" },
@@ -2041,6 +2053,72 @@
       await refreshTopics();
     });
   }
+  async function saveTopicControl(options) {
+    const channel = S.channel;
+    const result = await ask({ ...options, saveRequest: () => {
+      if (channel !== S.channel) throw new Error("The daemon connection changed. Close and reopen this topic control.");
+      return options.saveRequest();
+    } });
+    if (result && S.channel === channel) storeTopic(result);
+  }
+  async function editTopicContext(topic) {
+    const allow = !topic.allow_external_context;
+    return saveTopicControl({ title: allow ? "Allow other conversation context?" : "Restrict conversation context?",
+      text: allow ? "Harnesses in this topic will be allowed to search and read conversations outside this topic branch. This applies only to this topic; it does not widen child topics."
+        : "Harnesses in this topic will only read this topic chat and attempts, plus ancestor topic chats and attempts. Moved Main Chat messages remain included. This does not retract context already read.",
+      ok: allow ? "Allow external context" : "Restrict context",
+      saveRequest: () => ({ type: "set_topic_context_access", topic_id: topic.id, allow }) });
+  }
+  async function editTopicLimits(topic) {
+    const field = (label, value) => h("label", { class: "topic-form-field" }, h("span", null, label), value);
+    const retries = h("input", { type: "number", min: 0, max: 4294967295, step: 1, value: String(topic.limits?.max_retries_per_step ?? 3), "aria-label": "Retries per step" });
+    const attempts = h("input", { type: "number", min: 0, max: 4294967295, step: 1, value: String(topic.limits?.max_attempts_per_topic ?? 20), "aria-label": "Attempts per topic" });
+    const read = input => {
+      if (!/^\d+$/.test(input.value) || Number(input.value) > 4294967295) throw new Error("Enter whole numbers from 0 to 4294967295.");
+      return Number(input.value);
+    };
+    return saveTopicControl({ title: "Topic run limits", text: "Zero retries allows the initial attempt only. Zero attempts blocks all launches. At a cap, Formless asks you; it cannot raise these limits. Saving does not start or resume work.",
+      body: h("div", { class: "topic-form-grid" }, field("Retries per step", retries), field("Attempts per topic", attempts)), ok: "Save limits",
+      saveRequest: () => ({ type: "set_topic_limits", topic_id: topic.id, limits: { max_retries_per_step: read(retries), max_attempts_per_topic: read(attempts) } }) });
+  }
+  async function addTopicPermissionRule(topic) {
+    const field = (label, value) => h("label", { class: "topic-form-field" }, h("span", null, label), value);
+    const harness = h("select", { "aria-label": "Rule harness" }, ["", "claude", "codex", "pi", "opencode", "antigravity", "acp", "muse"].map(kind => h("option", { value: kind }, kind ? harnessLabel(kind) : "Any harness")));
+    const agent = h("input", { type: "text", "aria-label": "Rule ACP agent", placeholder: "Any ACP agent" });
+    const agentField = field("ACP agent (optional)", agent);
+    agentField.hidden = true; harness.onchange = () => { agentField.hidden = harness.value !== "acp"; };
+    const kind = h("input", { type: "text", "aria-label": "Permission kind", placeholder: "Any kind" });
+    const pattern = h("input", { type: "text", "aria-label": "Permission pattern", placeholder: "Exact title or command, with * and ? wildcards" });
+    // Default to reject. A rule is never inferred from a one-time decision.
+    const decision = h("select", { "aria-label": "Rule decision" }, h("option", { value: "reject" }, "Reject"), h("option", { value: "allow_once" }, "Allow once per matching request"));
+    decision.value = "reject";
+    return saveTopicControl({ title: "Add a topic permission rule", text: "Applies only to this topic. Patterns match the full permission title OR command, case-sensitively. * matches any characters; ? matches one. Reject takes precedence. A matching allow rule will answer future matching requests without another prompt; it does not grant permanent harness access.",
+      body: h("div", { class: "topic-outline-editor" }, field("Harness", harness), agentField, field("Permission kind (optional)", kind), field("Pattern", pattern), field("Decision", decision)), ok: "Add rule",
+      saveRequest: () => {
+        if (!pattern.value.trim()) throw new Error("Enter a permission title or command pattern.");
+        return { type: "add_topic_permission_rule", topic_id: topic.id, harness: harness.value || null, acp_agent: harness.value === "acp" ? agent.value.trim() || null : null,
+          kind: kind.value.trim() || null, pattern: pattern.value, decision: decision.value };
+      } });
+  }
+  async function removeTopicPermissionRule(topic, rule) {
+    return saveTopicControl({ title: "Remove this permission rule?", text: "This topic will no longer apply " + rule.decision + " to matching requests: " + rule.pattern,
+      ok: "Remove rule", saveRequest: () => ({ type: "remove_topic_permission_rule", topic_id: topic.id, rule_id: rule.rule_id }) });
+  }
+  function harnessAvailabilityLabel(item) {
+    if (!item.installed) return "Not installed";
+    return item.signed_in === true ? "Installed · signed in" : item.signed_in === false ? "Installed · sign in required" : "Installed · sign-in status unknown";
+  }
+  async function showHarnessStatus() {
+    const channel = S.channel;
+    try {
+      const items = await request({ type: "list_harnesses" });
+      if (channel !== S.channel) return;
+      if (!Array.isArray(items)) throw new Error("Invalid harness status response");
+      await ask({ title: "Harness status", text: "Detected on your daemon’s machine. Installed does not guarantee an integrated adapter or a working sign-in. Formless asks before substituting another harness.", ok: "Close",
+        body: h("ul", { class: "topic-outputs" }, items.length ? items.map(item => h("li", null, h("strong", null, harnessLabel(item.kind), item.acp_agent ? " · " + item.acp_agent : ""),
+          " · ", harnessAvailabilityLabel(item), item.version ? " · " + item.version : "", item.detail ? h("p", null, item.detail) : null)) : h("li", null, "No harnesses reported.")) });
+    } catch (error) { if (channel === S.channel) toast("Harness status unavailable: " + error.message, true); }
+  }
   function topicOutlineEditor(initial = []) {
     const field = (label, input) => h("label", { class: "topic-form-field" }, h("span", null, label), input);
     const list = h("div", { class: "topic-outline-editor" });
@@ -2061,7 +2139,7 @@
         instructions: h("textarea", { rows: 2, value: value.instructions || "", "aria-label": "Step instructions" }),
         harness: h("select", { "aria-label": "Step harness" }, ["", "claude", "codex", "pi", "opencode", "antigravity", "acp", "muse"].map(kind => h("option", { value: kind }, harnessLabel(kind)))),
         model: h("input", { type: "text", value: value.model || "", placeholder: "Harness default", "aria-label": "Step model" }),
-        access: h("select", { "aria-label": "Step access" }, h("option", { value: "read_only" }, "Read only"), h("option", { value: "write" }, "Can write")),
+        access: h("select", { "aria-label": "Step access" }, h("option", { value: "read_only" }, "Read only"), h("option", { value: "write" }, "Can write in isolated copy")),
         agent: h("input", { type: "text", value: value.acp_agent || "", placeholder: "Configured ACP agent", "aria-label": "ACP agent" })
       };
       step.instructions.value = value.instructions || "";
@@ -2080,7 +2158,7 @@
           { title: "Implement", harness: "claude", access: "write" }, { title: "Review", harness: "codex", access: "read_only" }]) }, "Code preset"),
         h("button", { type: "button", class: "btn small ghost", onclick: () => preset([
           { title: "Scan receipts", access: "read_only" }, { title: "Do accounting", access: "write" }, { title: "Create reports", access: "write" }]) }, "Accounting preset")),
-        h("p", { class: "muted" }, "Optional outline. Formless makes the final decisions and may adapt these steps. Any supported harness can handle any step."), list,
+        h("p", { class: "muted" }, "Optional outline. Formless adapts these steps but asks before substituting an unavailable harness. Write steps use isolated copies; merging results is explicit."), list,
         h("button", { type: "button", class: "btn small", onclick: () => { add(); render(); } }, "Add step")),
       read: () => steps.map(step => ({ title: recordValue(step.title, "Enter a title for each step."), instructions: step.instructions.value.trim(),
         harness: step.harness.value || null, acp_agent: step.harness.value === "acp" ? recordValue(step.agent, "Enter the ACP agent name.") : null,
@@ -5520,7 +5598,7 @@
     if (questions.some((q) => q.id === ev.question_id)) return;
     const qs = ev.questions && ev.questions.length ? ev.questions
       : [{ question: ev.question, options: (ev.options || []).map((label) => ({ label })) }];
-    questions.push({ id: ev.question_id, session_id: ev.session_id, topic_id: ev.topic_id, attempt_id: ev.attempt_id, qs });
+    questions.push({ id: ev.question_id, session_id: ev.session_id, topic_id: ev.topic_id, attempt_id: ev.attempt_id, user_only: !!ev.user_only, qs });
     S.pendingQuestion = questions[0];
     S.questionId = S.pendingQuestion.id;
     showQuestion();
@@ -5539,7 +5617,8 @@
     S.questionOpen = true;
     renderStatus();
     const body = questionForm(q.qs);
-    ask({ title: q.attempt_id ? "The harness asks" : "The agent asks", text: q.attempt_id ? sessionName(q.session_id) + " · Formless may also answer; the first answer wins." : undefined,
+    ask({ title: q.user_only ? "Your decision is needed" : q.attempt_id ? "The harness asks" : "The agent asks", text: q.user_only ? "Only you can answer this question. Formless cannot decide for you."
+      : q.attempt_id ? sessionName(q.session_id) + " · Formless may answer only from your request or decision, with a cited basis posted in Topic Chat. The first answer wins." : undefined,
       body, ok: "Answer", tag: "question:" + q.id }).then(async (done) => {
       S.questionOpen = false;
       if (!S.pendingQuestion || S.pendingQuestion.id !== q.id) { renderStatus(); showQuestion(); return; }
@@ -8974,9 +9053,11 @@
       }
       case "user_question_closed":
         // Answered elsewhere (or the Run stopped): close our prompt.
+        if (ev.answered_by) note("Question answered by " + (ev.answered_by === "model" ? "Formless; see the answer and basis in Topic Chat." : "the user."));
         removeQuestion(ev.question_id);
         break;
       case "harness_permission_closed":
+        if (ev.by?.startsWith("rule:")) note("Harness permission answered by a topic rule.");
         S.approvals = S.approvals.filter(item => item.kind !== "harness" || item.id !== ev.permission_id);
         renderApproval(); scheduleEventRender({ status: true });
         break;
