@@ -72,6 +72,12 @@ async fn availability_with_path(
 
 fn find_pi_executable(program: &Path, search_path: Option<&OsStr>) -> Option<PathBuf> {
     fn candidate(path: &Path) -> Option<PathBuf> {
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            if let Some(path) = candidate(&path.with_extension("exe")) {
+                return Some(path);
+            }
+        }
         if !path.is_file() {
             return None;
         }
@@ -97,12 +103,6 @@ fn find_pi_executable(program: &Path, search_path: Option<&OsStr>) -> Option<Pat
     }
     for directory in std::env::split_paths(search_path?) {
         let path = directory.join(program);
-        #[cfg(windows)]
-        if path.extension().is_none() {
-            if let Some(path) = candidate(&path.with_extension("exe")) {
-                return Some(path);
-            }
-        }
         if let Some(path) = candidate(&path) {
             return Some(path);
         }
@@ -1716,6 +1716,28 @@ mod tests {
                 OsString::from("secret-token"),
             )]),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_lookup_windows_explicit_extensionless_path() {
+        let dir = temp_dir();
+        let extensionless = dir.join("pi");
+        let exe = dir.join("pi.exe");
+        let cmd = dir.join("pi.cmd");
+        fs::write(&cmd, "@exit /b 0\r\n").unwrap();
+        assert_eq!(super::find_pi_executable(&extensionless, None), None);
+        assert_eq!(super::find_pi_executable(&cmd, None), Some(cmd));
+        fs::write(&exe, "lookup fixture").unwrap();
+        assert_eq!(
+            super::find_pi_executable(&extensionless, None),
+            Some(exe.clone())
+        );
+        assert_eq!(
+            super::find_pi_executable(Path::new("pi"), Some(dir.as_os_str())),
+            Some(exe)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn temp_dir() -> PathBuf {
