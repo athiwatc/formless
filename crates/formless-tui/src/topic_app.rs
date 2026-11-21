@@ -176,6 +176,12 @@ impl App {
         true
     }
 
+    /// Harness permission prompts sit above every other overlay.
+    pub(crate) fn topic_permission_key(&mut self, key: KeyEvent) {
+        let action = self.topic.key(key);
+        self.topic_action(action);
+    }
+
     fn topic_action(&mut self, action: Action) {
         match action {
             Action::None | Action::Close => {}
@@ -578,6 +584,14 @@ impl App {
     /// Nested harness transcripts are read-only; slash commands still work.
     pub(crate) fn topic_blocks_submit(&mut self) -> bool {
         if self.search_mode || !self.topic.current_is_harness(self.current.as_deref()) {
+            return false;
+        }
+        // A harness question takes the typed line as its answer.
+        if self
+            .questions
+            .iter()
+            .any(|q| Some(q.session_id.as_str()) == self.current.as_deref())
+        {
             return false;
         }
         let text = self.input.expanded();
@@ -1109,6 +1123,43 @@ mod tests {
         app.input.set("/topics");
         app.submit_chat(false);
         assert!(app.topic.overlay_open());
+    }
+
+    #[test]
+    fn harness_questions_take_typed_answers() {
+        let mut running = topic("t1", TopicStatus::Running);
+        running
+            .attempts
+            .push(attempt("t1", "claude-1", HarnessKind::Claude));
+        let (mut app, wire) = connected(vec![running]);
+        app.current = Some("claude-1".into());
+        app.on_event(Event::UserQuestion {
+            topic_id: Some("t1".into()),
+            attempt_id: Some("claude-1".into()),
+            question_id: "q1".into(),
+            session_id: "claude-1".into(),
+            question: "Which file?".into(),
+            options: vec![],
+            questions: vec![],
+        });
+        app.input.set("src/main.rs");
+        app.submit_chat(false);
+        assert!(wire
+            .requests()
+            .iter()
+            .any(|sent| matches!(&sent.request, Request::AnswerQuestion { question_id, .. } if question_id == "q1")));
+    }
+
+    #[test]
+    fn permission_prompts_take_keys_before_other_overlays() {
+        let (mut app, wire) = connected(vec![topic("t1", TopicStatus::Running)]);
+        app.switcher = Some((String::new(), 0));
+        app.on_event(permission_event("p1"));
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("Run cargo test"), "{screen}");
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(permission_decisions(&wire).len(), 1);
+        assert_eq!(app.switcher.as_ref().unwrap().0, "");
     }
 
     #[test]

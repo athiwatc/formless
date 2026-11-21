@@ -9798,6 +9798,12 @@ impl App {
                 editor.vim.cancel_pending_argument();
             }
         }
+        if self.topic.has_permission()
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.topic_permission_key(key);
+            return;
+        }
         if self.hunk_review_is_visible() {
             self.hunk_review_key(key);
             return;
@@ -12474,6 +12480,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
+    app.topic.draw_permission_overlay(f, app.color);
     // Dismissing a modal in an input burst must wait for an unobscured
     // frame before the list can receive wheel events.
     if app.list_wheel_blocked() {

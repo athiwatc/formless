@@ -250,7 +250,7 @@ struct ProposalForm {
     step: ProposalStep,
     name: InputLine,
     workspace: InputLine,
-    /// `(parent_topic_id, label)`; the first entry is Main Chat.
+    /// `(parent_topic_id, label)`; Main Chat comes first only when proposing from Main Chat.
     parents: Vec<(Option<String>, String)>,
     parent_index: usize,
     preset: Preset,
@@ -899,7 +899,12 @@ impl State {
         name: &str,
         parent: Option<&str>,
     ) {
-        let mut parents = vec![(None, "Main Chat".to_string())];
+        // The daemon reads a missing parent as "under the source topic", so
+        // Main Chat can only be chosen when proposing from Main Chat.
+        let mut parents = match parent {
+            Some(_) => vec![],
+            None => vec![(None, "Main Chat".to_string())],
+        };
         parents.extend(
             self.topics
                 .iter()
@@ -1578,9 +1583,20 @@ impl State {
         }
     }
 
-    pub fn draw_overlay(&self, frame: &mut Frame, color: bool) {
+    pub fn has_permission(&self) -> bool {
+        !self.permissions.is_empty()
+    }
+
+    /// Drawn last in the frame: permission keys are handled before every
+    /// other overlay, so the prompt must never be hidden beneath one.
+    pub fn draw_permission_overlay(&self, frame: &mut Frame, color: bool) {
         if let Some(permission) = self.permissions.first() {
             self.draw_permission(frame, permission, color);
+        }
+    }
+
+    pub fn draw_overlay(&self, frame: &mut Frame, color: bool) {
+        if !self.permissions.is_empty() {
             return;
         }
         let Some(overlay) = self.overlay.as_ref() else {
@@ -1950,7 +1966,7 @@ impl State {
                     "Stops the orchestrator and any running harness work. Nothing starts again until you start it."
                 }
                 ConfirmedAction::Recover => {
-                    "Resumes interrupted work from the last recorded state."
+                    "Marks interrupted work failed and abandons its running attempts. Retry a work item to run it again."
                 }
                 ConfirmedAction::Retry { .. } => {
                     "Resets this work item to pending. Start the topic again to run it."
@@ -2449,6 +2465,20 @@ mod tests {
             topic("t2", TopicStatus::PendingApproval),
         ];
         assert_eq!(state.update_topics(topics), Some("t2".into()));
+    }
+
+    #[test]
+    fn proposals_from_a_topic_chat_cannot_target_main_chat() {
+        let mut state = State::default();
+        state.update_topics(vec![topic("t1", TopicStatus::Approved)]);
+        let messages = vec![message("m1", 1, "user", "add X")];
+        state.open_proposal(&session("main"), &messages, "", "Story", Some("t1"));
+        let proposal = state.proposal.as_ref().unwrap();
+        assert!(proposal.parents.iter().all(|(id, _)| id.is_some()));
+        assert_eq!(
+            proposal.request().unwrap().parent_topic_id.as_deref(),
+            Some("t1")
+        );
     }
 
     #[test]
