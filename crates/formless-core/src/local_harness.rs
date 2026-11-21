@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod antigravity;
+pub mod opencode;
 
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
@@ -132,14 +133,30 @@ pub(crate) fn validate_acp_agent(kind: Option<HarnessKind>, agent: Option<&str>)
     Ok(())
 }
 
+/// Runs an integrated interactive harness using the core's interaction contract.
+pub async fn run(
+    request: &HarnessRequest,
+    interactions: std::sync::Arc<dyn InteractionHandler>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<HarnessResult> {
+    validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    match request.kind {
+        HarnessKind::OpenCode => opencode::run(request, interactions, cancel).await,
+        _ => bail!("{:?} has no integrated interactive adapter; use its supported local harness entry point", request.kind),
+    }
+}
+
 pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
     validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    if request.kind == HarnessKind::OpenCode {
+        bail!("OpenCode requires interactive ACP; use local_harness::opencode::run.");
+    }
     if request.kind == HarnessKind::Antigravity {
         return antigravity::command_spec(request);
     }
     if matches!(
         request.kind,
-        HarnessKind::Pi | HarnessKind::OpenCode | HarnessKind::Acp | HarnessKind::Muse
+        HarnessKind::Pi | HarnessKind::Acp | HarnessKind::Muse
     ) {
         bail!(
             "{:?} adapter not integrated yet; use Claude or Codex for now",
@@ -288,6 +305,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
         HarnessKind::Antigravity => antigravity::parse_output(stdout),
+        HarnessKind::OpenCode => bail!("OpenCode uses ACP; run/JSONL output is unsupported."),
         _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
     }
 }
@@ -579,6 +597,9 @@ mod access_tests {
                 } else {
                     assert!(args.windows(2).any(|p| p == ["--sandbox", "read-only"]));
                 }
+            } else if kind == HarnessKind::OpenCode {
+                assert!(command_spec(&request).unwrap_err().to_string().contains("opencode::run"));
+                assert!(parse_output(kind, "{}").unwrap_err().to_string().contains("ACP"));
             } else {
                 assert!(command_spec(&request)
                     .unwrap_err()

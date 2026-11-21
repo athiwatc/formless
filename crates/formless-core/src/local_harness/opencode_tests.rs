@@ -3,20 +3,24 @@ use std::{
     ffi::OsString,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     time::Duration,
 };
 
 use super::*;
-use crate::local_harness::{acp::PermissionRequest, HarnessKind};
+use crate::local_harness::{
+    acp::PermissionRequest, HarnessKind, HarnessPermissionRequest, HarnessUpdate,
+    InteractionFuture, StepAccess,
+};
 
-fn request(role: HarnessRole) -> HarnessRequest {
+fn request(access: StepAccess) -> HarnessRequest {
     HarnessRequest {
         kind: HarnessKind::OpenCode,
+        acp_agent: None,
         model: None,
         cwd: PathBuf::from("/work/repo"),
         prompt: "prompt-secret".into(),
-        role,
+        access,
         mcp_command: PathBuf::from("/usr/bin/python3"),
         mcp_args: vec!["mcp.py".into()],
         mcp_env_vars: vec!["PROBE_ENV".into()],
@@ -65,7 +69,7 @@ fn config_matches_live_permission_fixture_and_environment_is_private() {
     assert!(!config().to_string().contains("{env:"));
     assert!(!config().to_string().contains("cap-secret"));
     assert!(config().get("mcp").is_none());
-    let request = request(HarnessRole::Build);
+    let request = request(StepAccess::Write);
     let prepared = prepare(&request).unwrap();
     assert_eq!(prepared.executable, request.executable);
     assert_eq!(prepared.environment[&OsString::from("PWD")], "/work/repo");
@@ -76,7 +80,7 @@ fn config_matches_live_permission_fixture_and_environment_is_private() {
     assert_eq!((SPEC.args)(&prepared), vec![OsString::from("acp")]);
     assert_eq!(SPEC.write_modes, ["build"]);
     assert_eq!(SPEC.read_only_modes, ["formless-review"]);
-    assert!(SPEC.read_only_fail_closed);
+    const { assert!(SPEC.read_only_fail_closed) };
     assert_eq!(SPEC.program, "opencode");
     assert!(crate::local_harness::command_spec(&request).is_err());
     assert!(crate::local_harness::parse_output(HarnessKind::OpenCode, "{}").is_err());
@@ -200,7 +204,7 @@ fn unsupported_schemas_and_invalid_answers_are_declined() {
 }
 
 fn drive(
-    role: HarnessRole,
+    access: StepAccess,
     choice: Option<&str>,
     name: &str,
 ) -> (HarnessResult, Handler, Vec<Value>) {
@@ -232,7 +236,7 @@ fn drive(
         &SPEC,
         Cursor::new(input),
         &mut output,
-        &request(role),
+        &request(access),
         &mut handler,
         &CancellationToken::new(),
         true,
@@ -248,9 +252,9 @@ fn drive(
 
 #[test]
 fn execute_permissions_reach_user_in_both_modes_even_when_js_mentions_formless() {
-    for role in [HarnessRole::Build, HarnessRole::Review] {
+    for access in [StepAccess::Write, StepAccess::ReadOnly] {
         for choice in [Some("once"), Some("reject"), Some("invalid"), None] {
-            let (_, handler, sent) = drive(role, choice, "execute");
+            let (_, handler, sent) = drive(access, choice, "execute");
             assert_eq!(handler.permissions.len(), 1);
             assert!(!(SPEC.bridge_tool)(&handler.permissions[0]));
             let reply = sent.iter().find(|v| v["id"] == 90).unwrap();
@@ -271,7 +275,7 @@ fn execute_permissions_reach_user_in_both_modes_even_when_js_mentions_formless()
             assert_eq!(sent[2]["method"], "session/set_config_option");
             assert_eq!(
                 sent[2]["params"]["value"],
-                if role == HarnessRole::Build {
+                if access == StepAccess::Write {
                     "build"
                 } else {
                     "formless-review"
@@ -283,14 +287,158 @@ fn execute_permissions_reach_user_in_both_modes_even_when_js_mentions_formless()
 
 #[test]
 fn bridge_looking_names_also_never_bypass_the_user() {
-    let (_, handler, _) = drive(HarnessRole::Build, Some("reject"), "formless_echo_env");
+    let (_, handler, _) = drive(StepAccess::Write, Some("reject"), "formless_echo_env");
     assert_eq!(handler.permissions.len(), 1);
+}
+
+#[derive(Default)]
+struct CoreHandler {
+    choice: Option<String>,
+    answer: Option<Vec<QuestionAnswer>>,
+    permissions: Mutex<Vec<HarnessPermissionRequest>>,
+    questions: Mutex<Vec<Vec<Question>>>,
+}
+
+impl InteractionHandler for CoreHandler {
+    fn request_permission<'a>(
+        &'a self,
+        request: HarnessPermissionRequest,
+        _: &'a CancellationToken,
+    ) -> InteractionFuture<'a, Option<String>> {
+        self.permissions.lock().unwrap().push(request);
+        Box::pin(async { self.choice.clone() })
+    }
+
+    fn ask_question<'a>(
+        &'a self,
+        questions: Vec<Question>,
+        _: &'a CancellationToken,
+    ) -> InteractionFuture<'a, Option<Vec<QuestionAnswer>>> {
+        self.questions.lock().unwrap().push(questions);
+        Box::pin(async { self.answer.clone() })
+    }
+
+    fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn shared_interactions_use_core_types_and_keep_always_attempt_scoped() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let options = json!([
+        {"optionId":"once","name":"Allow once","kind":"allow_once"},
+        {"optionId":"always","name":"Always allow","kind":"allow_always"},
+        {"optionId":"reject","name":"Reject","kind":"reject_once"}
+    ]);
+    let tool_call = json!({"name":"execute","title":"execute","kind":"other","rawInput":{"code":"return await tools.other.echo_env()"}});
+    let cancel = CancellationToken::new();
+    for (choice, expected) in [
+        (Some("once"), "once"),
+        (Some("always"), "once"),
+        (Some("reject"), "reject"),
+        (Some("invalid"), "reject"),
+        (None, "reject"),
+    ] {
+        let core = CoreHandler {
+            choice: choice.map(str::to_owned),
+            ..CoreHandler::default()
+        };
+        let mut permissions = AttemptScoped(acp::Interactions {
+            handler: &core,
+            runtime: runtime.handle().clone(),
+        });
+        assert_eq!(
+            permissions
+                .decide(&PermissionRequest {
+                    tool_call: &tool_call,
+                    options: options.as_array().unwrap(),
+                    cancel: &cancel,
+                })
+                .as_deref(),
+            Some(expected)
+        );
+        let seen = core.permissions.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].title, "execute");
+        assert_eq!(seen[0].kind, "other");
+        assert_eq!(
+            seen[0].raw_input.as_ref().unwrap()["code"],
+            tool_call["rawInput"]["code"]
+        );
+        assert_eq!(seen[0].options[1].option_id, "always");
+    }
+    let core = CoreHandler {
+        answer: Some(vec![QuestionAnswer {
+            selected: vec!["Blue".into()],
+            text: None,
+        }]),
+        ..CoreHandler::default()
+    };
+    let mut permissions = AttemptScoped(acp::Interactions {
+        handler: &core,
+        runtime: runtime.handle().clone(),
+    });
+    let result = vendor_request("elicitation/create", &question(), &mut permissions, &cancel)
+        .unwrap()
+        .unwrap();
+    assert_eq!(result, json!({"action":"accept","content":{"q0":"Blue"}}));
+    assert_eq!(
+        core.questions.lock().unwrap()[0][0].options[1].label,
+        "Blue"
+    );
+}
+
+#[test]
+fn validation_rejects_empty_requests_and_invalid_acp_agent_metadata() {
+    let mut req = request(StepAccess::Write);
+    req.prompt.clear();
+    assert!(prepare(&req).is_err());
+    req.prompt = "ok".into();
+    req.acp_agent = Some("wrong-kind".into());
+    assert!(prepare(&req).is_err());
+    req.acp_agent = None;
+    req.cwd = PathBuf::from("relative");
+    assert!(prepare(&req).is_err());
 }
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn public_dispatch_runs_executable_override_with_core_interactions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fl-opencode-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let executable = dir.join("opencode");
+    std::fs::copy(fixture("opencode-acp.py"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut request = request(StepAccess::Write);
+    request.cwd = dir.clone();
+    request.executable = Some(executable);
+    request.environment.insert(
+        "QUESTION_FIXTURE".into(),
+        fixture("opencode-question.json").into_os_string(),
+    );
+    let core = Arc::new(CoreHandler {
+        choice: Some("always".into()),
+        answer: Some(vec![QuestionAnswer {
+            selected: vec!["Blue".into()],
+            text: None,
+        }]),
+        ..CoreHandler::default()
+    });
+    let result = crate::local_harness::run(&request, core.clone(), &CancellationToken::new()).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+    let result = result.unwrap();
+    assert_eq!(result.session_id.as_deref(), Some("fake-session"));
+    assert_eq!(result.message, "done");
+    assert_eq!(core.permissions.lock().unwrap().len(), 1);
+    assert_eq!(core.questions.lock().unwrap().len(), 1);
 }
 
 // Uses the shared ACP client, not a test-only protocol implementation.
@@ -316,12 +464,12 @@ fn real_binary_acp_permissions_and_read_only() {
                 }
             })
             .unwrap();
-        let role = if case == "review" {
-            HarnessRole::Review
+        let access = if case == "review" {
+            StepAccess::ReadOnly
         } else {
-            HarnessRole::Build
+            StepAccess::Write
         };
-        let mut request = request(role);
+        let mut request = request(access);
         request.executable = Some(binary.clone());
         request.cwd = root.join("work");
         assert!(request.cwd.is_dir());

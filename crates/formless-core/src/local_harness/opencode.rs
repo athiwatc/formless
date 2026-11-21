@@ -12,10 +12,20 @@
 //! Formless must authorize every bridge operation independently.
 //! OpenCode flattens namespaces: configured server names beginning formless_ also
 //! collide with that exception and must not be treated as untrusted servers.
+//! Rules are last-match-wins, verified by the ignored real-binary test. "Always"
+//! decisions stay in core's attempt cache and become allow-once replies to OpenCode.
 //!
 //! Code-mode approvals identify execute, not the inner action. They always require
 //! the user; JavaScript is never used to recognize a trusted bridge invocation.
 //! V1, run/JSONL, importing and resuming sessions are not supported here.
+//! Question forms currently support the observed optional single-choice oneOf and
+//! paired custom-text schema; other schemas (including arrays) are declined.
+//!
+//! Live smoke: set FORMLESS_OPENCODE_BIN and FORMLESS_OPENCODE_SMOKE_DIR (a persistent
+//! directory containing work/), then run the ignored real_binary_acp_permissions_and_read_only
+//! test with --nocapture. It uses fresh HOME/XDG directories and the default free model.
+
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use formless_protocol::{Question, QuestionAnswer, QuestionOption};
@@ -23,7 +33,7 @@ use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::acp::{self, AgentSpec, PermissionHandler};
-use super::{HarnessRequest, HarnessResult, HarnessRole};
+use super::{HarnessRequest, HarnessResult, InteractionHandler};
 
 pub const SPEC: AgentSpec = AgentSpec {
     name: "OpenCode",
@@ -42,16 +52,71 @@ pub const SPEC: AgentSpec = AgentSpec {
     vendor_request,
 };
 
-pub fn run(
+/// Runs the shared blocking ACP driver off the async core's executor.
+pub async fn run(
     request: &HarnessRequest,
-    permissions: &mut dyn PermissionHandler,
+    interactions: Arc<dyn InteractionHandler>,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    acp::run(&SPEC, &prepare(request)?, permissions, cancel)
+    let request = prepare(request)?;
+    let runtime = tokio::runtime::Handle::current();
+    let cancel = cancel.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut permissions = AttemptScoped(acp::Interactions {
+            handler: interactions.as_ref(),
+            runtime,
+        });
+        acp::run(&SPEC, &request, &mut permissions, &cancel)
+    })
+    .await
+    .context("OpenCode ACP task failed")?
 }
 
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
     acp::open_session(&SPEC, &prepare(request)?)
+}
+
+struct AttemptScoped<'a>(acp::Interactions<'a>);
+
+fn once_option(options: &[Value], allow: bool) -> Option<String> {
+    let kind = if allow { "allow_once" } else { "reject_once" };
+    options.iter().find(|o| o["kind"] == kind)?["optionId"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+impl PermissionHandler for AttemptScoped<'_> {
+    fn decide(&mut self, request: &acp::PermissionRequest<'_>) -> Option<String> {
+        let reject = || once_option(request.options, false);
+        if request.cancel.is_cancelled() {
+            return reject();
+        }
+        let decision = self.0.decide(request);
+        if request.cancel.is_cancelled() {
+            return reject();
+        }
+        let Some(option) = decision.as_ref().and_then(|id| {
+            request
+                .options
+                .iter()
+                .find(|o| o["optionId"].as_str() == Some(id))
+        }) else {
+            return reject();
+        };
+        match option["kind"].as_str() {
+            // Core owns attempt-scoped "always"; never persist it in OpenCode.
+            Some("allow_once" | "allow_always") => once_option(request.options, true),
+            _ => reject(),
+        }
+    }
+
+    fn ask_question(&mut self, questions: &Value, cancel: &CancellationToken) -> Option<Value> {
+        self.0.ask_question(questions, cancel)
+    }
+
+    fn on_update(&mut self, params: &Value) {
+        self.0.on_update(params);
+    }
 }
 
 fn check_agent(initialized: &Value) -> Result<()> {
@@ -98,6 +163,10 @@ fn config() -> Value {
 }
 
 fn prepare(request: &HarnessRequest) -> Result<HarnessRequest> {
+    super::validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    if request.kind != super::HarnessKind::OpenCode {
+        bail!("OpenCode adapter requires an OpenCode harness request.");
+    }
     acp::validate(request)?;
     let mut environment = request.environment.clone();
     environment.insert("PWD".into(), request.cwd.as_os_str().to_owned());
@@ -107,10 +176,11 @@ fn prepare(request: &HarnessRequest) -> Result<HarnessRequest> {
     );
     Ok(HarnessRequest {
         kind: request.kind,
+        acp_agent: request.acp_agent.clone(),
         model: request.model.clone(),
         cwd: request.cwd.clone(),
         prompt: request.prompt.clone(),
-        role: request.role,
+        access: request.access,
         mcp_command: request.mcp_command.clone(),
         mcp_args: request.mcp_args.clone(),
         mcp_env_vars: request.mcp_env_vars.clone(),
