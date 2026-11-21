@@ -511,6 +511,11 @@
     if (!m) return null;
     const { path, windows } = normalizeApprovalPath(m[2]);
     const seg = path.split("/").filter(Boolean);
+    const windowsPath = /^[a-z]:[\\/]|^\\\\/i.test(path);
+    const composer = (windowsPath ? path.split(/[\\/]/).filter(Boolean) : seg)
+      .slice(-3).map(part => (windowsPath ? part.split(":")[0] : part).toLowerCase());
+    if (composer.at(-1) === "auth.json" && (composer.at(-2) === ".composer" ||
+        (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
@@ -1686,10 +1691,11 @@
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
-    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
@@ -1697,6 +1703,15 @@
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
+  function powershellQuoteEnd(code, from, quote) {
+    for (let i = from; i < code.length; i++) {
+      const c = code[i];
+      if ((quote === '"' && c === "`") || (c === quote && code[i + 1] === quote)) i++;
+      else if (c === quote) return i + 1;
+    }
+    return code.length;
+  }
+
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1710,6 +1725,7 @@
     const php = L === HL.php;
     const out = [];
     let plain = "";
+    const powershell = L === HL.powershell;
     const tok = (cls, s) => {
       if (plain) { out.push(plain); plain = ""; }
       out.push(h("span", { class: cls }, s));
@@ -1755,6 +1771,23 @@
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
         tok("tok-com", code.slice(i, stop));
+        i = stop;
+        continue;
+      }
+      if (powershell && c === "@" && (code[i + 1] === '"' || code[i + 1] === "'")) {
+        const newline = code.indexOf("\n", i + 2);
+        const lineEnd = newline === -1 ? code.length : newline;
+        if (!code.slice(i + 2, lineEnd).trim()) {
+          const end = code.indexOf("\n" + code[i + 1] + "@", lineEnd);
+          const stop = end === -1 ? code.length : end + 3;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
+      if (powershell && L.q.includes(c)) {
+        const stop = powershellQuoteEnd(code, i + 1, c);
+        tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
       }
@@ -2330,19 +2363,23 @@
       pre.textContent = text;
       sync();
     };
-    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
-      while (end < first.total_chars) {
-        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
-        if (!r) return;
-        text += r.text;
-        end = r.end;
+    const download = h("button", { class: "btn small", type: "button" }, "Download");
+    download.onclick = async () => {
+      download.disabled = true;
+      try {
+        const chunks = [text];
+        let offset = end;
+        while (offset < first.total_chars) {
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          if (!r) return;
+          chunks.push(r.text);
+          offset = r.end;
+        }
+        downloadBlob("artifact-" + id.slice(0, 8) + ".txt", new Blob(chunks, { type: "text/plain" }));
+      } finally {
+        download.disabled = false;
       }
-      pre.textContent = text;
-      sync();
-      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    } }, "Download");
+    };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
@@ -3478,10 +3515,18 @@
     if (!readingVisible()) return null;
     const box = $("transcript"), bounds = visibleReadingBounds();
     const origin = box.getBoundingClientRect().top;
-    const messages = [...box.querySelectorAll("[data-message-id], [data-live-root]")];
-    const visible = messages.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
+    // These are the first four eligible roots in DOM order, not necessarily
+    // inside the viewport. Skip the remaining rectangle reads, but keep the
+    // same lower bound and do not assume the roots are sorted by geometry.
+    const messages = [];
+    for (const node of box.querySelectorAll("[data-message-id], [data-live-root]")) {
+      const r = node.getBoundingClientRect();
+      if (!(r.height && r.bottom > bounds.top + 1)) continue;
+      messages.push(node);
+      if (messages.length === 4) break;
+    }
     const candidates = [];
-    for (const message of visible.slice(0, 4)) {
+    for (const message of messages) {
       const blocks = [...message.querySelectorAll(anchorBlocks)];
       const visibleBlocks = blocks.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
       let block = visibleBlocks[0] || message;
