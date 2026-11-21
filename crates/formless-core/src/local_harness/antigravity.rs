@@ -109,13 +109,12 @@ fn models_signed_in(
         .collect();
     let deadline = Instant::now() + MODELS_TIMEOUT;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+        match child.has_exited() {
+            Ok(true) => break child.finish().ok()?,
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             _ => return None,
         }
     };
-    drop(child);
     let output: String = readers
         .into_iter()
         .filter_map(|reader| reader.join().ok())
@@ -366,6 +365,7 @@ mod tests {
             &agy,
             r#"#!/bin/sh
 if [ "$1" = models ]; then
+  sleep 30 &
   echo "Error: Please sign in to view available models. Launch the CLI without arguments to sign in." >&2
   exit 1
 fi
@@ -376,7 +376,10 @@ sleep 5
         )
         .unwrap();
         std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
         let availability = super::availability(Some(agy), &BTreeMap::new());
+        // A descendant holding agy's output pipes must not stall the probe.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(availability.kind, HarnessKind::Antigravity);
         assert!(availability.installed);

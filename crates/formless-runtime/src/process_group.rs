@@ -139,8 +139,17 @@ impl SupervisedProcess {
         )
     }
 
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
+    /// Polls the leader without reaping it, so the group stays killable.
+    pub fn has_exited(&mut self) -> std::io::Result<bool> {
+        platform::has_exited(&mut self.child)
+    }
+
+    /// Kills any remaining descendants, then reaps the leader.
+    pub fn finish(mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(group) = self.group.take() {
+            group.kill();
+        }
+        self.child.wait()
     }
 }
 
