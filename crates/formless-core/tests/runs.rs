@@ -815,20 +815,20 @@ fn queued_messages_can_be_edited_moved_and_removed() {
     assert_eq!(items.len(), 3);
     assert!(store.edit_queued(&s, items[1].id, Some("B")).unwrap());
     assert_eq!(texts(&store), ["a", "B", "c"]);
-    // Moving swaps with the neighbour; the ends do not move further.
+    // Positions swap while IDs and their text stay together.
     assert_eq!(
         store.move_queued(&s, items[2].id, true).unwrap(),
-        Some(items[1].id)
+        Some(items[2].id)
     );
     assert_eq!(texts(&store), ["a", "c", "B"]);
     assert_eq!(store.move_queued(&s, items[0].id, true).unwrap(), None);
-    assert_eq!(store.move_queued(&s, items[2].id, false).unwrap(), None);
+    assert_eq!(store.move_queued(&s, items[1].id, false).unwrap(), None);
     assert!(store.edit_queued(&s, items[0].id, None).unwrap());
     assert_eq!(texts(&store), ["c", "B"]);
     // Sent (popped) messages are no longer editable; other Sessions' ids
     // do not match.
     store.pop_queued_message(&s).unwrap();
-    assert!(!store.edit_queued(&s, items[1].id, Some("x")).unwrap());
+    assert!(!store.edit_queued(&s, items[2].id, Some("x")).unwrap());
     let other = store.create_session(None).unwrap().id;
     assert!(!store.edit_queued(&other, items[2].id, None).unwrap());
     assert_eq!(texts(&store), ["B"]);

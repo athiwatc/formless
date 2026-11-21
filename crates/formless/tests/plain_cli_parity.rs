@@ -258,6 +258,20 @@ impl Fixture {
                             json!([])
                         }
                         Request::ListTools => tool_rows.clone(),
+                        Request::SetToolTags { id, tags } => {
+                            let mut tool = tool_rows
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|row| row["id"] == *id)
+                                .unwrap()
+                                .clone();
+                            tool["tags"] = json!(tags
+                                .iter()
+                                .map(|tag| tag.to_ascii_lowercase())
+                                .collect::<Vec<_>>());
+                            tool
+                        }
                         Request::ExportTool { id } => {
                             assert_eq!(id, "full-tool-id");
                             json!({"fixture":"unchanged bundle"})
@@ -336,6 +350,8 @@ impl Fixture {
                         }
                         Request::SessionUsage { .. } => session_usage_report(),
                         Request::ContextUsage { .. } => session_context_report(),
+                        Request::ListMemories => json!([memory_note_for_display()]),
+                        Request::UpsertMemory { .. } => memory_note_for_display(),
                         Request::ListSubagents { session_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!([
@@ -2243,8 +2259,8 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
     assert!(inventory.status.success());
     let text = String::from_utf8(inventory.stdout).unwrap();
     assert!(text.contains("subagent-ไทย-full-reusable-id"));
-    assert!(text.contains("Result: null"));
-    assert!(text.contains("Result: \"\""));
+    assert!(text.contains("Result: (not reported)"));
+    assert!(text.contains("Result: (empty)"));
     let before = fixture.requests.lock().unwrap().len();
     for selector in ["abc", "missing"] {
         let output = fixture.run(&["sessions", "subagents", selector]);
@@ -2301,6 +2317,40 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+#[test]
+fn human_memory_list_add_and_edit_escape_stored_controls() {
+    let fixture = Fixture::new();
+    for args in [
+        &["memory", "list"][..],
+        &["memory", "add", "fixture"],
+        &["memory", "edit", "memory-fixture", "--disable"],
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains("off") && text.contains("note\\u{d}\\u{1b}\\u{9b}\\u{202e}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("project:/fixture\\u{202e}") && text.contains("from session ไทย"),
+            "{text}"
+        );
+        assert!(!text.contains(['\r', '\u{1b}', '\u{9b}', '\u{202e}']));
+    }
+    let output = fixture.run(&["memory", "list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([memory_note_for_display()])
+    );
+}
+
+fn memory_note_for_display() -> Value {
+    json!({"id":"memory-fixture","enabled":false,"scope":"project:/fixture\u{202e}","text":"note\r\u{1b}\u{9b}\u{202e}","session_id":"ไทยabcdef","author":"agent"})
 }
 
 #[test]
@@ -2440,9 +2490,9 @@ fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete
                 }
                 if status == "paused" {
                     assert!(
-                        text.contains("Known USD subtotal: 0.25")
+                        text.contains("Known USD subtotal: $0.250000")
                             && text.contains("Total USD: -")
-                            && text.contains("Spend complete: false")
+                            && text.contains("Spend complete: no")
                     );
                 }
             }
@@ -2525,6 +2575,14 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                     group.is_none() || group == Some("day")
                 );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
+                assert_eq!(
+                    text.lines()
+                        .last()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    ["TOTAL", "10", "12", "3", "-", "22", "-"]
+                );
                 let cost = |key| {
                     text.lines()
                         .find(|line| line.starts_with(key))
@@ -2603,21 +2661,20 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
                 "Invocation ID: invocation-full-id",
                 "Elapsed: 1.234s",
                 "Silent: 0.000s",
-                "Elapsed: 86400.001s",
-                "Silent: 60.001s",
+                "Elapsed: 24h",
+                "Silent: 1m",
                 "Stalled: yes",
                 "Stalled: no",
                 "Abandoned: no",
                 "Abandoned: yes — no longer awaited; may still finish",
-                "Progress fraction: 0",
-                "Progress label: label only\\u{9}ไทย",
+                "Progress: 0%",
+                "Progress: label only\\u{9}ไทย",
                 "日本語\\u{1b}[31m",
                 "Session: session\\u{a}full",
             ] {
                 assert!(text.contains(expected), "missing {expected:?}: {text}");
             }
-            assert_eq!(text.matches("Progress fraction:").count(), 1);
-            assert_eq!(text.matches("Progress label:").count(), 1);
+            assert_eq!(text.matches("Progress:").count(), 2);
             assert!(!text.contains('\u{1b}'));
         }
         let requests = fixture.requests.lock().unwrap();
@@ -2664,6 +2721,45 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn shipped_tool_tag_only_mutates_for_positional_tags_or_explicit_clear() {
+    let mut tool = detail_tool("full-tool-id", "FetchPage", 1);
+    tool["tags"] = json!(["web", "stored\u{202e}tag"]);
+    let fixture = Fixture::with_tools(json!([tool]));
+
+    let conflict = fixture.run(&["tools", "tag", "FetchPage", "web", "--clear"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    let read = fixture.run(&["tools", "tag", "FetchPage"]);
+    assert!(read.status.success(), "{read:?}");
+    assert_eq!(read.stdout, b"FetchPage: web stored\\u{202e}tag\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools]
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let cleared = fixture.run(&["tools", "tag", "FetchPage", "--clear"]);
+    assert!(cleared.status.success(), "{cleared:?}");
+    assert_eq!(cleared.stdout, b"FetchPage: no tags\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags.is_empty()
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let replaced = fixture.run(&["tools", "tag", "full-tool-id", "HTTP", "Docs"]);
+    assert!(replaced.status.success(), "{replaced:?}");
+    assert_eq!(replaced.stdout, b"FetchPage: http docs\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags == &["HTTP", "Docs"]
+    ));
 }
 
 #[test]

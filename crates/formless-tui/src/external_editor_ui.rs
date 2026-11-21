@@ -37,7 +37,7 @@ enum Target {
         session: Option<String>,
         instructions: Option<String>,
         message: Option<String>,
-        queued: Option<i64>,
+        queued: Option<QueuedEdit>,
         step: bool,
         display: String,
         cursor: usize,

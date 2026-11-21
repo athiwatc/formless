@@ -20,6 +20,61 @@ fn fts_queries_are_quoted_prefix_terms() {
 }
 
 #[test]
+fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let gap = "unrelated ".repeat(20);
+    let message = format!(
+        "Deploy early {gap} redeploy staging is an unrelated aside {gap} \
+         Staging was\ndeployed for the cafe\u{301} group {gap} after"
+    );
+    store.append_message(&session.id, "user", &message).unwrap();
+    for query in ["deploy stag", "deploy stag CAFÉ", "deploy stag cafe\u{301}"] {
+        let result = &store.search_sessions(query, 1).unwrap()[0].snippet;
+        assert!(result.contains("Staging was deployed for the cafe\u{301} group"));
+        assert!(!result.contains("redeploy"), "{result}");
+        assert!(result.starts_with('…') && result.ends_with('…'));
+        assert!(result.chars().count() <= 102);
+    }
+    let single = &store.search_sessions("deploy", 1).unwrap()[0].snippet;
+    assert_eq!(
+        single,
+        &format!("Deploy early {}unr…", "unrelated ".repeat(5))
+    );
+}
+
+#[test]
+fn search_snippet_ties_choose_the_shortest_then_earliest_span() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let gap = "遥".repeat(160);
+    let message = format!(
+        "alpha with extra words beta {gap} beta alpha EARLIEST {gap} \
+         alpha beta LATER {gap}"
+    );
+    store.append_message(&session.id, "user", &message).unwrap();
+    let hits = store.search_sessions("alpha beta", 10).unwrap();
+    assert!(hits[0].snippet.contains("beta alpha EARLIEST"));
+    assert!(!hits[0].snippet.contains("LATER"));
+    assert!(hits[0].snippet.chars().count() <= 102);
+
+    let message = format!("alpha {gap} beta and ??");
+    let isolated = store.append_message(&session.id, "user", &message).unwrap();
+    let hits = store.search_sessions("alpha beta", 10).unwrap();
+    let snippet = &hits
+        .iter()
+        .find(|hit| hit.message_id == isolated.id)
+        .unwrap()
+        .snippet;
+    assert!(snippet.contains("beta"));
+    assert!(!snippet.contains("alpha"));
+    assert!(snippet.chars().count() <= 102);
+    assert!(store.search_sessions("??", 1).unwrap()[0]
+        .snippet
+        .ends_with("beta and ??"));
+}
+
+#[test]
 fn search_follows_inserts_edits_and_deletes() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
     let db = std::path::PathBuf::from(format!("/tmp/fl-fts-{short}/f.db"));
