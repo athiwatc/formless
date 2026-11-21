@@ -122,6 +122,8 @@ fn url_key(url: &str) -> String {
     let u = if let Some(rest) = u
         .strip_prefix("http://127.0.0.1:")
         .or_else(|| u.strip_prefix("http://[::1]:"))
+        .or_else(|| u.strip_prefix("http://0.0.0.0:"))
+        .or_else(|| u.strip_prefix("http://[::]:"))
     {
         format!("http://localhost:{rest}")
     } else {
@@ -134,6 +136,14 @@ fn url_key(url: &str) -> String {
 pub fn for_url(base_url: &str) -> Option<&'static Preset> {
     let url = url_key(base_url);
     PRESETS.iter().find(|p| url_key(p.base_url) == url)
+}
+
+pub fn for_provider(provider: &crate::config::ProviderCfg) -> Option<&'static Preset> {
+    provider
+        .preset
+        .as_deref()
+        .and_then(find)
+        .or_else(|| for_url(&provider.base_url))
 }
 
 /// The API style a provider should have after its base URL changes from
