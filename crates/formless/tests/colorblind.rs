@@ -307,7 +307,7 @@ fn shipped_piped_tables_keep_original_cells_even_with_no_color_or_colorblind_the
 }
 
 #[cfg(unix)]
-fn terminal(f: &Fixture, no_color: Option<&str>) -> String {
+fn terminal(f: &Fixture, no_color: Option<&str>, colorfgbg: &str) -> String {
     use std::os::fd::FromRawFd;
     let (mut master, mut slave) = (-1, -1);
     let mut size = libc::winsize {
@@ -334,7 +334,9 @@ fn terminal(f: &Fixture, no_color: Option<&str>) -> String {
     if let Some(value) = no_color {
         command.env("NO_COLOR", value);
     }
-    command.stdout(Stdio::from(slave));
+    command
+        .env("COLORFGBG", colorfgbg)
+        .stdout(Stdio::from(slave));
     let mut child = Owned(command.spawn().unwrap());
     drop(command);
     let reader = std::thread::spawn(move || {
@@ -369,32 +371,38 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
     let f = Fixture::new();
     let daemon = f.daemon();
     success(f.run(&["config", "set", "tui.theme", "colorblind"], None));
-    let colored = terminal(&f, None);
-    for tone in [
-        formless_tui::SemanticTone::Good,
-        formless_tui::SemanticTone::Warn,
-        formless_tui::SemanticTone::Bad,
-    ] {
-        let (r, g, b) = formless_tui::colorblind_rgb(tone);
-        assert!(
-            colored.contains(&format!("\x1b[38;2;{r};{g};{b}m")),
-            "canonical RGB missing"
-        );
-    }
     let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
-    let visible = ansi.replace_all(&colored, "");
-    assert_eq!(
-        terminal(&f, Some("")),
-        colored,
-        "empty NO_COLOR keeps terminal colors"
-    );
-    for no_color in ["1", "0"] {
-        let plain = terminal(&f, Some(no_color));
-        assert!(!plain.contains('\x1b'));
+    let mut previous = None;
+    for (colorfgbg, light) in [("7;0", false), ("0;15", true)] {
+        let colored = terminal(&f, None, colorfgbg);
+        for tone in [
+            formless_tui::SemanticTone::Good,
+            formless_tui::SemanticTone::Warn,
+            formless_tui::SemanticTone::Bad,
+        ] {
+            let (r, g, b) = formless_tui::colorblind_rgb_on_background(tone, light);
+            assert!(
+                colored.contains(&format!("\x1b[38;2;{r};{g};{b}m")),
+                "canonical RGB missing for {colorfgbg}"
+            );
+        }
+        let visible = ansi.replace_all(&colored, "");
+        if let Some(previous) = previous.replace(visible.to_string()) {
+            assert_eq!(previous, visible, "background keeps status text and layout");
+        }
         assert_eq!(
-            plain, visible,
-            "NO_COLOR preserves status information and layout"
+            terminal(&f, Some(""), colorfgbg),
+            colored,
+            "empty NO_COLOR keeps terminal colors"
         );
+        for no_color in ["1", "0"] {
+            let plain = terminal(&f, Some(no_color), colorfgbg);
+            assert!(!plain.contains('\x1b'));
+            assert_eq!(
+                plain, visible,
+                "NO_COLOR preserves status information and layout"
+            );
+        }
     }
     f.no_provider_contact();
     drop(daemon);
