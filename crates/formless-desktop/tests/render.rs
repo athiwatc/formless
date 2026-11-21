@@ -25,7 +25,7 @@ mod render {
     use formless_desktop::timeline::TimelineBlock;
     use gpui_kit::assets::Assets;
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
-    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
     use gpui_kit::{
         point, px, size, AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity,
         Focusable as _, HeadlessAppContext, Pixels, ScrollDelta, Size, Window, WindowBounds,
@@ -76,7 +76,27 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 53] = [
+    const STATES: [State; 57] = [
+        state("slash-popup-light", 1440., 900., LIGHT, 100, None, WHOLE),
+        state("slash-popup-dark", 1440., 900., DARK, 100, None, WHOLE),
+        state(
+            "slash-popup-narrow-light",
+            480.,
+            900.,
+            LIGHT,
+            100,
+            None,
+            REFLOWED,
+        ),
+        state(
+            "slash-popup-narrow-dark-200pct",
+            480.,
+            900.,
+            DARK,
+            200,
+            None,
+            REFLOWED,
+        ),
         state(
             "session-usage-light",
             1440.,
@@ -739,6 +759,28 @@ mod render {
             );
             captures += 1;
         };
+
+        if name.starts_with("slash-popup-") {
+            cx.update_window(any, |_, window, cx| {
+                window.render_frame(cx);
+                let input = shell.read(cx).composer().clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("/", window, cx);
+                    input.focus(window, cx);
+                });
+                window.render_frame(cx);
+                assert!(window.find("slash-popup").visible());
+                window.press("down", cx);
+                window.render_frame(cx);
+                assert_eq!(window.find("slash-row-1").selected(), Some(true));
+                let popup = window.find("slash-popup").bounds();
+                assert!(popup.left() >= px(0.) && popup.right() <= viewport.width);
+                assert!(popup.bottom() <= window.find_by_label("Message").bounds().top());
+            })
+            .expect("slash popup renders with real fonts");
+            capture(&mut cx, "");
+            return captures;
+        }
 
         // With real fonts, before any overlay is opened over the shell.
         cx.update_window(any, |_, window, cx| {

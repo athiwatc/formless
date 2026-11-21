@@ -18,6 +18,7 @@ pub(super) struct Panel {
     stage: Stage,
     frozen: String,
     typed: Option<String>,
+    initial_text: Option<String>,
     input: Entity<TextareaState>,
     notice: String,
     focus: FocusHandle,
@@ -35,6 +36,11 @@ pub(super) struct State {
     observed: Status,
 }
 impl Shell {
+    pub(super) fn prefill_run_action(&mut self, text: String) {
+        if let Some(panel) = &mut self.run_actions.panel {
+            panel.initial_text = Some(text);
+        }
+    }
     pub(super) fn undo_deleted_session(&mut self, operation: uuid::Uuid, cx: &mut Context<Self>) {
         if let Some(ticket) = self
             .run_actions
@@ -93,6 +99,7 @@ impl Shell {
             stage: Stage::Loading,
             frozen: String::new(),
             typed: None,
+            initial_text: None,
             input,
             notice: "Reading the current canonical action target…".into(),
             focus: cx.focus_handle(),
@@ -154,7 +161,7 @@ impl Shell {
         };
         match result {
             Ok(target) => {
-                let text = match p.kind {
+                let text = p.initial_text.take().unwrap_or_else(|| match p.kind {
                     Kind::Edit => target
                         .user
                         .as_ref()
@@ -162,7 +169,7 @@ impl Shell {
                         .unwrap_or_default(),
                     Kind::Cwd => target.cwd.clone().unwrap_or_default(),
                     _ => String::new(),
-                };
+                });
                 p.input
                     .update(cx, |input, cx| input.set_value(text, window, cx));
                 p.notice = if target.allowed(p.kind) {

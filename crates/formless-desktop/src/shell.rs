@@ -49,6 +49,7 @@ mod run_actions;
 mod run_inspection;
 mod session_fork;
 mod sessions;
+mod slash;
 mod step_mode;
 mod step_review;
 mod usage;
@@ -95,6 +96,11 @@ gpui_kit::actions!(
         SelectNextCommand,
         RunSelectedCommand,
         ClosePalette,
+        SlashPrevious,
+        SlashNext,
+        SlashComplete,
+        SlashAccept,
+        SlashDismiss,
         CloseForecast,
         CloseQuestions,
         CloseStepReview,
@@ -126,6 +132,7 @@ gpui_kit::actions!(
 );
 
 const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
+const ACTION_QUEUED_NOTICE: &str = "Action queued; waiting for daemon acknowledgement. Draft kept.";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
@@ -187,7 +194,10 @@ pub fn bind_keys(cx: &mut App) {
                 Command::FocusPreviousRegion => KeyBinding::new(key, FocusPreviousRegion, None),
                 Command::ShowCommands => KeyBinding::new(key, ShowCommands, None),
                 Command::GoTo(Destination::Search) => KeyBinding::new(key, FindLoadedText, None),
-                Command::Send
+                Command::NewSession
+                | Command::SessionUsage
+                | Command::ToggleStepMode
+                | Command::Send
                 | Command::RunAction(_)
                 | Command::SendSecondary
                 | Command::Stop
@@ -215,6 +225,11 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new("up", SlashPrevious, Some("FormlessSlash > Input")),
+        KeyBinding::new("down", SlashNext, Some("FormlessSlash > Input")),
+        KeyBinding::new("tab", SlashComplete, Some("FormlessSlash > Input")),
+        KeyBinding::new("enter", SlashAccept, Some("FormlessSlash > Input")),
+        KeyBinding::new("escape", SlashDismiss, Some("FormlessSlash > Input")),
         KeyBinding::new("escape", CloseRunActions, Some("FormlessRunActions")),
         KeyBinding::new(
             "escape",
@@ -757,6 +772,7 @@ impl PageMetrics {
 }
 
 pub struct Shell {
+    slash: slash::Popup,
     client: Option<Client>,
     client_connected: bool,
     client_snapshot_ready: bool,
@@ -1122,6 +1138,9 @@ impl Shell {
                 can_recover: false,
                 can_questions: false,
                 can_approvals: false,
+                can_create_session: false,
+                usage_reason: Some("Choose a connected Session in Chat first"),
+                step_mode_reason: Some("Step mode is not available for this Session"),
                 can_search_profile: false,
                 can_edit_session: false,
                 can_browse_archived: false,
@@ -1142,6 +1161,7 @@ impl Shell {
                 destination: Destination::Chat,
                 palette_open: false,
             },
+            slash: slash::Popup::default(),
             palette: None,
             palette_focus: cx.focus_handle(),
             viewer: None,
@@ -1251,6 +1271,7 @@ impl Shell {
         // on its Change event: ending an input-method composition makes its
         // text part of the draft without emitting one.
         let changes = cx.observe_in(&composer, window, |this, _, window, cx| {
+            this.slash_changed(cx);
             this.composer_changed(window, cx)
         });
         (composer, [events, changes])
@@ -1839,10 +1860,9 @@ impl Shell {
     fn emit(&mut self, intent: Intent, cx: &mut Context<Self>) {
         self.last_intent = Some(IntentRecord::from(&intent));
         if self.client.is_some() {
-            self.composer_notice =
-                Some("Action queued; waiting for daemon acknowledgement. Draft kept.".into());
+            self.composer_notice = Some(ACTION_QUEUED_NOTICE.into());
             if intent.starts_work() {
-                let draft = self.draft(cx).to_string();
+                let draft = crate::slash::message_text(&self.draft(cx)).to_string();
                 if let Some(client) = &self.client {
                     let run_id = self.client_steerable_run_id.clone();
                     if let Err(error) = client.review_for_run(intent, draft, run_id) {
@@ -2069,7 +2089,7 @@ impl Shell {
             })
             && self.client_generation == prepared.generation
             && self.sidebar.active_id() == Some(prepared.session_id.as_str())
-            && self.draft(cx).as_ref() == prepared.draft_basis
+            && crate::slash::message_text(&self.draft(cx)) == prepared.draft_basis
             && self.composer.update(cx, |composer, cx| {
                 composer.marked_text_range(window, cx).is_none()
             })
@@ -3310,7 +3330,11 @@ impl Shell {
         let Some(session_id) = self.sidebar.active_id().map(str::to_string) else {
             return;
         };
-        let content = self.draft(cx).to_string();
+        let draft = self.draft(cx);
+        let content = match crate::slash::parse(&draft) {
+            crate::slash::Parsed::Message(text) => text.to_string(),
+            _ => return,
+        };
         self.emit(
             Intent::SendMessage {
                 session_id,
@@ -3349,6 +3373,12 @@ impl Shell {
             can_questions: self.client.is_some(),
             can_approvals: self.client_connected
                 && self.client.as_ref().is_some_and(Client::is_ready),
+            can_create_session: self.client_connected
+                && self.client.as_ref().is_some_and(Client::is_ready),
+            usage_reason: self.session_usage_command_reason(),
+            step_mode_reason: (self.mode_enable_action().is_none()
+                && self.mode_disable_action().is_none())
+            .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
             can_edit_session: self.client_connected && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
@@ -3382,6 +3412,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&'static str> {
+        if matches!(command, Command::Send | Command::SendSecondary)
+            && self.draft(cx).starts_with('/')
+            && !self.draft(cx).starts_with("//")
+        {
+            self.submit_slash(window, cx);
+            return None;
+        }
         if self.session_editor.is_some()
             && !matches!(
                 command,
@@ -3511,6 +3548,15 @@ impl Shell {
             return Some(reason);
         }
         match command {
+            Command::NewSession => self.client_request(ClientCommand::CreateSession, cx),
+            Command::SessionUsage => self.read_current_session_usage(window, cx),
+            Command::ToggleStepMode => {
+                if let Some(action) = self.mode_enable_action() {
+                    self.enable_mode(action, window, cx);
+                } else if let Some(action) = self.mode_disable_action() {
+                    self.disable_mode(action, window, cx);
+                }
+            }
             Command::Questions => self.open_questions(window, cx),
             Command::Approvals => self.open_approvals(window, cx),
             Command::SessionDetails => {
@@ -4355,7 +4401,12 @@ impl Shell {
                         .primary()
                         .disabled(self.client.is_none() || !self.client_connected)
                         .tooltip(if self.client.is_some() { "Create a new Session in this Profile" } else { "Session creation requires a daemon connection" })
-                        .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::CreateSession, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(reason) = this.run_command(Command::NewSession, window, cx) {
+                                this.composer_notice = Some(reason.into());
+                                cx.notify();
+                            }
+                        })),
                 ),
             )
             .when(self.sidebar.rows().is_empty(), |panel| panel.child(
@@ -5866,6 +5917,12 @@ impl Shell {
             .border_t_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
+            .on_action(cx.listener(|this, _: &SlashPrevious, window, cx| this.slash_key("up", window, cx)))
+            .on_action(cx.listener(|this, _: &SlashNext, window, cx| this.slash_key("down", window, cx)))
+            .on_action(cx.listener(|this, _: &SlashComplete, window, cx| this.slash_key("tab", window, cx)))
+            .on_action(cx.listener(|this, _: &SlashAccept, window, cx| this.slash_key("enter", window, cx)))
+            .on_action(cx.listener(|this, _: &SlashDismiss, window, cx| this.slash_key("escape", window, cx)))
+            .children(self.render_slash(inert, window, cx))
             .children(self.client_recovery.as_ref().map(|run| {
                 v_flex().id("run-recovery").test_support().role(Role::Group)
                     .aria_label("Run recovery").gap_2()
@@ -5881,7 +5938,7 @@ impl Shell {
                         .child(div().id("abandon-anchor").pt_1().anchor_scroll(Some(self.abandon_anchor.clone())).child(button("run-abandon", Command::AbandonRun, cx).outline().track_focus(&self.abandon_focus))))
             }))
             .child(
-                div().id("composer-input-anchor").rounded(self.scaled(crate::theme::SURFACE_RADIUS)).bg(cx.theme().background).key_context("FormlessComposer").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
+                div().id("composer-input-anchor").rounded(self.scaled(crate::theme::SURFACE_RADIUS)).bg(cx.theme().background).key_context(if self.slash_items(window, cx).is_empty() { "FormlessComposer" } else { "FormlessComposer FormlessSlash" }).when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
                     .aria_label("Message")
                     .on_paste({
                         let shell = cx.entity();

@@ -127,7 +127,7 @@ fn every_run_action_control_reviews_exact_target_and_requires_explicit_confirmat
             });
             window.render_frame(cx);
             assert_eq!(
-                window.find("run-action-heading").value().as_deref(),
+                window.find("run-action-heading").value(),
                 Some(kind.label())
             );
             if kind == Kind::Compact {
