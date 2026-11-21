@@ -2145,6 +2145,7 @@ name = "formless-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "axum",
  "base64 0.22.1",
@@ -2232,6 +2233,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
  "windows-sys 0.59.0",
 ]
