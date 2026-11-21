@@ -353,6 +353,42 @@ fn measured_run_context_survives_estimates_errors_and_resets_for_next_run(cx: &m
             s.apply_client_update(
                 Update::RunActivity {
                     owner: owner.clone(),
+                    event: formless_protocol::Event::CompactionNotice {
+                        session_id: owner.session.clone(),
+                        summary_preview: "Compacted history".into(),
+                    },
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::LiveContext {
+                    owner: owner.clone(),
+                    result: Err("unavailable".into()),
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::LiveContext {
+                    owner: owner.clone(),
+                    result: Ok(ContextUsage {
+                        used: 18,
+                        limit: 100,
+                        measured: false,
+                    }),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        let label = window.find("status-context").value().unwrap().to_string();
+        assert!(label.contains("18%") && label.contains("estimated"));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::RunActivity {
+                    owner: owner.clone(),
                     event: formless_protocol::Event::RunStarted {
                         session_id: owner.session.clone(),
                         run_id: "next".into(),

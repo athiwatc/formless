@@ -2392,6 +2392,10 @@ impl Engine {
         let definite_rejection = run_actions::definite_rejection(&message);
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if let Event::CompactionNotice { session_id, .. } = &event {
+                    self.pending.retain(|_, p| !matches!(p, Pending::LiveContext(owner) if owner.session == *session_id));
+                    self.outgoing.retain(|r| self.pending.contains_key(&r.id));
+                }
                 if matches!(&event, Event::CompactionNotice { .. })
                     || matches!(&event, Event::Note { text, .. } if text.starts_with("compaction failed:"))
                 {

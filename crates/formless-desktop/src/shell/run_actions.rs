@@ -312,7 +312,10 @@ impl Shell {
         match event {
             Event::ProviderStalled { run_id, idle_secs, .. } => self.run_actions.activity = Some((owner, run_id, format!("Provider stalled · silent for {idle_secs}s. Retry provider request continues this Run."))),
             Event::ProviderRetrying { run_id, attempt, max_attempts, wait_secs, reason, .. } => self.run_actions.activity = Some((owner, run_id, format!("Provider retrying · {attempt}/{max_attempts} · wait {wait_secs}s · {}", crate::questions::preview(&reason, 300)))),
-            Event::CompactionNotice { summary_preview, .. } => { self.run_actions.notice = Some((owner, format!("Compaction complete · {}", crate::questions::preview(&summary_preview, 500)))); },
+            Event::CompactionNotice { summary_preview, .. } => {
+                self.run_actions.context = None;
+                self.run_actions.notice = Some((owner, format!("Compaction complete · {}", crate::questions::preview(&summary_preview, 500))));
+            },
             Event::Note { text, .. } if text.starts_with("compaction failed:") => self.run_actions.notice = Some((owner, crate::questions::preview(&text, 500))),
             Event::RunUsage { run_id, usage, .. } => {
                 if usage.context_used >= 0 && usage.context_tokens > 0 {

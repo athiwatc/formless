@@ -861,6 +861,35 @@ mod tests {
         assert!(e.outgoing.is_empty());
     }
     #[test]
+    fn completed_compaction_replaces_precompaction_context_reads() {
+        let (mut e, _, _) = setup(Kind::Compact);
+        e.context_read();
+        let old = e.outgoing.pop_front().unwrap();
+        e.receive(ServerMessage::Event(Event::CompactionNotice {
+            session_id: "s".into(),
+            summary_preview: "summary".into(),
+        }))
+        .unwrap();
+        let fresh = e.outgoing.pop_front().unwrap();
+        assert!(matches!(fresh.request, Request::ContextUsage { .. }));
+        assert_ne!(old.id, fresh.id);
+        e.receive(ServerMessage::ok(
+            old.id,
+            json!({"used_tokens":90,"context_limit":100,"measured":false}),
+        ))
+        .unwrap();
+        assert!(!e
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::LiveContext { .. })));
+        e.receive(ServerMessage::ok(
+            fresh.id,
+            json!({"used_tokens":12,"context_limit":100,"measured":false}),
+        ))
+        .unwrap();
+        assert!(e.updates.iter().any(|u| matches!(u, Update::LiveContext { result: Ok(c), .. } if c.used == 12 && !c.measured)));
+    }
+    #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {
         let (mut e, _, _) = setup(Kind::Compact);
         e.context_read();
