@@ -222,13 +222,10 @@ pub(crate) fn estimate_store_with_window(
             copy.edit_message(session, edit, &input.draft)?
                 .context("user message not found")?;
         } else if input.retry {
-            let user = copy
-                .list_messages(session)?
-                .into_iter()
-                .rev()
-                .find(|m| m.role == "user")
+            let (id, _, content) = copy
+                .last_user_message(session)?
                 .context("nothing to retry")?;
-            copy.edit_message(session, &user.id, &user.content)?
+            copy.edit_message(session, &id, &content)?
                 .context("user message not found")?;
         } else {
             let (id, status) = copy
@@ -680,14 +677,27 @@ pub fn describe(f: &RunForecast) -> String {
 }
 
 pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
-    let runs = st.run_metrics(2000)?;
+    // The forecast window and its observations come from one read snapshot.
+    st.read_transaction(|st| {
+        let forecasts = st.recorded_forecasts_limited(200)?;
+        let ids: Vec<_> = forecasts.iter().map(|(id, _)| id.as_str()).collect();
+        let facts = st.forecast_metric_inputs(&ids, cfg)?;
+        Ok(render_metrics(forecasts, facts))
+    })
+}
+
+fn render_metrics(
+    forecasts: Vec<(String, RunForecast)>,
+    mut facts: std::collections::HashMap<String, crate::storage::ForecastMetricInput>,
+) -> Value {
     let mut rows = Vec::new();
-    for (id, f) in st.recorded_forecasts_limited(200)? {
-        let Some(run) = runs.iter().find(|r| r.run_id == id) else {
+    for (id, f) in forecasts {
+        let Some(run) = facts.remove(&id) else {
             continue;
         };
-        let (cost, main_peak, _) = st.forecast_usage(&id, cfg)?;
-        let served = st.forecast_models(&id)?;
+        let cost = run.cost;
+        let main_peak = run.main_peak;
+        let served = run.served;
         let quoted_provider = f
             .basis
             .provider_key
@@ -702,7 +712,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             .into_iter()
             .map(|(provider, model)| json!({"provider":provider,"model":model}))
             .collect();
-        let complete = st.forecast_usage_complete(&id)?;
+        let complete = run.complete;
         let actual = (run.prompt_tokens + run.completion_tokens) as f64;
         let finished = run.status == "completed" && complete;
         let error = f
@@ -727,7 +737,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
         let comparisons = json!({"steps":comparison(&f.steps,Some(run.steps as f64)),"tokens":comparison(&f.tokens,complete.then_some(actual)),"cost_usd":comparison(&f.cost_usd,cost.filter(|_|complete)),"duration_ms":comparison(&f.duration_ms,Some(run.duration_ms as f64))});
         rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"peak_main_prompt_tokens":main_peak,"served_main":served_main,"basis_match":basis_match,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished && basis_match && main_peak>0}));
     }
-    Ok(json!(rows))
+    json!(rows)
 }
 
 #[cfg(test)]

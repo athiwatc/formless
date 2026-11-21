@@ -3604,7 +3604,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   `/storage`, web Settings → Storage → Disk use) lists the database (and
   roughly what fills it: messages, Invocation logs, Tool versions, file
   snapshots), artifacts, daemon and MCP logs, skills and backups, with the
-  data folder's total.
+  data folder's total. The report reuses measurements where path and category
+  rules agree. Concurrent changes can affect counts within one report.
 - **Clean-up.** `Gc {dry_run}` (`formless gc [--dry-run]`, TUI `/gc` then
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` payload beyond `run_files.*`
