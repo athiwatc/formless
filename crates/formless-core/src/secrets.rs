@@ -13,18 +13,32 @@ const PREFIXES: &[(&str, &str)] = &[
     ("sk-", "API key"),
     ("sk_live_", "API key"),
     ("sk_test_", "API key"),
+    ("rk_test_", "API key"),
     ("rk_live_", "API key"),
+    ("whsec_", "API key"),
     ("ghp_", "GitHub token"),
     ("gho_", "GitHub token"),
     ("ghu_", "GitHub token"),
     ("ghs_", "GitHub token"),
+    ("ghr_", "GitHub token"),
     ("github_pat_", "GitHub token"),
+    ("npm_", "npm token"),
     ("glpat-", "GitLab token"),
+    ("gldt-", "GitLab token"),
+    ("glrt-", "GitLab token"),
     ("xoxb-", "Slack token"),
+    ("xoxe.xapp-", "Slack token"),
+    ("xoxe.xoxb-", "Slack token"),
+    ("xoxe.xoxp-", "Slack token"),
+    ("xoxe-", "Slack token"),
+    ("xapp-", "Slack token"),
     ("xoxp-", "Slack token"),
+    ("shpat_", "API key"),
+    ("shpss_", "API key"),
     ("AIza", "Google API key"),
     ("AKIA", "AWS access key"),
     ("ASIA", "AWS access key"),
+    ("dop_v1_", "DigitalOcean token"),
 ];
 
 const MARK: &str = "[REDACTED]";
@@ -310,6 +324,19 @@ pub fn scan(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn slack_app_and_rotating_tokens_are_redacted_as_whole_values() {
+        let suffix = "0123456789-abcdefghijklmnop";
+        for prefix in ["xapp-", "xoxe.xapp-", "xoxe.xoxb-", "xoxe.xoxp-", "xoxe-"] {
+            assert_eq!(
+                redact(&format!("({prefix}{suffix})")),
+                ("([REDACTED])".into(), Some("Slack token"))
+            );
+        }
+        let note = "documentation mentions tools-xapp and xapp-short";
+        assert_eq!(redact(note), (note.into(), None));
+    }
+
+    #[test]
     fn exact_credential_masking_decodes_json_escapes_without_changing_usage() {
         let body = r#"{"error":{"message":"echo \u006fpaque-access"},"usage":{"prompt_tokens":12,"completion_tokens":3}}"#;
         let clean = super::redact_known(body, &["opaque-access"]);
@@ -359,7 +386,26 @@ mod tests {
     }
 
     #[test]
+    fn digitalocean_personal_tokens_are_redacted_without_matching_short_mentions() {
+        let suffix = "0123456789abcdef".repeat(4);
+        let input = format!("credential rejected: (dop_v1_{suffix})");
+        let (redacted, kind) = redact(&input);
+        assert_eq!(redacted, "credential rejected: ([REDACTED])");
+        assert_eq!(kind, Some("DigitalOcean token"));
+
+        let notes = format!("examples: dop_v1_short dop_{suffix}");
+        assert_eq!(redact(&notes), (notes, None));
+    }
+
+    #[test]
     fn finds_and_blanks_secret_shapes_not_key_names() {
+        for prefix in ["gldt-", "glrt-"] {
+            let token = format!("{prefix}0123456789abcdefghij");
+            assert_eq!(redact(&token), (MARK.into(), Some("GitLab token")));
+        }
+        let note = "GitLab documentation includes gldt-short and glpat-";
+        assert_eq!(redact(note), (note.into(), None));
+
         let cases = [
             ("key sk-proj-abcdefghijklmnopqrstuvwxyz0123 here", "API key"),
             ("Authorization: Bearer abcdefghijklmnop1234", "bearer token"),
@@ -400,6 +446,14 @@ mod tests {
     }
 
     #[test]
+    fn github_app_refresh_tokens_are_scanned_and_redacted() {
+        let token = format!("ghr_{}", "0123456789abcdefghijklmnop");
+        assert_eq!(scan(&token), Some("GitHub token"));
+        assert_eq!(redact(&token), (MARK.into(), Some("GitHub token")));
+        assert_eq!(redact("ghr_short"), ("ghr_short".into(), None));
+    }
+
+    #[test]
     fn ordinary_is_prose_is_not_a_credential_assignment() {
         for text in [
             "The token is refreshed nightly",
@@ -416,6 +470,19 @@ mod tests {
             assert_eq!(redact(text), (text.to_string(), None), "{text}");
             assert_eq!(scan(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn shopify_admin_tokens_and_shared_secrets_are_redacted_by_exact_prefix() {
+        let suffix = "0123456789abcdef0123456789abcdef";
+        for prefix in ["shpat_", "shpss_"] {
+            assert_eq!(
+                redact(&format!("({prefix}{suffix})")),
+                ("([REDACTED])".into(), Some("API key"))
+            );
+        }
+        let note = format!("examples: shpat_abc shpss_short shp_{suffix}");
+        assert_eq!(redact(&note), (note, None));
     }
 
     #[test]
@@ -454,6 +521,21 @@ mod tests {
     }
 
     #[test]
+    fn stripe_webhook_signing_secrets_use_the_shared_token_floor() {
+        for suffix in [
+            "0123456789abcdef0123456789abcdef",
+            "abcdefghijklmnop0123456789",
+        ] {
+            assert_eq!(
+                redact(&format!("signature setting (whsec_{suffix})")),
+                ("signature setting ([REDACTED])".into(), Some("API key"))
+            );
+        }
+        let note = "docs mention whsec_abc in a webhook example";
+        assert_eq!(redact(note), (note.into(), None));
+    }
+
+    #[test]
     fn known_values_still_mask_plain_words_in_is_prose() {
         assert_eq!(
             redact_known("password is sunshine", &["sunshine"]),
@@ -466,6 +548,15 @@ mod tests {
     }
 
     #[test]
+    fn npm_access_tokens_are_redacted_without_matching_short_prefix_mentions() {
+        let token = format!("npm_{}", "abcdefghijklmnopqrstuvwxyz012345");
+        assert_eq!(scan(&token), Some("npm token"));
+        assert_eq!(redact(&token), (MARK.into(), Some("npm token")));
+        let note = "npm documentation mentions npm_short";
+        assert_eq!(redact(note), (note.into(), None));
+    }
+
+    #[test]
     fn configured_patterns_apply() {
         let bad = set_patterns(&["ACME-[0-9]{6}".into(), "(".into()]);
         assert_eq!(bad, vec!["(".to_string()]);
@@ -475,5 +566,12 @@ mod tests {
             ("ticket [REDACTED] done", Some("configured pattern"))
         );
         set_patterns(&[]);
+    }
+
+    #[test]
+    fn stripe_restricted_test_keys_are_redacted() {
+        let key = format!("rk_test_{}", "512345678901234567890123");
+        assert_eq!(redact(&key), (MARK.into(), Some("API key")));
+        assert_eq!(redact("rk_test_short"), ("rk_test_short".into(), None));
     }
 }
