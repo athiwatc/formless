@@ -12912,8 +12912,14 @@ impl Daemon {
     fn read_artifact_impl(&self, session_id: &str, args: &Value) -> Result<String> {
         let id = args["id"].as_str().context("id required")?;
         let (_, path, bytes) = self
-            .with_store(|st| st.get_artifact(id))?
-            .filter(|(owner, ..)| owner.as_deref() == Some(session_id))
+            .with_reader(|st| {
+                let Some(record) = st.get_artifact(id)? else {
+                    return Ok(None);
+                };
+                let allowed = record.0.as_deref() == Some(session_id)
+                    || st.topic_artifact_access(id, session_id, None, record.0.as_deref())?;
+                Ok(allowed.then_some(record))
+            })?
             .with_context(|| {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
