@@ -39,9 +39,13 @@ const WRITE_TOOL_KINDS: &[&str] = &["edit", "delete", "move", "execute"];
 pub struct PermissionRequest<'a> {
     pub tool_call: &'a Value,
     pub options: &'a [Value],
+    /// The run's cancellation token.
+    pub cancel: &'a CancellationToken,
 }
 
 /// Decides Antigravity tool approvals. Returns the chosen `optionId`, or `None` to cancel.
+/// A handler that waits for a person must stop waiting and return `None` once
+/// `request.cancel` fires; the run cannot be cancelled while `decide` blocks.
 pub trait PermissionHandler {
     fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String>;
 }
@@ -570,7 +574,11 @@ impl<W: Write> Rpc<W> {
             reject_option(options)
         } else {
             permissions
-                .decide(&PermissionRequest { tool_call, options })
+                .decide(&PermissionRequest {
+                    tool_call,
+                    options,
+                    cancel: &self.cancel,
+                })
                 .filter(|id| {
                     options
                         .iter()
@@ -889,8 +897,10 @@ mod tests {
     struct CancelOnAsk(CancellationToken);
 
     impl PermissionHandler for CancelOnAsk {
-        fn decide(&mut self, _: &PermissionRequest<'_>) -> Option<String> {
+        fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String> {
+            assert!(!request.cancel.is_cancelled());
             self.0.cancel();
+            assert!(request.cancel.is_cancelled());
             Some("allow".into())
         }
     }
