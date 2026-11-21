@@ -178,26 +178,12 @@ impl Shell {
                 cx.notify();
                 return true;
             }
-            let (bytes, mime) = match client::attachments::clipboard_bytes(
-                image.bytes(),
-                image.format().mime_type(),
-            ) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    self.attachment_notice(error);
-                    cx.notify();
-                    return true;
-                }
-            };
             self.pasted_image_number = self.pasted_image_number.saturating_add(1);
             self.stage_composer_attachments(
-                Intake::Bytes {
-                    name: client::attachments::clipboard_image_name(
-                        self.pasted_image_number,
-                        &mime,
-                    ),
-                    bytes,
-                    mime,
+                Intake::ClipboardImage {
+                    number: self.pasted_image_number,
+                    bytes: image.bytes().to_vec(),
+                    mime: image.format().mime_type().into(),
                 },
                 cx,
             );
@@ -242,7 +228,7 @@ impl Shell {
         }
         let count = |intake: &Intake| match intake {
             Intake::Paths(paths) => paths.len(),
-            Intake::Bytes { .. } => 1,
+            Intake::Bytes { .. } | Intake::ClipboardImage { .. } => 1,
             _ => 0,
         };
         let requested = count(&intake);
@@ -297,6 +283,9 @@ impl Shell {
                 })
                 .collect(),
             Intake::Bytes { name, .. } => vec![name.clone()],
+            Intake::ClipboardImage { number, mime, .. } => {
+                vec![client::attachments::clipboard_image_name(*number, mime)]
+            }
             _ => Vec::new(),
         };
         let mutating = !matches!(intake, Intake::Refresh);

@@ -83,6 +83,11 @@ pub enum Intake {
         bytes: Vec<u8>,
         mime: String,
     },
+    ClipboardImage {
+        number: u64,
+        bytes: Vec<u8>,
+        mime: String,
+    },
     Detach {
         id: String,
     },
@@ -102,8 +107,8 @@ impl Operation {
         Self {
             id: uuid::Uuid::new_v4(),
             session_id,
-            intake: Intake::Bytes {
-                name: clipboard_image_name(number, &mime),
+            intake: Intake::ClipboardImage {
+                number,
                 bytes,
                 mime,
             },
@@ -247,6 +252,18 @@ impl Engine {
                 bytes,
                 mime: Some(mime),
             })),
+            Intake::ClipboardImage {
+                number,
+                bytes,
+                mime,
+            } => match clipboard_bytes(&bytes, &mime) {
+                Ok((bytes, mime)) => work.sources.push_back(Source::Bytes(File {
+                    name: clipboard_image_name(number, &mime),
+                    bytes,
+                    mime: Some(mime),
+                })),
+                Err(error) => work.outcome.errors.push(error),
+            },
             Intake::Detach { id } => {
                 work.phase = Phase::Detach;
                 self.request(
@@ -409,6 +426,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_task_converts_clipboard_images_before_upload_and_reports_decode_errors() {
+        let operation = Operation::clipboard_image(
+            "chosen".into(),
+            4,
+            solid_tiff(128, 128),
+            "image/tiff".into(),
+        );
+        let mut e = engine(operation.intake);
+        assert!(
+            matches!(reply(&mut e, Ok(json!({"upload_id":"upload", "chunk_bytes":MAX_FILE_BYTES, "max_bytes":MAX_FILE_BYTES}))), Request::AttachBegin { name, mime: Some(mime), .. } if name == "pasted-image-4.png" && mime == "image/png")
+        );
+        let Request::AttachChunk { data_b64, .. } = reply(&mut e, Err("chunk rejected")) else {
+            panic!("encoded PNG chunk");
+        };
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .unwrap();
+        assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+        assert!(matches!(
+            reply(&mut e, Ok(json!({"aborted":true}))),
+            Request::AttachAbort { .. }
+        ));
+        assert!(refreshed(&mut e).errors[0].contains("chunk rejected"));
+        let operation = Operation::clipboard_image(
+            "chosen".into(),
+            5,
+            b"invalid TIFF".to_vec(),
+            "image/tiff".into(),
+        );
+        let mut e = engine(operation.intake);
+        assert!(refreshed(&mut e).errors[0].contains("convert clipboard image"));
+    }
+
+    #[test]
     fn clipboard_upload_names_match_the_final_mime() {
         for (mime, extension) in [
             ("image/png", "png"),
@@ -417,9 +468,9 @@ mod tests {
             ("image/webp", "webp"),
             ("image/tiff", "png"),
         ] {
-            let operation = Operation::clipboard_image("chosen".into(), 3, vec![], mime.into());
-            assert!(
-                matches!(operation.intake, Intake::Bytes { name, .. } if name == format!("pasted-image-3.{extension}"))
+            assert_eq!(
+                clipboard_image_name(3, mime),
+                format!("pasted-image-3.{extension}")
             );
         }
     }
@@ -709,7 +760,7 @@ mod tests {
         let op = Operation::clipboard_image("chosen".into(), 2, vec![1], "image/webp".into());
         let mut e = engine(op.intake);
         assert!(
-            matches!(reply(&mut e,Err("no session")), Request::AttachBegin{name,mime:Some(mime),..} if name=="pasted-image-2.png" && mime=="image/webp")
+            matches!(reply(&mut e,Err("no session")), Request::AttachBegin{name,mime:Some(mime),..} if name=="pasted-image-2.webp" && mime=="image/webp")
         );
         refreshed(&mut e);
         let mut e = engine(bytes(&vec![0; MAX_FILE_BYTES + 1]));

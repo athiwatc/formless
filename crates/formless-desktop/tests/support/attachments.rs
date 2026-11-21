@@ -227,6 +227,31 @@ fn successful_attach_clears_only_its_earlier_attachment_notice(cx: &mut TestAppC
 }
 
 #[gpui_kit::test]
+fn clipboard_raster_paste_queues_raw_bytes_for_client_task_conversion(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    cx.write_to_clipboard(ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
+        gpui_kit::ImageFormat::Tiff,
+        b"invalid TIFF: decoding must not run in the paste callback".to_vec(),
+    )));
+    step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let operation = queued(&shell, cx)
+            .pop()
+            .expect("raw image queued without decoding on UI thread");
+        assert!(
+            matches!(&operation.intake, Intake::ClipboardImage { number:1, mime, bytes } if mime == "image/tiff" && bytes.starts_with(b"invalid TIFF"))
+        );
+        window.render_frame(cx);
+        assert!(window
+            .find(("composer-attachment-uploading", 0_usize))
+            .visible());
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        complete(&shell, operation, vec![], window, cx);
+    });
+}
+
+#[gpui_kit::test]
 fn oversized_clipboard_images_are_rejected_before_copy_or_conversion(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     for format in [gpui_kit::ImageFormat::Png, gpui_kit::ImageFormat::Tiff] {
@@ -607,7 +632,7 @@ fn composer_attachment_clipboard_paths_and_image_use_staging_not_text(cx: &mut T
     step(cx, handle, |window, cx| {
         let operation = queued(&shell, cx).pop().unwrap();
         assert!(
-            matches!(&operation.intake, Intake::Bytes { name, mime, bytes } if name == "pasted-image-1.png" && mime == "image/png" && bytes == &[1, 2, 3])
+            matches!(&operation.intake, Intake::ClipboardImage { number: 1, mime, bytes } if mime == "image/png" && bytes == &[1, 2, 3])
         );
         complete(&shell, operation, vec![], window, cx);
     });
