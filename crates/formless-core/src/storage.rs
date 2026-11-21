@@ -2044,7 +2044,7 @@ impl Store {
         let descendants = self
             .conn
             .prepare(
-                "WITH RECURSIVE family(id) AS (SELECT id FROM sessions WHERE id=?1 UNION
+                "WITH RECURSIVE family(id) AS (SELECT ?1 UNION
                  SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
                  WHERE s.session_kind IN ('topic','topic_attempt') UNION
                  SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
