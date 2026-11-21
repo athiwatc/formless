@@ -149,7 +149,9 @@ mod tests {
     fn render(app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
-            .draw(|frame| draw_chat(frame, frame.area(), app))
+            .draw(|frame| {
+                draw_chat(frame, frame.area(), app);
+            })
             .unwrap();
         terminal
             .backend()

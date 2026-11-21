@@ -255,7 +255,10 @@ async fn nested_model_loop_has_independent_correction_guard_and_complete_results
     let app=Router::new().route("/chat/completions",post(move || {
         let index=seen.fetch_add(1,Ordering::SeqCst);
         async move {
-            let reply=json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("nested-{index}"),"type":"function","function":{"name":toolreg::FIND_TOOLS,"arguments":"{"}}]},"finish_reason":"tool_calls"}]});
+            if index == 3 {
+                std::future::pending::<()>().await;
+            }
+            let reply=json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":format!("nested-{index}"),"type":"function","function":{"name":"interrupted_fixture","arguments":"{"}}]},"finish_reason":"tool_calls"}]});
             ([("content-type","text/event-stream")],format!("data: {reply}\n\ndata: [DONE]\n\n")).into_response()
         }
     }));
@@ -268,6 +271,8 @@ async fn nested_model_loop_has_independent_correction_guard_and_complete_results
         .insert(cfg.provider.model.clone(), 100_000);
     cfg.provider.auto_test_models = false;
     cfg.provider.max_retries = 0;
+    cfg.roles
+        .insert("worker".into(), crate::config::RoleCfg::default());
     struct Server(tokio::task::JoinHandle<()>);
     impl Drop for Server {
         fn drop(&mut self) {
@@ -280,21 +285,24 @@ async fn nested_model_loop_has_independent_correction_guard_and_complete_results
     let f = Fixture::new(cfg);
     let cancel = CancellationToken::new();
     let flag = Arc::new(AtomicBool::new(false));
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+    let run = |task| {
         f.daemon.run_subagent_text(
             &f.session,
             &f.run,
             "private_parent",
-            "complete this private task",
+            task,
             None,
-            None,
+            Some("role:worker"),
             &f.cfg,
             &flag,
             &cancel,
             1,
             None,
-        ),
+        )
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run("complete this private task"),
     )
     .await
     .unwrap()
@@ -302,6 +310,11 @@ async fn nested_model_loop_has_independent_correction_guard_and_complete_results
     assert!(error
         .to_string()
         .starts_with("stuck: repeated daemon correction:"));
+    assert!(error.to_string().contains("interrupted_fixture"));
+    let stats = f.daemon.with_reader(|st| st.task_stats("worker")).unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].samples, 1);
+    assert_eq!(stats[0].good, 0);
     assert_eq!(
         count.load(Ordering::SeqCst),
         3,
@@ -340,4 +353,20 @@ async fn nested_model_loop_has_independent_correction_guard_and_complete_results
         .with_reader(|st| st.builtin_stats(None))
         .unwrap()
         .is_empty());
+
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (result, ()) = tokio::join!(run("cancel this private task"), async {
+            while count.load(Ordering::SeqCst) < 4 {
+                tokio::task::yield_now().await;
+            }
+            flag.store(true, Ordering::SeqCst);
+            cancel.cancel();
+        });
+        result.unwrap_err()
+    })
+    .await
+    .unwrap();
+    assert_eq!(cancelled.to_string(), "interrupted");
+    let stats = f.daemon.with_reader(|st| st.task_stats("worker")).unwrap();
+    assert_eq!(stats[0].samples, 1);
 }

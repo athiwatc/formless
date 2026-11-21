@@ -250,6 +250,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn rename_error(from: &Path, to: &Path, error: std::io::Error) -> String {
+    let mut message = format!("rename {} -> {}: {error}", from.display(), to.display());
+    if error.kind() == std::io::ErrorKind::CrossesDevices {
+        message.push_str(" (fs.rename cannot move directly across file systems)");
+    }
+    message
+}
+
 /// Set how many `tools.call` Invocations one sandbox may have in
 /// flight at once; the rest queue (SPEC §7.12, `scripts.max_parallel`).
 pub fn set_max_parallel_calls(n: u64) {
@@ -1290,13 +1298,8 @@ const PROCESS_BASE_ENV: &[&str] = &[
 /// A `process:` grant's command and, for `process:git:status|log`, the
 /// first arguments it allows (None = any).
 pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
-    match grant.rsplit_once(':') {
-        // `C:\…` is a Windows path, not a command with sub-commands.
-        Some((cmd, subs)) if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) => {
-            (cmd, Some(subs.split('|').collect()))
-        }
-        _ => (grant, None),
-    }
+    let (cmd, scope) = formless_protocol::split_process_grant(grant);
+    (cmd, scope.map(|scope| scope.split('|').collect()))
 }
 
 fn process_allowed(allowed: &[String], cmd: &str, first_arg: Option<&str>) -> bool {
@@ -1771,7 +1774,7 @@ impl State {
                         "readonly": m.permissions().readonly(),
                     })),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(format!("{}: {e}", p.display())),
                 }
             }
             "fs_list" => self.fs_list(a),
@@ -1862,7 +1865,7 @@ impl State {
                 if let Some(parent) = to.parent() {
                     self.create_tracked_directories(parent)?;
                 }
-                std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+                std::fs::rename(&from, &to).map_err(|e| rename_error(&from, &to, e))?;
                 self.changed(a["from"].as_str().unwrap_or_default(), &from, "rename");
                 self.changed(a["to"].as_str().unwrap_or_default(), &to, "rename");
                 Ok(Value::Null)
@@ -1882,14 +1885,14 @@ impl State {
                     Some(Some(chunk)) => chunk,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
-                        let mut f =
-                            std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-                        let total = f.metadata().map_err(|e| e.to_string())?.len();
-                        f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                        let path_error = |e| format!("{}: {e}", p.display());
+                        let mut f = std::fs::File::open(&p).map_err(path_error)?;
+                        let total = f.metadata().map_err(path_error)?.len();
+                        f.seek(SeekFrom::Start(offset)).map_err(path_error)?;
                         let mut buf = Vec::with_capacity(size);
                         f.take(size as u64)
                             .read_to_end(&mut buf)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(path_error)?;
                         (buf, total)
                     }
                 };
@@ -1939,7 +1942,7 @@ impl State {
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
                 for e in rd {
-                    let e = e.map_err(|e| e.to_string())?;
+                    let e = e.map_err(|e| format!("{}: {e}", p.display()))?;
                     let name = e.file_name().to_string_lossy().to_string();
                     let entry_path = e.path();
                     let raw_entry = entry_path
@@ -3434,6 +3437,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     // including on early error paths, as required by rquickjs::Persistent.
     #[derive(Clone)]
     struct Rejection {
+        sequence: u64,
         message: String,
         reason: rquickjs::Persistent<rquickjs::Value<'static>>,
     }
@@ -3449,24 +3453,47 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let unhandled: Rejections = Default::default();
     let _clear_rejections = ClearRejections(unhandled.clone());
     let rejected = unhandled.clone();
+    let next_sequence = std::cell::Cell::new(0);
     runtime.set_host_promise_rejection_tracker(Some(Box::new(
         move |ctx, promise, reason, handled| {
             let promise = rquickjs::Persistent::save(&ctx, promise);
             if handled {
                 rejected.borrow_mut().remove(&promise);
             } else {
+                let sequence = {
+                    let mut rejected = rejected.borrow_mut();
+                    let entry = rejected.entry(promise.clone());
+                    // Re-observing a still-tracked Promise retains its place.
+                    // If handled and later reinserted, it gets a new sequence.
+                    let sequence = match &entry {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.get().sequence,
+                        std::collections::hash_map::Entry::Vacant(_) => {
+                            let sequence = next_sequence.get();
+                            next_sequence.set(sequence + 1);
+                            sequence
+                        }
+                    };
+                    entry.insert_entry(Rejection {
+                        sequence,
+                        message: String::new(),
+                        reason: rquickjs::Persistent::save(&ctx, reason.clone()),
+                    });
+                    sequence
+                };
+                // Reading an Error message can call JS. The observation is
+                // already ordered, and any handling during the read is final.
                 let message = reason
                     .as_exception()
                     .and_then(|e| e.message())
                     .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
                     .unwrap_or_else(|| format!("{reason:?}"));
-                rejected.borrow_mut().insert(
-                    promise,
-                    Rejection {
-                        message,
-                        reason: rquickjs::Persistent::save(&ctx, reason),
-                    },
-                );
+                if let Some(entry) = rejected
+                    .borrow_mut()
+                    .get_mut(&promise)
+                    .filter(|entry| entry.sequence == sequence)
+                {
+                    entry.message = message;
+                }
             }
         },
     )));
@@ -3579,8 +3606,14 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
              tools.call returns a Promise, await every call"
         )));
     }
-    let rejection = unhandled.borrow().values().next().cloned();
-    if let Some(rejection) = rejection {
+    let rejection = {
+        let unhandled = unhandled.borrow();
+        unhandled
+            .values()
+            .min_by_key(|rejection| rejection.sequence)
+            .map(|first| (first.clone(), unhandled.len() - 1))
+    };
+    if let Some((rejection, extras)) = rejection {
         let mut message = format!("unhandled Promise rejection: {}", rejection.message);
         let nested = ctx.with(|ctx| {
             let reason = rejection.reason.clone().restore(&ctx).ok()?;
@@ -3594,6 +3627,19 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             nested_error(&ctx, reason)
         });
         let mut error = err(&message);
+        if extras > 0 && error.kind != ExecErrorKind::Cancelled {
+            if !error.message.ends_with('\n') {
+                error.message.push('\n');
+            }
+            let noun = if extras == 1 {
+                "rejection"
+            } else {
+                "rejections"
+            };
+            error
+                .message
+                .push_str(&format!("and {extras} more unhandled {noun}"));
+        }
         error.nested = nested;
         return Err(error);
     }
@@ -3664,6 +3710,58 @@ mod tests {
                 && error.contains("fs.readChunks")
                 && error.contains("fs.readLines")
         );
+    }
+
+    #[test]
+    fn fs_error_messages_name_the_paths_and_explain_cross_filesystem_renames() {
+        let fixture = std::env::temp_dir().join(format!("fl-io-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&fixture).unwrap();
+        struct RemoveDirectory(PathBuf);
+        impl Drop for RemoveDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectory(fixture.clone());
+        let root = fixture.canonicalize().unwrap();
+        let from = root.join("missing.txt");
+        let to = root.join("destination.txt");
+        let run = |code: &str| {
+            let mut request = live(code);
+            request.caps = Capabilities::parse(&[
+                format!("fs:read:{}", root.display()),
+                format!("fs:write:{}", root.display()),
+            ])
+            .unwrap();
+            request.input = json!({"root": root, "from": from, "to": to});
+            execute(&request, Arc::new(NoHostOps))
+        };
+        let error = run("function run(i) { fs.rename(i.from, i.to); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error
+                .message
+                .contains(&format!("rename {} -> {}", from.display(), to.display())),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            run("function run(i) { return fs.stat(i.from); }")
+                .unwrap()
+                .output,
+            Value::Null
+        );
+
+        let error = run("function run(i) { fs.readChunks(i.root, 16, () => {}); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error.message.contains(&root.display().to_string()),
+            "{}",
+            error.message
+        );
+
+        let error = rename_error(&from, &to, std::io::ErrorKind::CrossesDevices.into());
+        assert!(error.contains("fs.rename cannot move directly across file systems"));
     }
 
     #[test]
@@ -4097,6 +4195,10 @@ mod tests {
         assert_eq!(
             process_grant("C:\\tools\\x.exe"),
             ("C:\\tools\\x.exe", None)
+        );
+        assert_eq!(
+            process_grant("C:/Program Files/git.exe:status|log"),
+            ("C:/Program Files/git.exe", Some(vec!["status", "log"]))
         );
         let allowed = vec!["git:status|log".to_string()];
         assert!(process_allowed(&allowed, "git", Some("log")));
@@ -5052,6 +5154,124 @@ mod tests {
             assert!(e.message.contains("unhandled Promise rejection:"), "{}", e.message);
             assert!(e.message.contains(message), "{}", e.message);
         }
+    }
+
+    #[test]
+    fn unhandled_rejections_follow_observation_order_and_count_only_extras() {
+        for (handle_first, expected, extra_count) in
+            [(false, "first observed", 2), (true, "second observed", 1)]
+        {
+            let mut req = live(
+                "function first() { return new Error('first observed'); }
+                 function second() { return new Error('second observed'); }
+                 function run(input) {
+                   const pending = Promise.reject(first());
+                   Promise.reject(second());
+                   Promise.reject(new Error('third observed'));
+                   if (input.handle_first) pending.catch(() => {});
+                   return 1;
+                 }",
+            );
+            req.input = json!({"handle_first": handle_first});
+            let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with(&format!("unhandled Promise rejection: {expected}\n")),
+                "{}",
+                error.message
+            );
+            let frame = if handle_first { "second" } else { "first" };
+            assert!(error
+                .message
+                .contains(&format!("{frame} (formless-tool.js:")));
+            for other in ["first observed", "second observed", "third observed"] {
+                if other != expected {
+                    assert!(!error.message.contains(other), "{}", error.message);
+                }
+            }
+            assert_eq!(
+                error.message.lines().last().unwrap(),
+                format!(
+                    "and {extra_count} more unhandled rejection{}",
+                    if extra_count == 1 { "" } else { "s" }
+                )
+            );
+            assert!(error.nested.is_none());
+        }
+    }
+
+    #[test]
+    fn rejection_order_is_recorded_before_reading_the_message() {
+        let req = live(
+            "function run() {
+               const first = new Error();
+               Object.defineProperty(first, 'message', { get() {
+                 Promise.reject('observed while reading');
+                 return 'observed first';
+               } });
+               Promise.reject(first);
+               return 1;
+             }",
+        );
+        let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("unhandled Promise rejection: observed first\n"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("observed while reading"));
+    }
+
+    #[test]
+    fn selected_rejection_keeps_its_nested_detail_and_pending_calls_take_precedence() {
+        let nested = live(
+            "async function run() {
+               try { await tools.call('bad', {}); }
+               catch (error) {
+                 Promise.reject(error);
+                 Promise.reject(new Error('other rejection'));
+               }
+               return 1;
+             }",
+        );
+        let error = execute(&nested, Arc::new(SlowOps)).unwrap_err();
+        let detail = error.nested.as_ref().unwrap();
+        assert_eq!((&*detail.tool, &*detail.detail), ("bad", "bad tool"));
+        assert!(error
+            .message
+            .starts_with("unhandled Promise rejection: bad tool\n"));
+        assert!(error.message.contains("run (formless-tool.js:2:"));
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("other rejection"));
+
+        let pending = live(
+            "function run() {
+               Promise.reject(new Error('first'));
+               Promise.reject(new Error('second'));
+               tools.call('t', {});
+               return 1;
+             }",
+        );
+        let error = execute(&pending, Arc::new(SlowOps)).unwrap_err();
+        assert!(
+            error.message.contains("await every call"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("unhandled Promise rejection"));
+        assert!(error.nested.is_none());
+
+        let single = live("function run() { Promise.reject('single'); return 1; }");
+        let error = execute(&single, Arc::new(NoHostOps)).unwrap_err();
+        assert_eq!(error.message, "unhandled Promise rejection: single");
+
+        let early = live("Promise.reject('early floating'); throw new Error('early stop');");
+        let error = execute(&early, Arc::new(NoHostOps)).unwrap_err();
+        assert!(!error.message.contains("unhandled Promise rejection"));
     }
 
     #[test]
