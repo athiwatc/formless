@@ -109,6 +109,8 @@ fn desktop_theme_keeps_primary_tokens_in_sync_in_both_modes(cx: &mut TestAppCont
         for dark in [false, true] {
             let theme = Theme::global(cx);
             assert_eq!(theme.is_dark(), dark);
+            assert_eq!(theme.table_head, theme.muted);
+            assert_eq!(theme.table_head_foreground, theme.foreground);
             assert_eq!(theme.tokens.button_primary.color, theme.primary);
             assert_eq!(theme.tokens.button_primary_hover.color, theme.primary_hover);
             shell.update(cx, |shell, cx| {

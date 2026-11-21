@@ -50,7 +50,7 @@ test('the rule overrides the bar nowrap without touching neighbours', () => {
     '.statusbar .note { overflow: hidden; text-overflow: ellipsis; min-width: 0; }',
     '.statusbar .note.err { color: var(--err); }',
     '.statusbar .err { color: var(--err); font-weight: 650; }',
-    '#status-context.clickable { cursor: pointer; }',
+    '#status-context { min-height: 1.5rem; }',
     '#status-model { min-width: 1.5rem; min-height: 1.5rem; max-width: min(100%, 28ch); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
     '.spacer { flex: 1; }',
     '.hidden, [hidden] { display: none !important; }',
