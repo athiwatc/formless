@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub use formless_protocol::{HarnessKind, HarnessRole};
+pub mod pi;
 
 pub struct HarnessRequest {
     pub kind: HarnessKind,
@@ -87,32 +88,7 @@ impl fmt::Debug for HarnessResult {
 }
 
 pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
-    if request.prompt.trim().is_empty() {
-        bail!("harness prompt must not be empty");
-    }
-    if !request.cwd.is_absolute() {
-        bail!("harness working directory must be absolute");
-    }
-    if !request.mcp_command.is_absolute() {
-        bail!("MCP server executable must be an absolute path");
-    }
-    if request
-        .model
-        .as_deref()
-        .is_some_and(|model| model.trim().is_empty())
-    {
-        bail!("harness model must not be empty");
-    }
-    for name in &request.mcp_env_vars {
-        let mut chars = name.chars();
-        if !chars
-            .next()
-            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
-            || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        {
-            bail!("MCP environment variable names must be shell-independent identifiers");
-        }
-    }
+    validate_request(request)?;
 
     let program = request
         .executable
@@ -120,6 +96,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         .unwrap_or_else(|| match request.kind {
             HarnessKind::Claude => PathBuf::from("claude"),
             HarnessKind::Codex => PathBuf::from("codex"),
+            HarnessKind::Pi => PathBuf::from("pi"),
         });
     let mut args = Vec::<OsString>::new();
     match request.kind {
@@ -186,6 +163,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             }
             args.push(request.prompt.as_str().into());
         }
+        HarnessKind::Pi => return pi::command_spec(request),
     }
 
     Ok(CommandSpec {
@@ -194,6 +172,36 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         cwd: request.cwd.clone(),
         environment: request.environment.clone(),
     })
+}
+
+fn validate_request(request: &HarnessRequest) -> Result<()> {
+    if request.prompt.trim().is_empty() {
+        bail!("harness prompt must not be empty");
+    }
+    if !request.cwd.is_absolute() {
+        bail!("harness working directory must be absolute");
+    }
+    if !request.mcp_command.is_absolute() {
+        bail!("MCP server executable must be an absolute path");
+    }
+    if request
+        .model
+        .as_deref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        bail!("harness model must not be empty");
+    }
+    for name in &request.mcp_env_vars {
+        let mut chars = name.chars();
+        if !chars
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            bail!("MCP environment variable names must be shell-independent identifiers");
+        }
+    }
+    Ok(())
 }
 
 fn claude_mcp_config(request: &HarnessRequest) -> Result<String> {
@@ -217,6 +225,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
     match kind {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
+        HarnessKind::Pi => pi::parse_output(stdout),
     }
 }
 
