@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/plain_cli_fixture_workers.rs"]
+mod plain_cli_fixture_workers;
 #[path = "support/unix_fixture_io.rs"]
 mod unix_fixture_io;
 use formless_core::Paths;
@@ -96,16 +98,7 @@ impl Fixture {
         let invocation_error = Arc::new(AtomicBool::new(false));
         let fail_invocations = invocation_error.clone();
         let thread = std::thread::spawn(move || {
-            while !stopped.load(Ordering::SeqCst) {
-                let (socket, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
-                    Err(e) => panic!("{e}"),
-                };
-                connected.fetch_add(1, Ordering::SeqCst);
+            let serve = |socket| {
                 let mut socket = FixtureStream::new(
                     socket,
                     stopped.clone(),
@@ -381,7 +374,8 @@ impl Fixture {
                     }
                     line.clear();
                 }
-            }
+            };
+            plain_cli_fixture_workers::serve(&listener, &stopped, &connected, serve);
         });
         Self {
             root,

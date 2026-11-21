@@ -1,8 +1,10 @@
 mod branch_summary;
 pub mod client;
+mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;
@@ -835,7 +837,7 @@ impl Wizard {
         // Remember previous startup options: a saved config starts at the
         // API-key step (Esc returns to the URL), with model/effort restored.
         let has_saved = !cfg.provider.base_url.trim().is_empty();
-        let preset = formless_core::presets::for_url(&cfg.provider.base_url);
+        let preset = formless_core::presets::for_provider(&cfg.provider);
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
@@ -1121,6 +1123,14 @@ impl Wizard {
         self.status = status;
     }
 
+    fn apply_provider_endpoint(&self, provider: &mut formless_core::config::ProviderCfg) {
+        provider.base_url = self.base_url.trim().to_string();
+        provider.preset = self.preset.map(|preset| preset.id.to_string());
+        if let Some(preset) = self.preset {
+            provider.api_style = preset.api_style.to_string();
+        }
+    }
+
     /// List the endpoint's models in the background (`FetchModels`).
     fn fetch_models(&mut self) {
         if !self.normalize_key() {
@@ -1131,12 +1141,10 @@ impl Wizard {
         let generation = self.generation;
         self.step = WizardStep::FetchModels;
         self.status = format!("Fetching models from {}…", self.base_url.trim());
-        let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
-        cfg.provider.base_url = self.base_url.trim().to_string();
-        if let Some(p) = self.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
-        let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
+        let tx = self.job_tx.clone();
+        let mut pcfg = formless_core::config::ProviderCfg::default();
+        self.apply_provider_endpoint(&mut pcfg);
+        let key = self.api_key.clone();
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
                 generation,
@@ -1167,10 +1175,16 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
-        let endpoint = self
-            .local_offer_for(p.id)
-            .map(|offer| offer.base_url.clone())
-            .unwrap_or_else(|| p.base_url.to_string());
+        let endpoint = if p.local
+            && self.preset.is_some_and(|old| old.id == p.id)
+            && !self.base_url.trim().is_empty()
+        {
+            self.base_url.trim().to_string()
+        } else {
+            self.local_offer_for(p.id)
+                .map(|offer| offer.base_url.clone())
+                .unwrap_or_else(|| p.base_url.to_string())
+        };
         if self.preset.map(|old| old.id) != Some(p.id)
             || self.credential_endpoint != endpoint.trim()
         {
@@ -1706,6 +1720,7 @@ struct App {
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
     inbox: Option<mpsc::Receiver<ServerMessage>>,
+    clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
     session_idx: usize,
     session_filter: lists::ListFilter,
@@ -2095,6 +2110,7 @@ impl App {
             view: View::Chat,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -3966,6 +3982,13 @@ impl App {
                             }
                         }
                         Pending::SaveSetting => {
+                            if let Some(warnings) = result["routing_warnings"].as_array() {
+                                self.notes.extend(
+                                    warnings
+                                        .iter()
+                                        .filter_map(|warning| warning.as_str().map(str::to_owned)),
+                                );
+                            }
                             if let Some(key) = self.settings_saving.take() {
                                 self.notes.push(format!(
                                     "saved {key} = {} (used from the next Run)",
@@ -6804,6 +6827,7 @@ impl App {
                     Pending::RetryRun,
                     Request::RetryRun {
                         session_id,
+                        expected_run_id: None,
                         model,
                         keep_original,
                     },
@@ -8848,10 +8872,7 @@ impl App {
             w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
             return Ok(());
         }
-        cfg.provider.base_url = w.base_url.trim().to_string();
-        if let Some(p) = w.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
+        w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
         if w.prompt_fallback {
@@ -9084,13 +9105,8 @@ impl App {
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
-                    let pcfg = formless_core::config::ProviderCfg {
-                        base_url: w.base_url.trim().to_string(),
-                        api_style: w
-                            .preset
-                            .map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
-                        ..Default::default()
-                    };
+                    let mut pcfg = formless_core::config::ProviderCfg::default();
+                    w.apply_provider_endpoint(&mut pcfg);
                     let (key2, model) = (w.api_key.clone(), w.model());
                     std::thread::spawn(move || {
                         let _ = tx.send(WizardJob::Probe(
@@ -15766,13 +15782,23 @@ impl App {
     /// system clipboard too.
     fn copy_text(&mut self, text: &str, what: &str) {
         let mut out = stdout();
-        let _ = out.write_all(osc52(text).as_bytes());
-        let _ = out.flush();
-        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
-            let _ = formless_runtime::clipboard_write(text);
+        match out
+            .write_all(osc52(text).as_bytes())
+            .and_then(|()| out.flush())
+        {
+            Ok(()) => self.notes.push(format!(
+                "sent {what} to the terminal clipboard ({} chars)",
+                text.chars().count()
+            )),
+            Err(error) => self
+                .notes
+                .push(format!("terminal clipboard write failed: {error}")),
         }
-        self.notes
-            .push(format!("copied {what} ({} chars)", text.chars().count()));
+        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
+            if let Err(error) = self.clipboard_write.submit(text.to_owned()) {
+                self.notes.push(format!("system clipboard: {error}"));
+            }
+        }
     }
 
     /// The queue binding to advertise: one that works in this terminal.
@@ -19484,7 +19510,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
-pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use theme::{
+    colorblind_rgb, colorblind_rgb_on_background, terminal_has_light_background, tone_marker,
+    SemanticTone,
+};
 pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
@@ -19529,7 +19558,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         && std::env::var_os("COLORFGBG").is_none()
     {
         if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
-            theme::set_kind(theme::kind_for_background(bg));
+            theme::set_background(theme::kind_for_background(bg));
         }
     }
     let mut out = stdout();
@@ -19559,6 +19588,9 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
+            if let Err(error) = app.clipboard_write.poll() {
+                app.notes.push(format!("system clipboard: {error}"));
+            }
             // SettingsChanged may have arrived through any connected client.
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
@@ -19764,6 +19796,7 @@ mod tests {
             wizard: None,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -25434,7 +25467,10 @@ mod tests {
         assert_eq!(app.call_focus.as_deref(), Some("msg:a2"));
         assert!(render(&mut app, 100, 30).contains("c copy · C copy as Markdown"));
         app.key(key(KeyCode::Char('c')));
-        assert_eq!(app.notes.last().unwrap(), "copied the answer (17 chars)");
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "sent the answer to the terminal clipboard (17 chars)"
+        );
         app.key(key(KeyCode::Char('[')));
         app.key(key(KeyCode::Char('C')));
         assert_eq!(
