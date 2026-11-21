@@ -611,6 +611,83 @@ fn main_topic_harness_navigation_uses_canonical_transcripts_and_read_only_send(
 }
 
 #[gpui_kit::test]
+fn harness_details_export_its_own_transcript_without_allowing_setting_writes(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("topic-attempt-build-x", cx);
+        shell.update(cx, |s, cx| {
+            s.take_client_commands();
+            let state = s.command_state(window, cx);
+            assert!(commands::entry(Command::SessionDetails, &state).enabled());
+            assert!(!commands::entry(Command::SessionModel, &state).enabled());
+            s.run_command(Command::SessionDetails, window, cx);
+        });
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let operation = commands
+            .iter()
+            .find_map(|command| match command {
+                WireCommand::ReadSessionDetails {
+                    operation,
+                    session_id,
+                    ..
+                } => {
+                    assert_eq!(session_id, "claude-chat");
+                    Some(*operation)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let mut session = fixture::topic_workspace().0[0].clone();
+        session.id = "claude-chat".into();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::SessionDetails {
+                    connection: 0,
+                    operation,
+                    session_id: session.id.clone(),
+                    result: Ok(
+                        formless_desktop::session_edit::Metadata::from_session(&session).unwrap(),
+                    ),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window
+            .find("session-edit-help")
+            .value()
+            .unwrap()
+            .contains("read only"));
+        assert_eq!(window.find("session-edit-save").disabled(), Some(true));
+        window.click("session-edit-model", cx);
+        shell.update(cx, |s, cx| {
+            s.take_client_commands();
+            // Exercise the callback as well as the disabled Save control.
+            s.save_presented_session_selection(s.session_edit_revision().unwrap(), window, cx);
+            assert!(s.take_client_commands().is_empty());
+        });
+        window.scroll(
+            "session-edit-body",
+            ScrollDelta::Pixels(point(px(0.), px(-10000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.find("session-export-json").visible());
+        assert_ne!(window.find("session-export-json").disabled(), Some(true));
+        window.click("session-export-json", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(
+            matches!(commands.as_slice(), [WireCommand::ExportSession {session_id, ..}] if session_id == "claude-chat")
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn topic_accept_and_cancel_emit_distinct_single_intents(cx: &mut TestAppContext) {
     for accept in [true, false] {
         let (handle, shell) = open(cx, WIDE, 0, 0);

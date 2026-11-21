@@ -108,6 +108,7 @@ pub struct State {
     pub usage_reason: Option<&'static str>,
     pub step_mode_reason: Option<&'static str>,
     pub can_search_profile: bool,
+    pub can_inspect_session: bool,
     pub can_edit_session: bool,
     pub can_browse_archived: bool,
     pub archived_included: bool,
@@ -504,14 +505,14 @@ pub fn entry(command: Command, state: &State) -> Entry {
         ),
         Command::SessionDetails => (
             "Session details",
-            "Edit Session name, tags, pin, model/Role or effort".into(),
+            "Review Session settings and export history".into(),
             Group::Session,
             "Edit the chosen Sessions-list entry, or the open Session outside that list",
             None,
             if state.composing {
                 Some(COMPOSING)
             } else {
-                (!state.can_edit_session).then_some("Choose a Session while connected")
+                (!state.can_inspect_session).then_some("Choose a Session while connected")
             },
         ),
         Command::SessionModel | Command::SessionPendingFiles => {
@@ -721,6 +722,7 @@ mod tests {
             step_mode_reason: Some("Step mode is not available for this Session"),
             can_search_profile: false,
             can_edit_session: false,
+            can_inspect_session: false,
             can_browse_archived: false,
             archived_included: false,
             composing: false,

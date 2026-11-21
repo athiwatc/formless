@@ -198,7 +198,8 @@ impl Shell {
     ) {
         if self.session_editor.is_some()
             || !self.client_connected
-            || !self.topic_session_edit_allowed()
+            || !self.topic_session_inspect_allowed()
+            || (!matches!(start, SessionEditorStart::Details) && !self.topic_session_edit_allowed())
         {
             return;
         }
@@ -439,6 +440,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .session_editor
+            .as_ref()
+            .is_some_and(|panel| !self.topic_session_mutation_allowed(&panel.id))
+        {
+            self.session_editor.as_mut().unwrap().notice =
+                "Session settings are read only; no change was sent.".into();
+            cx.notify();
+            return;
+        }
         if let Some(client) = &self.client {
             client.cancel_unsent_reference();
         }
@@ -1049,7 +1060,9 @@ impl Shell {
         let viewport = window.viewport_size();
         let margin = px(16.);
         let busy = panel.waiting.is_some();
+        let read_only = !self.topic_session_mutation_allowed(&panel.id);
         let ready = self.client_connected
+            && !read_only
             && !busy
             && !panel.retired
             && panel.metadata.is_some()
@@ -1071,7 +1084,7 @@ impl Shell {
         let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
             .when(panel.files_first, |body| body.child(self.render_pending_files(cx)))
-            .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."));
+            .child(readable("session-edit-help",if read_only {"This Session is read only. Inspect or export its persisted history; Session settings cannot be changed here."} else {"Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."}));
         let mut tabs = h_flex().flex_wrap().gap_2();
         for (index, field) in [
             (0, Field::Name),
@@ -1157,7 +1170,17 @@ impl Shell {
                         .test_support()
                         .pt_1()
                         .anchor_scroll(Some(panel.input_anchor.clone()))
-                        .child(Textarea::new(input).aria_label("Session standing instructions")),
+                        .child(if read_only {
+                            readable(
+                                "session-edit-read-only-value",
+                                input.read(cx).value().to_string(),
+                            )
+                            .into_any_element()
+                        } else {
+                            Textarea::new(input)
+                                .aria_label("Session standing instructions")
+                                .into_any_element()
+                        }),
                 );
             }
         } else if panel.field == Field::Pin {
@@ -1194,7 +1217,15 @@ impl Shell {
                         .test_support()
                         .pt_1()
                         .anchor_scroll(Some(panel.input_anchor.clone()))
-                        .child(Textarea::new(input).aria_label(aria)),
+                        .child(if read_only {
+                            readable(
+                                "session-edit-read-only-value",
+                                input.read(cx).value().to_string(),
+                            )
+                            .into_any_element()
+                        } else {
+                            Textarea::new(input).aria_label(aria).into_any_element()
+                        }),
                 );
         }
         body = body
