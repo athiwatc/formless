@@ -8215,15 +8215,7 @@ impl Daemon {
         // back to the model.
         if let Some(reason) = self
             .run_tool_hooks(
-                "pre_tool",
-                session_id,
-                run_id,
-                &tc.name,
-                &args,
-                &hook_caps,
-                None,
-                cfg,
-                cancel,
+                "pre_tool", session_id, run_id, &tc.name, &args, &hook_caps, None, cfg, cancel,
             )
             .await
         {
