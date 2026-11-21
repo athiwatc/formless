@@ -71,7 +71,7 @@ def check(executable):
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env={**os.environ, "TERM": "xterm-256color", "FORMLESS_TEST_PAGER_PTY": "1"},
+            env={**os.environ, "TERM": "xterm-256color", "PAGER_PTY_FIXTURE": "1"},
             start_new_session=True,
         )
         os.close(slave)

@@ -25807,7 +25807,7 @@ mod tests {
     fn pager_search_owned_pty_fixture() {
         use std::io::IsTerminal;
 
-        assert_eq!(std::env::var("FORMLESS_TEST_PAGER_PTY").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("PAGER_PTY_FIXTURE").as_deref(), Ok("1"));
         assert!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
         struct RawMode;
         impl Drop for RawMode {
