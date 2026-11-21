@@ -414,13 +414,12 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
         .is_err());
 }
 
-#[tokio::test]
-async fn topic_orchestrator_fixture_muse_grants_one_run_trust_and_streams() {
+async fn run_muse_fixture(shutdown: bool) {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let path = f.root.join("fake-muse");
     std::fs::write(&path, r#"#!/usr/bin/env python3
-import json, os, sys, uuid
+import json, os, sys, time, uuid
 session, turn = str(uuid.uuid4()), str(uuid.uuid4())
 def receive(method):
     request = json.loads(sys.stdin.readline())
@@ -441,6 +440,10 @@ assert bridge["mode"] == "required" and bridge["env"]["FORMLESS_TOPIC_CAPABILITY
 respond(request, {"session":{"sessionId":session, "path":"", "approvalMode":{"mode":"promptUnmatched"}}})
 request = receive("turn/start")
 respond(request, {"status":"accepted", "disposition":"started", "commandId":request["params"]["commandId"], "turnId":turn})
+if fixture_pid := os.environ.get("TOPIC_FIXTURE_MUSE_PID"):
+    with open(fixture_pid, "w") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(120)
 item = {"itemId":"message", "kind":"agentMessage", "turnId":turn, "messagePhase":"finalAnswer"}
 notify("item/started", item=item)
 notify("item/delta", itemId="message", field="text", delta="Muse ")
@@ -451,6 +454,10 @@ assert sys.stdin.readline() == ""
 "#).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     env.set("FORMLESS_TOPIC_MUSE_EXE", &path);
+    let pid_path = f.root.join("muse-pid");
+    if shutdown {
+        env.set("TOPIC_FIXTURE_MUSE_PID", &pid_path);
+    }
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -505,11 +512,29 @@ assert sys.stdin.readline() == ""
         })
         .await
         .unwrap();
+    let pid = if shutdown {
+        wait_until(|| std::fs::read_to_string(&pid_path).is_ok_and(|pid| !pid.is_empty())).await;
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        f.daemon().shutdown.cancel();
+        Some(pid)
+    } else {
+        None
+    };
     let result = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+    if let Some(pid) = pid {
+        assert_eq!(result["status"], "failed", "{result}");
+        assert_eq!(result["summary"], "daemon is shutting down");
+        wait_until(|| unsafe { libc::kill(pid, 0) } == -1).await;
+        return;
+    }
     assert_eq!(result["status"], "succeeded", "{result}");
     assert_eq!(result["summary"], "Muse fixture complete");
     let conversation = result["conversation_session_id"].as_str().unwrap();
@@ -525,6 +550,16 @@ assert sys.stdin.readline() == ""
             .collect::<Vec<_>>(),
         ["Muse fixture complete"]
     );
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_muse_grants_one_run_trust_and_streams() {
+    run_muse_fixture(false).await;
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_shutdown_stops_active_muse_step() {
+    run_muse_fixture(true).await;
 }
 
 #[tokio::test]
