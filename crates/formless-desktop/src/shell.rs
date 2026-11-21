@@ -45,6 +45,7 @@ mod profile_search;
 mod questions;
 mod reader;
 mod reading_positions;
+mod resource_manage;
 mod run_actions;
 mod run_inspection;
 mod session_fork;
@@ -795,6 +796,11 @@ pub struct Shell {
     resource_body: ScrollHandle,
     comparison_controls: Vec<(FocusHandle, gpui_kit::ScrollAnchor)>,
     resource_controls: Vec<FocusHandle>,
+    resource_anchors: Vec<gpui_kit::ScrollAnchor>,
+    resource_confirm: Option<(Destination, u64, Option<usize>, usize)>,
+    resource_input: Entity<InputState>,
+    resource_schedule: Entity<InputState>,
+    resource_error: Option<String>,
     resource_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
     resource_frames: u8,
     resource_revision: u64,
@@ -948,6 +954,11 @@ impl Shell {
         sidebar.activate_selected();
 
         let timeline = cx.new(|cx| MessageScrollerState::new(blocks.len(), cx));
+        let resource_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Memory text, skill source or job prompt")
+        });
+        let resource_schedule =
+            cx.new(|cx| InputState::new(window, cx).placeholder("every weekday at 9am"));
         let (composer, composer_subscriptions) = Self::build_composer("", true, window, cx);
         // A resize can end an overlay (the panel docks again) or hide the
         // panel that holds focus.
@@ -1056,7 +1067,14 @@ impl Shell {
             forecast_scroll: ScrollHandle::new(),
             resource_pages: HashMap::new(),
             resource_scroll: gpui_kit::UniformListScrollHandle::new(),
-            resource_controls: (0..4).map(|_| cx.focus_handle()).collect(),
+            resource_controls: (0..10).map(|_| cx.focus_handle()).collect(),
+            resource_anchors: (0..12)
+                .map(|_| gpui_kit::ScrollAnchor::for_handle(resource_body.clone()))
+                .collect(),
+            resource_confirm: None,
+            resource_input,
+            resource_schedule,
+            resource_error: None,
             resource_body,
             resource_focus: None,
             resource_frames: 0,
@@ -1975,6 +1993,8 @@ impl Shell {
         self.directory.rebuild(&self.directory_rows, "");
         self.client_sessions.clear();
         self.resource_pages.clear();
+        self.resource_confirm = None;
+        self.resource_error = None;
         *self.blocks.borrow_mut() = Timeline::new(Vec::new());
         self.timeline
             .update(cx, |timeline, cx| timeline.reset(0, cx));
@@ -2693,6 +2713,9 @@ impl Shell {
                     .checked_add(1)
                     .expect("resource revision exhausted");
                 page.revision = self.resource_revision;
+                if self.destination == destination {
+                    self.resource_confirm = None;
+                }
                 self.resource_pages.insert(destination, page);
             }
             ClientUpdate::Action { session_id, result } => {
@@ -3920,6 +3943,14 @@ impl Shell {
             self.restore_focus = None;
         }
         let previous = self.destination;
+        if previous != destination {
+            self.resource_confirm = None;
+            self.resource_error = None;
+            self.resource_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.resource_schedule
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
 
         self.retire_transient_destination(destination);
         if destination == Destination::ProfileSearch && previous != Destination::ProfileSearch {
@@ -4388,6 +4419,11 @@ impl Shell {
             )
             .child(
                 h_flex()
+                    .id("destination-list")
+                    .test_support()
+                    .max_h(window.viewport_size().height * 0.4)
+                    .overflow_y_scroll()
+                    .flex_shrink_0()
                     .flex_wrap()
                     .gap_1()
                     .p_2()
@@ -5570,7 +5606,7 @@ impl Shell {
         let comparison_refresh = (self.comparison.pair.clone(), self.comparison.revision);
         let page = self.resource_pages.get(&destination);
         let count = page.map_or(0, |page| page.rows.len());
-        let notice = page.map_or(
+        let mut notice = page.map_or(
             if destination == Destination::Invocations {
                 self.invocations.notice.clone()
             } else if destination == Destination::RunDetails {
@@ -5582,6 +5618,9 @@ impl Shell {
             },
             |page| page.notice.clone(),
         );
+        if destination == Destination::Mcp {
+            notice.push_str(" · Add servers with formless mcp add or the TUI (server configuration table required).");
+        }
         let list = gpui_kit::uniform_list(
             "daemon-resource-list",
             count,
@@ -5593,29 +5632,71 @@ impl Shell {
                         let selected = page.selected == Some(index);
                         let revision = page.revision;
                         let destination = this.destination;
+                        let badge = row.status.as_ref().map(|status| {
+                            div()
+                                .text_xs()
+                                .px_2()
+                                .rounded_md()
+                                .bg(cx.theme().muted)
+                                .text_color(
+                                    if matches!(status.as_str(), "failed" | "needs approval") {
+                                        cx.theme().warning
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    },
+                                )
+                                .child(directory::visual_text(status))
+                        });
                         Some(
-                            Button::new(("resource-row", index))
-                                .small()
+                            h_flex()
                                 .w_full()
-                                .label(directory::visual_text(&row.label))
-                                .selected(selected)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(page) = this.resource_pages.get_mut(&destination) {
-                                        if this.destination != destination
-                                            || page.revision != revision
-                                        {
-                                            return;
-                                        }
-                                        page.selected = Some(index);
-                                    }
-                                    cx.notify();
-                                })),
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    Button::new(("resource-row", index))
+                                        .small()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .label(directory::visual_text(&row.label))
+                                        .accessibility_label(format!(
+                                            "{}{}",
+                                            directory::visual_text(&row.label),
+                                            row.status
+                                                .as_ref()
+                                                .map_or(String::new(), |status| format!(
+                                                    " · {status}"
+                                                ))
+                                        ))
+                                        .selected(selected)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(page) =
+                                                this.resource_pages.get_mut(&destination)
+                                            {
+                                                if this.destination != destination
+                                                    || page.revision != revision
+                                                {
+                                                    return;
+                                                }
+                                                if page.selected != Some(index) {
+                                                    this.resource_confirm = None;
+                                                }
+                                                page.selected = Some(index);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .when_some(badge, |row, badge| row.child(badge)),
                         )
                     })
                     .collect()
             }),
         )
-        .h(self.scaled(220.))
+        .h(self.scaled(if page_height.is_some() {
+            220.
+        } else {
+            (f32::from(window.viewport_size().height) * 0.3 / self.text_scale.factor()).max(220.)
+        }))
+        .flex_shrink_0()
         .track_scroll(&self.resource_scroll);
         let selected = page.and_then(|page| page.selected.and_then(|index| page.rows.get(index)));
         let copy_target = self.resource_copy_target();
@@ -5638,7 +5719,7 @@ impl Shell {
             .test_support()
             .role(Role::Main)
             .aria_label(format!("{} · daemon data", destination.label()))
-            .aria_description("Read-only daemon data. Up and Down choose entries; Tab reaches Refresh, Back and Copy details.")
+            .aria_description("Daemon data. Up and Down choose entries; Tab reaches page controls, entry actions and Copy details. Destructive actions require confirmation.")
             .map(|region| inert_while(region, self.background_inert(window)))
             .track_focus(&self.conversation_focus)
             .key_context(RESOURCE_CONTEXT)
@@ -5685,8 +5766,11 @@ impl Shell {
                             .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(),|title|title.flex_1())).child(actions)
                     })
                     .child(readable("resource-notice", notice))
+                    .child(readable("resource-result", self.client_status.clone()))
+                    .child(self.render_resource_management(true, window, cx))
                     .child(list)
                     .child(readable("resource-selected", label))
+                    .child(self.render_resource_management(false, window, cx))
                     .child(readable("resource-detail", detail))
                     .child(
                         div().id("resource-copy-anchor").child(Button::new("copy-resource")
@@ -5727,13 +5811,23 @@ impl Shell {
                     Destination::Comparison | Destination::RunDetails | Destination::Invocations
                 )
             {
+                for (index, input) in [&self.resource_input, &self.resource_schedule]
+                    .iter()
+                    .enumerate()
+                {
+                    if input.focus_handle(cx).contains_focused(window, cx) {
+                        self.resource_anchors[10 + index].scroll_to(window, cx);
+                        window.request_animation_frame();
+                    }
+                }
                 for (index, focus) in self.resource_controls.iter().enumerate() {
                     if focus.contains_focused(window, cx) {
-                        // Direct body children: header=0, notice=1, list=2,
-                        // selected label=3, detail=4 and Copy wrapper=5.
-                        // The handle preserves nested ancestor scroll offsets.
-                        self.resource_body
-                            .scroll_to_item(if index == 2 { 5 } else { 0 });
+                        if index >= 4 {
+                            self.resource_anchors[index].scroll_to(window, cx);
+                        } else {
+                            self.resource_body
+                                .scroll_to_item(if index == 2 { 8 } else { 0 });
+                        }
                         window.request_animation_frame();
                         break;
                     }
@@ -5776,6 +5870,9 @@ impl Shell {
                     .unwrap_or(0)
                     .saturating_add_signed(delta)
                     .min(page.rows.len() - 1);
+                if page.selected != Some(selected) {
+                    self.resource_confirm = None;
+                }
                 page.selected = Some(selected);
                 self.resource_scroll
                     .scroll_to_item_strict(selected, ScrollStrategy::Top);
