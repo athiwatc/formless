@@ -53,6 +53,19 @@ without redesign.
 
 ### 2.2 Processes and clients
 
+- The Grok Build ACP profile targets the official `grok agent --no-leader stdio`
+  interface (ACP v1, Grok 1.0.92 or newer). It disables automatic updates with
+  `GROK_DISABLE_AUTOUPDATER=1`; `XAI_API_KEY` and `GROK_HOME` remain environment
+  inputs, never command arguments. Read-only steps add `--sandbox read-only`
+  and require ACP plan mode plus the shared fail-closed tool permission policy.
+  Permissions are user-answered through the shared handler; vendor tool metadata
+  remains in raw input and `allow_always` is attempt-scoped. Native
+  `_x.ai/ask_user_question` requests translate to the same user question types as
+  the Formless bridge, with explicit accepted/cancelled replies. Prompt steering
+  toward bridge `AskUser` or a turn-end question is secondary, not enforcement.
+  Profile hooks are prepared separately from shared ACP dispatch; see
+  `docs/grok-adapter.md` for the current integration boundary and live evidence.
+
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).
   Optional `--profile <name>` runs an additional isolated daemon + data dir.
 - Clients: TUI (v1 UI), CLI (§12), and any future frontend. Clients are thin:
@@ -6667,6 +6680,16 @@ under `crates/*/src` against README or SPEC, including test-only references.
 `FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+
+`FORMLESS_LIVE_GROK=1` enables the ignored Grok ACP initialization smoke test.
+`FORMLESS_GROK_BIN` selects its installed executable instead of `grok` on PATH.
+This test only negotiates ACP and validates version metadata; it does not prove
+authentication, MCP attachment, permission enforcement, or a completed turn.
+
+`FORMLESS_LIVE_AGY=1` enables the ignored Antigravity ACP smoke test;
+`FORMLESS_AGY_BIN` selects its executable. `FORMLESS_TOPIC_CAPABILITY` carries
+the per-attempt bridge capability only in the selected MCP environment, never
+in harness command arguments.
 
 `FORMLESS_BIN` supplies a fallback CLI path when the desktop app starts its
 daemon. Lookup tries a sibling CLI first, then this nonempty path, then PATH.
