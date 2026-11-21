@@ -724,7 +724,10 @@ impl Form {
             review.push("Preserved advanced fields (edit in config.toml):".into());
             for key in ["candidates", "reasoning_effort", "max_turns"] {
                 let line = format!("{key}: {}", role.get(key).unwrap_or(&Value::Null));
-                review.push(crate::text::truncate(&crate::text::escape_bidi(&line), 64));
+                review.push(crate::text::truncate(
+                    &crate::text::escape_approval_controls(&line),
+                    64,
+                ));
             }
             review.push(match role["system"].as_str() {
                 Some(system) => format!("system: set ({} characters)", system.chars().count()),

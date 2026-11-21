@@ -3804,7 +3804,8 @@ refresh a cache, nightly cleanup.
   ends: a desktop notification, a Markdown entry appended to a file,
   and/or a JSON POST (`job_id, prompt, status, answer, session_id`).
   Desktop delivery runs off the daemon executor and gives the notifier
-  five seconds to submit the message.
+  five seconds to submit the message. On Windows, Jobs and Tool notifications
+  use the BurntToast module in Windows PowerShell under an interactive login.
   These are targets the user configured, so they need no approval; the
   results go in the history and the audit log (`job.deliver`). For other
   channels (email, chat) point a webhook at them, or have the prompt use
@@ -4443,6 +4444,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Naming cache.** `formless naming status` lists each cached model and
+  its file sizes, marking the configured model. `formless naming remove
+  [MODEL]` removes weights, the tokenizer and partial downloads for one
+  model. `formless naming remove --all` removes those files for every
+  supported naming model. Removal respects the same lock as downloads and
+  model loading. Automatic downloads can fetch the configured model again
+  unless `naming.auto_download` is disabled.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
@@ -5736,7 +5744,7 @@ previous headless Run's Session.
   - Responses carry the same CSP as the hosted relay.
   - **Reconnecting:** when a connected page loses the daemon, it keeps
     retrying with backoff. The connection pill counts down ("daemon
-    offline · retry in Ns") and a tap retries at once. After 3 failed
+    offline · retry in Ns"). Select **Retry now** to retry at once. After 3 failed
     tries it notes that a restarted daemon needs a new `formless web`
     link, because session cookies don't survive a restart. Pasting a new
     link into an open tab signs in with it. Relay mode uses the same
@@ -6654,6 +6662,16 @@ under `crates/*/src` against README or SPEC, including test-only references.
 `FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+
+`FORMLESS_BIN` supplies a fallback CLI path when the desktop app starts its
+daemon. Lookup tries a sibling CLI first, then this nonempty path, then PATH.
+
+`FORMLESS_NOTIFICATION_TITLE` and `FORMLESS_NOTIFICATION_BODY` are internal
+Windows desktop-notification helper inputs, not user configuration overrides.
+Formless sets them on its PowerShell child to pass the notification title and
+body as data rather than interpolating them into the script. The helper passes
+nonempty text to BurntToast, falling back to `Formless` if both are empty.
+
 Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,

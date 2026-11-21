@@ -1392,7 +1392,7 @@ enum McpAction {
 
 #[derive(Subcommand)]
 enum NamingAction {
-    /// Show the configured model and whether it is installed
+    /// Show the configured model and the files in the naming cache
     Status {
         /// One JSON object
         #[arg(long)]
@@ -1403,6 +1403,15 @@ enum NamingAction {
         /// Model ID to download; omit to use the configured model
         #[arg(value_parser = NamingModelParser::new())]
         model: Option<String>,
+    },
+    /// Remove cached weights, tokenizers, and partial downloads
+    Remove {
+        /// Model ID to remove; omit to use the configured model
+        #[arg(value_parser = NamingModelParser::new(), conflicts_with = "all")]
+        model: Option<String>,
+        /// Remove the files for all naming models
+        #[arg(long)]
+        all: bool,
     },
     /// Print the title the namer would give a first message
     Test {
@@ -8220,6 +8229,17 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
     match action {
         NamingAction::Status { json: true } => {
             let spec = cfg.naming.spec();
+            let cached = namer::cached_models(&paths)?
+                .into_iter()
+                .map(|model| {
+                    serde_json::json!({
+                        "id": model.id,
+                        "bytes": model.bytes,
+                        "installed": model.installed,
+                        "configured": spec.is_some_and(|spec| spec.id == model.id),
+                    })
+                })
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -8228,6 +8248,7 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
                     "installed": spec.is_some_and(|s| s.installed(&paths)),
                     "status": naming_model_status(&paths, &cfg),
                     "models_dir": namer::models_dir(&paths).display().to_string(),
+                    "cached": cached,
                     "available": namer::MODELS
                         .iter()
                         .map(|m| serde_json::json!({"id": m.id, "bytes": m.gguf_bytes}))
@@ -8247,26 +8268,80 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            let cached = namer::cached_models(&paths)?;
+            if cached.is_empty() {
+                println!("cache:      empty");
+            }
+            let selected = cfg.naming.spec();
+            for model in cached {
+                let selection = if selected.is_some_and(|spec| spec.id == model.id) {
+                    "configured"
+                } else {
+                    "unselected"
+                };
+                let state = if model.installed {
+                    "installed"
+                } else {
+                    "partial"
+                };
+                println!(
+                    "cached:     {} ({} bytes, {selection}, {state})",
+                    model.id, model.bytes
+                );
+            }
         }
         NamingAction::Pull { model } => {
             let id = model.unwrap_or_else(|| cfg.naming.model.clone());
             let spec = namer::spec(&id).with_context(|| format!("unknown naming model '{id}'"))?;
             if spec.installed(&paths) {
                 println!("{} already installed", spec.id);
-                return Ok(());
+            } else {
+                println!(
+                    "downloading {} ({} MB)…",
+                    spec.id,
+                    spec.gguf_bytes / 1_000_000
+                );
+                tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
+                println!("installed {}", spec.gguf_path(&paths).display());
             }
-            println!(
-                "downloading {} ({} MB)…",
-                spec.id,
-                spec.gguf_bytes / 1_000_000
-            );
-            tokio::runtime::Runtime::new()?.block_on(namer::download(&paths, &spec))?;
-            println!("installed {}", spec.gguf_path(&paths).display());
             if !id.eq_ignore_ascii_case(&cfg.naming.model) {
                 println!(
                     "set `[naming] model = \"{}\"` in config.toml to use it",
                     spec.id
                 );
+                if let Some(previous) = cfg
+                    .naming
+                    .spec()
+                    .filter(|previous| previous.installed(&paths))
+                {
+                    println!("{} remains cached. Reclaim its disk space with `formless naming remove {}`.", previous.id, previous.id);
+                }
+            }
+        }
+        NamingAction::Remove { model, all } => {
+            let selected = if all {
+                None
+            } else {
+                let id = model.unwrap_or_else(|| cfg.naming.model.clone());
+                Some(namer::spec(&id).with_context(|| format!("unknown naming model '{id}'"))?)
+            };
+            let models = selected
+                .as_ref()
+                .map_or(namer::MODELS, std::slice::from_ref);
+            let removed = namer::remove_cached_models(&paths, models)?;
+            println!(
+                "Removed {} naming cache file(s) totaling {} bytes.",
+                removed.files, removed.bytes
+            );
+            if removed.files > 0
+                && cfg.naming.enabled
+                && cfg.naming.auto_download
+                && cfg
+                    .naming
+                    .spec()
+                    .is_some_and(|configured| models.iter().any(|spec| spec.id == configured.id))
+            {
+                println!("The configured model can download again. Set `[naming] auto_download = false` to keep it removed.");
             }
         }
         NamingAction::Test { text } => {
