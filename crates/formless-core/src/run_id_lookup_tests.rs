@@ -81,6 +81,38 @@ fn run_lookup_prefers_exact_ids_and_bounds_literal_prefixes() {
 }
 
 #[test]
+fn run_inspection_sums_cached_cache_write_and_reasoning_tokens_for_that_run() {
+    use crate::provider::Usage;
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let run = store.create_run(&session).unwrap();
+    let unrelated = store.create_run(&session).unwrap();
+    let usage = Usage {
+        prompt_tokens: 9,
+        completion_tokens: 8,
+        cached_tokens: 2,
+        cache_write_tokens: 3,
+        reasoning_tokens: 4,
+        ..Usage::default()
+    };
+    store.record_usage(&session, &run, "one", &usage).unwrap();
+    store.record_usage(&session, &run, "two", &usage).unwrap();
+    store
+        .record_usage(&session, &unrelated, "one", &usage)
+        .unwrap();
+    let value = store.inspect_run(&run).unwrap().unwrap();
+    for (field, count) in [
+        ("prompt_tokens", 18),
+        ("completion_tokens", 16),
+        ("cached_tokens", 4),
+        ("cache_write_tokens", 6),
+        ("reasoning_tokens", 8),
+    ] {
+        assert_eq!(value[field], count, "{field}");
+    }
+}
+
+#[test]
 fn foreign_database_encoding_keeps_literal_run_lookup() {
     let path = std::env::temp_dir().join(format!("fl-run-encoding-{}.db", uuid::Uuid::new_v4()));
     let conn = Connection::open(&path).unwrap();
