@@ -46,6 +46,7 @@ impl Store {
     pub(crate) fn finish_topic_orchestrator(
         &self,
         session: &str,
+        run_id: &str,
         status: &str,
     ) -> Result<Option<String>> {
         self.transaction(|st|{
@@ -53,6 +54,7 @@ impl Store {
             if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){return Ok(None);}
             if matches!(status,"paused"|"failed"|"error") {
                 st.fail_topic_workflow(&topic.id,&format!("orchestrator run ended with {status}"))?;
+                st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?3 WHERE id=?1 AND session_id=?2 AND status IN ('paused','failed','error')",params![run_id,session,now()])?;
             } else if topic.features.iter().any(|feature|matches!(feature.status,formless_protocol::TopicFeatureStatus::Pending|formless_protocol::TopicFeatureStatus::Running|formless_protocol::TopicFeatureStatus::NeedsUser)) {
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
                 if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically. Active harness attempts, if any, keep running.")?;}
@@ -62,6 +64,7 @@ impl Store {
     }
     pub(crate) fn recover_topic_workflows(&self) -> Result<()> {
         self.transaction(|st|{
+            st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR EXISTS(SELECT 1 FROM topics t JOIN messages m ON m.id=runs.start_message_id AND m.session_id=t.topic_session_id WHERE t.topic_session_id=runs.session_id AND t.status NOT IN ('running','needs_user') AND m.generated_by='topic_kickoff'))",params![now()])?;
             let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in topics {
                 st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
@@ -410,7 +413,7 @@ impl Store {
                 bail!("only a pending topic can be approved");
             }
             let active: bool = st.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status IN ('running','paused'))
+                "SELECT COALESCE((SELECT status IN ('running','paused','interrupted') FROM runs WHERE session_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1),0)
                       OR EXISTS(SELECT 1 FROM queued_messages WHERE session_id=?1)",
                 params![topic.source_session_id],
                 |row| row.get(0),

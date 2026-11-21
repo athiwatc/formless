@@ -602,7 +602,7 @@ fn topic_invalid_feature_sources_blank_duplicates_and_empty_selection_are_reject
 
 #[test]
 fn topic_approval_rejects_edited_or_busy_source() {
-    for state in ["edited", "running", "paused", "queued"] {
+    for state in ["edited", "running", "paused", "interrupted", "queued"] {
         let (store, source, message, request) = fixture();
         let topic = store
             .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
@@ -617,7 +617,7 @@ fn topic_approval_rejects_edited_or_busy_source() {
                     )
                     .unwrap();
             }
-            "running" | "paused" => {
+            "running" | "paused" | "interrupted" => {
                 let run = store.create_run(&source.id).unwrap();
                 store.set_run_status(&run, state).unwrap();
             }
@@ -669,6 +669,37 @@ fn topic_retry_failed_and_corrupt_status_fail_closed() {
         )
         .unwrap();
     assert!(store.get_topic(&topic.id).is_err());
+}
+
+#[test]
+fn topic_approval_ignores_historical_paused_runs_and_new_runs_retire_resume_targets() {
+    let (store, source, _, request) = fixture();
+    let topic = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let old = store.create_run(&source.id).unwrap();
+    store.set_run_status(&old, "paused").unwrap();
+    store
+        .set_run_error(&old, "provider failure retained")
+        .unwrap();
+    let latest = store.create_run(&source.id).unwrap();
+    assert_eq!(
+        store.run_status(&old).unwrap().as_deref(),
+        Some("abandoned")
+    );
+    assert_eq!(
+        store.run_error(&old).unwrap().as_deref(),
+        Some("provider failure retained")
+    );
+    store.set_run_status(&latest, "abandoned").unwrap();
+    store.set_run_status(&old, "paused").unwrap();
+    assert!(store.unfinished_last_run(&source.id).unwrap().is_none());
+    store.approve_topic(&topic.id).unwrap();
+    assert_eq!(store.abandon_resumable_runs(&source.id).unwrap(), 1);
+    assert_eq!(
+        store.run_status(&old).unwrap().as_deref(),
+        Some("abandoned")
+    );
 }
 
 #[test]

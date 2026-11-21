@@ -598,7 +598,8 @@ async fn topic_async_normal_model_end_keeps_attempt_and_waiting_alive() {
         .unwrap();
     let id = started["attempt_id"].as_str().unwrap();
     wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
-    f.daemon().topic_orchestrator_ended(&session, "completed");
+    f.daemon()
+        .topic_orchestrator_ended(&session, "", "completed");
     assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
     assert!(!f
         .daemon()
@@ -1357,7 +1358,12 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
         .with_reader(|st| st.last_run(topic.topic_session_id.as_ref().unwrap()))
         .unwrap()
         .unwrap();
-    assert_eq!(last.1, "paused");
+    assert_eq!(last.1, "abandoned");
+    assert!(failed.features[0]
+        .detail
+        .as_ref()
+        .unwrap()
+        .contains("ended with paused"));
     let mut changed = false;
     while let Ok(event) = events.try_recv() {
         if matches!(event,ServerMessage::Event(Event::TopicChanged{topic_id}) if topic_id==topic.id)
@@ -1409,4 +1415,186 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
     assert_ne!(next.0, last.0);
     assert_eq!(next.1, "completed");
     retry_server.abort();
+}
+
+#[tokio::test]
+async fn topic_failed_kickoffs_retire_runs_and_allow_child_approval_after_abandon() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "provider_error");
+    let f = Fixture::new(&env);
+    let topic = topic(&f, None, false);
+    let session = topic.topic_session_id.clone().unwrap();
+    let server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Claude,
+        true,
+    )
+    .await;
+    let mut ids = Vec::new();
+    for iteration in 0..2 {
+        if iteration > 0 {
+            f.daemon()
+                .handle(Request::RetryTopicFeature {
+                    retry: TopicFeatureRetryRequest {
+                        topic_id: topic.id.clone(),
+                        feature_id: topic.features[0].id.clone(),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        f.daemon()
+            .handle(Request::StartTopicWorkflow {
+                topic_id: topic.id.clone(),
+            })
+            .await
+            .unwrap();
+        settled(&f, &session).await;
+        assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+        let last = f
+            .daemon()
+            .with_reader(|st| st.last_run(&session))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.1, "abandoned");
+        ids.push(last.0);
+    }
+    f.daemon()
+        .handle(Request::AbandonRun {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    let snapshot = f
+        .daemon()
+        .handle(Request::GetSession {
+            id: session.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot["running"], false);
+    assert!(snapshot["unfinished_run"].is_null());
+    assert_eq!(snapshot["queued"], json!([]));
+    assert!(snapshot["last_recap"].is_null());
+    let proposal = TopicProposalRequest {
+        source_session_id: session.clone(),
+        message_ids: vec![topic.features[0].source_message_id.clone()],
+        name: "Child after errors".into(),
+        workspace: None,
+        parent_topic_id: Some(topic.id.clone()),
+        outline: vec![],
+        features: vec![],
+    };
+    let child: TopicInfo = serde_json::from_value(
+        f.daemon()
+            .handle(Request::ProposeTopic { proposal })
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let publishing = f
+        .daemon()
+        .begin_run_publication(&session, ids.last().unwrap());
+    assert!(f
+        .daemon()
+        .handle(Request::ApproveTopic {
+            approval: TopicApprovalRequest {
+                topic_id: child.id.clone()
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("finishing"));
+    drop(publishing);
+    f.daemon()
+        .handle(Request::ApproveTopic {
+            approval: TopicApprovalRequest {
+                topic_id: child.id.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    for id in ids {
+        assert_eq!(
+            f.daemon()
+                .with_reader(|st| st.run_status(&id))
+                .unwrap()
+                .as_deref(),
+            Some("abandoned")
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn topic_startup_retires_legacy_failed_kickoffs_but_preserves_resumable_runs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mut f = Fixture::new(&env);
+    let failed = topic(&f, None, false);
+    let active = topic(&f, None, false);
+    let (old, latest, continuable, ordinary) = f
+        .daemon()
+        .with_store(|st| {
+            st.claim_topic_workflow(&failed.id)?;
+            let session = failed.topic_session_id.as_ref().unwrap();
+            st.append_message_generated(
+                session,
+                "user",
+                "legacy kickoff",
+                None,
+                Some("topic_kickoff"),
+            )?;
+            let old = st.create_run(session)?;
+            st.set_run_status(&old, "paused")?;
+            st.append_message_generated(
+                session,
+                "user",
+                "another kickoff",
+                None,
+                Some("topic_kickoff"),
+            )?;
+            let latest = st.create_run(session)?;
+            st.set_run_status(&latest, "paused")?;
+            st.set_run_status(&old, "paused")?;
+            st.fail_topic_workflow(&failed.id, "legacy provider failure")?;
+            st.claim_topic_workflow(&active.id)?;
+            let session = active.topic_session_id.as_ref().unwrap();
+            st.append_message_generated(
+                session,
+                "user",
+                "resumable kickoff",
+                None,
+                Some("topic_kickoff"),
+            )?;
+            let continuable = st.create_run(session)?;
+            st.set_run_status(&continuable, "paused")?;
+            let ordinary = st.create_run(&f.session)?;
+            st.set_run_status(&ordinary, "paused")?;
+            Ok((old, latest, continuable, ordinary))
+        })
+        .unwrap();
+    drop(f.daemon.take());
+    let restarted = Daemon::new(f.paths.clone()).unwrap();
+    for id in [old, latest] {
+        assert_eq!(
+            restarted
+                .with_reader(|st| st.run_status(&id))
+                .unwrap()
+                .as_deref(),
+            Some("abandoned")
+        );
+    }
+    for id in [continuable, ordinary] {
+        assert_eq!(
+            restarted
+                .with_reader(|st| st.run_status(&id))
+                .unwrap()
+                .as_deref(),
+            Some("paused")
+        );
+    }
 }

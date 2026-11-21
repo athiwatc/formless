@@ -2072,7 +2072,21 @@ impl Daemon {
                 self.propose_topic_request(&proposal)?,
             )?),
             Request::ApproveTopic { approval } => {
-                let topic = self.with_store(|st| st.approve_topic(&approval.topic_id))?;
+                let _admission = self.forecast_admission.locked();
+                let topic = self.with_store(|st| {
+                    let topic = st
+                        .get_topic(&approval.topic_id)?
+                        .context(RequestFailure::not_found("topic not found"))?;
+                    if self.runs.locked().contains_key(&topic.source_session_id)
+                        || self.session_is_publishing(&topic.source_session_id)
+                    {
+                        return Err(RequestFailure::busy(
+                            "source session has an active or finishing Run",
+                        )
+                        .into());
+                    }
+                    st.approve_topic(&approval.topic_id)
+                })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: topic.source_session_id.clone(),
                 });
@@ -3035,14 +3049,10 @@ impl Daemon {
                         || self.session_is_publishing(&session_id) {
                         return Err(RequestFailure::busy("The Run is active or still finishing; wait until it finishes before abandoning it").into());
                     }
-                    let Some((run_id, _)) = st.last_run(&session_id)?
-                        .filter(|(_, status)| status == "interrupted" || status == "paused") else {
-                        return Ok(false);
-                    };
-                    st.set_run_status(&run_id, "abandoned")?;
+                    let abandoned=st.abandon_resumable_runs(&session_id)? >0;
                     #[cfg(windows)]
                     self.prune_retained_capture_leases_in(st);
-                    Ok(true)
+                    Ok(abandoned)
                 })?;
                 if abandoned {
                     self.publish_session_plan(&session_id);
@@ -6615,6 +6625,7 @@ impl Daemon {
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
+        let final_status = self.topic_orchestrator_ended(&session_id, &run_id, final_status);
         // Persist the exact terminal snapshot before a new Run or Resume can
         // acquire this Session, and before any recap event advertises it.
         let changes = self
@@ -6646,7 +6657,6 @@ impl Daemon {
                 None
             }
         };
-        self.topic_orchestrator_ended(&session_id, final_status);
         // Locks a panicking Run may have poisoned are still taken. Only this
         // Run's own entry goes: a newer Run of the Session keeps its
         // controls (#726).

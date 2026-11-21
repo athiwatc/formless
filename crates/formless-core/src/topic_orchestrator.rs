@@ -364,8 +364,13 @@ impl Daemon {
         Ok(topic)
     }
 
-    pub(super) fn topic_orchestrator_ended(&self, session: &str, status: &str) {
-        match self.with_store(|st| st.finish_topic_orchestrator(session, status)) {
+    pub(super) fn topic_orchestrator_ended<'a>(
+        &self,
+        session: &str,
+        run: &str,
+        status: &'a str,
+    ) -> &'a str {
+        match self.with_store(|st| st.finish_topic_orchestrator(session, run, status)) {
             Ok(Some(topic_id)) => {
                 if status != "completed" {
                     for ((id, _), cancel) in self.topic_steps.locked().iter() {
@@ -376,10 +381,14 @@ impl Daemon {
                     self.close_topic_interactions(&topic_id, None);
                 }
                 self.broadcast(Event::TopicChanged { topic_id });
+                if matches!(status, "paused" | "failed" | "error") {
+                    return "abandoned";
+                }
             }
             Ok(None) => {}
             Err(error) => tracing::warn!("could not finalize topic orchestrator: {error:#}"),
         }
+        status
     }
 
     pub(super) fn finish_topic_feature_tool(
