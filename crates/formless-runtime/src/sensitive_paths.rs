@@ -366,6 +366,9 @@ fn builtin(path: &Path) -> Option<&'static str> {
             | "_netrc"
             | ".htpasswd"
             | ".git-credentials"
+            | ".s3cfg"
+            | ".boto"
+            | ".vault-token"
             | "rclone.conf"
             | ".rclone.conf"
             | ".yarnrc"
@@ -631,6 +634,54 @@ mod tests {
                 policy.classify(&path, &path).unwrap(),
                 PathDecision::Ordinary,
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn protects_s3_client_config_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [".s3cfg", ".boto", "project/.BOTO"] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in ["project/s3cfg/notes.txt", ".s3cfg.example", "boto"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn protects_vault_token_during_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [".vault-token", "project/.VAULT-TOKEN"] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in ["project/vault/notes.txt", ".vault-token.example"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
             );
         }
     }
