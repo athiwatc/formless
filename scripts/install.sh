@@ -234,6 +234,7 @@ case "${FORMLESS_TARGET:-$os/$arch}" in
   Darwin/arm64) target="aarch64-apple-darwin" ;;
   Darwin/x86_64) target="x86_64-apple-darwin" ;;
   Linux/x86_64) target="x86_64-unknown-linux-gnu" ;;
+  Linux/aarch64 | Linux/arm64) target="aarch64-unknown-linux-gnu" ;;
   */*) die "unsupported platform $os/$arch; build from source with FORMLESS_FROM_SOURCE=1 (requires Rust/cargo and a C compiler/linker; see README.md source-build requirements)" ;;
   *) target="$FORMLESS_TARGET" ;;
 esac

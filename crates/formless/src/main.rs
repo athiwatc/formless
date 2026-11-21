@@ -805,12 +805,15 @@ enum ToolsAction {
         /// Tool name or ID
         name: String,
     },
-    /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
+    /// Read or replace a Tool's tags
     Tag {
         /// Tool name or id
         name: String,
-        /// Tags to assign to this Tool; omit all tags to clear them
+        /// Replacement tags; omission only reads
         tags: Vec<String>,
+        /// Explicitly remove all tags
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
@@ -3209,7 +3212,12 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         }
         DaemonAction::Status { json, check: false } => {
             if daemon_reachable(&paths) {
-                let v = formless_tui::client::request_once(&paths, Request::Status)?;
+                let mut v = formless_tui::client::request_once(&paths, Request::Status)?;
+                #[cfg(unix)]
+                let endpoint = paths.socket_path().to_string_lossy().into_owned();
+                #[cfg(windows)]
+                let endpoint = paths.pipe_name();
+                v["endpoint"] = serde_json::Value::String(endpoint);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&v)?);
                 } else {
@@ -3510,6 +3518,8 @@ enum Fix {
     RemoveStale(Vec<std::path::PathBuf>),
     /// Secret files others can read.
     Chmod600(Vec<std::path::PathBuf>),
+    #[cfg(unix)]
+    MakeDaemonEndpointPrivate,
 }
 
 /// The daemon and file checks `--fix` can act on.
@@ -3606,17 +3616,22 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
             }
         }
     }
-    // A data dir too deep for a unix socket uses a short socket path
-    // instead; that folder must be usable (SPEC §9.1).
     #[cfg(unix)]
-    if paths.socket_path().parent() != Some(paths.data_dir.as_path()) {
-        if let Err(e) = paths.prepare_socket_dir() {
-            out.push(Problem {
-                what: format!("{e:#}"),
-                next: Some("set a shorter FORMLESS_DATA_DIR".into()),
-                fix: None,
-            });
-        }
+    match paths.daemon_endpoint_permissions_need_repair() {
+        Ok(true) => out.push(Problem {
+            what: format!(
+                "the daemon data directory or socket has incorrect permissions ({})",
+                paths.socket_path().display()
+            ),
+            next: Some("formless doctor --fix".into()),
+            fix: Some(Fix::MakeDaemonEndpointPrivate),
+        }),
+        Ok(false) => {}
+        Err(error) => out.push(Problem {
+            what: format!("{error:#}"),
+            next: Some("inspect the daemon data directory and socket ownership".into()),
+            fix: None,
+        }),
     }
     #[cfg(unix)]
     {
@@ -3674,6 +3689,14 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             }
             Ok("removed the stale files".into())
         }
+        #[cfg(unix)]
+        Fix::MakeDaemonEndpointPrivate => {
+            paths
+                .prepare_socket_dir()
+                .and_then(|()| paths.set_daemon_socket_permissions())
+                .map_err(|error| format!("{error:#}"))?;
+            Ok("made the daemon directories (700) and existing socket (600) private".into())
+        }
         Fix::Chmod600(files) => {
             #[cfg(unix)]
             for f in files {
@@ -3684,6 +3707,39 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             Ok("made the secret files private (600)".into())
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_reports_and_repairs_loose_daemon_directory_and_socket_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = std::env::temp_dir().join(format!("fl-doctor-endpoint-{}", std::process::id()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    paths.prepare_socket_dir().unwrap();
+    std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = paths.socket_path();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let problems = doctor_local_problems(&paths);
+    let fix = problems
+        .iter()
+        .find_map(|problem| match &problem.fix {
+            Some(fix @ Fix::MakeDaemonEndpointPrivate) => Some(fix),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o777);
+    apply_fix(&paths, fix).unwrap();
+    assert_eq!(
+        std::fs::metadata(&paths.data_dir).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    assert!(!paths.daemon_endpoint_permissions_need_repair().unwrap());
+    drop(listener);
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Doctor already wrote the full diagnostic report before returning this verdict.
@@ -3762,7 +3818,7 @@ fn redact(text: &str) -> String {
             (r"(?i)((?:api[_-]?key|token|secret|password|authorization)\x22?\s*[:=]\s*\x22?)[^\s\x22',]+", "${1}[redacted]"),
             (r"#(k|local)=[^\s&\x22']+", "#${1}=[redacted]"),
             (r"(://)[^/\s:@]+:[^/\s@]+@", "${1}[redacted]@"),
-            (r"\b(sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
+            (r"\b(sk|pk|rk|ghp|gho|ghr|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
             (r"[A-Za-z0-9+/_\-]{40,}={0,2}", "[redacted]"),
         ]
         .into_iter()
@@ -6909,19 +6965,23 @@ fn comparison_terminal_text(text: &str) -> String {
 }
 
 fn comparison_quoted_metadata(text: &str) -> Result<String> {
+    Ok(escape_json_terminal_controls(&serde_json::to_string(text)?))
+}
+
+/// Keep JSON text parseable while escaping terminal controls left by Serde.
+fn escape_json_terminal_controls(json: &str) -> String {
     use std::fmt::Write as _;
-    let quoted = serde_json::to_string(text)?;
-    let mut visible = String::with_capacity(quoted.len());
-    for c in quoted.chars() {
-        if table::terminal_control(c) {
-            // All relevant control/format characters are in the BMP. Keep a
-            // valid JSON string while making bidi and C1 controls visible too.
-            write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
+    let mut visible = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && table::terminal_control(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(&mut visible, "\\u{unit:04x}").expect("writing to String");
+            }
         } else {
             visible.push(c);
         }
     }
-    Ok(visible)
+    visible
 }
 
 fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> Result<()> {
@@ -7652,15 +7712,19 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
         formless_tui::client::request_once(&paths, req)
     };
     let show = |m: &serde_json::Value| {
+        let field = |key: &str| comparison_terminal_text(m[key].as_str().unwrap_or_default());
         println!(
             "{:<10} {:<8} {:<20} {}{}",
-            m["id"].as_str().unwrap_or_default(),
+            field("id"),
             if m["enabled"] == true { "on" } else { "off" },
-            m["scope"].as_str().unwrap_or_default(),
-            m["text"].as_str().unwrap_or_default(),
+            field("scope"),
+            field("text"),
             match m["session_id"].as_str() {
-                Some(s) => format!("  (from session {})", &s[..s.len().min(8)]),
-                None => format!("  ({})", m["author"].as_str().unwrap_or_default()),
+                Some(s) => format!(
+                    "  (from session {})",
+                    comparison_terminal_text(&s.chars().take(8).collect::<String>())
+                ),
+                None => format!("  ({})", field("author")),
             }
         )
     };
@@ -8430,17 +8494,23 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
         ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),
         ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
-        ToolsAction::Tag { name, tags } => {
+        ToolsAction::Tag { name, tags, clear } => {
             let tool = find_tool(&paths, &name)?;
-            let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(
-                &paths,
-                Request::SetToolTags { id: tool.id, tags },
-            )?)?;
-            if t.tags.is_empty() {
-                println!("{}: no tags", t.name);
+            let tool = if clear || !tags.is_empty() {
+                serde_json::from_value(request_once(
+                    &paths,
+                    Request::SetToolTags { id: tool.id, tags },
+                )?)?
             } else {
-                println!("{}: {}", t.name, t.tags.join(" "));
-            }
+                tool
+            };
+            let name = comparison_terminal_text(&tool.name);
+            let tags = if tool.tags.is_empty() {
+                "no tags".into()
+            } else {
+                comparison_terminal_text(&tool.tags.join(" "))
+            };
+            println!("{name}: {tags}");
             Ok(())
         }
         ToolsAction::Retire { name, force } => set_tool_retired(&paths, &name, true, force),
@@ -10505,6 +10575,15 @@ mod tests {
             [("v0.2.0".into(), "Final release".into(), "final".into())]
         );
         assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
+    }
+
+    #[test]
+    fn bug_reports_redact_github_app_refresh_tokens() {
+        let token = format!("ghr_{}", "0123456789abcdefghijklmnop");
+        assert_eq!(
+            redact(&format!("github: {token}, ghr_short")),
+            "github: ghr-[redacted], ghr_short"
+        );
     }
 
     #[test]
