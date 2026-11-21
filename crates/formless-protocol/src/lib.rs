@@ -944,11 +944,29 @@ pub struct MessageInfo {
     pub session_id: String,
     pub seq: i64,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_by: Option<String>,
     pub content: String,
     pub created_at: String,
     /// Provider-format extras (tool_calls / tool_call_id) as JSON, if any.
     #[serde(default)]
     pub meta: Option<String>,
+}
+
+#[cfg(test)]
+mod generated_message_wire_tests {
+    use super::*;
+    #[test]
+    fn generated_message_marker_is_additive_and_exposed() {
+        let old = serde_json::json!({"id":"m","session_id":"s","seq":1,"role":"user","content":"hello","created_at":""});
+        let mut message: MessageInfo = serde_json::from_value(old).unwrap();
+        assert!(message.generated_by.is_none());
+        message.generated_by = Some("topic_kickoff".into());
+        assert_eq!(
+            serde_json::to_value(message).unwrap()["generated_by"],
+            "topic_kickoff"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

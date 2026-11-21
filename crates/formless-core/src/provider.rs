@@ -6013,6 +6013,7 @@ mod tests {
     fn history_keeps_the_preamble_on_tool_call_turns() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let m = formless_protocol::MessageInfo {
+            generated_by: None,
             role: "assistant".into(),
             content: "Let me check the file first.".into(),
             meta: Some(

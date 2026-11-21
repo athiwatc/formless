@@ -7129,3 +7129,10 @@ visible in Topic Chat with the harness, attempt, questions, answers and basis.
 User-only questions cannot be answered by this tool. First answer wins.
 UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
 absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.

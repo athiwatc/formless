@@ -545,6 +545,7 @@ pub(crate) async fn counted<F: std::future::Future>(
 tokio::task_local! {
     /// The connection (id, label) a request came from, for attribution.
     static CLIENT: (u64, String);
+    static GENERATED_MESSAGE:String;
 }
 
 /// The client a request came from, outside requests none.
@@ -5844,6 +5845,15 @@ impl Daemon {
         let control = self.runs.locked().get(&session_id).cloned();
         // A Run can start or finish after the client confirms. Classify under
         // the same admission lock as the ensuing append and Run admission.
+        if GENERATED_MESSAGE
+            .try_with(|marker| marker == "topic_kickoff")
+            .unwrap_or(false)
+            && (control.is_some() || self.session_is_publishing(&session_id))
+        {
+            bail!(
+                "Topic Chat became busy before kickoff; no generated message was queued or steered"
+            );
+        }
         if let Some(review) = &review {
             if let Some(expected_run) = &review.run_id {
                 if control.as_ref().map(|run| &run.run_id) != Some(expected_run) {
@@ -12396,7 +12406,8 @@ impl Daemon {
             meta[k] = v;
         }
         let meta = (meta != json!({})).then(|| meta.to_string());
-        st.append_message_meta(session_id, "user", content, meta)
+        let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+        st.append_message_generated(session_id, "user", content, meta, generated_by.as_deref())
     }
 
     /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
@@ -17673,6 +17684,7 @@ pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> Str
 #[test]
 fn stored_tool_result_outcome_preserves_provider_projection() {
     let mut message = formless_protocol::MessageInfo {
+        generated_by: None,
         id: "result".into(),
         session_id: "session".into(),
         seq: 1,

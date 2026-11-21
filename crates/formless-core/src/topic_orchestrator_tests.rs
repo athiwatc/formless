@@ -124,6 +124,90 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let topic = topic(&f, None, false);
+    let (tx, mut rx) = mpsc::channel(256);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 98,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    let server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Codex,
+        true,
+    )
+    .await;
+    f.daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(ServerMessage::Event(Event::MessageAppended { message, .. })) =
+                rx.recv().await
+            {
+                if message
+                    .content
+                    .starts_with("You are the Formless topic orchestrator.")
+                {
+                    break message;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(message.role, "user");
+    assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
+    let session = topic.topic_session_id.clone().unwrap();
+    let wire = f
+        .daemon()
+        .handle(Request::GetSession {
+            id: session.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        wire["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == message.id)
+            .unwrap()["generated_by"],
+        "topic_kickoff"
+    );
+    settled(&f, &session).await;
+    assert!(f
+        .daemon()
+        .handle(Request::ProposeTopic {
+            proposal: TopicProposalRequest {
+                parent_topic_id: None,
+                source_session_id: session,
+                message_ids: vec![message.id],
+                features: vec![],
+                name: "Not a user request".into(),
+                workspace: None,
+                outline: vec![],
+            }
+        })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("generated"));
+    server.abort();
+}
 async fn model(
     f: &Fixture,
     env: &crate::credential_env::EnvGuard,

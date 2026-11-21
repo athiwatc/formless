@@ -151,12 +151,16 @@ impl Daemon {
             }
             let daemon = self.clone();
             tokio::spawn(async move {
-                daemon
-                    .handle(Request::SendMessage {
-                        session_id: session,
-                        content: kickoff,
-                        mode: SendMode::Send,
-                        client_msg_id: None,
+                GENERATED_MESSAGE
+                    .scope("topic_kickoff".into(), async move {
+                        daemon
+                            .handle(Request::SendMessage {
+                                session_id: session,
+                                content: kickoff,
+                                mode: SendMode::Send,
+                                client_msg_id: None,
+                            })
+                            .await
                     })
                     .await
             })

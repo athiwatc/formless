@@ -33,6 +33,106 @@ fn topic_main_identity_is_non_creating_and_persistent() {
 }
 
 #[test]
+fn topic_generated_messages_cannot_be_proposed_or_approved_and_forks_keep_marker() {
+    let (store, source, message, proposal) = fixture();
+    let pending = store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET generated_by='topic_kickoff' WHERE id=?1",
+            [&message.id],
+        )
+        .unwrap();
+    assert!(store
+        .approve_topic(&pending.id)
+        .unwrap_err()
+        .to_string()
+        .contains("generated"));
+    assert!(store
+        .get_message(&source.id, &message.id)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_topic(&pending.id)
+        .unwrap()
+        .unwrap()
+        .topic_session_id
+        .is_none());
+    assert!(store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap_err()
+        .to_string()
+        .contains("generated"));
+    let fork = store.fork_session(&source.id, None, None).unwrap().unwrap();
+    assert_eq!(
+        store.list_messages(&fork.id).unwrap()[0]
+            .generated_by
+            .as_deref(),
+        Some("topic_kickoff")
+    );
+    let generated = store
+        .append_message_generated(
+            &source.id,
+            "user",
+            "new kickoff",
+            None,
+            Some("topic_kickoff"),
+        )
+        .unwrap();
+    assert_eq!(generated.generated_by.as_deref(), Some("topic_kickoff"));
+    assert_eq!(
+        store
+            .get_message(&source.id, &generated.id)
+            .unwrap()
+            .unwrap()
+            .generated_by,
+        generated.generated_by
+    );
+}
+
+#[test]
+fn topic_generated_marker_migrates_v73_and_survives_reopen() {
+    let root = std::env::temp_dir().join(format!("fl-generated-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("formless.db");
+    let store = Store::open(&path).unwrap();
+    let session = store.create_session(None).unwrap();
+    let old = store
+        .append_message(&session.id, "user", "User request")
+        .unwrap();
+    store
+        .conn
+        .execute_batch("ALTER TABLE messages DROP COLUMN generated_by;PRAGMA user_version=73;")
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert!(store
+        .get_message(&session.id, &old.id)
+        .unwrap()
+        .unwrap()
+        .generated_by
+        .is_none());
+    let generated = store
+        .append_message_generated(&session.id, "user", "Kickoff", None, Some("topic_kickoff"))
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store
+            .get_message(&session.id, &generated.id)
+            .unwrap()
+            .unwrap()
+            .generated_by
+            .as_deref(),
+        Some("topic_kickoff")
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn topic_context_branch_scope_search_and_external_opt_in() {
     let (store, source, _, _) = fixture();
     let parent = nested_topic(&store, &source.id, None).unwrap();

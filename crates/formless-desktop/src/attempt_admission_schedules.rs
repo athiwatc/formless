@@ -399,6 +399,7 @@ fn canonical_storage_and_publication_interleavings_never_attach_text_to_the_old_
         let canonical = Event::MessageAppended {
             session_id: "s".into(),
             message: formless_protocol::MessageInfo {
+                generated_by: None,
                 id: "next".into(),
                 session_id: "s".into(),
                 seq: 5,

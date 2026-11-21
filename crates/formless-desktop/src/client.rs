@@ -5343,6 +5343,7 @@ mod tests {
 
     fn snapshot(id: &str, text: &str) -> Value {
         let message = MessageInfo {
+            generated_by: None,
             id: "m1".into(),
             session_id: id.into(),
             seq: 1,
