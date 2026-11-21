@@ -2,6 +2,10 @@
 //! paths as file capabilities. All data and restored databases are disposable.
 use super::*;
 
+#[cfg(unix)]
+#[path = "topic_orchestrator_tests.rs"]
+mod topic_orchestrator_tests;
+
 #[path = "topic_interaction_tests.rs"]
 mod topic_interaction_tests;
 
@@ -535,11 +539,14 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
         .daemon()
         .with_store(|st| st.approve_topic(&topic.id))
         .unwrap();
-    let parent=topic.topic_session_id.unwrap();
-    proposal.source_session_id=parent.clone();
-    let child=f.daemon().propose_topic_request(&proposal).unwrap();
-    let child=f.daemon().with_store(|st|st.approve_topic(&child.id)).unwrap();
-    let session=child.topic_session_id.unwrap();
+    let parent = topic.topic_session_id.unwrap();
+    proposal.source_session_id = parent.clone();
+    let child = f.daemon().propose_topic_request(&proposal).unwrap();
+    let child = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&child.id))
+        .unwrap();
+    let session = child.topic_session_id.unwrap();
     let cancel = CancellationToken::new();
     let flag = Arc::new(AtomicBool::new(false));
     let (steer_tx, _) = mpsc::unbounded_channel();
@@ -573,7 +580,69 @@ async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
 }
 
 #[tokio::test]
-async fn topic_fixture_workspace_classification_and_unavailable_start() {
+async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/retained.txt");
+    std::fs::write(&file, b"retained attachment").unwrap();
+    let id = f.record(&file, 19, Some(&f.session));
+    let discarded = f.paths.data_dir.join("artifacts/nested/discarded.txt");
+    std::fs::write(&discarded, b"discarded").unwrap();
+    let discarded_id = f.record(&discarded, 9, Some(&f.session));
+    let topic = f
+        .daemon()
+        .with_store(|st| {
+            let message = st.append_message_meta(
+                &f.session,
+                "user",
+                "Keep this",
+                Some(json!({"attachments":[{"id":id,"path":file,"bytes":19}]}).to_string()),
+            )?;
+            let topic = st.propose_topic(
+                &TopicProposalRequest {
+                    parent_topic_id: None,
+                    source_session_id: f.session.clone(),
+                    message_ids: vec![message.id],
+                    features: vec![],
+                    name: "Independent".into(),
+                    workspace: Some(f.root.clone()),
+                    outline: vec![],
+                },
+                WorkspaceKind::Directory,
+                None,
+            )?;
+            st.approve_topic(&topic.id)
+        })
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    f.daemon().purge_session(&f.session).await.unwrap();
+    let result: Value = serde_json::from_str(
+        &f.daemon()
+            .read_artifact_impl(&session, &json!({"id":id}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["text"], "retained attachment");
+    let access = crate::attachment_access::AttachmentAccess::profile(&f.paths);
+    assert_eq!(
+        access
+            .read(
+                &json!({"id":id,"path":file,"bytes":19,"_source_session":session,"_source_seq":1}),
+                100
+            )
+            .unwrap(),
+        b"retained attachment"
+    );
+    assert!(!discarded.exists());
+    assert!(f
+        .daemon()
+        .with_reader(|st| st.get_artifact(&discarded_id))
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn topic_fixture_workspace_classification_and_start_failure() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let ping = f.daemon().handle(Request::Ping).await.unwrap();
@@ -655,7 +724,7 @@ async fn topic_fixture_workspace_classification_and_unavailable_start() {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("orchestrator not available yet"));
+        assert!(!error.to_string().contains("read-only"));
         let failed = f
             .daemon()
             .with_reader(|st| st.get_topic(&topic.id))
@@ -663,10 +732,11 @@ async fn topic_fixture_workspace_classification_and_unavailable_start() {
             .unwrap();
         assert_eq!(failed.status, TopicStatus::Failed);
         assert_eq!(failed.features[0].status, TopicFeatureStatus::Failed);
-        assert_eq!(
-            failed.features[0].detail.as_deref(),
-            Some("orchestrator not available yet")
-        );
+        assert!(failed.features[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("orchestrator start failed"));
         assert!(failed.attempts.is_empty());
         let reply = f
             .daemon()

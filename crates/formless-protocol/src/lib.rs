@@ -248,6 +248,12 @@ pub struct TopicAttemptInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TopicMcpOperation {
+    RequestPermission {
+        title: String,
+        kind: String,
+        raw_input: Option<serde_json::Value>,
+        options: Vec<HarnessPermissionOption>,
+    },
     AskUser {
         questions: Vec<Question>,
     },

@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 use crate::storage::Store;
 use formless_protocol::ToolInfo;
 
+pub const TOPIC_RUN_STEP: &str = "topic_run_step";
+pub const TOPIC_COMPLETE_FEATURE: &str = "topic_complete_feature";
+pub const TOPIC_FAIL_FEATURE: &str = "topic_fail_feature";
+
 pub const CREATE_TOOL: &str = "create_tool";
 pub const CREATE_MODULE: &str = "create_module";
 /// Not a built-in any more (sub-agents are the `agent` Capability), but
@@ -39,7 +43,7 @@ pub const UPDATE_PLAN: &str = "update_plan";
 /// Most steps a plan may have, and longest step text.
 pub const MAX_PLAN_ITEMS: usize = 20;
 pub const MAX_PLAN_TEXT: usize = 200;
-pub const RESERVED: [&str; 26] = [
+pub const RESERVED: [&str; 29] = [
     CREATE_TOOL,
     CREATE_MODULE,
     SPAWN_SUBAGENT,
@@ -66,6 +70,9 @@ pub const RESERVED: [&str; 26] = [
     READ_METRICS,
     RUN_SCRIPT,
     UPDATE_PLAN,
+    TOPIC_RUN_STEP,
+    TOPIC_COMPLETE_FEATURE,
+    TOPIC_FAIL_FEATURE,
 ];
 
 /// Built-in (non-registry) tools, dispatched by the daemon itself.
@@ -932,8 +939,20 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
 }
 
 /// The built-in tools' definitions, as listed to the model.
+fn topic_step_definition() -> Value {
+    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Run one independent harness step for this topic. The outline is advisory. Choose harness and access. Inputs must be exact artifacts from this feature's outputs. Never merge or push.","parameters":{
+        "type":"object","properties":{"feature_id":{"type":"string"},"title":{"type":"string"},"instructions":{"type":"string"},"harness":{"type":"string","enum":["claude","codex","pi","opencode","antigravity","acp","muse"]},"acp_agent":{"type":"string"},"model":{"type":"string"},"access":{"type":"string","enum":["read_only","write"]},"inputs":{"type":"array","items":{"type":"object"}}},
+        "required":["feature_id","title","instructions","harness","access"],"additionalProperties":false}}})
+}
+fn topic_feature_definition(name: &str, field: &str) -> Value {
+    json!({"type":"function","function":{"name":name,"description":"Finish a topic feature explicitly after considering the step results. No merge or push is performed.","parameters":{
+        "type":"object","properties":{"feature_id":{"type":"string"},(field):{"type":"string"}},"required":["feature_id",field],"additionalProperties":false}}})
+}
 pub fn builtin_definitions() -> Vec<Value> {
     vec![
+        topic_step_definition(),
+        topic_feature_definition(TOPIC_COMPLETE_FEATURE,"summary"),
+        topic_feature_definition(TOPIC_FAIL_FEATURE,"reason"),
         create_tool_definition(),
         create_module_definition(),
         retire_tool_definition(),
@@ -1212,6 +1231,18 @@ fn definitions(
         .map(|t| t.name.to_lowercase())
         .collect();
     let mut defs = builtin_definitions();
+    if !session_id
+        .map(|id| store.is_topic_orchestrator(id))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        defs.retain(|definition| {
+            !matches!(
+                definition["function"]["name"].as_str(),
+                Some(TOPIC_RUN_STEP | TOPIC_COMPLETE_FEATURE | TOPIC_FAIL_FEATURE)
+            )
+        });
+    }
     let trusted_builtins = defs.len();
     // Read after membership writes, and use keyed lookup only: shown still
     // controls order. A failed batch must not make every snapshot look absent.

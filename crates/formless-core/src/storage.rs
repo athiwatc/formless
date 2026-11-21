@@ -6980,6 +6980,18 @@ impl Store {
     }
 
     /// Paths of a Session's artifacts (to delete with it).
+    pub(crate) fn session_artifact_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id,path FROM artifacts WHERE session_id=?1")?
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Paths of a Session's artifacts (to delete with it).
     pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
