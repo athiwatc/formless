@@ -10,6 +10,80 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::DirBuilderExt;
 
 impl Store {
+    pub(crate) fn set_topic_limits(
+        &self,
+        id: &str,
+        limits: &formless_protocol::TopicLimits,
+    ) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            if st.conn.execute(
+                "UPDATE topics SET limits=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(limits)?, now()],
+            )? != 1
+            {
+                bail!("topic not found");
+            }
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn topic_step_limit(
+        &self,
+        id: &str,
+        feature: &str,
+        title: &str,
+    ) -> Result<Option<bool>> {
+        let topic = topic_info(self, id)?.context("topic not found")?;
+        let feature = topic
+            .features
+            .iter()
+            .find(|f| f.id == feature)
+            .context("feature not found")?;
+        if !matches!(
+            topic.status,
+            formless_protocol::TopicStatus::Running | formless_protocol::TopicStatus::NeedsUser
+        ) || !matches!(
+            feature.status,
+            formless_protocol::TopicFeatureStatus::Pending
+                | formless_protocol::TopicFeatureStatus::NeedsUser
+        ) || feature.active_attempt_id.is_some()
+        {
+            bail!("feature is terminal or has an active attempt");
+        }
+        if topic.attempts.len() as u64 >= u64::from(topic.limits.max_attempts_per_topic) {
+            return Ok(Some(true));
+        }
+        if topic
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.feature_id == feature.id && attempt.step_title == title.trim()
+            })
+            .count() as u64
+            > u64::from(topic.limits.max_retries_per_step)
+        {
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+    pub(crate) fn mark_topic_limit(&self, id: &str, feature: &str) -> Result<()> {
+        self.transaction(|st|{
+            st.conn.execute("UPDATE topic_features SET status='needs_user',detail='topic step limit reached',updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status IN ('pending','needs_user')",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+            Ok(())
+        })
+    }
+    pub(crate) fn raise_topic_limit(&self, id: &str, feature: &str, total: bool) -> Result<()> {
+        self.transaction(|st|{
+            let mut topic=topic_info(st,id)?.context("topic not found")?;
+            if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){bail!("topic no longer active");}
+            if total{topic.limits.max_attempts_per_topic=topic.limits.max_attempts_per_topic.saturating_add(20);}
+            else{topic.limits.max_retries_per_step=topic.limits.max_retries_per_step.saturating_add(3);}
+            st.set_topic_limits(id,&topic.limits)?;
+            st.conn.execute("UPDATE topic_features SET status='pending',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status='needs_user'",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user'",params![id,now()])?;
+            Ok(())
+        })
+    }
     pub(crate) fn add_topic_permission_rule(
         &self,
         id: &str,
@@ -654,13 +728,7 @@ impl Store {
                     "topic must be approved and not already running before its workflow can start"
                 );
             }
-            let workspace = topic.workspace.context("approved topic has no workspace")?;
-            st.conn
-                .execute(
-                    "INSERT INTO topic_repo_locks(workspace,topic_id,acquired_at) VALUES(?1,?2,?3)",
-                    params![workspace, topic_id, now()],
-                )
-                .context("workspace already has an active topic workflow")?;
+            topic.workspace.context("approved topic has no workspace")?;
             st.conn.execute(
                 "UPDATE topics SET status='running',updated_at=?2 WHERE id=?1",
                 params![topic_id, now()],
@@ -693,11 +761,11 @@ impl Store {
         self.transaction(|st| {
             let topic = topic_row(st, topic_id)?.context("topic not found")?;
             if !matches!(topic.status.as_str(),"running"|"needs_user") { bail!("topic must be running to launch an attempt"); }
-            let (status, count, active): (String, u32, Option<String>) = st.conn.query_row(
+            let (status, _count, active): (String, u32, Option<String>) = st.conn.query_row(
                 "SELECT status,attempt_count,active_attempt_id FROM topic_features WHERE topic_id=?1 AND id=?2",
                 params![topic_id,feature_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             if !matches!(status.as_str(),"pending"|"needs_user") || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
-            if count >= 12 { bail!("work item reached the 12-attempt limit"); }
+            if st.topic_step_limit(topic_id,feature_id,step_title)?.is_some(){bail!("topic step limit reached");}
             let id = uuid::Uuid::new_v4().to_string();
             let session = st.create_session(Some(format!("{}: {}", harness_label(harness), step_title.trim())))?;
             let outputs_dir = st.artifact_root.as_ref().and_then(|root|root.parent())
@@ -765,6 +833,13 @@ impl Store {
             let attempt=st.authenticate_topic_attempt(id,token)?;
             let mut outputs=outputs.to_vec();
             for artifact in &mut outputs {
+                if let TopicArtifact::Directory{path}=artifact{
+                    let root:Option<String>=st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1",[id],|row|row.get(0))?;
+                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
+                    let directory=if Path::new(path).is_absolute(){PathBuf::from(&*path)}else{root.join(&*path)}.canonicalize()?;
+                    if !directory.starts_with(&root)||!directory.is_dir(){bail!("directory output must be inside this attempt's private outputs directory");}
+                    *path=directory.to_string_lossy().into_owned();
+                }
                 if let TopicArtifact::File {path,sha256} = artifact {
                     let root: Option<String> = st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1", [id], |r|r.get(0))?;
                     let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
@@ -900,7 +975,11 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
             [id],
             |r| r.get::<_, String>(0),
         )?)?,
-        limits: Default::default(),
+        limits: serde_json::from_str(&st.conn.query_row(
+            "SELECT limits FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
         allow_external_context: st.conn.query_row(
             "SELECT allow_external_context FROM topics WHERE id=?1",
             [id],

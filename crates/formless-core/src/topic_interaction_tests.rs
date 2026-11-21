@@ -92,6 +92,75 @@ async fn next_event(
     .expect("expected event")
 }
 
+#[test]
+fn topic_directory_reports_are_private_and_reject_files_and_escaping_links() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let outputs = f
+        .fixture
+        .paths
+        .data_dir
+        .join("topic-attempts")
+        .join(&f.attempt.id)
+        .join("outputs");
+    let outside = f.fixture.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outputs.join("file"), "not a directory").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, outputs.join("escape")).unwrap();
+    for path in [outside.to_string_lossy().into_owned(), "file".into()] {
+        assert!(f
+            .daemon()
+            .with_store(|st| st.report_topic_result(
+                &f.attempt.id,
+                &f.token,
+                TopicAttemptStatus::Succeeded,
+                "invalid",
+                &[TopicArtifact::Directory { path }]
+            ))
+            .is_err());
+    }
+    #[cfg(unix)]
+    assert!(f
+        .daemon()
+        .with_store(|st| st.report_topic_result(
+            &f.attempt.id,
+            &f.token,
+            TopicAttemptStatus::Succeeded,
+            "invalid",
+            &[TopicArtifact::Directory {
+                path: "escape".into()
+            }]
+        ))
+        .is_err());
+    std::fs::create_dir(outputs.join("empty")).unwrap();
+    let result = f
+        .daemon()
+        .with_store(|st| {
+            st.report_topic_result(
+                &f.attempt.id,
+                &f.token,
+                TopicAttemptStatus::Succeeded,
+                "valid",
+                &[TopicArtifact::Directory {
+                    path: "empty".into(),
+                }],
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        result.outputs,
+        vec![TopicArtifact::Directory {
+            path: outputs
+                .join("empty")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }]
+    );
+}
+
 fn permission(always: bool) -> HarnessPermissionRequest {
     HarnessPermissionRequest {
         title: "Read invoices".into(),

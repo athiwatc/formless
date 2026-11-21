@@ -3,12 +3,18 @@ use super::*;
 use crate::local_harness::HarnessUpdate;
 use axum::response::IntoResponse;
 use std::os::unix::fs::PermissionsExt;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,socket,pathlib,subprocess,hashlib,time
+if '--version' in sys.argv:print('fixture 1.0');sys.exit()
+if sys.argv[1:]==['auth','status']:print(json.dumps({} if os.environ.get('TOPIC_FIXTURE_AUTH_UNKNOWN') else {'loggedIn':True}));sys.exit()
+if sys.argv[1:]==['login','status']:print('Logged in');sys.exit()
 mode=os.environ.get('TOPIC_FIXTURE_MODE','git')
 if mode=='hold':
     pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
@@ -49,14 +55,47 @@ if mode=='scratch':
         target.write_text('1,2\n')
         outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()},{'kind':'text','title':'Input','content':'ledger input'}]
     rpc({'operation':'report_result','status':'succeeded','summary':'ledger step','outputs':outputs})
+if mode in ('directory','directory_read','directory_merge'):
+    prompt=sys.argv[-1];inputs=json.loads(prompt.split('Inputs: ',1)[1].split('\n',1)[0])
+    if mode=='directory_merge':
+        assert len(inputs)==2
+        for item in inputs:
+            assert item['kind']=='directory'
+            assert list(pathlib.Path(item['path']).glob('result-*.txt'))
+        pathlib.Path('combined.txt').write_text(json.dumps(inputs))
+    else:
+        assert pathlib.Path('seed.txt').exists()
+        pathlib.Path('result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt').write_text(os.getcwd())
+        if pathlib.Path('internal-link').exists():pathlib.Path('internal-link').write_text('private copy')
+if mode=='directory':
+    gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
+    gate.with_suffix('.ready').write_text(str(os.getpid()))
+    while not gate.with_suffix('.go').exists():time.sleep(.01)
 codex='exec' in sys.argv[1:3]
+if mode=='substitute_model':
+    expected=os.environ['TOPIC_FIXTURE_EXPECT_MODEL']
+    if expected:assert sys.argv[sys.argv.index('--model')+1]==expected
+    else:assert '--model' not in sys.argv
 readonly=('plan' in sys.argv or 'read-only' in sys.argv)
-if mode=='git':
+if mode in ('git','git_isolated','git_merge'):
     def git(*args):return subprocess.check_output(['git',*args],stderr=subprocess.STDOUT,text=True).strip()
     if not readonly:
-        pathlib.Path('result.txt').write_text('fixture change')
-        git('add','result.txt');git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','fixture result')
+        if mode=='git_merge':
+            prompt=sys.argv[-1];inputs=json.loads(prompt.split('Inputs: ',1)[1].split('\n',1)[0])
+            trees=json.loads(prompt.split('Git input worktrees: ',1)[1].split('\n',1)[0])
+            assert len(inputs)==len(trees)==2
+            assert git('rev-parse','HEAD')==inputs[0]['revision']
+            for item,tree in zip(inputs,trees):assert git('-C',tree['path'],'rev-parse','HEAD')==item['revision']
+            git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','merge','--no-edit',inputs[1]['revision'])
+        else:
+            filename='result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt' if mode=='git_isolated' else 'result.txt'
+            pathlib.Path(filename).write_text('fixture change')
+            git('add',filename);git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','fixture result')
     result=git('rev-parse','HEAD')
+    if mode=='git_isolated':
+        gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
+        gate.with_suffix('.ready').write_text(str(os.getpid()))
+        while not gate.with_suffix('.go').exists():time.sleep(.01)
 else:result='fixture complete'
 if codex:
     for event in [{'type':'thread.started','thread_id':'fixture-codex'},{'type':'item.completed','item':{'type':'agent_message','text':result}},{'type':'turn.completed'}]:print(json.dumps(event))
@@ -116,6 +155,45 @@ fn step(
     inputs: &[TopicArtifact],
 ) -> Value {
     json!({"feature_id":feature,"title":"Fixture step","instructions":"Perform exactly this step; never merge or push","harness":harness,"access":access,"inputs":inputs})
+}
+fn attempt_workspace(f: &Fixture, id: &str) -> PathBuf {
+    f.daemon()
+        .with_reader(|st| {
+            let attempt = st.get_topic_attempt(id)?.unwrap();
+            Ok(PathBuf::from(
+                st.get_session(&attempt.conversation_session_id)?
+                    .unwrap()
+                    .cwd
+                    .unwrap(),
+            ))
+        })
+        .unwrap()
+}
+fn git(path: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+async fn finish_attempt(f: &Fixture, session: &str, id: &str) -> Value {
+    let result = f
+        .daemon()
+        .wait_topic_steps(
+            session,
+            &json!({"attempt_ids":[id]}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["event"], "completed", "{result}");
+    assert_eq!(result["status"], "succeeded", "{result}");
+    result
 }
 async fn settled(f: &Fixture, session: &str) {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -182,6 +260,16 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     .unwrap();
     assert_eq!(message.role, "user");
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
+    assert!(message
+        .content
+        .contains("Inputs are exact artifact references from any finalized output in this topic."));
+    assert!(message
+        .content
+        .contains("Combine inputs only when intended, in an isolated step."));
+    assert!(message
+        .content
+        .contains("Never push or modify the source workspace or its branch."));
+    assert!(!message.content.contains("selected feature's outputs"));
     let session = topic.topic_session_id.clone().unwrap();
     let wire = f
         .daemon()
@@ -962,6 +1050,455 @@ async fn topic_wait_returns_old_attempt_while_newer_attempt_of_same_feature_runs
         second
     );
 }
+
+#[tokio::test]
+async fn topic_limits_refuse_fourth_retry_require_user_and_allow_explicit_increase() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            f.daemon()
+                .run_topic_step_until_done(&session, &args, &cancel)
+                .await
+                .unwrap()["status"],
+            "succeeded"
+        );
+    }
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Limit reached"));
+    let snapshot = state(&f, &topic.id);
+    assert_eq!(snapshot.attempts.len(), 4);
+    assert_eq!(snapshot.status, TopicStatus::NeedsUser);
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(question["event"], "question");
+    assert_eq!(question["user_only"], true);
+    let id = question["question_id"].as_str().unwrap().to_owned();
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":id,"answers":[{"selected":["Raise limit and continue"]}],"basis":"made up"})).unwrap_err().to_string().contains("user_only"));
+    assert!(f
+        .daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id.clone(),
+            answer: "invalid".into(),
+            answers: vec![]
+        })
+        .await
+        .is_err());
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id,
+            answer: "Raise limit and continue".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).limits.max_retries_per_step, 6);
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Running);
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 5,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .is_err());
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: question["question_id"].as_str().unwrap().into(),
+            answer: "Stop".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 6,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert!(f
+        .daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: "missing".into(),
+            limits: TopicLimits::default()
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_readiness_rejects_missing_harness_and_user_can_approve_one_step_substitute() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    let topic = topic(&f, None, false);
+    let session = topic.topic_session_id.clone().unwrap();
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not ready"));
+    assert!(state(&f, &topic.id).attempts.is_empty());
+    let values = f.daemon().handle(Request::ListHarnesses).await.unwrap();
+    assert_eq!(values.as_array().unwrap().len(), 6);
+    assert!(!values
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["kind"] == "acp"));
+    assert_eq!(values[0]["installed"], false);
+    assert_eq!(values[1]["installed"], true);
+    let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"Claude is unavailable"});
+    let daemon = f.daemon().clone();
+    let s = session.clone();
+    let c = cancel.clone();
+    let waiting = tokio::spawn(async move {
+        daemon
+            .request_topic_harness_substitute(&s, &request, &c)
+            .await
+    });
+    wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(question["user_only"], true);
+    let id = question["question_id"].as_str().unwrap().to_owned();
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":id,"answers":[{"selected":["Use Codex"]}],"basis":"No human approved this"})).is_err());
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id,
+            answer: "Use Codex".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.await.unwrap().unwrap()["answer"], "Use Codex");
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert_eq!(state(&f, &topic.id).attempts[0].harness, HarnessKind::Codex);
+    assert!(f.daemon().topic_substitutes.locked().is_empty());
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topic_substitute_retry_skip_cancel_and_invalid_requests_do_not_authorize_launch() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let request = json!({"feature_id":topic.features[0].id,"step_title":"step","wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"unavailable"});
+    let mut invalid = request.clone();
+    invalid["reason"] = json!("");
+    assert!(f
+        .daemon()
+        .request_topic_harness_substitute(&session, &invalid, &CancellationToken::new())
+        .await
+        .is_err());
+    invalid = request.clone();
+    invalid["substitute"] = invalid["wanted"].clone();
+    assert!(f
+        .daemon()
+        .request_topic_harness_substitute(&session, &invalid, &CancellationToken::new())
+        .await
+        .is_err());
+    for answer in [Some("Sign in and retry"), Some("Skip step"), None] {
+        let daemon = f.daemon().clone();
+        let s = session.clone();
+        let args = request.clone();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let waiting =
+            tokio::spawn(
+                async move { daemon.request_topic_harness_substitute(&s, &args, &c).await },
+            );
+        wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+        let id = f
+            .daemon()
+            .topic_decisions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        if let Some(answer) = answer {
+            f.daemon()
+                .handle(Request::AnswerQuestion {
+                    question_id: id,
+                    answer: answer.into(),
+                    answers: vec![],
+                })
+                .await
+                .unwrap();
+            assert_eq!(waiting.await.unwrap().unwrap()["answer"], answer);
+        } else {
+            cancel.cancel();
+            assert!(waiting.await.unwrap().is_err());
+        }
+        assert!(f.daemon().topic_decisions.locked().is_empty());
+        assert!(f.daemon().topic_substitutes.locked().is_empty());
+    }
+    assert!(state(&f, &topic.id).attempts.is_empty());
+}
+
+#[tokio::test]
+async fn topic_substitute_clears_original_model_or_uses_the_suggested_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "substitute_model");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    args["model"] = json!("claude-source-model");
+    for expected in [None, Some("codex-selected-model")] {
+        env.set("TOPIC_FIXTURE_EXPECT_MODEL", expected.unwrap_or(""));
+        let mut suggestion = json!({"harness":"codex"});
+        if let Some(model) = expected {
+            suggestion["model"] = json!(model);
+        }
+        let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":suggestion,"reason":"Use an available harness"});
+        let daemon = f.daemon().clone();
+        let session = session.clone();
+        let c = cancel.clone();
+        let waiting = tokio::spawn(async move {
+            daemon
+                .request_topic_harness_substitute(&session, &request, &c)
+                .await
+        });
+        wait_until(|| !f.daemon().topic_decisions.locked().is_empty()).await;
+        let id = f
+            .daemon()
+            .topic_decisions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id: id,
+                answer: "Use Codex".into(),
+                answers: vec![],
+            })
+            .await
+            .unwrap();
+        waiting.await.unwrap().unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(topic.topic_session_id.as_ref().unwrap(), &args, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "succeeded", "{result}");
+        assert_eq!(result["model"], json!(expected));
+        assert_eq!(result["harness"], "codex");
+        assert!(result["acp_agent"].is_null());
+        assert!(f.daemon().topic_substitutes.locked().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn topic_unknown_auth_is_ready() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    env.set("TOPIC_FIXTURE_AUTH_UNKNOWN", "1");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    assert_eq!(
+        crate::local_harness::harness_availability(HarnessKind::Claude, None)
+            .await
+            .signed_in,
+        None
+    );
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[]
+                ),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+}
+
+#[tokio::test]
+async fn topic_terminal_failure_closes_limit_question_and_does_not_block_idle() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| {
+            st.claim_topic_workflow(&topic.id)?;
+            st.set_topic_limits(
+                &topic.id,
+                &TopicLimits {
+                    max_retries_per_step: 0,
+                    max_attempts_per_topic: 0,
+                },
+            )
+        })
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(
+            session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[]
+            ),
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+    assert_eq!(f.daemon().topic_decisions.locked().len(), 1);
+    assert!(f.daemon().topic_work_in_flight());
+    let id = f
+        .daemon()
+        .topic_decisions
+        .locked()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let (tx, mut rx) = mpsc::channel(64);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 981,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    f.daemon()
+        .finish_topic_feature_tool(
+            session,
+            &json!({"feature_id":topic.features[0].id,"reason":"User is stopping this feature"}),
+            false,
+        )
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+    assert!(f.daemon().topic_decisions.locked().is_empty());
+    assert!(!f.daemon().topic_work_in_flight());
+    assert!(!f
+        .daemon()
+        .pending_attention
+        .locked()
+        .iter()
+        .any(|event| matches!(event,Event::UserQuestion{question_id,..} if question_id==&id)));
+    let mut closed = false;
+    while let Ok(message) = rx.try_recv() {
+        if matches!(message,ServerMessage::Event(Event::UserQuestionClosed{question_id,answered_by:None}) if question_id==id)
+        {
+            closed = true;
+        }
+    }
+    assert!(closed);
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -987,6 +1524,373 @@ fn repository(f: &Fixture) -> PathBuf {
             .success());
     }
     repo
+}
+
+#[tokio::test]
+async fn topic_directory_writes_are_isolated_and_merge_receives_both_copies() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "directory");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let source = f.root.join("source directory");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("seed.txt"), "source stays unchanged").unwrap();
+    std::os::unix::fs::symlink("seed.txt", source.join("internal-link")).unwrap();
+    let topic = topic(&f, Some(source.clone()), true);
+    assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
+    std::fs::create_dir(source.join(".git")).unwrap();
+    std::fs::write(source.join(".git").join("not-a-repo"), "skip").unwrap();
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+    let mut ids = Vec::new();
+    for feature in &topic.features {
+        let started = f
+            .daemon()
+            .run_topic_step(
+                session,
+                &step(&feature.id, HarnessKind::Claude, StepAccess::Write, &[]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        ids.push(started["attempt_id"].as_str().unwrap().to_owned());
+    }
+    wait_until(|| {
+        ids.iter()
+            .all(|id| f.root.join(format!("{id}.ready")).exists())
+    })
+    .await;
+    let a = attempt_workspace(&f, &ids[0]);
+    let b = attempt_workspace(&f, &ids[1]);
+    assert_ne!(a, b);
+    for workspace in [&a, &b] {
+        assert!(!workspace.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("internal-link")).unwrap(),
+            "private copy"
+        );
+        assert!(workspace
+            .join("internal-link")
+            .canonicalize()
+            .unwrap()
+            .starts_with(workspace));
+    }
+    assert_eq!(
+        std::fs::read_to_string(source.join("seed.txt")).unwrap(),
+        "source stays unchanged"
+    );
+    for id in &ids {
+        std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+    }
+    for id in &ids {
+        finish_attempt(&f, session, id).await;
+    }
+    let state = state(&f, &topic.id);
+    let inputs: Vec<_> = state
+        .features
+        .iter()
+        .map(|feature| {
+            feature
+                .outputs
+                .iter()
+                .find(|artifact| matches!(artifact, TopicArtifact::Directory { .. }))
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    env.set("TOPIC_FIXTURE_MODE", "directory_merge");
+    let mut merge = step(
+        &topic.features[0].id,
+        HarnessKind::Codex,
+        StepAccess::Write,
+        &inputs,
+    );
+    merge["title"] = json!("Combine independent copies");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(session, &merge, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let workspace = attempt_workspace(&f, result["id"].as_str().unwrap());
+    let received: Value =
+        serde_json::from_str(&std::fs::read_to_string(workspace.join("combined.txt")).unwrap())
+            .unwrap();
+    assert_eq!(received.as_array().unwrap().len(), 2);
+    assert_ne!(received[0]["path"], received[1]["path"]);
+    for item in received.as_array().unwrap() {
+        assert!(Path::new(item["path"].as_str().unwrap()).starts_with(workspace.parent().unwrap()));
+    }
+    assert_eq!(
+        std::fs::read_to_string(source.join("seed.txt")).unwrap(),
+        "source stays unchanged"
+    );
+    assert_eq!(std::fs::read_dir(&source).unwrap().count(), 3);
+}
+
+#[tokio::test]
+async fn topic_directory_read_only_empty_and_symlink_escape_cases() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "directory_read");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let source = f.root.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("seed.txt"), "original").unwrap();
+    let read = topic(&f, Some(source.clone()), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&read.id))
+        .unwrap();
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            read.topic_session_id.as_ref().unwrap(),
+            &step(
+                &read.features[0].id,
+                HarnessKind::Codex,
+                StepAccess::ReadOnly,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert!(
+        std::fs::read_dir(attempt_workspace(&f, result["id"].as_str().unwrap()))
+            .unwrap()
+            .count()
+            > 1
+    );
+    assert_eq!(std::fs::read_dir(&source).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(source.join("seed.txt")).unwrap(),
+        "original"
+    );
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let empty = f.root.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let empty = topic(&f, Some(empty), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&empty.id))
+        .unwrap();
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            empty.topic_session_id.as_ref().unwrap(),
+            &step(
+                &empty.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["outputs"][0]["kind"], "directory");
+    let outside = f.root.join("outside.txt");
+    std::fs::write(&outside, "not copied").unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("escape")).unwrap();
+    let bad = topic(&f, Some(source.clone()), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&bad.id))
+        .unwrap();
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            bad.topic_session_id.as_ref().unwrap(),
+            &step(
+                &bad.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "failed");
+    assert!(result["summary"]
+        .as_str()
+        .unwrap()
+        .contains("symlink escapes"));
+    assert!(std::fs::symlink_metadata(
+        attempt_workspace(&f, result["id"].as_str().unwrap()).join("escape")
+    )
+    .is_err());
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "not copied");
+}
+
+#[tokio::test]
+async fn topic_directory_preserves_dangling_internal_links_and_rejects_lexical_escapes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    for (name, relative, accepted) in [
+        ("internal", Some("../build/./generated.txt"), true),
+        ("escape", Some("../../missing/generated.txt"), false),
+        ("absolute", None, false),
+    ] {
+        let source = f.root.join(name);
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(source.join("links")).unwrap();
+        let link = relative
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source.join("missing/generated.txt"));
+        std::os::unix::fs::symlink(&link, source.join("links/pending")).unwrap();
+        let topic = topic(&f, Some(source.clone()), false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let copied = attempt_workspace(&f, result["id"].as_str().unwrap()).join("links/pending");
+        if accepted {
+            assert_eq!(result["status"], "succeeded", "{result}");
+            assert!(std::fs::symlink_metadata(&copied)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_link(&copied).unwrap().as_os_str(),
+                link.as_os_str()
+            );
+            assert!(!copied.exists());
+        } else {
+            assert_eq!(result["status"], "failed", "{result}");
+            assert!(result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("symlink escapes"));
+            assert!(std::fs::symlink_metadata(&copied).is_err());
+        }
+        assert_eq!(
+            std::fs::read_link(source.join("links/pending"))
+                .unwrap()
+                .as_os_str(),
+            link.as_os_str()
+        );
+        assert!(!source.join("links/pending").exists());
+    }
+}
+
+#[tokio::test]
+async fn topic_git_writes_have_distinct_branches_and_explicit_merge_gets_both_revisions() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "git_isolated");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let repo = repository(&f);
+    let original = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let branch = git(&repo, &["symbolic-ref", "HEAD"]).unwrap();
+    let topic = topic(&f, Some(repo.clone()), true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+    let mut ids = Vec::new();
+    for feature in &topic.features {
+        let started = f
+            .daemon()
+            .run_topic_step(
+                session,
+                &step(&feature.id, HarnessKind::Claude, StepAccess::Write, &[]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        ids.push(started["attempt_id"].as_str().unwrap().to_owned());
+    }
+    wait_until(|| {
+        ids.iter()
+            .all(|id| f.root.join(format!("{id}.ready")).exists())
+    })
+    .await;
+    assert_ne!(
+        attempt_workspace(&f, &ids[0]),
+        attempt_workspace(&f, &ids[1])
+    );
+    for id in &ids {
+        assert_eq!(
+            git(&attempt_workspace(&f, id), &["branch", "--show-current"]).unwrap(),
+            format!("formless/topic/{}/{id}", topic.id)
+        );
+        std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+    }
+    for id in &ids {
+        finish_attempt(&f, session, id).await;
+    }
+    let saved = state(&f, &topic.id);
+    let inputs: Vec<_> = saved
+        .features
+        .iter()
+        .map(|feature| {
+            feature
+                .outputs
+                .iter()
+                .find(|artifact| matches!(artifact, TopicArtifact::GitRevision { .. }))
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    assert_ne!(inputs[0], inputs[1]);
+    env.set("TOPIC_FIXTURE_MODE", "git_merge");
+    let mut merge = step(
+        &topic.features[0].id,
+        HarnessKind::Codex,
+        StepAccess::Write,
+        &inputs,
+    );
+    merge["title"] = json!("Combine exact revisions");
+    merge["instructions"] = json!(
+        "Merge both selected revisions in this private branch; never push or change the source."
+    );
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(session, &merge, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let merged = result["outputs"][0]["revision"].as_str().unwrap();
+    for input in inputs {
+        let TopicArtifact::GitRevision { revision } = input else {
+            unreachable!()
+        };
+        git(&repo, &["merge-base", "--is-ancestor", &revision, merged]).unwrap();
+    }
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap(), original);
+    assert_eq!(git(&repo, &["symbolic-ref", "HEAD"]).unwrap(), branch);
+    assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    for id in ids {
+        assert!(!attempt_workspace(&f, &id).exists());
+        assert!(git(
+            &repo,
+            &[
+                "rev-parse",
+                &format!("refs/heads/formless/topic/{}/{id}", topic.id)
+            ]
+        )
+        .is_ok());
+    }
 }
 
 #[tokio::test]
@@ -1240,6 +2144,8 @@ async fn topic_interrupt_run_stops_live_harness_and_releases_chat() {
 async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_are_step_failures() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
+    let executable = script(&f, &env);
+    env.set("FORMLESS_TOPIC_MUSE_EXE", executable);
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -1278,8 +2184,8 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
             &CancellationToken::new(),
         )
         .await
-        .unwrap();
-    assert_eq!(result["status"], "failed");
+        .unwrap_err();
+    assert!(result.to_string().contains("not ready"));
     assert_eq!(state(&f, &topic.id).status, TopicStatus::Running);
     assert_eq!(
         state(&f, &topic.id).features[0].status,

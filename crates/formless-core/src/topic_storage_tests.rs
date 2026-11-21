@@ -23,6 +23,104 @@ fn fixture() -> (Store, SessionInfo, MessageInfo, TopicProposalRequest) {
 }
 
 #[test]
+fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
+    let (store, _, _, request) = fixture();
+    let pending = store
+        .propose_topic(&request, WorkspaceKind::Directory, None)
+        .unwrap();
+    let topic = store.approve_topic(&pending.id).unwrap();
+    assert_eq!(topic.limits, formless_protocol::TopicLimits::default());
+    store.claim_topic_workflow(&topic.id).unwrap();
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: 0,
+                max_attempts_per_topic: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+            .unwrap(),
+        Some(true)
+    );
+    store
+        .set_topic_limits(&topic.id, &formless_protocol::TopicLimits::default())
+        .unwrap();
+    for n in 0..20 {
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                &format!("step {n}"),
+                StepAccess::ReadOnly,
+                HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                &"c".repeat(64),
+                Path::new("/topic/repo"),
+            )
+            .unwrap();
+        store
+            .finish_topic_step(
+                &attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "done",
+                &[],
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+            .unwrap(),
+        Some(true)
+    );
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: u32::MAX,
+                max_attempts_per_topic: u32::MAX,
+            },
+        )
+        .unwrap();
+    assert!(store
+        .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn topic_isolated_workflows_can_share_a_source_workspace() {
+    let (store, source, _, mut request) = fixture();
+    let first = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&first.id).unwrap();
+    let message = store
+        .append_message(&source.id, "user", "Independent work")
+        .unwrap();
+    request.message_ids = vec![message.id];
+    request.name = "Other work".into();
+    let second = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&second.id).unwrap();
+    store.claim_topic_workflow(&first.id).unwrap();
+    store.claim_topic_workflow(&second.id).unwrap();
+    store.cancel_topic(&first.id).unwrap();
+    assert_eq!(
+        store.get_topic(&second.id).unwrap().unwrap().status,
+        TopicStatus::Running
+    );
+}
+
+#[test]
 fn topic_main_identity_is_non_creating_and_persistent() {
     let store = Store::open_in_memory().unwrap();
     assert!(!store.is_main_chat("unknown").unwrap());
@@ -1019,6 +1117,15 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
         .unwrap();
     store.approve_topic(&topic.id).unwrap();
     store.claim_topic_workflow(&topic.id).unwrap();
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: 11,
+                max_attempts_per_topic: 12,
+            },
+        )
+        .unwrap();
     let token = "token".repeat(8);
     for count in 1..=12 {
         let attempt = store

@@ -7197,3 +7197,83 @@ The core rule-ineligible-kind denylist starts with trust_workspace: it always
 requires a fresh user decision, even with wildcard Reject rules or an earlier
 Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
 most 256 saved rules.
+
+SetTopicLimits is a user/client-only persisted control. Defaults allow three
+retries after the first attempt of a feature+trimmed step title, and twenty
+attempts across a topic. Both values accept the full u32 range; zero retries
+still allows the first attempt, while zero total attempts blocks all launches.
+Caps are checked atomically at launch, including concurrent launches. Hitting
+a cap refuses launch, marks the topic and feature NeedsUser, and raises a
+user_only question: "Raise limit and continue" or "Stop". Model answers are
+rejected. Raising increments the hit cap by its default (3 or 20, saturating)
+and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
+a model or harness automatically. SetTopicLimits itself changes limits only.
+
+ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
+10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
+detail "probe timed out". A harness is ready iff installed and signed_in is
+not Some(false): unknown auth is ready. Planning receives fresh availability,
+and each step refreshes its selected harness before launching. Claude uses
+--version and auth status; Codex uses --version and login status. Neither sends
+a model turn, and no auth output is copied into detail or logs.
+
+CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
+and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
+and Muse have dedicated dispatch arms that look up the executable and run
+--version in a private cwd under the probe deadline, with kill-on-drop and
+process-group cleanup. Their auth remains unknown, including version failures.
+Adapter owners can replace those fallbacks
+with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+probe initializes and creates a session with no MCP servers in a private
+temporary cwd, never prompts, maps configured auth errors, and kills its
+process group on success, failure or timeout.
+Adapter blocking probes must enforce their own internal deadline and kill
+child processes on drop: core's outer timeout cannot abort spawn_blocking.
+Core does not own the ACP agent registry and omits the bare ACP entry from
+ListHarnesses; the ACP adapter's registry supplies per-agent entries.
+The per-kind probe dispatch receives the selected acp_agent id, including
+for its current executable-only fallback. ACP is a protocol, not a CLI.
+
+topic_request_harness_substitute raises a user_only question with "Sign in and
+retry", "Use <substitute>", and "Skip step". Model answers are rejected.
+Only a user's Use answer records an approval for that topic, feature and
+trimmed step title; the next successful launch consumes it. A request to run
+the wanted harness then uses the explicitly approved substitute, which must
+itself be ready. Formless never substitutes without that approval. Other
+answers and cancellation record no approval and start no work.
+Only the suggestion's optional model and acp_agent are used for a substitute;
+an omitted model selects the substitute's default, never the original model.
+
+Terminal topic transitions close pending limit/substitute decisions with
+UserQuestionClosed answered_by=None. Finalizing one feature also closes its
+own decisions while leaving sibling work alone. Closed decisions no longer
+keep the daemon busy or leave stale user prompts.
+
+Every step owns a private attempt area. Git Write uses a worktree on
+formless/topic/<topic>/<attempt>, starting at the first selected GitRevision
+or otherwise its feature's latest revision/base. ReadOnly Git is detached.
+Every selected revision is also exposed through a detached input worktree
+whose path and exact revision are in the harness prompt. Cleanup removes
+worktrees on completion, failure and cancel; attempt branches retain commits.
+No operation changes the source checkout or moves the user's branch.
+
+Directory Write and ReadOnly steps recursively copy the source into their
+private workspace; a selected Directory input becomes the starting copy.
+Copies skip .git and reject special files, absolute symlink targets and
+targets escaping the source tree lexically. Relative internal links are
+preserved as-is, including dangling links. File data copying
+runs off the async executor and checks cancellation. The attempt area must
+be outside the source tree to avoid recursive/self-copying. Scratch steps
+get an empty private workspace. Directory Write automatically reports a
+Directory artifact pointing at its retained attempt workspace.
+
+Inputs may reference exact finalized artifacts from any feature of this
+topic. Every Directory input is copied to a distinct private input path;
+every File is copied and SHA-256 checked, and text inputs remain inline.
+Harness-reported directories must be inside that attempt's private outputs.
+Concurrent workflows and Write steps may share a source workspace because
+the old exclusive source-workspace lock is no longer acquired. Per-attempt
+leases/cancel tokens remain live through validation and are released on stop.
+Combining outputs is explicit work in a later isolated step, never an
+automatic merge or push into the source workspace.

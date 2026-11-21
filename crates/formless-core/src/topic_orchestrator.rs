@@ -6,9 +6,11 @@ use std::os::unix::{
     fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     process::CommandExt,
 };
+#[cfg(windows)]
+use std::os::windows::fs::FileTypeExt;
 use std::{
     ffi::OsString,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -77,6 +79,134 @@ fn private_file(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     options.mode(0o600);
     Ok(options.open(path)?)
+}
+
+fn copy_directory(source: &Path, destination: &Path, cancel: &CancellationToken) -> Result<()> {
+    let source = source.canonicalize()?;
+    if !source.is_dir() || destination.starts_with(&source) {
+        bail!("directory copy must be outside its source tree");
+    }
+    fn copy(
+        source: &Path,
+        target: &Path,
+        source_root: &Path,
+        target_root: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if cancel.is_cancelled() {
+            bail!("directory copy cancelled");
+        }
+        for entry in std::fs::read_dir(source)? {
+            if cancel.is_cancelled() {
+                bail!("directory copy cancelled");
+            }
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            let target = target.join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                let link = std::fs::read_link(&path)?;
+                let mut resolved = path
+                    .parent()
+                    .context("missing source parent")?
+                    .to_path_buf();
+                for component in link.components() {
+                    match component {
+                        std::path::Component::Normal(part) => resolved.push(part),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir => {
+                            if !resolved.pop() {
+                                bail!("directory symlink escapes the source tree");
+                            }
+                        }
+                        std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                            bail!("directory symlink escapes the source tree: absolute targets are not allowed");
+                        }
+                    }
+                }
+                if !resolved.starts_with(source_root) {
+                    bail!("directory symlink escapes the source tree");
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&link, &target)?;
+                #[cfg(windows)]
+                if kind.is_symlink_dir() {
+                    std::os::windows::fs::symlink_dir(&link, &target)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&link, &target)?;
+                }
+            } else if kind.is_dir() {
+                private_dir(target_root, target.strip_prefix(target_root)?)?;
+                copy(&path, &target, source_root, target_root, cancel)?;
+            } else if kind.is_file() {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                let mut input = options.open(&path)?;
+                let metadata = input.metadata()?;
+                if !metadata.is_file() {
+                    bail!("directory copy encountered a non-regular file");
+                }
+                let mut output = private_file(&target)?;
+                let mut buffer = vec![0u8; 65536];
+                loop {
+                    if cancel.is_cancelled() {
+                        bail!("directory copy cancelled");
+                    }
+                    let size = input.read(&mut buffer)?;
+                    if size == 0 {
+                        break;
+                    }
+                    output.write_all(&buffer[..size])?;
+                }
+                std::fs::set_permissions(&target, metadata.permissions())?;
+            } else {
+                bail!("directory copy encountered a special file");
+            }
+        }
+        Ok(())
+    }
+    copy(&source, destination, &source, destination, cancel)
+}
+
+async fn copy_directory_async(
+    source: &Path,
+    destination: &Path,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let (source, destination, cancel) = (
+        source.to_path_buf(),
+        destination.to_path_buf(),
+        cancel.clone(),
+    );
+    tokio::task::spawn_blocking(move || copy_directory(&source, &destination, &cancel)).await?
+}
+
+fn git_input(repo: &Path, topic: &TopicInfo, revision: &str) -> Result<()> {
+    let pinned = git(
+        repo,
+        &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+    )?;
+    if pinned != revision {
+        bail!("Git input must be an exact full commit revision");
+    }
+    git(
+        repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            topic
+                .base_revision
+                .as_deref()
+                .context("missing base revision")?,
+            revision,
+        ],
+    )?;
+    Ok(())
 }
 
 fn read_log(path: &Path) -> Result<String> {
@@ -214,7 +344,9 @@ impl Daemon {
                                 attempt_id.as_ref().is_some_and(|id| ids.contains(id))
                             }) =>
                         {
-                            if !self.questions.locked().contains_key(&question_id) {
+                            if !self.questions.locked().contains_key(&question_id)
+                                && !self.topic_decisions.locked().contains_key(&question_id)
+                            {
                                 continue;
                             }
                             if !user_only || seen.insert(format!("question:{question_id}")) {
@@ -296,7 +428,7 @@ impl Daemon {
 
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never merge or push. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex; pi, opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from the selected feature's outputs. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex; pi, opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
         let start = async {
             let session = topic
                 .topic_session_id
@@ -305,6 +437,11 @@ impl Daemon {
             if self.runs.locked().contains_key(&session) {
                 bail!("Topic Chat already has an active model run");
             }
+            let availability=local_harness::list_harnesses().await;
+            if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
+            if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
+            if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
+            let kickoff=format!("{kickoff}\nFresh local harness availability (ready means installed && signed_in != false; unknown auth is ready):\n{}\nNever launch an unready harness. Ask the user through topic_request_harness_substitute to sign in and retry, approve a substitute for one feature+step, or skip. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
@@ -329,6 +466,7 @@ impl Daemon {
             self.with_store(|st| {
                 st.fail_topic_workflow(&topic_id, &format!("orchestrator start failed: {error:#}"))
             })?;
+            self.close_topic_interactions(&topic_id, None);
             self.broadcast(Event::TopicChanged { topic_id });
             return Err(error.context("could not start topic orchestrator"));
         }
@@ -419,6 +557,14 @@ impl Daemon {
         }
         let topic =
             self.with_store(|st| st.finish_topic_feature(session, feature, ready, detail))?;
+        if matches!(
+            topic.status,
+            TopicStatus::Complete | TopicStatus::Failed | TopicStatus::Cancelled
+        ) {
+            self.close_topic_interactions(&topic.id, None);
+        } else {
+            self.close_topic_decisions(&topic.id, Some(feature));
+        }
         self.broadcast(Event::TopicChanged {
             topic_id: topic.id.clone(),
         });
@@ -440,7 +586,7 @@ impl Daemon {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        let step: Step = serde_json::from_value(args.clone())?;
+        let mut step: Step = serde_json::from_value(args.clone())?;
         local_harness::validate_acp_agent(Some(step.harness), step.acp_agent.as_deref())?;
         if step.title.trim().is_empty() || step.instructions.trim().is_empty() {
             bail!("step title and instructions must not be blank");
@@ -456,12 +602,38 @@ impl Daemon {
             .iter()
             .find(|feature| feature.id == step.feature_id)
             .context("feature does not belong to this topic")?;
-        if step
-            .inputs
-            .iter()
-            .any(|input| !feature.outputs.contains(input))
-        {
-            bail!("inputs must be exact artifacts from this feature's outputs");
+        let substitute_key = (
+            topic.id.clone(),
+            feature.id.clone(),
+            step.title.trim().to_owned(),
+        );
+        let approved = {
+            let approvals = self.topic_substitutes.locked();
+            approvals
+                .get(&substitute_key)
+                .filter(|approval| {
+                    approval.wanted.harness == step.harness
+                        && approval.wanted.acp_agent == step.acp_agent
+                })
+                .cloned()
+        };
+        if let Some(approval) = &approved {
+            step.harness = approval.substitute.harness;
+            step.acp_agent = approval.substitute.acp_agent.clone();
+            step.model = approval.substitute.model.clone();
+        }
+        let availability =
+            local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;
+        if !availability.installed || availability.signed_in == Some(false) {
+            bail!("{:?} is not ready: {}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness,availability.detail.as_deref().unwrap_or("not signed in"));
+        }
+        if step.inputs.iter().any(|input| {
+            !topic
+                .features
+                .iter()
+                .any(|feature| feature.outputs.contains(input))
+        }) {
+            bail!("inputs must be exact artifacts from this topic's finalized feature outputs");
         }
         if cancel.is_cancelled() {
             bail!("step cancelled before preparation");
@@ -481,6 +653,13 @@ impl Daemon {
                     path: root.join("inputs").join(index.to_string()),
                     sha256: sha256.clone(),
                 },
+                TopicArtifact::Directory { .. } => TopicArtifact::Directory {
+                    path: root
+                        .join("inputs")
+                        .join(index.to_string())
+                        .to_string_lossy()
+                        .into_owned(),
+                },
                 other => other.clone(),
             })
             .collect();
@@ -491,8 +670,32 @@ impl Daemon {
         );
         let (attempt, lease) = {
             let _launch = self.topic_launch.locked();
+            if approved.is_some()
+                && self.topic_substitutes.locked().get(&substitute_key) != approved.as_ref()
+            {
+                bail!("substitute approval was already consumed; ask the user again");
+            }
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
+            }
+            if let Some(total) = self.with_store(|st| {
+                st.transaction(|st| {
+                    let hit = st.topic_step_limit(&topic.id, &feature.id, &step.title)?;
+                    if hit.is_some() {
+                        st.mark_topic_limit(&topic.id, &feature.id)?;
+                    }
+                    Ok(hit)
+                })
+            })? {
+                self.raise_topic_limit_question(&topic, &feature.id, total)?;
+                bail!(
+                    "Limit reached: {}; ask the user to raise the limit or stop",
+                    if total {
+                        "attempts per topic"
+                    } else {
+                        "retries for this feature and step title"
+                    }
+                );
             }
             let attempt = self.with_store(|st| {
                 st.begin_topic_attempt(
@@ -509,6 +712,7 @@ impl Daemon {
                 )
             })?;
             let key = (topic.id.clone(), attempt.id.clone());
+            self.topic_substitutes.locked().remove(&substitute_key);
             self.topic_steps
                 .locked()
                 .insert(key.clone(), step_cancel.clone());
@@ -681,6 +885,7 @@ impl Daemon {
         cancel: &CancellationToken,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
+        let mut extra_worktrees = Vec::new();
         let mut base = None;
         if topic.workspace_kind == WorkspaceKind::Git {
             let repo = topic
@@ -700,39 +905,18 @@ impl Daemon {
                 })
                 .or(topic.base_revision.as_deref())
                 .context("Git topic has no base revision")?;
-            let revision = if step.access == StepAccess::ReadOnly {
-                step.inputs
-                    .iter()
-                    .find_map(|artifact| {
-                        if let TopicArtifact::GitRevision { revision } = artifact {
-                            Some(revision.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(latest)
-            } else {
-                latest
-            };
-            let pinned = git(
-                repo,
-                &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
-            )?;
-            if pinned != revision {
-                bail!("Git input must be an exact full commit revision");
-            }
-            git(
-                repo,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    topic
-                        .base_revision
-                        .as_deref()
-                        .context("missing base revision")?,
-                    revision,
-                ],
-            )?;
+            let revision = step
+                .inputs
+                .iter()
+                .find_map(|artifact| {
+                    if let TopicArtifact::GitRevision { revision } = artifact {
+                        Some(revision.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(latest);
+            git_input(repo, topic, revision)?;
             let path = workspace.to_str().context("worktree path is not UTF-8")?;
             worktree = Some(Worktree {
                 repo: repo.clone(),
@@ -745,7 +929,7 @@ impl Daemon {
                         "worktree",
                         "add",
                         "-b",
-                        &format!("formless-topic-{}", attempt.id),
+                        &format!("formless/topic/{}/{}", topic.id, attempt.id),
                         path,
                         revision,
                     ],
@@ -756,14 +940,39 @@ impl Daemon {
             base = Some(revision.to_owned());
         } else {
             private_dir(root, Path::new("workspace"))?;
+            let source = step
+                .inputs
+                .iter()
+                .find_map(|input| {
+                    if let TopicArtifact::Directory { path } = input {
+                        Some(PathBuf::from(path))
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    (topic.workspace_kind == WorkspaceKind::Directory)
+                        .then(|| topic.workspace.clone())
+                        .flatten()
+                });
+            if let Some(source) = source {
+                if step.inputs.iter().any(|input|matches!(input,TopicArtifact::Directory{path} if Path::new(path)==source)){
+                    self.validate_topic_directory_input(&source)?;
+                }
+                copy_directory_async(&source, workspace, cancel).await?;
+            }
         }
-        if inputs
-            .iter()
-            .any(|input| matches!(input, TopicArtifact::File { .. }))
-        {
+        if inputs.iter().any(|input| {
+            matches!(
+                input,
+                TopicArtifact::File { .. }
+                    | TopicArtifact::Directory { .. }
+                    | TopicArtifact::GitRevision { .. }
+            )
+        }) {
             private_dir(root, Path::new("inputs"))?;
         }
-        for (source, target) in step.inputs.iter().zip(inputs) {
+        for (index, (source, target)) in step.inputs.iter().zip(inputs).enumerate() {
             if let (
                 TopicArtifact::File { path, sha256 },
                 TopicArtifact::File { path: target, .. },
@@ -776,6 +985,41 @@ impl Daemon {
                 permissions.set_readonly(true);
                 std::fs::set_permissions(target, permissions)?;
             }
+            if let (TopicArtifact::Directory { path }, TopicArtifact::Directory { path: target }) =
+                (source, target)
+            {
+                let source = self.validate_topic_directory_input(Path::new(path))?;
+                let destination =
+                    private_dir(root, &PathBuf::from("inputs").join(index.to_string()))?;
+                if Path::new(target) != destination {
+                    bail!("invalid directory input destination");
+                }
+                copy_directory_async(&source, &destination, cancel).await?;
+            }
+            if let TopicArtifact::GitRevision { revision } = source {
+                let repo = topic
+                    .workspace
+                    .as_ref()
+                    .filter(|_| topic.workspace_kind == WorkspaceKind::Git)
+                    .context("Git revision input requires a Git topic workspace")?;
+                git_input(repo, topic, revision)?;
+                let path = root.join("inputs").join(format!("git-{index}"));
+                let input_worktree = Worktree {
+                    repo: repo.clone(),
+                    path: path.clone(),
+                };
+                git(
+                    repo,
+                    &[
+                        "worktree",
+                        "add",
+                        "--detach",
+                        path.to_str().context("input worktree path is not UTF-8")?,
+                        revision,
+                    ],
+                )?;
+                extra_worktrees.push((revision.clone(), input_worktree));
+            }
         }
         let outputs_dir = self
             .paths
@@ -784,7 +1028,11 @@ impl Daemon {
             .join("topic-attempts")
             .join(&attempt.id)
             .join("outputs");
-        let prompt=format!("Topic: {}\nFeature {}: {}\nStep: {}\n{}\nAccess: {:?}\nInputs: {}\nWrite file outputs only to {} and report their SHA-256 via report_result. Text outputs can be reported directly. Never merge or push. For Git Write create a clean new commit; the daemon verifies HEAD. Use the scoped Formless MCP for questions, conversations and reporting outputs.\n",topic.name,feature.id,feature.request,step.title,step.instructions,step.access,serde_json::to_string(inputs)?,outputs_dir.display());
+        let git_inputs: Vec<_> = extra_worktrees
+            .iter()
+            .map(|(revision, tree)| json!({"revision":revision,"path":tree.path}))
+            .collect();
+        let prompt=format!("Topic: {}\nFeature {}: {}\nStep: {}\n{}\nAccess: {:?}\nInputs: {}\nGit input worktrees: {}\nWrite file outputs only to {} and report their SHA-256 via report_result. Text outputs can be reported directly. Never push or modify the source workspace or its branch. Combine inputs only in this private workspace when instructed. For Git Write create a clean new commit; the daemon verifies HEAD. Use the scoped Formless MCP for questions, conversations and reporting outputs.\n",topic.name,feature.id,feature.request,step.title,step.instructions,step.access,serde_json::to_string(inputs)?,serde_json::to_string(&git_inputs)?,outputs_dir.display());
         let message = self.with_store(|st| {
             st.append_message(&attempt.conversation_session_id, "user", &prompt)
         })?;
@@ -868,8 +1116,22 @@ impl Daemon {
             )?;
             outputs.push(TopicArtifact::GitRevision { revision });
         }
+        if step.access == StepAccess::Write && topic.workspace_kind == WorkspaceKind::Directory {
+            outputs.push(TopicArtifact::Directory {
+                path: workspace.to_string_lossy().into_owned(),
+            });
+        }
         drop(worktree);
         Ok((result, outputs))
+    }
+
+    fn validate_topic_directory_input(&self, path: &Path) -> Result<PathBuf> {
+        let path = path.canonicalize()?;
+        let private = self.paths.data_dir.canonicalize()?.join("topic-attempts");
+        if !path.starts_with(&private) || !path.is_dir() {
+            bail!("directory input must be a private topic attempt artifact");
+        }
+        Ok(path)
     }
 
     async fn launch_topic_adapter(
