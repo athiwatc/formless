@@ -140,6 +140,15 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
     environment
 }
 
+/// `agy acp` flags; review runs also get agy's terminal sandbox.
+pub(super) fn agent_args(request: &HarnessRequest) -> Vec<&'static str> {
+    let mut args = vec!["acp", "--disable-telemetry"];
+    if request.role == HarnessRole::Review {
+        args.push("--sandbox");
+    }
+    args
+}
+
 /// `agy acp` and every process it starts (MCP servers, tools); dropping it kills them all.
 struct AgentProcess(SupervisedProcess);
 
@@ -152,7 +161,7 @@ impl AgentProcess {
             .unwrap_or_else(|| PathBuf::from("agy"));
         let mut command = Command::new(&program);
         command
-            .args(["acp", "--disable-telemetry"])
+            .args(agent_args(request))
             .current_dir(&request.cwd)
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| {
@@ -1002,6 +1011,18 @@ mod tests {
             drive_cancellable(&[LIVE_INITIALIZE.into()], &mut RejectAll, &cancel, true);
         assert_eq!(result.unwrap_err().to_string(), CANCELLED);
         assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn review_runs_use_the_agy_sandbox() {
+        assert_eq!(
+            agent_args(&request(HarnessRole::Build)),
+            ["acp", "--disable-telemetry"]
+        );
+        assert_eq!(
+            agent_args(&request(HarnessRole::Review)),
+            ["acp", "--disable-telemetry", "--sandbox"]
+        );
     }
 
     #[test]
