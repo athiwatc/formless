@@ -503,6 +503,21 @@ fn context_provider_and_compaction_notices_are_live_and_selection_guarded(cx: &m
             .value()
             .unwrap()
             .contains("Checkpoint decisions"));
+        assert!(window.try_find("status-context").is_none());
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::LiveContext {
+                    owner: owner.clone(),
+                    result: Ok(ContextUsage {
+                        used: 50,
+                        limit: 100,
+                        measured: false,
+                    }),
+                },
+                window,
+                cx,
+            )
+        });
         let mut stale = owner.clone();
         stale.generation += 1;
         shell.update(cx, |s, cx| {
