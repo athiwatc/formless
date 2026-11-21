@@ -35,7 +35,8 @@ impl Fixture {
         keep: impl Fn(&LogEntry) -> bool,
     ) -> (String, log_output::OutputSummary) {
         let mut out = Vec::new();
-        let summary = log_output::history(&self.paths, n, &keep, &mut out).unwrap();
+        let summary =
+            log_output::history(&self.paths, n, &keep, log_output::Format::Text, &mut out).unwrap();
         (String::from_utf8(out).unwrap(), summary)
     }
 }
@@ -171,10 +172,14 @@ fn log_history_writer_failures_are_propagated_instead_of_hidden() {
     }
     let f = Fixture::new();
     std::fs::write(f.paths.log_file(), "2026-10-23T10:00:00Z INFO value\n").unwrap();
-    assert!(log_output::history(&f.paths, 0, &|_| true, &mut Broken)
-        .unwrap_err()
-        .to_string()
-        .contains("fixture output failed"));
+    for format in [log_output::Format::Text, log_output::Format::Jsonl] {
+        assert!(
+            log_output::history(&f.paths, 0, &|_| true, format, &mut Broken)
+                .unwrap_err()
+                .to_string()
+                .contains("fixture output failed")
+        );
+    }
 }
 
 #[test]

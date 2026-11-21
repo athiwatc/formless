@@ -41,8 +41,25 @@ hook=r'''
       $('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='chat';renderChrome();
       $('app').style.width=width+'px';
       const long='/workspace/'+('very_long_unbroken_path_'.repeat(35))+'file.txt';
-      S.plan=[{content:long,status:completed?'completed':'in_progress'},{content:'Ordinary sentence with normal wrapping opportunities.',status:'completed'}];
-      S.planState=mode==='collapsed'?null:{run_status:completed?'completed':'running',origin:'live'};
+      // Feed the same snapshot reducers as opening a Session. A forked
+      // checklist is detached from its Run and remains readable even when
+      // every item was completed; a completed current live plan is compact.
+      const copied=mode==="copied", legacy=mode==="legacy";
+      const id="plan-wrap-fixture", run="synthetic-run";
+      const snapshot={
+        running:!completed, pending_events:[],
+        latest_run:copied||legacy?null:{run_id:run,status:completed?"completed":"running"},
+        plan:[{content:long,status:completed?"completed":"in_progress"},
+              {content:"Ordinary sentence with normal wrapping opportunities.",status:"completed"}],
+        plan_state:legacy?null:{
+          run_id:copied?null:run, updated_at:"2026-11-02T01:00:00Z",
+          run_status:copied?null:(completed?"completed":"running"),
+          previous_task:copied, origin:copied?"copied":"live",
+        },
+      };
+      S.current=id;
+      applySessionLiveState(id,snapshot,[]);
+      restoreSessionRunState(id,snapshot,[]);
       renderPlan();return long;
     }
   };
@@ -51,13 +68,15 @@ hook=r'''
 def check(page):
     for width in [320,480,900]:
         page.set_viewport_size({'width':width,'height':1000})
-        for mode in ['running','completed','collapsed']:
+        for mode in ['running','copied','completed','legacy']:
             completed=mode!='running'
             original=page.evaluate('({width,mode})=>__fixture.setup(width,mode)',{'width':width,'mode':mode})
-            if mode=='collapsed':
-                assert page.locator('#plan li').count()==0, 'existing completed collapse retained'
-                assert 'Plan done' in page.locator('#plan').inner_text()
+            if mode in ['completed','legacy']:
+                assert page.locator('#plan li').count()==0, (width,mode,'completed plan is compact')
+                assert 'Plan done (2/2)' in page.locator('#plan').inner_text(), (width,mode)
                 continue
+            if mode=='copied':
+                assert 'previous task · copied' in page.locator('#plan').inner_text()
             item=page.locator('#plan li').first
             assert original in item.inner_text(), 'long text is unchanged'
             geometry=page.evaluate('''()=>{
@@ -66,5 +85,5 @@ def check(page):
             assert all(g['scroll']<=g['client']+1 for g in geometry.values()),(width,completed,geometry)
             assert page.locator('#plan li').nth(1).inner_text().endswith('Ordinary sentence with normal wrapping opportunities.')
             assert item.get_attribute('class')==('completed' if completed else 'in_progress')
-    print('PASS 320/480/900px expanded/running and collapsed/completed plans: no horizontal overflow, exact text/status')
+    print('PASS 320/480/900px running and copied lists wrap; current and legacy completed plans stay compact')
 run(Path(__file__).resolve().parent,hook,check,css=args.css)

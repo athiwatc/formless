@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline accounting fixtures; do not run any cleanup operation."""
+"""Offline accounting and package-tool fixtures in private temporary paths."""
 import os
 from pathlib import Path
 import subprocess
@@ -61,6 +61,41 @@ class Snapshot(unittest.TestCase):
             output = self.snapshot(target)
             self.assertEqual(output.count("storage checkout target:"), 1)
             self.assertNotIn("storage CARGO_TARGET_DIR:", output)
+
+    def test_package_tool_install_pins_both_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Cargo.toml").write_text("[workspace]\n")
+            (root / ".github/workflows").mkdir(parents=True)
+            for name in ["bin", "cargo-home", "runner-temp", "target"]:
+                (root / name).mkdir()
+            mock = root / "bin/cargo"
+            mock.write_text(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$@" > "$CARGO_TRACE"\n'
+                'printf "%s\\n" "$CARGO_TARGET_DIR" > "$CARGO_TARGET_TRACE"\n'
+                'test -d "$CARGO_TARGET_DIR"\n'
+            )
+            mock.chmod(0o700)
+            trace = root / "cargo-args"
+            target = root / "cargo-target"
+            env = {
+                **os.environ, "PATH": str(mock.parent) + os.pathsep + os.environ["PATH"],
+                "GITHUB_WORKSPACE": str(root), "RUNNER_TEMP": str(root / "runner-temp"),
+                "CARGO_HOME": str(root / "cargo-home"), "CARGO_TARGET_DIR": str(root / "target"),
+                "CARGO_TRACE": str(trace), "CARGO_TARGET_TRACE": str(target),
+            }
+            result = subprocess.run(
+                ["bash", str(SCRIPT), "install-package-tools"], cwd=root, env=env,
+                text=True, capture_output=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(trace.read_text().splitlines(),
+                             ["install", "cargo-deb@3.8.0", "cargo-generate-rpm@0.21.1", "--locked"])
+            temporary_target = Path(target.read_text().strip())
+            self.assertEqual(temporary_target.parent, root / "runner-temp")
+            self.assertFalse(temporary_target.exists())
+            self.assertTrue((root / "target").is_dir())
 
 
 if __name__ == "__main__":

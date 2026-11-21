@@ -39,6 +39,100 @@ fn paid_turn(st: &Store, session: &str, content: &str, cost: f64) -> String {
 }
 
 #[test]
+fn batched_request_coverage_matches_the_single_run_checks() {
+    let st = Store::open_in_memory().unwrap();
+    let session = st.create_session(None).unwrap().id;
+    let other = st.create_session(None).unwrap().id;
+    let complete = paid_turn(&st, &session, "complete", 1.0);
+    st.bump_run_steps(&complete).unwrap();
+    // A Run's coverage keys by Run ID, including non-main requests and
+    // records attached to a different Session in older or imported data.
+    usage(
+        &st,
+        &other,
+        &complete,
+        "alternate",
+        "tool-model",
+        "tool",
+        5,
+        Some(1.0),
+    );
+    let missing = paid_turn(&st, &session, "missing request", 1.0);
+    st.record_forecast_request(&missing, "run").unwrap();
+    let unobserved = paid_turn(&st, &session, "unobserved usage", 1.0);
+    st.ex(
+        "UPDATE run_usage SET usage_complete=0 WHERE run_id=?1",
+        [&unobserved],
+    )
+    .unwrap();
+    let too_many_steps = paid_turn(&st, &session, "missing main step", 1.0);
+    st.bump_run_steps(&too_many_steps).unwrap();
+    st.bump_run_steps(&too_many_steps).unwrap();
+    let no_usage = st.create_run(&session).unwrap();
+    let invalid_steps = paid_turn(&st, &session, "invalid steps", 1.0);
+    st.ex(
+        "UPDATE runs SET steps='unknown' WHERE id=?1",
+        [&invalid_steps],
+    )
+    .unwrap();
+
+    let checks = [
+        (complete, true),
+        (missing, false),
+        (unobserved, false),
+        (too_many_steps, false),
+        (no_usage, false),
+        (invalid_steps, true),
+    ];
+    assert!(st.forecast_usage_complete_for_runs(&[]).unwrap());
+    for (run, expected) in &checks {
+        assert_eq!(st.forecast_usage_complete(run).unwrap(), *expected);
+        assert_eq!(
+            st.forecast_usage_complete_for_runs(std::slice::from_ref(run))
+                .unwrap(),
+            *expected,
+        );
+    }
+    let batch = checks.map(|(run, _)| run);
+    assert!(!st.forecast_usage_complete_for_runs(&batch).unwrap());
+}
+
+#[test]
+fn comparison_checks_coverage_only_for_allocated_nonrunning_runs() {
+    let st = Store::open_in_memory().unwrap();
+    let parent = st.create_session(None).unwrap();
+    let shared = paid_turn(&st, &parent.id, "shared", 5.0);
+    let child = st.fork_session(&parent.id, None, None).unwrap().unwrap();
+    let owned = paid_turn(&st, &parent.id, "allocatable", 1.0);
+    let running = st.create_run(&parent.id).unwrap();
+    st.record_forecast_request(&running, "run").unwrap();
+    st.ex(
+        "UPDATE forecast_request_counts SET expected='invalid' WHERE run_id IN (?1, ?2)",
+        [&shared, &running],
+    )
+    .unwrap();
+    let partial = st
+        .compare_sessions(&parent.id, &child.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(partial.left.usage.requests, 1);
+    assert_eq!(partial.left.usage.unknown_runs, 0);
+    assert_eq!(partial.left.usage.priced_cost_subtotal, 1.0);
+    assert!(!partial.left.usage.usage_complete);
+    assert!(partial.right.usage.usage_complete);
+
+    // A decode error in an allocated Run is still returned even when the
+    // running Run has already made complete coverage impossible.
+    st.ex(
+        "UPDATE forecast_request_counts SET expected='invalid' WHERE run_id=?1",
+        [&owned],
+    )
+    .unwrap();
+    assert!(st
+        .compare_sessions(&parent.id, &child.id, &crate::Config::default())
+        .is_err());
+}
+
+#[test]
 fn related_comparison_diff_and_cost_exclude_shared_runs_and_copied_history() {
     let st = Store::open_in_memory().unwrap();
     let parent = st.create_session(Some("Parent".into())).unwrap();

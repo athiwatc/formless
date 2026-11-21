@@ -141,6 +141,27 @@ install_file() {
   }
 }
 
+# A source install renders the manual; an archive install supplies its file.
+install_man_page() (
+  man_dir="$PREFIX/share/man/man1"
+  man_page="$man_dir/formless.1"
+  mkdir -p "$man_dir" && [ ! -d "$man_page" ] || exit 1
+  man_tmp="$(mktemp "$man_dir/.formless-man.XXXXXX")" || exit 1
+  trap 'rm -f "$man_tmp"' EXIT
+  if [ "$#" -eq 0 ]; then
+    "$PREFIX/bin/formless" man > "$man_tmp" || exit 1
+  else
+    cat "$1" > "$man_tmp" || exit 1
+  fi
+  [ -s "$man_tmp" ] && chmod 644 "$man_tmp" && mv -f "$man_tmp" "$man_page"
+)
+
+install_optional_man_page() {
+  if ! install_man_page "$@" 2>/dev/null; then
+    echo "note: could not install the optional man page in $PREFIX/share/man/man1" >&2
+  fi
+}
+
 if [ "${FORMLESS_FROM_SOURCE:-0}" = "1" ]; then
   command -v cargo >/dev/null 2>&1 || die "cargo is required for a source install"
   here="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd || true)"
@@ -153,6 +174,7 @@ if [ "${FORMLESS_FROM_SOURCE:-0}" = "1" ]; then
     cargo install --git "$REPO" --locked --root "$PREFIX" formless-bin
   fi
   printf 'installed: %s/bin/formless\n' "$PREFIX"
+  install_optional_man_page
   install_completions
   install_guidance
   exit 0
@@ -214,12 +236,7 @@ fetch "$RELEASES/$version/$asset.sha256" "$tmp/$asset.sha256" || die "could not 
 tar -xzf "$tmp/$asset" -C "$tmp"
 install_file "$tmp/formless-$version-$target/formless" "$PREFIX/bin/formless" 755
 if [ -f "$tmp/formless-$version-$target/formless.1" ]; then
-  if mkdir -p "$PREFIX/share/man/man1" 2>/dev/null &&
-      (install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644) 2>/dev/null; then
-    :
-  else
-    echo "note: could not install the optional man page in $PREFIX/share/man/man1" >&2
-  fi
+  install_optional_man_page "$tmp/formless-$version-$target/formless.1"
 fi
 printf 'installed: %s/bin/formless (%s)\n' "$PREFIX" "$version"
 install_completions
