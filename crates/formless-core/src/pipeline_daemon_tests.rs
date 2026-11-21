@@ -266,7 +266,9 @@ fn schema_options() -> RunOptions {
 async fn pipeline_repairs_once_accounts_both_calls_and_keeps_system_out_of_session() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env).await;
-    f.queue(Reply::text("INVALID private candidate"));
+    f.queue(Reply::text(
+        r#"{"n":"INVALID private candidate private value"}"#,
+    ));
     f.queue(Reply::text(r#"{"n":2}"#));
     let (tx, mut delivered) = mpsc::channel(256);
     f.d().subs.locked().push(Subscriber {
@@ -299,6 +301,22 @@ async fn pipeline_repairs_once_accounts_both_calls_and_keeps_system_out_of_sessi
     let seen = f.seen.locked().clone();
     assert_eq!(seen[0]["stream"], true);
     assert_eq!(seen[1]["stream"], false);
+    let instruction = seen[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| {
+            message["content"]
+                .as_str()
+                .filter(|text| text.contains("validation_failure"))
+        })
+        .unwrap();
+    assert!(
+        instruction.contains("type at $/[property]"),
+        "{instruction}"
+    );
+    assert!(!instruction.contains("INVALID private candidate"));
+    assert!(!instruction.contains("private value"));
     assert!(
         seen[1]["tools"].as_array().is_none_or(Vec::is_empty),
         "repair has no executable Tools"

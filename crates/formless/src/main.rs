@@ -10,6 +10,7 @@ mod cli_models;
 mod cli_modules;
 mod cli_pipeline;
 mod cli_price_import;
+mod cli_prices;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
@@ -307,7 +308,7 @@ enum Cmd {
     },
     /// Model prices for spending limits and cost (provider.prices)
     #[command(
-        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run\n  formless prices list --provider default --json"
     )]
     Prices {
         #[command(subcommand)]
@@ -970,6 +971,15 @@ enum PricesAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show stored prices and configured model references without contacting the provider
+    List {
+        /// Show only this provider (use "default" for the default provider)
+        #[arg(long)]
+        provider: Option<String>,
+        /// One JSON value instead of tables
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -987,13 +997,13 @@ enum ProvidersAction {
         /// Provider API base URL; use --preset or Azure options instead when applicable
         #[arg(long, required_unless_present_any = ["preset", "azure_resource"])]
         base_url: Option<String>,
-        /// Azure OpenAI: the resource name (or its https://… endpoint)
+        /// Azure OpenAI resource name, host, or HTTPS endpoint
         #[arg(long, requires = "azure_deployment", conflicts_with_all = ["base_url", "preset"])]
         azure_resource: Option<String>,
         /// Azure OpenAI: the deployment name
         #[arg(long, requires = "azure_resource")]
         azure_deployment: Option<String>,
-        /// Azure OpenAI: the API version (default: the latest known)
+        /// Use the dated Azure deployment route with this API version (default: v1)
         #[arg(long, requires = "azure_resource")]
         api_version: Option<String>,
         /// Extra request header, `Key=Value` (repeatable)
@@ -2319,15 +2329,21 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 }
         )
     );
+    let read_only = matches!(
+        cli.cmd,
+        Some(Cmd::Prices {
+            action: PricesAction::List { .. }
+        })
+    );
     let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
-    let _operation = if destructive || serving {
+    let _operation = if destructive || serving || read_only {
         None
     } else {
         Some(formless_core::profile_lock::ProfileLock::hierarchy_shared(
             &paths,
         )?)
     };
-    let paths = if destructive {
+    let paths = if destructive || read_only {
         paths
     } else {
         Paths::resolve(cli.profile.as_deref())?
@@ -2433,7 +2449,16 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
-        Some(Cmd::Prices { action }) => prices_cmd(paths, action),
+        Some(Cmd::Prices { action }) => match action {
+            PricesAction::Import {
+                provider,
+                all,
+                dry_run,
+            } => prices_import_cmd(paths, provider, all, dry_run),
+            PricesAction::List { provider, json } => {
+                cli_prices::list(&paths, provider.as_deref(), json)
+            }
+        },
         Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
         Some(Cmd::Config { action }) => config_cmd(paths, action),
         Some(Cmd::Logs {
@@ -2745,18 +2770,23 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     }
 }
 
-pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
-    let core = tag
-        .trim()
-        .trim_start_matches('v')
-        .split(['-', '+'])
-        .next()?;
-    let mut parts = core.split('.');
-    Some((
-        parts.next()?.parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-        parts.next().unwrap_or("0").parse().ok()?,
-    ))
+pub fn parse_version(tag: &str) -> Option<semver::Version> {
+    let tag = tag.trim().trim_start_matches('v');
+    let (core, suffix) = tag.split_at(tag.find(['-', '+']).unwrap_or(tag.len()));
+    // Older tags may omit the minor or patch number.
+    let fill = match core.split('.').count() {
+        1 => ".0.0",
+        2 => ".0",
+        _ => "",
+    };
+    let mut version = if fill.is_empty() {
+        semver::Version::parse(tag).ok()?
+    } else {
+        semver::Version::parse(&format!("{core}{fill}{suffix}")).ok()?
+    };
+    // SemVer precedence ignores build metadata, including when sorting notes.
+    version.build = semver::BuildMetadata::EMPTY;
+    Some(version)
 }
 
 pub fn compare_versions(current: &str, latest_tag: &str) -> Option<std::cmp::Ordering> {
@@ -3059,7 +3089,10 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
                 || formless_core::service::install(&plan),
             )?;
             println!("installed: {} ({})", plan.file.display(), plan.manager);
-            println!("the daemon now starts at login and stays up, so jobs run on schedule");
+            println!("the daemon is configured to start at login and stay active while the user service manager is running");
+            if let Some(guidance) = formless_core::service::systemd_lingering_guidance(&plan) {
+                println!("{guidance}");
+            }
             println!("remove it: formless daemon uninstall-service");
             Ok(())
         }
@@ -3972,6 +4005,78 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn doctor_auto_routing(store: &formless_core::Store, cfg: &Config) -> Result<Vec<String>> {
+    let mut lines = vec![format!(
+        "routing:    auto, last {} days of eligible calls",
+        cfg.provider.routing_window_days
+    )];
+    for (task, complex) in [("simple", false), ("complex", true)] {
+        let Some(choice) =
+            store.routing_auto_choice(cfg, formless_core::config::DEFAULT_PROVIDER, complex)?
+        else {
+            lines.push(format!("            {task} task: no candidates"));
+            continue;
+        };
+        let reason = choice.explanation["reason"].as_str().unwrap_or_default();
+        lines.push(format!(
+            "            {task} task: {} ({reason})",
+            choice.model
+        ));
+        for row in choice.explanation["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let model = row["model"].as_str().unwrap_or_default();
+            let samples = row["samples"].as_u64().unwrap_or_default();
+            let rate = row["good_rate"]
+                .as_f64()
+                .map(|rate| format!(", {:.0}% successful", 100.0 * rate))
+                .unwrap_or_default();
+            let cost = row["usd_per_success"]
+                .as_f64()
+                .map(|usd| format!(", ${usd:.6} per success"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "              {model}: {samples} samples{rate}{cost}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_auto_routing_ignores_all_time_counters_and_matches_the_live_selector() {
+    let store = formless_core::Store::open_in_memory().unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.model = "auto".into();
+    cfg.provider.routing_models = vec!["configured-first".into(), "historical-fast".into()];
+    cfg.provider.routing_window_days = 7;
+    for _ in 0..20 {
+        store
+            .record_model_outcome("historical-fast", true, 5)
+            .unwrap();
+    }
+    let lines = doctor_auto_routing(&store, &cfg).unwrap().join("\n");
+    let choice = store
+        .routing_auto_choice(&cfg, formless_core::config::DEFAULT_PROVIDER, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(choice.model, "configured-first");
+    assert!(lines.contains("last 7 days of eligible calls"));
+    let reason = choice.explanation["reason"].as_str().unwrap();
+    assert!(
+        lines.contains(&format!("simple task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(
+        lines.contains(&format!("complex task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(lines.contains("historical-fast: 0 samples"), "{lines}");
+}
+
 fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     // `quiet`: only the problems (for --json and bug reports).
     macro_rules! say {
@@ -4217,28 +4322,14 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         cfg.provider.tool_mode,
         cfg.provider.fallback_models.join(", ")
     );
-    if formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
-        say!(
-            "routing:    auto over [{}]",
-            cfg.provider.routing_candidates().join(", ")
-        );
-        if let Ok(store) = Store::open(&paths.db_file()) {
-            if let Ok(stats) = store.list_model_stats() {
-                let picked = formless_core::routing::select_model(&cfg.provider, &stats, false);
-                say!(
-                    "            simple task now routes to: {}",
-                    picked.as_deref().unwrap_or("(no candidates)")
-                );
-                for st in &stats {
-                    say!(
-                        "            {}: ok={} fail={} total_ms={}",
-                        st.model,
-                        st.successes,
-                        st.failures,
-                        st.total_ms
-                    );
+    if !quiet && formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
+        match Store::open(&paths.db_file()).and_then(|store| doctor_auto_routing(&store, &cfg)) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
             }
+            Err(error) => println!("routing:    preview unavailable ({error:#})"),
         }
     }
     for provider in oauth_provider_statuses(&paths, &cfg) {
@@ -6457,10 +6548,19 @@ fn config_edit(paths: &Paths) -> Result<()> {
         Config::default().save(paths)?;
     }
     let draft = file.with_extension("toml.edit");
-    std::fs::copy(&file, &draft)?;
+    #[cfg(unix)]
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
+    #[cfg(not(unix))]
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "notepad".into());
+    #[cfg(not(unix))]
+    let mut editor_command = windows_config_editor(&editor, &draft)?;
+    std::fs::copy(&file, &draft)?;
     loop {
         // $EDITOR may carry arguments and quotes ("code --wait"): let the
         // shell read it, as git does.
@@ -6472,14 +6572,14 @@ fn config_edit(paths: &Paths) -> Result<()> {
             .arg(&draft)
             .status();
         #[cfg(not(unix))]
-        let status = {
-            let mut words = editor.split_whitespace();
-            std::process::Command::new(words.next().unwrap_or("notepad"))
-                .args(words)
-                .arg(&draft)
-                .status()
-        };
-        let status = status.with_context(|| format!("start editor '{editor}'"))?;
+        let status = editor_command.status();
+        let status = status.with_context(|| {
+            if cfg!(unix) {
+                format!("start editor '{editor}'")
+            } else {
+                format!("start editor '{editor}'. Put double quotes around an executable path containing spaces.")
+            }
+        })?;
         if !status.success() {
             let _ = std::fs::remove_file(&draft);
             anyhow::bail!("the editor exited with {status}; config.toml unchanged");
@@ -6521,6 +6621,44 @@ fn config_edit(paths: &Paths) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn windows_config_editor(editor: &str, draft: &std::path::Path) -> Result<std::process::Command> {
+    let mut command = formless_tui::windows_editor_command(editor)?;
+    command.arg(draft);
+    Ok(command)
+}
+
+#[cfg(test)]
+#[test]
+fn config_edit_windows_argument_parsing_preserves_literal_paths() {
+    use std::path::Path;
+
+    let draft = Path::new(r"C:\Profile Folder\config.toml.edit");
+    let quoted = windows_config_editor(
+        r#""C:\Program Files\Editor\edit.exe" --wait "--name=two words""#,
+        draft,
+    )
+    .unwrap();
+    assert_eq!(quoted.get_program(), r"C:\Program Files\Editor\edit.exe");
+    assert_eq!(
+        quoted.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("--wait"),
+            std::ffi::OsStr::new("--name=two words"),
+            draft.as_os_str(),
+        ]
+    );
+
+    let unquoted = r"C:\Program Files\Editor\edit.exe --wait";
+    let shared = formless_tui::windows_editor_command(unquoted).unwrap();
+    let config = windows_config_editor(unquoted, draft).unwrap();
+    assert_eq!(config.get_program(), shared.get_program());
+    assert!(config
+        .get_args()
+        .eq(shared.get_args().chain([draft.as_os_str()])));
+    assert!(windows_config_editor("\"unclosed", draft).is_err());
 }
 
 /// First-line tool output for the static human Session transcript.
@@ -6779,12 +6917,12 @@ fn set_archived(paths: &Paths, id: &str, archived: bool) -> Result<()> {
 
 /// `formless prices import` (#809): the endpoint's own prices, dated, so
 /// dollar limits can count the models in use.
-fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
-    let PricesAction::Import {
-        provider,
-        all,
-        dry_run,
-    } = action;
+fn prices_import_cmd(
+    paths: Paths,
+    provider: Option<String>,
+    all: bool,
+    dry_run: bool,
+) -> Result<()> {
     let live = Config::load(&paths)?;
     let pcfg = live.provider_cfg(provider.as_deref())?;
     let name = provider.clone().unwrap_or_else(|| "default".into());
@@ -6863,8 +7001,10 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
 }
 
 fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
-    formless_core::daemon::ensure_daemon(&paths)?;
-    let daemon = |req: Request| formless_tui::client::request_once(&paths, req);
+    let daemon = |req: Request| {
+        formless_core::daemon::ensure_daemon(&paths)?;
+        formless_tui::client::request_once(&paths, req)
+    };
     match action {
         ProvidersAction::List { json } => {
             let r = daemon(Request::ListProviders)?;
@@ -6916,17 +7056,33 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             let mut header_map = pairs(&headers, "--header")?;
             let mut query_map = pairs(&query, "--query")?;
             let mut key_header = key_header;
-            // Azure OpenAI: deployment URL, api-version and the api-key header.
+            let mut model = model;
             let azure_base = match (&azure_resource, &azure_deployment) {
-                (Some(r), Some(d)) => {
-                    let (base, q, header) =
-                        formless_core::presets::azure(r, d, api_version.as_deref())?;
-                    query_map.extend(q);
-                    key_header.get_or_insert(header.to_string());
+                (Some(resource), Some(deployment)) => {
+                    let (base, query, header) =
+                        formless_core::presets::azure(resource, deployment, api_version.as_deref())
+                            .map_err(|err| usage(err.to_string()))?;
+                    if api_version.is_none() {
+                        if model
+                            .as_deref()
+                            .is_some_and(|model| model != deployment.trim())
+                        {
+                            return Err(usage(
+                                "--model must match --azure-deployment with Azure v1",
+                            ));
+                        }
+                        if query_map.contains_key("api-version") {
+                            return Err(usage("use --api-version to select the dated Azure API"));
+                        }
+                    }
+                    query_map.extend(query);
+                    key_header.get_or_insert_with(|| header.to_owned());
+                    model.get_or_insert_with(|| deployment.trim().to_owned());
                     Some(base)
                 }
                 _ => None,
             };
+            let use_azure = azure_base.is_some();
             header_map.retain(|k, _| !k.is_empty());
             let preset = match preset.as_deref() {
                 Some(id) => Some(formless_core::presets::find(id).with_context(|| {
@@ -6977,7 +7133,7 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
                 model,
                 api_key,
                 headers: (!header_map.is_empty()).then_some(header_map),
-                query_params: (!query_map.is_empty()).then_some(query_map),
+                query_params: (use_azure || !query_map.is_empty()).then_some(query_map),
                 api_key_header: key_header,
             })?;
             println!("provider {name} saved; check it with `formless providers test {name}`");
@@ -10047,6 +10203,16 @@ mod tests {
         assert_eq!(tags, ["v0.2.0", "v0.3.0"]);
         assert_eq!(newer[1].1, "New: run --timeout");
         assert!(newer_releases(&releases, "0.3.0").is_empty());
+
+        let final_release = serde_json::json!([
+            {"tag_name": "v0.2.0-rc.2", "prerelease": true, "body": "rc", "html_url": "rc"},
+            {"tag_name": "v0.2.0", "body": "Final release", "html_url": "final"},
+        ]);
+        assert_eq!(
+            newer_releases(&final_release, "0.2.0-rc.1"),
+            [("v0.2.0".into(), "Final release".into(), "final".into())]
+        );
+        assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
     }
 
     #[test]
@@ -10267,11 +10433,27 @@ mod tests {
 
     #[test]
     fn version_comparison_handles_tags() {
-        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("0.1"), Some((0, 1, 0)));
+        assert_eq!(parse_version("v1.2.3"), Some(semver::Version::new(1, 2, 3)));
+        assert_eq!(parse_version("0.1"), Some(semver::Version::new(0, 1, 0)));
         assert_eq!(compare_versions("0.1.0", "v0.2.0"), Some(Ordering::Less));
         assert_eq!(compare_versions("1.0.0", "v1.0.0"), Some(Ordering::Equal));
         assert_eq!(compare_versions("2.0.0", "v1.9.9"), Some(Ordering::Greater));
+        assert_eq!(
+            compare_versions("0.2.0-rc.1", "v0.2.0"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0", "v0.2.0-rc.1"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_versions("0.2.0-rc.2", "v0.2.0-rc.10"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_versions("0.2.0+build.5", "v0.2.0"),
+            Some(Ordering::Equal)
+        );
         assert_eq!(parse_version("nope"), None);
     }
 }
