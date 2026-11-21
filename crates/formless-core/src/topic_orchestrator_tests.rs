@@ -965,7 +965,16 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "provider_error");
     let f = Fixture::new(&env);
-    let topic = topic(&f, None, false);
+    let repo = repository(&f);
+    let topic = topic(&f, Some(repo.clone()), false);
+    let (tx, mut events) = mpsc::channel(256);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 97,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
     let server = model(
         &f,
         &env,
@@ -982,7 +991,29 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
         .await
         .unwrap();
     settled(&f, topic.topic_session_id.as_ref().unwrap()).await;
-    assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+    let failed = state(&f, &topic.id);
+    assert_eq!(failed.status, TopicStatus::Failed);
+    assert_eq!(failed.features[0].status, TopicFeatureStatus::Failed);
+    let last = f
+        .daemon()
+        .with_reader(|st| st.last_run(topic.topic_session_id.as_ref().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.1, "paused");
+    let mut changed = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event,ServerMessage::Event(Event::TopicChanged{topic_id}) if topic_id==topic.id)
+        {
+            changed = true;
+        }
+    }
+    assert!(changed, "provider failure must publish TopicChanged");
+    let another = self::topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&another.id))
+        .unwrap();
+    f.daemon().cancel_topic_work(&another.id).unwrap();
+    server.abort();
     f.daemon()
         .handle(Request::RetryTopicFeature {
             retry: TopicFeatureRetryRequest {
@@ -992,8 +1023,32 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
         })
         .await
         .unwrap();
+    env.set("TOPIC_FIXTURE_MODE", "done");
+    let retry_server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Claude,
+        true,
+    )
+    .await;
     f.daemon()
-        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
         .unwrap();
-    server.abort();
+    settled(&f, topic.topic_session_id.as_ref().unwrap()).await;
+    let retried = state(&f, &topic.id);
+    assert_eq!(retried.status, TopicStatus::NeedsUser);
+    assert_eq!(retried.features[0].status, TopicFeatureStatus::Pending);
+    let next = f
+        .daemon()
+        .with_reader(|st| st.last_run(topic.topic_session_id.as_ref().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_ne!(next.0, last.0);
+    assert_eq!(next.1, "completed");
+    retry_server.abort();
 }
