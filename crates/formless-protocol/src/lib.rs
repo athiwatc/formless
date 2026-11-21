@@ -726,8 +726,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             base,
             "sh" | "bash"
                 | "zsh"
-                | "csh"
-                | "tcsh"
+                | "nu"
                 | "fish"
                 | "dash"
                 | "ksh"
@@ -735,6 +734,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "tcsh"
                 | "mksh"
                 | "ash"
+                | "busybox"
                 | "cmd"
                 | "powershell"
                 | "pwsh"
@@ -773,6 +773,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     | "luajit"
                     | "pypy"
                     | "tclsh"
+                    | "wish"
+                    | "expect"
             )
         {
             return Some("an interpreter or shell: it can run any program, like bare process");
@@ -824,7 +826,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "PARTITION_KEY"
         );
         // Preserve warnings for compact credential spellings as well.
-        let credential_key = !schema_role && k.split('_').any(|part| part == "KEY")
+        let credential_key = k.ends_with("_PWD")
+            || !schema_role && k.split('_').any(|part| part == "KEY")
             || [
                 "APIKEY",
                 "ACCESSKEY",
@@ -851,6 +854,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         .iter()
         .any(|w| k.contains(w))
             || credential_key
+            || matches!(k.as_str(), "DATABASE_URL" | "REDIS_URL" | "MONGODB_URI")
             || k.ends_with("_PAT");
         if secret {
             return Some("a secret from your environment");
@@ -3946,11 +3950,36 @@ mod tests {
     }
 
     #[test]
+    fn ash_and_busybox_use_the_shell_broad_grant_warning() {
+        let shell = broad_capability("process:dash").unwrap();
+        for spec in [
+            "process:ash",
+            "process:busybox",
+            "process:/bin/busybox",
+            "process:ash.exe",
+        ] {
+            assert_eq!(broad_capability(spec), Some(shell), "{spec}");
+        }
+        assert_eq!(broad_capability("process:ls"), None);
+        assert_eq!(broad_capability("process:busybox-helper"), None);
+    }
+
+    #[test]
     fn programs_that_run_others_are_flagged_broad() {
+        assert!(broad_capability("process:autoexpect").is_none());
+        assert!(broad_capability("process:unexpect").is_none());
         for spec in [
             "process:python3.11",
+            "process:wish",
+            "process:wish8.6",
+            "process:wish.exe",
+            "process:expect",
+            "process:expect5.45",
             "process:ruby3.2",
             "process:node20",
+            "process:nu",
+            "process:/usr/bin/nu",
+            "process:nu.exe",
             "process:git",
             "process:git:status|log",
             "process:find",
@@ -3960,6 +3989,8 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+        assert!(broad_capability("process:nuget").is_none());
+        assert!(broad_capability("process:null").is_none());
     }
 
     #[test]
@@ -4484,8 +4515,13 @@ mod tests {
             "fs:write:/home/ada/",
             "fs:write:~",
             "env:GITHUB_TOKEN",
+            "env:MYSQL_PWD",
+            "env:db_pwd",
             "env:OPENAI_API_KEY",
             "env:DB_PASSWORD",
+            "env:DATABASE_URL",
+            "env:redis_url",
+            "env:MONGODB_URI",
         ] {
             assert!(broad_capability(broad).is_some(), "{broad}");
         }
@@ -4495,8 +4531,12 @@ mod tests {
             "fs:write:/Users/ada/project",
             "fs:write:/tmp/out",
             "fs:read:/",
+            "env:PWD",
+            "env:OLDPWD",
             "env:HOME",
             "env:LANG",
+            "env:PUBLIC_URL",
+            "env:DATABASE_URL_SAMPLE",
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
         }
