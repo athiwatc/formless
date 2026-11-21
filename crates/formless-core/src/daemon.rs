@@ -1851,6 +1851,14 @@ impl Daemon {
         &self,
         proposal: &TopicProposalRequest,
     ) -> Result<TopicInfo> {
+        self.propose_topic_with_git(proposal, std::ffi::OsStr::new("git"))
+    }
+
+    fn propose_topic_with_git(
+        &self,
+        proposal: &TopicProposalRequest,
+        git: &std::ffi::OsStr,
+    ) -> Result<TopicInfo> {
         let mut normalized = proposal.clone();
         let (kind, base) = match &proposal.workspace {
             None => (WorkspaceKind::Scratch, None),
@@ -1862,32 +1870,43 @@ impl Daemon {
                 if !path.is_dir() {
                     bail!("workspace must be an existing directory");
                 }
-                let output = std::process::Command::new("git")
+                let output = std::process::Command::new(git)
                     .arg("-C")
                     .arg(&path)
                     .args(["rev-parse", "--is-inside-work-tree"])
-                    .output()
-                    .context("could not inspect workspace with git")?;
-                let git_marker = path
-                    .ancestors()
-                    .any(|ancestor| ancestor.join(".git").exists());
-                if !output.status.success() && git_marker {
-                    bail!(
-                        "could not inspect Git workspace: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                if output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() != "true"
-                {
-                    bail!("Git workspace must be a working tree, not a bare repository");
-                }
-                if output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() == "true"
-                {
-                    let (root, base) = topic_repo_snapshot(&path)?;
-                    normalized.workspace = Some(root);
-                    (WorkspaceKind::Git, Some(base))
+                    .output();
+                let output = match output {
+                    Ok(output) => Some(output),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).context("could not inspect workspace with git")
+                    }
+                };
+                if let Some(output) = output {
+                    let git_marker = path
+                        .ancestors()
+                        .any(|ancestor| ancestor.join(".git").exists());
+                    if !output.status.success() && git_marker {
+                        bail!(
+                            "could not inspect Git workspace: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    if output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() != "true"
+                    {
+                        bail!("Git workspace must be a working tree, not a bare repository");
+                    }
+                    if output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                    {
+                        let (root, base) = topic_repo_snapshot(&path)?;
+                        normalized.workspace = Some(root);
+                        (WorkspaceKind::Git, Some(base))
+                    } else {
+                        normalized.workspace = Some(path);
+                        (WorkspaceKind::Directory, None)
+                    }
                 } else {
                     normalized.workspace = Some(path);
                     (WorkspaceKind::Directory, None)

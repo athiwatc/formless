@@ -438,6 +438,20 @@ fn topic_fixture_proposal(
     }
 }
 
+#[test]
+fn topic_workspace_without_git_executable_is_directory() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let proposal = topic_fixture_proposal(&f, Some(f.root.clone()));
+    let topic = f
+        .daemon()
+        .propose_topic_with_git(&proposal, f.root.join("missing-git").as_os_str())
+        .unwrap();
+    assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
+    assert_eq!(topic.workspace, Some(f.root.canonicalize().unwrap()));
+    assert!(topic.base_revision.is_none());
+}
+
 #[tokio::test]
 async fn topic_fixture_workspace_classification_and_unavailable_start() {
     let env = crate::credential_env::EnvGuard::isolated();
