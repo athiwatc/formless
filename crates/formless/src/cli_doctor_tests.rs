@@ -154,7 +154,7 @@ impl Fixture {
         let raw = out.join().unwrap();
         let stderr = err.join().unwrap();
         assert!(
-            status.success(),
+            matches!(status.code(), Some(0 | 1)),
             "doctor child failed: {}",
             String::from_utf8_lossy(&stderr)
         );
@@ -196,6 +196,23 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_fixes_open_config_backup_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let backup = fixture.paths.config_file().with_extension("toml.bak");
+    std::fs::write(&backup, "fixture backup").unwrap();
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let problem = super::doctor_local_problems(&fixture.paths)
+        .into_iter()
+        .find(|problem| matches!(&problem.fix, Some(super::Fix::Chmod600(files)) if files.contains(&backup)))
+        .expect("doctor should report an open config backup");
+    super::apply_fix(&fixture.paths, &problem.fix.unwrap()).unwrap();
+    let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 #[ignore = "owned subprocess fixture; invoked by doctor dispatch/output tests"]
 fn doctor_child_fixture() {
@@ -220,9 +237,16 @@ fn doctor_child_fixture() {
     );
     print!("{BEGIN}");
     std::io::stdout().flush().unwrap();
-    super::run_cli(cli).unwrap();
-    std::io::stdout().flush().unwrap();
+    let status = match super::run_cli(cli) {
+        Ok(()) => 0,
+        Err(error) if error.is::<super::DoctorProblems>() => super::exit_code(&error),
+        Err(error) => panic!("doctor child failed: {error:#}"),
+    };
     println!("{}", END.trim_end());
+    std::io::stdout().flush().unwrap();
+    if status != 0 {
+        std::process::exit(status);
+    }
 }
 
 #[test]
@@ -258,8 +282,9 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
     cfg.save(&f.paths).unwrap();
     let before = std::fs::read(f.paths.config_file()).unwrap();
     let human = f.run("p", &["doctor"]);
-    assert!(
-        human.status.success(),
+    assert_eq!(
+        human.status.code(),
+        Some(1),
         "{}",
         String::from_utf8_lossy(&human.stderr)
     );
@@ -269,8 +294,9 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
         "{text}"
     );
     let json = f.run("p", &["doctor", "--json"]);
-    assert!(
-        json.status.success(),
+    assert_eq!(
+        json.status.code(),
+        Some(1),
         "{}",
         String::from_utf8_lossy(&json.stderr)
     );
@@ -303,8 +329,9 @@ fn unconfigured_doctor_names_the_profile_and_offers_saved_setup_elsewhere() {
     let before = std::fs::read(f.paths.config_file()).unwrap();
     for active in ["default", "scratch"] {
         let doctor = f.run(active, &["doctor"]);
-        assert!(
-            doctor.status.success(),
+        assert_eq!(
+            doctor.status.code(),
+            Some(1),
             "{}",
             String::from_utf8_lossy(&doctor.stderr)
         );
@@ -315,8 +342,9 @@ fn unconfigured_doctor_names_the_profile_and_offers_saved_setup_elsewhere() {
             "{text}"
         );
         let json = f.run(active, &["doctor", "--json"]);
-        assert!(
-            json.status.success(),
+        assert_eq!(
+            json.status.code(),
+            Some(1),
             "{}",
             String::from_utf8_lossy(&json.stderr)
         );

@@ -46,10 +46,40 @@ self.addEventListener("push", (e) => {
   }));
 });
 
+// Chat notices carry the same local data as the page notification and
+// keep the tab ID so a click cannot accidentally switch a different tab.
+self.addEventListener("message", (e) => {
+  const message = e.data;
+  const source = e.source;
+  if (message?.type !== "formless-chat-notification" || source?.type !== "window"
+    || new URL(source.url).origin !== location.origin) return;
+  const { title, options } = message;
+  if (typeof title !== "string" || typeof options?.tag !== "string") return;
+  const session = options.data?.session;
+  e.waitUntil(self.registration.showNotification(title, {
+    body: options.body,
+    icon: "icon-192.png",
+    tag: options.tag,
+    renotify: true,
+    data: { session: typeof session === "string" ? session : null, client: source.id },
+  }));
+});
+
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
-  e.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
+  e.waitUntil((async () => {
+    const { session, client } = e.notification.data || {};
+    if (client) {
+      const win = await self.clients.get(client);
+      if (win?.type === "window" && new URL(win.url).origin === location.origin) {
+        await win.focus();
+        if (session) win.postMessage({ type: "formless-open-notification-session", session });
+        return;
+      }
+      return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/");
+    }
+    const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const win = wins.find((w) => new URL(w.url).origin === location.origin);
     return win ? win.focus() : self.clients.openWindow("/");
-  }));
+  })());
 });
