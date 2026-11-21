@@ -149,6 +149,11 @@ fn topic_controls_require_explicit_user_actions_and_keep_failed_changes_unsaved(
             )
         });
         assert_eq!(inputs[0].read(cx).value().as_ref(), "*cargo test*");
+        window.render_frame(cx);
+        assert!(
+            window.find("topic-notice").visible(),
+            "a failed save must show its error without another scroll"
+        );
         assert_eq!(shell.read(cx).sidebar().active_id(), Some("topic-chat"));
         assert!(
             shell.update(cx, |s, _| s.take_client_commands()).is_empty(),

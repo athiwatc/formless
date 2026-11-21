@@ -1037,15 +1037,39 @@ impl Shell {
                 panel = panel.child(feature_row);
             }
         }
-        if let Some(notice) = &ui.state.notice {
-            panel = panel.child(
-                announced(div().id("topic-notice"))
-                    .test_support()
-                    .role(Role::Status)
-                    .aria_value(notice.clone())
-                    .child(Label::new(notice.clone()).text_sm()),
-            );
+        let feedback = ui.state.notice.as_ref().map(|notice| {
+            announced(div().id("topic-notice"))
+                .test_support()
+                .role(Role::Status)
+                .aria_value(notice.clone())
+                .child(Label::new(notice.clone()).text_sm())
+        });
+        let policy_open = !ui.proposing
+            && current_topic.is_some_and(|topic| {
+                ui.policy
+                    .as_ref()
+                    .is_some_and(|editor| editor.topic == topic.id)
+            });
+        if policy_open {
+            // A setting's outcome must remain visible at the clicked control,
+            // not below the rest of the workflow's scrollable detail history.
+            v_flex()
+                .min_w_0()
+                .flex_shrink_0()
+                .child(panel)
+                .children(feedback.map(|feedback| {
+                    feedback
+                        .max_h(window.viewport_size().height * 0.12)
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .bg(cx.theme().muted)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                }))
+                .into_any_element()
+        } else {
+            panel.children(feedback).into_any_element()
         }
-        panel.into_any_element()
     }
 }
