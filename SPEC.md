@@ -434,12 +434,15 @@ without redesign.
   accepted wherever a model id is (`/model fast`, `--model`, Roles,
   candidates, fallbacks) and resolved at use, so changing it moves
   everything that names it. The pickers list aliases first.
-- **Missing models.** At start and then daily the daemon checks the
-  configured models (default, fallbacks, routing lists, Roles and their
-  candidates) against each endpoint's `/models` and notes the ones no
-  longer offered ("pick others with /model"); `ListModels.missing` and
-  `Status.missing_models` carry them. An endpoint that lists nothing is
-  not counted against.
+- **Missing models.** The daemon checks each provider's configured default,
+  fallbacks, routing models and Role candidates against `/models` once every
+  24 hours, saving the last check and its evidence per profile. A model is
+  flagged after two consecutive complete listings omit it. Known aliases and
+  dated snapshots count as matches. Empty, partial, failed and Azure
+  deployment listings cannot add a warning. `ListModels.missing` and
+  `Status.missing_models` describe the provider, model and configuration
+  locations. Status also shows the check time and reasons for skipped checks.
+  `formless providers dismiss-warning PROVIDER MODEL` hides one warning.
 - **Which model answered.** When another model than the requested one
   produced an answer (a fallback, or auto routing's pick), the message is
   stored with `meta.model {name, via, requested}` and clients show "via

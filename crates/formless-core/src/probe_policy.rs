@@ -35,7 +35,7 @@ struct ModelIdentity {
     mismatch: Option<String>,
 }
 
-fn same_model(requested: &str, reported: &str) -> bool {
+pub(crate) fn same_model(requested: &str, reported: &str) -> bool {
     if requested == reported {
         return true;
     }
@@ -57,6 +57,12 @@ fn same_model(requested: &str, reported: &str) -> bool {
         || (alias.starts_with("claude-")
             && date.len() == 8
             && chrono::NaiveDate::parse_from_str(date, "%Y%m%d").is_ok())
+}
+
+pub(crate) fn azure_deployment(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let (path, name) = url.path().trim_end_matches('/').rsplit_once('/')?;
+    (path.ends_with("/openai/deployments") && !name.is_empty()).then(|| name.to_owned())
 }
 #[derive(Default)]
 struct Observed {
@@ -97,13 +103,7 @@ impl ProbePolicy {
     /// Azure's URL identifies the deployment, while the reply names its
     /// backing model. Those identifiers describe different things.
     pub(crate) fn verify_model(&self, model: &str, base_url: &str) {
-        let deployment = reqwest::Url::parse(base_url).ok().is_some_and(|url| {
-            url.path()
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .is_some_and(|(path, name)| path.ends_with("/openai/deployments") && name == model)
-        });
-        if !deployment {
+        if azure_deployment(base_url).as_deref() != Some(model) {
             *self.0.model.locked() = Some(ModelIdentity {
                 requested: model.into(),
                 mismatch: None,
