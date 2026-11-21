@@ -3834,8 +3834,9 @@
       h("ol", null, q.map((m, i) => h("li", null,
         h("span", { class: "text", title: m.content }, m.content),
         btn("✎", "Edit", () => {
+          if (!Number.isSafeInteger(m.revision)) return toast("Update the daemon to edit queued messages safely.", true);
           const text = prompt("Edit the queued message", m.content);
-          if (text != null && text.trim()) act({ type: "edit_queued", session_id: sid, id: m.id, content: text.trim() });
+          if (text != null && text.trim()) act({ type: "edit_queued_if_current", session_id: sid, id: m.id, revision: m.revision, content: text.trim() });
         }),
         i > 0 ? btn("↑", "Move up", () => act({ type: "move_queued", session_id: sid, id: m.id, up: true })) : null,
         i < q.length - 1 ? btn("↓", "Move down", () => act({ type: "move_queued", session_id: sid, id: m.id, up: false })) : null,

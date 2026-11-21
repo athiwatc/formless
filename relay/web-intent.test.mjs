@@ -34,6 +34,26 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('queued edits submit the revision opened by the editor', () => {
+  const actions = [], notices = [];
+  let rendered;
+  const c = setup(['renderQueue'], {
+    tr: text => text, h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+    act: request => actions.push(request), toast: notice => notices.push(notice),
+    prompt: () => { c.S.queued = [{ id: 7, revision: 13, content: 'moved' }]; return 'my edit'; },
+  });
+  c.$('queue').replaceChildren = (...tree) => { rendered = tree; };
+  const edit = () => rendered[1].children[0][0].children.find(node => node?.attrs?.title === 'Edit').attrs.onclick();
+  c.S.queued = [{ id: 7, revision: 12, content: 'original' }];
+  c.renderQueue();
+  edit();
+  assert.deepEqual({ ...actions[0] }, { type: 'edit_queued_if_current', session_id: 'A', id: 7, revision: 12, content: 'my edit' });
+  c.S.queued = [{ id: 7, content: 'legacy' }];
+  c.renderQueue();
+  edit();
+  assert.equal(actions.length, 1);
+  assert.match(notices[0], /Update the daemon/);
+});
 test('malformed fragment pairs preserve independently valid pairs and plus signs', () => {
   const c = setup(['hashParams'], { location: { hash: '' } });
   for (const hash of ['#k=%E0%A4%A', '#s=%', '#local=%zz', '#k=abc%&s=valid']) {

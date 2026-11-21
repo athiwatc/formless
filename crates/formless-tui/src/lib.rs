@@ -252,6 +252,7 @@ enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
+    QueuedSave { session_id: String, edit: QueuedEdit, draft: String },
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -522,6 +523,13 @@ const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 struct Draft {
     input: input::InputLine,
     attachments: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedEdit {
+    id: i64,
+    revision: i64,
+    stale: bool,
 }
 
 /// Where text drafts persist between TUI starts.
@@ -1980,7 +1988,7 @@ struct App {
     /// the chat and editable with `/queue`.
     queued: Vec<formless_protocol::QueuedMessage>,
     /// `/queue edit N`: the queued message the input replaces.
-    editing_queued: Option<i64>,
+    editing_queued: Option<QueuedEdit>,
     /// The last long Run's "What I did" recap, and whether `/recap`
     /// expanded it.
     recap: Option<formless_protocol::RunRecap>,
@@ -2716,7 +2724,7 @@ impl App {
         self.input.invalidate_history();
         self.messages = messages;
         self.md_cache.borrow_mut().clear();
-        self.queued = queued;
+        self.apply_queued_items(queued);
         self.plan = plan;
         self.plan_state = plan_state;
         let same_recap =
@@ -2874,6 +2882,10 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if let Pending::QueuedSave { session_id, edit, draft } = &kind {
+                self.finish_queued_save(session_id, *edit, draft, false, Some("no daemon acknowledgement"));
+                continue;
+            }
             if matches!(kind, Pending::ProviderRetry { .. }) {
                 self.notes.push(
                     "Provider retry was not confirmed; the request may already have been re-sent."
@@ -3113,6 +3125,11 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::QueuedSave { session_id, edit, draft } = &kind {
+                        let saved = ok && result.as_ref().is_some_and(|value| value["ok"] == true);
+                        self.finish_queued_save(session_id, *edit, draft, saved, error.as_deref());
+                        continue;
+                    }
                     if let Pending::SuggestName { target } = &kind {
                         self.finish_rename_suggestion(
                             target,
@@ -3270,6 +3287,7 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::QueuedSave { .. } => unreachable!("queued saves are acknowledged above"),
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
@@ -5051,8 +5069,8 @@ impl App {
                                     r["error"].as_str().unwrap_or_default().to_string(),
                                 )
                             });
-                            self.queued = serde_json::from_value(result["queued_items"].clone())
-                                .unwrap_or_default();
+                            self.apply_queued_items(serde_json::from_value(result["queued_items"].clone())
+                                .unwrap_or_default());
                             if restore_state {
                                 self.plan = serde_json::from_value(result["plan"].clone())
                                     .unwrap_or_default();
@@ -5105,7 +5123,21 @@ impl App {
         };
         match verb {
             "edit" => {
-                self.editing_queued = Some(item.id);
+                let Some(revision) = item.revision else {
+                    self.notes
+                        .push("Update the daemon to edit queued messages safely.".into());
+                    return;
+                };
+                if self.queue_save_pending(&session_id) {
+                    self.notes
+                        .push("Waiting for the queued edit acknowledgement.".into());
+                    return;
+                }
+                self.editing_queued = Some(QueuedEdit {
+                    id: item.id,
+                    revision,
+                    stale: false,
+                });
                 self.input.set(&item.content);
                 self.input.set_literal(true);
                 self.notes
@@ -5122,6 +5154,96 @@ impl App {
                 up: verb == "up",
             }),
             _ => self.notes.push("usage: /queue edit|rm|up|down N".into()),
+        }
+    }
+
+    fn queue_save_pending(&self, session_id: &str) -> bool {
+        self.pending.values().any(|pending| {
+            matches!(pending, Pending::QueuedSave { session_id: owner, .. } if owner == session_id)
+        })
+    }
+
+    fn apply_queued_items(&mut self, queued: Vec<QueuedMessage>) {
+        let pending = self
+            .current
+            .as_deref()
+            .is_some_and(|id| self.queue_save_pending(id));
+        if let Some(edit) = self
+            .editing_queued
+            .as_mut()
+            .filter(|edit| !edit.stale && !pending)
+        {
+            let current = queued.iter().find(|message| message.id == edit.id);
+            if current.and_then(|message| message.revision) != Some(edit.revision) {
+                edit.stale = true;
+                self.notes.push(if current.is_some() {
+                    "The queued message changed or moved. Your draft is still here. Review the queue before editing again."
+                } else {
+                    "The message left the queue. Your draft is still here."
+                }.into());
+            }
+        }
+        self.queued = queued;
+    }
+
+    fn submit_queued_edit(&mut self, edit: QueuedEdit) {
+        let Some(session_id) = self.current.clone() else {
+            return;
+        };
+        if edit.stale {
+            self.notes.push("The queue changed. Review the latest message with /queue edit N, or press Esc to cancel this edit.".into());
+            return;
+        }
+        if self.queue_save_pending(&session_id) {
+            return;
+        }
+        let draft = self.input.expanded();
+        let content = draft.trim().to_owned();
+        if content.is_empty() {
+            self.notes
+                .push("A queued message cannot be empty. Use /queue rm N to remove it.".into());
+            return;
+        }
+        self.request(
+            Pending::QueuedSave {
+                session_id: session_id.clone(),
+                edit,
+                draft,
+            },
+            Request::EditQueuedIfCurrent {
+                session_id,
+                id: edit.id,
+                revision: edit.revision,
+                content,
+            },
+        );
+    }
+
+    fn finish_queued_save(
+        &mut self,
+        session_id: &str,
+        edit: QueuedEdit,
+        draft: &str,
+        saved: bool,
+        error: Option<&str>,
+    ) {
+        if self.is_current(session_id) && self.editing_queued == Some(edit) {
+            if saved {
+                self.editing_queued = None;
+                if self.input.expanded() == draft {
+                    self.input.clear();
+                }
+            } else if let Some(edit) = &mut self.editing_queued {
+                edit.stale = true;
+            }
+        }
+        if saved {
+            self.notes.push("Queued message saved.".into());
+        } else {
+            self.notes.push(format!(
+                "Queued edit was not confirmed. Your draft is still here. {}",
+                error.unwrap_or("Review the latest queue before retrying.")
+            ));
         }
     }
 
@@ -5854,15 +5976,7 @@ impl App {
             }
             Event::QueueChanged { session_id, queued } => {
                 if self.is_current(&session_id) {
-                    if self
-                        .editing_queued
-                        .is_some_and(|id| !queued.iter().any(|q| q.id == id))
-                    {
-                        self.editing_queued = None;
-                        self.notes
-                            .push("the queued message you were editing was sent".into());
-                    }
-                    self.queued = queued;
+                    self.apply_queued_items(queued);
                 }
             }
             Event::ProviderRetrying {
@@ -6851,13 +6965,17 @@ impl App {
     }
 
     fn submit_chat(&mut self, queued: bool) {
-        if !self.expand_user_command() {
-            return;
-        }
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
                 .push("not sent — offline; your input is kept as a draft".into());
+            return;
+        }
+        if let Some(edit) = self.editing_queued {
+            self.submit_queued_edit(edit);
+            return;
+        }
+        if !self.expand_user_command() {
             return;
         }
         let text = self.input.expanded();
@@ -6865,7 +6983,6 @@ impl App {
             && (!text.starts_with('/') || self.input.is_literal())
             && !self.running()
             && self.current.is_some()
-            && self.editing_queued.is_none()
             && Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some())
         {
             let generation = self.forecast_generation();
@@ -6959,16 +7076,6 @@ impl App {
             let text = self.input.take();
             self.editing_step = false;
             self.step_decide("edit", Some(text.trim().to_string()));
-            return;
-        }
-        if let Some(id) = self.editing_queued.take() {
-            if let Some(session_id) = self.current.clone() {
-                self.fire(Request::EditQueued {
-                    session_id,
-                    id,
-                    content: Some(text),
-                });
-            }
             return;
         }
         if let Some(message_id) = self.editing_id.take() {
@@ -16523,7 +16630,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             ui::dim(app.color),
         ));
         for (i, q) in app.queued.iter().enumerate() {
-            let editing = app.editing_queued == Some(q.id);
+            let editing = app.editing_queued.is_some_and(|edit| edit.id == q.id);
             let first = q.content.lines().next().unwrap_or_default();
             lines.push(Line::styled(
                 format!(
@@ -20292,12 +20399,13 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_follows_events_and_drops_a_sent_edit() {
+    fn the_queue_follows_events_and_keeps_a_stale_draft_from_being_sent() {
         use formless_protocol::QueuedMessage;
         let mut app = test_app();
         let q = |id: i64, t: &str| QueuedMessage {
             id,
             content: t.into(),
+            revision: Some(0),
         };
         app.on_event(Event::QueueChanged {
             session_id: "s1".into(),
@@ -20305,20 +20413,94 @@ mod tests {
         });
         assert_eq!(app.queued.len(), 2);
         app.queue_command("queue edit 2");
-        assert_eq!(app.editing_queued, Some(2));
+        assert_eq!(app.editing_queued.map(|edit| edit.id), Some(2));
         assert_eq!(app.input.expanded(), "second");
-        // It is sent meanwhile: the edit is dropped.
+        // It is sent meanwhile. The previous draft cannot become a chat send.
         app.on_event(Event::QueueChanged {
             session_id: "s1".into(),
             queued: vec![q(1, "first")],
         });
-        assert_eq!(app.editing_queued, None);
+        assert!(app.editing_queued.unwrap().stale);
+        app.submit_chat(false);
+        assert_eq!(app.input.expanded(), "second");
         // Another Session's queue is not shown here.
         app.on_event(Event::QueueChanged {
             session_id: "s2".into(),
             queued: vec![],
         });
         assert_eq!(app.queued.len(), 1);
+    }
+
+    #[test]
+    fn queued_save_uses_opened_revision_and_preserves_a_rejected_draft() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (reply, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let item = QueuedMessage {
+            id: 9,
+            content: "original".into(),
+            revision: Some(1),
+        };
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![item.clone()],
+        });
+        app.queue_command("queue edit 1");
+        app.input.set("edit from this client");
+        app.submit_chat(false);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(request.request, Request::EditQueuedIfCurrent { id:9, revision:1, ref content, .. } if content == "edit from this client")
+        );
+        reply
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: None,
+                error: Some("queued message moved".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+        assert!(app.editing_queued.unwrap().stale);
+        assert_eq!(app.input.expanded(), "edit from this client");
+        assert!(app.notes.last().unwrap().contains("queued message moved"));
+        app.submit_chat(false);
+        assert!(sent.try_recv().is_err());
+
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![QueuedMessage {
+                revision: Some(2),
+                ..item
+            }],
+        });
+        app.queue_command("queue edit 1");
+        app.submit_chat(false);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            request.request,
+            Request::EditQueuedIfCurrent {
+                id: 9,
+                revision: 2,
+                ..
+            }
+        ));
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![],
+        });
+        reply
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: true,
+                result: Some(serde_json::json!({"ok":true})),
+                error: None,
+            })
+            .unwrap();
+        app.drain_daemon();
+        assert!(app.editing_queued.is_none() && app.input.is_empty());
     }
 
     #[test]
@@ -20704,6 +20886,7 @@ mod tests {
                 queued: vec![QueuedMessage {
                     id: 8,
                     content: "new queue".into(),
+                    revision: Some(0),
                 }],
             },
             Event::PlanUpdated {

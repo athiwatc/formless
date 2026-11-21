@@ -2433,16 +2433,24 @@ impl Daemon {
                 id,
                 content,
             } => {
-                let content = content.map(|c| c.trim().to_string());
-                if content.as_deref() == Some("") {
-                    return Err(anyhow!(
-                        "a queued message cannot be empty; remove it instead"
-                    ));
+                if content.is_some() {
+                    return Err(RequestFailure::invalid("Update your client to save queued edits with a message revision.").into());
                 }
-                let found =
-                    self.with_store(|st| st.edit_queued(&session_id, id, content.as_deref()))?;
+                let found = self.with_store(|st| st.edit_queued(&session_id, id, None))?;
                 if !found {
                     return Err(anyhow!("that message is no longer queued (it was sent)"));
+                }
+                self.queue_changed(&session_id);
+                Ok(json!({"ok": true}))
+            }
+            Request::EditQueuedIfCurrent { session_id, id, revision, content } => {
+                let content = content.trim();
+                if content.is_empty() {
+                    return Err(RequestFailure::invalid("a queued message cannot be empty; remove it instead").into());
+                }
+                let saved = self.with_store(|st| st.edit_queued_if_current(&session_id, id, revision, content))?;
+                if !saved {
+                    return Err(RequestFailure::busy("This queued message changed, moved, or left the queue. Review the latest queue before editing.").into());
                 }
                 self.queue_changed(&session_id);
                 Ok(json!({"ok": true}))

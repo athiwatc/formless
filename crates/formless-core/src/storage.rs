@@ -544,7 +544,11 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 67;
+pub const SCHEMA_VERSION: i64 = 70;
+
+fn unsupported_preview_schema(version: i64) -> bool {
+    matches!(version, 68 | 69)
+}
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -629,7 +633,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 67] = [
+const MIGRATIONS: [(i64, MigrationStep); 68] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -955,12 +959,18 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
         add_column(c, "sessions", "plan_state TEXT")?;
         Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
+    // Versions 68 and 69 were unpublished preview schemas.
+    (70, |c| {
+        add_column(c, "queued_messages", "position INTEGER")?;
+        add_column(c, "queued_messages", "revision INTEGER NOT NULL DEFAULT 0")?;
+        Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
 /// Applies the same ordered migration prefix without opening/upgrading a backup.
 pub(crate) fn schema_at(version: i64) -> Result<Connection> {
-    if !(1..=SCHEMA_VERSION).contains(&version) {
+    if !(1..=SCHEMA_VERSION).contains(&version) || unsupported_preview_schema(version) {
         return Err(anyhow!("unsupported backup schema v{version}"));
     }
     let conn = Connection::open_in_memory()?;
@@ -978,6 +988,9 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
 /// the last completed version.
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if unsupported_preview_schema(version) {
+        return Err(anyhow!("database schema v{version} is an unsupported preview schema (this build writes v{SCHEMA_VERSION})"));
+    }
     if version > SCHEMA_VERSION {
         return Err(anyhow!(
             "database schema v{version} is newer than this build (v{SCHEMA_VERSION}); upgrade formless"
@@ -3600,25 +3613,16 @@ impl Store {
 
     /// Remove and return the Session's oldest queued message.
     pub fn pop_queued_message(&self, session_id: &str) -> Result<Option<String>> {
-        let next: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id LIMIT 1",
-                params![session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        if let Some((id, _)) = &next {
-            self.conn
-                .execute("DELETE FROM queued_messages WHERE id=?1", params![id])?;
-        }
-        Ok(next.map(|(_, content)| content))
+        Ok(self.ps(
+            "DELETE FROM queued_messages WHERE id=(SELECT id FROM queued_messages WHERE session_id=?1
+               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content",
+        )?.query_row([session_id], |row| row.get(0)).optional()?)
     }
 
     pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
+            .prepare("SELECT content FROM queued_messages WHERE session_id=?1 ORDER BY COALESCE(position,id),id")?;
         let rows = stmt
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -3628,12 +3632,13 @@ impl Store {
     /// The Session's queued messages with their ids, in send order.
     pub fn queued_items(&self, session_id: &str) -> Result<Vec<formless_protocol::QueuedMessage>> {
         let mut stmt =
-            self.ps("SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
+            self.ps("SELECT id, content, revision FROM queued_messages WHERE session_id=?1 ORDER BY COALESCE(position,id),id")?;
         let rows = stmt
             .query_map(params![session_id], |r| {
                 Ok(formless_protocol::QueuedMessage {
                     id: r.get(0)?,
                     content: r.get(1)?,
+                    revision: Some(r.get(2)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3645,7 +3650,7 @@ impl Store {
     pub fn edit_queued(&self, session_id: &str, id: i64, content: Option<&str>) -> Result<bool> {
         let n = match content {
             Some(c) => self.ex(
-                "UPDATE queued_messages SET content=?3 WHERE id=?1 AND session_id=?2",
+                "UPDATE queued_messages SET content=?3, revision=revision+1 WHERE id=?1 AND session_id=?2",
                 params![id, session_id, c],
             )?,
             None => self.ex(
@@ -3656,27 +3661,44 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Move a queued message one place earlier (`up`) or later, by
-    /// swapping its text with its neighbour's. Returns the id that now
-    /// holds it, or None when it is not queued or already at that end.
+    /// A revision binds editable text and position. Reject a stale draft
+    /// atomically even when there was no event on the editing connection.
+    pub fn edit_queued_if_current(
+        &self,
+        session_id: &str,
+        id: i64,
+        revision: i64,
+        content: &str,
+    ) -> Result<bool> {
+        Ok(self.ex(
+            "UPDATE queued_messages SET content=?4, revision=revision+1 WHERE session_id=?1 AND id=?2 AND revision=?3",
+            params![session_id, id, revision, content],
+        )? > 0)
+    }
+
+    /// Move a queued message one place without changing its identity or text.
     pub fn move_queued(&self, session_id: &str, id: i64, up: bool) -> Result<Option<i64>> {
-        let items = self.queued_items(session_id)?;
-        let Some(i) = items.iter().position(|q| q.id == id) else {
-            return Ok(None);
-        };
-        let j = if up { i.checked_sub(1) } else { Some(i + 1) };
-        let Some(other) = j.and_then(|j| items.get(j)) else {
-            return Ok(None);
-        };
-        self.ex(
-            "UPDATE queued_messages SET content=?2 WHERE id=?1",
-            params![items[i].id, other.content],
-        )?;
-        self.ex(
-            "UPDATE queued_messages SET content=?2 WHERE id=?1",
-            params![other.id, items[i].content],
-        )?;
-        Ok(Some(other.id))
+        self.transaction(|st| {
+            let Some(position) = st.ps("SELECT COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND id=?2")?
+                .query_row(params![session_id, id], |row| row.get::<_, i64>(0)).optional()? else {
+                return Ok(None);
+            };
+            let neighbor = if up {
+                "SELECT id, COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND COALESCE(position,id)<?2 ORDER BY COALESCE(position,id) DESC,id DESC LIMIT 1"
+            } else {
+                "SELECT id, COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND COALESCE(position,id)>?2 ORDER BY COALESCE(position,id),id LIMIT 1"
+            };
+            let Some((other, other_position)) = st.ps(neighbor)?
+                .query_row(params![session_id, position], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).optional()? else {
+                return Ok(None);
+            };
+            st.ex(
+                "UPDATE queued_messages SET position=CASE id WHEN ?2 THEN ?4 ELSE ?5 END, revision=revision+1
+                 WHERE session_id=?1 AND id IN (?2,?3)",
+                params![session_id, id, other, other_position, position],
+            )?;
+            Ok(Some(id))
+        })
     }
 
     pub fn clear_queued_messages(&self, session_id: &str) -> Result<()> {

@@ -1411,6 +1411,8 @@ pub struct ReviewCommentResult {
 pub struct QueuedMessage {
     pub id: i64,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
 }
 
 /// A user-memory note (SPEC §7.11).
@@ -2116,6 +2118,8 @@ pub enum Request {
         #[serde(default)]
         content: Option<String>,
     },
+    /// Save only the queued text and position version the client opened.
+    EditQueuedIfCurrent { session_id: String, id: i64, revision: i64, content: String },
     /// Move a queued message one place earlier (`up`) or later.
     MoveQueued {
         session_id: String,
