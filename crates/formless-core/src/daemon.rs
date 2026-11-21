@@ -17279,6 +17279,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".terraformrc",
         "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
     ]
     .contains(&name.as_str())
