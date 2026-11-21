@@ -17470,6 +17470,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".pypirc",
         ".s3cfg",
         ".boto",
+        ".vault-token",
         "rclone.conf",
         ".rclone.conf",
         ".yarnrc",
