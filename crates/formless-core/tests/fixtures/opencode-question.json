@@ -1,0 +1,26 @@
+{
+  "mode": "form",
+  "sessionId": "ses_e01046c08ffeyWB02ckYHiOkmT",
+  "toolCallId": "chatcmpl-tool-b05dea46adcef105",
+  "message": "Questions",
+  "requestedSchema": {
+    "type": "object",
+    "properties": {
+      "q0": {
+        "type": "string",
+        "title": "Color choice",
+        "description": "Choose Red or Blue.",
+        "oneOf": [
+          {"const":"Red","title":"Red","description":"Choose the color Red."},
+          {"const":"Blue","title":"Blue","description":"Choose the color Blue."}
+        ]
+      },
+      "q0_custom": {
+        "type": "string",
+        "title": "Color choice (other)",
+        "description": "Type your own answer"
+      }
+    },
+    "required": []
+  }
+}
