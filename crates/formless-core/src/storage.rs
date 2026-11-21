@@ -16,9 +16,16 @@ mod job_schedule_tests;
 #[path = "pin_batch_tests.rs"]
 mod pin_batch_tests;
 
-/// Token use for one key and model: (key, model, prompt, completion,
-/// cached, provider-reported USD when every request reported one).
-/// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
+#[cfg(test)]
+#[path = "run_id_lookup_tests.rs"]
+mod run_id_lookup_tests;
+
+#[path = "short_ids.rs"]
+mod short_ids;
+use short_ids::insert_short_id;
+
+/// A usage bucket's key, provider, model, prompt, completion, cache read and
+/// write tokens, reported cost, and whether the cost is explicitly unknown.
 pub type GroupedUsage = (
     String,
     String,
@@ -30,6 +37,9 @@ pub type GroupedUsage = (
     Option<f64>,
     bool,
 );
+
+#[path = "storage_forecast.rs"]
+mod forecast_storage;
 
 #[path = "forecast_snapshot.rs"]
 mod forecast_snapshot;
@@ -52,6 +62,9 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+
+#[path = "attachment_expiry.rs"]
+mod attachment_expiry;
 
 #[path = "recap_storage.rs"]
 mod recap_storage;
@@ -101,6 +114,137 @@ pub const UNASKED_KEEP: i64 = 2000;
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+#[test]
+fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = Capabilities::parse(&[]).unwrap();
+    let (tool, version) = store
+        .create_tool_version(
+            "usage_fixture",
+            "usage fixture",
+            "{}",
+            "{}",
+            "",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    let (unused, _) = store
+        .create_tool_version("unused_fixture", "", "{}", "{}", "", &caps, 64, "user")
+        .unwrap();
+    let running = store
+        .start_invocation(&tool.id, version, None, None, None, "{}")
+        .unwrap();
+    let older = store
+        .record_invocation(
+            &tool.id, version, None, None, None, "denied", "", "{}", "", "", 0, 20,
+        )
+        .unwrap();
+    let latest = "2026-01-02T03:04:05+00:00";
+    for (id, stamp) in [(&running, latest), (&older, "2026-01-01T03:04:05+00:00")] {
+        store
+            .conn
+            .execute(
+                "UPDATE invocations SET created_at=?2 WHERE id=?1",
+                params![id, stamp],
+            )
+            .unwrap();
+    }
+    let rows = store.list_tools(true).unwrap();
+    let used = rows.iter().find(|row| row.id == tool.id).unwrap();
+    assert_eq!(used.updated_at, tool.updated_at);
+    assert_eq!(used.invocations, 2);
+    assert_eq!(used.last_used_at.as_deref(), Some(latest));
+    assert_eq!(
+        store
+            .tool_last_used()
+            .unwrap()
+            .get(&tool.id)
+            .map(String::as_str),
+        Some(latest)
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.id == unused.id)
+            .unwrap()
+            .last_used_at,
+        None
+    );
+
+    let (revised, revised_version) = store
+        .create_tool_version(
+            "usage_fixture",
+            "updated usage fixture",
+            "{}",
+            "{}",
+            "function run() { return {}; }",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    assert_eq!(revised.id, tool.id);
+    assert!(revised_version > version);
+    assert_eq!(revised.last_used_at.as_deref(), Some(latest));
+    let rolled_back = store.rollback_tool(&tool.id, version).unwrap().unwrap();
+    assert_eq!(rolled_back.current_version, version);
+    assert_eq!(rolled_back.last_used_at.as_deref(), Some(latest));
+
+    store.set_needs_attention(&tool.id, true).unwrap();
+    let retired = store.set_tool_retired(&tool.id, true).unwrap().unwrap();
+    assert!(retired.retired && retired.needs_attention);
+    assert_eq!(retired.last_used_at.as_deref(), Some(latest));
+    assert_eq!(
+        store
+            .get_tool_current(&tool.id)
+            .unwrap()
+            .unwrap()
+            .0
+            .last_used_at
+            .as_deref(),
+        Some(latest)
+    );
+    store
+        .finish_invocation(&running, &tool.id, "success", "", "", "", 1, 0)
+        .unwrap();
+    let pruned = store
+        .list_tools(true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == tool.id)
+        .unwrap();
+    assert_eq!(pruned.invocations, 0);
+    assert_eq!(pruned.last_used_at, None);
+}
+
+const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
+    start_message_seq,end_message_seq,
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    FROM runs WHERE id=?1";
+const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_OTHER_ENCODING: &str =
+    "SELECT id FROM runs WHERE substr(id,1,length(?1))=?1 LIMIT 2";
+
+/// The exclusive upper bound for a literal prefix in SQLite's BINARY
+/// ordering on Formless's UTF-8 databases. A prefix made entirely of the
+/// maximum scalar has no upper bound.
+fn run_id_prefix_end(prefix: &str) -> Option<String> {
+    let mut upper = prefix.trim_end_matches(char::MAX).to_owned();
+    let last = upper.pop()?;
+    let next = if last == '\u{d7ff}' {
+        '\u{e000}'
+    } else {
+        char::from_u32(last as u32 + 1)?
+    };
+    upper.push(next);
+    Some(upper)
 }
 
 fn make_snippet(content: &str, needle_lower: &str) -> String {
@@ -372,15 +516,6 @@ CREATE INDEX IF NOT EXISTS idx_builtin_calls ON builtin_calls(name, created_at);
 CREATE INDEX IF NOT EXISTS idx_builtin_calls_run ON builtin_calls(run_id);
 ";
 
-/// Applied memory-kind proposals move into the memory store (author
-/// `optimiser`, linked for rollback).
-const SCHEMA_V18: &str = "
-INSERT OR IGNORE INTO memories(id,text,dedup_key,scope,author,enabled,created_at,updated_at,proposal_id)
-  SELECT 'm' || lower(hex(randomblob(4))), trim(content), lower(trim(content)), 'global', 'optimiser', 1,
-         COALESCE(applied_at, created_at), COALESCE(applied_at, created_at), id
-  FROM prompt_proposals WHERE kind='memory' AND status='applied';
-";
-
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -408,6 +543,16 @@ impl ModelStat {
 /// schema v39) and triggers on `messages`/`runs` keep them true, so the
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
+
+fn run_duration_ms(created: &str, updated: &str) -> i64 {
+    match (
+        chrono::DateTime::parse_from_rfc3339(created),
+        chrono::DateTime::parse_from_rfc3339(updated),
+    ) {
+        (Ok(start), Ok(end)) => (end - start).num_milliseconds().max(0),
+        _ => 0,
+    }
+}
 
 /// Schema version this build writes (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: i64 = 67;
@@ -536,7 +681,7 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
     (17, |c| Ok(c.execute_batch(SCHEMA_V17)?)),
     (18, |c| {
         add_column(c, "memories", "proposal_id TEXT")?;
-        Ok(c.execute_batch(SCHEMA_V18)?)
+        short_ids::migrate_applied_memories(c, uuid::Uuid::new_v4)
     }),
     // Run-level metrics (SPEC §8.7).
     (19, |c| {
@@ -2367,11 +2512,14 @@ impl Store {
         approved: bool,
         author: &str,
     ) -> Result<formless_protocol::JobInfo> {
-        let id = format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)",
-            params![id, prompt, session_id, cron, next_run, approved, author, now()],
-        )?;
+        let created = now();
+        let id = insert_short_id('j', "job", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, prompt, session_id, cron, next_run, approved, author, created],
+            )
+        })?;
         self.get_job(&id)?.context("job vanished")
     }
 
@@ -2611,6 +2759,27 @@ impl Store {
         Ok(())
     }
 
+    /// Read the live Session and latest Run status with strict SQL errors.
+    /// `None` means the Session is unavailable, not that it has no Run.
+    pub(crate) fn idle_step_off_status(&self, session_id: &str) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT (SELECT status FROM runs WHERE session_id=sessions.id
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1)
+               FROM sessions WHERE id=?1 AND deleted_at IS NULL",
+                params![session_id],
+                |row| {
+                    let status = row.get::<_, Option<String>>(0)?;
+                    Ok(matches!(
+                        status.as_deref(),
+                        None | Some("completed" | "abandoned" | "failed")
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     /// The Session's last Run when it stopped unfinished (interrupted or
     /// paused): (id, status, reason).
     pub fn unfinished_last_run(
@@ -2716,12 +2885,14 @@ impl Store {
         tool: &str,
         reason: &str,
     ) -> Result<String> {
-        let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
-        )?;
-        Ok(id)
+        let (before, after, created) = (before.to_string(), after.to_string(), now());
+        insert_short_id('h', "harness change", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, op, target, before, after, tool, reason, created],
+            )
+        })
     }
 
     /// Harness changes, newest first.
@@ -3022,8 +3193,7 @@ impl Store {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
-        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
-        if !exists {
+        if !self.has_forecast_history()? {
             return Ok(Vec::new());
         }
         let mut stmt =
@@ -3056,78 +3226,101 @@ impl Store {
             && expected == known
             && main >= self.run_steps(run_id)?)
     }
+
+    /// Check coverage for a branch's allocated Runs in one statement.
+    /// Each aggregate streams one Run's indexed rows. Packing each pair keeps
+    /// one scan per child table and avoids sorting the matched history.
+    fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
+        if run_ids.is_empty() {
+            return Ok(true);
+        }
+        let ids = serde_json::to_string(run_ids)?;
+        let mut stmt = self.ps("SELECT
+                 (SELECT json_array(
+                     COALESCE(SUM(expected),0),
+                     COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0))
+                  FROM forecast_request_counts WHERE run_id=w.value),
+                 (SELECT json_array(COUNT(*),COALESCE(SUM(usage_complete),0))
+                  FROM run_usage WHERE run_id=w.value),
+                 r.steps
+             FROM json_each(?1) AS w LEFT JOIN runs AS r ON r.id=w.value")?;
+        let mut rows = stmt.query(params![ids])?;
+        let mut complete = true;
+        while let Some(row) = rows.next()? {
+            let read_counts = |column| -> Result<(i64, i64)> {
+                Ok(serde_json::from_str(row.get_ref(column)?.as_str()?)?)
+            };
+            let (expected, main) = read_counts(0)?;
+            let (recorded, covered) = read_counts(1)?;
+            // Match run_steps' zero fallback for a missing or invalid value.
+            let steps: i64 = row.get(2).unwrap_or_default();
+            complete &=
+                expected > 0 && expected == recorded && expected == covered && main >= steps;
+        }
+        Ok(complete)
+    }
+
     pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
         let rows = stmt.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    pub fn forecast_usage(
-        &self,
-        run_id: &str,
-        cfg: &crate::Config,
-    ) -> Result<(Option<f64>, u64, u64)> {
-        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source,cost_unknown FROM run_usage WHERE run_id=?1")?;
-        let rows = stmt.query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<f64>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, bool>(8)?,
-            ))
-        })?;
-        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
-        let mut any = false;
-        for row in rows {
-            let (p, m, input, output, cache, write, reported, source, unknown) = row?;
-            any = true;
-            // Only the main Session request drives its compaction threshold;
-            // nested llm/sub-agent/summarizer contexts have separate windows.
-            if source == "run" {
-                peak = peak.max(input.max(0) as u64);
-            }
-            cached += cache.max(0) as u64;
-            cost = cost
-                .zip(cfg.cost_of_known(&p, &m, input, output, cache, write, reported, unknown))
-                .map(|(a, b)| a + b);
-        }
-        Ok((cost.filter(|_| any), peak, cached))
+    pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
+        Ok(self
+            .ps("SELECT COUNT(*) FROM runs WHERE session_id=?1")?
+            .query_row(params![session_id], |r| r.get(0))?)
     }
 
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
     }
 
-    /// The newest `limit` Runs, of one Session or all.
-    /// Resolve literal prefixes, preferring an exact identity. No LIKE wildcards.
+    /// Resolve literal prefixes, preferring an exact identity.
     pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
-        let mut stmt = self.ps("SELECT id FROM runs WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY (id=?1) DESC LIMIT 2")?;
-        let ids: Vec<String> = stmt
-            .query_map(params![query], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let Some(id) = ids.first() else {
+        if query.is_empty() {
+            let any_run: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(!any_run, "ambiguous Run id");
             return Ok(None);
-        };
-        anyhow::ensure!(
-            !query.is_empty() && (ids.len() == 1 || id == query),
-            "ambiguous Run id"
-        );
-        self.conn.query_row("SELECT id,session_id,status,error,steps,created_at,updated_at,start_message_seq,end_message_seq,
-            (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
-            FROM runs WHERE id=?1", params![id], |r| Ok(serde_json::json!({
-                "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
-                "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
-                "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
-                "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-                "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-            }))).optional().map_err(Into::into)
+        }
+        self.read_transaction(|st| {
+            if let Some(exact) = st.inspect_exact_run(query)? {
+                return Ok(Some(exact));
+            }
+            let encoding: String = st.ps("PRAGMA encoding")?.query_row([], |row| row.get(0))?;
+            let (sql, upper) = match encoding.as_str() {
+                "UTF-8" => match run_id_prefix_end(query) {
+                    Some(upper) => (RUN_ID_PREFIX_RANGE, Some(upper)),
+                    None => (RUN_ID_PREFIX_TAIL, None),
+                },
+                // Restored databases can use UTF-16, whose binary byte order
+                // differs from the scalar ordering used for the upper bound.
+                _ => (RUN_ID_PREFIX_OTHER_ENCODING, None),
+            };
+            let mut stmt = st.ps(sql)?;
+            let binds = rusqlite::params_from_iter(std::iter::once(query).chain(upper.as_deref()));
+            let mut ids = stmt.query(binds)?;
+            let Some(first) = ids.next()? else {
+                return Ok(None);
+            };
+            let id: String = first.get(0)?;
+            anyhow::ensure!(ids.next()?.is_none(), "ambiguous Run id");
+            st.inspect_exact_run(&id)
+        })
+    }
+
+    fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+            "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
+            "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
+            "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
+            "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
+            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
+        }))).optional().map_err(Into::into)
     }
 
     pub fn run_metrics_for(
@@ -3171,13 +3364,7 @@ impl Store {
         let rows = stmt
             .query_map(params![limit as i64, session_id, since, run_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
-                let duration_ms = match (
-                    chrono::DateTime::parse_from_rfc3339(&created),
-                    chrono::DateTime::parse_from_rfc3339(&updated),
-                ) {
-                    (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
-                    _ => 0,
-                };
+                let duration_ms = run_duration_ms(&created, &updated);
                 let status: String = r.get(2)?;
                 let followup: String = r.get(3)?;
                 let rating: String = r.get(10)?;
@@ -3702,7 +3889,7 @@ impl Store {
                 )
             })
             .unwrap_or_default();
-        let metrics = self.tool_metrics(&id, None)?;
+        let (metrics, last_used_at) = self.tool_metrics_with_last_use(&id, None)?;
         let mut recent: Vec<char> = {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT status FROM invocations WHERE tool_id=?1 AND status IN ('success','failure')
@@ -3732,6 +3919,7 @@ impl Store {
             needs_attention: needs_attention != 0,
             created_at,
             updated_at,
+            last_used_at,
             recent: recent.into_iter().collect(),
             author,
         }))
@@ -4169,16 +4357,30 @@ impl Store {
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
+        let patterns = ["requiremodule", "modules.load"]
+            .map(|function| ["\"", "'", "`"].map(|q| format!("{function}({q}{lower}{q}")));
+        let mut stmt = self.ps("SELECT t.name, v.code FROM tools AS t
+             LEFT JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
+             WHERE t.retired=0 ORDER BY t.name_lower")?;
+        let tools = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            // Keep reporting a missing current version, even for a Tool
+            // that would not have matched the module reference.
+            let code: String = r
+                .get::<_, Option<String>>(1)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            Ok((name, code))
+        })?;
         let mut out = Vec::new();
-        for t in self.list_tools(false)? {
-            if let Some((_, v)) = self.get_tool_current(&t.id)? {
-                let code = v.code.to_lowercase();
-                if ["\"", "'", "`"].iter().any(|q| {
-                    code.contains(&format!("requiremodule({q}{lower}{q}"))
-                        || code.contains(&format!("modules.load({q}{lower}{q}"))
-                }) {
-                    out.push(t.name);
-                }
+        for tool in tools {
+            let (name, code) = tool?;
+            let code = code.to_lowercase();
+            if patterns
+                .iter()
+                .flatten()
+                .any(|pattern| code.contains(pattern))
+            {
+                out.push(name);
             }
         }
         Ok(out)
@@ -4313,12 +4515,10 @@ impl Store {
     }
 
     pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
-        // Oldest first, as with the reversed full-history read. Equal timestamps
-        // previously had no SQL tie guarantee; explicitly retain the reversed
-        // table-insertion order observed by that read, independent of query plan.
-        // Non-applied content/rationale are intentionally not decoded here.
+        // Append guidance in application order. Legacy rows without an
+        // application timestamp use their creation time and existing tie order.
         let mut stmt = self.ps(
-            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY created_at ASC, rowid DESC",
+            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY COALESCE(applied_at,created_at) ASC, rowid DESC",
         )?;
         let rows = stmt
             .query_map([], Self::proposal_row)?
@@ -4389,7 +4589,7 @@ impl Store {
     }
 
     /// Effective system prompt: frozen bootstrap + applied guidance
-    /// proposals as versioned sections (oldest first). Memory proposals
+    /// proposals as versioned sections (first applied first). Memory proposals
     /// are in the memory store instead.
     pub fn effective_system_prompt(&self, base: &str) -> Result<String> {
         let applied: Vec<_> = self
@@ -5208,10 +5408,24 @@ impl Store {
     }
 
     pub fn tool_metrics(&self, tool_id: &str, version: Option<i64>) -> Result<ToolMetricsInfo> {
-        let (total, success, failure, denied, cancelled, validation, retried): (i64, i64, i64, i64, i64, i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(status='success'),0), COALESCE(SUM(status='failure'),0), COALESCE(SUM(status='denied'),0), COALESCE(SUM(status='cancelled'),0), COALESCE(SUM(tag='validation'),0), COALESCE(SUM(retried),0) FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
+        self.tool_metrics_with_last_use(tool_id, version)
+            .map(|(metrics, _)| metrics)
+    }
+
+    fn tool_metrics_with_last_use(
+        &self,
+        tool_id: &str,
+        version: Option<i64>,
+    ) -> Result<(ToolMetricsInfo, Option<String>)> {
+        // Reuse the existing per-Tool counts scan instead of making an extra
+        // query for every Tool in a list. Match tool_last_used's retained MAX.
+        let (total, success, failure, denied, cancelled, validation, retried, last_used_at) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(status='success'),0), COALESCE(SUM(status='failure'),0),
+                    COALESCE(SUM(status='denied'),0), COALESCE(SUM(status='cancelled'),0),
+                    COALESCE(SUM(tag='validation'),0), COALESCE(SUM(retried),0), MAX(created_at)
+             FROM invocations WHERE tool_id=?1 AND (?2 IS NULL OR version=?2)",
             params![tool_id, version],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)?, r.get::<_, Option<String>>(7)?)),
         )?;
         // Cost per Success (§8.1 metric 3): everything spent, failures
         // included, over the successes it bought.
@@ -5251,7 +5465,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let denom = success + failure;
-        Ok(ToolMetricsInfo {
+        let metrics = ToolMetricsInfo {
             total,
             success,
             failure,
@@ -5275,7 +5489,8 @@ impl Store {
             tokens_per_success: per_success(all_tokens),
             model_tokens_per_call: model_used.then(|| model_tokens as f64 / total as f64),
             model_cost_per_call: (model_used && unpriced == 0).then(|| model_cost / total as f64),
-        })
+        };
+        Ok((metrics, last_used_at))
     }
 
     /// Remove one Capability spec from a Tool's grant (or the whole grant
@@ -5737,32 +5952,32 @@ impl Store {
         }
         let key = crate::memory::dedup_key(text);
         let t = now();
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
-                params![scope, key],
-                |r| r.get(0),
-            )
-            .ok();
-        let (id, created) = match existing {
-            Some(id) => {
-                self.ex(
+        self.transaction(|st| {
+            let existing: Option<String> = st
+                .conn
+                .query_row(
+                    "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
+                    params![scope, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                st.ex(
                     "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
                     params![id, t],
                 )?;
-                (id, false)
+                return Ok((st.get_memory(&id)?.context("memory vanished")?, false));
             }
-            None => {
-                let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                self.ex(
-                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-                    params![id, crate::memory::clean(text), key, scope, author, session_id, t],
-                )?;
-                (id, true)
-            }
-        };
-        Ok((self.get_memory(&id)?.context("memory vanished")?, created))
+            let text = crate::memory::clean(text);
+            let id = insert_short_id('m', "memory", uuid::Uuid::new_v4, |id| {
+                st.ex(
+                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![id, text, key, scope, author, session_id, t],
+                )
+            })?;
+            Ok((st.get_memory(&id)?.context("memory vanished")?, true))
+        })
     }
 
     pub fn get_memory(&self, id: &str) -> Result<Option<formless_protocol::MemoryInfo>> {
@@ -6126,6 +6341,42 @@ impl Store {
         Ok(rows)
     }
 
+    /// Strict bounded metadata read: never silently omits corrupt rows.
+    /// The SQL projection avoids loading an oversized individual metadata value.
+    pub fn pending_attachment_inventory(&self, session_id: &str) -> Result<Vec<Value>> {
+        let max_rows = formless_protocol::PENDING_ATTACHMENT_MAX_ENTRIES;
+        let max_bytes = formless_protocol::PENDING_ATTACHMENT_METADATA_BYTES;
+        let mut stmt=self.ps("SELECT length(CAST(att AS BLOB)), CASE WHEN length(CAST(att AS BLOB))<=?2 THEN att ELSE NULL END FROM pending_attachments WHERE session_id=?1 ORDER BY rowid LIMIT ?3")?;
+        let rows = stmt.query_map(
+            params![session_id, max_bytes as i64, (max_rows + 1) as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let (size, text) = row?;
+            if out.len() >= max_rows || size < 0 || size as u64 > max_bytes as u64 {
+                return Err(anyhow!(
+                    "pending attachment inventory exceeds metadata bounds"
+                ));
+            }
+            let text = text.context("pending attachment metadata unavailable")?;
+            bytes = bytes.saturating_add(text.len());
+            if bytes > max_bytes {
+                return Err(anyhow!(
+                    "pending attachment inventory exceeds metadata bounds"
+                ));
+            }
+            let value: Value =
+                serde_json::from_str(&text).context("pending attachment metadata is corrupt")?;
+            if !value.is_object() {
+                return Err(anyhow!("pending attachment metadata is not a record"));
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     /// Take the Session's held attachments (they go with its next message).
     pub fn take_pending_attachments(&self, session_id: &str) -> Result<Vec<Value>> {
         let out = self.pending_attachments(session_id)?;
@@ -6199,28 +6450,56 @@ impl Store {
     }
 
     /// Token use since `since` grouped by `by` ("model", "provider",
-    /// "purpose", "role", "session", else the UTC day), then by provider
-    /// and model for pricing.
+    /// "purpose", "role", the immutable "session" ID, else the UTC day),
+    /// then by provider and model for pricing.
     pub fn usage_grouped(&self, since: Option<&str>, by: &str) -> Result<Vec<GroupedUsage>> {
+        self.query_usage_groups(since, by, |usage, _| usage)
+    }
+
+    pub(crate) fn usage_grouped_with_labels(
+        &self,
+        since: Option<&str>,
+        by: &str,
+    ) -> Result<Vec<(GroupedUsage, Option<String>)>> {
+        self.query_usage_groups(since, by, |usage, label| (usage, label))
+    }
+
+    fn query_usage_groups<T>(
+        &self,
+        since: Option<&str>,
+        by: &str,
+        project: impl Fn(GroupedUsage, Option<String>) -> T,
+    ) -> Result<Vec<T>> {
         let key = match by {
             "model" => "u.model",
             "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
             "purpose" => "u.source",
-            "session" => "COALESCE(s.name, u.session_id)",
+            "session" => "u.session_id",
             "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
             _ => "substr(u.created_at, 1, 10)",
+        };
+        let (label, join, order) = if by == "session" {
+            (
+                "COALESCE(s.name, u.session_id)",
+                "LEFT JOIN sessions s ON s.id=u.session_id",
+                // Keep alphabetical labels on token-count ties. The ID
+                // makes buckets with an identical label stay contiguous.
+                "10, 1",
+            )
+        } else {
+            ("NULL", "", "1")
         };
         let mut stmt = self.ps(&format!(
             "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
                SUM(u.cached_tokens), SUM(u.cache_write_tokens),
-               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown)
-             FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
+               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
+             FROM run_usage u {join}
              WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY 1"
+             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
         ))?;
         let rows = stmt
             .query_map(params![since], |r| {
-                Ok((
+                let usage = (
                     r.get(0)?,
                     r.get(1)?,
                     r.get(2)?,
@@ -6230,9 +6509,10 @@ impl Store {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
-                ))
+                );
+                Ok(project(usage, r.get(9)?))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
@@ -6315,44 +6595,6 @@ impl Store {
     /// Mark the attachments with these artifact ids as expired in the
     /// messages that carry them, so every client and the model's history
     /// say so instead of pointing at a removed file (#858).
-    pub fn mark_attachments_expired(&self, ids: &[String]) -> Result<usize> {
-        let mut changed = 0;
-        for id in ids {
-            let rows: Vec<(String, String)> = {
-                let mut stmt =
-                    self.ps("SELECT id, meta FROM messages WHERE role='user' AND meta LIKE ?1")?;
-                let rows = stmt
-                    .query_map(params![format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                rows
-            };
-            for (msg_id, meta) in rows {
-                let Ok(mut v) = serde_json::from_str::<Value>(&meta) else {
-                    continue;
-                };
-                let mut hit = false;
-                for a in v["attachments"].as_array_mut().into_iter().flatten() {
-                    if a["id"].as_str() == Some(id.as_str()) && a["expired"] != true {
-                        a["expired"] = json!(true);
-                        hit = true;
-                    }
-                }
-                if hit {
-                    self.ex(
-                        "UPDATE messages SET meta=?1 WHERE id=?2",
-                        params![v.to_string(), msg_id],
-                    )?;
-                    changed += 1;
-                }
-            }
-        }
-        if changed > 0 {
-            self.rewrites
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(changed)
-    }
-
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
         self.ex(
             "DELETE FROM artifacts WHERE session_id=?1",
@@ -8658,3 +8900,17 @@ mod thinking_metadata_tests;
 #[cfg(test)]
 #[path = "applied_proposal_read_tests.rs"]
 mod applied_proposal_read_tests;
+
+#[cfg(test)]
+#[path = "pending_attachment_inventory_storage_tests.rs"]
+mod pending_attachment_inventory_tests;
+
+#[path = "reviewed_reference_store.rs"]
+mod reviewed_reference_store;
+
+#[cfg(test)]
+#[path = "preview_schema_compat_tests.rs"]
+mod preview_schema_compat_tests;
+
+#[path = "session_selection_store.rs"]
+mod session_selection_store;

@@ -993,3 +993,11 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 .forecast-warnings { font-size: 0.875rem; overflow-wrap: anywhere; }
 .forecast-warnings summary { cursor: pointer; }
 .forecast-warnings ul { max-height: 10rem; overflow-y: auto; margin: 0.25rem 0; padding-inline-start: 1.5rem; }
+
+/* Recent retained invocation sample: shape and text supplement colour. */
+.tool-recent { display: block; margin-top: 0.25rem; }
+.tool-recent-bars { display: flex; align-items: flex-end; gap: 1px; width: 5rem; max-width: 100%; height: 0.75rem; margin-left: auto; }
+.tool-recent-bars > span { flex: 1; min-width: 0; background: currentColor; }
+.tool-recent-bars .success { height: 100%; }
+.tool-recent-bars .failure { height: 30%; }
+.tool-recent-counts { display: block; font-size: 0.6875rem; white-space: nowrap; }

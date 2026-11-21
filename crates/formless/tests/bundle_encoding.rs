@@ -113,6 +113,26 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn daemon_status_check_requires_a_live_reply_without_starting_a_daemon() {
+    let mut fixture = Fixture::new();
+    let healthy = fixture.output(&["daemon", "status", "--check"]);
+    assert!(healthy.status.success(), "{healthy:?}");
+    assert!(healthy.stdout.is_empty());
+
+    let mut child = fixture.daemon.take().unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let unhealthy = fixture.output(&["daemon", "status", "--check"]);
+    assert!(!unhealthy.status.success(), "{unhealthy:?}");
+    let status = fixture.output(&["daemon", "status", "--json"]);
+    assert!(status.status.success(), "{status:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap(),
+        json!({"running": false}),
+    );
+}
+
+#[test]
 fn every_cli_import_accepts_utf8_bom_and_names_utf16_conversion_errors() {
     let fixture = Fixture::new();
     let skill=base64::engine::general_purpose::STANDARD.encode("---\nname: bom-fixture\ndescription: Simple fixture notes\n---\nPrivate fixture instructions.\n");
