@@ -2756,7 +2756,6 @@ impl Shell {
                 destination,
                 notice,
             } => {
-                self.client_status = notice.clone();
                 if self.destination == destination {
                     self.resource_result = Some(notice);
                 }

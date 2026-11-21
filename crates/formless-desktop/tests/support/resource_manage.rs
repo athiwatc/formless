@@ -4,6 +4,46 @@ use formless_protocol::Request;
 use serde_json::json;
 
 #[gpui_kit::test]
+fn management_receipts_never_replace_the_global_footer_status(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::Notice("Connected".into()), window, cx);
+            s.run_command(Command::GoTo(Destination::Memory), window, cx);
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Done: Delete".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        settle_frames(window, cx);
+        assert_eq!(
+            window.find("resource-result").value().as_deref(),
+            Some("Done: Delete")
+        );
+        assert_eq!(shell.read(cx).client_status_notice(), "Connected");
+        shell.update(cx, |s, cx| {
+            s.run_command(Command::GoTo(Destination::Jobs), window, cx);
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Could not Delete: late rejection".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        settle_frames(window, cx);
+        assert_eq!(window.find("resource-result").value().as_deref(), Some(""));
+        assert_eq!(shell.read(cx).client_status_notice(), "Connected");
+    });
+}
+
+#[gpui_kit::test]
 fn resource_secondary_summaries_and_bounded_field_values(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     daemon_view(cx, handle, &shell);
