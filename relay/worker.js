@@ -241,9 +241,11 @@ export class RelayRoom {
     };
     await Promise.allSettled(Array.from({ length: Math.min(MAX_PUSH_IN_FLIGHT, eligible.length) }, deliver));
   }
-  async boundedPush(sid,work){
-    if(this.pushJobs.has(sid)||this.pushJobs.size>=4)throw new TransportError("push control work limit");
-    this.pushJobs.add(sid);try{return await work();}finally{this.pushJobs.delete(sid);}
+  async boundedPush(ws,sid,request,work){
+    if(this.pushJobs.has(sid)||this.pushJobs.size>=4)return this.sendControl(ws,{relay:"push_refused",reason:"busy",...request});
+    this.pushJobs.add(sid);
+    try{return await work();}
+    finally{this.pushJobs.delete(sid);}
   }
 
   async webSocketMessage(ws,message){
@@ -290,20 +292,28 @@ export class RelayRoom {
         const p=peers.find(p=>p.cid===cid&&p.daemon===n.sid);const target=p&&this.socket(p.browser);
         if(target)this.requestClose(target,packet.code===4002?4002:4001,"disconnected by daemon");return;
       }
-      if(att.role==="client"&&current?.ready&&packet?.relay==="push_subscribe"&&validSubscription(packet.sub,this.env.ALLOW_LOCAL_PUSH==="1",this.env.PUSH_HOSTS)){
-        return await this.boundedPush(n.sid,async()=>{
-          const subs=await this.state.storage.list({prefix:"push:",limit:MAX_SUBSCRIPTIONS});
+      if(att.role==="client"&&current?.ready&&packet?.relay==="push_subscribe"){
+        if(!validSubscription(packet.sub,this.env.ALLOW_LOCAL_PUSH==="1",this.env.PUSH_HOSTS)){
+          return this.sendControl(ws,{relay:"push_refused",reason:"invalid",operation:"subscribe"});
+        }
+        return await this.boundedPush(ws,n.sid,{operation:"subscribe"},async()=>{
           const key=await this.subKey(packet.sub.endpoint);
-          if(subs.size>=MAX_SUBSCRIPTIONS&&!subs.has(key))throw new TransportError("push subscription capacity");
+          const subs=await this.state.storage.list({prefix:"push:",limit:MAX_SUBSCRIPTIONS});
+          if(subs.size>=MAX_SUBSCRIPTIONS&&!subs.has(key))return this.sendControl(ws,{relay:"push_refused",reason:"capacity",operation:"subscribe"});
           await this.state.storage.put(key,packet.sub);
           this.sendControl(ws,{relay:"push_subscribed"});
         });
       }
-      if(att.role==="client"&&current?.ready&&packet?.relay==="push_unsubscribe"&&typeof packet.endpoint==="string"){
-        wireBytes(packet.endpoint,LIMITS.preReady);
+      if(att.role==="client"&&current?.ready&&packet?.relay==="push_unsubscribe"){
         const id=packet.id;
-        if(id!==undefined&&(typeof id!=="string"||!/^[a-f0-9-]{36}$/.test(id)))throw new TransportError("invalid push request id");
-        return await this.boundedPush(n.sid,async()=>{
+        if(id!==undefined&&(typeof id!=="string"||!/^[a-f0-9-]{36}$/.test(id))){
+          return this.sendControl(ws,{relay:"push_refused",reason:"invalid",operation:"unsubscribe"});
+        }
+        const request={operation:"unsubscribe",id};
+        if(typeof packet.endpoint!=="string"||!packet.endpoint){
+          return this.sendControl(ws,{relay:"push_refused",reason:"invalid",...request});
+        }
+        return await this.boundedPush(ws,n.sid,request,async()=>{
           await this.state.storage.delete(await this.subKey(packet.endpoint));
           this.sendControl(ws,{relay:"push_unsubscribed",id});
         });

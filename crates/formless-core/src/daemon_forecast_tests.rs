@@ -329,6 +329,7 @@ async fn prospective_edit_retry_and_resume_require_consent_before_any_mutation()
             },
             1 => Request::RetryRun {
                 session_id: sid.clone(),
+                expected_run_id: None,
                 model: None,
                 keep_original: true,
             },
@@ -444,6 +445,7 @@ async fn retry_override_is_the_immutable_forecast_and_dispatch_model() {
     st.append_message(&sid, "user", "original").unwrap();
     d.handle(Request::RetryRun {
         session_id: sid.clone(),
+        expected_run_id: None,
         model: Some("override".into()),
         keep_original: false,
     })
@@ -463,6 +465,39 @@ async fn retry_override_is_the_immutable_forecast_and_dispatch_model() {
         "override"
     );
     cancel_fixture_run(&d, &sid).await;
+}
+
+#[tokio::test]
+async fn retry_expected_run_rejects_a_stale_selection_without_editing_or_forking() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    cfg.limits.forecast_confirm_usd = None;
+    cfg.save(&paths).unwrap();
+    let st = Store::open(&paths.db_file()).unwrap();
+    let old = st.create_run(&sid).unwrap();
+    st.set_run_status(&old, "completed").unwrap();
+    let latest = st.create_run(&sid).unwrap();
+    st.set_run_status(&latest, "completed").unwrap();
+    st.append_message(&sid, "user", "second question").unwrap();
+    st.append_message(&sid, "assistant", "current answer")
+        .unwrap();
+    let error = d
+        .handle(Request::RetryRun {
+            session_id: sid.clone(),
+            expected_run_id: Some(old),
+            model: Some("override".into()),
+            keep_original: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("the latest Run changed"));
+    assert_eq!(st.last_run(&sid).unwrap().unwrap().0, latest);
+    assert_eq!(st.list_sessions().unwrap().len(), 1);
+    assert_eq!(
+        st.list_messages(&sid).unwrap().last().unwrap().content,
+        "current answer"
+    );
+    assert!(d.runs.locked().is_empty());
 }
 
 #[tokio::test]

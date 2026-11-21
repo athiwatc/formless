@@ -2456,6 +2456,7 @@ impl Daemon {
             }
             Request::RetryRun {
                 session_id,
+                expected_run_id,
                 model,
                 keep_original,
             } => {
@@ -2465,6 +2466,15 @@ impl Daemon {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before retrying",
                     )));
+                }
+                if let Some(expected) = expected_run_id.as_deref() {
+                    let latest = self.with_store(|st| st.last_run(&session_id))?;
+                    if latest.as_ref().map(|(id, _)| id.as_str()) != Some(expected) {
+                        return Err(RequestFailure::invalid(
+                            "the latest Run changed; open Retry again",
+                        )
+                        .into());
+                    }
                 }
                 let cfg = self.config()?;
                 let model = model
@@ -3006,10 +3016,24 @@ impl Daemon {
                 } else {
                     "now"
                 };
-                Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
-                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
-                )
+                let mut response = json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                    "override_source": override_source, "effective_value": effective.setting_value(&key)?});
+                if matches!(
+                    key.as_str(),
+                    "provider.routing_models"
+                        | "provider.fallback_models"
+                        | "provider.routing_fast_models"
+                        | "provider.routing_strong_models"
+                        | "provider.aliases"
+                ) || key.starts_with("provider.aliases.")
+                {
+                    let warnings =
+                        crate::routing_policy::routing_subset_warnings(&effective.provider);
+                    if !warnings.is_empty() {
+                        response["routing_warnings"] = json!(warnings);
+                    }
+                }
+                Ok(response)
             }
             Request::RevokeApproval {
                 tool_id,
@@ -17219,6 +17243,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".pypirc",
         ".yarnrc",
         ".yarnrc.yml",
+        "credentials.tfrc.json",
+        ".terraformrc",
+        "terraform.rc",
         "credentials",
         "credentials.toml",
         ".git-credentials",
