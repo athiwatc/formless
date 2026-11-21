@@ -38,7 +38,8 @@ def render(page, source, lang, kind):
     return page.evaluate(r'''({source,lang,kind})=>{
       const node=kind==='fence'?__fixture.markdown('```'+lang+'\n'+source+'\n```'):__fixture.codeBlock(source,lang);
       const code=node.querySelector('pre code');
-      return {text:code.textContent,comments:[...code.querySelectorAll('.tok-com')].map(c=>c.textContent)};
+      const tokens=selector=>[...code.querySelectorAll(selector)].map(c=>c.textContent);
+      return {text:code.textContent,comments:tokens('.tok-com'),keys:tokens('.tok-key'),strings:tokens('.tok-str')};
     }''',{'source':source,'lang':lang,'kind':kind})
 
 def check(page):
@@ -66,6 +67,29 @@ def check(page):
     for kind in ['block','fence']:
       for lang,source,comments in cases:
         actual=render(page,source,lang,kind)
-        assert actual=={'text':source,'comments':comments},(kind,lang,source,actual,comments)
+        assert actual['text']==source and actual['comments']==comments,(kind,lang,source,actual,comments)
+    if args.case!='python':
+      for quote, middle, tail in [
+          ('"', r'\""" keep # escaped quote', ''),
+          ("'", 'keep # literal', '\\'),
+      ]:
+        raw = quote*3 + '\n' + middle + '\nname = not a key\n# still content\n' + tail + quote*5
+        source = 'text = ' + raw + (' ' if tail else '') + '# outside\nname = "formless" # comment'
+        for kind in ['block','fence']:
+          actual=render(page,source,'TOML',kind)
+          assert actual=={
+              'text':source,'comments':['# outside','# comment'],
+              'keys':['text','name'],'strings':[raw,'"formless"'],
+          },(kind,quote,actual)
+        for first_line in ['a = b', '\n= continued']:
+          raw = quote*3 + first_line + '\n# inside the array value\n' + quote*3
+          source = 'items = [\n  ' + raw + '\n]\n# outside'
+          for kind in ['block','fence']:
+            actual=render(page,source,'TOML',kind)
+            assert actual=={
+                'text':source,'comments':['# outside'],
+                'keys':['items'],'strings':[raw],
+            },(kind,quote,actual)
+      print('PASS TOML basic and literal multiline strings in code blocks and Markdown fences')
     print(f'PASS {len(cases)} comment/source controls through both shipped codeBlock and Markdown fence DOM ({2*len(cases)} views)')
 run(Path(__file__).resolve().parent,hook,check,args.app)
