@@ -122,6 +122,18 @@ fn snapshot_jsonl_matches_raw_entries_and_selection() {
 }
 
 #[test]
+fn very_large_since_values_keep_history_when_the_cutoff_is_unrepresentable() {
+    let fixture = Fixture::new();
+    fixture.write("daemon.log", "2001-01-02T03:04:05Z INFO early fixture\n");
+    let original = successful_stdout(fixture.run(&["--jsonl"]));
+    assert!(original.contains("early fixture"));
+    for since in ["100000000d", "18446744073709551615"] {
+        let result = successful_stdout(fixture.run(&["--jsonl", "--since", since]));
+        assert_eq!(result, original, "{since}");
+    }
+}
+
+#[test]
 fn empty_jsonl_has_only_the_existing_stderr_diagnostic() {
     let fixture = Fixture::new();
     let empty = fixture.run(&["--jsonl", "--lines=0"]);

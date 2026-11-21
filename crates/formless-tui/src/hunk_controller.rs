@@ -348,6 +348,21 @@ impl App {
                     self.hunk_review.reset_viewport();
                 }
             }
+            KeyCode::Char('N' | 'P') => {
+                if let Some(review) = &self.hunk_review.document {
+                    match hunk_view::navigate_pending(
+                        &review.files,
+                        self.hunk_review.focus,
+                        key.code == KeyCode::Char('N'),
+                    ) {
+                        Some(next) => {
+                            self.hunk_review.focus = next;
+                            self.hunk_review.reset_viewport();
+                        }
+                        None => self.notes.push("All hunks decided.".into()),
+                    }
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.hunk_review.move_viewport(ViewportMove::Rows(1))
             }
@@ -577,30 +592,43 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         "Waiting for the server; closing does not cancel a dispatched action.".into()
     } else if view.total_hunks == 0 {
         "No editable text hunks. Excluded files remain listed above.".into()
+    } else if view.pending_hunks == 0 {
+        "All hunks decided.".into()
     } else {
         "Comments use server-derived path:line context; idle comments do not start a Run.".into()
     };
     if let Some(comment) = &app.hunk_review.comment {
-        let panel = ui::panel(" Comment · Enter send · Shift+Enter newline · Esc back ", app.color, Color::Yellow);
+        let panel = ui::panel(
+            " Comment · Enter send · Shift+Enter newline · Esc back ",
+            app.color,
+            Color::Yellow,
+        );
         let mut editor = panel.inner(rows[2]);
         f.render_widget(panel, rows[2]);
-        let notice = app.hunk_review.error.as_ref().map(|error| {
-            format!("Server: {}", hunk_view::display_text(error))
-        }).or_else(|| app.hunk_review.busy.then(|| "Saving comment…".into()));
+        let notice = app
+            .hunk_review
+            .error
+            .as_ref()
+            .map(|error| format!("Server: {}", hunk_view::display_text(error)))
+            .or_else(|| app.hunk_review.busy.then(|| "Saving comment…".into()));
         if let Some(notice) = notice.filter(|_| editor.height > 0) {
             editor.height -= 1;
             let status = Rect::new(editor.x, editor.bottom(), editor.width, 1);
             f.render_widget(Paragraph::new(notice), status);
         }
         if !editor.is_empty() {
-            let (lines, (row, col)) = editor_viewport::comment(comment, editor.width.into(), editor.height.into());
-            f.render_widget(Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>()), editor);
+            let (lines, (row, col)) =
+                editor_viewport::comment(comment, editor.width.into(), editor.height.into());
+            f.render_widget(
+                Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>()),
+                editor,
+            );
             if !app.hunk_review.busy {
                 f.set_cursor_position((editor.x + col as u16, editor.y + row as u16));
             }
         }
     } else {
-        let footer = format!("n/p hunk · a keep · r reject · u undo · c comment · f all files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
+        let footer = format!("n/p hunk · N/P pending · a keep · r reject · u undo · c comment · f files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
             if is_tool { " · Ctrl+S normal save" } else { "" },
             status);
         f.render_widget(

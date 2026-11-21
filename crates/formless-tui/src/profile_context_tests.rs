@@ -209,7 +209,11 @@ fn wizard_and_status_identify_profile_and_cache_alternate_setup_hints() {
 fn edited_role_shows_preserved_advanced_settings_in_the_actual_form() {
     let role = serde_json::json!({"provider":"default", "model":"auto", "description":"Primary role", "candidates":["fast","precise"], "reasoning_effort":"high", "max_turns":7, "system":"Private system content"});
     let form = settings::Form::role(Some("primary"), Some(&role));
-    let text = screen(|frame| draw_settings_form(frame, &form, false, true), 120, 30);
+    let text = screen(
+        |frame| draw_settings_form(frame, &form, false, true),
+        120,
+        30,
+    );
     for label in [
         "candidates",
         "fast",

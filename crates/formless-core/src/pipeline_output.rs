@@ -1,9 +1,15 @@
 //! Client-local atomic result publication. A failed Run never calls this helper.
 use anyhow::{ensure, Context, Result};
-use std::fs::{File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{File, Metadata};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+#[path = "pipeline_output_windows.rs"]
+mod windows_access;
+
 pub const MAX_RESULT_FILE_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct OutputCommit {
@@ -20,7 +26,7 @@ impl Drop for Temporary {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-fn ordinary_destination(path: &Path) -> Result<()> {
+fn ordinary_destination(path: &Path) -> Result<Option<Metadata>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             ensure!(
@@ -39,9 +45,9 @@ fn ordinary_destination(path: &Path) -> Result<()> {
                     "output destination is a reparse point"
                 );
             }
-            Ok(())
+            Ok(Some(metadata))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -63,7 +69,7 @@ fn create_private(path: &Path) -> Result<File> {
         Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
             CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
+            FILE_SHARE_WRITE, WRITE_DAC,
         },
     };
     let security = crate::win_pipe::OwnerOnly::new()?;
@@ -71,7 +77,7 @@ fn create_private(path: &Path) -> Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_WRITE,
+            GENERIC_WRITE | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             security.as_raw().cast(),
             CREATE_NEW,
@@ -84,6 +90,37 @@ fn create_private(path: &Path) -> Result<File> {
         std::io::Error::last_os_error()
     );
     Ok(unsafe { File::from_raw_handle(handle.cast()) })
+}
+
+fn preserve_destination_access(file: &File, destination: &Path, metadata: &Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, PermissionsExt},
+        };
+        let _ = destination;
+        if file.metadata()?.gid() != metadata.gid() {
+            // SAFETY: the destination group is data and this descriptor is
+            // the still-owned private temporary file. Leave its owner alone.
+            if unsafe { libc::fchown(file.as_raw_fd(), !0 as libc::uid_t, metadata.gid()) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("preserve output destination group");
+            }
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(metadata.mode() & 0o777))?;
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        windows_access::copy_dacl(destination, file)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = destination;
+        file.set_permissions(metadata.permissions())?;
+    }
+    Ok(())
 }
 
 /// Commit exactly one complete bounded result. This refuses final symlinks and
@@ -128,6 +165,11 @@ fn write_with(
         .context("output temporary file unavailable")?;
     write(file, bytes).context("write complete Run result")?;
     file.sync_all().context("flush complete Run result")?;
+    if let Some(metadata) = ordinary_destination(&destination)? {
+        preserve_destination_access(file, &destination, &metadata)
+            .context("preserve existing output destination access")?;
+        file.sync_all().context("flush Run output permissions")?;
+    }
     owned.file.take(); // Windows rename must not retain an open writer.
     ordinary_destination(&destination)?;
     std::fs::rename(&owned.path, &destination)
@@ -164,6 +206,11 @@ mod tests {
         let fixture = fixture();
         let path = fixture.0.join("answer.json");
         std::fs::write(&path, b"old output").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         assert!(write_with(&path, b"new complete output", |file, bytes| {
             file.write_all(&bytes[..3])?;
             anyhow::bail!("private injected write failure")
@@ -179,10 +226,57 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
+                0o644
             );
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn output_updates_shared_access_only_after_writing_and_keeps_new_paths_private() {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, PermissionsExt},
+        };
+        let fixture = fixture();
+        let shared = fixture.0.join("shared");
+        let existing = File::create(&shared).unwrap();
+        let original_group = existing.metadata().unwrap().gid();
+        // Exercise a different group where this fixture can set one.
+        let alternate = if unsafe { libc::geteuid() } == 0 {
+            if original_group == 65534 {
+                65533
+            } else {
+                65534
+            }
+        } else {
+            original_group
+        };
+        assert_eq!(
+            unsafe { libc::fchown(existing.as_raw_fd(), !0 as libc::uid_t, alternate) },
+            0
+        );
+        existing
+            .set_permissions(std::fs::Permissions::from_mode(0o660))
+            .unwrap();
+        drop(existing);
+        write_with(&shared, b"finished", |file, bytes| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            Ok(file.write_all(bytes)?)
+        })
+        .unwrap();
+        let metadata = std::fs::metadata(&shared).unwrap();
+        assert_eq!(metadata.gid(), alternate);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        assert_eq!(std::fs::read(shared).unwrap(), b"finished");
+
+        let private = fixture.0.join("new");
+        write_result_file(&private, b"private").unwrap();
+        assert_eq!(
+            std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     #[test]
     fn output_limits_and_invalid_parent_leave_old_destination_untouched() {
         let fixture = fixture();

@@ -176,7 +176,11 @@ fn hunk_review_scroll_stops_at_rendered_edges_and_recovers_immediately() {
     let up = render(&mut app, width, height);
     assert_eq!(app.hunk_review.scroll, offset - 1);
     let first_diff = |screen: &str| {
-        screen.lines().find(|line| line.contains("diff-row-")).unwrap().to_owned()
+        screen
+            .lines()
+            .find(|line| line.contains("diff-row-"))
+            .unwrap()
+            .to_owned()
     };
     assert_ne!(first_diff(&bottom), first_diff(&up));
 
@@ -208,7 +212,10 @@ fn hunk_review_scroll_stops_at_rendered_edges_and_recovers_immediately() {
     let second = render(&mut app, width, height);
     assert_eq!(app.hunk_review.focus, 1);
     assert!(second.contains("diff-row-40") && !second.contains("diff-row-01"));
-    assert!(sent.try_recv().is_err(), "viewport navigation sends no requests");
+    assert!(
+        sent.try_recv().is_err(),
+        "viewport navigation sends no requests"
+    );
 }
 
 #[test]
@@ -223,6 +230,7 @@ fn hunk_review_reachable_keys_use_opaque_ids_hashes_and_preserve_composer() {
         "image.png",
         "binary:",
         "n/p hunk",
+        "N/P pending",
         "a keep",
         "r reject",
         "u undo",
@@ -232,7 +240,8 @@ fn hunk_review_reachable_keys_use_opaque_ids_hashes_and_preserve_composer() {
     ] {
         assert!(screen.contains(expected), "missing {expected}: {screen}");
     }
-    app.key(key(KeyCode::Char('n')));
+    assert!(screen.contains("2 pending · 0 kept · 0 rejected"));
+    app.key(key(KeyCode::Char('N')));
     app.key(key(KeyCode::Char('a')));
     let accept = hunk_next(&sent);
     assert!(
@@ -256,7 +265,8 @@ fn hunk_review_reachable_keys_use_opaque_ids_hashes_and_preserve_composer() {
         .unwrap(),
     );
     app.drain_daemon();
-    app.key(key(KeyCode::Char('p')));
+    assert!(render(&mut app, 110, 30).contains("1 pending · 1 kept · 0 rejected"));
+    app.key(key(KeyCode::Char('P')));
     app.key(key(KeyCode::Char('r')));
     let reject = hunk_next(&sent);
     assert!(
@@ -292,6 +302,12 @@ fn hunk_review_reachable_keys_use_opaque_ids_hashes_and_preserve_composer() {
         .unwrap(),
     );
     app.drain_daemon();
+    let focus = app.hunk_review.focus;
+    app.key(key(KeyCode::Char('N')));
+    assert_eq!(app.hunk_review.focus, focus);
+    assert!(sent.try_recv().is_err());
+    assert_eq!(app.notes.last().unwrap(), "All hunks decided.");
+    assert!(render(&mut app, 110, 30).contains("All hunks decided."));
     app.key(key(KeyCode::Char('a')));
     assert!(
         sent.try_recv().is_err(),
