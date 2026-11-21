@@ -2756,9 +2756,13 @@
       + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
       + (t.error ? " · " + t.error : "");
   }
+  function storedSessionModel(session) {
+    return session?.model || S.settings?.provider?.model || "";
+  }
   async function openModelPicker(onPick) {
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
+    const model = storedSessionModel(session);
     const efforts = ["", "low", "medium", "high"];
     const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
     const list = h("ul", { class: "picker-list", role: "listbox" });
@@ -2775,6 +2779,7 @@
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
         h("h2", null, title),
+        h("p", { class: "muted picker-current-model" }, model ? "Current selection: " + model : "Current model unavailable"),
         input, list,
         selectionOnly ? null : h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
         h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }),
@@ -4177,7 +4182,12 @@
     const others = S.others || [];
     $("status-others").classList.toggle("hidden", !others.length);
     $("status-others").textContent = others.length ? " · also open in " + othersText(others) : "";
-    $("status-model").textContent = (s && s.model) || S.settings?.provider?.model || "";
+    const model = storedSessionModel(s);
+    const modelButton = $("status-model");
+    const modelText = model || "Model unavailable";
+    const modelLabel = model ? "Change model (" + model + ")" : "Model unavailable. Choose model.";
+    if (modelButton.textContent !== modelText) modelButton.textContent = modelText;
+    if (modelButton.getAttribute("aria-label") !== modelLabel) modelButton.setAttribute("aria-label", modelLabel);
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
     $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";

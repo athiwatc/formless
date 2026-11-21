@@ -40,7 +40,7 @@ function fixture() {
     setSessionModel: (m, e) => applied.push([m, e]), note: () => {}, uiMoney: v => String(v),
     fuzzyMatch: (q, id) => (id.includes(q.trim()) ? [1, []] : null),
   });
-  vm.runInContext(['modelContextLabel', 'modelDetail', 'modelTestText', 'openModelPicker'].map(fn).join('\n'), c);
+  vm.runInContext(['modelContextLabel', 'modelDetail', 'modelTestText', 'storedSessionModel', 'openModelPicker'].map(fn).join('\n'), c);
   c.done = vm.runInContext('openModelPicker()', c);
   const find = (n, pred) => (pred(n) ? n : n.children.map(k => find(k, pred)).find(Boolean));
   c.status = () => find(c.dialog, n => n.cls.has('modal-actions')).children[0];
