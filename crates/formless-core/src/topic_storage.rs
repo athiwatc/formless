@@ -10,6 +10,51 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::DirBuilderExt;
 
 impl Store {
+    pub(crate) fn add_topic_permission_rule(
+        &self,
+        id: &str,
+        mut rule: formless_protocol::TopicPermissionRule,
+    ) -> Result<TopicInfo> {
+        if rule.pattern.is_empty() || rule.pattern.chars().count() > 1024 {
+            bail!("permission rule pattern must contain 1..=1024 characters");
+        }
+        if rule
+            .acp_agent
+            .as_ref()
+            .is_some_and(|agent| agent.trim().is_empty())
+            || rule.acp_agent.is_some() && rule.harness.is_some_and(|kind| kind != HarnessKind::Acp)
+        {
+            bail!("acp_agent requires an ACP harness filter");
+        }
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            if topic.permission_rules.len() >= 256 {
+                bail!("topic reached the 256 permission rule limit");
+            }
+            rule.rule_id = uuid::Uuid::new_v4().to_string();
+            topic.permission_rules.push(rule);
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn remove_topic_permission_rule(&self, id: &str, rule: &str) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            let previous = topic.permission_rules.len();
+            topic.permission_rules.retain(|saved| saved.rule_id != rule);
+            if previous == topic.permission_rules.len() {
+                bail!("permission rule not found");
+            }
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
     pub(crate) fn update_topic_message(&self, message: &MessageInfo) -> Result<()> {
         self.note_rewrite();
         self.conn.execute(
@@ -850,7 +895,11 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
         )
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(TopicInfo {
-        permission_rules: vec![],
+        permission_rules: serde_json::from_str(&st.conn.query_row(
+            "SELECT permission_rules FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
         limits: Default::default(),
         allow_external_context: st.conn.query_row(
             "SELECT allow_external_context FROM topics WHERE id=?1",

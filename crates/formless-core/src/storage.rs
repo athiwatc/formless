@@ -802,7 +802,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 74;
+pub const SCHEMA_VERSION: i64 = 75;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 72] = [
+const MIGRATIONS: [(i64, MigrationStep); 73] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1284,6 +1284,9 @@ const MIGRATIONS: [(i64, MigrationStep); 72] = [
         add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
     }),
     (74, |c| add_column(c, "messages", "generated_by TEXT")),
+    (75, |c| {
+        add_column(c, "topics", "permission_rules TEXT NOT NULL DEFAULT '[]'")
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
