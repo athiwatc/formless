@@ -1990,7 +1990,9 @@ fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run_cli(cli) {
-        eprintln!("error: {e:#}");
+        if !e.is::<DoctorProblems>() {
+            eprintln!("error: {e:#}");
+        }
         std::process::exit(exit_code(&e));
     }
 }
@@ -2359,11 +2361,19 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             restore_drill: true,
             ..
         }) => run_restore_drill(&paths, None),
-        Some(Cmd::Doctor { json: true, .. }) => {
-            println!("{}", serde_json::to_string_pretty(&doctor_json(&paths)?)?);
+        Some(Cmd::Doctor { json, fix, .. }) => {
+            let healthy = if json {
+                let report = doctor_json(&paths)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                report["problems"].as_array().is_some_and(Vec::is_empty)
+            } else {
+                doctor(paths, fix)?
+            };
+            if !healthy {
+                return Err(DoctorProblems.into());
+            }
             Ok(())
         }
-        Some(Cmd::Doctor { fix, .. }) => doctor(paths, fix),
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
@@ -3548,11 +3558,23 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
     }
 }
 
-fn doctor(paths: Paths, fix: bool) -> Result<()> {
+/// Doctor already wrote the full diagnostic report before returning this verdict.
+#[derive(Debug)]
+struct DoctorProblems;
+
+impl std::fmt::Display for DoctorProblems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor found unresolved diagnostic problems")
+    }
+}
+
+impl std::error::Error for DoctorProblems {}
+
+fn doctor(paths: Paths, fix: bool) -> Result<bool> {
     let problems = doctor_report(&paths, false)?;
     if problems.is_empty() {
         println!("\nno problems found");
-        return Ok(());
+        return Ok(true);
     }
     println!("\n{} problem(s):", problems.len());
     for p in &problems {
@@ -3572,10 +3594,10 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
                 fixes.len()
             );
         }
-        return Ok(());
+        return Ok(false);
     }
     if fixes.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     println!("\nfixing:");
     for f in fixes {
@@ -3598,7 +3620,7 @@ fn doctor(paths: Paths, fix: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(left.is_empty())
 }
 
 /// Secrets out of text meant for others: bearer tokens, API keys, pairing

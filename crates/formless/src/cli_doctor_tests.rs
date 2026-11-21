@@ -154,7 +154,7 @@ impl Fixture {
         let raw = out.join().unwrap();
         let stderr = err.join().unwrap();
         assert!(
-            status.success(),
+            matches!(status.code(), Some(0 | 1)),
             "doctor child failed: {}",
             String::from_utf8_lossy(&stderr)
         );
@@ -220,9 +220,16 @@ fn doctor_child_fixture() {
     );
     print!("{BEGIN}");
     std::io::stdout().flush().unwrap();
-    super::run_cli(cli).unwrap();
-    std::io::stdout().flush().unwrap();
+    let status = match super::run_cli(cli) {
+        Ok(()) => 0,
+        Err(error) if error.is::<super::DoctorProblems>() => super::exit_code(&error),
+        Err(error) => panic!("doctor child failed: {error:#}"),
+    };
     println!("{}", END.trim_end());
+    std::io::stdout().flush().unwrap();
+    if status != 0 {
+        std::process::exit(status);
+    }
 }
 
 #[test]
@@ -258,8 +265,9 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
     cfg.save(&f.paths).unwrap();
     let before = std::fs::read(f.paths.config_file()).unwrap();
     let human = f.run("p", &["doctor"]);
-    assert!(
-        human.status.success(),
+    assert_eq!(
+        human.status.code(),
+        Some(1),
         "{}",
         String::from_utf8_lossy(&human.stderr)
     );
@@ -269,8 +277,9 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
         "{text}"
     );
     let json = f.run("p", &["doctor", "--json"]);
-    assert!(
-        json.status.success(),
+    assert_eq!(
+        json.status.code(),
+        Some(1),
         "{}",
         String::from_utf8_lossy(&json.stderr)
     );
@@ -303,8 +312,9 @@ fn unconfigured_doctor_names_the_profile_and_offers_saved_setup_elsewhere() {
     let before = std::fs::read(f.paths.config_file()).unwrap();
     for active in ["default", "scratch"] {
         let doctor = f.run(active, &["doctor"]);
-        assert!(
-            doctor.status.success(),
+        assert_eq!(
+            doctor.status.code(),
+            Some(1),
             "{}",
             String::from_utf8_lossy(&doctor.stderr)
         );
@@ -315,8 +325,9 @@ fn unconfigured_doctor_names_the_profile_and_offers_saved_setup_elsewhere() {
             "{text}"
         );
         let json = f.run(active, &["doctor", "--json"]);
-        assert!(
-            json.status.success(),
+        assert_eq!(
+            json.status.code(),
+            Some(1),
             "{}",
             String::from_utf8_lossy(&json.stderr)
         );
