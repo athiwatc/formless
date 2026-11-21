@@ -819,5 +819,6 @@ fn harness_label(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::Claude => "Claude",
         HarnessKind::Codex => "Codex",
+        HarnessKind::OpenCode => "OpenCode",
     }
 }
