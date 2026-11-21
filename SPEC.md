@@ -7171,3 +7171,14 @@ The core rule-ineligible-kind denylist starts with trust_workspace: it always
 requires a fresh user decision, even with wildcard Reject rules or an earlier
 Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
 most 256 saved rules.
+
+SetTopicLimits is a user/client-only persisted control. Defaults allow three
+retries after the first attempt of a feature+trimmed step title, and twenty
+attempts across a topic. Both values accept the full u32 range; zero retries
+still allows the first attempt, while zero total attempts blocks all launches.
+Caps are checked atomically at launch, including concurrent launches. Hitting
+a cap refuses launch, marks the topic and feature NeedsUser, and raises a
+user_only question: "Raise limit and continue" or "Stop". Model answers are
+rejected. Raising increments the hit cap by its default (3 or 20, saturating)
+and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
+a model or harness automatically. SetTopicLimits itself changes limits only.
