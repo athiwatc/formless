@@ -143,6 +143,9 @@ without redesign.
   model-calibrated prompt estimator, including Tool schemas and images; an
   unresolved auto choice conservatively uses the largest candidate estimate. No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
+  An unmatched subset entry appears in configuration diagnostics. If the
+  entire subset is unmatched, auto-routing uses the first configured
+  candidate and explains the fallback in `/routing`.
   **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
   daemon start. A `primary` role is created with `model = "auto"` and the
   former routing pool as `candidates`, `provider.model` becomes
@@ -2180,6 +2183,10 @@ pattern (§4.4).
     memory) require `net`. They support HTTP(S) and check the scope on each
     redirect. The configured connection and total deadlines apply to both
     APIs, with one total budget for redirects and body reads (§13).
+    For fetchChunks, size is a maximum. The callback receives available data
+    as each chunk is read. At the end of a stream, incomplete UTF-8 is decoded
+    with replacement characters. A terminal read error is thrown after any
+    available data has been delivered.
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -4812,12 +4819,17 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
   highest required single-digit position and whether `$ARGUMENTS` occurs, using
   the same token rules as expansion. TUI/plain help, the TUI picker and CLI
-  metadata listings show `<arg1> … <argN>` and optional `[arguments…]` hints;
-  `commands list --json` exposes `max_position` and `uses_arguments` without
-  exposing template bodies. Names are 1–64 lowercase
+  metadata listings show a supplied `argument-hint` or derive
+  `<arg1> … <argN>` and `[arguments…]` from the placeholders.
+  `commands list --json` exposes `argument_hint`, `max_position`, and
+  `uses_arguments`. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
-  frontmatter accepts only a nonempty `description` string (plain, quoted or
-  block text). The key may have leading spaces or tabs; block content must be
+  frontmatter requires a nonempty `description` string (plain, quoted or
+  block text) and accepts an optional plain or quoted `argument-hint` string.
+  Each is limited to 512 bytes and screened for single-line display.
+  Other well-formed string keys produce a warning and have no effect on
+  template expansion or permissions. Keys may have leading spaces or tabs.
+  Block content must be
   indented more deeply than its key, so sibling keys remain subject to validation.
   Malformed templates are excluded with a stable diagnostic, never executed.
   Valid project templates override global templates. Built-in slash roots always win, including their subcommands; `/help` groups custom commands
@@ -5269,7 +5281,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless chat` | `--session ID` or `--new` | Line-mode chat with streamed answers and inline questions. |
 | `formless commands` | `list` | List local user-defined slash-command metadata without starting a daemon. |
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
-| `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
+| `formless config` | `path`, `list`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
@@ -5507,6 +5519,12 @@ previous headless Run's Session.
   usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
+  - `list [--filter TEXT] [--json]` reads documented settings from the local
+    profile and environment, with descriptions, defaults and settable status.
+    The optional filter matches dotted key names. The result marks changed
+    values and distinguishes null, empty and missing values from defaults
+    explained only in documentation. Credentials and other sensitive values
+    are excluded or masked. The command works before a daemon starts.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
     an unknown key exits 2.
   - `set KEY VALUE` goes through the settings API, so it's validated against
