@@ -73,6 +73,13 @@ pub(super) struct Panel {
 
 impl Shell {
     pub(super) fn prefill_session_slash(&mut self, field: crate::slash::Arguments, text: String) {
+        if self
+            .session_editor
+            .as_ref()
+            .is_none_or(|p| !self.topic_session_mutation_allowed(&p.id))
+        {
+            return;
+        }
         if let Some(panel) = &mut self.session_editor {
             panel.slash_prefill = Some((field, text));
         }
@@ -548,6 +555,7 @@ impl Shell {
         {
             return;
         }
+        let can_mutate = self.topic_session_mutation_allowed(id);
         let Some(panel) = &mut self.session_editor else {
             return;
         };
@@ -574,7 +582,7 @@ impl Shell {
                         Arguments::Pin => Field::Pin,
                         _ => Field::Name,
                     };
-                    if !text.is_empty() {
+                    if can_mutate && !text.is_empty() {
                         match field {
                             Arguments::Name => panel.name = text,
                             Arguments::Tags => {
