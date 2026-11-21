@@ -45,6 +45,11 @@ Bounded transport v1 is a separate framing layer; E2E frame v2 and daemon
 claim v3 remain unchanged. Worker, browser and daemon transport changes must be
 integrated together before use. Source changes perform no deployment.
 
+Ready clients receive a bounded `push_refused` control when the relay rejects
+notification setup or cleanup. The browser keeps its connection open, skips
+automatic registration for the refused endpoint in that room, and offers a
+manual retry in Settings.
+
 ## Bounded room transport (#638)
 
 The logical IPC ceiling stays **32 MiB**. Encrypted envelopes travel in 64 KiB

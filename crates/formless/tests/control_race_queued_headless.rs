@@ -89,7 +89,7 @@ impl Fixture {
             server: Some(server),
         }
     }
-    fn run(&self, mode: &str, quiet: bool, file: bool) -> Output {
+    fn run(&self, mode: &str, quiet: bool, file: bool, existing_session: bool) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
         command.env_clear();
         for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
@@ -103,17 +103,13 @@ impl Fixture {
             .env("FORMLESS_API_KEY", "private-headless-dummy")
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "error")
-            .args([
-                "run",
-                "private headless task",
-                "--session",
-                &self.session.id,
-                "--output",
-                mode,
-            ])
+            .args(["run", "private headless task", "--output", mode])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if existing_session {
+            command.args(["--session", &self.session.id]);
+        }
         if quiet {
             command.arg("--quiet");
         }
@@ -206,6 +202,13 @@ fn serve_peer(
                     json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"secure":true})
                 }
                 Request::ListSessions => json!([session]),
+                Request::CreateSession { .. } => {
+                    frame(
+                        &mut stream,
+                        ServerMessage::err(request.id, "fixture database is locked".into()),
+                    );
+                    continue;
+                }
                 Request::Subscribe { .. } => json!({}),
                 Request::SendMessage { session_id, .. } => {
                     assert_eq!(session_id, session.id);
@@ -239,7 +242,7 @@ fn queued_headless_ack_has_no_target_run_or_answer_in_any_output_mode() {
                 let fixture = Fixture::new();
                 let output_path = fixture.root.join("answer.txt");
                 std::fs::write(&output_path, b"EXISTING_RESULT_FILE_964").unwrap();
-                let output = fixture.run(mode, quiet, file);
+                let output = fixture.run(mode, quiet, file, true);
                 assert_eq!(
                     output.status.code(),
                     Some(2),
@@ -272,4 +275,14 @@ fn queued_headless_ack_has_no_target_run_or_answer_in_any_output_mode() {
             }
         }
     }
+}
+
+#[test]
+fn rejected_session_creation_finishes_the_headless_run() {
+    let fixture = Fixture::new();
+    let result = fixture.run("text", false, false, false);
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("fixture database is locked"));
+    assert!(!fixture.paths.last_run_session_file().exists());
 }

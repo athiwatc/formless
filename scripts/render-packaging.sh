@@ -16,6 +16,10 @@ out="${3:?output directory}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
   echo "error: '$version' is not a version like 0.2.0" >&2; exit 1; }
+if [[ "${version%%+*}" == *-* ]]; then
+  echo "error: stable channel manifests cannot be rendered for prerelease $version" >&2
+  exit 1
+fi
 # The packages must describe the version the binaries report.
 "$root/scripts/release-check.sh" "v$version" "${MANIFEST:-$root/Cargo.toml}" >/dev/null
 mkdir -p "$out/homebrew" "$out/aur" "$out/winget"

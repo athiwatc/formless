@@ -71,7 +71,7 @@ impl App {
     pub(super) fn start_rename(&mut self, id: &str, name: &str) {
         self.cancel_rename();
         self.renaming = Some(Rename::new(id, Some(name)));
-        self.view = View::Chat;
+        self.open_view(View::Chat);
     }
 
     pub(super) fn suggest_rename(&mut self, id: String) {
@@ -82,7 +82,7 @@ impl App {
         }
         self.cancel_rename();
         self.renaming = Some(Rename::new(&id, None));
-        self.view = View::Chat;
+        self.open_view(View::Chat);
         self.request(
             Pending::SuggestName { target: id.clone() },
             Request::SuggestSessionName { id },
