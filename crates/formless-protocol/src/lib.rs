@@ -717,6 +717,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "php"
                 | "lua"
                 | "tclsh"
+                | "julia"
+                | "dart"
         ) {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
@@ -728,13 +730,27 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         }
         // Run other programs through options or files they read (#1099).
         match base.as_str() {
+            _ if stem == "dotnet" => {
+                return Some("dotnet can build and execute repository code")
+            }
             "git" => {
                 return Some(
                     "git runs hooks and settings from the repository it works in, even for read-only sub-commands",
                 )
             }
+            _ if stem == "go" => {
+                return Some("the Go tool can build and execute repository code")
+            }
             "find" => return Some("find can run any program (-exec)"),
+            _ if stem == "pip" => {
+                return Some("pip can execute code from package build backends")
+            }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
+            "bundle" | "bundler" => return Some("Bundler can execute code in the Gemfile"),
+            _ if stem == "gem" => return Some("RubyGems can execute package build code"),
+            "gradle" | "gradlew" | "mvn" | "mvnw" => {
+                return Some("Gradle and Maven can execute repository build code")
+            }
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
             }
@@ -796,6 +812,24 @@ pub fn sensitive_read_warning(spec: &str) -> Option<&'static str> {
     })
 }
 
+/// The credential file in a conventional Composer configuration directory.
+pub fn is_composer_auth_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter().rev();
+    let matches = |part: Option<&std::ffi::OsStr>, expected: &str| {
+        part.is_some_and(|part| {
+            let name = part.to_string_lossy();
+            #[cfg(windows)]
+            let name = name.split(':').next().unwrap_or_default();
+            name.eq_ignore_ascii_case(expected)
+        })
+    };
+    if !matches(parts.next(), "auth.json") {
+        return false;
+    }
+    let parent = parts.next();
+    matches(parent, ".composer") || matches(parent, "composer") && matches(parts.next(), ".config")
+}
+
 /// Where an `fs:` Capability's path lies (SPEC §10.3), for approval
 /// prompts: `(warn, note)`. Credential reads always warn, including inside
 /// the working folder. Other secret folders and paths outside it warn too.
@@ -806,6 +840,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     let path = spec
         .strip_prefix("fs:read:")
         .or_else(|| spec.strip_prefix("fs:write:"))?;
+    if is_composer_auth_path(std::path::Path::new(path)) {
+        return Some((true, "holds Composer credentials".into()));
+    }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     const SECRET_DIRS: [(&str, &str); 7] = [
         (".ssh", "SSH keys"),
@@ -827,6 +864,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     {
         return Some((true, "holds account credentials".into()));
     }
+    if is_pulumi_credentials_path(std::path::Path::new(path)) {
+        return Some((true, "holds Pulumi credentials".into()));
+    }
     if segments.first() == Some(&"etc") {
         return Some((true, "system configuration".into()));
     }
@@ -837,6 +877,21 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     } else {
         (true, format!("outside the working folder {cwd}"))
     })
+}
+
+/// Pulumi stores access tokens in this file under its conventional home.
+pub fn is_pulumi_credentials_path(path: &std::path::Path) -> bool {
+    let mut parts = path.iter().rev();
+    let name_matches = |part: &std::ffi::OsStr, expected: &str| {
+        let name = part.to_string_lossy();
+        #[cfg(windows)]
+        let name = name.split(':').next().unwrap_or_default();
+        name.eq_ignore_ascii_case(expected)
+    };
+    parts
+        .next()
+        .is_some_and(|name| name_matches(name, "credentials.json"))
+        && parts.any(|part| name_matches(part, ".pulumi"))
 }
 
 /// One granted Capability, for the central approvals list (SPEC §10.3).
@@ -3859,6 +3914,158 @@ mod tests {
     }
 
     #[test]
+    fn julia_require_broad_process_confirmation() {
+        for spec in [
+            "process:julia",
+            "process:julia1.10",
+            "process:/usr/bin/julia",
+            "process:julia.exe",
+            "process:julia:eval",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:juliaup", "process:julian", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn dart_require_broad_process_confirmation() {
+        for spec in [
+            "process:dart",
+            "process:dart3.2",
+            "process:/usr/bin/dart",
+            "process:dart.exe",
+            "process:dart:run",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:dartdoc", "process:dart2js", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn ruby_package_tools_require_broad_process_confirmation() {
+        for spec in [
+            "process:gem",
+            "process:gem3.2",
+            "process:/usr/bin/gem",
+            "process:gem.exe",
+            "process:gem:install",
+            "process:bundle",
+            "process:bundler",
+            "process:bundle.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:gemini",
+            "process:bundles",
+            "process:bundle2",
+            "process:rake",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn gradle_maven_requires_broad_process_confirmation() {
+        for spec in [
+            "process:gradle",
+            "process:gradlew",
+            "process:/usr/bin/gradle",
+            "process:gradle.exe",
+            "process:mvn",
+            "process:mvnw",
+            "process:gradle:tasks",
+            "process:mvnw:validate",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("Gradle and Maven can execute repository build code"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:mvnDebug", "process:gradle-profiler"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn dotnet_requires_broad_process_confirmation() {
+        for spec in [
+            "process:dotnet",
+            "process:/usr/bin/dotnet",
+            "process:dotnet.exe",
+            "process:DOTNET",
+            "process:dotnet8",
+            "process:dotnet:run",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("dotnet can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:dotnet-dump",
+            "process:dotnet-trace",
+            "process:dotnet-counters",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn go_requires_broad_process_confirmation() {
+        for spec in [
+            "process:go",
+            "process:/usr/local/go/bin/go",
+            "process:go.exe",
+            "process:GO",
+            "process:go1.22.5",
+            "process:go:test",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("the Go tool can build and execute repository code"),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "process:gofmt",
+            "process:godoc",
+            "process:goreleaser",
+            "process:golangci-lint",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn pip_requires_broad_process_confirmation() {
+        for spec in [
+            "process:pip",
+            "process:pip3",
+            "process:pip3.11",
+            "process:/usr/bin/pip3",
+            "process:pip.exe",
+            "process:pip:install",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("pip can execute code from package build backends"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:pipx", "process:pipenv", "process:piper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
     fn lines_are_capped_while_reading() {
         let mut r = std::io::BufReader::new(&b"short\nxxxxxxxxxxxxxxxxxxxx"[..]);
         assert_eq!(
@@ -4020,6 +4227,29 @@ mod tests {
     }
 
     #[test]
+    fn composer_auth_warnings_are_limited_to_config_locations() {
+        for path in [
+            "/work/.composer/auth.json",
+            "/work/.config/Composer/AUTH.JSON",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((true, "holds Composer credentials".into()))
+            );
+        }
+        for path in [
+            "/work/auth.json",
+            "/work/.composer/cache/auth.json",
+            "/work/.config/composer/config.json",
+        ] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((false, "inside the working folder".into()))
+            );
+        }
+    }
+
+    #[test]
     fn environment_key_grants_use_credential_name_boundaries() {
         for name in [
             "AWS_ACCESS_KEY_ID",
@@ -4058,6 +4288,21 @@ mod tests {
             "HOME",
         ] {
             assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn pulumi_approval_warning_matches_only_credentials_inside_the_namespace() {
+        let credential = "fs:read:/work/.Pulumi/nested/Credentials.json";
+        assert_eq!(
+            path_note(credential, Some("/work")),
+            Some((true, "holds Pulumi credentials".into()))
+        );
+        for path in ["/work/credentials.json", "/work/.pulumi/stacks/dev.json"] {
+            assert_eq!(
+                path_note(&format!("fs:read:{path}"), Some("/work")),
+                Some((false, "inside the working folder".into()))
+            );
         }
     }
 
