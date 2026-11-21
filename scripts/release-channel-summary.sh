@@ -15,6 +15,13 @@ state() {
             else echo 'skipped (no secret)'; fi ;;
     esac
 }
+channel_state() {
+    if [ "${PRERELEASE:-}" = true ] && [ "$release" = success ] && [ "$1" = skipped ]; then
+        echo 'skipped (prerelease)'
+    else
+        state "$1"
+    fi
+}
 docker_state() {
     case "$1" in
         success)
@@ -42,9 +49,9 @@ docker_state() {
     echo '|---|---|'
     echo "| GitHub Release | $(state "$release") |"
     echo "| Docker (ghcr.io) | $(docker_state "$5") |"
-    echo "| Homebrew tap | $(state "$2") |"
-    echo "| winget | $(state "$3") |"
-    echo "| AUR | $(state "$4") |"
+    echo "| Homebrew tap | $(channel_state "$2") |"
+    echo "| winget | $(channel_state "$3") |"
+    echo "| AUR | $(channel_state "$4") |"
 } >> "${GITHUB_STEP_SUMMARY:?}"
 for outcome in "$@"; do
     case "$outcome" in failure|cancelled) exit 1 ;; esac

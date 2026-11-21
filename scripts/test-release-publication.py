@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from textwrap import dedent
 import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
@@ -73,6 +74,103 @@ class ReleasePublication(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("| Docker (ghcr.io) | version published (job failure, latest unverified) |",
                           summary.read_text())
+
+    def test_summary_distinguishes_prerelease_from_missing_channel_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            subprocess.run(
+                ["bash", str(ROOT / "scripts/release-channel-summary.sh"),
+                 "success", "skipped", "skipped", "skipped", "success"],
+                env={"PATH": os.environ["PATH"], "GITHUB_STEP_SUMMARY": str(summary), "PRERELEASE": "true"},
+                check=True, timeout=5,
+            )
+            for channel in ("Homebrew tap", "winget", "AUR"):
+                self.assertIn(f"| {channel} | skipped (prerelease) |", summary.read_text())
+
+    def test_prerelease_cannot_render_stable_channel_manifests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "manifests"
+            manifest = Path(directory) / "Cargo.toml"
+            manifest.write_text('[workspace.package]\nversion = "0.2.0-rc.1"\n')
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/render-packaging.sh"), "0.2.0-rc.1", directory, str(out)],
+                env={**os.environ, "MANIFEST": str(manifest)}, capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("stable channel manifests cannot be rendered for prerelease", result.stderr)
+            self.assertFalse(out.exists())
+
+    def test_workflow_classifies_tags_before_publication(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        preflight = workflow.split("\n  version-check:\n", 1)[1].split("\n  build:\n", 1)[0]
+        classify = re.search(r"(?m)^        id: tag-kind\n[^\n]+\n        run: \|\n((?:          [^\n]+\n)+)", preflight)
+        self.assertIsNotNone(classify)
+        self.assertIn("prerelease: ${{ steps.tag-kind.outputs.prerelease }}", preflight)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for version, expected in (("v0.2.0-rc.1", "true"), ("v0.2.0", "false"), ("v0.2.0+build", None)):
+                with self.subTest(version=version):
+                    output.write_text("")
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", dedent(classify[1])], cwd=ROOT,
+                        env={"PATH": os.environ["PATH"], "GITHUB_REF_NAME": version,
+                             "GITHUB_OUTPUT": str(output)},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, int(expected is None), result.stderr)
+                    self.assertEqual(output.read_text(), f"prerelease={expected}\n" if expected else "")
+
+        release = workflow.split("\n  publish:\n", 1)[1].split("\n  docker-publish:\n", 1)[0]
+        stable = "needs.version-check.outputs.prerelease == 'false'"
+        self.assertIn("prerelease: ${{ needs.version-check.outputs.prerelease }}", release)
+        self.assertIn("make_latest: ${{ needs.version-check.outputs.prerelease == 'true' && 'false' || '' }}", release)
+        self.assertIn(f"name: Render Homebrew, AUR and winget files\n        if: {stable}", release)
+        for secret in ("TAP_TOKEN", "WINGET_TOKEN", "AUR_KEY"):
+            self.assertIn(f"if: {stable} && env.{secret} != ''", release)
+        for path in ("packaging-out/aur/PKGBUILD", "packaging-out/homebrew/formless.rb", "packaging-out/winget/*.yaml"):
+            self.assertIn("${{ " + stable + f" && '{path}' || ''" + " }}", release)
+
+    def test_prerelease_binary_packages_use_versions_that_sort_before_stable(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        packages = workflow.split("      - name: Packages\n", 1)[1].split("      - uses:", 1)[0]
+        run = dedent(packages.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for subdir in ("target/debian", "target/generate-rpm", "dist", "bin"):
+                (root / subdir).mkdir(parents=True)
+            (root / "target/debian/fixture.deb").touch()
+            (root / "target/generate-rpm/fixture.rpm").touch()
+            (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin/sha256sum").write_text('#!/bin/sh\nprintf "digest  %s\\n" "$1"\n')
+            (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
+            for command in (root / "bin").iterdir():
+                command.chmod(0o755)
+            for kind, tag in (("", "main"), ("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
+                with self.subTest(tag=tag):
+                    dist = root / "dist"
+                    for file in dist.iterdir():
+                        file.unlink()
+                    args = root / "args"
+                    args.write_text("")
+                    subprocess.run(
+                        ["bash", "-e", "-c", run], cwd=root,
+                        env={"PATH": f'{root / "bin"}:{os.environ["PATH"]}', "PRERELEASE": kind,
+                             "GITHUB_REF_NAME": tag}, check=True, timeout=5,
+                    )
+                    actual = args.read_text().splitlines()
+                    if kind == "true":
+                        self.assertIn("--deb-version", actual)
+                        self.assertIn("0.2.0~rc.1+hotfix-1", actual)
+                        self.assertIn("--set-metadata", actual)
+                        self.assertIn('version="0.2.0~rc.1+hotfix"', actual)
+                        names = ["formless_0.2.0-rc.1-hotfix_amd64.deb", "formless-0.2.0-rc.1-hotfix.x86_64.rpm"]
+                    else:
+                        self.assertNotIn("--deb-version", actual)
+                        self.assertNotIn("--set-metadata", actual)
+                        names = ["fixture.deb", "fixture.rpm"]
+                    for name in names:
+                        self.assertTrue((dist / name).is_file())
+                        self.assertEqual((dist / (name + ".sha256")).read_text(), f"digest  {name}\n")
 
     def test_new_version_push_and_latest_uses_the_verified_manifest(self):
         registry = Mock()
@@ -233,7 +331,7 @@ class ReleasePublication(unittest.TestCase):
         self.assertNotIn("packages: write", build)
         self.assertNotIn("push: true", build)
         self.assertLess(build.index("Smoke private container"), build.index("docker image save"))
-        self.assertIn("needs: [build, linux, linux-install-test, docker]", release)
+        self.assertIn("needs: [version-check, build, linux, linux-install-test, docker]", release)
         self.assertIn("fail_on_unmatched_files: true", release)
         self.assertRegex(release, r"uses: softprops/action-gh-release@[0-9a-f]{40} #[^\n]+\n        id: release")
         self.assertIn("release: ${{ steps.release.outcome }}", release)

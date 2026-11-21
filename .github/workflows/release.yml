@@ -19,6 +19,8 @@ jobs:
   # Before any build (#842): the tag must have matching binaries and notes.
   version-check:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    outputs:
+      prerelease: ${{ steps.tag-kind.outputs.prerelease }}
     timeout-minutes: 5
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -29,8 +31,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
       - name: Tag is compatible with Docker version tags
+        id: tag-kind
         if: startsWith(github.ref, 'refs/tags/v')
-        run: python3 scripts/push-release-image.py --check-version
+        run: |
+          python3 scripts/push-release-image.py --check-version
+          case "$GITHUB_REF_NAME" in
+            *-*) echo 'prerelease=true' ;;
+            *) echo 'prerelease=false' ;;
+          esac >> "$GITHUB_OUTPUT"
       - name: Tag has release notes
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
@@ -180,12 +188,30 @@ jobs:
         run: bash scripts/ci-storage-budget.sh install-package-tools
       - name: Packages
         shell: bash
+        env:
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
         run: |
-          cargo deb -p formless-bin --no-build --output target/debian/
+          deb_version=()
+          rpm_version=()
+          if [[ "$PRERELEASE" == true ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            suffix="${version#*-}"
+            package_version="${version%%-*}~${suffix//-/+}"
+            deb_version=(--deb-version "$package_version-1")
+            rpm_version=(--set-metadata "version=\"$package_version\"")
+          fi
+          cargo deb -p formless-bin --no-build --output target/debian/ "${deb_version[@]}"
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
-          cargo generate-rpm -p crates/formless --output target/generate-rpm
-          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
+          if [[ "$PRERELEASE" == true ]]; then
+            # Use the tag's characters in asset names so checksum sidecars
+            # match the downloaded names after GitHub's filename normalization.
+            cp target/debian/*.deb "dist/formless_${version}_amd64.deb"
+            cp target/generate-rpm/*.rpm "dist/formless-${version}.x86_64.rpm"
+          else
+            cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          fi
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
           dpkg -I ./*.deb | sed -n '/Depends/p'
@@ -395,8 +421,8 @@ jobs:
       winget: ${{ steps.winget.outcome }}
       aur: ${{ steps.aur.outcome }}
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, linux, linux-install-test, docker]
+    if: startsWith(github.ref, 'refs/tags/v') && (needs.version-check.outputs.prerelease == 'true' || needs.version-check.outputs.prerelease == 'false')
+    needs: [version-check, build, linux, linux-install-test, docker]
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -408,6 +434,7 @@ jobs:
           pattern: formless-*
           merge-multiple: true
       - name: Render Homebrew, AUR and winget files
+        if: needs.version-check.outputs.prerelease == 'false'
         run: scripts/render-packaging.sh "${GITHUB_REF_NAME#v}" assets packaging-out
       # Notes `formless update` shows: the CHANGELOG section, then GitHub's
       # generated list of changes (#842).
@@ -417,6 +444,8 @@ jobs:
         id: release
         with:
           body_path: release-notes.md
+          prerelease: ${{ needs.version-check.outputs.prerelease }}
+          make_latest: ${{ needs.version-check.outputs.prerelease == 'true' && 'false' || '' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
@@ -425,9 +454,9 @@ jobs:
             assets/*.deb
             assets/*.rpm
             assets/*.sha256
-            packaging-out/aur/PKGBUILD
-            packaging-out/homebrew/formless.rb
-            packaging-out/winget/*.yaml
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/aur/PKGBUILD' || '' }}
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/homebrew/formless.rb' || '' }}
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/winget/*.yaml' || '' }}
       # Each channel runs only when its secret exists (packaging/README.md),
       # independently of the others; the summary says how each went.
       - name: Update the Homebrew tap
@@ -435,7 +464,7 @@ jobs:
         continue-on-error: true
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        if: env.TAP_TOKEN != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.TAP_TOKEN != ''
         run: |
           # Never persist the tap token in .git/config on a self-hosted runner.
           askpass=$(mktemp "$RUNNER_TEMP/formless-tap-askpass.XXXXXX")
@@ -466,7 +495,7 @@ jobs:
         continue-on-error: true
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-        if: env.WINGET_TOKEN != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.WINGET_TOKEN != ''
         uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         with:
           identifier: athiwatc.formless
@@ -477,7 +506,7 @@ jobs:
         continue-on-error: true
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_KEY }}
-        if: env.AUR_KEY != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.AUR_KEY != ''
         uses: KSXGitHub/github-actions-deploy-aur@a97f56a8425a7a7f3b8c58607f769c69b089cadb # v3.0.1
         with:
           pkgname: formless-bin
@@ -555,7 +584,7 @@ jobs:
           rm -f -- "$DOCKER_PUBLISH_DIR/image.tar"
   channel-summary:
     if: always() && startsWith(github.ref, 'refs/tags/v')
-    needs: [publish, docker-publish]
+    needs: [version-check, publish, docker-publish]
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
@@ -566,6 +595,7 @@ jobs:
         shell: bash
         env:
           RELEASE: ${{ needs.publish.outputs.release }}
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
           TAP: ${{ needs.publish.outputs.tap }}
           WINGET: ${{ needs.publish.outputs.winget }}
           AUR: ${{ needs.publish.outputs.aur }}
