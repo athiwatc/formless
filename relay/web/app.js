@@ -1693,6 +1693,7 @@
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
   HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
+  HL.scss = { ...HL.css, lc: ["//"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
@@ -1701,7 +1702,7 @@
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", less: "scss",
   };
   function powershellQuoteEnd(code, from, quote) {
     for (let i = from; i < code.length; i++) {
@@ -1722,7 +1723,9 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const toml = lang === "toml";
     const php = L === HL.php;
+    const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
     const out = [];
     let plain = "";
     const powershell = L === HL.powershell;
@@ -1757,8 +1760,11 @@
         }
       }
       if (lineStart && L.key) {
-        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
-        if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
+        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
+        const key = m?.[2].trim();
+        // A multiline TOML array value can start where a key normally would.
+        if (key && !(L.lc || []).some((p) => key.startsWith(p)) &&
+            (!toml || !/^(['"])\1\1/.test(key) && !/[^\t ]/.test(m[3]))) {
           plain += m[1];
           tok("tok-key", m[2]);
           i += m[0].length;
@@ -1792,7 +1798,7 @@
         continue;
       }
       const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
-        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]));
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]));
       if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
           (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
@@ -1804,12 +1810,20 @@
         continue;
       }
       if (L.q.includes(c)) {
-        let j = i + 1;
-        const multiline = c === "`" || L.mysqlComments;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
-          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+        const multiline = toml && code.startsWith(c.repeat(3), i);
+        const delimiter = multiline ? c.repeat(3) : c;
+        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
+        let j = i + delimiter.length;
+        while (j < code.length && !code.startsWith(delimiter, j) &&
+            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
+          j += code[j] === "\\" && escapes ? 2 : 1;
         }
-        const stop = Math.min(j + 1, code.length);
+        let stop = Math.min(j + delimiter.length, code.length);
+        // Include up to two quotes immediately before the TOML closing delimiter.
+        if (multiline) {
+          const trailing = stop + 2;
+          while (stop < trailing && code[stop] === c) stop++;
+        }
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
@@ -1832,7 +1846,15 @@
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;
         if (cls) tok(cls, w); else plain += w;
+        const previous = code[i - 1];
         i += w.length;
+        if (L === HL.scss && w.toLowerCase() === "url" && code[i] === "(" && previous !== "-") {
+          const url = /^\((?:\\[^\r\n]|[^\\()'"\r\n])*\)/.exec(code.slice(i));
+          if (url) {
+            plain += url[0];
+            i += url[0].length;
+          }
+        }
         continue;
       }
       plain += c;
@@ -2363,19 +2385,23 @@
       pre.textContent = text;
       sync();
     };
-    const download = h("button", { class: "btn small", type: "button", onclick: async () => {
-      while (end < first.total_chars) {
-        const r = await act({ type: "get_artifact", id, offset: end, length: 1000000 });
-        if (!r) return;
-        text += r.text;
-        end = r.end;
+    const download = h("button", { class: "btn small", type: "button" }, "Download");
+    download.onclick = async () => {
+      download.disabled = true;
+      try {
+        const chunks = [text];
+        let offset = end;
+        while (offset < first.total_chars) {
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          if (!r) return;
+          chunks.push(r.text);
+          offset = r.end;
+        }
+        downloadBlob("artifact-" + id.slice(0, 8) + ".txt", new Blob(chunks, { type: "text/plain" }));
+      } finally {
+        download.disabled = false;
       }
-      pre.textContent = text;
-      sync();
-      const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain" })), download: "artifact-" + id.slice(0, 8) + ".txt" });
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-    } }, "Download");
+    };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
