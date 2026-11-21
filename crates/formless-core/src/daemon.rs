@@ -15815,7 +15815,17 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let listener = tokio::net::UnixListener::bind(&sock)
+            .with_context(|| format!("bind {}", sock.display()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(&sock)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
+            bail!("socket ownership or permissions changed during bind");
+        }
+        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -15825,6 +15835,10 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if !unix_peer_is_owner(&stream) {
+                        tracing::warn!("rejecting Unix socket peer without owner credentials");
+                        continue;
+                    }
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(stream).await });
                 }
@@ -17388,9 +17402,59 @@ fn harness_target(op: &str, args: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+fn unix_peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    unix_peer_uid_matches(stream, uid)
+}
+
+#[cfg(unix)]
+fn unix_peer_uid_matches(stream: &tokio::net::UnixStream, uid: libc::uid_t) -> bool {
+    stream.peer_cred().is_ok_and(|peer| peer.uid() == uid)
+}
+
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_and_owner_can_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::Path::new("/tmp").join(format!("fl-ipc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _client = tokio::net::UnixStream::connect(paths.socket_path())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(unix_peer_is_owner(&peer));
+        let actual_uid = peer.peer_cred().unwrap().uid();
+        assert!(!unix_peer_uid_matches(&peer, actual_uid.wrapping_add(1)));
+        drop(listener);
+        drop(daemon);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {
