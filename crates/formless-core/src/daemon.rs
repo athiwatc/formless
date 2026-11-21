@@ -17439,8 +17439,13 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
     }
+    let mut under_config = false;
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
+        if p.eq_ignore_ascii_case("GitHub CLI") || (under_config && p.eq_ignore_ascii_case("gh")) {
+            return Some("GitHub CLI credentials");
+        }
+        under_config = p.eq_ignore_ascii_case(".config");
         if let Some((_, why)) = CREDENTIAL_DIRS
             .iter()
             .find(|(d, _)| *d == p || (*d == ".azure" && p.eq_ignore_ascii_case(d)))

@@ -74,6 +74,24 @@ fn detects_azure_cli_cache_in_attachment_paths() {
 }
 
 #[test]
+fn detects_github_cli_credentials_in_attachment_paths() {
+    for name in [
+        ".config/gh/hosts.yml",
+        ".CONFIG/GH/hosts.yml",
+        "AppData/Roaming/GitHub CLI/hosts.yml",
+    ] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in [
+        "project/gh/hosts.yml",
+        "project/.config/other/hosts.yml",
+        "GitHub CLI docs/notes.txt",
+    ] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn detects_rclone_config_in_attachment_paths() {
     for name in [
         ".config/rclone/rclone.conf",

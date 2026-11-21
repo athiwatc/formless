@@ -213,6 +213,7 @@ fn credential_name(name: &std::ffi::OsStr) -> String {
 }
 
 const DIRECTORY_SEQUENCES: &[&[&str]] = &[
+    &[".config", "gh"],
     &["library", "keychains"],
     &[".local", "share", "keyrings"],
     &["microsoft", "credentials"],
@@ -301,6 +302,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
                 | ".kube"
                 | ".docker"
                 | ".password-store"
+                | "github cli"
         ) || (name == "gcloud" && (index + 1 < parts.len() || path.is_dir()))
         {
             return Some("credential directory");
@@ -701,6 +703,38 @@ mod tests {
             );
         }
         for relative in ["project/accessTokens.json", ".azure-example/notes.txt"] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn protects_github_cli_credentials_in_tool_reads() {
+        let root = std::env::temp_dir();
+        let policy = PathPolicy::default();
+        for relative in [
+            ".config/gh/hosts.yml",
+            ".CONFIG/GH/hosts.yml",
+            "AppData/Roaming/GitHub CLI/hosts.yml",
+        ] {
+            let path = root.join(relative);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{relative}"
+            );
+        }
+        for relative in [
+            "project/gh/hosts.yml",
+            "project/.config/other/hosts.yml",
+            "GitHub CLI docs/notes.txt",
+        ] {
             let path = root.join(relative);
             assert_eq!(
                 policy.classify(&path, &path).unwrap(),
