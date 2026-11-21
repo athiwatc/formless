@@ -6641,6 +6641,9 @@ under `crates/*/src` against README or SPEC, including test-only references.
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
 
+`FORMLESS_BIN` supplies a fallback CLI path when the desktop app starts its
+daemon. Lookup tries a sibling CLI first, then this nonempty path, then PATH.
+
 `FORMLESS_NOTIFICATION_TITLE` and `FORMLESS_NOTIFICATION_BODY` are internal
 Windows desktop-notification helper inputs, not user configuration overrides.
 Formless sets them on its PowerShell child to pass the notification title and
