@@ -492,10 +492,11 @@
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
-      const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
+      const credentialKey = k.endsWith("_PWD") || (!schemaRole && k.split("_").includes("KEY")) ||
         ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
           "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
       if (credentialKey || k.endsWith("_PAT") ||
+          ["DATABASE_URL", "REDIS_URL", "MONGODB_URI"].includes(k) ||
           ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
         return "a secret from your environment";
       }
@@ -519,6 +520,10 @@
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
+    const pulumiWindowsPath = /^(?:[a-z]:|\\\\)/i.test(path);
+    const pulumiPath = (pulumiWindowsPath ? path.split(/[\\/]+/) : seg)
+      .filter(Boolean).map((part) => (pulumiWindowsPath ? part.split(":", 1)[0] : part).toLowerCase());
+    if (pulumiPath.at(-1) === "credentials.json" && pulumiPath.slice(0, -1).includes(".pulumi")) return [true, "holds Pulumi credentials"];
     if (seg[0] === "etc") return [true, "system configuration"];
     if (!cwd) return null;
     const c = cwd.replace(/\/+$/, "");
@@ -1000,13 +1005,16 @@
     try { return measure(); }
     finally { if (hidden) { if (display) node.style.setProperty("display", display, priority); else node.style.removeProperty("display"); node.style.visibility = visibility; } }
   }
-  function revealViewportControl(node, container, bounds) {
+  function revealViewportControl(node, container, bounds, { partial = false } = {}) {
     if (!node || !container || !container.contains(node)) return;
     const rect = node.getBoundingClientRect(), box = container.getBoundingClientRect();
     const top = Math.max(bounds.top, box.top) + 1, bottom = Math.min(bounds.bottom, box.bottom) - 1;
     if (rect.height <= bottom - top) {
       if (rect.top < top) container.scrollTop -= top - rect.top;
       else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
+    } else if (partial) {
+      if (rect.top > top) container.scrollTop += rect.top - top;
+      else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
   function positionPopover() {
@@ -1063,7 +1071,9 @@
     withTranscriptLayout(() => {
       root.setAttribute("data-visual-viewport", "");
       root.toggleAttribute("data-viewport-zoomed", zoomed);
-      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 24);
+      const keyboardShrankViewport = !zoomed && viewport.height < root.clientHeight - fontSize * 3;
+      const shortViewport = viewport.height < fontSize * (zoomed ? 28 : 24);
+      root.toggleAttribute("data-viewport-short", shortViewport || keyboardShrankViewport);
       root.toggleAttribute("data-viewport-composing", composing);
       viewportVariable("--visual-left", viewport.left);
       viewportVariable("--visual-top", viewport.top);
@@ -1108,8 +1118,13 @@
         positionJump(bounds, fontSize);
       }
       positionPopover();
-      const modal = activeDialog()?.node.querySelector(".modal") || document.activeElement?.closest(".pair-card");
-      if (modal) revealViewportControl(document.activeElement, modal, bounds);
+      const focused = document.activeElement;
+      const focusScrollport = activeDialog()?.node.querySelector(".modal") || focused?.closest(".pair-card");
+      if (focusScrollport) revealViewportControl(focused, focusScrollport, bounds);
+      else {
+        const chrome = focused?.closest(".topbar, .statusbar");
+        if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
+      }
     }, { newContent: false });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
@@ -1693,6 +1708,7 @@
   HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
   HL.powershell = { ...HL.sh, bc: ["<#", "#>"], hashAnywhere: true };
   HL.php = { ...HL.c, lc: ["//", "#"] };
+  HL.scss = { ...HL.css, lc: ["//"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", ps: "powershell",
@@ -1701,7 +1717,7 @@
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", less: "scss",
   };
   function powershellQuoteEnd(code, from, quote) {
     for (let i = from; i < code.length; i++) {
@@ -1724,6 +1740,7 @@
     if (!L) return null;
     const toml = lang === "toml";
     const php = L === HL.php;
+    const shellLiteralQuotes = /^(?:sh|bash|zsh|shell|console)$/.test(lang);
     const out = [];
     let plain = "";
     const powershell = L === HL.powershell;
@@ -1732,8 +1749,11 @@
       out.push(h("span", { class: cls }, s));
     };
     const word = /[\p{L}\p{N}_$]/u;
+    const yaml = lang === "yaml" || lang === "yml";
+    let yamlScalar = null;
     let i = 0;
     let lineStart = true;
+    const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
     while (i < code.length) {
       const c = code[i];
       if (L === HL.js && (c === "." || /\d/.test(c))) {
@@ -1756,6 +1776,23 @@
           i++;
           continue;
         }
+      }
+      if (yaml && lineStart) {
+        const newline = code.indexOf("\n", i);
+        const end = newline === -1 ? code.length : newline;
+        const line = code.slice(i, end);
+        if (yamlScalar) {
+          const indent = line.length - line.replace(/^ +/, "").length;
+          const blank = !line.trim();
+          if (blank || indent >= (yamlScalar.contentIndent ?? yamlScalar.headerIndent + 1)) {
+            if (!blank) yamlScalar.contentIndent ??= indent;
+            if (line) tok("tok-str", line);
+            if (newline !== -1) plain += "\n";
+            i = newline === -1 ? end : end + 1;
+            continue;
+          }
+        }
+        yamlScalar = yamlScalarHeader(line);
       }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
@@ -1807,10 +1844,21 @@
         i = stop;
         continue;
       }
+      if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
+        const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
+        if (opener) {
+          const delimiter = opener[0];
+          const closer = code.indexOf(delimiter, i + delimiter.length);
+          const stop = closer === -1 ? code.length : closer + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
       if (L.q.includes(c)) {
         const multiline = toml && code.startsWith(c.repeat(3), i);
         const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = !(toml && c === "'" || L.mysqlComments && c === "`");
+        const escapes = !(c === "'" && (toml || shellLiteralQuotes && code[i - 1] !== "$") || L.mysqlComments && c === "`");
         let j = i + delimiter.length;
         while (j < code.length && !code.startsWith(delimiter, j) &&
             (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
@@ -1844,7 +1892,15 @@
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;
         if (cls) tok(cls, w); else plain += w;
+        const previous = code[i - 1];
         i += w.length;
+        if (L === HL.scss && w.toLowerCase() === "url" && code[i] === "(" && previous !== "-") {
+          const url = /^\((?:\\[^\r\n]|[^\\()'"\r\n])*\)/.exec(code.slice(i));
+          if (url) {
+            plain += url[0];
+            i += url[0].length;
+          }
+        }
         continue;
       }
       plain += c;
@@ -1852,6 +1908,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function yamlScalarHeader(line) {
+    let rest = line.replace(/^ +/, "");
+    let headerIndent = line.length - rest.length;
+    while (/^-[ \t]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      rest = rest.replace(/^-[ \t]+/, "");
+    }
+    if (!/^[|>]/.test(rest)) {
+      headerIndent = line.length - rest.length;
+      let quote = rest[0] === "'" || rest[0] === '"' ? rest[0] : null;
+      let colon = -1;
+      for (let i = quote ? 1 : 0; i < rest.length; i++) {
+        const c = rest[i];
+        if (quote) {
+          if ((quote === '"' && c === "\\") || (quote === "'" && c === "'" && rest[i + 1] === "'")) i++;
+          else if (c === quote) quote = null;
+        } else if (c === "#" && (i === 0 || /\s/.test(rest[i - 1]))) {
+          break;
+        } else if (i > 0 && c === ":" && /[ \t]/.test(rest[i + 1] || "")) {
+          colon = i;
+          break;
+        }
+      }
+      if (colon === -1) return null;
+      rest = rest.slice(colon + 1).replace(/^[ \t]+/, "");
+    }
+    const match = /^[|>]([1-9][+-]?|[+-][1-9]?)?(?:[ \t]+(?:#.*)?)?\r?$/.exec(rest);
+    if (!match) return null;
+    const digit = match[1]?.match(/[1-9]/);
+    return { headerIndent, contentIndent: digit ? headerIndent + Number(digit[0]) : null };
   }
 
   function javascriptNumberEnd(code, start) {
@@ -2076,7 +2164,9 @@
         if (d.width && d.height) { img.width = d.width; img.height = d.height; }
         img.addEventListener("click", () => box.classList.toggle("zoom"));
         img.addEventListener("load", () => {
-          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+          // The decoded image may already have resized. Keep the reading
+          // anchor captured before that reflow, even after a recent scroll.
+          if (current() && $("transcript").contains(img)) settleReadingLayout();
         }, { once: true });
         update(() => {
           view.replaceChildren(img);
@@ -2666,9 +2756,13 @@
       + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
       + (t.error ? " · " + t.error : "");
   }
+  function storedSessionModel(session) {
+    return session?.model || S.settings?.provider?.model || "";
+  }
   async function openModelPicker(onPick) {
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
+    const model = storedSessionModel(session);
     const efforts = ["", "low", "medium", "high"];
     const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
     const list = h("ul", { class: "picker-list", role: "listbox" });
@@ -2685,6 +2779,7 @@
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
         h("h2", null, title),
+        h("p", { class: "muted picker-current-model" }, model ? "Current selection: " + model : "Current model unavailable"),
         input, list,
         selectionOnly ? null : h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
         h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }),
@@ -3937,19 +4032,21 @@
         btn("✕", "Remove", () => act({ type: "edit_queued", session_id: sid, id: m.id, content: null }))))));
   }
   function editQueuedMessage(sid, item) {
+    if (!Number.isSafeInteger(item.revision)) return toast("Update the daemon to edit queued messages safely.", true);
     const sequence = sessionSeq;
+    const revision = item.revision;
     const input = h("textarea", { rows: 6, "aria-label": "Queued message" });
     input.value = item.content;
     const initial = input.value;
     return ask({
       title: "Edit the queued message", body: h("div", null, input), ok: "Save",
       saveRequest: () => {
-        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.content === item.content)) {
+        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.revision === revision)) {
           note("The queued message changed. Open it again.", true);
           return null;
         }
         if (!input.value.trim()) throw Object.assign(new Error("Enter a nonempty message."), { field: input });
-        return { type: "edit_queued", session_id: sid, id: item.id, content: input.value === initial ? item.content : input.value };
+        return { type: "edit_queued_if_current", session_id: sid, id: item.id, revision, content: input.value === initial ? item.content : input.value };
       },
     });
   }
@@ -4085,7 +4182,12 @@
     const others = S.others || [];
     $("status-others").classList.toggle("hidden", !others.length);
     $("status-others").textContent = others.length ? " · also open in " + othersText(others) : "";
-    $("status-model").textContent = (s && s.model) || S.settings?.provider?.model || "";
+    const model = storedSessionModel(s);
+    const modelButton = $("status-model");
+    const modelText = model || "Model unavailable";
+    const modelLabel = model ? "Change model (" + model + ")" : "Model unavailable. Choose model.";
+    if (modelButton.textContent !== modelText) modelButton.textContent = modelText;
+    if (modelButton.getAttribute("aria-label") !== modelLabel) modelButton.setAttribute("aria-label", modelLabel);
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
     $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";
@@ -7234,7 +7336,9 @@
         (S.chips[sid] = S.chips[sid] || []).push(a);
         fresh.push(a.name);
       } catch (e) {
-        if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
+        if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(e.message)) {
+          note("cannot attach @" + path + ": " + e.message, true);
+        }
       }
     }
     if (fresh.length) {

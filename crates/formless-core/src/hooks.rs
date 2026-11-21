@@ -27,12 +27,34 @@ pub fn glob(pattern: &str, name: &str) -> bool {
     true
 }
 
-/// Whether a hook applies to a call of `tool` declaring `caps`.
+/// Whether a hook applies to a call of `tool` with effective `caps`.
 pub fn matches(h: &HookCfg, tool: &str, caps: &[String]) -> bool {
     h.tool.as_deref().is_none_or(|p| glob(p, tool))
-        && h.capability
-            .as_deref()
-            .is_none_or(|c| caps.iter().any(|x| x.starts_with(c)))
+        && h.capability.as_deref().is_none_or(|filter| {
+            caps.iter()
+                .any(|capability| capability_matches(filter.trim(), capability))
+        })
+}
+
+fn capability_matches(filter: &str, capability: &str) -> bool {
+    use formless_runtime::Capabilities;
+    if filter == capability {
+        return true;
+    }
+    if let Some(scope) = ["net:", "fs:read:", "fs:write:", "fs:read-sensitive:"]
+        .into_iter()
+        .find(|scope| filter.starts_with(scope))
+    {
+        // Reuse the grant's host, port, wildcard and path-component rules.
+        return capability.starts_with(scope)
+            && Capabilities::parse(&[filter.to_string()])
+                .ok()
+                .zip(Capabilities::parse(&[capability.to_string()]).ok())
+                .is_some_and(|(filter, capability)| filter.covers(&capability));
+    }
+    capability
+        .strip_prefix(filter)
+        .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 /// A hook Tool's verdict: `{deny: true, reason}` refuses, anything else
@@ -129,6 +151,34 @@ pub async fn run_command(
             (status.success(), text.chars().take(2000).collect())
         }
         Err(e) => (false, format!("hook command {cmd} failed: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod match_tests {
+    use super::capability_matches;
+
+    #[test]
+    fn scoped_hooks_match_hosts_ports_and_path_components() {
+        for (filter, capability, expected) in [
+            ("net", "net:sample.invalid", true),
+            ("net", "network", false),
+            ("net:sample.invalid", "net:sample.invalid.example", false),
+            ("net:sample.invalid", "net:sample.invalid:8443", true),
+            ("net:sample.invalid:8443", "net:sample.invalid:443", false),
+            ("net:*.sample.invalid", "net:api.sample.invalid", true),
+            ("net:*.sample.invalid", "net:sample.invalid", false),
+            ("fs:write", "fs:write:/a/proj", true),
+            ("fs:write:/a/proj", "fs:write:/a/proj/result", true),
+            ("fs:write:/a/proj", "fs:write:/a/project2", false),
+            ("fs:read:/a/proj", "fs:write:/a/proj", false),
+        ] {
+            assert_eq!(
+                capability_matches(filter, capability),
+                expected,
+                "{filter} / {capability}"
+            );
+        }
     }
 }
 

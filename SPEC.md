@@ -25,16 +25,8 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Network activity can include requests to
-   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
-   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
-   Naming and auto-download are enabled by default. When both are enabled
-   in a build with embedded naming, an eligible Session can trigger a
-   download of its missing configured catalogue model and tokenizer from
-   Hugging Face. `naming.auto_download = false` disables
-   automatic naming downloads; `naming.enabled = false` disables automatic
-   naming. These settings do not block explicit `formless naming pull`.
-   There is no automatic update checker.
+5. **Local-first.** The daemon stores Sessions and Tools locally.
+   See [network activity, naming controls and telemetry](#15-privacy-and-data-lifecycle).
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -1051,7 +1043,7 @@ task, with quality as a gate**.
   the next step boundary without killing in-flight work. **Ctrl+Enter =
   queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
-  `GetSession` lists them (`queued` texts, and `queued_items` with ids).
+  `GetSession` lists them (`queued` texts, and `queued_items` with ids and revisions).
   When idle, Enter simply starts a new Run. Steering extends the Run only
   when its message sequence is newer than the transcript boundary included
   in the actual provider request. A steer already included after a Tool
@@ -1066,10 +1058,12 @@ task, with quality as a gate**.
   removed, reordered). The TUI lists queued messages at the end of the
   chat with `/queue edit|rm|up|down N`; `/queue edit N` loads one into
   the input (`queued ›`), Enter saves, Esc cancels. The web lists them
-  above the composer with edit, ↑/↓ and remove buttons. Requests:
-  `EditQueued {session_id, id, content?}` (no content removes it) and
-  `MoveQueued {session_id, id, up}`. Editing a message that was already
-  sent fails with "no longer queued".
+  above the composer with edit, ↑/↓ and remove buttons. Reordering updates
+  both positions in one transaction and preserves each message ID and text.
+  Editors send the revision they opened with `EditQueuedIfCurrent`.
+  A reorder, edit or removal that intervenes causes a conflict. Removing a
+  message uses `EditQueued` without content. Clients without revisions can
+  still remove messages. `MoveQueued` returns the same message ID when it moves.
 - `Esc` interrupts the current Run (in-flight Invocations are cancelled and
   recorded as user-cancelled, §8.2). `Ctrl+C` clears a typed message, and a second `Ctrl+C` within 2 s detaches the TUI client only.
 
@@ -2000,8 +1994,9 @@ pattern (§4.4).
 - **Tags:** Tools carry topic tags (`git`, `web`, `finance`).
   - **Setting them:** the agent passes `create_tool`'s optional `tags`; a
     new version without tags keeps the old ones. Users use `SetToolTags`:
-    `formless tools tag NAME [TAG…]`, `/tooltag NAME [TAG…]` in the TUI,
-    or the Tags field in the web Tool detail. None given clears them.
+    `formless tools tag NAME TAG…` or `formless tools tag NAME --clear`,
+    `/tooltag NAME [TAG…]` in the TUI, or the Tags field in the web Tool
+    detail. `formless tools tag NAME` reads the existing tags.
   - **Normalised:** lowercase, without `#`, spaces become `-`, only
     letters, digits, `-` and `_`, at most 24 characters each and 8 per
     Tool.
@@ -2452,8 +2447,11 @@ are unchanged.
 - **From a URL:** `formless tools import <https-url>` and the web's
   "Import URL" take a link instead of a file.
   - **What counts as a link:** an https URL to a bundle, a GitHub file page
-    (`github.com/…/blob/…`, read from its raw file), or a gist (the first
-    of its files that is a bundle, through the GitHub API). Anything not
+    (`github.com/…/blob/…`, read from its raw file), or a gist. Raw gist
+    links fetch the linked file directly. Gist pages use the GitHub API
+    for the linked revision and use the file selected by a `#file-…`
+    anchor when supplied. Without a file anchor the preview selects a
+    bundle from the requested revision. Anything not
     https, larger than 2 MB, or not a `formless.tool/1` or
     `formless.tools/1` bundle is refused.
   - **Fetched by the daemon** (`FetchToolBundle {url}` → `{source, file,
@@ -2728,11 +2726,12 @@ Tools fill capability gaps; skills say how to use them well.
   enabled state instead of previewing a name beginning with the verb.
   The web "Review" does the same preview. `/skill:NAME [args]`
   (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
-  Session: its instructions and arguments join the chat as a note, and
-  the load counts like the agent's.
+  Session. Once its note is saved, the manual load counts toward skill usage.
+  Run completion metrics count skill loads associated with a Run.
 - **Retired skills say why.** An auto-retired skill keeps
   `retire_reason` ("unused: …" or "unhelpful: N of M Runs that loaded it
-  completed"), shown by `/skills` and the web; enabling it clears it.
+  completed"), shown by `/skills` and the web. Enabling the skill or
+  installing a new version clears the reason.
 
 ### 7.11 User memory
 
@@ -3037,10 +3036,11 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 - Before contacting the candidate-generation provider, freeze a **server-owned
   replay manifest** from recent terminal success/failure Invocations. Selection
   is independent of outcome: there is no balancing or oversampling of failures.
-  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan at
-  most four times that many recent records, at most 2,048, with at most 256 KiB
-  per raw input and an 8 MiB manifest. Invalid/oversized inputs and samples
-  outside the bounded pool are counted as exclusions, never silently claimed
+  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan
+  four times that many recent records, then continue if the pool is short of
+  distinct inputs. Stop at 8,192 terminal records or 32 MiB of additional input,
+  with at most 256 KiB per raw input and an 8 MiB manifest. Invalid or oversized
+  inputs and samples outside the bounded pool are counted as exclusions and never claimed
   as tested. The snapshot records source Invocation IDs, canonical input
   digests, selection bounds and partitions.
 - Group semantically identical JSON inputs before splitting, ignoring object
@@ -3816,7 +3816,7 @@ Hooks let users enforce policy and automate workflows. Each is a
 [[hooks]]
 event = "pre_tool"              # pre_tool | post_tool | run_end
 tool = "mcp__*"                 # optional: name, with * wildcards
-capability = "net"              # optional: a declared Capability prefix
+capability = "net"              # optional: a Capability family or scope
 run_tool = "network_policy"     # a registry Tool, or…
 # command = ["/usr/local/bin/check"]   # …a command (no shell)
 # trusted = true                # run the command without asking
@@ -3827,6 +3827,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   Tool's Capabilities, Session and Run. post_tool adds the result
   (clipped to 4000 characters) and `ok`; run_end has the Run's `status`.
   A Tool hook gets it as input, and a command gets it on stdin.
+  For Tool calls, the `capabilities` payload and filter use scopes bound to the
+  call arguments. A binding failure keeps the declared list for the hook.
+  A family such as `net` matches the whole family. A scoped filter uses the
+  same host, port, wildcard and path-component rules as a Capability grant.
   After a command exits, Formless gives its output pipes a short grace
   period to drain and then stops any remaining processes in the hook's
   process group. A hook that reaches its timeout also stops the group.
@@ -4555,7 +4559,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached) per UTC day, or with `by` = "model",
+  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -6275,10 +6279,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 ## 15. Privacy and data lifecycle
 
 - **Zero telemetry.** No analytics, no automatic update checks, no crash
-  reporting. Outbound traffic goes only to the user's configured provider
-  endpoint (sessions, optimiser, compaction), the user-enabled Relay
-  (ciphertext only, §12), and explicit user-run commands — always with
-  redacted secrets in optimiser paths (§8.3).
+  reporting.
+- **Network activity.** Examples include configured provider calls for
+  Sessions, optimisation and Compaction, connections to a
+  [user-enabled Relay](README.md#37-browser-access-via-the-relay-v2) and
+  explicit commands such as `formless update check`. Optimiser paths redact
+  secrets (§8.3). In builds with embedded model support, naming an untitled
+  or provisionally named Session with suitable user text can download weights
+  or a tokenizer when the selected [catalogue model](README.md#local-naming-models)
+  needs them. Automatic naming and downloads are enabled by default. Set
+  `naming.auto_download = false` to disable automatic downloads or
+  `naming.enabled = false` to disable automatic naming.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
@@ -6637,7 +6648,8 @@ body as data rather than interpolating them into the script. The helper passes
 nonempty text to BurntToast, falling back to `Formless` if both are empty.
 
 Private subprocess fixtures also use these test-only variables (no product
-configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
+configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
+`FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -6788,8 +6800,11 @@ the bounded recent Run list. Default/explicit day sends no group key and keeps
 the daemon's oldest-first day order; other groups keep its descending total-token
 order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
-the complete array and null costs. Cost is the daemon's current estimate, not a
+Human tables show cache writes, total tokens (prompt plus completion), and a
+final total row. Cached and cache-write tokens are included in prompt tokens.
+Unknown costs and unavailable cache-write counts display as `-`, including in
+totals that contain an unknown value. JSON preserves the complete row array,
+including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a
 billing guarantee. Session groups use the ID for attribution and display the
 current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
@@ -6828,6 +6843,11 @@ human-detail layout change leaves fetching, metrics and security fields intact.
 The existing GetTool all-version payload remains until protocol selectors
 are addressed separately (#889).
 
+Run inspection includes recorded cache-read, cache-write and reasoning token
+counts. The human `runs show` report derives duration from the stored timestamps,
+shows estimated USD amounts with six decimal places, and formats spend flags
+and unpriced model names for reading.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
@@ -6836,8 +6856,9 @@ an active Run query exits 0, and cancel exits 0 when its request succeeds.
 `--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
-Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
-returned stalled/abandoned flags and optional progress fraction/label.
+Tool/Session identifiers, optional Invocation ID, compact elapsed/silent
+durations for a minute or longer, returned stalled/abandoned flags and
+optional progress as a clamped whole percentage with its label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
 Outer `runs --json running` is also supported.
@@ -6906,17 +6927,24 @@ handles. Cross-volume, unknown identity/security, untracked aliases, unsupported
 filesystems or uncertain I/O refuse mutations. Every native hard link waived by
 review is accounted for by a verified store manifest and exact object identity;
 an extra public alias is never treated as an internal retention link. The store
-admits at most 64 manifests and 32 MiB of serialized immutable receipts plus
-reserved bounded object bytes. Seven-day cleanup skips live review leases and
-uses verified original handles, never recursive or database-path deletion.
+admits at most 64 logical records and 32 MiB of serialized receipts and
+retained object bytes. A private missing-state receipt reserves one slot and
+4 KiB before the Tool runs. Reject can use that slot when the immutable
+created-image receipt and retained object fit the remaining byte budget.
+Existing-file hard links reserve their full bounded object allowance.
+Seven-day cleanup skips live review leases and uses verified original handles.
 The 32 MiB limit is an admission budget for serialized immutable images and
 reserved retained bytes, not an instantaneous OS disk quota. Later writes to a
 shared object and already-open handles can retain additional bytes. Inventory
 charges the actual observed size without reading an oversized body; admission
 refuses excess use. Cleanup can reclaim an inactive verified retained alias as
 soon as it becomes oversized, without waiting seven days or touching its public
-name. Active Run/review leases still protect their owned objects. Unknown entries
-fail closed rather than counting as zero or supplying deletion authority.
+name. Active Run/review leases still protect their owned objects.
+Receipts publish after a private staging file has been flushed. Recovery can
+remove verified private staging files and legacy truncated receipts with
+absent objects. Other corrupt token entries remain charged to the store for
+manual recovery. Affected tokens cannot authorize review or deletion, and
+verified tokens can still expire. Unknown filenames fail closed.
 Already-deleted legacy files without a captured original object remain read-only.
 
 

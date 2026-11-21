@@ -26,6 +26,24 @@ manual Windows baseline remain on GitHub-hosted Windows runners, because release
 packaging still requires the Windows archive for winget. Local Windows testing
 remains part of PR verification; removing that workflow does not prove portability.
 
+## Linux relay browser checks
+
+The Linux CI browser step installs Playwright and its Chromium build in the job's
+temporary directory. The PDF fixtures use Poppler to render pages and extract
+text. The runner environment needs both `pdftoppm` and `pdftotext` on the job's
+`PATH`, with runtime libraries compatible with that environment. On Debian and
+Ubuntu, both commands are provided by `poppler-utils`.
+
+Run this check from the Linux runner environment and account that CI uses.
+
+```sh
+command -v pdftoppm && command -v pdftotext && pdftoppm -v && pdftotext -v
+```
+
+Supply the tools in the runner image or put a compatible runner-provided copy
+on the job's `PATH`. The browser step fails before starting Playwright when a
+tool is missing. It relies on the runner for system packages.
+
 ## Trust boundary
 
 No automatic `pull_request` or `pull_request_target` event runs on self-hosted

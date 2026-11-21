@@ -1,4 +1,4 @@
-//! Owned fixtures only: schema-67 preview compatibility and future-stamp refusal.
+//! Owned fixtures for schema-67 upgrades and unsupported preview refusal.
 use super::*;
 struct Directory(std::path::PathBuf);
 impl Directory {
@@ -20,8 +20,7 @@ impl Drop for Directory {
     }
 }
 #[test]
-fn preview_schema67_preserves_existing_history_and_metadata_without_new_tables_or_version_bump() {
-    assert_eq!(SCHEMA_VERSION, 67);
+fn upgrade_schema67_preserves_existing_history_and_reference_metadata() {
     let dir = Directory::new();
     let file = dir.0.join("schema67.db");
     let conn = schema_at(67).unwrap();
@@ -40,7 +39,7 @@ fn preview_schema67_preserves_existing_history_and_metadata_without_new_tables_o
         st.conn
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        67
+        SCHEMA_VERSION
     );
     assert_eq!(
         st.get_session("known").unwrap().unwrap().name,
@@ -80,11 +79,11 @@ fn preview_schema67_preserves_existing_history_and_metadata_without_new_tables_o
         st.conn
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        67
+        SCHEMA_VERSION
     );
 }
 #[test]
-fn preview_schema67_refuses_future_version_stamps_without_downgrading_or_replacing_rows() {
+fn unsupported_preview_stamps_are_refused_without_replacing_rows() {
     // Refusal probes, not genuine prototype69 recovery fixtures. No claim that
     // these establish an approved downgrade/restore procedure.
     for version in [68, 69] {
@@ -99,10 +98,12 @@ fn preview_schema67_refuses_future_version_stamps_without_downgrading_or_replaci
             Err(error) => error.to_string(),
         };
         assert!(
-            error.contains(&format!("database schema v{version} is newer")),
+            error.contains(&format!(
+                "database schema v{version} is an unsupported preview schema"
+            )),
             "{error}"
         );
-        assert!(error.contains("v67"));
+        assert!(error.contains(&format!("v{SCHEMA_VERSION}")));
         let conn =
             Connection::open_with_flags(&file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         assert_eq!(
@@ -126,4 +127,63 @@ fn preview_schema67_refuses_future_version_stamps_without_downgrading_or_replaci
             1
         );
     }
+}
+
+#[test]
+fn queue_upgrade_reorder_rolls_back_on_error_and_survives_reopening() {
+    let dir = Directory::new();
+    let file = dir.0.join("queued.db");
+    let conn = schema_at(67).unwrap();
+    conn.execute_batch(
+        "PRAGMA user_version=67;
+         INSERT INTO sessions(id,name,created_at,updated_at) VALUES('s','S','t','t');
+         INSERT INTO queued_messages(id,session_id,content,created_at) VALUES(3,'s','first','t'),(9,'s','second','u');",
+    ).unwrap();
+    conn.execute("VACUUM INTO ?1", [file.to_str().unwrap()])
+        .unwrap();
+    let st = Store::open(&file).unwrap();
+    let original = st.queued_items("s").unwrap();
+    assert_eq!(
+        original
+            .iter()
+            .map(|m| (m.id, m.content.as_str(), m.revision))
+            .collect::<Vec<_>>(),
+        [(3, "first", Some(0)), (9, "second", Some(0))]
+    );
+    st.conn.execute_batch("CREATE TRIGGER reject_queue_update BEFORE UPDATE OF position ON queued_messages WHEN old.id=9 BEGIN SELECT RAISE(ABORT, 'held'); END;").unwrap();
+    assert!(st.move_queued("s", 9, true).is_err());
+    drop(st);
+    let st = Store::open(&file).unwrap();
+    assert_eq!(st.queued_items("s").unwrap(), original);
+    st.conn
+        .execute_batch("DROP TRIGGER reject_queue_update")
+        .unwrap();
+    assert_eq!(st.move_queued("s", 9, true).unwrap(), Some(9));
+    assert!(!st.edit_queued_if_current("s", 9, 0, "stale move").unwrap());
+    assert!(st
+        .edit_queued_if_current("s", 9, 1, "second edited")
+        .unwrap());
+    assert!(!st.edit_queued_if_current("s", 9, 1, "stale edit").unwrap());
+    st.enqueue_message("s", "third").unwrap();
+    drop(st);
+    let st = Store::open(&file).unwrap();
+    let queued = st.queued_items("s").unwrap();
+    assert_eq!(
+        queued
+            .iter()
+            .map(|m| (m.id, m.content.as_str(), m.revision))
+            .collect::<Vec<_>>(),
+        [
+            (9, "second edited", Some(2)),
+            (3, "first", Some(1)),
+            (10, "third", Some(0))
+        ]
+    );
+    assert_eq!(
+        st.pop_queued_message("s").unwrap().as_deref(),
+        Some("second edited")
+    );
+    assert!(!st
+        .edit_queued_if_current("s", 9, 2, "left the queue")
+        .unwrap());
 }

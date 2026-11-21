@@ -24,7 +24,7 @@ use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use rquickjs::{context::EvalOptions, Context, Function, Runtime};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -106,6 +106,19 @@ pub trait HostOps: Send + Sync {
     ) -> Result<Value, String> {
         Err("store is not available in this context".into())
     }
+    /// Exact membership, including keys whose stored value is JSON null.
+    fn kv_contains(&self, _namespace: &str, _key: &str) -> Result<bool, String> {
+        Err("store is not available in this context".into())
+    }
+    /// Return up to 1,000 matching keys in ascending order, after the cursor.
+    fn kv_list_page(
+        &self,
+        _namespace: &str,
+        _prefix: &str,
+        _after: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        Err("store is not available in this context".into())
+    }
     /// A live `fs.write` / `fs.append` / `fs.remove` / `fs.rename` is about
     /// to change `path` (each side of a rename): the daemon snapshots the
     /// file first so the Run's changes can be listed and reverted.
@@ -183,6 +196,16 @@ pub fn set_fetch_timeouts(connect_ms: u64, total_ms: u64) {
     FETCH_TIMEOUT_MS.store(total_ms.clamp(1, DAY_MS), Ordering::Relaxed);
 }
 
+/// Look up a host in the bounded native resolver pool. Callers on an async
+/// executor must run this wait on a blocking worker.
+pub fn resolve_host_until(
+    host: &str,
+    port: u16,
+    deadline: std::time::Instant,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    dns::resolve_host_until(host, port, deadline)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FetchTimeouts {
     connect_ms: u64,
@@ -252,6 +275,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("{}: {e}", p.display()))?;
     check_read_size(ReadSize::AtLeast(out.len() as u64))?;
     Ok(out)
+}
+
+fn rename_error(from: &Path, to: &Path, error: std::io::Error) -> String {
+    let mut message = format!("rename {} -> {}: {error}", from.display(), to.display());
+    if error.kind() == std::io::ErrorKind::CrossesDevices {
+        message.push_str(" (fs.rename cannot move directly across file systems)");
+    }
+    message
 }
 
 /// Set how many `tools.call` Invocations one sandbox may have in
@@ -456,7 +487,7 @@ struct State {
     /// poll it so Esc stops them, not only the JS interpreter.
     cancel: Arc<AtomicBool>,
     /// Smoke/Replay key-value store: in memory, gone after the run.
-    kv_overlay: Mutex<std::collections::BTreeMap<(String, String), Value>>,
+    kv_overlay: Mutex<HashMap<String, BTreeMap<String, Option<Value>>>>,
     /// `tools.call` bookkeeping: each call runs on its own thread.
     calls: Mutex<AsyncCalls>,
     settled_tx: std::sync::mpsc::Sender<Settled>,
@@ -1545,49 +1576,43 @@ impl State {
                 let value = a.get("value").filter(|v| !v.is_null());
                 match self.mode {
                     HostMode::Live => self.ops.kv(op, ns, key, value),
-                    // Reads see real values (and this run's writes); writes
-                    // stay in memory.
-                    HostMode::DryRun => {
-                        let mut kv = self.kv_overlay.locked();
-                        let k = (ns.to_string(), key.to_string());
+                    mode => {
+                        let mut overlay = self.kv_overlay.locked();
+                        let values = overlay.entry(ns.to_owned()).or_default();
+                        let dry_run = mode == HostMode::DryRun;
                         match op {
-                            "get" => match kv.get(&k) {
-                                Some(v) => Ok(v.clone()),
-                                None => self.ops.kv(op, ns, key, None),
+                            "get" => match values.get(key) {
+                                Some(value) => Ok(value.clone().unwrap_or(Value::Null)),
+                                None if dry_run => self.ops.kv(op, ns, key, None),
+                                None => Ok(Value::Null),
                             },
                             "set" => {
-                                self.would(format!(
-                                    "store {key} = {}",
-                                    value.cloned().unwrap_or(Value::Null)
-                                ));
-                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
+                                let value = value.cloned().unwrap_or(Value::Null);
+                                if dry_run {
+                                    self.would(format!("store {key} = {value}"));
+                                }
+                                values.insert(key.to_owned(), Some(value));
                                 Ok(Value::Null)
                             }
-                            "delete" => {
+                            "delete" if dry_run => {
+                                let present = match values.get(key) {
+                                    Some(value) => value.is_some(),
+                                    None => self.ops.kv_contains(ns, key)?,
+                                };
                                 self.would(format!("delete the stored {key}"));
-                                kv.insert(k, Value::Null);
-                                Ok(json!(true))
+                                values.insert(key.to_owned(), None);
+                                Ok(json!(present))
                             }
-                            _ => self.ops.kv(op, ns, key, value),
-                        }
-                    }
-                    HostMode::Smoke | HostMode::Replay => {
-                        let mut kv = self.kv_overlay.locked();
-                        let k = (ns.to_string(), key.to_string());
-                        Ok(match op {
-                            "get" => kv.get(&k).cloned().unwrap_or(Value::Null),
-                            "set" => {
-                                kv.insert(k, value.cloned().unwrap_or(Value::Null));
-                                Value::Null
+                            "delete" => Ok(json!(values.remove(key).is_some())),
+                            "list" if dry_run => {
+                                Ok(json!(self.dry_run_store_keys(ns, key, values)?))
                             }
-                            "delete" => json!(kv.remove(&k).is_some()),
-                            "list" => json!(kv
+                            "list" => Ok(json!(values
                                 .keys()
-                                .filter(|(n, key2)| n == ns && key2.starts_with(key))
-                                .map(|(_, key2)| key2.clone())
-                                .collect::<Vec<_>>()),
-                            other => return Err(format!("unknown store op {other}")),
-                        })
+                                .filter(|name| name.starts_with(key))
+                                .collect::<Vec<_>>())),
+                            other => Err(format!("unknown store op {other}")),
+                        }
                     }
                 }
             }
@@ -1770,7 +1795,7 @@ impl State {
                         "readonly": m.permissions().readonly(),
                     })),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
-                    Err(e) => Err(e.to_string()),
+                    Err(e) => Err(format!("{}: {e}", p.display())),
                 }
             }
             "fs_list" => self.fs_list(a),
@@ -1861,7 +1886,7 @@ impl State {
                 if let Some(parent) = to.parent() {
                     self.create_tracked_directories(parent)?;
                 }
-                std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+                std::fs::rename(&from, &to).map_err(|e| rename_error(&from, &to, e))?;
                 self.changed(a["from"].as_str().unwrap_or_default(), &from, "rename");
                 self.changed(a["to"].as_str().unwrap_or_default(), &to, "rename");
                 Ok(Value::Null)
@@ -1881,14 +1906,14 @@ impl State {
                     Some(Some(chunk)) => chunk,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
-                        let mut f =
-                            std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-                        let total = f.metadata().map_err(|e| e.to_string())?.len();
-                        f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                        let path_error = |e| format!("{}: {e}", p.display());
+                        let mut f = std::fs::File::open(&p).map_err(path_error)?;
+                        let total = f.metadata().map_err(path_error)?.len();
+                        f.seek(SeekFrom::Start(offset)).map_err(path_error)?;
                         let mut buf = Vec::with_capacity(size);
                         f.take(size as u64)
                             .read_to_end(&mut buf)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(path_error)?;
                         (buf, total)
                     }
                 };
@@ -1904,6 +1929,50 @@ impl State {
             }
             other => Err(format!("unknown host op: {other}")),
         }
+    }
+
+    fn dry_run_store_keys(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        values: &BTreeMap<String, Option<Value>>,
+    ) -> Result<Vec<String>, String> {
+        const LIST_LIMIT: usize = 1_000;
+        // SQLite's text-prefix expression cannot match a prefix containing NUL.
+        if prefix.contains('\0') {
+            return Ok(Vec::new());
+        }
+        let mut keys: BTreeSet<_> = values
+            .range(prefix.to_owned()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .filter(|(_, value)| value.is_some())
+            .take(LIST_LIMIT)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut after = None;
+        'pages: loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("interrupted".into());
+            }
+            let page = self.ops.kv_list_page(namespace, prefix, after.as_deref())?;
+            let exhausted = page.len() < LIST_LIMIT;
+            after = page.last().cloned();
+            for key in page {
+                if keys.len() == LIST_LIMIT && keys.last().is_some_and(|last| key >= *last) {
+                    break 'pages;
+                }
+                if !values.contains_key(&key) {
+                    keys.insert(key);
+                    if keys.len() > LIST_LIMIT {
+                        keys.pop_last();
+                    }
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(keys.into_iter().collect())
     }
 
     /// Inspect an exact overlay entry while holding the lock. A removed entry
@@ -1938,7 +2007,7 @@ impl State {
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
                 for e in rd {
-                    let e = e.map_err(|e| e.to_string())?;
+                    let e = e.map_err(|e| format!("{}: {e}", p.display()))?;
                     let name = e.file_name().to_string_lossy().to_string();
                     let entry_path = e.path();
                     let raw_entry = entry_path
@@ -3696,6 +3765,58 @@ mod tests {
     }
 
     #[test]
+    fn fs_error_messages_name_the_paths_and_explain_cross_filesystem_renames() {
+        let fixture = std::env::temp_dir().join(format!("fl-io-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&fixture).unwrap();
+        struct RemoveDirectory(PathBuf);
+        impl Drop for RemoveDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDirectory(fixture.clone());
+        let root = fixture.canonicalize().unwrap();
+        let from = root.join("missing.txt");
+        let to = root.join("destination.txt");
+        let run = |code: &str| {
+            let mut request = live(code);
+            request.caps = Capabilities::parse(&[
+                format!("fs:read:{}", root.display()),
+                format!("fs:write:{}", root.display()),
+            ])
+            .unwrap();
+            request.input = json!({"root": root, "from": from, "to": to});
+            execute(&request, Arc::new(NoHostOps))
+        };
+        let error = run("function run(i) { fs.rename(i.from, i.to); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error
+                .message
+                .contains(&format!("rename {} -> {}", from.display(), to.display())),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            run("function run(i) { return fs.stat(i.from); }")
+                .unwrap()
+                .output,
+            Value::Null
+        );
+
+        let error = run("function run(i) { fs.readChunks(i.root, 16, () => {}); }").unwrap_err();
+        assert_eq!(error.kind, ExecErrorKind::Js);
+        assert!(
+            error.message.contains(&root.display().to_string()),
+            "{}",
+            error.message
+        );
+
+        let error = rename_error(&from, &to, std::io::ErrorKind::CrossesDevices.into());
+        assert!(error.contains("fs.rename cannot move directly across file systems"));
+    }
+
+    #[test]
     fn structured_incomplete_reasons_keep_runtime_error_classification() {
         use structured_output::{IncompleteReason, StructuredOutputError};
         for (reason, expected) in [
@@ -4827,6 +4948,24 @@ mod tests {
             json!({"$type":"Set","values":[2],"properties":[["extra",{"nested":4}]]})
         );
         assert_eq!(outcome.logs[3], "[Unformattable]");
+    }
+
+    #[test]
+    fn smoke_and_replay_store_use_only_their_own_membership() {
+        for mode in [HostMode::Smoke, HostMode::Replay] {
+            let mut request = live(
+                r#"function run() {
+                const before = store.list('');
+                store.set('n', null);
+                const after = store.list('n');
+                return [before, after, store.get('n'), store.delete('n'), store.delete('n'), store.list('')];
+            }"#,
+            );
+            request.mode = mode;
+            request.caps = Capabilities::parse(&["store".into()]).unwrap();
+            let result = execute(&request, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(result, json!([[], ["n"], null, true, false, []]));
+        }
     }
 
     #[test]

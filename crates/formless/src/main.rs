@@ -805,12 +805,15 @@ enum ToolsAction {
         /// Tool name or ID
         name: String,
     },
-    /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
+    /// Read or replace a Tool's tags
     Tag {
         /// Tool name or id
         name: String,
-        /// Tags to assign to this Tool; omit all tags to clear them
+        /// Replacement tags; omission only reads
         tags: Vec<String>,
+        /// Explicitly remove all tags
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
@@ -2853,8 +2856,17 @@ fn upgrade_command() -> &'static str {
     upgrade_command_for_exe(&exe)
 }
 
+fn is_homebrew_executable(exe: &str) -> bool {
+    let resolved = std::fs::canonicalize(exe).ok();
+    let exe = resolved
+        .as_deref()
+        .map(std::path::Path::to_string_lossy)
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(exe));
+    exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/")
+}
+
 fn upgrade_command_for_exe(exe: &str) -> &'static str {
-    if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
+    if is_homebrew_executable(exe) {
         "brew upgrade formless"
     } else if exe.contains("/.cargo/bin/") {
         "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
@@ -3193,7 +3205,12 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         }
         DaemonAction::Status { json, check: false } => {
             if daemon_reachable(&paths) {
-                let v = formless_tui::client::request_once(&paths, Request::Status)?;
+                let mut v = formless_tui::client::request_once(&paths, Request::Status)?;
+                #[cfg(unix)]
+                let endpoint = paths.socket_path().to_string_lossy().into_owned();
+                #[cfg(windows)]
+                let endpoint = paths.pipe_name();
+                v["endpoint"] = serde_json::Value::String(endpoint);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&v)?);
                 } else {
@@ -3494,6 +3511,8 @@ enum Fix {
     RemoveStale(Vec<std::path::PathBuf>),
     /// Secret files others can read.
     Chmod600(Vec<std::path::PathBuf>),
+    #[cfg(unix)]
+    MakeDaemonEndpointPrivate,
 }
 
 /// The daemon and file checks `--fix` can act on.
@@ -3590,17 +3609,22 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
             }
         }
     }
-    // A data dir too deep for a unix socket uses a short socket path
-    // instead; that folder must be usable (SPEC §9.1).
     #[cfg(unix)]
-    if paths.socket_path().parent() != Some(paths.data_dir.as_path()) {
-        if let Err(e) = paths.prepare_socket_dir() {
-            out.push(Problem {
-                what: format!("{e:#}"),
-                next: Some("set a shorter FORMLESS_DATA_DIR".into()),
-                fix: None,
-            });
-        }
+    match paths.daemon_endpoint_permissions_need_repair() {
+        Ok(true) => out.push(Problem {
+            what: format!(
+                "the daemon data directory or socket has incorrect permissions ({})",
+                paths.socket_path().display()
+            ),
+            next: Some("formless doctor --fix".into()),
+            fix: Some(Fix::MakeDaemonEndpointPrivate),
+        }),
+        Ok(false) => {}
+        Err(error) => out.push(Problem {
+            what: format!("{error:#}"),
+            next: Some("inspect the daemon data directory and socket ownership".into()),
+            fix: None,
+        }),
     }
     #[cfg(unix)]
     {
@@ -3658,6 +3682,14 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             }
             Ok("removed the stale files".into())
         }
+        #[cfg(unix)]
+        Fix::MakeDaemonEndpointPrivate => {
+            paths
+                .prepare_socket_dir()
+                .and_then(|()| paths.set_daemon_socket_permissions())
+                .map_err(|error| format!("{error:#}"))?;
+            Ok("made the daemon directories (700) and existing socket (600) private".into())
+        }
         Fix::Chmod600(files) => {
             #[cfg(unix)]
             for f in files {
@@ -3668,6 +3700,39 @@ fn apply_fix(paths: &Paths, fix: &Fix) -> Result<String, String> {
             Ok("made the secret files private (600)".into())
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn doctor_reports_and_repairs_loose_daemon_directory_and_socket_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = std::env::temp_dir().join(format!("fl-doctor-endpoint-{}", std::process::id()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    paths.prepare_socket_dir().unwrap();
+    std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = paths.socket_path();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let problems = doctor_local_problems(&paths);
+    let fix = problems
+        .iter()
+        .find_map(|problem| match &problem.fix {
+            Some(fix @ Fix::MakeDaemonEndpointPrivate) => Some(fix),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o777);
+    apply_fix(&paths, fix).unwrap();
+    assert_eq!(
+        std::fs::metadata(&paths.data_dir).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);
+    assert!(!paths.daemon_endpoint_permissions_need_repair().unwrap());
+    drop(listener);
+    std::fs::remove_file(socket).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Doctor already wrote the full diagnostic report before returning this verdict.
@@ -3746,7 +3811,7 @@ fn redact(text: &str) -> String {
             (r"(?i)((?:api[_-]?key|token|secret|password|authorization)\x22?\s*[:=]\s*\x22?)[^\s\x22',]+", "${1}[redacted]"),
             (r"#(k|local)=[^\s&\x22']+", "#${1}=[redacted]"),
             (r"(://)[^/\s:@]+:[^/\s@]+@", "${1}[redacted]@"),
-            (r"\b(sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
+            (r"\b(sk|pk|rk|ghp|gho|ghr|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
             (r"[A-Za-z0-9+/_\-]{40,}={0,2}", "[redacted]"),
         ]
         .into_iter()
@@ -6893,19 +6958,23 @@ fn comparison_terminal_text(text: &str) -> String {
 }
 
 fn comparison_quoted_metadata(text: &str) -> Result<String> {
+    Ok(escape_json_terminal_controls(&serde_json::to_string(text)?))
+}
+
+/// Keep JSON text parseable while escaping terminal controls left by Serde.
+fn escape_json_terminal_controls(json: &str) -> String {
     use std::fmt::Write as _;
-    let quoted = serde_json::to_string(text)?;
-    let mut visible = String::with_capacity(quoted.len());
-    for c in quoted.chars() {
-        if table::terminal_control(c) {
-            // All relevant control/format characters are in the BMP. Keep a
-            // valid JSON string while making bidi and C1 controls visible too.
-            write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
+    let mut visible = String::with_capacity(json.len());
+    for c in json.chars() {
+        if c != '\n' && table::terminal_control(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                write!(&mut visible, "\\u{unit:04x}").expect("writing to String");
+            }
         } else {
             visible.push(c);
         }
     }
-    Ok(visible)
+    visible
 }
 
 fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> Result<()> {
@@ -7628,15 +7697,19 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
         formless_tui::client::request_once(&paths, req)
     };
     let show = |m: &serde_json::Value| {
+        let field = |key: &str| comparison_terminal_text(m[key].as_str().unwrap_or_default());
         println!(
             "{:<10} {:<8} {:<20} {}{}",
-            m["id"].as_str().unwrap_or_default(),
+            field("id"),
             if m["enabled"] == true { "on" } else { "off" },
-            m["scope"].as_str().unwrap_or_default(),
-            m["text"].as_str().unwrap_or_default(),
+            field("scope"),
+            field("text"),
             match m["session_id"].as_str() {
-                Some(s) => format!("  (from session {})", &s[..s.len().min(8)]),
-                None => format!("  ({})", m["author"].as_str().unwrap_or_default()),
+                Some(s) => format!(
+                    "  (from session {})",
+                    comparison_terminal_text(&s.chars().take(8).collect::<String>())
+                ),
+                None => format!("  ({})", field("author")),
             }
         )
     };
@@ -8406,17 +8479,23 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
         ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),
         ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
-        ToolsAction::Tag { name, tags } => {
+        ToolsAction::Tag { name, tags, clear } => {
             let tool = find_tool(&paths, &name)?;
-            let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(
-                &paths,
-                Request::SetToolTags { id: tool.id, tags },
-            )?)?;
-            if t.tags.is_empty() {
-                println!("{}: no tags", t.name);
+            let tool = if clear || !tags.is_empty() {
+                serde_json::from_value(request_once(
+                    &paths,
+                    Request::SetToolTags { id: tool.id, tags },
+                )?)?
             } else {
-                println!("{}: {}", t.name, t.tags.join(" "));
-            }
+                tool
+            };
+            let name = comparison_terminal_text(&tool.name);
+            let tags = if tool.tags.is_empty() {
+                "no tags".into()
+            } else {
+                comparison_terminal_text(&tool.tags.join(" "))
+            };
+            println!("{name}: {tags}");
             Ok(())
         }
         ToolsAction::Retire { name, force } => set_tool_retired(&paths, &name, true, force),
@@ -9114,6 +9193,20 @@ fn tool_run_exit(v: &serde_json::Value, text: &str) -> i32 {
     }
 }
 
+fn package_uninstall_command(exe: &str) -> Option<&'static str> {
+    if is_homebrew_executable(exe) {
+        Some("brew uninstall formless")
+    } else if exe.starts_with("/usr/bin/") {
+        Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
+    } else if exe.contains("WinGet") {
+        Some("winget uninstall --id athiwatc.formless --exact")
+    } else if exe.contains("/.cargo/bin/") || exe.contains("\\.cargo\\bin\\") {
+        Some("cargo uninstall formless-bin")
+    } else {
+        None
+    }
+}
+
 /// `formless uninstall` (SPEC §15): every profile's daemon, login service
 /// and secrets, then its folders (unless --keep-data), then the binary
 /// (unless --keep-binary or a package manager owns it).
@@ -9122,20 +9215,9 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     let profiles = paths.list_profiles();
     let exe = std::env::current_exe().ok();
     // A package manager's binary is removed with the package manager.
-    let managed = exe.as_ref().and_then(|e| {
-        let s = e.to_string_lossy();
-        if s.contains("/Cellar/") || s.contains("/homebrew/") {
-            Some("brew uninstall formless")
-        } else if s.starts_with("/usr/bin/") {
-            Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
-        } else if s.contains("WinGet") {
-            Some("winget uninstall formless")
-        } else if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
-            Some("cargo uninstall formless-bin")
-        } else {
-            None
-        }
-    });
+    let managed = exe
+        .as_ref()
+        .and_then(|exe| package_uninstall_command(&exe.to_string_lossy()));
     println!("This removes Formless from this machine:");
     for p in &profiles {
         println!(
@@ -10246,6 +10328,68 @@ mod tests {
         assert!(readme.contains(&format!("`{install}`")));
     }
 
+    #[test]
+    fn uninstall_uses_the_package_manager_for_winget_and_homebrew() {
+        for exe in [
+            "/home/linuxbrew/.linuxbrew/bin/formless",
+            "/opt/homebrew/bin/formless",
+            "/usr/local/Cellar/formless/1.0/bin/formless",
+        ] {
+            assert_eq!(
+                super::package_uninstall_command(exe),
+                Some("brew uninstall formless")
+            );
+            assert_eq!(super::upgrade_command_for_exe(exe), "brew upgrade formless");
+        }
+        assert_eq!(
+            super::package_uninstall_command(
+                r"C:\Users\example\AppData\Local\Microsoft\WinGet\Packages\athiwatc.formless\formless.exe"
+            ),
+            Some("winget uninstall --id athiwatc.formless --exact")
+        );
+        assert_eq!(super::package_uninstall_command("/tmp/formless"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_intel_homebrew_binary_uses_brew_for_update_and_uninstall() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("formless-brew-{}-{stamp}", std::process::id()));
+        let prefix = root.join("usr/local");
+        let bin = prefix.join("bin");
+        let keg = prefix.join("Cellar/formless/0.2.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::write(keg.join("formless"), b"fixture").unwrap();
+        let exe = bin.join("formless");
+        std::os::unix::fs::symlink("../Cellar/formless/0.2.0/bin/formless", &exe).unwrap();
+
+        assert_eq!(
+            super::upgrade_command_for_exe(exe.to_str().unwrap()),
+            "brew upgrade formless"
+        );
+        assert_eq!(
+            super::package_uninstall_command(exe.to_str().unwrap()),
+            Some("brew uninstall formless")
+        );
+        assert_eq!(
+            std::fs::read_link(&exe).unwrap(),
+            std::path::PathBuf::from("../Cellar/formless/0.2.0/bin/formless")
+        );
+        let ordinary = root.join(".local/bin/formless");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, b"unmanaged fixture").unwrap();
+        assert_eq!(
+            super::package_uninstall_command(ordinary.to_str().unwrap()),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Root presentation order is deliberate (#1609), independently of inventory.
     #[test]
     fn root_help_and_man_use_alphabetical_command_order() {
@@ -10416,6 +10560,15 @@ mod tests {
             [("v0.2.0".into(), "Final release".into(), "final".into())]
         );
         assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
+    }
+
+    #[test]
+    fn bug_reports_redact_github_app_refresh_tokens() {
+        let token = format!("ghr_{}", "0123456789abcdefghijklmnop");
+        assert_eq!(
+            redact(&format!("github: {token}, ghr_short")),
+            "github: ghr-[redacted], ghr_short"
+        );
     }
 
     #[test]

@@ -168,6 +168,28 @@ fn annotation(key: &str) -> bool {
             | "writeOnly"
     )
 }
+// Stable metadata does not block the structural proof. A dialect change or
+// unknown dialect can change the meaning of assertions. Draft 4 also lacks
+// some assertions understood by this comparator, such as const.
+fn stable_schema_metadata(key: &str, sub: &Map<String, Value>, sup: &Map<String, Value>) -> bool {
+    let Some(value) = sub.get(key).and_then(Value::as_str) else {
+        return false;
+    };
+    if sup.get(key).and_then(Value::as_str) != Some(value) {
+        return false;
+    }
+    match key {
+        "$id" | "$anchor" => true,
+        "$schema" => matches!(
+            jsonschema::Draft::from_schema_uri(value),
+            jsonschema::Draft::Draft6
+                | jsonschema::Draft::Draft7
+                | jsonschema::Draft::Draft201909
+                | jsonschema::Draft::Draft202012
+        ),
+        _ => false,
+    }
+}
 fn schema_map(key: &str) -> bool {
     matches!(
         key,
@@ -505,6 +527,7 @@ fn subset(sub: &Value, sup: &Value, side: Side, pointer: &str, state: &mut State
         .chain(sup.keys())
         .filter(|key| {
             !annotation(key)
+                && !stable_schema_metadata(key, sub, sup)
                 && !matches!(
                     key.as_str(),
                     "type"
@@ -585,6 +608,11 @@ fn subset(sub: &Value, sup: &Value, side: Side, pointer: &str, state: &mut State
         for name in names {
             if state.halted {
                 return;
+            }
+            if side == Side::Input && sub_props.contains_key(name) && !sup_props.contains_key(name)
+            {
+                // The declaration removal above already records this path as breaking.
+                continue;
             }
             let sub_property = sub_props.get(name).unwrap_or(sub_extra);
             let sup_property = sup_props.get(name).unwrap_or(sup_extra);
@@ -696,6 +724,47 @@ mod tests {
         .is_breaking());
         let old_required = object(json!({"a":{"type":"string"}}), json!(["a"]));
         assert_eq!(input(old_required, old).verdict, Verdict::Compatible);
+    }
+    #[test]
+    fn stable_draft_and_identifier_allow_a_structurally_compatible_edit() {
+        let mut old = object(json!({"a":{"type":"string"}}), json!(["a"]));
+        old["$schema"] = json!("http://json-schema.org/draft-07/schema#");
+        old["$id"] = json!("https://example.invalid/tool");
+        let mut optional = old.clone();
+        optional["properties"]["b"] = json!({"type":"integer"});
+        assert_eq!(
+            input(old.clone(), optional.clone()).verdict,
+            Verdict::Compatible
+        );
+
+        let mut changed = optional.clone();
+        changed["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+        assert_eq!(input(old.clone(), changed).verdict, Verdict::Inconclusive);
+        optional["$id"] = json!("https://example.invalid/different");
+        assert_eq!(input(old, optional).verdict, Verdict::Inconclusive);
+
+        let mut old = json!({"$schema":"https://example.invalid/dialect", "type":"string"});
+        let mut widened = json!({
+            "$schema": "https://example.invalid/dialect",
+            "type": ["string", "null"]
+        });
+        assert_eq!(
+            input(old.clone(), widened.clone()).verdict,
+            Verdict::Inconclusive
+        );
+        old["$schema"] = json!("http://json-schema.org/draft-04/schema#");
+        widened["$schema"] = old["$schema"].clone();
+        assert_eq!(input(old, widened).verdict, Verdict::Inconclusive);
+    }
+
+    #[test]
+    fn removing_a_closed_input_property_reports_its_path_once() {
+        let old = object(json!({"a":{"type":"string"}}), json!([]));
+        let new = object(json!({}), json!([]));
+        let report = input(old, new);
+        assert!(report.is_breaking());
+        assert_eq!(report.changes.len(), 1, "{report:?}");
+        assert_eq!(report.changes[0].pointer, "/properties/a");
     }
     #[test]
     fn output_required_optional_and_closed_extra_fields_mirror_input_variance() {
