@@ -11,6 +11,7 @@ use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 use ratatui::prelude::*;
+use std::{ops::Range, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -78,7 +79,31 @@ fn parser_options() -> Options {
         | Options::ENABLE_MATH
 }
 
-pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Link {
+    pub row: usize,
+    pub columns: Range<usize>,
+    pub target: Arc<str>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    pub links: Vec<Link>,
+}
+
+impl Rendered {
+    pub fn append_to(self, lines: &mut Vec<Line<'static>>, links: &mut Vec<Link>) {
+        let offset = lines.len();
+        lines.extend(self.lines);
+        links.extend(self.links.into_iter().map(|mut link| {
+            link.row += offset;
+            link
+        }));
+    }
+}
+
+pub(crate) fn render_with_links(text: &str, color: bool, indent: &str, width: usize) -> Rendered {
     let opts = parser_options();
     let mut r = Renderer {
         color,
@@ -91,6 +116,11 @@ pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec
     }
     r.flush();
     r.out
+}
+
+#[cfg(test)]
+pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
+    render_with_links(text, color, indent, width).lines
 }
 
 /// A parsed table, with containers already interpreted by the same parser as
@@ -111,7 +141,7 @@ impl ParsedTable<'_> {
             renderer.event(event.clone());
         }
         renderer.flush();
-        renderer.out
+        renderer.out.lines
     }
 }
 
@@ -171,11 +201,36 @@ struct Prefix {
 }
 
 /// Layout provenance for parsed inline content, independent of its colors.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct InlineSpan {
     content: String,
     style: Style,
     literal: bool,
+    target: Option<Arc<str>>,
+}
+
+impl InlineSpan {
+    fn plain(span: Span<'static>) -> Self {
+        Self {
+            content: span.content.into_owned(),
+            style: span.style,
+            literal: false,
+            target: None,
+        }
+    }
+
+    fn styled(self) -> Span<'static> {
+        Span::styled(self.content, self.style)
+    }
+
+    fn with_content(&self, content: String) -> Self {
+        Self {
+            content,
+            style: self.style,
+            literal: self.literal,
+            target: self.target.clone(),
+        }
+    }
 }
 
 struct Table {
@@ -191,7 +246,7 @@ struct Renderer {
     color: bool,
     width: usize,
     indent: String,
-    out: Vec<Line<'static>>,
+    out: Rendered,
     spans: Vec<InlineSpan>,
     styles: Vec<Style>,
     prefixes: Vec<Prefix>,
@@ -228,14 +283,22 @@ impl Renderer {
     /// Close a link: its URL follows its text unless the text is the URL.
     fn finish_link(&mut self) {
         if let Some((url, at)) = self.link.take() {
-            let spans = self.table.as_ref().map_or(&self.spans, |t| &t.cell);
-            let text: String = spans[at.min(spans.len())..]
-                .iter()
-                .map(|s| s.content.as_str())
-                .collect();
+            let target = super::links::explicit_http_target(&url).map(Arc::<str>::from);
+            let spans = self.table.as_mut().map_or(&mut self.spans, |t| &mut t.cell);
+            let len = spans.len();
+            let label = &mut spans[at.min(len)..];
+            let text: String = label.iter().map(|s| s.content.as_str()).collect();
+            if let Some(target) = target.as_ref().filter(|_| text == url) {
+                for span in label {
+                    span.target = Some(target.clone());
+                }
+            }
             let bare = url.trim_start_matches("mailto:");
             if !url.is_empty() && text != url && text != bare && !url.starts_with('#') {
-                self.push_text(format!(" ({url})"), dim(self.color));
+                let style = dim(self.color);
+                self.push_text(" (", style);
+                self.push_target(url, style, false, target);
+                self.push_text(")", style);
             }
         }
     }
@@ -309,10 +372,21 @@ impl Renderer {
     }
 
     fn push_inline(&mut self, text: impl Into<String>, extra: Style, literal: bool) {
+        self.push_target(text, extra, literal, None);
+    }
+
+    fn push_target(
+        &mut self,
+        text: impl Into<String>,
+        extra: Style,
+        literal: bool,
+        target: Option<Arc<str>>,
+    ) {
         let span = InlineSpan {
             content: text.into(),
             style: self.style().patch(extra),
             literal,
+            target,
         };
         match &mut self.table {
             Some(t) => t.cell.push(span),
@@ -348,13 +422,43 @@ impl Renderer {
     fn emit(&mut self, body: Vec<Span<'static>>) {
         let mut spans = self.prefix();
         spans.extend(body);
-        self.out.push(Line::from(spans));
+        self.out.lines.push(Line::from(spans));
+    }
+
+    fn emit_inline(&mut self, body: Vec<InlineSpan>) {
+        let mut spans = self.prefix();
+        let row = self.out.lines.len();
+        let mut column = spans.iter().map(Span::width).sum::<usize>();
+        for span in body {
+            let end = column + span.content.width();
+            if let Some(target) = &span.target {
+                if end > column {
+                    match self.out.links.last_mut() {
+                        Some(link)
+                            if link.row == row
+                                && link.columns.end == column
+                                && link.target == *target =>
+                        {
+                            link.columns.end = end;
+                        }
+                        _ => self.out.links.push(Link {
+                            row,
+                            columns: column..end,
+                            target: target.clone(),
+                        }),
+                    }
+                }
+            }
+            spans.push(span.styled());
+            column = end;
+        }
+        self.out.lines.push(Line::from(spans));
     }
 
     /// Blank separator between blocks (quote bars continue through it;
     /// pending list markers are kept for the block's real first row).
     fn gap(&mut self) {
-        if self.need_gap && !self.out.is_empty() {
+        if self.need_gap && !self.out.lines.is_empty() {
             let mut spans: Vec<Span<'static>> = self
                 .prefixes
                 .iter()
@@ -367,7 +471,7 @@ impl Renderer {
                 last.content = last.content.trim_end().to_string().into();
                 spans.insert(0, Span::raw(self.indent.clone()));
             }
-            self.out.push(Line::from(spans));
+            self.out.lines.push(Line::from(spans));
         }
         self.need_gap = false;
     }
@@ -383,7 +487,7 @@ impl Renderer {
             .saturating_sub(self.prefix_width())
             .max(if self.heading { 1 } else { 8 });
         for row in wrap(spans, avail) {
-            self.emit(row);
+            self.emit_inline(row);
         }
     }
 
@@ -791,28 +895,28 @@ impl Renderer {
             }
             // Each cell wraps within its column; the row is as tall as
             // its tallest cell.
-            let cells: Vec<Vec<Vec<Span<'static>>>> = widths
+            let cells: Vec<_> = widths
                 .iter()
                 .enumerate()
                 .map(|(i, w)| wrap(row.get(i).cloned().unwrap_or_default(), *w))
                 .collect();
             let height = cells.iter().map(Vec::len).max().unwrap_or(1);
             for k in 0..height {
-                let mut line = vec![Span::styled("│", dim(color))];
+                let mut line = vec![InlineSpan::plain(Span::styled("│", dim(color)))];
                 for (i, w) in widths.iter().enumerate() {
-                    let cell = truncate_spans(cells[i].get(k).cloned().unwrap_or_default(), *w);
+                    let cell = truncate_inline(cells[i].get(k).cloned().unwrap_or_default(), *w);
                     let pad = w - cell.iter().map(|span| span.content.width()).sum::<usize>();
                     let (l, r) = match t.aligns.get(i) {
                         Some(Alignment::Right) => (pad, 0),
                         Some(Alignment::Center) => (pad / 2, pad - pad / 2),
                         _ => (0, pad),
                     };
-                    line.push(Span::raw(" ".repeat(l + 1)));
+                    line.push(InlineSpan::plain(Span::raw(" ".repeat(l + 1))));
                     line.extend(cell);
-                    line.push(Span::raw(" ".repeat(r + 1)));
-                    line.push(Span::styled("│", dim(color)));
+                    line.push(InlineSpan::plain(Span::raw(" ".repeat(r + 1))));
+                    line.push(InlineSpan::plain(Span::styled("│", dim(color))));
                 }
-                self.emit(line);
+                self.emit_inline(line);
             }
         }
         self.emit(vec![border("└", "┴", "┘")]);
@@ -832,17 +936,15 @@ impl Renderer {
                 dim(color).add_modifier(Modifier::BOLD),
             )]);
             for (i, cell) in row.iter().enumerate() {
-                let mut line = vec![Span::raw("  ")];
+                let mut line = vec![InlineSpan::plain(Span::raw("  "))];
                 match headers.get(i).filter(|h| !h.is_empty()) {
-                    Some(h) => line.extend(h.iter().map(|s| {
-                        Span::styled(s.content.clone(), s.style.add_modifier(Modifier::BOLD))
+                    Some(h) => line.extend(h.iter().cloned().map(|mut span| {
+                        span.style = span.style.add_modifier(Modifier::BOLD);
+                        span
                     })),
-                    None => line.push(Span::styled(
-                        format!("col {}", i + 1),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )),
+                    None => line.push(InlineSpan::plain(Span::raw(format!("col {}", i + 1)))),
                 }
-                line.push(Span::raw(": "));
+                line.push(InlineSpan::plain(Span::raw(": ")));
                 // The value wraps under itself with a hanging indent, so no
                 // row is wider than the pane (#874); a key too wide to leave
                 // room puts the value on the rows below it.
@@ -851,17 +953,20 @@ impl Renderer {
                 let (first, hang) = if avail >= key_w + 8 {
                     (line, key_w)
                 } else {
-                    self.emit(truncate_spans(line, avail));
-                    (vec![Span::raw("    ")], 4.min(avail.saturating_sub(1)))
+                    self.emit_inline(truncate_inline(line, avail));
+                    (
+                        vec![InlineSpan::plain(Span::raw("    "))],
+                        4.min(avail.saturating_sub(1)),
+                    )
                 };
                 let mut rows = wrap(cell.clone(), avail - hang).into_iter();
                 let mut head = first;
                 head.extend(rows.next().unwrap_or_default());
-                self.emit(head);
+                self.emit_inline(head);
                 for r in rows {
-                    let mut l = vec![Span::raw(" ".repeat(hang))];
+                    let mut l = vec![InlineSpan::plain(Span::raw(" ".repeat(hang)))];
                     l.extend(r);
-                    self.emit(l);
+                    self.emit_inline(l);
                 }
             }
         }
@@ -912,27 +1017,98 @@ fn fit_widths(natural: &[usize], room: usize) -> Vec<usize> {
     widths
 }
 
+/// Discover bare URLs in a logical row before layout splits words or
+/// graphemes. Parsed Markdown destinations keep their existing priority.
+fn mark_bare_urls(spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+    if !spans.iter().any(|span| span.content.contains(':')) {
+        return spans;
+    }
+    let mut text = String::new();
+    let mut parsed = Vec::new();
+    for span in &spans {
+        let start = text.len();
+        text.push_str(&span.content);
+        if span.target.is_some() {
+            parsed.push(start..text.len());
+        }
+    }
+    let urls = super::links::find_urls(&text);
+    if urls.is_empty() {
+        return spans;
+    }
+    let offsets: Vec<_> = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let mut urls = urls
+        .into_iter()
+        .filter_map(|(first, last, target)| {
+            let range = offsets[first]..offsets[last];
+            (!parsed
+                .iter()
+                .any(|p| range.start < p.end && range.end > p.start))
+            .then(|| (range, Arc::<str>::from(target)))
+        })
+        .peekable();
+    if urls.peek().is_none() {
+        return spans;
+    }
+
+    let mut tagged = Vec::with_capacity(spans.len());
+    let mut offset = 0;
+    for span in spans {
+        let end = offset + span.content.len();
+        let mut start = offset;
+        while let Some((range, target)) = urls
+            .peek()
+            .filter(|(range, _)| start < end && range.start < end)
+        {
+            let first = range.start.max(start);
+            let last = range.end.min(end);
+            if first > start {
+                tagged.push(span.with_content(text[start..first].to_owned()));
+            }
+            let mut linked = span.with_content(text[first..last].to_owned());
+            linked.target = Some(target.clone());
+            tagged.push(linked);
+            start = last;
+            if last == range.end {
+                urls.next();
+            } else {
+                break;
+            }
+        }
+        if start == offset {
+            tagged.push(span);
+        } else if start < end {
+            tagged.push(span.with_content(text[start..end].to_owned()));
+        }
+        offset = end;
+    }
+    tagged
+}
+
 /// Greedy word wrap of styled spans; `\n` inside a span forces a break.
-fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
+fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<InlineSpan>> {
     // Split into words (non-space runs, possibly multi-style) and spaces.
     enum Piece {
-        Word(Vec<Span<'static>>, usize),
-        Space(Style),
+        Word(Vec<InlineSpan>, usize),
+        Space(InlineSpan),
         /// A place to break with no space: between clusters of a script
         /// written without spaces (Thai, CJK) (#786).
         Soft,
         Break,
     }
     let mut pieces: Vec<Piece> = Vec::new();
-    for span in spans {
-        let style = span.style;
+    for span in mark_bare_urls(spans) {
         let mut word = String::new();
         let flush_word = |word: &mut String, pieces: &mut Vec<Piece>| {
             if word.is_empty() {
                 return;
             }
             let w = word.width();
-            let s = Span::styled(std::mem::take(word), style);
+            let s = span.with_content(std::mem::take(word));
             match pieces.last_mut() {
                 Some(Piece::Word(parts, pw)) => {
                     parts.push(s);
@@ -956,7 +1132,7 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
             } else if ch.is_whitespace() {
                 flush_word(&mut word, &mut pieces);
                 if !matches!(pieces.last(), Some(Piece::Space(_))) {
-                    pieces.push(Piece::Space(style));
+                    pieces.push(Piece::Space(span.with_content(" ".into())));
                 }
             } else if crate::text::unspaced(ch) {
                 // Each cluster is its own word, with break chances around it.
@@ -1011,10 +1187,10 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
             (_, piece) => grouped.push(piece),
         }
     }
-    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut rows: Vec<Vec<InlineSpan>> = Vec::new();
+    let mut row: Vec<InlineSpan> = Vec::new();
     let mut row_w = 0;
-    let mut space: Option<Style> = None;
+    let mut space: Option<InlineSpan> = None;
     for p in grouped {
         match p {
             Piece::Break => {
@@ -1033,8 +1209,8 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
                 if row_w > 0 && row_w + sp + w > avail {
                     rows.push(std::mem::take(&mut row));
                     row_w = 0;
-                } else if let Some(s) = space {
-                    row.push(Span::styled(" ", s));
+                } else if let Some(s) = space.take() {
+                    row.push(s);
                     row_w += 1;
                 }
                 space = None;
@@ -1062,7 +1238,7 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
 }
 
 /// Split spans into rows of at most `avail` columns, ignoring words.
-fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+fn hard_wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<InlineSpan>> {
     if avail == 0 {
         return Vec::new();
     }
@@ -1079,7 +1255,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
                 if !buf.is_empty() {
                     rows.last_mut()
                         .unwrap()
-                        .push(Span::styled(std::mem::take(&mut buf), span.style));
+                        .push(span.with_content(std::mem::take(&mut buf)));
                 }
                 rows.push(Vec::new());
                 w = 0;
@@ -1088,7 +1264,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
             w += cw;
         }
         if !buf.is_empty() {
-            rows.last_mut().unwrap().push(Span::styled(buf, span.style));
+            rows.last_mut().unwrap().push(span.with_content(buf));
         }
     }
     rows
@@ -1175,6 +1351,16 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     if total <= max {
         return spans;
     }
+    truncate_inline(spans.into_iter().map(InlineSpan::plain).collect(), max)
+        .into_iter()
+        .map(InlineSpan::styled)
+        .collect()
+}
+
+fn truncate_inline(spans: Vec<InlineSpan>, max: usize) -> Vec<InlineSpan> {
+    if spans.iter().map(|s| s.content.width()).sum::<usize>() <= max {
+        return spans;
+    }
     let mut out = Vec::new();
     let mut w = 0;
     for span in spans {
@@ -1183,13 +1369,13 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
             let cw = g.width();
             if w + cw + 1 > max {
                 buf.push('…');
-                out.push(Span::styled(buf, span.style));
+                out.push(span.with_content(buf));
                 return out;
             }
             buf.push_str(g);
             w += cw;
         }
-        out.push(Span::styled(buf, span.style));
+        out.push(span.with_content(buf));
     }
     out
 }
@@ -1676,6 +1862,7 @@ mod tests {
                     content: source.into(),
                     style: Style::default(),
                     literal: false,
+                    target: None,
                 }],
                 width,
             );
@@ -1683,7 +1870,7 @@ mod tests {
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|span| span.content.as_ref())
+                        .map(|span| span.content.as_str())
                         .collect::<String>()
                 })
                 .collect();
@@ -1697,6 +1884,7 @@ mod tests {
             content: text.into(),
             style,
             literal: false,
+            target: None,
         };
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let italic = Style::default().add_modifier(Modifier::ITALIC);
@@ -1710,7 +1898,7 @@ mod tests {
         );
         let texts: Vec<String> = rows
             .iter()
-            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .map(|row| row.iter().map(|span| span.content.as_str()).collect())
             .collect();
         assert_eq!(texts, ["中", "（文"]);
         assert_eq!(rows[1][0].style, bold);
@@ -1724,7 +1912,7 @@ mod tests {
                 let rows = wrap(vec![span(source, Style::default())], width);
                 let texts: Vec<String> = rows
                     .iter()
-                    .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+                    .map(|row| row.iter().map(|span| span.content.as_str()).collect())
                     .collect();
                 assert_eq!(texts.concat(), source);
                 for row in texts {
@@ -1742,7 +1930,7 @@ mod tests {
             rows.iter()
                 .map(|row| row
                     .iter()
-                    .map(|span| span.content.as_ref())
+                    .map(|span| span.content.as_str())
                     .collect::<String>())
                 .collect::<Vec<_>>(),
             ["中", "。文"]
@@ -1752,7 +1940,7 @@ mod tests {
             assert_eq!(
                 rows.iter()
                     .flat_map(|row| row.iter())
-                    .map(|span| span.content.as_ref())
+                    .map(|span| span.content.as_str())
                     .collect::<String>(),
                 if width == 1 { "………" } else { "（文）" }
             );
@@ -1764,19 +1952,18 @@ mod tests {
         }
         for source in ["กขคง", "ກຂຄງ", "កខគឃ", "ကခဂဃ"] {
             let rows = wrap(vec![span(source, bold)], 2);
-            let text_rows = |rows: Vec<Vec<Span<'static>>>| {
+            let text_rows = |rows: Vec<Vec<InlineSpan>>| {
                 rows.into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .map(|span| span.content.into_owned())
-                            .collect::<String>()
-                    })
+                    .map(|row| row.into_iter().map(|span| span.content).collect::<String>())
                     .collect::<Vec<_>>()
             };
             assert!(rows.iter().flatten().all(|span| span.style == bold));
             assert_eq!(
                 text_rows(rows),
-                text_rows(hard_wrap(vec![Span::styled(source, bold)], 2))
+                text_rows(hard_wrap(
+                    vec![InlineSpan::plain(Span::styled(source, bold))],
+                    2
+                ))
             );
         }
     }
@@ -1787,6 +1974,7 @@ mod tests {
             content: text.into(),
             style,
             literal: false,
+            target: None,
         };
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
@@ -1795,7 +1983,10 @@ mod tests {
                 .graphemes(true)
                 .map(|g| if g.width() > 1 { "…" } else { g })
                 .collect::<String>();
-            let rows = hard_wrap(vec![Span::styled(source.to_string(), bold)], 1);
+            let rows = hard_wrap(
+                vec![InlineSpan::plain(Span::styled(source.to_string(), bold))],
+                1,
+            );
             assert!(
                 rows.iter()
                     .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
@@ -1804,12 +1995,16 @@ mod tests {
             assert_eq!(
                 rows.iter()
                     .flatten()
-                    .map(|s| s.content.as_ref())
+                    .map(|s| s.content.as_str())
                     .collect::<String>(),
                 expected
             );
             assert!(rows.iter().flatten().all(|s| s.style == bold));
-            assert!(hard_wrap(vec![Span::styled(source.to_string(), bold)], 0).is_empty());
+            assert!(hard_wrap(
+                vec![InlineSpan::plain(Span::styled(source.to_string(), bold))],
+                0
+            )
+            .is_empty());
             let rows = wrap(vec![span(source, bold)], 1);
             assert!(
                 rows.iter()
@@ -1817,21 +2012,27 @@ mod tests {
                 "{rows:?}"
             );
         }
-        let rows = hard_wrap(vec![Span::styled("a", bold), Span::raw("界b")], 1);
+        let rows = hard_wrap(
+            vec![
+                InlineSpan::plain(Span::styled("a", bold)),
+                InlineSpan::plain(Span::raw("界b")),
+            ],
+            1,
+        );
         assert_eq!(
             rows.iter()
                 .flatten()
-                .map(|s| s.content.as_ref())
+                .map(|s| s.content.as_str())
                 .collect::<String>(),
             "a…b"
         );
         assert_eq!(rows[0][0].style, bold);
         assert_eq!(rows[1][0].style, Style::default());
-        let rows = hard_wrap(vec![Span::raw(format!("{family}界"))], 2);
+        let rows = hard_wrap(vec![InlineSpan::plain(Span::raw(format!("{family}界")))], 2);
         assert_eq!(
             rows.iter()
                 .flatten()
-                .map(|s| s.content.as_ref())
+                .map(|s| s.content.as_str())
                 .collect::<String>(),
             format!("{family}界")
         );
@@ -1851,7 +2052,7 @@ mod tests {
             renderer.event(event);
         }
         renderer.flush();
-        let rows = renderer.out;
+        let rows = renderer.out.lines;
         // Scope the assertion to wrapped values: the existing fixed row
         // heading has its own minimum width and is outside hard wrapping.
         let values: Vec<_> = rows
@@ -1912,9 +2113,9 @@ mod tests {
         );
         assert_eq!(hangul, ["  abcdefghijklmnop", "  ㄱㄴ"]);
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
-        let rows = hard_wrap(vec![Span::raw(family.repeat(3))], 3);
+        let rows = hard_wrap(vec![InlineSpan::plain(Span::raw(family.repeat(3)))], 3);
         for r in &rows {
-            let t: String = r.iter().map(|s| s.content.as_ref()).collect();
+            let t: String = r.iter().map(|s| s.content.as_str()).collect();
             assert_eq!(t, family, "{rows:?}");
         }
         let cut = truncate_spans(vec![Span::raw(format!("{family}{family}x"))], 4);

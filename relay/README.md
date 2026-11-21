@@ -156,7 +156,30 @@ loopback servers, malformed requests and injected handler faults. It verifies
 health and valid mock replies after failures; it does not deploy a Worker.
 
 Run the relay/web regression suite with `node --test relay/*.test.mjs` from
-the repository root. Display regressions also have a browser check:
+the repository root.
+
+### Browser regressions
+
+Linux CI runs the Chromium coverage of every `relay/*.browser-test.py` suite
+and the loopback `relay/*.dev-test.mjs` suites. It generates the Settings
+fixture from Rust and saves a log for every suite. To run the same suite locally
+on Linux, install Python Playwright and Chromium, and make `pdftotext` and
+`pdftoppm` available. From the repository root:
+
+```sh
+browser_run=$(mktemp -d)
+FORMLESS_SETTINGS_FIXTURE="$browser_run/settings.json" \
+  cargo test --locked -p formless-core --test settings_inventory
+python3 -B relay/browser_suite.py --settings-fixture "$browser_run/settings.json" \
+  --output "$browser_run/results" --failure-artifacts "$browser_run/failures"
+```
+
+Set `FORMLESS_CHROMIUM_EXECUTABLE` to use a specific Chromium executable. The
+default is `/usr/bin/chromium` when present, then Playwright's installed
+Chromium. Run the individual scripts below with their defaults for dual-engine
+validation where offered.
+
+Display regressions also have a browser check:
 `python relay/web-display.browser-test.py /tmp/formless-display-check`.
 It requires Python Playwright, `/usr/bin/chromium`, and Poppler's `pdftotext`
 and `pdftoppm`. It serves the actual web assets locally with a test-only

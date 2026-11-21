@@ -5,6 +5,8 @@ from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import chromium_executable
+
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -14,7 +16,7 @@ def run(root, hook, check, app=None):
     thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
     try:
         with sync_playwright() as p:
-            browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox'])
+            browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox'])
             page=browser.new_page(viewport={'width':1000,'height':900})
             def expose(route):
                 source=(app or root/'web/app.js').read_text();end=source.rfind('\n})();');assert end>0
@@ -43,6 +45,7 @@ hook=r'''
   };
   window.__fixture={
     setup(){ $('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='settings';S.daemonOnline=true;
+      S.ws={readyState:1};S.channel={local:true};S.local=true;
       S.settings=structuredClone(fixtureData);S.providers={providers:[],roles:{}};renderChrome();renderSettings();},
     pending(){return fixturePending.length;},
     save(remove=false){const p=fixturePending.shift();fixtureData.values[p.req.key]=p.req.value;if(remove)delete fixtureData.docs[p.req.key];p.resolve({applies:'now'});}
