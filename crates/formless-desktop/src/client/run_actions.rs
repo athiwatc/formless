@@ -16,6 +16,14 @@ impl Drop for Work {
     }
 }
 impl Engine {
+    fn compaction_pending(&self, session: &str) -> bool {
+        self.compacting.lock().unwrap_or_else(|e| e.into_inner()).contains(session)
+    }
+    fn action_target(&self, session: &str, value: &Value) -> Result<Target, String> {
+        let mut target = Target::decode(session, value)?;
+        target.compacting = self.compaction_pending(session);
+        Ok(target)
+    }
     pub(super) fn action_owner(&self) -> Option<Owner> {
         Some(Owner {
             client: self.instance,
@@ -27,6 +35,8 @@ impl Engine {
     }
     fn action_current(&self, work: &Work) -> bool {
         self.ready
+            && !(matches!(work.dispatch.action.kind, crate::run_actions::Kind::Edit | crate::run_actions::Kind::Retry | crate::run_actions::Kind::Compact)
+                && self.compaction_pending(&work.dispatch.action.owner.session))
             && self.action_owner().as_ref() == Some(&work.dispatch.action.owner)
             && self.status_revision == work.revision
             && work.dispatch.reserved()
@@ -62,6 +72,8 @@ impl Engine {
             return;
         }
         if !self.ready
+            || (matches!(dispatch.action.kind, crate::run_actions::Kind::Edit | crate::run_actions::Kind::Retry | crate::run_actions::Kind::Compact)
+                && self.compaction_pending(&dispatch.action.owner.session))
             || self.action_owner().as_ref() != Some(&dispatch.action.owner)
             || !dispatch.action.valid()
             || !dispatch.reserved()
@@ -102,7 +114,7 @@ impl Engine {
         }
         let a = &work.dispatch.action;
         let valid = value
-            .and_then(|v| Target::decode(&a.owner.session, &v))
+            .and_then(|v| self.action_target(&a.owner.session, &v))
             .is_ok_and(|target| target == a.target);
         if !valid {
             work.dispatch.reject(
@@ -253,6 +265,9 @@ impl Engine {
             return false;
         }
         w.sent = true;
+        if w.dispatch.action.kind == crate::run_actions::Kind::Compact {
+            self.compacting.lock().unwrap_or_else(|e| e.into_inner()).insert(w.dispatch.action.owner.session.clone());
+        }
         true
     }
     pub(super) fn context_read(&mut self) {
@@ -516,6 +531,34 @@ mod tests {
             }
         )));
         assert!(!e.reader.requested);
+    }
+    #[test]
+    fn compact_ack_does_not_unlock_history_until_completion() {
+        let (mut e, _, d) = setup(Kind::Compact);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        e.receive(ServerMessage::ok(request.id, json!({"started":true,"up_to":1}))).unwrap();
+        assert!(e.compaction_pending("s"));
+        let target = e.action_target("s", &snapshot()).unwrap();
+        assert!(!target.allowed(Kind::Edit));
+        assert!(!target.allowed(Kind::Retry));
+        assert!(!target.allowed(Kind::Compact));
+        assert!(target.allowed(Kind::Cwd));
+        let mut next = d.action.clone();
+        next.operation = uuid::Uuid::new_v4();
+        next.kind = Kind::Retry;
+        let ledger = Arc::new(Ledger::default());
+        e.action_prepare(ledger.reserve(next).unwrap());
+        assert!(e.outgoing.is_empty());
+        e.receive(ServerMessage::Event(Event::Note { session_id: Some("other".into()), text: "compaction failed: test".into() })).unwrap();
+        assert!(e.compaction_pending("s"));
+        e.receive(ServerMessage::Event(Event::Note { session_id: Some("s".into()), text: "compaction failed: test".into() })).unwrap();
+        assert!(!e.compaction_pending("s"));
+        assert!(e.action_target("s", &snapshot()).unwrap().allowed(Kind::Retry));
     }
     #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {

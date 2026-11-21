@@ -971,6 +971,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     action_work: Option<Box<run_actions::Work>>,
     live_overlay: crate::live_overlay::Overlay,
     live_available: bool,
@@ -1396,6 +1397,27 @@ impl Engine {
         }
     }
     fn request(&mut self, request: Request, pending: Pending) {
+        let session = match &request {
+            Request::SendMessage { session_id, .. }
+            | Request::SendReviewedMessage { session_id, .. }
+            | Request::StartPipelineRun { session_id, .. }
+            | Request::ResumeRun { session_id }
+            | Request::EditMessage { session_id, .. }
+            | Request::RetryRun { session_id, .. } => Some(session_id),
+            _ => None,
+        };
+        if session.is_some_and(|id| self.compaction_pending(id)) {
+            let error = "Compaction is still pending. Wait for its completion before starting work or rewriting history.";
+            match &pending {
+                Pending::RunWrite(w) => w.dispatch.reject(error),
+                Pending::Action(a) | Pending::ReviewedAction { action: a, .. } => {
+                    self.updates.push(Update::Action { session_id: a.session_id.clone(), result: Err(error.into()) });
+                }
+                _ => {},
+            }
+            self.updates.push(Update::Notice(error.into()));
+            return;
+        }
         self.next_id = self
             .next_id
             .checked_add(1)
@@ -2329,6 +2351,13 @@ impl Engine {
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if matches!(&event, Event::CompactionNotice { .. })
+                    || matches!(&event, Event::Note { text, .. } if text.starts_with("compaction failed:"))
+                {
+                    if let Some(session) = event.session_id() {
+                        self.compacting.lock().unwrap_or_else(|e| e.into_inner()).remove(session);
+                    }
+                }
                 if matches!(
                     event,
                     Event::ProviderStalled { .. }
@@ -2516,7 +2545,7 @@ impl Engine {
             Pending::RunTarget { owner, operation } => {
                 if self.action_owner().as_ref() == Some(&owner) {
                     let result =
-                        result.and_then(|v| crate::run_actions::Target::decode(&owner.session, &v));
+                        result.and_then(|v| self.action_target(&owner.session, &v));
                     self.updates.push(Update::RunActionTarget {
                         owner,
                         operation,
@@ -3187,6 +3216,7 @@ fn deliver(tx: &SyncSender<Update>, engine: &mut Engine) -> Result<(), String> {
 
 #[derive(Default)]
 struct Retained {
+    compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     instance: uuid::Uuid,
     stream_epoch: Arc<AtomicU64>,
     future_attempts: bool,
@@ -3216,6 +3246,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         connection,
     } = state;
     let Retained {
+        compacting,
         active,
         page,
         uncertain,
@@ -3229,6 +3260,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let _fork_connection_guard =
         session_fork::ConnectionGuard::new(forks.clone(), connection.load(Ordering::Acquire));
     let mut engine = Engine {
+        compacting: compacting.clone(),
         instance: *instance,
         reader: reader::Reader::new(*future_attempts),
         stream_epoch: stream_epoch.load(Ordering::Acquire),

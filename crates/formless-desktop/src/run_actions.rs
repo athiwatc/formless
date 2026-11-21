@@ -69,6 +69,7 @@ pub struct Owner {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
+    pub compacting: bool,
     pub session: String,
     pub running: bool,
     pub run: Option<String>,
@@ -113,6 +114,7 @@ impl Target {
             return Err(bad.into());
         }
         Ok(Self {
+            compacting: false,
             session: session.into(),
             running: value["running"].as_bool().ok_or(bad)?,
             run: run["run_id"].as_str().map(str::to_string),
@@ -125,8 +127,8 @@ impl Target {
     pub fn allowed(&self, kind: Kind) -> bool {
         match kind {
             Kind::ProviderRetry => self.running && self.run.is_some(),
-            Kind::Edit => !self.running && self.user.is_some(),
-            Kind::Retry => !self.running && self.user.is_some() && self.run.is_some(),
+            Kind::Edit => !self.compacting && !self.running && self.user.is_some(),
+            Kind::Retry => !self.compacting && !self.running && self.user.is_some() && self.run.is_some(),
             Kind::Good | Kind::Bad => {
                 !self.running
                     && self.run.is_some()
@@ -135,7 +137,7 @@ impl Target {
                         .as_deref()
                         .is_some_and(|s| !matches!(s, "running" | "paused"))
             }
-            Kind::Compact => !self.running && self.last_seq.is_some(),
+            Kind::Compact => !self.compacting && !self.running && self.last_seq.is_some(),
             Kind::Delete | Kind::Cwd => true,
         }
     }
