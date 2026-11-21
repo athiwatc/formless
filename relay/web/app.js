@@ -471,16 +471,23 @@
       return h("pre", null, text);
     }
   }
+  function normalizeApprovalPath(path) {
+    const plain = path.replace(/^\\\\\?\\(?=[a-z]:[\\/])/i, "");
+    const windows = /^(?:[a-z]:[\\/]|\\\\)/i.test(path);
+    return { path: windows ? plain.replace(/\\/g, "/").replace(/[A-Z]/g, (letter) => letter.toLowerCase()) : path, windows };
+  }
   /** Why a Capability is unusually broad, or null (SPEC §10.3; the same
    * rule as `broad_capability` in the protocol crate). */
   function broadWhy(cap) {
     if (cap === "net") return "any host on the internet";
     if (cap === "process") return "any program on this computer";
     if (cap.startsWith("fs:write:")) {
-      const p = cap.slice(9).replace(/\/+$/, "");
+      const { path } = normalizeApprovalPath(cap.slice(9));
+      const p = path.replace(/\/+$/, "");
       const parts = p.split("/").filter(Boolean);
       const home = parts.length === 0 || (["Users", "home"].includes(parts[0]) && parts.length <= 2) || (parts.length === 1 && parts[0] === "root");
-      if (p === "" || p === "~" || home) return "writing anywhere in your files";
+      const windowsHome = /^[a-z]:\//.test(path) && (parts.length === 1 || (parts[1] === "users" && parts.length <= 3));
+      if (p === "" || p === "~" || home || windowsHome) return "writing anywhere in your files";
     }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
@@ -502,7 +509,7 @@
     if (cap.startsWith("fs:read-sensitive:")) return [true, "Credential read: exact approved path identity only, not descendants. Contents may flow to the model provider."];
     const m = /^fs:(read|write):(.*)$/.exec(cap);
     if (!m) return null;
-    const path = m[2];
+    const { path, windows } = normalizeApprovalPath(m[2]);
     const seg = path.split("/").filter(Boolean);
     const windowsPath = /^[a-z]:[\\/]|^\\\\/i.test(path);
     const composer = (windowsPath ? path.split(/[\\/]/).filter(Boolean) : seg)
@@ -510,12 +517,13 @@
     if (composer.at(-1) === "auth.json" && (composer.at(-2) === ".composer" ||
         (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
-    for (const [dir, what] of secret) if (seg.includes(dir)) return [true, "holds " + what];
+    for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
     if (seg[0] === "etc") return [true, "system configuration"];
     if (!cwd) return null;
     const c = cwd.replace(/\/+$/, "");
-    return path === c || path.startsWith(c + "/") ? [false, "inside the working folder"] : [true, "outside the working folder " + c];
+    const compared = normalizeApprovalPath(cwd).path.replace(/\/+$/, "");
+    return path === compared || path.startsWith(compared + "/") ? [false, "inside the working folder"] : [true, "outside the working folder " + c];
   }
   function capTags(caps) {
     if (!caps || !caps.length) return h("span", { class: "muted" }, "none");
@@ -2376,12 +2384,14 @@
   }
 
   // ------------------------------------------------------- @ mentions
-  /** `@path` mentions: an `@` at the start or after whitespace (same rule
-   * as the daemon's `files::mentions`). */
+  /** Match ordinary and Markdown-wrapped `@path` mentions. */
+  function mentionMatches(text) {
+    return text.matchAll(/(^|[\s`(\[{])(@\S+)/g);
+  }
   function mentionsIn(text) {
     const out = [];
-    for (const m of text.matchAll(/(^|\s)@(\S+)/g)) {
-      const p = m[2].replace(/[,.;:!?)"']+$/, "");
+    for (const m of mentionMatches(text)) {
+      const p = m[2].slice(1).replace(/[,.;:!?)"'`\]}>]+$/, "");
       if (p && !out.includes(p)) out.push(p);
     }
     return out;
@@ -2390,7 +2400,7 @@
   function withMentions(text) {
     const parts = [];
     let last = 0;
-    for (const m of text.matchAll(/(^|\s)(@\S+)/g)) {
+    for (const m of mentionMatches(text)) {
       const at = m.index + m[1].length;
       parts.push(text.slice(last, at), h("span", { class: "mention" }, m[2]));
       last = at + m[2].length;
@@ -2409,7 +2419,7 @@
   function mentionAtCaret() {
     const t = $("input");
     const before = t.value.slice(0, t.selectionStart);
-    const m = before.match(/(^|\s)@(\S*)$/);
+    const m = before.match(/(^|[\s`(\[{])@(\S*)$/);
     return m && !t.value.startsWith("/") ? { query: m[2], start: before.length - m[2].length - 1 } : null;
   }
   async function updateMentions() {
@@ -2635,7 +2645,8 @@
       + " · tool calls " + (t.tool_calling ? "yes" : "no") + (t.prompt_fallback ? " (prompt fallback)" : "")
       + (t.error ? " · " + t.error : "");
   }
-  async function openModelPicker() {
+  async function openModelPicker(onPick) {
+    const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
     const efforts = ["", "low", "medium", "high"];
     const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
@@ -2646,15 +2657,17 @@
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
-    const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, "Use in this Session");
+    const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
-    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Model" },
+    const title = selectionOnly ? "Retry with a model" : "Model";
+    const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
-        h("h2", null, "Model"),
+        h("h2", null, title),
         input, list,
-        h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
-        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), test, cancel, asDefault, apply)));
+        selectionOnly ? null : h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
+        h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }),
+          selectionOnly ? null : test, cancel, selectionOnly ? null : asDefault, apply)));
     let items = [], matches = [], sel = 0;
     const close = () => closeDialog(dialog);
     const choice = () => (matches[sel] && matches[sel].item.id) || input.value.trim();
@@ -2701,6 +2714,7 @@
       if (!model) return;
       const e = effort.value || null;
       close();
+      if (selectionOnly) return onPick(model);
       if (!global) return setSessionModel(model, e);
       // Settings go through the daemon (principle 6).
       if (await act({ type: "set_setting", key: "provider.model", value: model })
@@ -3017,11 +3031,31 @@
   }
 
   // 👍/👎 on the last answer (SPEC §8.7), with an optional comment for 👎.
+  function currentRunTarget() {
+    return { session: S.current, sequence: sessionSeq, run: S.liveRun?.id || null };
+  }
+  function ensureRunTarget(target) {
+    if (target.session && target.session === S.current
+        && target.sequence === sessionSeq && target.run === (S.liveRun?.id || null)) return true;
+    note("The Session or latest Run changed. Open the action again.", true);
+    return false;
+  }
   function rateButtons() {
     const rate = async (rating) => {
-      const comment = rating === "bad" ? (prompt("What was wrong? (optional)") || "") : "";
-      const r = await act({ type: "rate_run", session_id: S.current, rating, comment: comment || null });
-      if (r) { S.rated = { session: S.current, rating: r.rating }; renderHistory(); note(r.rating ? "rated " + (r.rating === "good" ? "👍" : "👎") : "rating cleared"); }
+      const target = currentRunTarget();
+      let comment = null;
+      if (rating === "bad") {
+        const input = h("textarea", { rows: 4, "aria-label": "Optional rating comment" });
+        const save = await ask({ title: "What was wrong?", body: h("div", null, input), ok: "Submit rating" });
+        if (save) comment = input.value || null;
+      }
+      if (!ensureRunTarget(target)) return;
+      const r = await act({ type: "rate_run", session_id: target.session, run_id: target.run, rating, comment });
+      if (r && target.session === S.current && target.run === (S.liveRun?.id || null)) {
+        S.rated = { session: target.session, rating: r.rating };
+        renderHistory();
+        note(r.rating ? "rated " + (r.rating === "good" ? "👍" : "👎") : "rating cleared");
+      }
     };
     const cur = S.rated && S.rated.session === S.current ? S.rated.rating : "";
     const btn = (rating, label, title) => h("button", { class: "btn ghost small" + (cur === rating ? " active" : ""), type: "button", title, "aria-pressed": String(cur === rating),
@@ -3029,18 +3063,20 @@
     return h("div", { class: "rate" }, btn("good", "👍", "Good answer"), btn("bad", "👎", "Bad answer"),
       h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message (/retry)", onclick: () => retryRun("") }, tr("Retry")),
       h("button", { class: "btn ghost small", type: "button", title: "Re-run your last message on another model; this answer stays in a fork", onclick: () => {
-        const m = prompt("Retry on which model?");
-        if (m && m.trim()) retryRun(m.trim());
+        const target = currentRunTarget();
+        openModelPicker(model => retryRun(model, target));
       } }, tr("Retry with…")));
   }
   // Re-run the last user message, on `model` for that Run when given.
-  async function retryRun(model) {
-    const sid = S.current;
+  async function retryRun(model, target = currentRunTarget()) {
+    if (!ensureRunTarget(target)) return;
+    const sid = target.session;
     if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
       try { if (!(await confirmForecast(sid, "", {retry:true,model:model || null,edit_message_id:null}))) return; }
       catch (e) { note("forecast: " + e.message, true); return; }
     }
-    const r = await act({ type: "retry_run", session_id: sid, model: model || null });
+    if (!ensureRunTarget(target)) return;
+    const r = await act({ type: "retry_run", session_id: sid, expected_run_id: target.run, model: model || null });
     if (!r) return;
     note("retrying" + (r.model ? " on " + r.model : "") + (r.original_session ? "; the previous answer is kept in \"… · original answer\"" : ""));
     if (r.original_session) refreshSessions();
@@ -3866,13 +3902,27 @@
       h("span", { class: "muted" }, "⏳ " + tr("Queued for after this Run") + " (" + q.length + ")"),
       h("ol", null, q.map((m, i) => h("li", null,
         h("span", { class: "text", title: m.content }, m.content),
-        btn("✎", "Edit", () => {
-          const text = prompt("Edit the queued message", m.content);
-          if (text != null && text.trim()) act({ type: "edit_queued", session_id: sid, id: m.id, content: text.trim() });
-        }),
+        btn("✎", "Edit", () => editQueuedMessage(sid, m)),
         i > 0 ? btn("↑", "Move up", () => act({ type: "move_queued", session_id: sid, id: m.id, up: true })) : null,
         i < q.length - 1 ? btn("↓", "Move down", () => act({ type: "move_queued", session_id: sid, id: m.id, up: false })) : null,
         btn("✕", "Remove", () => act({ type: "edit_queued", session_id: sid, id: m.id, content: null }))))));
+  }
+  function editQueuedMessage(sid, item) {
+    const sequence = sessionSeq;
+    const input = h("textarea", { rows: 6, "aria-label": "Queued message" });
+    input.value = item.content;
+    const initial = input.value;
+    return ask({
+      title: "Edit the queued message", body: h("div", null, input), ok: "Save",
+      saveRequest: () => {
+        if (sequence !== sessionSeq || sid !== S.current || !S.queued?.some(m => m.id === item.id && m.content === item.content)) {
+          note("The queued message changed. Open it again.", true);
+          return null;
+        }
+        if (!input.value.trim()) throw Object.assign(new Error("Enter a nonempty message."), { field: input });
+        return { type: "edit_queued", session_id: sid, id: item.id, content: input.value === initial ? item.content : input.value };
+      },
+    });
   }
 
   /** Chips for the Tools the last Run created, updated or retired (SPEC §10.6). */
@@ -5602,9 +5652,12 @@
     if (!supported) return h("span", { class: "muted" }, "not supported in this browser");
     navigator.serviceWorker.getRegistration().then(async (reg) => {
       const sub = reg && (await reg.pushManager.getSubscription());
+      const refused = sub && S.pushRefusal?.room === S.room && S.pushRefusal?.endpoint === sub.endpoint;
       box.replaceChildren(sub
-        ? h("span", null, "on · ", h("button", { class: "btn ghost small", type: "button", onclick: () => pushOff(sub) }, "Turn off"))
-        : h("button", { class: "btn small", type: "button", onclick: pushOn }, "Notify me about approvals"));
+        ? h("span", null, refused ? S.pushRefusal.message + " " : "on · ",
+            refused ? h("button", { class: "btn small", type: "button", onclick: () => pushOn(sub) }, "Retry") : null,
+            h("button", { class: "btn ghost small", type: "button", onclick: () => pushOff(sub) }, "Turn off"))
+        : h("button", { class: "btn small", type: "button", onclick: () => pushOn() }, "Notify me about approvals"));
     });
     return box;
   }
@@ -5612,10 +5665,14 @@
     const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
     return Uint8Array.from(b, (c) => c.charCodeAt(0));
   }
-  async function pushOn() {
+  async function pushOn(existing) {
     if (S.forgetting || S.pushRemoval || S.pushEnabling) return;
     S.pushEnabling = true;
     try {
+      if (existing) {
+        registerRelayPush(S.ws, existing, true);
+        return;
+      }
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
@@ -5625,8 +5682,7 @@
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
       const sub = await S.pushSubscribe;
       if (S.forgetting || S.pushRemoval) return;
-      registerRelayPush(S.ws, sub);
-      note("This device gets a notification when an approval or question waits.");
+      registerRelayPush(S.ws, sub, true);
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
     } finally {
@@ -5643,29 +5699,55 @@
     try {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
+      if (sub && S.pushRefusal?.room === room && S.pushRefusal?.endpoint === sub.endpoint) return;
       if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
         registerRelayPush(ws, sub);
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
   const PUSH_CLEANUP_MS = 1500;
-  function registerRelayPush(ws, sub) {
+  function registerRelayPush(ws, sub, interactive = false) {
     if (ws?.readyState !== 1) throw new Error("not connected to the relay");
     if (S.pushRegistration?.socket === ws) return;
+    const room = S.room;
+    const wire = sub.toJSON();
     let resolve;
     const settled = new Promise((done) => { resolve = done; });
-    const finish = (socket) => {
+    const finish = (socket, outcome) => {
       if (socket !== ws) return;
       ws.removeEventListener("close", closed);
-      if (S.pushRegistration === pending) S.pushRegistration = null;
+      if (S.pushRegistration === pending) {
+        S.pushRegistration = null;
+        if (outcome && S.ws === ws && S.room === room) {
+          if (outcome === "accepted") {
+            if (S.pushRefusal?.room === room && S.pushRefusal?.endpoint === wire.endpoint) S.pushRefusal = null;
+            if (interactive && !S.forgetting) note("This device gets a notification when an approval or question waits.");
+          } else {
+            S.pushRefusal = { room, endpoint: wire.endpoint, message: outcome };
+            if (!S.forgetting) toast(outcome, true);
+          }
+          if (!S.forgetting && S.view === "settings") renderView();
+        }
+      }
       resolve();
     };
     const closed = () => finish(ws);
     const pending = { socket: ws, settled, finish };
     S.pushRegistration = pending;
     ws.addEventListener("close", closed, { once: true });
-    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() })); }
+    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: wire })); }
     catch (error) { finish(ws); throw error; }
+  }
+  function pushRefused(ws, value) {
+    if (value.operation === "unsubscribe") {
+      S.pushRemovalAck?.(ws, value.id, false);
+      return;
+    }
+    if (value.operation !== "subscribe") return;
+    const message = value.reason === "capacity" ? "The relay has reached its notification device limit."
+      : value.reason === "busy" ? "The relay is busy. Retry notification setup."
+      : "The relay refused this browser's notification subscription.";
+    S.pushRegistration?.finish(ws, message);
   }
   async function boundedPushCleanup(promise) {
     let timer;
@@ -5693,7 +5775,7 @@
       };
       const closed = () => done(false);
       const timer = setTimeout(closed, PUSH_CLEANUP_MS);
-      S.pushRemovalAck = (socket, ack) => { if (ws === socket && ack === id) done(true); };
+      S.pushRemovalAck = (socket, ack, confirmed = true) => { if (ws === socket && ack === id) done(confirmed); };
       ws.addEventListener("close", closed, { once: true });
       try { ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint, id })); }
       catch (_) { closed(); }
@@ -7000,9 +7082,10 @@
   async function showRunFiles() {
     const trigger = document.activeElement;
     if (!S.current) return note("open a session first", true);
-    const sid = S.current;
+    const target = currentRunTarget();
+    const sid = target.session;
     const r = await act({ type: "run_files", session_id: sid });
-    if (!r) return;
+    if (!r || !ensureRunTarget(target)) return;
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const rewind = async (path) => {
       const x = await act({ type: "rewind_run", session_id: sid, run_id: r.run_id, path: path || null });
@@ -7017,7 +7100,11 @@
         h("span", { class: "spacer" }),
         f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
       f.diff ? h("pre", { class: "diff" }, renderDiffLines(f.diff, "span")) : null)));
-    const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
+    const all = h("button", { class: "btn small", type: "button", onclick: async () => {
+      const confirmed = await ask({ title: "Revert all tracked paths?", danger: true, ok: "Revert all",
+        text: "Attempt safe restoration of every tracked path. Paths changed since the Run may be skipped." });
+      if (confirmed && dialog.isConnected && ensureRunTarget(target)) await rewind("");
+    } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
         h("div", { class: "modal-actions" }, all, h("span", { class: "spacer" }), close)));
@@ -7759,8 +7846,9 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws); return; }
+              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws, "accepted"); return; }
               if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
+              if (value.relay === "push_refused") { pushRefused(ws, value); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");
                 S.relayRoomReady = true;
