@@ -46,31 +46,11 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
             if e.depth() == 0 {
                 return true;
             }
-            if e.file_type().is_some_and(|t| t.is_dir())
-                && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
-            {
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            if is_dir && SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()) {
                 return false;
             }
-            // Check each entry too: an alias may have been replaced since
-            // its parent was admitted, so descendants must remain contained.
-            let Ok(target) = e.path().canonicalize() else {
-                return false;
-            };
-            let Ok(relative) = target.strip_prefix(&canonical_root) else {
-                return false;
-            };
-            // A visible alias must not bypass the hidden/build exclusions.
-            let directories = if e.file_type().is_some_and(|t| t.is_dir()) {
-                relative
-            } else {
-                relative.parent().unwrap_or_else(|| Path::new(""))
-            };
-            !relative
-                .components()
-                .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
-                && !directories
-                    .components()
-                    .any(|part| SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref()))
+            allowed_target(e.path(), is_dir, &canonical_root)
         })
         .build();
     let mut out = Vec::new();
@@ -97,6 +77,28 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
         });
     }
     (out, false)
+}
+
+fn allowed_target(path: &Path, is_dir: bool, canonical_root: &Path) -> bool {
+    // An alias may have changed since its parent was admitted. Resolve each
+    // descendant again before checking containment and hidden/build exclusions.
+    let Ok(target) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(relative) = target.strip_prefix(canonical_root) else {
+        return false;
+    };
+    let directories = if is_dir {
+        relative
+    } else {
+        relative.parent().unwrap_or_else(|| Path::new(""))
+    };
+    !relative
+        .components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+        && !directories
+            .components()
+            .any(|part| SKIP_DIRS.contains(&part.as_os_str().to_string_lossy().as_ref()))
 }
 
 /// The best `limit` entries for `query`. An empty query lists the top
@@ -251,9 +253,86 @@ pub use file_mentions::{
     MentionInsertion,
 };
 
+/// Parse a numeric line or line/column suffix, preserving colons in the path.
+pub fn path_and_line(word: &str) -> (&str, Option<u32>) {
+    let Some((head, last)) = word.rsplit_once(':') else {
+        return (word, None);
+    };
+    let Ok(number) = last.parse::<u32>() else {
+        return (word, None);
+    };
+    if let Some((path, line)) = head.rsplit_once(':') {
+        if let Ok(line) = line.parse::<u32>() {
+            return (path, Some(line));
+        }
+    }
+    (head, Some(number))
+}
+
+/// Return the requested path and its canonical destination. A literal file
+/// takes precedence over a line citation. Interpret only the final path
+/// component, so directory names and Windows prefixes stay intact.
+pub fn resolve_file_mention(
+    base: &Path,
+    path: std::path::PathBuf,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::io::ErrorKind;
+
+    let error = match base.join(&path).canonicalize() {
+        Ok(full) => return Ok((path, full)),
+        Err(error) => error,
+    };
+    if error.kind() != ErrorKind::NotFound
+        && !(cfg!(windows) && error.kind() == ErrorKind::InvalidInput)
+    {
+        return Err(error);
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(error);
+    };
+    let (name, line) = path_and_line(name);
+    if line.is_none() || name.is_empty() {
+        return Err(error);
+    }
+    let cited_path = path.with_file_name(name);
+    let full = base.join(&cited_path).canonicalize()?;
+    if !full.is_file() {
+        return Err(error);
+    }
+    Ok((cited_path, full))
+}
+
+/// The suffix of a path that explicitly names the native home directory.
+pub fn home_path_suffix(path: &str) -> Option<&str> {
+    if path == "~" {
+        return Some("");
+    }
+    #[cfg(windows)]
+    if let Some(suffix) = path.strip_prefix("~\\") {
+        return Some(suffix);
+    }
+    path.strip_prefix("~/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_path_prefixes_follow_native_path_separators() {
+        assert_eq!(home_path_suffix("~"), Some(""));
+        assert_eq!(
+            home_path_suffix("~/Documents/notes.txt"),
+            Some("Documents/notes.txt")
+        );
+        assert_eq!(home_path_suffix("~other/file"), None);
+        let windows_path = r"~\Documents\notes.txt";
+        assert_eq!(mentions(&format!("@{windows_path}")), [windows_path]);
+        assert_eq!(
+            home_path_suffix(windows_path),
+            cfg!(windows).then_some(r"Documents\notes.txt")
+        );
+    }
 
     fn tree() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("fl-files-{}", uuid::Uuid::new_v4().simple()));
@@ -286,6 +365,40 @@ mod tests {
             || p.starts_with("ignored")));
         let main = entries.iter().find(|e| e.path == "src/main.rs").unwrap();
         assert_eq!((main.dir, main.bytes), (false, 1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn descendants_are_rechecked_when_an_admitted_alias_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let root = tree();
+        let outside = tree();
+        let canonical_root = root.canonicalize().unwrap();
+        let alias = root.join("changing");
+        let candidate = alias.join("main.rs");
+        let inside = root.join("src");
+        symlink(&inside, &alias).unwrap();
+        assert!(allowed_target(&alias, true, &canonical_root));
+        assert!(allowed_target(&candidate, false, &canonical_root));
+        for target in [
+            outside.join("src"),
+            root.join(".hidden"),
+            root.join("target"),
+        ] {
+            std::fs::write(target.join("main.rs"), "replacement").unwrap();
+            let replacement = root.join("replacement");
+            symlink(&target, &replacement).unwrap();
+            std::fs::rename(&replacement, &alias).unwrap();
+            assert!(
+                !allowed_target(&candidate, false, &canonical_root),
+                "the child routes through the replacement alias to {target:?}"
+            );
+            let (entries, truncated) = walk(&root);
+            assert!(!truncated);
+            assert!(search(&entries, "changing/", 10).is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

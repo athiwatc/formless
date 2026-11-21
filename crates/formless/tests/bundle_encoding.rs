@@ -6,6 +6,7 @@ use serde_json::json;
 use std::{
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -36,7 +37,9 @@ impl Fixture {
     }
     fn output(&self, args: &[&str]) -> Output {
         let mut cmd = self.command(args);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.current_dir(&self.root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
@@ -50,13 +53,15 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
     fn new() -> Self {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "bundle-cli-{}-{}",
+            "bundle-cli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
@@ -113,6 +118,82 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn export_all_requires_explicit_overwrite_and_publishes_private_bundles() {
+    let fixture = Fixture::new();
+    let target = fixture.root.join("nested/export.json");
+    let args = ["export-all", "--sessions", "-o", "nested/export.json"];
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| fixture.output(&args));
+        let second = fixture.output(&args);
+        (first.join().unwrap(), second)
+    });
+    assert_ne!(
+        first.status.success(),
+        second.status.success(),
+        "{first:?}, {second:?}"
+    );
+    let refused = if first.status.success() {
+        second
+    } else {
+        first
+    };
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    let contents = std::fs::read(&target).unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+    assert_eq!(bundle["format"], "formless.all/1");
+    assert!(bundle["sessions"].is_array());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+        1
+    );
+
+    std::fs::write(&target, b"previous bundle").unwrap();
+    let refused = fixture.output(&args);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"previous bundle");
+
+    let overwritten = fixture.output(&[
+        "export-all",
+        "--sessions",
+        "-o",
+        "nested/export.json",
+        "--overwrite",
+    ]);
+    assert!(overwritten.status.success(), "{overwritten:?}");
+    let replacement: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+    assert_eq!(replacement["format"], "formless.all/1");
+    assert_eq!(replacement["sessions"], bundle["sessions"]);
+
+    let invalid = fixture.output(&["export-all", "--overwrite"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let default = fixture.output(&["export-all"]);
+    assert!(default.status.success(), "{default:?}");
+    let name = String::from_utf8(default.stdout).unwrap();
+    let filename = name
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("exported:  ")
+        .unwrap();
+    let stamp = filename
+        .strip_prefix("formless-export-")
+        .unwrap()
+        .strip_suffix(".json")
+        .unwrap();
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").unwrap();
+    assert!(fixture.root.join(filename).is_file());
+}
+
+#[test]
 fn daemon_status_check_requires_a_live_reply_without_starting_a_daemon() {
     let mut fixture = Fixture::new();
     let healthy = fixture.output(&["daemon", "status", "--check"]);
@@ -130,6 +211,38 @@ fn daemon_status_check_requires_a_live_reply_without_starting_a_daemon() {
         serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap(),
         json!({"running": false}),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_serve_cleans_up_after_sigterm_and_sigint() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let mut fixture = Fixture::new();
+        let paths = Paths {
+            data_dir: fixture.root.join("data/bundle-fixture"),
+            config_dir: fixture.root.join("config/bundle-fixture"),
+            profile: "bundle-fixture".into(),
+        };
+        assert!(paths.lock_file().exists());
+        assert!(paths.socket_path().exists());
+        let child = fixture.daemon.as_mut().unwrap();
+        // The fixture owns this unreaped child, so its PID cannot be reused.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not exit on signal {signal}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "signal {signal}: {status}");
+        assert!(!paths.lock_file().exists());
+        assert!(!paths.socket_path().exists());
+    }
 }
 
 #[test]

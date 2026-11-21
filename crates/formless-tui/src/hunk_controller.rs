@@ -348,6 +348,21 @@ impl App {
                     self.hunk_review.reset_viewport();
                 }
             }
+            KeyCode::Char('N' | 'P') => {
+                if let Some(review) = &self.hunk_review.document {
+                    match hunk_view::navigate_pending(
+                        &review.files,
+                        self.hunk_review.focus,
+                        key.code == KeyCode::Char('N'),
+                    ) {
+                        Some(next) => {
+                            self.hunk_review.focus = next;
+                            self.hunk_review.reset_viewport();
+                        }
+                        None => self.notes.push("All hunks decided.".into()),
+                    }
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.hunk_review.move_viewport(ViewportMove::Rows(1))
             }
@@ -577,6 +592,8 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         "Waiting for the server; closing does not cancel a dispatched action.".into()
     } else if view.total_hunks == 0 {
         "No editable text hunks. Excluded files remain listed above.".into()
+    } else if view.pending_hunks == 0 {
+        "All hunks decided.".into()
     } else {
         "Comments use server-derived path:line context; idle comments do not start a Run.".into()
     };
@@ -595,7 +612,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
                 })
         )
     } else {
-        format!("n/p hunk · a keep · r reject · u undo · c comment · f all files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
+        format!("n/p hunk · N/P pending · a keep · r reject · u undo · c comment · f files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
             if is_tool { " · Ctrl+S normal save" } else { "" },
             status)
     };

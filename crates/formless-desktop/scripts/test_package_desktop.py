@@ -286,10 +286,11 @@ class Packaging(unittest.TestCase):
                     package.collect_toolchain_notices(upstream, self.root / "not-published", compiler)
 
     def bundle(self):
-        bundle = self.root / "Formless Development.app"
+        bundle = self.root / "Formless.app"
         executable = bundle / "Contents/MacOS/formless-desktop"
         executable.parent.mkdir(parents=True)
         executable.write_bytes(b"fixture executable bytes; never executed")
+        (executable.parent / "formless").write_bytes(b"fixture CLI bytes")
         notice = bundle / "Contents/Resources/LICENSE"
         notice.parent.mkdir()
         notice.write_text("fixture terms")
@@ -310,7 +311,8 @@ class Packaging(unittest.TestCase):
             for info in archive.infolist():
                 self.assertEqual(info.date_time, (2023, 11, 14, 22, 13, 20))
                 self.assertTrue(stat.S_ISREG(info.external_attr >> 16))
-                self.assertEqual(stat.S_IMODE(info.external_attr >> 16), 0o755 if info.filename.endswith("/formless-desktop") else 0o644)
+                self.assertEqual(stat.S_IMODE(info.external_attr >> 16), 0o755 if info.filename.endswith(("/formless-desktop", "/formless")) else 0o644)
+            self.assertEqual(archive.read("Formless.app/Contents/MacOS/formless"), b"fixture CLI bytes")
 
     def test_archive_timestamp_is_clamped_to_zip_range(self):
         bundle, executable, _ = self.bundle()
@@ -440,6 +442,8 @@ class Packaging(unittest.TestCase):
                 return "host: aarch64-apple-darwin"
             if arguments[:2] == ["cargo", "metadata"]:
                 return json.dumps(metadata)
+            if arguments[:2] == ["cargo", "build"]:
+                return json.dumps(dict(reason="compiler-artifact", target=dict(name="formless"), executable=str(binary)))
             if arguments == ["rustc", "--print", "target-list"]:
                 return "aarch64-apple-darwin"
             if arguments[:2] == ["otool", "-l"]:
