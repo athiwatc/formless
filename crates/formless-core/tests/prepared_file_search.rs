@@ -262,11 +262,22 @@ fn bounded_search_preserves_full_order_basename_scores_and_stable_duplicates() {
             bytes: 1000 + n,
         });
     }
-    for query in queries() {
+    // The ranking oracle predates separator aliases. Supply the normalized
+    // spelling explicitly so it still tests rankings without modeling aliases.
+    let query_pairs = queries()
+        .into_iter()
+        .map(|query| (query, if query == "/" { "" } else { query }))
+        .chain([
+            (r"\", ""),
+            (r"a\", "a/"),
+            (r"src\lib", "src/lib"),
+            (r"x\/", "x//"),
+        ]);
+    for (query, oracle_query) in query_pairs {
         for limit in [0, 1, 2, 10, 20, entries.len(), usize::MAX] {
             assert_eq!(
                 files::search(&entries, query, limit),
-                legacy_search(&entries, query, limit),
+                legacy_search(&entries, oracle_query, limit),
                 "{query:?} limit {limit}"
             );
         }
