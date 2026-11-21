@@ -603,11 +603,18 @@ pub fn matches(query: &str) -> Vec<&'static Command> {
         .enumerate()
         .filter_map(|(i, c)| fuzzy_match(q, c.name).map(|(s, _)| (s, i, c)))
         .collect();
-    // Exact prefixes first (so `mem` lists `memory` before `harness undo`).
+    // The exact name first (so `topic` runs `topic`, not `topics`), then
+    // exact prefixes (so `mem` lists `memory` before `harness undo`).
+    let exact = q.trim_end();
     scored.sort_by(|a, b| {
+        let ea = a.2.name == exact;
+        let eb = b.2.name == exact;
         let pa = a.2.name.starts_with(q);
         let pb = b.2.name.starts_with(q);
-        pb.cmp(&pa).then(b.0.cmp(&a.0)).then(a.1.cmp(&b.1))
+        eb.cmp(&ea)
+            .then(pb.cmp(&pa))
+            .then(b.0.cmp(&a.0))
+            .then(a.1.cmp(&b.1))
     });
     scored.into_iter().map(|(_, _, c)| c).collect()
 }
@@ -814,6 +821,13 @@ pub fn reference_markdown() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exact_name_ranks_before_longer_prefixes() {
+        assert_eq!(matches("topic")[0].name, "topic");
+        assert_eq!(matches("topic ")[0].name, "topic");
+        assert_eq!(matches("topics")[0].name, "topics");
+    }
 
     #[test]
     fn the_keys_page_matches_the_tables() {
