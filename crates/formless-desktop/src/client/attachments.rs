@@ -4,12 +4,42 @@ use base64::Engine as _;
 use formless_protocol::Request;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Default)]
+struct ClipboardPng(Cursor<Vec<u8>>);
+
+impl Write for ClipboardPng {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.position().saturating_add(bytes.len() as u64) > MAX_FILE_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Clipboard PNG is larger than 20 MiB",
+            ));
+        }
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Seek for ClipboardPng {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
+    }
+}
 
 pub fn clipboard_bytes(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String), String> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err("Cannot attach clipboard image: file is larger than 20 MiB".into());
+    }
     if matches!(
         mime,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
@@ -21,12 +51,14 @@ pub fn clipboard_bytes(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String), St
     let convert = || -> Result<Vec<u8>, image::ImageError> {
         let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = image::Limits::default();
-        limits.max_alloc = Some(MAX_FILE_BYTES as u64);
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_DECODE_BYTES);
         reader.limits(limits);
         let decoded = reader.decode()?;
-        let mut output = Cursor::new(Vec::new());
+        let mut output = ClipboardPng::default();
         decoded.write_to(&mut output, image::ImageFormat::Png)?;
-        Ok(output.into_inner())
+        Ok(output.0.into_inner())
     };
     convert()
         .map(|bytes| (bytes, "image/png".into()))
@@ -365,6 +397,80 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_tiff(width: u32, height: u32) -> Vec<u8> {
+        // One RGB strip using PackBits repeat runs, with an out-of-line BitsPerSample.
+        let raw_bytes = width as u64 * height as u64 * 3;
+        assert_eq!(raw_bytes % 128, 0);
+        let packed_bytes = u32::try_from(raw_bytes / 128 * 2).unwrap();
+        let tags = [
+            (256_u16, 4_u16, 1_u32, width),
+            (257, 4, 1, height),
+            (258, 3, 3, 134),
+            (259, 3, 1, 32773),
+            (262, 3, 1, 2),
+            (273, 4, 1, 140),
+            (277, 3, 1, 3),
+            (278, 4, 1, height),
+            (279, 4, 1, packed_bytes),
+            (284, 3, 1, 1),
+        ];
+        let mut tiff = b"II\x2a\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in tags {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&[0, 0, 0, 0, 8, 0, 8, 0, 8, 0]);
+        for _ in 0..raw_bytes / 128 {
+            tiff.extend_from_slice(&[129, 0]);
+        }
+        tiff
+    }
+
+    #[test]
+    fn compressed_4k_tiff_uses_separate_decode_and_upload_limits() {
+        let tiff = solid_tiff(4096, 4096);
+        assert!(tiff.len() < MAX_FILE_BYTES);
+        let dimensions = image::ImageReader::new(Cursor::new(&tiff))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert!(u64::from(dimensions.0) * u64::from(dimensions.1) * 3 > MAX_FILE_BYTES as u64);
+        let (png, mime) = clipboard_bytes(&tiff, "image/tiff").unwrap();
+        assert_eq!(mime, "image/png");
+        assert!(png.len() < MAX_FILE_BYTES);
+        assert_eq!(
+            image::ImageReader::new(Cursor::new(&png))
+                .with_guessed_format()
+                .unwrap()
+                .into_dimensions()
+                .unwrap(),
+            (4096, 4096)
+        );
+        assert!(clipboard_bytes(&solid_tiff(MAX_IMAGE_DIMENSION + 128, 1), "image/tiff").is_err());
+    }
+
+    #[test]
+    fn clipboard_upload_limits_reject_input_and_encoded_output_over_twenty_mib() {
+        let oversized = vec![0; MAX_FILE_BYTES + 1];
+        for mime in ["image/png", "image/tiff"] {
+            assert!(clipboard_bytes(&oversized, mime)
+                .unwrap_err()
+                .contains("larger than 20 MiB"));
+        }
+        let mut png = ClipboardPng::default();
+        png.seek(SeekFrom::Start(MAX_FILE_BYTES as u64)).unwrap();
+        assert!(png
+            .write_all(&[0])
+            .unwrap_err()
+            .to_string()
+            .contains("larger than 20 MiB"));
+        assert!(png.0.get_ref().is_empty());
+    }
 
     #[test]
     fn clipboard_ico_aliases_are_detected_from_bytes_and_converted_to_png() {
