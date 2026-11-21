@@ -138,7 +138,15 @@ impl Fixture {
         })
         .await
         .expect("ordering fixture retained its private Profile lease");
-        std::fs::remove_dir_all(self.root).unwrap();
+        for attempt in 0..50 {
+            match std::fs::remove_dir_all(&self.root) {
+                Ok(()) => break,
+                Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) && attempt < 49 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("cannot remove fixture {}: {error}", self.root.display()),
+            }
+        }
     }
 }
 
