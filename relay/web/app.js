@@ -471,16 +471,23 @@
       return h("pre", null, text);
     }
   }
+  function normalizeApprovalPath(path) {
+    const plain = path.replace(/^\\\\\?\\(?=[a-z]:[\\/])/i, "");
+    const windows = /^(?:[a-z]:[\\/]|\\\\)/i.test(path);
+    return { path: windows ? plain.replace(/\\/g, "/").replace(/[A-Z]/g, (letter) => letter.toLowerCase()) : path, windows };
+  }
   /** Why a Capability is unusually broad, or null (SPEC §10.3; the same
    * rule as `broad_capability` in the protocol crate). */
   function broadWhy(cap) {
     if (cap === "net") return "any host on the internet";
     if (cap === "process") return "any program on this computer";
     if (cap.startsWith("fs:write:")) {
-      const p = cap.slice(9).replace(/\/+$/, "");
+      const { path } = normalizeApprovalPath(cap.slice(9));
+      const p = path.replace(/\/+$/, "");
       const parts = p.split("/").filter(Boolean);
       const home = parts.length === 0 || (["Users", "home"].includes(parts[0]) && parts.length <= 2) || (parts.length === 1 && parts[0] === "root");
-      if (p === "" || p === "~" || home) return "writing anywhere in your files";
+      const windowsHome = /^[a-z]:\//.test(path) && (parts.length === 1 || (parts[1] === "users" && parts.length <= 3));
+      if (p === "" || p === "~" || home || windowsHome) return "writing anywhere in your files";
     }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
@@ -502,15 +509,16 @@
     if (cap.startsWith("fs:read-sensitive:")) return [true, "Credential read: exact approved path identity only, not descendants. Contents may flow to the model provider."];
     const m = /^fs:(read|write):(.*)$/.exec(cap);
     if (!m) return null;
-    const path = m[2];
+    const { path, windows } = normalizeApprovalPath(m[2]);
     const seg = path.split("/").filter(Boolean);
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
-    for (const [dir, what] of secret) if (seg.includes(dir)) return [true, "holds " + what];
+    for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];
     if (seg[0] === "etc") return [true, "system configuration"];
     if (!cwd) return null;
     const c = cwd.replace(/\/+$/, "");
-    return path === c || path.startsWith(c + "/") ? [false, "inside the working folder"] : [true, "outside the working folder " + c];
+    const compared = normalizeApprovalPath(cwd).path.replace(/\/+$/, "");
+    return path === compared || path.startsWith(compared + "/") ? [false, "inside the working folder"] : [true, "outside the working folder " + c];
   }
   function capTags(caps) {
     if (!caps || !caps.length) return h("span", { class: "muted" }, "none");
