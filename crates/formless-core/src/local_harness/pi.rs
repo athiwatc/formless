@@ -1,15 +1,28 @@
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
+use formless_protocol::{Question, QuestionAnswer};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, watch};
+use tokio::time::{timeout, Instant};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{validate_request, CommandSpec, HarnessRequest, HarnessResult, StepAccess};
+use super::{
+    validate_request, CommandSpec, HarnessRequest, HarnessResult, HarnessUpdate,
+    InteractionHandler, StepAccess,
+};
 
 pub const MCP_CONFIG_ENV: &str = "FORMLESS_PI_MCP_CONFIG";
 const BRIDGE_CUSTOM_TYPE: &str = "formless-pi-bridge";
@@ -71,7 +84,7 @@ pub fn stage_extension(attempt_private_dir: &Path) -> Result<PathBuf> {
 }
 
 pub fn command_spec(_request: &HarnessRequest) -> Result<CommandSpec> {
-    bail!("Pi requires an attempt-private staged extension path; call local_harness::pi::stage_extension and then command_spec_with_extension")
+    bail!("Pi requires interactive RPC execution; call local_harness::pi::run with an attempt-private staged extension from pi::stage_extension")
 }
 
 pub fn command_spec_with_extension(
@@ -103,20 +116,18 @@ pub fn command_spec_with_extension(
         .to_str()
         .context("harness working directory must be valid UTF-8 for Pi")?;
     let server_name = format!("formless_{}", Uuid::new_v4().simple());
-    let restore_leading_at = request.prompt.starts_with('@');
     let mcp_config = json!({
         "name": server_name,
         "command": command,
         "args": request.mcp_args,
         "cwd": cwd,
         "envVars": request.mcp_env_vars,
-        "restoreLeadingAt": restore_leading_at,
     })
     .to_string();
 
     let mut args = vec![
         "--mode".into(),
-        "json".into(),
+        "rpc".into(),
         "--no-session".into(),
         "--no-extensions".into(),
         "-e".into(),
@@ -141,12 +152,6 @@ pub fn command_spec_with_extension(
             format!("read,grep,find,ls,mcp__{server_name}__*").into(),
         ]);
     }
-    let prompt = if restore_leading_at {
-        format!("\n{}", request.prompt)
-    } else {
-        request.prompt.clone()
-    };
-    args.extend(["--".into(), prompt.into()]);
 
     let mut environment = request.environment.clone();
     environment.insert(OsString::from(MCP_CONFIG_ENV), OsString::from(mcp_config));
@@ -159,6 +164,373 @@ pub fn command_spec_with_extension(
         cwd: request.cwd.clone(),
         environment,
     })
+}
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const STDERR_LIMIT: usize = 8192;
+
+pub async fn run(
+    request: &HarnessRequest,
+    staged_extension: &Path,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    if cancel.is_cancelled() {
+        bail!("Pi run cancelled");
+    }
+    let spec = command_spec_with_extension(request, staged_extension)?;
+    let mut command = tokio::process::Command::from(spec.command());
+    let mut child = command
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start Pi RPC process")?;
+    let mut stdin = child.stdin.take().context("Pi stdin unavailable")?;
+    let stdout = child.stdout.take().context("Pi stdout unavailable")?;
+    let mut stderr = child.stderr.take().context("Pi stderr unavailable")?;
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let captured_tail = tail.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        loop {
+            let count = stderr.read(&mut buffer).await?;
+            if count == 0 {
+                return std::io::Result::Ok(());
+            }
+            let mut tail = captured_tail.lock().unwrap();
+            tail.extend_from_slice(&buffer[..count]);
+            let excess = tail.len().saturating_sub(STDERR_LIMIT);
+            tail.drain(..excess);
+        }
+    });
+    let (input, mut commands) = mpsc::unbounded_channel::<Value>();
+    let (writer_error, errors) = watch::channel(false);
+    let mut writer = tokio::spawn(async move {
+        let result = async {
+            while let Some(command) = commands.recv().await {
+                let mut bytes = serde_json::to_vec(&command)?;
+                bytes.push(b'\n');
+                stdin.write_all(&bytes).await?;
+                stdin.flush().await?;
+            }
+            stdin.shutdown().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = writer_error.send(true);
+        }
+        result
+    });
+    let outcome = rpc_session(stdout, input, errors, &request.prompt, handler, cancel).await;
+    if outcome.is_err() && !cancel.is_cancelled() {
+        let _ = child.start_kill();
+    }
+    let write_result = match timeout(SHUTDOWN_TIMEOUT, &mut writer).await {
+        Ok(result) => result
+            .context("Pi RPC writer failed")
+            .and_then(|result| result),
+        Err(_) => {
+            writer.abort();
+            Err(anyhow::anyhow!("Pi RPC stdin did not close in time"))
+        }
+    };
+    let exit = match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("failed waiting for Pi RPC process"),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(anyhow::anyhow!("Pi RPC process did not exit in time"))
+        }
+    };
+    let mut stderr_task = stderr_task;
+    if timeout(SHUTDOWN_TIMEOUT, &mut stderr_task).await.is_err() {
+        stderr_task.abort();
+    }
+    let stderr_tail = String::from_utf8_lossy(&tail.lock().unwrap()).into_owned();
+    let finish = || -> Result<HarnessResult> {
+        let result = outcome?;
+        write_result?;
+        let status = exit?;
+        if !status.success() {
+            bail!("Pi RPC process exited unsuccessfully: {status}");
+        }
+        Ok(result)
+    };
+    finish().map_err(|error| {
+        let context = format!("Pi RPC execution failed: {error}; stderr tail: {stderr_tail}");
+        error.context(context)
+    })
+}
+
+async fn rpc_session(
+    stdout: tokio::process::ChildStdout,
+    input: mpsc::UnboundedSender<Value>,
+    mut writer_errors: watch::Receiver<bool>,
+    prompt: &str,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    let send = |value| input.send(value).context("Pi RPC stdin closed");
+    send(json!({"id": "state-1", "type": "get_state"}))?;
+    send(json!({"id": "prompt-1", "type": "prompt", "message": prompt}))?;
+    let mut lines = BufReader::new(stdout).lines();
+    let mut events = Vec::new();
+    let mut dialogs = FuturesUnordered::new();
+    let mut open = BTreeSet::new();
+    let mut prompt_accepted = false;
+    let mut state_received = false;
+    let mut session_id = None;
+    let mut settled = false;
+    let mut cancelling = false;
+    let mut cancel_deadline = Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled(), if !cancelling => {
+                cancelling = true;
+                cancel_deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+                for id in &open {
+                    send(json!({"type": "extension_ui_response", "id": id, "cancelled": true}))?;
+                }
+                dialogs.clear();
+                open.clear();
+                send(json!({"id": "abort-1", "type": "abort"}))?;
+            }
+            _ = tokio::time::sleep_until(cancel_deadline), if cancelling => {
+                bail!("Pi run cancelled (abort timed out)");
+            }
+            changed = writer_errors.changed() => {
+                changed.context("Pi RPC writer stopped unexpectedly")?;
+                bail!("Pi RPC stdin write failed");
+            }
+            Some((id, response)) = dialogs.next(), if !dialogs.is_empty() => {
+                open.remove(&id);
+                if let Some(response) = response {
+                    send(response)?;
+                }
+            }
+            line = lines.next_line() => {
+                let Some(line) = line.context("failed reading Pi RPC stdout")? else {
+                    if cancelling { bail!("Pi run cancelled"); }
+                    bail!("Pi RPC process exited before successful settle");
+                };
+                if line.is_empty() { continue; }
+                let event: Value = serde_json::from_str(&line).context("Pi RPC returned invalid JSONL")?;
+                if !event.is_object() { bail!("Pi RPC event was not an object"); }
+                match event["type"].as_str() {
+                    Some("response") => match event["id"].as_str() {
+                        Some("abort-1") if cancelling => bail!("Pi run cancelled"),
+                        Some("prompt-1") => {
+                            if event["command"] != "prompt" || event["success"] != true {
+                                bail!("Pi RPC prompt was rejected");
+                            }
+                            prompt_accepted = true;
+                        }
+                        Some("state-1") => {
+                            if event["command"] != "get_state" || event["success"] != true {
+                                bail!("Pi RPC get_state failed");
+                            }
+                            session_id = event["data"]["sessionId"].as_str().map(str::to_owned);
+                            state_received = true;
+                        }
+                        _ => {}
+                    },
+                    Some("extension_ui_request") => {
+                        if event["method"] == "notify" {
+                            handler.on_update(HarnessUpdate::Message {
+                                content: event["message"].as_str().context("Pi notification missing message")?.to_owned(),
+                            })?;
+                        } else if let Some(dialog) = Dialog::from_event(&event)? {
+                            if cancelling {
+                                send(dialog.cancelled())?;
+                            } else {
+                                if !open.insert(dialog.id.clone()) { bail!("Pi RPC reused an open dialog id"); }
+                                dialogs.push(dialog.answer(handler, cancel));
+                            }
+                        }
+                    }
+                    Some("agent_start") => settled = false,
+                    Some("agent_settled") => {
+                        if cancelling { bail!("Pi run cancelled"); }
+                        if event["aborted"] != false { bail!("Pi RPC run aborted"); }
+                        settled = true;
+                    }
+                    _ => {}
+                }
+                if !cancelling {
+                    for update in stream_updates(&event) { handler.on_update(update)?; }
+                }
+                events.push(event);
+                if settled && prompt_accepted && state_received && !cancel.is_cancelled() {
+                    for id in &open {
+                        send(json!({"type": "extension_ui_response", "id": id, "cancelled": true}))?;
+                    }
+                    let output = events.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+                    let mut result = parse_output(&output)?;
+                    result.session_id = session_id;
+                    return Ok(result);
+                }
+            }
+        }
+    }
+}
+
+struct Dialog {
+    id: String,
+    method: String,
+    question: Question,
+    deadline: Option<Instant>,
+}
+
+impl Dialog {
+    fn from_event(event: &Value) -> Result<Option<Self>> {
+        let method = event["method"]
+            .as_str()
+            .context("Pi UI request missing method")?;
+        if !matches!(method, "confirm" | "select" | "input" | "editor") {
+            return Ok(None);
+        }
+        let id = event["id"]
+            .as_str()
+            .context("Pi UI request missing id")?
+            .to_owned();
+        let title = event["title"]
+            .as_str()
+            .context("Pi UI request missing title")?;
+        let options = match method {
+            "confirm" => vec!["Yes".to_owned(), "No".to_owned()],
+            "select" => event["options"]
+                .as_array()
+                .context("Pi select missing options")?
+                .iter()
+                .map(|option| {
+                    option
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("Pi select option was not text")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => Vec::new(),
+        };
+        let text = if method == "confirm" {
+            event["message"]
+                .as_str()
+                .context("Pi confirm missing message")?
+        } else {
+            title
+        };
+        let mut question = Question::single(text.to_owned(), options);
+        question.header = Some(title.to_owned());
+        let deadline = event
+            .get("timeout")
+            .map(|value| {
+                let millis = value
+                    .as_u64()
+                    .context("Pi UI timeout was not milliseconds")?;
+                Instant::now()
+                    .checked_add(Duration::from_millis(millis))
+                    .context("Pi UI timeout too large")
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            id,
+            method: method.to_owned(),
+            question,
+            deadline,
+        }))
+    }
+
+    fn cancelled(&self) -> Value {
+        json!({"type": "extension_ui_response", "id": self.id, "cancelled": true})
+    }
+
+    fn response(&self, answers: Option<Vec<QuestionAnswer>>) -> Value {
+        let Some(mut answers) = answers.filter(|answers| answers.len() == 1) else {
+            return self.cancelled();
+        };
+        let answer = answers.remove(0);
+        let mut response = json!({"type": "extension_ui_response", "id": self.id});
+        match self.method.as_str() {
+            "confirm" | "select" => {
+                let Some(selected) = answer.selected.first().filter(|selected| {
+                    answer.selected.len() == 1
+                        && self
+                            .question
+                            .options
+                            .iter()
+                            .any(|option| &option.label == *selected)
+                }) else {
+                    return self.cancelled();
+                };
+                if self.method == "confirm" {
+                    response["confirmed"] = json!(selected == "Yes");
+                } else {
+                    response["value"] = json!(selected);
+                }
+            }
+            _ => {
+                let Some(text) = answer.text else {
+                    return self.cancelled();
+                };
+                response["value"] = json!(text);
+            }
+        }
+        response
+    }
+
+    async fn answer(
+        self,
+        handler: &dyn InteractionHandler,
+        cancel: &CancellationToken,
+    ) -> (String, Option<Value>) {
+        if self
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return (self.id, None);
+        }
+        let cancel = cancel.child_token();
+        let _guard = cancel.clone().drop_guard();
+        let deadline = self.deadline;
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Some(self.cancelled()),
+            _ = async { if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; } else { std::future::pending::<()>().await; } } => None,
+            answer = handler.ask_question(vec![self.question.clone()], &cancel) => Some(self.response(answer)),
+        };
+        (self.id, response)
+    }
+}
+
+fn stream_updates(event: &Value) -> Vec<HarnessUpdate> {
+    match event["type"].as_str() {
+        Some("tool_execution_start") => vec![HarnessUpdate::ToolCall {
+            name: event["toolName"].as_str().unwrap_or_default().to_owned(),
+            input: event["args"].clone(),
+        }],
+        Some("message_end") if event["message"]["role"] == "assistant" => {
+            let mut updates = Vec::new();
+            if let Some(blocks) = event["message"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"] == "thinking" {
+                        if let Some(content) = block["thinking"].as_str() {
+                            updates.push(HarnessUpdate::Thought {
+                                content: content.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+            let content = assistant_text(&event["message"]);
+            if !content.is_empty() {
+                updates.push(HarnessUpdate::Message { content });
+            }
+            updates
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn canonical_extension_path(extension_path: &Path) -> Result<PathBuf> {
@@ -310,6 +682,494 @@ fn assistant_text(message: &Value) -> String {
 }
 
 #[cfg(test)]
+mod rpc_tests {
+    #[cfg(unix)]
+    use super::tests::{request, staged_extension};
+    use super::*;
+    use crate::local_harness::{HarnessPermissionRequest, InteractionFuture};
+    use tokio::sync::Notify;
+
+    struct RecordingHandler {
+        answer: bool,
+        wait: bool,
+        questions: Mutex<Vec<Question>>,
+        updates: Mutex<Vec<HarnessUpdate>>,
+        asked: Notify,
+    }
+
+    impl RecordingHandler {
+        fn new(answer: bool, wait: bool) -> Self {
+            Self {
+                answer,
+                wait,
+                questions: Mutex::new(Vec::new()),
+                updates: Mutex::new(Vec::new()),
+                asked: Notify::new(),
+            }
+        }
+    }
+
+    impl InteractionHandler for RecordingHandler {
+        fn request_permission<'a>(
+            &'a self,
+            _: HarnessPermissionRequest,
+            _: &'a CancellationToken,
+        ) -> InteractionFuture<'a, Option<String>> {
+            panic!("Pi must not invent core permission prompts")
+        }
+
+        fn ask_question<'a>(
+            &'a self,
+            questions: Vec<Question>,
+            cancel: &'a CancellationToken,
+        ) -> InteractionFuture<'a, Option<Vec<QuestionAnswer>>> {
+            Box::pin(async move {
+                self.questions.lock().unwrap().extend(questions.clone());
+                self.asked.notify_one();
+                if self.wait {
+                    cancel.cancelled().await;
+                    return None;
+                }
+                self.answer.then(|| {
+                    questions
+                        .into_iter()
+                        .map(|question| {
+                            if question.options.is_empty() {
+                                QuestionAnswer {
+                                    selected: vec![],
+                                    text: Some("literal answer".into()),
+                                }
+                            } else {
+                                let label = if question.options.iter().any(|o| o.label == "Yes") {
+                                    "Yes"
+                                } else {
+                                    "Review"
+                                };
+                                QuestionAnswer {
+                                    selected: vec![label.into()],
+                                    text: None,
+                                }
+                            }
+                        })
+                        .collect()
+                })
+            })
+        }
+
+        fn on_update(&self, update: HarnessUpdate) -> Result<()> {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
+        }
+    }
+
+    fn ui(method: &str) -> Value {
+        json!({"type":"extension_ui_request","id":method,"method":method,"title":"Probe title","message":"Allow probe?","options":["Build","Review"]})
+    }
+
+    #[test]
+    fn maps_dialog_questions_answers_and_invalid_or_absent_answers() {
+        for method in ["confirm", "select", "input", "editor"] {
+            let dialog = Dialog::from_event(&ui(method)).unwrap().unwrap();
+            assert_eq!(dialog.question.header.as_deref(), Some("Probe title"));
+            assert!(!dialog.question.multi_select);
+            let answer = match method {
+                "confirm" => QuestionAnswer {
+                    selected: vec!["Yes".into()],
+                    text: None,
+                },
+                "select" => QuestionAnswer {
+                    selected: vec!["Review".into()],
+                    text: None,
+                },
+                _ => QuestionAnswer {
+                    selected: vec![],
+                    text: Some("literal @answer\nnext".into()),
+                },
+            };
+            let response = dialog.response(Some(vec![answer]));
+            assert_eq!(response["id"], method);
+            assert_eq!(response["type"], "extension_ui_response");
+            if method == "confirm" {
+                assert_eq!(dialog.question.question, "Allow probe?");
+                assert_eq!(
+                    dialog
+                        .question
+                        .options
+                        .iter()
+                        .map(|o| o.label.as_str())
+                        .collect::<Vec<_>>(),
+                    ["Yes", "No"]
+                );
+                assert_eq!(response["confirmed"], true);
+                assert_eq!(
+                    dialog.response(Some(vec![QuestionAnswer {
+                        selected: vec!["No".into()],
+                        text: None
+                    }]))["confirmed"],
+                    false
+                );
+            } else if method == "select" {
+                assert_eq!(response["value"], "Review");
+            } else {
+                assert!(dialog.question.options.is_empty());
+                assert_eq!(response["value"], "literal @answer\nnext");
+            }
+            for answers in [None, Some(vec![]), Some(vec![QuestionAnswer::default()])] {
+                assert_eq!(dialog.response(answers)["cancelled"], true);
+            }
+        }
+        assert!(Dialog::from_event(&ui("notify")).unwrap().is_none());
+        assert!(Dialog::from_event(&json!({"method":"confirm"})).is_err());
+        assert!(
+            Dialog::from_event(&json!({"method":"select","id":"x","title":"x","options":[1]}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn maps_assistant_thought_text_and_tool_updates_without_deltas_or_duplicates() {
+        let updates = stream_updates(
+            &json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"reason"},{"type":"text","text":"answer"}]}}),
+        );
+        assert!(matches!(&updates[0], HarnessUpdate::Thought { content } if content == "reason"));
+        assert!(matches!(&updates[1], HarnessUpdate::Message { content } if content == "answer"));
+        let updates = stream_updates(
+            &json!({"type":"tool_execution_start","toolName":"read","args":{"path":"file"}}),
+        );
+        assert!(
+            matches!(&updates[0], HarnessUpdate::ToolCall { name, input } if name == "read" && input["path"] == "file")
+        );
+        assert!(stream_updates(&json!({"type":"message_update"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dialog_timeout_sends_nothing_and_cancels_handler() {
+        let handler = RecordingHandler::new(true, true);
+        let mut event = ui("confirm");
+        event["timeout"] = json!(10);
+        let dialog = Dialog::from_event(&event).unwrap().unwrap();
+        let (_, response) = timeout(
+            Duration::from_secs(1),
+            dialog.answer(&handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert!(response.is_none());
+        assert_eq!(handler.questions.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn fake_pi(body: &str) -> (PathBuf, PathBuf, HarnessRequest) {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, extension) = staged_extension();
+        let executable = dir.join("fake-pi");
+        fs::write(&executable, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = request(StepAccess::Write);
+        request.cwd = dir.clone();
+        request.executable = Some(executable);
+        request.prompt = "@alice literal RPC prompt".into();
+        (dir, extension, request)
+    }
+
+    #[cfg(unix)]
+    const START: &str = r#"
+IFS= read -r state
+printf '%s\n' '{"type":"response","id":"state-1","command":"get_state","success":true,"data":{"sessionId":"rpc-session"}}'
+IFS= read -r prompt
+printf '{"type":"received_prompt","value":%s}\n' "$prompt"
+printf '%s\n' '{"type":"response","id":"prompt-1","command":"prompt","success":true}'
+printf '%s\n' '{"type":"message_end","message":{"role":"custom","customType":"formless-pi-bridge","content":"formless-pi-mcp-registered"}}'
+"#;
+
+    #[cfg(unix)]
+    const FINISH: &str = r#"
+printf '%s\r\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}' '{"type":"agent_end","willRetry":false}' '{"type":"agent_settled","aborted":false}'
+while IFS= read -r remaining; do :; done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_relays_answers_none_notifications_and_literal_prompt() {
+        for answer in [true, false] {
+            let mut body = START.to_owned();
+            for method in ["confirm", "select", "input", "editor"] {
+                body.push_str(&format!("printf '%s\\n' '{}'\nIFS= read -r answer\nprintf '{{\"type\":\"received_answer\",\"value\":%s}}\\n' \"$answer\"\n", ui(method)));
+            }
+            body.push_str("printf '%s\\n' '{\"type\":\"extension_ui_request\",\"id\":\"notice\",\"method\":\"notify\",\"message\":\"notification\"}'\n");
+            body.push_str(FINISH);
+            let (dir, extension, request) = fake_pi(&body);
+            let handler = RecordingHandler::new(answer, false);
+            let result = timeout(
+                Duration::from_secs(10),
+                run(&request, &extension, &handler, &CancellationToken::new()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.message, "done");
+            assert_eq!(result.session_id.as_deref(), Some("rpc-session"));
+            assert_eq!(handler.questions.lock().unwrap().len(), 4);
+            assert!(handler.updates.lock().unwrap().iter().any(|update| matches!(update, HarnessUpdate::Message { content } if content == "notification")));
+            let prompt = result
+                .events
+                .iter()
+                .find(|e| e["type"] == "received_prompt")
+                .unwrap();
+            assert_eq!(prompt["value"]["message"], request.prompt);
+            let responses: Vec<_> = result
+                .events
+                .iter()
+                .filter(|e| e["type"] == "received_answer")
+                .collect();
+            assert_eq!(responses.len(), 4);
+            if answer {
+                assert_eq!(responses[0]["value"]["confirmed"], true);
+                assert_eq!(responses[1]["value"]["value"], "Review");
+                assert_eq!(responses[2]["value"]["value"], "literal answer");
+            } else {
+                assert!(responses.iter().all(|e| e["value"]["cancelled"] == true));
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_drains_stdout_while_handler_pending_and_cancels_all_dialogs_before_abort() {
+        let body = format!(
+            r#"{START}
+printf '%s\n' '{confirm}' '{select}'
+i=0
+while [ "$i" -lt 4000 ]; do
+    printf '%s\n' '{{"type":"extension_ui_request","method":"notify","id":"notice","message":"pipe drain probe"}}'
+    i=$((i + 1))
+done
+IFS= read -r first
+IFS= read -r second
+IFS= read -r abort
+printf '%s\n' '{{"type":"extension_ui_request","method":"input","id":"late","title":"Late input"}}'
+IFS= read -r late
+printf '%s\n' "$first" "$second" "$abort" "$late" > cancel-replies.jsonl
+printf '%s\n' '{{"type":"response","command":"abort","id":"abort-1","success":true}}'
+"#,
+            confirm = ui("confirm"),
+            select = ui("select")
+        );
+        let (dir, extension, request) = fake_pi(&body);
+        let handler = RecordingHandler::new(true, true);
+        let cancel = CancellationToken::new();
+        let (result, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(run(&request, &extension, &handler, &cancel), async {
+                loop {
+                    if handler.updates.lock().unwrap().len() == 4000 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                cancel.cancel();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(handler.questions.lock().unwrap().len(), 2);
+        let replies: Vec<Value> = fs::read_to_string(dir.join("cancel-replies.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 4);
+        assert_eq!(
+            replies[0],
+            json!({"type":"extension_ui_response","id":"confirm","cancelled":true})
+        );
+        assert_eq!(
+            replies[1],
+            json!({"type":"extension_ui_response","id":"select","cancelled":true})
+        );
+        assert_eq!(replies[2], json!({"id":"abort-1","type":"abort"}));
+        assert_eq!(
+            replies[3],
+            json!({"type":"extension_ui_response","id":"late","cancelled":true})
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_kills_unresponsive_process_after_abort_deadline() {
+        let body = format!(
+            r#"{START}
+printf '%s\n' '{confirm}'
+IFS= read -r cancelled
+IFS= read -r abort
+exec sleep 30
+"#,
+            confirm = ui("confirm")
+        );
+        let (dir, extension, request) = fake_pi(&body);
+        let handler = RecordingHandler::new(true, true);
+        let cancel = CancellationToken::new();
+        let (result, ()) = timeout(Duration::from_secs(12), async {
+            tokio::join!(run(&request, &extension, &handler, &cancel), async {
+                handler.asked.notified().await;
+                cancel.cancel();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled (abort timed out)"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_rejects_early_exit_malformed_json_prompt_rejection_and_nonzero_exit() {
+        let cases = [
+            ("IFS= read -r state\nIFS= read -r prompt\nprintf '%s' 'early failure' >&2\nexit 7".to_owned(), "before successful settle"),
+            (format!("{START}\nprintf '%s\\n' 'not json'"), "invalid JSONL"),
+            (format!("{START}\nprintf '%s\\n' '{{\"type\":\"response\",\"id\":\"prompt-1\",\"command\":\"prompt\",\"success\":false}}'"), "prompt was rejected"),
+            (format!("{START}\n{FINISH}\nexit 9"), "exited unsuccessfully"),
+        ];
+        for (body, expected) in cases {
+            let (dir, extension, request) = fake_pi(&body);
+            let handler = RecordingHandler::new(true, false);
+            let result = timeout(
+                Duration::from_secs(10),
+                run(&request, &extension, &handler, &CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(expected), "{error}");
+            if expected == "before successful settle" {
+                assert!(error.contains("early failure"));
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_timeout_sends_no_reply_and_stderr_tail_is_bounded() {
+        let mut dialog = ui("confirm");
+        dialog["timeout"] = json!(0);
+        let body = format!(
+            r#"{START}
+printf '%s\n' '{dialog}'
+sleep 0.1
+printf '%s\n' '{{"type":"extension_ui_request","method":"select","id":"select","title":"Pick","options":["Build","Review"]}}'
+IFS= read -r answer
+printf '{{"type":"received_answer","value":%s}}\n' "$answer"
+{FINISH}
+"#
+        );
+        let (dir, extension, request) = fake_pi(&body);
+        let handler = RecordingHandler::new(true, false);
+        let result = timeout(
+            Duration::from_secs(10),
+            run(&request, &extension, &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let responses: Vec<_> = result
+            .events
+            .iter()
+            .filter(|e| e["type"] == "received_answer")
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["value"]["id"], "select");
+        fs::remove_dir_all(dir).unwrap();
+
+        let (dir, extension, request) = fake_pi("IFS= read -r state\nIFS= read -r prompt\ni=0\nwhile [ \"$i\" -lt 2000 ]; do printf '%s' 'stderr buffer probe ' >&2; i=$((i + 1)); done\nprintf '%s' 'TAIL-MARKER' >&2\nexit 1");
+        let error = timeout(
+            Duration::from_secs(10),
+            run(&request, &extension, &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("TAIL-MARKER"));
+        assert!(error.len() < STDERR_LIMIT + 200);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn precancelled_rpc_does_not_spawn() {
+        let (dir, extension, mut request) = fake_pi("exit 99");
+        request.executable = Some(dir.join("nonexistent"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = run(
+            &request,
+            &extension,
+            &RecordingHandler::new(true, false),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires real Pi and the localhost mock configured in PI_RPC_SMOKE_DIR"]
+    async fn live_rpc_question_relay() {
+        let dir = PathBuf::from(std::env::var_os("PI_RPC_SMOKE_DIR").expect("PI_RPC_SMOKE_DIR"));
+        let extension = stage_extension(&dir).unwrap();
+        let mut request = request(StepAccess::Write);
+        request.cwd = dir.clone();
+        request.prompt = "@alice literal RPC smoke.".into();
+        request.model = Some("formless-smoke/mock".into());
+        request.executable = Some(dir.join("pi-wrapper"));
+        request.mcp_command = dir.join("fake-mcp");
+        request.mcp_args = vec![];
+        request.mcp_env_vars = vec![];
+        request.environment.clear();
+        request
+            .environment
+            .insert("PI_CODING_AGENT_DIR".into(), dir.clone().into_os_string());
+        let handler = RecordingHandler::new(true, false);
+        let result = timeout(
+            Duration::from_secs(30),
+            run(&request, &extension, &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(handler.questions.lock().unwrap().len(), 3);
+        assert_eq!(result.message, "Local UI smoke completed.");
+        assert!(result.session_id.is_some());
+        let tool = result
+            .events
+            .iter()
+            .find(|e| e["type"] == "tool_execution_end" && e["toolName"] == "ui_probe")
+            .unwrap();
+        assert_eq!(tool["result"]["details"]["confirmed"], true);
+        assert_eq!(tool["result"]["details"]["selected"], "Review");
+        assert_eq!(tool["result"]["details"]["input"], "literal answer");
+        println!("live pi::run session_id: {:?}", result.session_id);
+        for event in &result.events {
+            if matches!(
+                event["type"].as_str(),
+                Some("response" | "extension_ui_request" | "tool_execution_end" | "agent_settled")
+            ) {
+                println!("{event}");
+            }
+        }
+        fs::remove_file(extension).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
@@ -328,7 +1188,7 @@ mod tests {
     };
     use crate::local_harness::{HarnessKind, HarnessRequest, StepAccess};
 
-    fn request(access: StepAccess) -> HarnessRequest {
+    pub(super) fn request(access: StepAccess) -> HarnessRequest {
         HarnessRequest {
             kind: HarnessKind::Pi,
             acp_agent: None,
@@ -362,7 +1222,7 @@ mod tests {
         }
     }
 
-    fn staged_extension() -> (PathBuf, PathBuf) {
+    pub(super) fn staged_extension() -> (PathBuf, PathBuf) {
         let dir = temp_dir();
         let extension = stage_extension(&dir).unwrap();
         (dir, extension)
@@ -485,7 +1345,7 @@ mod tests {
             args[0..8],
             [
                 "--mode",
-                "json",
+                "rpc",
                 "--no-session",
                 "--no-extensions",
                 "-e",
@@ -498,9 +1358,8 @@ mod tests {
         assert_eq!(args[10], "--append-system-prompt");
         assert_eq!(args[11], WRITE_GUIDANCE);
         assert!(!args.iter().any(|arg| arg == "--tools"));
-        let prompt_index = args.len() - 1;
-        assert_eq!(args[prompt_index - 1], "--");
-        assert_eq!(args[prompt_index], request.prompt);
+        assert_eq!(args.len(), 12);
+        assert!(!args.iter().any(|arg| arg == &request.prompt));
         assert_eq!(
             spec.environment
                 .get(&OsString::from("FORMLESS_TOPIC_CAPABILITY")),
@@ -556,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn command_spec_escapes_only_leading_at_prompts_for_literal_input_restoration() {
+    fn rpc_command_never_puts_prompts_or_transport_flags_in_argv() {
         let (dir, extension) = staged_extension();
         for prompt in [
             "@alice please review the parser",
@@ -574,14 +1433,9 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let escaped = prompt.starts_with('@');
-            assert_eq!(config["restoreLeadingAt"], escaped);
-            let expected = if escaped {
-                format!("\n{prompt}")
-            } else {
-                prompt.to_owned()
-            };
-            assert_eq!(spec.args.last(), Some(&OsString::from(expected)));
+            assert!(config.get("restoreLeadingAt").is_none());
+            assert!(!spec.args.iter().any(|arg| arg == prompt));
+            assert!(!spec.args.iter().any(|arg| arg == "--"));
         }
         fs::remove_dir_all(dir).unwrap();
     }
@@ -593,6 +1447,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("attempt-private staged extension"));
+        assert!(crate::local_harness::command_spec(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("pi::run"));
 
         #[cfg(unix)]
         {

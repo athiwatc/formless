@@ -21,20 +21,10 @@ export default function registerFormlessPiBridge(pi) {
     !Array.isArray(config.args) ||
     !config.args.every((arg) => typeof arg === "string") ||
     !Array.isArray(config.envVars) ||
-    !config.envVars.every((name) => typeof name === "string") ||
-    (config.restoreLeadingAt !== undefined && typeof config.restoreLeadingAt !== "boolean")
+    !config.envVars.every((name) => typeof name === "string")
   ) {
     throw new Error(`Formless Pi adapter received invalid ${MCP_CONFIG_ENV}`);
   }
-
-  let restoreLeadingAt = config.restoreLeadingAt === true;
-  pi.on("input", (event) => {
-    if (!restoreLeadingAt) return;
-    restoreLeadingAt = false;
-    if (event.text.startsWith("\n@")) {
-      return { action: "transform", text: event.text.slice(1) };
-    }
-  });
 
   pi.on("session_start", () => {
     const env = {};
