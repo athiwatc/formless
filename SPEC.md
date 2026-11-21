@@ -2185,10 +2185,9 @@ pattern (§4.4).
     available data has been delivered.
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
-    `fetch`: by `Content-Length` and while reading), process output at
-    `tools.max_process_output_bytes` per stream (the pipe keeps draining,
-    so the child never blocks), logs at `tools.max_log_bytes`, and `emit`
-    at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
+    `fetch`: by `Content-Length` and while reading), logs at
+    `tools.max_log_bytes`, and `emit` at `tools.max_emit_bytes`.
+    Whole-value reads over their cap fail with a `resource` error naming
     the setting and the streaming alternative.
   - `fs.read` (whole-value), `fs.exists`, `fs.stat` (`{type,
     size, modified_ms, readonly?}` or null), `fs.list(dir, {details})`, and
@@ -2199,7 +2198,8 @@ pattern (§4.4).
     parent dirs. Removal is recursive when `recursive` is true.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
-    stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
+    stderr, timed_out, killed, truncated, stdout_cap_truncated,
+    stderr_cap_truncated}` — gated by `process`, no shell,
     stdin closed unless given. An optional integer `timeout_ms` from 0 to
     86400000 terminates the owned process group/job on expiry and returns
     `timed_out: true`; omission preserves cancellation-only execution.
@@ -2220,9 +2220,16 @@ pattern (§4.4).
   - Streamed process output is backpressured: at most 256 KiB is queued per
     stream, plus a 64 KiB pipe read and at most three UTF-8 carry bytes. There
     are at most 16 open process handles per Invocation; waiting/closing frees
-    a slot. `run` still retains only `tools.max_process_output_bytes` from
-    each stream and drains the rest with `truncated: true`. Timeouts and
-    cancellation are supervised independently of JS reads or sleeps.
+    a slot. `run` captures up to `tools.max_process_output_bytes` raw bytes
+    from each stream and continues draining after reaching either cap. For
+    text output, it omits a valid UTF-8 character that straddles the cap.
+    Malformed bytes in the captured prefix are decoded with replacement
+    characters, which can expand the encoded text past the raw-byte cap.
+    Base64 stdout encodes the exact captured byte prefix. Stderr is always
+    text. `stdout_cap_truncated` and `stderr_cap_truncated` report whether
+    the respective cap omitted bytes. `truncated` also covers any unread
+    output discarded by the process layer. Timeouts and cancellation are
+    supervised independently of JS reads or sleeps.
     Processes cannot outlive their Invocation: normal return, thrown errors,
     abandoned handles, and cancellation close all owned handles and reap
     children/pipe workers. A direct child that exits cannot leave background

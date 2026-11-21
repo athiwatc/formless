@@ -2547,23 +2547,14 @@ impl State {
 
     fn process_run(&self, a: &Value) -> Result<Value, String> {
         let Some(process) = self.process_start(a)? else {
-            return Ok(self.process_stub());
+            return Ok(processes::RunOutput::new(0, Enc::Text).finish(self.process_stub()));
         };
         let cap = MAX_PROCESS_OUTPUT.load(Ordering::Relaxed) as usize;
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut truncated = false;
+        let mut output = processes::RunOutput::new(cap, enc_of(&a["encoding"])?);
         while let Some((is_stdout, chunk)) = process.read_bytes(65536)? {
-            let out = if is_stdout { &mut stdout } else { &mut stderr };
-            let room = cap.saturating_sub(out.len());
-            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            truncated |= chunk.len() > room;
+            output.push(is_stdout, &chunk);
         }
-        let mut result = process.wait()?;
-        result["stdout"] = encode(&stdout, enc_of(&a["encoding"])?);
-        result["stderr"] = encode(&stderr, Enc::Text);
-        result["truncated"] = json!(truncated || result["truncated"] == true);
-        Ok(result)
+        Ok(output.finish(process.wait()?))
     }
 
     fn process_spawn(&self, a: &Value) -> Result<Value, String> {
