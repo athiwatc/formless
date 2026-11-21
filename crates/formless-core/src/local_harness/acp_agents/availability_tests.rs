@@ -124,6 +124,36 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
 }
 
 #[test]
+fn readiness_version_falls_back_to_initialize_metadata() {
+    let mut fixture = Fixture::new("gemini");
+    let mut initialized: Value = serde_json::from_str(
+        fixture.environment[OsStr::new("PROBE_INITIALIZE")]
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    initialized["result"]["agentInfo"]
+        .as_object_mut()
+        .unwrap()
+        .remove("version");
+    initialized["result"]["_meta"] = json!({"agentVersion":"metadata-version"});
+    fixture
+        .environment
+        .insert("PROBE_INITIALIZE".into(), initialized.to_string().into());
+    let result = fixture.probe("gemini");
+    assert_eq!(result.version.as_deref(), Some("metadata-version"));
+    assert_eq!(result.signed_in, Some(false));
+    initialized["result"]["agentInfo"]["version"] = json!("agent-info-version");
+    fixture
+        .environment
+        .insert("PROBE_INITIALIZE".into(), initialized.to_string().into());
+    assert_eq!(
+        fixture.probe("gemini").version.as_deref(),
+        Some("agent-info-version")
+    );
+}
+
+#[test]
 fn readiness_initialize_auth_error_uses_the_sign_in_hint() {
     let mut fixture = Fixture::new("gemini");
     fixture.environment.insert(

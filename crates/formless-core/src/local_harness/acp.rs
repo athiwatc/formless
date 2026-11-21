@@ -367,6 +367,7 @@ pub(super) fn probe_session(
         };
         version = initialized
             .pointer("/agentInfo/version")
+            .or_else(|| initialized.pointer("/_meta/agentVersion"))
             .and_then(Value::as_str)
             .map(str::to_owned);
         (spec.check_agent)(&initialized)?;

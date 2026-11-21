@@ -7196,7 +7196,8 @@ rejected. Raising increments the hit cap by its default (3 or 20, saturating)
 and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
 a model or harness automatically. SetTopicLimits itself changes limits only.
 
-ListHarnesses refreshes all seven kinds concurrently. Every probe is capped at
+ListHarnesses refreshes all seven kinds concurrently, expanding ACP into one
+entry per ACP registry id with acp_agent set. Every probe is capped at
 10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
@@ -7206,8 +7207,12 @@ a model turn, and no auth output is copied into detail or logs.
 
 Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
 the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
-and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-ACP and Muse have dedicated dispatch arms currently reporting lookup-only
+and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). FORMLESS_TOPIC_ACP_EXE applies
+to each ACP registry probe; without it each agent's own command is looked up on
+PATH. ACP dispatch runs the registry's bounded availability probe on a blocking
+worker, including initialize version (agentInfo.version, then _meta.agentVersion)
+and session/new sign-in checks. Pi, OpenCode, Antigravity,
+and Muse have dedicated dispatch arms currently reporting lookup-only
 availability with unknown auth. Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private

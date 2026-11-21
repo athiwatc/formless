@@ -1101,6 +1101,7 @@ async fn topic_readiness_rejects_missing_harness_and_user_can_approve_one_step_s
     let f = Fixture::new(&env);
     script(&f, &env);
     env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
+    env.set("FORMLESS_TOPIC_ACP_EXE", f.root.join("missing-acp"));
     let topic = topic(&f, None, false);
     let session = topic.topic_session_id.clone().unwrap();
     f.daemon()
@@ -1122,7 +1123,18 @@ async fn topic_readiness_rejects_missing_harness_and_user_can_approve_one_step_s
         .contains("not ready"));
     assert!(state(&f, &topic.id).attempts.is_empty());
     let values = f.daemon().handle(Request::ListHarnesses).await.unwrap();
-    assert_eq!(values.as_array().unwrap().len(), 7);
+    let ids = crate::local_harness::acp_agents::agent_ids();
+    assert_eq!(values.as_array().unwrap().len(), 6 + ids.len());
+    for id in ids {
+        let entries: Vec<_> = values
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["kind"] == "acp" && value["acp_agent"] == *id)
+            .collect();
+        assert_eq!(entries.len(), 1, "{id}");
+        assert_eq!(entries[0]["installed"], false);
+    }
     assert_eq!(values[0]["installed"], false);
     assert_eq!(values[1]["installed"], true);
     let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"Claude is unavailable"});

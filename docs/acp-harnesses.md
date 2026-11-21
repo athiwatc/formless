@@ -81,8 +81,9 @@ not echoed by the shared runner.
 `acp_agents::availability(id, executable, environment)` returns core's
 `HarnessAvailability` for a registry agent. It checks executable presence on PATH
 (the supplied environment's PATH takes precedence), or an explicit absolute
-executable path. Core has no ACP executable-override environment variable; this
-adapter introduces none. Installed remains true if the CLI is present but cannot
+executable path. Core's ListHarnesses and named-agent readiness checks honor
+`FORMLESS_TOPIC_ACP_EXE` as an absolute executable override; otherwise each
+registry agent's command is resolved separately on PATH. Installed remains true if the CLI is present but cannot
 answer the readiness check.
 
 The probe starts the normal ACP command, sends initialize then `session/new`
@@ -90,7 +91,7 @@ with an empty `mcpServers` list in a fresh private temporary cwd, and kills the
 process group afterward. The combined RPC deadline is eight seconds. No prompt,
 authenticate request, bridge, credential arguments or config edits are made.
 Normal run environment stripping is reused, including bridge variables. Version
-comes from `agentInfo.version`; Cursor may report no version.
+comes from `agentInfo.version`, falling back to `_meta.agentVersion`; Cursor may report no version.
 
 A profile's authentication/configuration error code means `signed_in=false` with
 its sign-in hint. Session creation means `signed_in=true` only for profiles whose
@@ -101,7 +102,10 @@ malformed sessions and other errors also report unknown with a diagnostic. This
 does not prove that a future prompt/model call will succeed. The registry entry's
 `session_auth` flag records whether successful session creation is meaningful.
 
-Core's `ListHarnesses` handler has no adapter hook and remains unwired here.
+Core's `ListHarnesses` handler expands ACP into one availability entry per registry
+id, each with `kind=Acp` and `acp_agent` set. Registry probes run concurrently on
+blocking workers, capped at ten seconds each (the ACP handshake itself uses its
+eight-second deadline). Single-agent readiness uses the same dispatch.
 
 ## Installation observations
 

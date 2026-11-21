@@ -53,12 +53,12 @@ for line in sys.stdin:
 async fn official_probes_report_version_and_explicit_auth_status() {
     let (_root, mut ctx) = fixture();
     for kind in [HarnessKind::Claude, HarnessKind::Codex] {
-        let ready = dispatch(kind, &ctx).await;
+        let ready = dispatch(kind, None, &ctx).await;
         assert!(ready.installed);
         assert_eq!(ready.signed_in, Some(true));
         assert_eq!(ready.version.as_deref(), Some("fixture 1.0"));
         ctx.environment.insert("PROBE_MODE".into(), "auth".into());
-        assert_eq!(dispatch(kind, &ctx).await.signed_in, Some(false));
+        assert_eq!(dispatch(kind, None, &ctx).await.signed_in, Some(false));
         ctx.environment.remove(std::ffi::OsStr::new("PROBE_MODE"));
     }
 }
@@ -89,7 +89,10 @@ async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
     ctx.environment
         .insert("PROBE_GATE".into(), root.0.clone().into_os_string());
     let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
-    assert_eq!(values.len(), 7);
+    assert_eq!(
+        values.len(),
+        6 + super::super::acp_agents::agent_ids().len()
+    );
     assert!(values.iter().all(|value| value.installed));
     assert!(values[..2]
         .iter()
@@ -111,22 +114,115 @@ async fn muse_pi_overrides_and_missing_or_relative_executables() {
         .into();
         ctx.environment
             .insert(key.clone(), ctx.executable.clone().into_os_string());
-        let value = probe_environment(kind, &ctx.environment, Duration::from_secs(1)).await;
+        let value = probe_environment(kind, &ctx.environment, Duration::from_secs(1), None).await;
         assert!(value.installed);
         assert_eq!(value.signed_in, None);
         ctx.environment.insert(key.clone(), "relative".into());
         assert!(
-            !probe_environment(kind, &ctx.environment, Duration::from_secs(1))
+            !probe_environment(kind, &ctx.environment, Duration::from_secs(1), None)
                 .await
                 .installed
         );
         ctx.environment
             .insert(key, "/missing/formless-fixture".into());
         assert!(
-            !probe_environment(kind, &ctx.environment, Duration::from_secs(1))
+            !probe_environment(kind, &ctx.environment, Duration::from_secs(1), None)
                 .await
                 .installed
         );
+    }
+}
+
+#[tokio::test]
+async fn list_harnesses_expands_acp_registry_with_missing_binaries() {
+    let root = ProbeDirectory::new().unwrap();
+    let values = list_environment(
+        BTreeMap::from([("PATH".into(), root.0.clone().into_os_string())]),
+        Duration::from_secs(1),
+    )
+    .await;
+    let acp: Vec<_> = values
+        .iter()
+        .filter(|value| value.kind == HarnessKind::Acp)
+        .collect();
+    let ids = super::super::acp_agents::agent_ids();
+    assert_eq!(values.len(), 6 + ids.len());
+    assert_eq!(acp.len(), ids.len());
+    for id in ids {
+        let matches: Vec<_> = acp
+            .iter()
+            .filter(|value| value.acp_agent.as_deref() == Some(*id))
+            .collect();
+        assert_eq!(matches.len(), 1, "{id}");
+        assert!(!matches[0].installed);
+        assert_eq!(matches[0].signed_in, None);
+        assert_eq!(matches[0].version, None);
+        assert!(matches[0].detail.is_some());
+    }
+}
+
+#[tokio::test]
+async fn named_acp_probe_uses_registry_and_executable_override() {
+    let (_root, mut ctx) = fixture();
+    let captured: serde_json::Value =
+        serde_json::from_str(include_str!("local_harness/acp_agents/captured.json")).unwrap();
+    std::fs::write(
+        &ctx.executable,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r request
+printf '%s\n' "$ACP_INITIALIZE"
+IFS= read -r request
+printf '%s\n' "$ACP_SESSION"
+"#,
+    )
+    .unwrap();
+    ctx.environment.insert(
+        "ACP_INITIALIZE".into(),
+        captured["gemini"]["initialize"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "ACP_SESSION".into(),
+        captured["gemini"]["session_new"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "FORMLESS_TOPIC_ACP_EXE".into(),
+        ctx.executable.clone().into_os_string(),
+    );
+    let result = probe_environment(
+        HarnessKind::Acp,
+        &ctx.environment,
+        ctx.timeout,
+        Some("gemini"),
+    )
+    .await;
+    assert_eq!(result.kind, HarnessKind::Acp);
+    assert_eq!(result.acp_agent.as_deref(), Some("gemini"));
+    assert!(result.installed);
+    assert_eq!(result.signed_in, Some(false));
+    assert_eq!(result.version.as_deref(), Some("0.70.0"));
+    assert_eq!(
+        result.detail.as_deref(),
+        Some(
+            super::super::acp_agents::spec("gemini")
+                .unwrap()
+                .not_signed_in
+        )
+    );
+
+    let result = dispatch(HarnessKind::Acp, None, &ctx).await;
+    assert!(!result.installed);
+    assert!(result.detail.unwrap().contains("requires an acp_agent"));
+    let result = dispatch(HarnessKind::Acp, Some("unknown"), &ctx).await;
+    assert!(!result.installed);
+    assert_eq!(result.acp_agent.as_deref(), Some("unknown"));
+    assert!(result.detail.unwrap().contains("available agents:"));
+    for invalid in ["", "relative"] {
+        ctx.environment
+            .insert("FORMLESS_TOPIC_ACP_EXE".into(), invalid.into());
+        let result = dispatch(HarnessKind::Acp, Some("gemini"), &ctx).await;
+        assert!(!result.installed);
+        assert!(result.detail.unwrap().contains("absolute"));
     }
 }
 

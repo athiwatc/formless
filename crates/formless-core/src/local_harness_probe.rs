@@ -245,12 +245,17 @@ async fn official_probe(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailab
     }
 }
 
-pub async fn blocking_probe(
+pub async fn blocking_probe<F>(
     kind: HarnessKind,
     executable: Option<PathBuf>,
     environment: BTreeMap<OsString, OsString>,
-    probe: fn(Option<PathBuf>, &BTreeMap<OsString, OsString>) -> HarnessAvailability,
-) -> HarnessAvailability {
+    probe: F,
+) -> HarnessAvailability
+where
+    F: FnOnce(Option<PathBuf>, &BTreeMap<OsString, OsString>) -> HarnessAvailability
+        + Send
+        + 'static,
+{
     let base = availability(kind, executable.as_deref());
     match tokio::time::timeout(
         Duration::from_secs(10),
@@ -268,14 +273,43 @@ pub async fn blocking_probe(
     }
 }
 
-async fn dispatch(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
+async fn dispatch(
+    kind: HarnessKind,
+    agent: Option<&str>,
+    ctx: &ProbeContext,
+) -> HarnessAvailability {
     match kind {
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
         HarnessKind::Pi => availability(kind, Some(&ctx.executable)),
         HarnessKind::OpenCode => availability(kind, Some(&ctx.executable)),
         HarnessKind::Antigravity => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Acp => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Acp => {
+            let Some(agent) = agent else {
+                let mut value = availability(kind, None);
+                value.detail = Some("ACP availability requires an acp_agent registry id.".into());
+                return value;
+            };
+            let id = agent.to_owned();
+            let executable = ctx
+                .environment
+                .get(std::ffi::OsStr::new("FORMLESS_TOPIC_ACP_EXE"))
+                .map(PathBuf::from)
+                .or_else(|| {
+                    (!ctx.executable.as_os_str().is_empty()).then(|| ctx.executable.clone())
+                });
+            let mut value = blocking_probe(
+                kind,
+                executable,
+                ctx.environment.clone(),
+                move |executable, environment| {
+                    super::acp_agents::availability(&id, executable, environment)
+                },
+            )
+            .await;
+            value.acp_agent = Some(agent.into());
+            value
+        }
         HarnessKind::Muse => availability(kind, Some(&ctx.executable)),
     }
 }
@@ -283,7 +317,16 @@ async fn probe_environment(
     kind: HarnessKind,
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
+    agent: Option<&str>,
 ) -> HarnessAvailability {
+    if kind == HarnessKind::Acp {
+        let ctx = ProbeContext {
+            executable: PathBuf::new(),
+            environment: environment.clone(),
+            timeout,
+        };
+        return dispatch(kind, agent, &ctx).await;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let lookup_environment = environment.clone();
     let executable = match tokio::time::timeout_at(
@@ -311,7 +354,7 @@ async fn probe_environment(
         environment: environment.clone(),
         timeout,
     };
-    match tokio::time::timeout_at(deadline, dispatch(kind, &ctx)).await {
+    match tokio::time::timeout_at(deadline, dispatch(kind, agent, &ctx)).await {
         Ok(value) => value,
         Err(_) => timed_out(base),
     }
@@ -321,6 +364,7 @@ pub async fn harness_availability(kind: HarnessKind, agent: Option<&str>) -> Har
         kind,
         &std::env::vars_os().collect(),
         Duration::from_secs(10),
+        agent,
     )
     .await;
     value.acp_agent = agent.map(str::to_owned);
@@ -341,7 +385,19 @@ async fn list_environment(
             HarnessKind::Muse,
         ]
         .into_iter()
-        .map(|kind| probe_environment(kind, &environment, timeout)),
+        .flat_map(|kind| {
+            let agents = if kind == HarnessKind::Acp {
+                super::acp_agents::agent_ids()
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect()
+            } else {
+                vec![None]
+            };
+            agents.into_iter().map(move |agent| (kind, agent))
+        })
+        .map(|(kind, agent)| probe_environment(kind, &environment, timeout, agent)),
     )
     .await
 }
