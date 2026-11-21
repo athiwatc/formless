@@ -19,6 +19,7 @@ pub const SPEC: AgentSpec = AgentSpec {
     read_only_modes: &["plan"],
     read_only_fail_closed: true,
     strip_env: &[],
+    set_env: &[],
     bridge_tool: acp::no_bridge_tools,
     vendor_request: acp::no_vendor_requests,
 };
