@@ -6,6 +6,7 @@ use serde_json::json;
 use std::{
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -50,13 +51,15 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
     fn new() -> Self {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "bundle-cli-{}-{}",
+            "bundle-cli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
         #[cfg(unix)]
@@ -130,6 +133,38 @@ fn daemon_status_check_requires_a_live_reply_without_starting_a_daemon() {
         serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap(),
         json!({"running": false}),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_serve_cleans_up_after_sigterm_and_sigint() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let mut fixture = Fixture::new();
+        let paths = Paths {
+            data_dir: fixture.root.join("data/bundle-fixture"),
+            config_dir: fixture.root.join("config/bundle-fixture"),
+            profile: "bundle-fixture".into(),
+        };
+        assert!(paths.lock_file().exists());
+        assert!(paths.socket_path().exists());
+        let child = fixture.daemon.as_mut().unwrap();
+        // The fixture owns this unreaped child, so its PID cannot be reused.
+        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not exit on signal {signal}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "signal {signal}: {status}");
+        assert!(!paths.lock_file().exists());
+        assert!(!paths.socket_path().exists());
+    }
 }
 
 #[test]

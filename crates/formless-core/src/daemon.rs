@@ -15727,6 +15727,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
