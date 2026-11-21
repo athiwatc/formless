@@ -73,15 +73,31 @@ pub(super) struct Panel {
 
 impl Shell {
     pub(super) fn prefill_session_slash(&mut self, field: crate::slash::Arguments, text: String) {
-        if self
-            .session_editor
-            .as_ref()
-            .is_none_or(|p| !self.topic_session_mutation_allowed(&p.id))
-        {
-            return;
-        }
         if let Some(panel) = &mut self.session_editor {
             panel.slash_prefill = Some((field, text));
+        }
+    }
+
+    fn session_edit_display_value(&self, cx: &App) -> String {
+        let Some(panel) = &self.session_editor else {
+            return String::new();
+        };
+        // A newly discovered attempt may already have an ordinary editor draft.
+        // Inspection must show/copy the persisted value, not that old draft.
+        if self.topic_ui.state.attempt_for(&panel.id).is_some()
+            || matches!(panel.field, Field::Pin | Field::Archive)
+        {
+            panel
+                .metadata
+                .as_ref()
+                .map(|m| panel.field.value(m))
+                .unwrap_or_default()
+        } else {
+            panel
+                .input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
         }
     }
     pub(super) fn retire_session_editor_attachment(
@@ -1181,7 +1197,7 @@ impl Shell {
                         .child(if read_only {
                             readable(
                                 "session-edit-read-only-value",
-                                input.read(cx).value().to_string(),
+                                self.session_edit_display_value(cx),
                             )
                             .into_any_element()
                         } else {
@@ -1228,7 +1244,7 @@ impl Shell {
                         .child(if read_only {
                             readable(
                                 "session-edit-read-only-value",
-                                input.read(cx).value().to_string(),
+                                self.session_edit_display_value(cx),
                             )
                             .into_any_element()
                         } else {
@@ -1248,7 +1264,7 @@ impl Shell {
                             .anchor_scroll(Some(panel.controls[5].1.clone()))
                             .child(
                                 Button::new("session-edit-copy")
-                                    .label("Copy edit")
+                                    .label(if read_only { "Copy value" } else { "Copy edit" })
                                     .disabled(
                                         panel.field == Field::Instructions && panel.input.is_none(),
                                     )
@@ -1260,22 +1276,7 @@ impl Shell {
                                             {
                                                 return;
                                             }
-                                            let text = if matches!(
-                                                panel.field,
-                                                Field::Pin | Field::Archive
-                                            ) {
-                                                panel
-                                                    .metadata
-                                                    .as_ref()
-                                                    .map(|metadata| panel.field.value(metadata))
-                                                    .unwrap_or_default()
-                                            } else {
-                                                panel
-                                                    .input
-                                                    .as_ref()
-                                                    .map(|input| input.read(cx).value().to_string())
-                                                    .unwrap_or_default()
-                                            };
+                                            let text = this.session_edit_display_value(cx);
                                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                                         }
                                     })),

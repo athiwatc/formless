@@ -670,6 +670,11 @@ fn harness_details_export_its_own_transcript_without_allowing_setting_writes(
             // Exercise the callback as well as the disabled Save control.
             s.save_presented_session_selection(s.session_edit_revision().unwrap(), window, cx);
             assert!(s.take_client_commands().is_empty());
+            s.read_presented_session_catalog(s.session_edit_revision().unwrap(), window, cx);
+            assert!(
+                s.take_client_commands().is_empty(),
+                "a stale model editor callback must remain disabled in the inspector"
+            );
         });
         window.scroll(
             "session-edit-body",
