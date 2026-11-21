@@ -4819,12 +4819,17 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
   highest required single-digit position and whether `$ARGUMENTS` occurs, using
   the same token rules as expansion. TUI/plain help, the TUI picker and CLI
-  metadata listings show `<arg1> … <argN>` and optional `[arguments…]` hints;
-  `commands list --json` exposes `max_position` and `uses_arguments` without
-  exposing template bodies. Names are 1–64 lowercase
+  metadata listings show a supplied `argument-hint` or derive
+  `<arg1> … <argN>` and `[arguments…]` from the placeholders.
+  `commands list --json` exposes `argument_hint`, `max_position`, and
+  `uses_arguments`. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
-  frontmatter accepts only a nonempty `description` string (plain, quoted or
-  block text). The key may have leading spaces or tabs; block content must be
+  frontmatter requires a nonempty `description` string (plain, quoted or
+  block text) and accepts an optional plain or quoted `argument-hint` string.
+  Each is limited to 512 bytes and screened for single-line display.
+  Other well-formed string keys produce a warning and have no effect on
+  template expansion or permissions. Keys may have leading spaces or tabs.
+  Block content must be
   indented more deeply than its key, so sibling keys remain subject to validation.
   Malformed templates are excluded with a stable diagnostic, never executed.
   Valid project templates override global templates. Built-in slash roots always win, including their subcommands; `/help` groups custom commands
