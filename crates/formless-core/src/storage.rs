@@ -810,7 +810,7 @@ CREATE TABLE IF NOT EXISTS topics (
  id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
  workspace TEXT,workspace_kind TEXT NOT NULL,
  base_revision TEXT,outline TEXT NOT NULL DEFAULT '[]',
- source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ source_session_id TEXT NOT NULL,
  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,status TEXT NOT NULL,
  redirect_message_id TEXT,rejection_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_topics_status_updated ON topics(status,updated_at DESC);
@@ -2046,9 +2046,10 @@ impl Store {
             .prepare(
                 "WITH RECURSIVE family(id) AS (SELECT ?1 UNION
                  SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
-                 WHERE s.session_kind IN ('topic','topic_attempt') UNION
-                 SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
-                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family",
+                 WHERE s.session_kind='topic_attempt' OR EXISTS(
+                   SELECT 1 FROM topics child JOIN topics parent ON child.parent_topic_id=parent.id
+                   WHERE child.topic_session_id=s.id AND parent.topic_session_id=f.id))
+                 SELECT id FROM family",
             )?
             .query_map([id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2061,6 +2062,7 @@ impl Store {
             let descendants=st.topic_session_family(id)?;
             let mut deleted=false;
             for session_id in descendants {
+                st.ex("DELETE FROM topics WHERE source_session_id=?1 AND status IN ('pending_approval','rejected')",params![session_id])?;
                 st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
                 st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
                 st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;

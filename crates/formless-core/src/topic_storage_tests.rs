@@ -439,7 +439,7 @@ fn topic_source_can_be_deleted_or_purged_after_rejection() {
 }
 
 #[test]
-fn topic_source_deletion_cascades_active_attempts_and_repository_lock() {
+fn topic_session_deletion_cascades_active_attempts_and_repository_lock() {
     let (store, source, _, request) = fixture();
     let topic = store
         .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
@@ -461,6 +461,11 @@ fn topic_source_deletion_cascades_active_attempts_and_repository_lock() {
         )
         .unwrap();
     assert!(store.delete_session(&source.id).unwrap());
+    let surviving = store.get_topic(&topic.id).unwrap().unwrap();
+    assert!(store.get_topic_attempt(&attempt.id).unwrap().is_some());
+    assert!(store
+        .delete_session(surviving.topic_session_id.as_ref().unwrap())
+        .unwrap());
     assert!(store.get_topic(&topic.id).unwrap().is_none());
     assert!(store.get_topic_attempt(&attempt.id).unwrap().is_none());
     let locks: i64 = store
@@ -914,4 +919,42 @@ fn topic_acp_selector_is_required_iff_acp_and_persisted() {
         )
         .unwrap();
     assert_eq!(attempt.acp_agent.as_deref(), Some("custom agent/id"));
+}
+
+#[test]
+fn topic_approved_explicit_parent_survives_source_purge_but_pending_does_not() {
+    let (store, source, message, mut proposal) = fixture();
+    let owner = store.create_session(None).unwrap();
+    let parent = nested_topic(&store, &owner.id, None).unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    let artifact = store
+        .save_artifact(Some(&source.id), "/retained.txt", "", 0)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET meta=?2 WHERE id=?1",
+            params![
+                message.id,
+                json!({"attachments":[{"id":artifact}]}).to_string()
+            ],
+        )
+        .unwrap();
+    proposal.parent_topic_id = Some(parent.id.clone());
+    let topic = store
+        .propose_topic(&proposal, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let topic = store.approve_topic(&topic.id).unwrap();
+    let pending = nested_topic(&store, &source.id, Some(parent.id.clone())).unwrap();
+    store.delete_session(&source.id).unwrap();
+    let surviving = store.get_topic(&topic.id).unwrap().unwrap();
+    assert_eq!(surviving.parent_topic_id, Some(parent.id));
+    assert_eq!(surviving.source_session_id, source.id);
+    assert!(store.get_topic(&pending.id).unwrap().is_none());
+    let session = topic.topic_session_id.unwrap();
+    assert!(store.get_message(&session, &message.id).unwrap().is_some());
+    assert!(store
+        .topic_artifact_access(&artifact, &session, None, Some(&source.id))
+        .unwrap());
+    assert!(store.get_artifact(&artifact).unwrap().is_some());
 }
