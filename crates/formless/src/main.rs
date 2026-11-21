@@ -2136,16 +2136,20 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
-            Some(
-                std::fs::read_to_string(paths.last_run_session_file())?
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            session.clone()
-        };
-        let session = if let Some(wanted) = session {
-            validate_session_selector(&wanted)?;
+            let id = read_last_run_session_id(&paths).map_err(usage)?;
+            if live {
+                Some(check_last_run_session(&paths, id).map_err(usage)?)
+            } else {
+                let missing = || usage(missing_last_run_session(&id));
+                let store =
+                    formless_core::Store::open_forecast_snapshot(&paths)?.ok_or_else(missing)?;
+                if store.get_session(&id)?.is_none() {
+                    return Err(missing());
+                }
+                Some(id)
+            }
+        } else if let Some(wanted) = session.as_deref() {
+            validate_session_selector(wanted)?;
             let sessions: Vec<SessionInfo> = if live {
                 serde_json::from_value(formless_tui::client::request_once(
                     &paths,
@@ -2158,7 +2162,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             };
             let matches: Vec<_> = sessions
                 .into_iter()
-                .filter(|s| s.id == wanted || s.id.starts_with(&wanted) || s.name == wanted)
+                .filter(|s| s.id == wanted || s.id.starts_with(wanted) || s.name == wanted)
                 .collect();
             if matches.len() != 1 {
                 return Err(usage("forecast Session is missing or ambiguous"));
@@ -4534,20 +4538,32 @@ fn run_input(task: String, stdin: Option<Vec<u8>>) -> Result<(String, Option<Vec
 }
 
 /// The Session the last `formless run` used, if it still exists.
-fn last_run_session(paths: &Paths) -> Result<String, String> {
-    let id = std::fs::read_to_string(paths.last_run_session_file())
+fn read_last_run_session_id(paths: &Paths) -> Result<String, String> {
+    std::fs::read_to_string(paths.last_run_session_file())
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or("no earlier `formless run` Session to continue; run once without --continue")?;
-    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+        .ok_or_else(|| {
+            "no earlier `formless run` Session to continue; run once without --continue".into()
+        })
+}
+
+fn missing_last_run_session(id: &str) -> String {
+    format!("the last `formless run` Session ({id}) no longer exists; run once without --continue")
+}
+
+fn check_last_run_session(paths: &Paths, id: String) -> Result<String, String> {
     match formless_tui::client::request_once(paths, Request::GetSession { id: id.clone() }) {
         Ok(_) => Ok(id),
         Err(e) if !e.to_string().contains("session not found") => Err(format!("{e:#}")),
-        Err(_) => Err(format!(
-            "the last `formless run` Session ({id}) no longer exists; run once without --continue"
-        )),
+        Err(_) => Err(missing_last_run_session(&id)),
     }
+}
+
+fn last_run_session(paths: &Paths) -> Result<String, String> {
+    let id = read_last_run_session_id(paths)?;
+    formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
+    check_last_run_session(paths, id)
 }
 
 #[allow(clippy::too_many_arguments)]
