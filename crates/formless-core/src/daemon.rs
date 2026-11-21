@@ -545,6 +545,7 @@ pub(crate) async fn counted<F: std::future::Future>(
 tokio::task_local! {
     /// The connection (id, label) a request came from, for attribution.
     static CLIENT: (u64, String);
+    static GENERATED_MESSAGE:String;
 }
 
 /// The client a request came from, outside requests none.
@@ -926,9 +927,16 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    topic_decisions: StdMutex<HashMap<String, topic_interactions::TopicDecision>>,
+    topic_substitutes:
+        StdMutex<HashMap<(String, String, String), topic_interactions::ApprovedSubstitute>>,
+    question_answered_by: StdMutex<HashMap<String, String>>,
+    #[cfg(test)]
+    topic_notifications: StdMutex<Vec<(String, String)>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     topic_activity: tokio::sync::Notify,
+    topic_wait_seen: StdMutex<HashMap<String, std::collections::HashSet<String>>>,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1174,9 +1182,15 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            topic_decisions: StdMutex::new(HashMap::new()),
+            topic_substitutes: StdMutex::new(HashMap::new()),
+            question_answered_by: StdMutex::new(HashMap::new()),
+            #[cfg(test)]
+            topic_notifications: StdMutex::new(vec![]),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
             topic_activity: tokio::sync::Notify::new(),
+            topic_wait_seen: StdMutex::new(HashMap::new()),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1791,6 +1805,16 @@ impl Daemon {
     }
 
     pub(crate) fn broadcast(&self, ev: Event) {
+        if let Event::UserQuestion {
+            user_only: true,
+            topic_id,
+            attempt_id,
+            question,
+            ..
+        } = &ev
+        {
+            self.notify_topic_attention(topic_id.as_deref(), attempt_id.as_deref(), question);
+        }
         match &ev {
             Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. }
@@ -1818,6 +1842,16 @@ impl Daemon {
                 | Event::HarnessPermissionRequested { .. }
         ) {
             let _ = self.attention.send(());
+        }
+        if matches!(
+            &ev,
+            Event::TopicChanged { .. }
+                | Event::UserQuestion { .. }
+                | Event::UserQuestionClosed { .. }
+                | Event::HarnessPermissionRequested { .. }
+                | Event::HarnessPermissionClosed { .. }
+        ) {
+            self.topic_activity.notify_waiters();
         }
         send_all(&self.subs, ev);
     }
@@ -2043,7 +2077,21 @@ impl Daemon {
                 self.propose_topic_request(&proposal)?,
             )?),
             Request::ApproveTopic { approval } => {
-                let topic = self.with_store(|st| st.approve_topic(&approval.topic_id))?;
+                let _admission = self.forecast_admission.locked();
+                let topic = self.with_store(|st| {
+                    let topic = st
+                        .get_topic(&approval.topic_id)?
+                        .context(RequestFailure::not_found("topic not found"))?;
+                    if self.runs.locked().contains_key(&topic.source_session_id)
+                        || self.session_is_publishing(&topic.source_session_id)
+                    {
+                        return Err(RequestFailure::busy(
+                            "source session has an active or finishing Run",
+                        )
+                        .into());
+                    }
+                    st.approve_topic(&approval.topic_id)
+                })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: topic.source_session_id.clone(),
                 });
@@ -2089,12 +2137,44 @@ impl Daemon {
                 self.broadcast(Event::TopicChanged { topic_id });
                 Ok(serde_json::to_value(topic)?)
             }
-            Request::AddTopicPermissionRule { .. }
-            | Request::RemoveTopicPermissionRule { .. }
-            | Request::SetTopicLimits { .. }
-            | Request::ListHarnesses => {
-                bail!("topic control request is not implemented yet");
+            Request::AddTopicPermissionRule {
+                topic_id,
+                harness,
+                acp_agent,
+                kind,
+                pattern,
+                decision,
+            } => {
+                let topic = self.with_store(|st| {
+                    st.add_topic_permission_rule(
+                        &topic_id,
+                        formless_protocol::TopicPermissionRule {
+                            rule_id: String::new(),
+                            harness,
+                            acp_agent,
+                            kind,
+                            pattern,
+                            decision,
+                        },
+                    )
+                })?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
             }
+            Request::RemoveTopicPermissionRule { topic_id, rule_id } => {
+                let topic =
+                    self.with_store(|st| st.remove_topic_permission_rule(&topic_id, &rule_id))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::SetTopicLimits { topic_id, limits } => {
+                let topic = self.with_store(|st| st.set_topic_limits(&topic_id, &limits))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::ListHarnesses => Ok(serde_json::to_value(
+                crate::local_harness::list_harnesses().await,
+            )?),
             Request::CancelTopic { topic_id } => {
                 let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
@@ -2154,6 +2234,15 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::RetryTopicFeature { retry } => {
+                let _launch = self.topic_launch.locked();
+                if self
+                    .topic_steps
+                    .locked()
+                    .keys()
+                    .any(|(id, _)| id == &retry.topic_id)
+                {
+                    return Err(RequestFailure::busy("topic still has live harness steps; wait for them to finish or explicitly cancel/recover the topic before retrying").into());
+                }
                 let topic = self
                     .with_store(|st| st.retry_topic_feature(&retry.topic_id, &retry.feature_id))?;
                 self.broadcast(Event::TopicChanged {
@@ -3006,14 +3095,10 @@ impl Daemon {
                         || self.session_is_publishing(&session_id) {
                         return Err(RequestFailure::busy("The Run is active or still finishing; wait until it finishes before abandoning it").into());
                     }
-                    let Some((run_id, _)) = st.last_run(&session_id)?
-                        .filter(|(_, status)| status == "interrupted" || status == "paused") else {
-                        return Ok(false);
-                    };
-                    st.set_run_status(&run_id, "abandoned")?;
+                    let abandoned=st.abandon_resumable_runs(&session_id)? >0;
                     #[cfg(windows)]
                     self.prune_retained_capture_leases_in(st);
-                    Ok(true)
+                    Ok(abandoned)
                 })?;
                 if abandoned {
                     self.publish_session_plan(&session_id);
@@ -4098,12 +4183,23 @@ impl Daemon {
                 answer,
                 answers,
             } => {
+                if self.topic_decisions.locked().contains_key(&question_id) {
+                    return self.answer_topic_decision(&question_id, &answer, &answers);
+                }
                 // First answer wins; the others find it gone.
                 let answered = {
                     let mut waiters = self.questions.locked();
-                    waiters
-                        .remove(&question_id)
-                        .is_some_and(|tx| tx.send((answer, answers)).is_ok())
+                    waiters.remove(&question_id).is_some_and(|tx| {
+                        self.question_answered_by
+                            .locked()
+                            .insert(question_id.clone(), "user".into());
+                        if tx.send((answer, answers)).is_ok() {
+                            true
+                        } else {
+                            self.question_answered_by.locked().remove(&question_id);
+                            false
+                        }
+                    })
                 };
                 self.remove_attention(&question_id);
                 Ok(json!({"answered": answered}))
@@ -5834,6 +5930,15 @@ impl Daemon {
         let control = self.runs.locked().get(&session_id).cloned();
         // A Run can start or finish after the client confirms. Classify under
         // the same admission lock as the ensuing append and Run admission.
+        if GENERATED_MESSAGE
+            .try_with(|marker| marker == "topic_kickoff")
+            .unwrap_or(false)
+            && (control.is_some() || self.session_is_publishing(&session_id))
+        {
+            bail!(
+                "Topic Chat became busy before kickoff; no generated message was queued or steered"
+            );
+        }
         if let Some(review) = &review {
             if let Some(expected_run) = &review.run_id {
                 if control.as_ref().map(|run| &run.run_id) != Some(expected_run) {
@@ -6569,6 +6674,7 @@ impl Daemon {
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
+        let final_status = self.topic_orchestrator_ended(&session_id, &run_id, final_status);
         // Persist the exact terminal snapshot before a new Run or Resume can
         // acquire this Session, and before any recap event advertises it.
         let changes = self
@@ -6600,7 +6706,6 @@ impl Daemon {
                 None
             }
         };
-        self.topic_orchestrator_ended(&session_id, final_status);
         // Locks a panicking Run may have poisoned are still taken. Only this
         // Run's own entry goes: a newer Run of the Session keeps its
         // controls (#726).
@@ -8739,6 +8844,25 @@ impl Daemon {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
             },
+            toolreg::TOPIC_WAIT => match self.wait_topic_steps(session_id, &args, cancel).await {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic_wait: {error:#}")),
+            },
+            toolreg::TOPIC_REQUEST_HARNESS_SUBSTITUTE => match self
+                .request_topic_harness_substitute(session_id, &args, cancel)
+                .await
+            {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!(
+                    "error: topic_request_harness_substitute: {error:#}"
+                )),
+            },
+            toolreg::TOPIC_ANSWER_QUESTION => {
+                match self.answer_topic_question_tool(session_id, &args) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => call_failed(format!("error: topic_answer_question: {error:#}")),
+                }
+            }
             toolreg::TOPIC_COMPLETE_FEATURE | toolreg::TOPIC_FAIL_FEATURE => match self
                 .finish_topic_feature_tool(
                     session_id,
@@ -11145,9 +11269,13 @@ impl Daemon {
         for session in &family {
             self.with_store(|st| crate::artifacts::remove_for_session(st, session))?;
         }
-        self.with_store(|st| st.delete_session(id))?;
+        self.with_store(|st| {
+            crate::artifacts::remove_retained_for_topic_purge(st, &family)?;
+            st.delete_session(id)
+        })?;
         for session in &family {
             self.contexts.locked().remove(session);
+            self.topic_wait_seen.locked().remove(session);
         }
         Ok(())
     }
@@ -12377,7 +12505,8 @@ impl Daemon {
             meta[k] = v;
         }
         let meta = (meta != json!({})).then(|| meta.to_string());
-        st.append_message_meta(session_id, "user", content, meta)
+        let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+        st.append_message_generated(session_id, "user", content, meta, generated_by.as_deref())
     }
 
     /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
@@ -12883,7 +13012,7 @@ impl Daemon {
         });
         let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
         self.broadcast(Event::UserQuestionClosed {
-            answered_by: None,
+            answered_by: self.question_answered_by.locked().remove(&question_id),
             question_id,
         });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
@@ -16213,7 +16342,16 @@ impl Daemon {
             .unwrap()
             .values()
             .any(|e| e.result.locked().is_none());
-        !held && self.runs.locked().is_empty() && self.subscriber_count() == 0
+        !held
+            && self.runs.locked().is_empty()
+            && !self.topic_work_in_flight()
+            && self.subscriber_count() == 0
+    }
+    fn topic_work_in_flight(&self) -> bool {
+        !self.topic_steps.locked().is_empty()
+            || !self.topic_questions.locked().is_empty()
+            || !self.harness_permissions.locked().is_empty()
+            || !self.topic_decisions.locked().is_empty()
     }
 
     async fn idle_watcher(self: Arc<Self>) {
@@ -16283,6 +16421,7 @@ impl Daemon {
                 || stay
                 || jobs_waiting
                 || !self.runs.locked().is_empty()
+                || self.topic_work_in_flight()
                 || self.subscriber_count() > 0;
             if busy {
                 idle_since = None;
@@ -17654,6 +17793,7 @@ pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> Str
 #[test]
 fn stored_tool_result_outcome_preserves_provider_projection() {
     let mut message = formless_protocol::MessageInfo {
+        generated_by: None,
         id: "result".into(),
         session_id: "session".into(),
         seq: 1,

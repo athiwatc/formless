@@ -17,6 +17,71 @@ type Records = HashMap<String, Record>;
 type Lineage = HashMap<String, Vec<(String, i64)>>;
 const MAX_LINEAGE_DEPTH: usize = 64;
 
+pub(crate) fn session_references_artifact(
+    conn: &rusqlite::Connection,
+    id: &str,
+    scope: &str,
+    owner: &str,
+) -> Result<bool> {
+    if topic_provenance(conn, id, scope, None, Some(owner))? {
+        return Ok(true);
+    }
+    let mut statement =
+        conn.prepare("SELECT seq,meta FROM messages WHERE session_id=?1 AND meta IS NOT NULL")?;
+    let rows = statement.query_map([scope], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (seq, meta) = row?;
+        let Ok(meta) = serde_json::from_str::<Value>(&meta) else {
+            continue;
+        };
+        let attached = meta["attachments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| {
+                a["imported"] != true
+                    && a["reference"] != true
+                    && a["expired"] != true
+                    && (a["id"].as_str() == Some(id) || a["_artifact_id"].as_str() == Some(id))
+            });
+        if !attached || seq <= 0 {
+            continue;
+        }
+        let mut current = scope.to_string();
+        let mut cutoff = i64::MAX;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_LINEAGE_DEPTH {
+            if !seen.insert(current.clone()) {
+                break;
+            }
+            if current == owner {
+                return Ok(true);
+            }
+            let fork = conn
+                .query_row(
+                    "SELECT forked_from,fork_point_seq FROM sessions WHERE id=?1",
+                    [&current],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()?;
+            let Some((Some(parent), Some(point))) = fork else {
+                break;
+            };
+            cutoff = cutoff.min(point);
+            if seq > cutoff {
+                break;
+            }
+            if parent == owner {
+                return Ok(true);
+            }
+            current = parent;
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn topic_provenance(
     conn: &rusqlite::Connection,
     id: &str,
