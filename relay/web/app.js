@@ -1736,6 +1736,7 @@
     const word = /[\p{L}\p{N}_$]/u;
     let i = 0;
     let lineStart = true;
+    const postgresDollarQuotes = /^(?:sql|postgres|postgresql)$/.test(lang);
     while (i < code.length) {
       const c = code[i];
       if (L === HL.js && (c === "." || /\d/.test(c))) {
@@ -1808,6 +1809,17 @@
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
+      }
+      if (postgresDollarQuotes && c === "$" && (i === 0 || !/[\p{L}\p{N}_]/u.test(code[i - 1]))) {
+        const opener = /^\$(?:[a-zA-Z_\u0080-\uffff][a-zA-Z_0-9\u0080-\uffff]*)?\$/.exec(code.slice(i));
+        if (opener) {
+          const delimiter = opener[0];
+          const closer = code.indexOf(delimiter, i + delimiter.length);
+          const stop = closer === -1 ? code.length : closer + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
       }
       if (L.q.includes(c)) {
         const multiline = toml && code.startsWith(c.repeat(3), i);

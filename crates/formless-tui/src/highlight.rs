@@ -532,6 +532,21 @@ pub(crate) struct Highlighter {
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
     js_typescript: bool,
+    postgres_dollar_quotes: bool,
+}
+
+fn postgres_dollar_delimiter(chars: &[char]) -> Option<&[char]> {
+    let end = match chars.get(1)? {
+        '$' => 1,
+        first if first.is_ascii_alphabetic() || *first == '_' || !first.is_ascii() => {
+            2 + chars[2..]
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_' || !c.is_ascii())
+                .count()
+        }
+        _ => return None,
+    };
+    (chars.get(end) == Some(&'$')).then(|| &chars[..=end])
 }
 
 /// Rust-shaped literals only. A dot before another dot or an identifier
@@ -684,6 +699,7 @@ impl Highlighter {
             in_block: 0,
             in_str: None,
             js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
+            postgres_dollar_quotes: matches!(name.as_str(), "sql" | "postgres" | "postgresql"),
         })
     }
 
@@ -781,6 +797,10 @@ impl Highlighter {
                     (i == 0 && at(0, &close)).then_some(2)
                 } else if self.powershell {
                     powershell_quote_end(&chars, i, close.chars().next().unwrap())
+                } else if self.postgres_dollar_quotes {
+                    (i..chars.len())
+                        .find(|&j| at(j, &close))
+                        .map(|j| j + close.chars().count())
                 } else {
                     close_at(i, &close)
                 };
@@ -826,6 +846,21 @@ impl Highlighter {
             }
             let c = chars[i];
             let word_start = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+            if self.postgres_dollar_quotes && c == '$' && word_start {
+                if let Some(delimiter) = postgres_dollar_delimiter(&chars[i..]) {
+                    let from = i + delimiter.len();
+                    let stop = (from..chars.len())
+                        .find(|&j| chars[j..].starts_with(delimiter))
+                        .map(|j| j + delimiter.len());
+                    if stop.is_none() {
+                        self.in_str = Some(delimiter.iter().collect());
+                    }
+                    let end = stop.unwrap_or(chars.len());
+                    push(Tok::Str, &chars[i..end]);
+                    i = end;
+                    continue;
+                }
+            }
             // Rust raw strings: `r"…"`, `r#"…"#`, `br#"…"#` (#877).
             if l.raw_strings
                 && word_start
@@ -1315,6 +1350,47 @@ mod tests {
             highlighter.line("// comment")[0].style.fg,
             Some(Color::DarkGray)
         );
+    }
+
+    #[test]
+    fn postgres_dollar_quotes_keep_comments_and_other_tags_inside_strings() {
+        for lang in ["sql", "postgres", "PostgreSQL"] {
+            for delimiter in ["$$", "$Body_2$", "$λ$"] {
+                let mut highlighter = Highlighter::new(lang, true).unwrap();
+                let opener = format!("AS {delimiter}");
+                let spans = highlighter.line(&opener);
+                assert_eq!(spans.last().unwrap().content, delimiter);
+                assert_eq!(spans.last().unwrap().style.fg, Some(Color::Green));
+                let body = "/* open-looking -- ' $another_tag$";
+                let spans = highlighter.line(body);
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].content, body);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+
+                let closer = format!(r"\{delimiter}");
+                let line = format!("{closer}; SELECT $1 -- tail");
+                let spans = highlighter.line(&line);
+                assert_eq!(spans[0].content, closer);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+                assert!(spans
+                    .iter()
+                    .any(|span| span.content == "SELECT" && span.style.fg == Some(Color::Magenta)));
+                assert!(spans
+                    .last()
+                    .unwrap()
+                    .style
+                    .add_modifier
+                    .contains(Modifier::ITALIC));
+            }
+        }
+        for lang in ["sqlite", "mysql"] {
+            assert!(!toks(lang, "$$ /* block */ $$")
+                .iter()
+                .any(|(_, color)| *color == Some(Color::Green)));
+        }
+        assert!(toks("postgres", "SELECT col$tag$ FROM t")
+            .iter()
+            .any(|(text, color)| text == "FROM" && *color == Some(Color::Magenta)));
     }
 
     #[test]
