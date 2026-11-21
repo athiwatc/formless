@@ -766,6 +766,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     | "julia"
                     | "elixir"
                     | "iex"
+                    | "luajit"
+                    | "pypy"
                     | "tclsh"
                     | "wish"
                     | "expect"
@@ -3985,6 +3987,23 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn broad_process_confirmation_for_luajit_and_pypy() {
+        for spec in [
+            "process:luajit",
+            "process:luajit2.1",
+            "process:/usr/bin/luajit",
+            "process:pypy",
+            "process:pypy3",
+            "process:pypy3.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:luajit-helper", "process:pypy-config", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
