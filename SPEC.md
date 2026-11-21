@@ -25,16 +25,8 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Network activity can include requests to
-   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
-   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
-   Naming and auto-download are enabled by default. When both are enabled
-   in a build with embedded naming, an eligible Session can trigger a
-   download of its missing configured catalogue model and tokenizer from
-   Hugging Face. `naming.auto_download = false` disables
-   automatic naming downloads; `naming.enabled = false` disables automatic
-   naming. These settings do not block explicit `formless naming pull`.
-   There is no automatic update checker.
+5. **Local-first.** The daemon stores Sessions and Tools locally.
+   See [network activity, naming controls and telemetry](#15-privacy-and-data-lifecycle).
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -6280,10 +6272,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 ## 15. Privacy and data lifecycle
 
 - **Zero telemetry.** No analytics, no automatic update checks, no crash
-  reporting. Outbound traffic goes only to the user's configured provider
-  endpoint (sessions, optimiser, compaction), the user-enabled Relay
-  (ciphertext only, §12), and explicit user-run commands — always with
-  redacted secrets in optimiser paths (§8.3).
+  reporting.
+- **Network activity.** Examples include configured provider calls for
+  Sessions, optimisation and Compaction, connections to a
+  [user-enabled Relay](README.md#37-browser-access-via-the-relay-v2) and
+  explicit commands such as `formless update check`. Optimiser paths redact
+  secrets (§8.3). In builds with embedded model support, naming an untitled
+  or provisionally named Session with suitable user text can download weights
+  or a tokenizer when the selected [catalogue model](README.md#local-naming-models)
+  needs them. Automatic naming and downloads are enabled by default. Set
+  `naming.auto_download = false` to disable automatic downloads or
+  `naming.enabled = false` to disable automatic naming.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
