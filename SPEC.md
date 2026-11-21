@@ -3711,7 +3711,9 @@ refresh a cache, nightly cleanup.
     at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
-    unsupported. Natural schedules are stored as cron.
+    unsupported. Natural schedules are stored as cron. Minute and hour
+    intervals must divide 60 minutes or 24 hours evenly. Use explicit cron
+    to schedule uneven gaps at particular clock times.
     `PreviewSchedule {schedule}` returns the cron and up to three projected
     recurring times from the daemon's current local time. `jobs add` prints
     them after creation. `formless jobs preview SCHEDULE [--json]` requests
