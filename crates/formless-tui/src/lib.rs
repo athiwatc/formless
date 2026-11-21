@@ -33,6 +33,7 @@ mod profile_context_tests;
 pub mod qr;
 mod query;
 mod review_wrap;
+mod search_display;
 mod search_jump;
 mod session_rename;
 mod session_ui;
@@ -331,7 +332,12 @@ enum Pending {
     ReconnectSession,
     CreateSession,
     ForkSession,
-    SearchSessions,
+    SearchSessions {
+        context: search_display::Context,
+        serial: u64,
+        view: View,
+        session: Option<String>,
+    },
     ListTools,
     ListModules,
     ListModelStats,
@@ -1987,6 +1993,8 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_context: Option<search_display::Context>,
+    search_serial: u64,
     search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
@@ -2270,6 +2278,8 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -2875,6 +2885,11 @@ impl App {
         }
     }
 
+    fn stale_search(&self, pending: &Pending) -> bool {
+        matches!(pending, Pending::SearchSessions { serial, view, session, .. }
+            if *serial != self.search_serial || *view != self.view || *session != self.current)
+    }
+
     /// Give up on requests the daemon never answered.
     fn expire_pending(&mut self) {
         let late: Vec<u64> = self
@@ -2890,6 +2905,9 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if self.stale_search(&kind) {
+                continue;
+            }
             if matches!(kind, Pending::ProviderRetry { .. }) {
                 self.notes.push(
                     "Provider retry was not confirmed; the request may already have been re-sent."
@@ -3129,6 +3147,9 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if self.stale_search(&kind) {
+                        continue;
+                    }
                     if let Pending::SuggestName { target } = &kind {
                         self.finish_rename_suggestion(
                             target,
@@ -3403,10 +3424,11 @@ impl App {
                                 }
                             }
                         }
-                        Pending::SearchSessions => {
+                        Pending::SearchSessions { context, .. } => {
                             if let Ok(v) = serde_json::from_value::<Vec<SearchHit>>(result) {
                                 self.notes.push(format!("{} search hit(s)", v.len()));
                                 self.search_hits = v;
+                                self.search_context = Some(context);
                                 self.search_idx = 0;
                                 self.open_view(View::Search);
                             }
@@ -5535,6 +5557,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
@@ -6973,11 +6996,21 @@ impl App {
         }
         if self.search_mode {
             self.search_mode = false;
+            const LIMIT: usize = 50;
+            self.search_serial = self.search_serial.wrapping_add(1);
             self.request(
-                Pending::SearchSessions,
+                Pending::SearchSessions {
+                    context: search_display::Context {
+                        query: text.clone(),
+                        limit: LIMIT,
+                    },
+                    serial: self.search_serial,
+                    view: self.view,
+                    session: self.current.clone(),
+                },
                 Request::SearchSessions {
                     query: text,
-                    limit: Some(50),
+                    limit: Some(LIMIT),
                 },
             );
             return;
@@ -7505,6 +7538,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
             self.search_jump = None;
@@ -7579,6 +7613,7 @@ impl App {
             },
             cmd if cmd.starts_with("template ") => self.template_cmd(cmd[9..].trim()),
             "search" => {
+                self.search_serial = self.search_serial.wrapping_add(1);
                 self.search_mode = true;
                 self.notes
                     .push("Type a search query, then Enter (searches all sessions).".into());
@@ -9146,8 +9181,14 @@ impl App {
         if self.wizard.is_some() {
             return;
         }
-        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
+        let left_released = matches!(m.kind, MouseEventKind::Up(MouseButton::Left));
+        if left_released {
             self.selecting_draft = false;
+        }
+        // A fullscreen pager covers all hit targets. Keep release cleanup
+        // for both draft editors if a pager appeared during a drag.
+        if self.pager.is_some() && !left_released {
+            return;
         }
         if self.editor.is_none() && self.renaming.is_some() {
             if self.rename_mouse(m) {
@@ -9993,6 +10034,34 @@ impl App {
         }
         if self.list_filter_key(&key) || self.list_nav_key(&key) {
             return;
+        }
+        // Keep filter, overlay and delete-confirmation ownership ahead of list help.
+        if !modal_open
+            && !(self.view == View::Sessions && self.delete_arm.is_some())
+            && !self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::ProposalDiff))
+            && self.branch_summary.intent.is_none()
+            && self.branch_summary.review.is_none()
+            && !self.branch_summary.committing
+            && key.code == KeyCode::Char('?')
+            && query::plain(&key)
+        {
+            if let Some((title, lines)) = keys::contextual_help(self.view) {
+                // A failed diff may leave its owner behind without a pager
+                // or request. Never carry its decision keys into list help.
+                self.reviewing = None;
+                self.pager = Some(Pager {
+                    title: title.into(),
+                    lines,
+                    top: 0,
+                    left: 0,
+                    viewport: Default::default(),
+                    styled: Vec::new(),
+                });
+                return;
+            }
         }
         match self.view {
             View::Settings => self.settings_key(key),
@@ -10946,6 +11015,25 @@ impl App {
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
         if let Some(form) = &mut self.settings_form {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
+                form.viewport.get_mut().page(key.code == KeyCode::PageDown);
+                return;
+            }
+            if matches!(
+                key.code,
+                KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Down
+                    | KeyCode::Up
+                    | KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Left
+                    | KeyCode::Right
+            ) || matches!(key.code, KeyCode::Char(_))
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                form.viewport.get_mut().inspecting = false;
+            }
             let n = form.fields.len();
             match key.code {
                 KeyCode::Esc => self.settings_form = None,
@@ -11893,6 +11981,7 @@ impl App {
         if self.view == View::Settings {
             if let Some(f) = &mut self.settings_form {
                 f.fields[f.idx].input.paste(text.trim());
+                f.viewport.get_mut().inspecting = false;
             } else if let Some((_, edit)) = &mut self.settings_edit {
                 edit.paste(text.trim());
             }
@@ -12019,6 +12108,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         chat_focus,
     );
     draw_status(f, chunks[3], app, chat_focus);
+    // Give the form the full frame after drawing its background. Approval
+    // and other modal overlays below keep their existing priority.
+    if app.view == View::Settings {
+        if let Some(form) = &app.settings_form {
+            draw_settings_form(f, form, app.color);
+        }
+    }
     if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
@@ -13384,7 +13480,19 @@ fn compact_status(
 fn draw_status(f: &mut Frame, area: Rect, app: &App, focus: Option<keys::ChatFocus>) {
     let width = area.width as usize;
     let mut spans = status_left(app, width);
-    let used: usize = spans.iter().map(status_width).sum();
+    let mut used: usize = spans.iter().map(status_width).sum();
+    // Make room for the omission marker without displacing the existing
+    // high-ranked shortcuts or the pending-approval indicator.
+    let reserve = text::width(keys::LIST_MORE) + 3;
+    if width >= reserve
+        && keys::list_footer_truncated(app.view, width.saturating_sub(used + 3))
+        && app.approvals.is_empty()
+        && app.promotions.is_empty()
+    {
+        let status_budget = used.min(width - 3).saturating_sub(reserve);
+        spans = status_left(app, status_budget);
+        used = spans.iter().map(status_width).sum();
+    }
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
     let hint_width = width.saturating_sub(used + 3);
@@ -16001,14 +16109,36 @@ impl App {
     }
 }
 
-fn tool_result_line(content: &str, color: bool) -> Line<'static> {
+fn tool_result_failed(result: &MessageInfo) -> bool {
+    if let Some(is_error) = result
+        .meta
+        .as_deref()
+        .and_then(|meta| serde_json::from_str::<serde_json::Value>(meta).ok())
+        .and_then(|meta| {
+            meta.get("is_error")
+                .map(|flag| flag.as_bool() == Some(true))
+        })
+    {
+        return is_error;
+    }
+    // Older rows without an outcome may hold a JSON reply or a plain error.
+    // Only a top-level boolean `ok` describes a legacy JSON reply's outcome.
+    let content = result.content.trim_start();
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(reply) => reply.get("ok").and_then(serde_json::Value::as_bool) == Some(false),
+        Err(_) => content
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error")),
+    }
+}
+
+fn tool_result_line(result: &MessageInfo, color: bool) -> Line<'static> {
+    let content = &result.content;
     let n = content.lines().count();
-    let failed = content.contains("\"ok\":false")
-        || content.trim_start().to_lowercase().starts_with("error");
     let mut spans = vec![
         Span::styled(
             "  ↳ ",
-            if failed {
+            if tool_result_failed(result) {
                 bold_fg(color, Color::Red)
             } else {
                 fg(color, Color::Yellow)
@@ -16208,13 +16338,12 @@ fn result_diff(result: &str) -> Option<String> {
 fn tool_call_block(
     app: &App,
     (id, name, args): &(String, String, String),
-    result: Option<&str>,
+    result: Option<&MessageInfo>,
 ) -> Vec<Line<'static>> {
     let focused = app.call_focus.as_deref() == Some(id.as_str());
     let expanded = app.expanded_calls.contains(id);
-    let failed = result.is_some_and(|r| {
-        r.contains("\"ok\":false") || r.trim_start().to_lowercase().starts_with("error")
-    });
+    let failed = result.is_some_and(tool_result_failed);
+    let result = result.map(|message| message.content.as_str());
     let (mark, mark_style) = match result {
         None => ("…".to_owned(), ui::dim(app.color)),
         Some(_) if failed => (
@@ -16335,11 +16464,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let focus_actions = app.chat_focus_actions_available();
     // Results by call id, so each call renders with its result and the
     // separate `tool` line is skipped.
-    let results: HashMap<String, &str> = app
+    let results: HashMap<String, &MessageInfo> = app
         .messages
         .iter()
         .filter(|m| m.role == "tool")
-        .filter_map(|m| result_call_id(m).map(|id| (id, m.content.as_str())))
+        .filter_map(|m| result_call_id(m).map(|id| (id, m)))
         .collect();
     let called: HashSet<String> = app
         .messages
@@ -16436,7 +16565,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     continue;
                 }
                 open_group(&mut lines, &mut group, "assistant", when);
-                lines.push(tool_result_line(&m.content, app.color));
+                lines.push(tool_result_line(m, app.color));
             }
             "system-note" => {
                 open_group(&mut lines, &mut group, "system-note", when);
@@ -17185,73 +17314,159 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         )),
         area,
     );
-    if let Some(form) = &app.settings_form {
-        draw_settings_form(f, form, app.color);
+}
+
+/// The normal word wrapper can overhang the last column with a wide
+/// grapheme. Split those rows before painting them inside the form border.
+fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
+    let columns = usize::from(width);
+    let mut rows = Vec::new();
+    for row in review_wrap::window(&line, width, 0, usize::MAX) {
+        if row.width() <= columns {
+            rows.push(row);
+            continue;
+        }
+        let mut chunk = Vec::new();
+        let mut used = 0;
+        // The wrapper emits one complete grapheme per span.
+        for span in row.spans {
+            let span_width = span.width();
+            if used + span_width > columns && !chunk.is_empty() {
+                rows.push(Line::from(std::mem::take(&mut chunk)));
+                used = 0;
+            }
+            used += span_width;
+            chunk.push(span);
+        }
+        if !chunk.is_empty() {
+            rows.push(Line::from(chunk));
+        }
     }
+    rows
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
-    let mut lines = vec![Line::raw("")];
-    let width = f.area().width.saturating_sub(6).min(66).max(1) as usize;
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        form.viewport.set(Default::default());
+        return;
+    }
+    // In very narrow terminals use all columns so a two-column grapheme
+    // still fits. A one-column frame can only paint one-column graphemes.
+    let bordered = area.width >= 6 && area.height >= 3;
+    let border = if bordered { 2 } else { 0 };
+    let width = area.width.saturating_sub(border).min(72);
+    let inner_width = width - border;
+    let wrap = |line: Line<'_>| settings_form_rows(line, inner_width);
+    let mut body = vec![Line::raw("")];
     for text in &form.review {
-        let chars: Vec<char> = text.chars().collect();
-        for part in chars.chunks(width) {
-            lines.push(Line::raw(part.iter().collect::<String>()));
+        for line in text.split('\n') {
+            body.extend(wrap(Line::raw(line)));
         }
     }
+    let mut active_rows = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
-        let text = if field.masked {
+        let mut text = if field.masked {
             "•".repeat(field.input.chars().count())
         } else {
             field.input.to_string()
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} {:<12}", if active { "›" } else { " " }, field.label),
-                if active {
-                    bold_fg(color, Color::Green)
-                } else {
-                    ui::dim(color)
-                },
-            ),
-            Span::raw(if active { format!("{text}▏") } else { text }),
-        ]));
         if active {
-            lines.push(Line::styled(
+            text.push('▏');
+        }
+        let start = body.len();
+        for (row, line) in text.split('\n').enumerate() {
+            if row == 0 {
+                body.extend(wrap(Line::from(vec![
+                    Span::styled(
+                        format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                        if active {
+                            bold_fg(color, Color::Green)
+                        } else {
+                            ui::dim(color)
+                        },
+                    ),
+                    Span::raw(line),
+                ])));
+            } else {
+                body.extend(wrap(Line::raw(line)));
+            }
+        }
+        if active {
+            active_rows = Some(start..body.len());
+            body.extend(wrap(Line::styled(
                 format!("               {}", field.hint),
                 ui::dim(color),
-            ));
+            )));
         }
     }
-    if let Some(e) = &form.error {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            ui::status_text(color, SemanticTone::Bad, format!("  ✗ {e}")),
-            fg(color, Color::Red),
-        ));
+    if let Some(error) = &form.error {
+        body.push(Line::raw(""));
+        let title = ui::status_text(color, SemanticTone::Bad, format!("  ✗ {error}"));
+        for line in title.split('\n') {
+            body.extend(wrap(Line::styled(line, fg(color, Color::Red))));
+        }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
+
+    let capacity = usize::from(area.height - border);
+    let mut footer = wrap(Line::styled(
         "  Tab/↑↓ field · Enter next, then save · Esc cancel",
         ui::dim(color),
     ));
-    let area = f.area();
-    let w = 72.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 3,
-        width: w,
-        height: h,
-    };
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(format!(" {} ", form.title), color, Color::Cyan))
-            .wrap(Wrap { trim: false }),
-        rect,
+    if footer.len() >= capacity {
+        // Leave room to follow the active field even at one terminal row.
+        // The full footer remains reachable by paging through the body.
+        body.push(Line::raw(""));
+        body.append(&mut footer);
+    } else if body.len() + footer.len() < capacity {
+        footer.insert(0, Line::raw(""));
+    } else {
+        let hint = wrap(Line::styled("  PgUp/PgDn scroll form", ui::dim(color)));
+        if footer.len() + hint.len() + 1 < capacity {
+            footer.extend(hint);
+        }
+    }
+
+    let mut viewport = form.viewport.get();
+    viewport.page = body.len().min(capacity - footer.len());
+    viewport.max_top = body.len() - viewport.page;
+    if !viewport.inspecting {
+        if let Some(active) = active_rows {
+            let first_with_end = active.end.saturating_sub(viewport.page);
+            // Keep the entire active field visible when it fits. Otherwise
+            // keep its trailing editing marker in view.
+            viewport.top = viewport
+                .top
+                .clamp(first_with_end, active.start.max(first_with_end));
+        }
+    }
+    viewport.top = viewport.top.min(viewport.max_top);
+    form.viewport.set(viewport);
+
+    let height = (viewport.page + footer.len()) as u16 + border;
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 3,
+        width,
+        height,
     );
+    f.render_widget(Clear, rect);
+    let inner = if bordered {
+        let panel = ui::panel(format!(" {} ", form.title), color, Color::Cyan);
+        let inner = panel.inner(rect);
+        f.render_widget(panel, rect);
+        inner
+    } else {
+        rect
+    };
+    let rows = body
+        .into_iter()
+        .skip(viewport.top)
+        .take(viewport.page)
+        .chain(footer)
+        .collect();
+    f.render_widget(review_wrap::Rows(rows), inner);
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -17261,20 +17476,30 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
             .len()
             .min(area.height.saturating_sub(2) as usize),
     );
+    let context = app.search_context.as_ref();
     let items: Vec<ListItem> = if app.search_hits.is_empty() {
+        let budget = usize::from(area.width.saturating_sub(2));
         vec![ListItem::new(Line::styled(
-            "No hits. /search to try again.",
+            search_display::empty(context, budget),
             ui::dim(app.color),
         ))]
     } else {
+        let terms = search_display::Terms::new(context.map_or("", |context| &context.query));
         app.search_hits
             .iter()
             .map(|h| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(h.session_name.clone(), bold_fg(app.color, Color::Cyan)),
-                    Span::styled(format!("  #{} {}  ", h.seq, h.role), ui::dim(app.color)),
-                    Span::raw(h.snippet.clone()),
-                ]))
+                let mut spans = vec![
+                    Span::styled(
+                        search_display::label(&h.session_name),
+                        bold_fg(app.color, Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!("  #{} {}  ", h.seq, search_display::label(&h.role)),
+                        ui::dim(app.color),
+                    ),
+                ];
+                spans.extend(terms.snippet_spans(&h.snippet, Style::default()));
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -17285,7 +17510,11 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(
         List::new(items)
             .block(ui::panel(
-                format!(" Search ({} hits) ", app.search_hits.len()),
+                search_display::title(
+                    app.search_hits.len(),
+                    context,
+                    usize::from(area.width.saturating_sub(2)),
+                ),
                 app.color,
                 Color::Magenta,
             ))
@@ -20113,6 +20342,8 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_context: None,
+            search_serial: 0,
             search_jump: None,
             search_idx: 0,
             search_mode: false,
@@ -23703,6 +23934,144 @@ mod tests {
     }
 
     #[test]
+    fn settings_form_paging_reads_the_body_without_submitting_or_revealing_masked_text() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.view = View::Settings;
+        let mut form = settings::Form::provider(None);
+        form.review = (0..16).map(|i| format!("review row {i:02}")).collect();
+        form.error = Some("fixture error at end".into());
+        form.fields[0].masked = true;
+        let masked = "ab界e\u{301}";
+        form.fields[0].input.set(masked);
+        app.settings_form = Some(form);
+
+        let first = render(&mut app, 65, 9);
+        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("Enter next, then save"), "{first}");
+        assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
+        assert!(!first.contains("ab界"), "{first}");
+        let form = app.settings_form.as_ref().unwrap();
+        let original_index = form.idx;
+        let original_cursor = form.fields[original_index].input.cursor_byte();
+        let original_top = form.viewport.get().top;
+
+        app.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL));
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            original_top
+        );
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageUp));
+        }
+        let intro = render(&mut app, 65, 9);
+        assert!(intro.contains("review row 00"), "{intro}");
+        for _ in 0..32 {
+            app.key(key(KeyCode::PageDown));
+        }
+        let tail = render(&mut app, 65, 9);
+        assert!(tail.contains("fixture error at end"), "{tail}");
+        assert!(tail.contains("Enter next, then save"), "{tail}");
+        let form = app.settings_form.as_ref().unwrap();
+        assert_eq!(form.idx, original_index);
+        assert_eq!(
+            form.fields[original_index].input.cursor_byte(),
+            original_cursor
+        );
+        assert_eq!(form.fields[original_index].input, masked);
+        assert_eq!(form.error.as_deref(), Some("fixture error at end"));
+        assert!(sent.try_recv().is_err());
+
+        app.key(key(KeyCode::Left));
+        let followed = render(&mut app, 65, 9);
+        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(!followed.contains("ab界"), "{followed}");
+        app.paste("X");
+        let edited = render(&mut app, 65, 9);
+        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(!edited.contains("ab界"), "{edited}");
+        app.key(key(KeyCode::Tab));
+        let next_field = render(&mut app, 65, 9);
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, original_index + 1);
+        assert!(next_field.contains("› base_url"), "{next_field}");
+        assert!(sent.try_recv().is_err());
+    }
+
+    fn render_only_settings_form(form: &settings::Form, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_settings_form(frame, form, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn settings_form_reflows_wide_graphemes_and_keeps_the_tiny_footer_reachable() {
+        let mut form = settings::Form::provider(None);
+        let value = format!("{} end", "界e\u{301}".repeat(65));
+        form.fields[0].input.set(&value);
+        for (width, height) in [(60, 18), (27, 8), (1, 1), (15, 2), (60, 20)] {
+            let screen = render_only_settings_form(&form, width, height);
+            let viewport = form.viewport.get();
+            assert!(viewport.top <= viewport.max_top);
+            assert!(viewport.page > 0 && viewport.page <= usize::from(height));
+            assert!(screen.contains('▏'), "{width}x{height}: {screen}");
+        }
+        let screen = render_only_settings_form(&form, 60, 20);
+        assert!(
+            screen.contains("e\u{301}") && screen.contains("end▏"),
+            "{screen}"
+        );
+        assert!(screen.contains("Enter next, then save"), "{screen}");
+        render_only_settings_form(&form, 15, 2);
+        let mut viewport = form.viewport.get();
+        for _ in 0..viewport.max_top {
+            viewport.page(true);
+        }
+        form.viewport.set(viewport);
+        let tail = render_only_settings_form(&form, 15, 2);
+        assert!(
+            tail.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("Esc cancel"),
+            "{tail}"
+        );
+        assert_eq!(form.fields[0].input, value.as_str());
+        assert_eq!(form.idx, 0);
+    }
+
+    #[test]
+    fn settings_form_preserves_wide_text_at_narrow_and_right_edges() {
+        for width in 2..=5 {
+            let mut form = settings::Form::provider(None);
+            form.fields[0].input.set("a界");
+            let screen = render_only_settings_form(&form, width, 16);
+            assert!(screen.contains('界'), "{width} columns: {screen}");
+        }
+        for width in 2..=8 {
+            let value = format!("{}界", "a".repeat(usize::from(width - 1)));
+            let rows = settings_form_rows(Line::raw(&value), width);
+            assert_eq!(
+                rows.iter().map(ToString::to_string).collect::<String>(),
+                value,
+                "{width} columns"
+            );
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+        }
+    }
+
+    #[test]
     fn active_settings_form_owns_tabs_after_overlays_without_hidden_form_capture() {
         let mut app = test_app();
         let (client, sent) = DaemonClient::recording();
@@ -23752,6 +24121,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             cursors
         );
+        render(&mut app, 65, 9);
+        let form_top = app.settings_form.as_ref().unwrap().viewport.get().top;
         app.pager = Some(Pager {
             title: "overlay".into(),
             lines: vec!["first".into()],
@@ -23762,7 +24133,12 @@ mod tests {
         });
         app.key(key(KeyCode::Tab));
         app.key(key(KeyCode::BackTab));
+        app.key(key(KeyCode::PageDown));
         assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().viewport.get().top,
+            form_top
+        );
         assert!(app.pager.is_some());
         assert_eq!(app.view, View::Settings);
         assert!(
@@ -26597,7 +26973,7 @@ mod tests {
                 "t",
                 "tool",
                 serde_json::json!({"diff": diff, "ok": true}).to_string(),
-                serde_json::json!({"tool_call_id": "c1"}),
+                serde_json::json!({"tool_call_id": "c1", "is_error": false}),
             ),
         ];
         let screen = render(&mut app, 100, 20);
@@ -27353,6 +27729,309 @@ mod tests {
         assert_eq!(short_dir("/a/b"), "/a/b");
         #[cfg(unix)]
         assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
+    }
+
+    #[test]
+    fn list_help_lists_real_bindings_and_preserves_the_view_and_draft() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("synthetic draft");
+        app.input.prepare_selection(true);
+        app.input.left();
+        let cursor = app.input.cursor_byte();
+        let selection = app.input.selection();
+        app.session_idx = 2;
+        app.tool_idx = 3;
+        app.search_idx = 4;
+        app.proposal_idx = 5;
+        app.click_targets
+            .borrow_mut()
+            .push((Rect::new(0, 0, 8, 1), Click::View(View::Chat)));
+        for (view, title, expected) in [
+            (View::Sessions, "Sessions keys", "T  session tree"),
+            (
+                View::Tools,
+                "Tools keys",
+                "z/Z  fold selected group / unfold all",
+            ),
+            (View::Metrics, "Metrics keys", "f  forecast versus actual"),
+            (View::Proposals, "Proposals keys", "Enter  review"),
+            (View::Search, "Search keys", "Enter  open"),
+        ] {
+            app.view = view;
+            app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
+            let pager = app.pager.as_ref().unwrap();
+            assert_eq!(pager.title, title);
+            assert!(pager.lines.iter().any(|line| line == expected));
+            for hint in keys::table(view) {
+                assert!(pager
+                    .lines
+                    .contains(&format!("{}  {}", hint.keys, hint.action)));
+            }
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.selecting_draft = true;
+            app.mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(!app.selecting_draft);
+            assert_eq!(app.view, view);
+            app.key(key(KeyCode::Char('?')));
+            assert_eq!(app.pager.as_ref().unwrap().title, title);
+            app.key(key(if view == View::Sessions {
+                KeyCode::Char('q')
+            } else {
+                KeyCode::Esc
+            }));
+            assert!(app.pager.is_none());
+            assert_eq!(app.view, view);
+            assert_eq!(
+                (
+                    app.session_idx,
+                    app.tool_idx,
+                    app.search_idx,
+                    app.proposal_idx
+                ),
+                (2, 3, 4, 5)
+            );
+            assert_eq!(app.current.as_deref(), Some("s1"));
+            assert_eq!(app.input, "synthetic draft");
+            assert_eq!(app.input.cursor_byte(), cursor);
+            assert_eq!(app.input.selection(), selection);
+        }
+        assert!(sent.try_recv().is_err(), "context help sends no requests");
+    }
+
+    #[test]
+    fn list_help_respects_filters_and_existing_overlay_keys() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            app.key(key(KeyCode::Char('/')));
+            app.key(key(KeyCode::Char('?')));
+            let filter = match view {
+                View::Sessions => &app.session_filter,
+                View::Tools => &app.tool_filter,
+                _ => &app.proposal_filter,
+            };
+            assert_eq!(filter.query, "?");
+            assert!(filter.editing && app.pager.is_none());
+            app.key(key(KeyCode::Esc));
+        }
+        let (tx, rx) = mpsc::channel();
+        app.inbox = Some(rx);
+        app.reviewing = Some("awaiting-proposal".into());
+        app.request(
+            Pending::ProposalDiff,
+            Request::ProposalDiff {
+                id: "awaiting-proposal".into(),
+            },
+        );
+        let diff: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_none());
+        assert_eq!(app.reviewing.as_deref(), Some("awaiting-proposal"));
+
+        tx.send(ServerMessage::err(diff.id, "synthetic diff failure".into()))
+            .unwrap();
+        app.drain_daemon();
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.pager.is_some() && app.reviewing.is_none());
+        app.key(key(KeyCode::Char('a')));
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.pager.is_some());
+        app.key(key(KeyCode::Esc));
+
+        app.view = View::Sessions;
+        app.delete_arm = Some("s1".into());
+        app.key(key(KeyCode::Char('?')));
+        assert!(app.delete_arm.is_none() && app.pager.is_none());
+        assert_eq!(app.notes.last().unwrap(), "delete cancelled");
+
+        app.on_event(reconnect_approval("fixture", "s1"));
+        let explanation = app.approval_explain;
+        app.key(key(KeyCode::Char('?')));
+        assert_ne!(app.approval_explain, explanation);
+        assert!(app.pager.is_none());
+        assert_eq!(app.approvals.len(), 1);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn list_help_marker_survives_a_busy_narrow_status_row() {
+        let mut app = test_app();
+        app.view = View::Tools;
+        app.model_label.clear();
+        let screen = render(&mut app, 40, 16);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("Enter detail") && footer.contains("? more"),
+            "{footer}"
+        );
+
+        app.model_label = "synthetic-model-label".repeat(5);
+        app.context_fill.insert("s1".into(), (70, 100));
+        for view in [
+            View::Sessions,
+            View::Tools,
+            View::Metrics,
+            View::Proposals,
+            View::Search,
+        ] {
+            app.view = view;
+            for width in [40, 60, 80] {
+                let screen = render(&mut app, width, 16);
+                let footer = screen.lines().last().unwrap();
+                assert!(
+                    footer.contains("? more") && footer.contains("ctx 70%"),
+                    "{view:?} {width}: {footer}"
+                );
+            }
+        }
+    }
+
+    fn send_fixture_search(app: &mut App, sent: &mpsc::Receiver<String>, query: &str) -> u64 {
+        app.slash("search");
+        app.input.set(query);
+        app.submit_chat(false);
+        let envelope: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            envelope.request,
+            Request::SearchSessions { query: text, limit: Some(50) } if text == query
+        ));
+        envelope.id
+    }
+
+    fn fixture_search_hit(seq: i64) -> SearchHit {
+        SearchHit {
+            session_id: "synthetic".into(),
+            session_name: "Fixture".into(),
+            message_id: format!("m{seq}"),
+            seq,
+            role: "user".into(),
+            snippet: "capped fixture text".into(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn search_results_follow_the_matching_reply_and_preserve_daemon_order() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let first = send_fixture_search(&mut app, &sent, "first query");
+        let second = send_fixture_search(&mut app, &sent, "second query");
+        branch_summary_reply(&tx, second, serde_json::json!([]));
+        branch_summary_reply(&tx, first, serde_json::json!([fixture_search_hit(93)]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Search);
+        assert!(app.search_hits.is_empty());
+        let screen = render(&mut app, 85, 18);
+        assert!(screen.contains("No hits for “second query”"), "{screen}");
+        assert!(!screen.contains("first query"), "{screen}");
+        assert!(!screen.contains("more may exist"), "{screen}");
+
+        for count in [2, 50] {
+            app.key(key(KeyCode::Esc));
+            let current = send_fixture_search(&mut app, &sent, "capped fixture");
+            assert_eq!(app.search_context.as_ref().unwrap().limit, 50);
+            let hits: Vec<_> = (0..count).rev().map(fixture_search_hit).collect();
+            branch_summary_reply(&tx, current, serde_json::to_value(&hits).unwrap());
+            app.drain_daemon();
+            assert_eq!(app.view, View::Search);
+            assert_eq!(app.search_hits, hits);
+            assert_eq!(app.search_idx, 0);
+            let screen = render(&mut app, 85, 18);
+            assert!(
+                screen.contains(&format!("Search ({count} hits)")),
+                "{screen}"
+            );
+            assert_eq!(screen.contains("more may exist"), count == 50, "{screen}");
+            assert!(screen.contains("capped fixture"), "{screen}");
+            render(&mut app, 14, 9);
+        }
+
+        app.key(key(KeyCode::Esc));
+        let malformed = send_fixture_search(&mut app, &sent, "malformed");
+        branch_summary_reply(&tx, malformed, serde_json::json!({"query":"wrong shape"}));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert_eq!(app.search_context.as_ref().unwrap().query, "capped fixture");
+        assert_eq!(app.search_hits.len(), 50);
+    }
+
+    #[test]
+    fn search_replies_and_timeouts_do_not_interrupt_newer_views_or_sessions() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+
+        let requests: Vec<_> = ["before move", "stale error", "stale timeout"]
+            .into_iter()
+            .map(|query| send_fixture_search(&mut app, &sent, query))
+            .collect();
+        app.open_view(View::Sessions);
+        let list: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(list.request, Request::ListSessions));
+        branch_summary_reply(&tx, list.id, serde_json::json!([]));
+        app.open_view(View::Chat);
+        app.pending_since.insert(
+            requests[2],
+            Instant::now() - REQUEST_DEADLINE - Duration::from_secs(1),
+        );
+        let notes_before = app.notes.clone();
+        branch_summary_reply(&tx, requests[0], serde_json::json!([]));
+        tx.send(ServerMessage::Response {
+            id: requests[1],
+            ok: false,
+            result: None,
+            error: Some("obsolete fixture error".into()),
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.notes, notes_before);
+
+        let before_suggestion = send_fixture_search(&mut app, &sent, "before suggestion");
+        app.slash("rename auto");
+        let suggest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(suggest.request, Request::SuggestSessionName { id } if id == "s1"));
+        branch_summary_reply(&tx, before_suggestion, serde_json::json!([]));
+        branch_summary_reply(
+            &tx,
+            suggest.id,
+            serde_json::json!({"name":"Synthetic suggestion"}),
+        );
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(render(&mut app, 85, 18).contains("Synthetic suggestion"));
+        assert!(app.search_context.is_none());
+        app.key(key(KeyCode::Esc));
+
+        let before_switch = send_fixture_search(&mut app, &sent, "before switch");
+        app.switch_session("other".into());
+        app.switch_session("s1".into());
+        branch_summary_reply(&tx, before_switch, serde_json::json!([]));
+        app.drain_daemon();
+        assert_eq!(app.view, View::Chat);
+        assert!(app.search_context.is_none());
+        assert_eq!(app.current.as_deref(), Some("s1"));
     }
 
     fn branch_summary_test_app() -> (
@@ -32426,7 +33105,15 @@ mod tests {
         app.color = true;
         let call = ("call".into(), "edit_file".into(), "{}".into());
         let diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
-        let result = serde_json::json!({"diff":diff}).to_string();
+        let result = MessageInfo {
+            id: "result".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "tool".into(),
+            content: serde_json::json!({"diff":diff}).to_string(),
+            created_at: String::new(),
+            meta: Some(serde_json::json!({"is_error":false}).to_string()),
+        };
         let rows = tool_call_block(&app, &call, Some(&result));
         let text = rows
             .iter()
@@ -32445,7 +33132,12 @@ mod tests {
                 .unwrap();
             assert!(span.style.add_modifier.contains(Modifier::BOLD));
         }
-        let failed = tool_call_block(&app, &call, Some("error: private fixture"));
+        let failed_result = MessageInfo {
+            content: "private fixture".into(),
+            meta: Some(serde_json::json!({"is_error":true}).to_string()),
+            ..result.clone()
+        };
+        let failed = tool_call_block(&app, &call, Some(&failed_result));
         assert!(failed[0].to_string().contains("fail ✗"));
         app.color = false;
         let plain = tool_call_block(&app, &call, Some(&result));
@@ -32458,6 +33150,90 @@ mod tests {
             text
         );
     }
+
+    #[test]
+    fn stored_tool_outcomes_drive_grouped_and_standalone_results() {
+        use serde_json::json;
+
+        let _theme = theme::test_theme("colorblind");
+        let mut app = test_app();
+        app.color = true;
+        app.expanded_calls.insert("call".into());
+        let assistant = MessageInfo {
+            id: "assistant".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "assistant".into(),
+            content: String::new(),
+            created_at: String::new(),
+            meta: Some(
+                json!({"tool_calls":[
+                    {"id":"call","function":{"name":"fixture_tool","arguments":"{}"}}
+                ]})
+                .to_string(),
+            ),
+        };
+        for (content, flag, failed) in [
+            ("validation rejected", Some(json!(true)), true),
+            (
+                "Error is the title of the report",
+                Some(json!(false)),
+                false,
+            ),
+            (r#"{"body":{"ok":false}}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(false)), false),
+            (r#"{"ok":false}"#, Some(json!(null)), false),
+            (r#" { "ok" : false } "#, None, true),
+            (r#"{"body":{"ok":false}}"#, None, false),
+            ("  ERROR: legacy failure", None, true),
+        ] {
+            let mut meta = json!({"tool_call_id":"call"});
+            if let Some(flag) = flag {
+                meta["is_error"] = flag;
+            }
+            let grouped = MessageInfo {
+                id: "grouped".into(),
+                seq: 2,
+                role: "tool".into(),
+                content: content.into(),
+                meta: Some(meta.to_string()),
+                ..assistant.clone()
+            };
+            meta["tool_call_id"] = json!("orphan");
+            let orphan = MessageInfo {
+                id: "orphan".into(),
+                seq: 3,
+                meta: Some(meta.to_string()),
+                ..grouped.clone()
+            };
+            app.messages = vec![assistant.clone(), grouped, orphan];
+
+            let chat = chat_lines(&app, 100, 40);
+            let header = chat.lines[chat.call_lines[0].0].to_string();
+            assert!(
+                header.contains(if failed { "fail ✗" } else { "ok ✓" }),
+                "{content} {meta}: {header}"
+            );
+            let heading = if failed { "    error" } else { "    result" };
+            assert!(
+                chat.lines.iter().any(|line| line.to_string() == heading),
+                "{content} {meta}: missing expanded {heading} label"
+            );
+            let arrow = chat
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content == "  ↳ ")
+                .unwrap();
+            let style = if failed {
+                bold_fg(true, Color::Red)
+            } else {
+                fg(true, Color::Yellow)
+            };
+            assert_eq!(arrow.style, style, "{content} {meta}");
+        }
+    }
+
     #[test]
     fn colorblind_approval_broad_warning_keeps_identity_and_keys_without_color() {
         let _theme = theme::test_theme("colorblind");
