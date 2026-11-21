@@ -2853,8 +2853,17 @@ fn upgrade_command() -> &'static str {
     upgrade_command_for_exe(&exe)
 }
 
+fn is_homebrew_executable(exe: &str) -> bool {
+    let resolved = std::fs::canonicalize(exe).ok();
+    let exe = resolved
+        .as_deref()
+        .map(std::path::Path::to_string_lossy)
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(exe));
+    exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/")
+}
+
 fn upgrade_command_for_exe(exe: &str) -> &'static str {
-    if exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/") {
+    if is_homebrew_executable(exe) {
         "brew upgrade formless"
     } else if exe.contains("/.cargo/bin/") {
         "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
@@ -9114,6 +9123,20 @@ fn tool_run_exit(v: &serde_json::Value, text: &str) -> i32 {
     }
 }
 
+fn package_uninstall_command(exe: &str) -> Option<&'static str> {
+    if is_homebrew_executable(exe) {
+        Some("brew uninstall formless")
+    } else if exe.starts_with("/usr/bin/") {
+        Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
+    } else if exe.contains("WinGet") {
+        Some("winget uninstall --id athiwatc.formless --exact")
+    } else if exe.contains("/.cargo/bin/") || exe.contains("\\.cargo\\bin\\") {
+        Some("cargo uninstall formless-bin")
+    } else {
+        None
+    }
+}
+
 /// `formless uninstall` (SPEC §15): every profile's daemon, login service
 /// and secrets, then its folders (unless --keep-data), then the binary
 /// (unless --keep-binary or a package manager owns it).
@@ -9122,20 +9145,9 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     let profiles = paths.list_profiles();
     let exe = std::env::current_exe().ok();
     // A package manager's binary is removed with the package manager.
-    let managed = exe.as_ref().and_then(|e| {
-        let s = e.to_string_lossy();
-        if s.contains("/Cellar/") || s.contains("/homebrew/") {
-            Some("brew uninstall formless")
-        } else if s.starts_with("/usr/bin/") {
-            Some("your package manager (apt remove formless / dnf remove formless / pacman -R formless-bin)")
-        } else if s.contains("WinGet") {
-            Some("winget uninstall formless")
-        } else if s.contains("/.cargo/bin/") || s.contains("\\.cargo\\bin\\") {
-            Some("cargo uninstall formless-bin")
-        } else {
-            None
-        }
-    });
+    let managed = exe
+        .as_ref()
+        .and_then(|exe| package_uninstall_command(&exe.to_string_lossy()));
     println!("This removes Formless from this machine:");
     for p in &profiles {
         println!(
@@ -10244,6 +10256,68 @@ mod tests {
         );
         let readme = include_str!("../../../README.md");
         assert!(readme.contains(&format!("`{install}`")));
+    }
+
+    #[test]
+    fn uninstall_uses_the_package_manager_for_winget_and_homebrew() {
+        for exe in [
+            "/home/linuxbrew/.linuxbrew/bin/formless",
+            "/opt/homebrew/bin/formless",
+            "/usr/local/Cellar/formless/1.0/bin/formless",
+        ] {
+            assert_eq!(
+                super::package_uninstall_command(exe),
+                Some("brew uninstall formless")
+            );
+            assert_eq!(super::upgrade_command_for_exe(exe), "brew upgrade formless");
+        }
+        assert_eq!(
+            super::package_uninstall_command(
+                r"C:\Users\example\AppData\Local\Microsoft\WinGet\Packages\athiwatc.formless\formless.exe"
+            ),
+            Some("winget uninstall --id athiwatc.formless --exact")
+        );
+        assert_eq!(super::package_uninstall_command("/tmp/formless"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_intel_homebrew_binary_uses_brew_for_update_and_uninstall() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("formless-brew-{}-{stamp}", std::process::id()));
+        let prefix = root.join("usr/local");
+        let bin = prefix.join("bin");
+        let keg = prefix.join("Cellar/formless/0.2.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::write(keg.join("formless"), b"fixture").unwrap();
+        let exe = bin.join("formless");
+        std::os::unix::fs::symlink("../Cellar/formless/0.2.0/bin/formless", &exe).unwrap();
+
+        assert_eq!(
+            super::upgrade_command_for_exe(exe.to_str().unwrap()),
+            "brew upgrade formless"
+        );
+        assert_eq!(
+            super::package_uninstall_command(exe.to_str().unwrap()),
+            Some("brew uninstall formless")
+        );
+        assert_eq!(
+            std::fs::read_link(&exe).unwrap(),
+            std::path::PathBuf::from("../Cellar/formless/0.2.0/bin/formless")
+        );
+        let ordinary = root.join(".local/bin/formless");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, b"unmanaged fixture").unwrap();
+        assert_eq!(
+            super::package_uninstall_command(ordinary.to_str().unwrap()),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Root presentation order is deliberate (#1609), independently of inventory.
