@@ -12,6 +12,48 @@ pub(super) struct PendingPermission {
 
 pub(super) type AlwaysPermissions = Arc<StdMutex<HashMap<String, HarnessPermissionOptionKind>>>;
 
+fn rule_eligible(kind: &str) -> bool {
+    !matches!(kind, "trust_workspace")
+}
+
+pub(super) fn permission_glob(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<_> = pattern.chars().collect();
+    let value: Vec<_> = value.chars().collect();
+    let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if let Some(previous) = star {
+            retry += 1;
+            v = retry;
+            p = previous + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn permission_option_ids(request: &HarnessPermissionRequest) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    if request
+        .options
+        .iter()
+        .any(|option| option.option_id.is_empty() || !ids.insert(&option.option_id))
+    {
+        bail!("permission option IDs must be unique and nonempty");
+    }
+    Ok(())
+}
+
 struct Handler {
     daemon: Arc<Daemon>,
     attempt_id: String,
@@ -34,8 +76,18 @@ impl InteractionHandler for Handler {
                 .daemon
                 .with_reader(|st| st.authenticate_topic_attempt(&self.attempt_id, &self.token))
                 .ok()?;
+            permission_option_ids(&request).ok()?;
+            if let Some(answer) = self
+                .daemon
+                .apply_topic_permission_rule(&attempt, &self.token, &request)
+                .ok()?
+            {
+                return Some(answer);
+            }
             let key = json!([request.kind, request.title, request.raw_input]).to_string();
-            let cached = self.always.locked().get(&key).copied();
+            let cached = rule_eligible(&request.kind)
+                .then(|| self.always.locked().get(&key).copied())
+                .flatten();
             if let Some(kind) = cached {
                 let allow = kind == HarnessPermissionOptionKind::AllowAlways;
                 return request
@@ -57,6 +109,7 @@ impl InteractionHandler for Handler {
                     })
                     .map(|option| option.option_id.clone());
             }
+            let eligible = rule_eligible(&request.kind);
             let options = request.options.clone();
             let answer = self
                 .daemon
@@ -69,11 +122,12 @@ impl InteractionHandler for Handler {
                 .and_then(|id| options.iter().find(|option| &option.option_id == id))
                 .map(|option| option.kind)
                 .filter(|kind| {
-                    matches!(
-                        kind,
-                        HarnessPermissionOptionKind::AllowAlways
-                            | HarnessPermissionOptionKind::RejectAlways
-                    )
+                    eligible
+                        && matches!(
+                            kind,
+                            HarnessPermissionOptionKind::AllowAlways
+                                | HarnessPermissionOptionKind::RejectAlways
+                        )
                 })
             {
                 self.always.locked().insert(key, kind);
@@ -193,6 +247,118 @@ impl Drop for Lease {
 }
 
 impl Daemon {
+    fn apply_topic_permission_rule(
+        &self,
+        attempt: &TopicAttemptInfo,
+        token: &str,
+        request: &HarnessPermissionRequest,
+    ) -> Result<Option<String>> {
+        if !rule_eligible(&request.kind) {
+            return Ok(None);
+        }
+        let decision = self.with_store(|st| {
+            st.transaction(|st| {
+                st.authenticate_topic_attempt(&attempt.id, token)?;
+                let topic = st.get_topic(&attempt.topic_id)?.context("topic vanished")?;
+                let mut matches = topic.permission_rules.iter().filter(|rule| {
+                    rule.harness.is_none_or(|kind| kind == attempt.harness)
+                        && rule
+                            .acp_agent
+                            .as_ref()
+                            .is_none_or(|agent| Some(agent) == attempt.acp_agent.as_ref())
+                        && rule.kind.as_ref().is_none_or(|kind| kind == &request.kind)
+                        && (permission_glob(&rule.pattern, &request.title)
+                            || request
+                                .raw_input
+                                .as_ref()
+                                .and_then(|raw| raw.get("command"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|command| permission_glob(&rule.pattern, command)))
+                });
+                let first = matches.next();
+                let rule = first.and_then(|first| {
+                    if first.decision == formless_protocol::TopicRuleDecision::Reject {
+                        Some(first)
+                    } else {
+                        Some(
+                            matches
+                                .find(|rule| {
+                                    rule.decision == formless_protocol::TopicRuleDecision::Reject
+                                })
+                                .unwrap_or(first),
+                        )
+                    }
+                });
+                let Some(rule) = rule else { return Ok(None) };
+                let preferred = if rule.decision == formless_protocol::TopicRuleDecision::Reject {
+                    HarnessPermissionOptionKind::RejectOnce
+                } else {
+                    HarnessPermissionOptionKind::AllowOnce
+                };
+                let option = request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == preferred)
+                    .or_else(|| {
+                        request.options.iter().find(|option| {
+                            matches!(
+                                (preferred, option.kind),
+                                (
+                                    HarnessPermissionOptionKind::AllowOnce,
+                                    HarnessPermissionOptionKind::AllowAlways
+                                ) | (
+                                    HarnessPermissionOptionKind::RejectOnce,
+                                    HarnessPermissionOptionKind::RejectAlways
+                                )
+                            )
+                        })
+                    });
+                let Some(option) = option else {
+                    return Ok(None);
+                };
+                let permission_id = uuid::Uuid::new_v4().to_string();
+                let message = st.append_message(
+                    &attempt.conversation_session_id,
+                    "system-note",
+                    &format!(
+                        "Permission {permission_id}: option {} selected by rule:{}",
+                        option.option_id, rule.rule_id
+                    ),
+                )?;
+                Ok(Some((
+                    permission_id,
+                    rule.rule_id.clone(),
+                    option.option_id.clone(),
+                    message,
+                )))
+            })
+        })?;
+        let Some((permission_id, rule, option, message)) = decision else {
+            return Ok(None);
+        };
+        self.broadcast(Event::MessageAppended {
+            session_id: attempt.conversation_session_id.clone(),
+            message,
+        });
+        self.broadcast(Event::HarnessPermissionRequested {
+            permission_id: permission_id.clone(),
+            session_id: attempt.conversation_session_id.clone(),
+            topic_id: attempt.topic_id.clone(),
+            attempt_id: attempt.id.clone(),
+            harness: attempt.harness,
+            acp_agent: attempt.acp_agent.clone(),
+            title: request.title.clone(),
+            kind: request.kind.clone(),
+            raw_input: request.raw_input.clone(),
+            options: request.options.clone(),
+        });
+        self.broadcast(Event::HarnessPermissionClosed {
+            permission_id,
+            option_id: Some(option.clone()),
+            by: Some(format!("rule:{rule}")),
+        });
+        Ok(Some(option))
+    }
     pub(super) fn notify_topic_attention(
         &self,
         topic_id: Option<&str>,

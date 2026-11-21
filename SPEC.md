@@ -7156,3 +7156,18 @@ model run. Normal model-run completion with open work marks NeedsUser and
 appends a durable "send a message to continue" note; harnesses may continue,
 but no model follow-up is started automatically. Run interruption/error
 cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.

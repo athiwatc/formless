@@ -2132,10 +2132,37 @@ impl Daemon {
                 self.broadcast(Event::TopicChanged { topic_id });
                 Ok(serde_json::to_value(topic)?)
             }
-            Request::AddTopicPermissionRule { .. }
-            | Request::RemoveTopicPermissionRule { .. }
-            | Request::SetTopicLimits { .. }
-            | Request::ListHarnesses => {
+            Request::AddTopicPermissionRule {
+                topic_id,
+                harness,
+                acp_agent,
+                kind,
+                pattern,
+                decision,
+            } => {
+                let topic = self.with_store(|st| {
+                    st.add_topic_permission_rule(
+                        &topic_id,
+                        formless_protocol::TopicPermissionRule {
+                            rule_id: String::new(),
+                            harness,
+                            acp_agent,
+                            kind,
+                            pattern,
+                            decision,
+                        },
+                    )
+                })?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::RemoveTopicPermissionRule { topic_id, rule_id } => {
+                let topic =
+                    self.with_store(|st| st.remove_topic_permission_rule(&topic_id, &rule_id))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::SetTopicLimits { .. } | Request::ListHarnesses => {
                 bail!("topic control request is not implemented yet");
             }
             Request::CancelTopic { topic_id } => {
