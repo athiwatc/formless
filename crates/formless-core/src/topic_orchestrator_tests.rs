@@ -260,6 +260,16 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     .unwrap();
     assert_eq!(message.role, "user");
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
+    assert!(message
+        .content
+        .contains("Inputs are exact artifact references from any finalized output in this topic."));
+    assert!(message
+        .content
+        .contains("Combine inputs only when intended, in an isolated step."));
+    assert!(message
+        .content
+        .contains("Never push or modify the source workspace or its branch."));
+    assert!(!message.content.contains("selected feature's outputs"));
     let session = topic.topic_session_id.clone().unwrap();
     let wire = f
         .daemon()
