@@ -483,7 +483,9 @@ an empty listing just asks for one.
   providers test NAME --model M`) sends a short prompt and the probe tool
   call, and reports the time to the first token and to the end, whether
   the answer streamed, whether reasoning streamed, and whether tool calls
-  work (natively, or only through the prompt-based fallback). Results are
+  work (natively, or only through the prompt-based fallback). A test fails
+  when a comparable response model identifies a different model. The result
+  records the reported identity in `served_model`. Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
   pickers (`✓ tested` / `✗ test failed`; temporary failures name the manual
   retry action). Results include a backward-compatible `transient` flag for

@@ -149,6 +149,9 @@ pub fn rate_limits() -> HashMap<String, Value> {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ModelTest {
     pub model: String,
+    /// Model reported by the provider when it differs from the test target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
     pub ok: bool,
     /// A temporary transport/rate/server/deadline failure, eligible for a
     /// bounded background retry when the user already opted into auto tests.
@@ -1605,6 +1608,8 @@ impl Provider {
                 client.proxy(reqwest::Proxy::all(self.cfg.proxy.trim()).context("provider.proxy")?);
         }
         scoped.http = client.build()?;
+        // Streaming and prompt probes share the ordinary dispatch path.
+        // All physical sends in this scope stay on the requested model.
         scoped.cfg.fallback_models.clear();
         let prior = scoped.on_usage.clone();
         let observed = policy.clone();
@@ -2150,9 +2155,14 @@ impl Provider {
         model: &str,
         policy: crate::probe_policy::ProbePolicy,
     ) -> ModelTest {
+        let model = self.cfg.resolve_alias(model);
+        policy.verify_model(&model, &self.cfg.base_url);
         let started = std::time::Instant::now();
         let outcome = match self.scoped_probe(policy.clone()) {
-            Ok(scoped) => policy.run(scoped.test_model_inner(model)).await,
+            Ok(scoped) => {
+                let dispatch = scoped.resolved_dispatch(&model);
+                policy.run(dispatch.test_model_inner(&model, &policy)).await
+            }
             Err(error) => Err(error),
         };
         let mut result = outcome.unwrap_or_else(|error| ModelTest {
@@ -2166,10 +2176,33 @@ impl Provider {
         result.transient =
             model_test_failure_is_transient(&result, usage["deadline_exceeded"] == true);
         result.probe_usage = Some(usage);
+        if let Some(served) = policy.model_mismatch() {
+            result.ok = false;
+            result.transient = false;
+            result.first_token_ms = None;
+            result.streaming = false;
+            result.reasoning = false;
+            result.tool_calling = false;
+            result.prompt_fallback = false;
+            result.error = Some(format!(
+                "provider served model '{served}' during the test for '{model}'"
+            ));
+            result.served_model = Some(served);
+        }
         result
     }
 
-    async fn test_model_inner(&self, model: &str) -> ModelTest {
+    fn observe_probe_model(&self, response: &Value) {
+        if let Some(policy) = &self.probe_policy {
+            policy.observe_model(response);
+        }
+    }
+
+    async fn test_model_inner(
+        &self,
+        model: &str,
+        policy: &crate::probe_policy::ProbePolicy,
+    ) -> ModelTest {
         let mut t = ModelTest {
             model: model.to_string(),
             tested_at: chrono::Utc::now().to_rfc3339(),
@@ -2201,6 +2234,9 @@ impl Provider {
             t.error = Some(format!("{e:#}"));
             return t;
         }
+        if policy.model_mismatch().is_some() {
+            return t;
+        }
         t.first_token_ms = first;
         t.total_ms = Some(started.elapsed().as_millis() as u64);
         t.streaming = deltas > 1;
@@ -2219,6 +2255,9 @@ impl Provider {
             }
             r => r,
         };
+        if policy.model_mismatch().is_some() {
+            return t;
+        }
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
@@ -2678,6 +2717,7 @@ impl Provider {
             };
             dispatch.post_chat_served(&mut body, effort).await?
         };
+        self.observe_probe_model(&v);
         let mut usage = Usage::parse(&v["usage"]);
         if let Some(usage) = &mut usage {
             usage.cost_unknown = unknown_cost && usage.cost.is_none();
@@ -3415,6 +3455,7 @@ impl Provider {
                                 }
                                 pending.clear();
                                 if let Ok(v) = parsed {
+                                    self.observe_probe_model(&v);
                                     // Error/incomplete events can carry usage too. Observe
                                     // before branches that retry or return, not just success.
                                     usage = Usage::parse(&v["usage"])
@@ -3755,6 +3796,7 @@ impl Provider {
                 let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
                     return;
                 };
+                self.observe_probe_model(&v);
                 match f.event(&v) {
                     crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
                     crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
@@ -5043,6 +5085,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         }
         let (resp, _, _, permit) = p.post_provider(&mut b, None, false).await?;
         let v = completed_json(resp, permit, "parse probe response").await?;
+        p.observe_probe_model(&v);
         return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
     }
     let mut body = if p.cfg.responses() {
@@ -5070,6 +5113,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
     };
     let (resp, _, _, permit) = p.post_provider(&mut body, None, false).await?;
     let v = completed_json(resp, permit, "parse probe response").await?;
+    p.observe_probe_model(&v);
     if p.cfg.responses() {
         return Ok(!responses_tool_calls(&v).is_empty());
     }
