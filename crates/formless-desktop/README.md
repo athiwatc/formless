@@ -138,10 +138,23 @@ Batches, promotions, unsupported/mixed inventories and wider scopes retain
 their TUI handoff. The desktop never starts a daemon
 or reads its database, credentials or configuration files.
 
-The current protocol has no snapshot watermark or token offset. This client
-therefore subscribes with deltas disabled and refreshes canonical snapshots:
-completion text appears when the daemon persists it, rather than streaming
-token by token. Events invalidate snapshots; they are never replayed onto
+The current protocol has no snapshot watermark or token offset. Connected
+production clients request legacy deltas when the daemon advertises
+`subscribe_filter`. Assistant text and reasoning appear in a separate,
+explicitly provisional live preview, never appended to canonical history.
+Reasoning is labelled separately as a live preview; the daemon decides what reasoning it persists. The combined live text
+is limited to 1 MiB; each displayed tail is limited to 32 KiB / 400 lines.
+Updates coalesce at the existing 250 ms client refresh interval. Completion,
+persisted assistant messages, Run end and accepted canonical refreshes retire
+the preview. A refresh can leave a later live suffix rather than a reconstructed
+answer; the preview is labelled as text since the last refresh. Dropped deltas
+discard the preview and suppress the incomplete remainder until a completion,
+restart or new Run boundary. Stream restart discards both channels and permits
+the replacement stream. Both gaps and restarts refetch persisted history.
+Reconnect and Session switches discard provisional state. Older peers without
+the subscription capability retain canonical-only behavior.
+The validation-only future-attempt reader remains disabled and unchanged.
+Events invalidate snapshots; they are never replayed onto
 snapshot text. A relevant overlapping event schedules another read. Requests
 carry window selection generations, including A→B→A navigation. An unchanged
 snapshot leaves the reading anchor and open source viewer alone.
@@ -574,8 +587,9 @@ They do not enable streaming or discharge the missing snapshot cutoff contract.
 An unenabled [future-attempt protocol and admission model](../../docs/desktop/future-attempt-protocol-20261115.md)
 adds a conservative producer barrier, turn/attempt correlation and byte offsets.
 A [serialized reader and view adapter](../../docs/desktop/future-reader-20261115.md)
-now exist behind validation-only constructors. The production desktop remains
-canonical-only until independent review and full streaming acceptance pass.
+now exist behind validation-only constructors. That path remains disabled;
+production uses the separate provisional legacy-delta preview described above,
+not the future-attempt reader.
 
 The [minimum production streaming plan](../../docs/desktop/production-streaming-plan-20261115.md)
 records the required future-only recovery scope decision, implemented guarantees,

@@ -756,6 +756,7 @@ pub struct Shell {
     client_snapshot_ready: bool,
     client_generation: u64,
     client_status: String,
+    live_overlay: crate::live_overlay::View,
     client_attention: bool,
     client_questions: crate::questions::State,
     question_panel: Option<questions::Panel>,
@@ -1017,6 +1018,7 @@ impl Shell {
             client_snapshot_ready: false,
             client_generation: 0,
             client_status: String::new(),
+            live_overlay: Default::default(),
             client_attention: false,
             client_questions: crate::questions::State::default(),
             question_panel: None,
@@ -1906,6 +1908,7 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.live_overlay = Default::default();
         self.retire_stream_view(cx);
         self.stream_view_latest = None;
         self.retire_invocations(
@@ -2137,6 +2140,7 @@ impl Shell {
     }
 
     fn client_select(&mut self, cx: &mut Context<Self>) {
+        self.live_overlay = Default::default();
         self.session_usage
             .retire("Session changed. Read recorded usage explicitly for the open Session.");
         self.invalidate_forecast(cx);
@@ -2204,6 +2208,7 @@ impl Shell {
             return;
         }
         self.reading_notice = None;
+        self.live_overlay = Default::default();
         let state = if snapshot.running {
             RunState::Running
         } else if snapshot
@@ -2242,8 +2247,16 @@ impl Shell {
         }
         self.client_steerable_run_id = snapshot.steerable_run_id.take();
         if !self.client_snapshot_ready {
-            self.client_status =
-                "Connected · canonical messages · live token streaming unavailable".into();
+            self.client_status = if self
+                .client
+                .as_ref()
+                .is_some_and(Client::future_attempt_validation)
+            {
+                "Connected · canonical messages · live token streaming unavailable"
+            } else {
+                "Connected · canonical history refreshed"
+            }
+            .into();
         }
         self.client_snapshot_ready = true;
         let prefix = self
@@ -2310,6 +2323,26 @@ impl Shell {
                 connection,
                 revision,
             } => self.approval_invalidated(client, connection, revision, cx),
+            ClientUpdate::LiveOverlay {
+                client,
+                connection,
+                generation,
+                session_id,
+                view,
+            } => {
+                if self.client_connected
+                    && generation == self.client_generation
+                    && self.sidebar.active_id() == Some(session_id.as_str())
+                    && self.client.as_ref().is_some_and(|current| {
+                        current.is_ready()
+                            && current.instance() == client
+                            && current.connection() == connection
+                    })
+                {
+                    self.live_overlay = view;
+                    cx.notify();
+                }
+            }
             ClientUpdate::Transcript(batch) => self.apply_stream_batch(batch, window, cx),
             ClientUpdate::Connection { ready, notice } => {
                 self.client_connected = ready;
@@ -2318,6 +2351,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.live_overlay = Default::default();
                     self.client_steps = Default::default();
                     self.client_step_mode = None;
                     self.retire_stream_view(cx);
@@ -2733,6 +2767,7 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
+        self.live_overlay = Default::default();
         self.stream_view_owner = None;
         self.reading_notice = None;
         self.invalidate_source_view();
@@ -4609,6 +4644,29 @@ impl Shell {
                     .when(reflowed, |area| area.child(self.wheel_to_page(cx)))
                     .child(timeline),
             )
+            .when(self.live_overlay.visible(), |region| {
+                region.child(
+                    v_flex()
+                        .id("production-live-overlay")
+                        .test_support()
+                        .w_full()
+                        .min_h_0()
+                        .max_h(self.scaled(200.))
+                        .overflow_y_scroll()
+                        .px_2()
+                        .gap_1()
+                        .child(readable("live-overlay-label", "Live preview · provisional since last refresh").text_xs())
+                        .when(self.live_overlay.unavailable, |view| view.child(readable("live-overlay-unavailable", "Live preview unavailable after skipped updates or size limit; reloading persisted history.").text_sm()))
+                        .when(!self.live_overlay.reasoning.is_empty(), |view| view.child(
+                            v_flex().text_color(cx.theme().muted_foreground)
+                                .child(readable("live-reasoning-label", "Reasoning (live preview)").text_xs())
+                                .child(readable("live-reasoning", crate::live_overlay::View::preview(&self.live_overlay.reasoning).to_owned()).text_sm())
+                        ))
+                        .when(!self.live_overlay.answer.is_empty(), |view| view.child(
+                            readable("live-assistant", crate::live_overlay::View::preview(&self.live_overlay.answer).to_owned()).text_sm()
+                        ))
+                )
+            })
             .when(!reflowed, |region| {
                 region.child(self.render_composer(false, cx))
             })

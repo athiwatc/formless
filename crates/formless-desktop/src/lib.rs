@@ -12,6 +12,7 @@ pub mod directory;
 pub mod fixture;
 pub mod forecast;
 pub mod full_view;
+pub mod live_overlay;
 pub mod memory;
 pub mod model;
 pub mod pages;

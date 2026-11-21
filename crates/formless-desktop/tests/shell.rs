@@ -10,6 +10,9 @@
 //! Anything that depends on those is measured in `tests/render.rs`, which
 //! runs on the platform text system.
 
+#[path = "support/production_overlay.rs"]
+mod production_overlay_tests;
+
 use std::time::{Duration, Instant};
 
 #[path = "support/archive.rs"]
