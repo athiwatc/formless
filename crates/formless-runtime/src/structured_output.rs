@@ -17,6 +17,86 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_OUTPUT_NODES: usize = 16 * 1024;
 pub const MAX_OUTPUT_DEPTH: usize = 64;
 const MAX_REFERENCE_DEPTH: usize = 64;
+const MAX_DIAGNOSTIC_SEGMENTS: usize = 12;
+
+/// Value-free facts from one failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationSummary {
+    keyword: &'static str,
+    location: String,
+}
+
+impl ValidationSummary {
+    fn from_error(error: &jsonschema::ValidationError<'_>, value: &Value) -> Self {
+        const SAFE_KEYWORDS: &[&str] = &[
+            "additionalItems",
+            "additionalProperties",
+            "anyOf",
+            "const",
+            "contains",
+            "contentEncoding",
+            "contentMediaType",
+            "enum",
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "falseSchema",
+            "format",
+            "maxItems",
+            "maxLength",
+            "maxProperties",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minProperties",
+            "minimum",
+            "multipleOf",
+            "not",
+            "oneOf",
+            "pattern",
+            "propertyNames",
+            "required",
+            "type",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+            "uniqueItems",
+        ];
+        let reported = error.kind().keyword();
+        let keyword = SAFE_KEYWORDS
+            .iter()
+            .copied()
+            .find(|&key| key == reported)
+            .unwrap_or("constraint");
+        let mut location = String::from("$");
+        let mut current = Some(value);
+        for (depth, segment) in error
+            .instance_path()
+            .as_str()
+            .split('/')
+            .skip(1)
+            .enumerate()
+        {
+            if depth == MAX_DIAGNOSTIC_SEGMENTS {
+                location.push_str("/…");
+                break;
+            }
+            // JSON Pointer uses the same spelling for an array index and a
+            // numeric property name. Only reveal indices into actual arrays.
+            if let Some(index) = current.and_then(Value::as_array).and_then(|array| {
+                segment
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&index| index < array.len())
+            }) {
+                use fmt::Write as _;
+                let _ = write!(location, "/{index}");
+            } else {
+                location.push_str("/[property]");
+            }
+            current = current.and_then(|value| value.pointer(&format!("/{segment}")));
+        }
+        Self { keyword, location }
+    }
+}
 
 /// A call-local option, independent of probe limits and request hooks.
 #[derive(Clone, Default)]
@@ -83,7 +163,9 @@ pub enum StructuredOutputError {
         line: usize,
         column: usize,
     },
-    SchemaViolation,
+    SchemaViolation {
+        summary: Option<ValidationSummary>,
+    },
     IncompleteResponse(IncompleteReason),
     RefusedResponse,
 }
@@ -106,8 +188,12 @@ impl fmt::Display for StructuredOutputError {
             Self::OutputLimit(limit) => write!(f, "structured output exceeds {limit} limit"),
             Self::InvalidJson { category, line, column } => write!(f,
                 "structured output is not one complete JSON value (parser: {category}, line {line}, column {column})"),
-            Self::SchemaViolation => {
-                f.write_str("structured output does not satisfy its JSON Schema")
+            Self::SchemaViolation { summary } => {
+                f.write_str("structured output does not satisfy its JSON Schema")?;
+                if let Some(summary) = summary {
+                    write!(f, " ({} at {})", summary.keyword, summary.location)?;
+                }
+                Ok(())
             }
         }
     }
@@ -181,8 +267,10 @@ impl JsonOutputSchema {
         let value = serde_json::from_str(text).map_err(StructuredOutputError::invalid_json)?;
         measure(&value, MAX_OUTPUT_NODES, MAX_OUTPUT_DEPTH, MAX_OUTPUT_BYTES)
             .map_err(StructuredOutputError::OutputLimit)?;
-        if self.validator.validate(&value).is_err() {
-            return Err(StructuredOutputError::SchemaViolation);
+        if let Err(error) = self.validator.validate(&value) {
+            return Err(StructuredOutputError::SchemaViolation {
+                summary: Some(ValidationSummary::from_error(&error, &value)),
+            });
         }
         Ok(value)
     }
@@ -449,10 +537,10 @@ mod tests {
                 .unwrap(),
             json!({"n":2,"s":"ok"})
         );
-        assert_eq!(
+        assert!(matches!(
             schema.parse_and_validate(r#"{"n":1,"s":"ok"}"#),
-            Err(StructuredOutputError::SchemaViolation)
-        );
+            Err(StructuredOutputError::SchemaViolation { summary: Some(_) })
+        ));
         for invalid in [
             "```json\n{\"n\":2,\"s\":\"ok\"}\n```",
             "prefix {}",
@@ -465,10 +553,10 @@ mod tests {
                 Err(StructuredOutputError::InvalidJson { .. })
             ));
         }
-        assert_eq!(
+        assert!(matches!(
             schema.parse_and_validate(r#""{\"n\":2,\"s\":\"ok\"}""#),
-            Err(StructuredOutputError::SchemaViolation)
-        );
+            Err(StructuredOutputError::SchemaViolation { summary: Some(_) })
+        ));
     }
 
     #[test]
@@ -693,12 +781,75 @@ mod tests {
         let error = integer
             .parse_and_validate(&json!(secret).to_string())
             .unwrap_err();
-        assert_eq!(error, StructuredOutputError::SchemaViolation);
+        assert!(matches!(
+            error,
+            StructuredOutputError::SchemaViolation { summary: Some(_) }
+        ));
         assert!(!error.to_string().contains(secret));
         assert!(JsonOutputSchema::compile(json!(false))
             .unwrap()
             .parse_and_validate("null")
             .is_err());
+    }
+
+    #[test]
+    fn schema_diagnostics_report_safe_keywords_and_only_actual_array_indices() {
+        let key = "private/key~ไทย\u{001b}\n";
+        let numeric_key = "9136";
+        let cases = [
+            (json!({"required":[key]}), json!({}), "required at $"),
+            (
+                json!({"additionalProperties":{"items":{"additionalProperties":{"type":"integer"}}}}),
+                json!({key:[{numeric_key:"private-output-sentinel"}]}),
+                "type at $/[property]/0/[property]",
+            ),
+            (
+                json!({"properties":{"known":{"type":"string"}},"additionalProperties":false}),
+                json!({key:"private-output-sentinel"}),
+                "additionalProperties at $",
+            ),
+            (
+                json!({"pattern":"^private-schema-pattern$"}),
+                json!("private-output-sentinel"),
+                "pattern at $",
+            ),
+            (
+                json!({"enum":["private-schema-enum"]}),
+                json!("private-output-sentinel"),
+                "enum at $",
+            ),
+        ];
+        for (schema, input, expected) in cases {
+            let error = JsonOutputSchema::compile(schema)
+                .unwrap()
+                .parse_and_validate(&input.to_string())
+                .unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.ends_with(&format!("({expected})")),
+                "{diagnostic}"
+            );
+            for hidden in [key, numeric_key, "private-", "ไทย"] {
+                assert!(!diagnostic.contains(hidden), "{diagnostic}");
+            }
+            assert!(!diagnostic.chars().any(char::is_control));
+        }
+        let mut schema = json!({"type":"integer"});
+        let mut value = json!("private-output-sentinel");
+        for _ in 0..MAX_DIAGNOSTIC_SEGMENTS + 5 {
+            schema = json!({"additionalProperties":schema});
+            value = json!({key:value});
+        }
+        let diagnostic = JsonOutputSchema::compile(schema)
+            .unwrap()
+            .parse_and_validate(&value.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            diagnostic.ends_with("/…)") && diagnostic.len() < 240,
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("private"));
     }
 
     #[test]
