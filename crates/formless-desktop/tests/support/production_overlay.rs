@@ -12,6 +12,23 @@ fn production_preview_is_distinct_owned_and_replaced_by_canonical_history(cx: &m
         let (client, connection) = shell.read(cx).client_identity().unwrap();
         let generation = shell.read(cx).client_generation();
         let session_id = sessions[0].id.clone();
+        let snapshot = replies::session_snapshot(
+            &session_id,
+            &serde_json::json!({
+                "session":{"id":session_id},"running":true,"messages":[]
+            }),
+        )
+        .unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot,
+                },
+                window,
+                cx,
+            )
+        });
         let view = View {
             answer: "Live answer".into(),
             reasoning: "Private reasoning".into(),
@@ -52,6 +69,24 @@ fn production_preview_is_distinct_owned_and_replaced_by_canonical_history(cx: &m
         window.render_frame(cx);
         assert_eq!(window.find("live-assistant").value(), Some("Live answer"));
         assert!(window.find("production-live-overlay").bounds().size.height > px(0.));
+        shell.update(cx, |shell, cx| {
+            shell.run_command(
+                Command::RunAction(formless_desktop::run_actions::Kind::Cwd),
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("run-action-dialog").is_some());
+        assert_eq!(window.find("live-assistant").value(), Some("Live answer"));
+        assert_eq!(
+            window.find("live-reasoning").value(),
+            Some("Private reasoning")
+        );
+        window.click("run-action-close", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("run-action-dialog").is_none());
+        assert_eq!(window.find("live-assistant").value(), Some("Live answer"));
         let snapshot = replies::session_snapshot(
             &session_id,
             &serde_json::json!({

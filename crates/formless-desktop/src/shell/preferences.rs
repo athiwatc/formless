@@ -9,10 +9,25 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let settings = store.settings().clone();
+        let mut settings = store.settings().clone();
+        if !store.has_saved_settings() {
+            settings.dark = cx.theme().is_dark();
+        }
         self.preference_notice = Some(store.notice().to_string().into());
         self.preferences = Some(store);
         self.apply_preferences(settings, window, cx);
+    }
+
+    pub fn sync_system_appearance(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .preferences
+            .as_ref()
+            .is_some_and(Store::has_saved_settings)
+        {
+            return;
+        }
+        Theme::sync_system_appearance(Some(window), cx);
+        crate::theme::apply(cx);
     }
 
     pub fn view_preferences(&self, cx: &App) -> Settings {
