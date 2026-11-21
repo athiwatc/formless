@@ -2539,6 +2539,14 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                     group.is_none() || group == Some("day")
                 );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
+                assert_eq!(
+                    text.lines()
+                        .last()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    ["TOTAL", "10", "12", "3", "-", "22", "-"]
+                );
                 let cost = |key| {
                     text.lines()
                         .find(|line| line.starts_with(key))

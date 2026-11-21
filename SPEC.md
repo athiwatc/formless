@@ -4553,7 +4553,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached) per UTC day, or with `by` = "model",
+  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -6779,8 +6779,11 @@ the bounded recent Run list. Default/explicit day sends no group key and keeps
 the daemon's oldest-first day order; other groups keep its descending total-token
 order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
-the complete array and null costs. Cost is the daemon's current estimate, not a
+Human tables show cache writes, total tokens (prompt plus completion), and a
+final total row. Cached and cache-write tokens are included in prompt tokens.
+Unknown costs and unavailable cache-write counts display as `-`, including in
+totals that contain an unknown value. JSON preserves the complete row array,
+including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a
 billing guarantee. Session groups use the ID for attribution and display the
 current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail

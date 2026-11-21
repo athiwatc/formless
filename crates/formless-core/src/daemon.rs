@@ -3721,6 +3721,7 @@ impl Daemon {
                     prompt: i64,
                     completion: i64,
                     cached: i64,
+                    cache_write: i64,
                     cost: Option<f64>,
                 }
                 let mut out: Vec<UsageBucket> = Vec::new();
@@ -3732,6 +3733,7 @@ impl Daemon {
                             bucket.prompt += p;
                             bucket.completion += c;
                             bucket.cached += cached;
+                            bucket.cache_write += cw;
                             bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
                         None => out.push(UsageBucket {
@@ -3740,12 +3742,15 @@ impl Daemon {
                             prompt: p,
                             completion: c,
                             cached,
+                            cache_write: cw,
                             cost: price,
                         }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
+                    out.sort_by_key(|bucket| {
+                        std::cmp::Reverse(i128::from(bucket.prompt) + i128::from(bucket.completion))
+                    });
                 }
                 Ok(json!(out
                     .into_iter()
@@ -3753,7 +3758,8 @@ impl Daemon {
                         let mut row = json!({
                             "key": bucket.label.as_deref().unwrap_or(&bucket.key),
                             "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
-                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                            "cached_tokens": bucket.cached, "cache_write_tokens": bucket.cache_write,
+                            "cost": bucket.cost,
                         });
                         if bucket.label.is_some() {
                             row["session_id"] = json!(bucket.key);
