@@ -221,6 +221,21 @@ impl Store {
                 if current.role != "user" || hash_token(&current.content) != *snapshot {
                     bail!("selected source message {message_id} changed since proposal; create a new proposal to approve the edited request");
                 }
+                if let Some(meta) = &current.meta {
+                    let meta: Value = serde_json::from_str(meta)
+                        .context("selected source message has invalid attachment metadata")?;
+                    for attachment in meta["attachments"].as_array().into_iter().flatten() {
+                        if attachment["imported"] == true || attachment["reference"] == true || attachment["expired"] == true {
+                            continue;
+                        }
+                        for id in [attachment["id"].as_str(), attachment["_artifact_id"].as_str()].into_iter().flatten() {
+                            st.conn.execute(
+                                "UPDATE artifacts SET session_id=?2 WHERE id=?1 AND session_id=?3",
+                                params![id, session.id, topic.source_session_id],
+                            )?;
+                        }
+                    }
+                }
                 let changed = st.conn.execute(
                     "UPDATE messages SET session_id=?2,seq=?3 WHERE id=?1 AND session_id=?4",
                     params![message_id, session.id, seq as i64 + 1, topic.source_session_id],
