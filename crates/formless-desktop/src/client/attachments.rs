@@ -16,9 +16,8 @@ pub fn clipboard_bytes(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String), St
     ) {
         return Ok((bytes.to_vec(), mime.into()));
     }
-    let format = image::ImageFormat::from_mime_type(mime).ok_or_else(|| {
-        format!("Could not convert clipboard image to PNG: unsupported format {mime}")
-    })?;
+    let format = image::guess_format(bytes)
+        .map_err(|error| format!("Could not convert clipboard image to PNG: {error}"))?;
     let convert = || -> Result<Vec<u8>, image::ImageError> {
         let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = image::Limits::default();
@@ -366,6 +365,24 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_ico_aliases_are_detected_from_bytes_and_converted_to_png() {
+        let original = image::DynamicImage::new_rgba8(2, 2);
+        let mut encoded = Cursor::new(Vec::new());
+        original
+            .write_to(&mut encoded, image::ImageFormat::Ico)
+            .unwrap();
+        for mime in ["image/ico", "image/x-icon", "image/vnd.microsoft.icon"] {
+            let (png, mime) = clipboard_bytes(encoded.get_ref(), mime).unwrap();
+            assert_eq!(mime, "image/png");
+            assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+            assert_eq!(
+                image::load_from_memory(&png).unwrap().to_rgba8(),
+                original.to_rgba8()
+            );
+        }
+    }
 
     #[test]
     fn vision_clipboard_formats_preserve_every_encoded_byte() {
