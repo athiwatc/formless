@@ -5370,13 +5370,36 @@ impl Store {
         )? > 0)
     }
 
-    /// Keys under `prefix`, sorted (at most 1000).
+    pub fn kv_contains(&self, namespace: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_kv WHERE namespace=?1 AND key=?2)",
+            params![namespace, key],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Keys under the prefix, sorted (at most 1,000).
     pub fn kv_list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
-        let mut stmt = self.ps(
-            "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000",
-        )?;
+        self.kv_list_page(namespace, prefix, None)
+    }
+
+    pub(crate) fn kv_list_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let sql = if after.is_some() {
+            "SELECT key FROM tool_kv WHERE namespace=?1 AND key>?3 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000"
+        } else {
+            "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000"
+        };
+        let mut stmt = self.ps(sql)?;
         let rows = stmt
-            .query_map(params![namespace, prefix], |r| r.get(0))?
+            .query_map(
+                rusqlite::params_from_iter([namespace, prefix].into_iter().chain(after)),
+                |r| r.get(0),
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
