@@ -843,6 +843,11 @@
   // Installable app shell (SPEC §12): the page opens offline and says so.
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      if (event.data?.type === "formless-open-notification-session") {
+        openNotificationSession(event.data.session).catch(() => {});
+      }
+    });
   }
   window.addEventListener("offline", () => renderAll());
   window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
@@ -7267,12 +7272,46 @@
   function notifyMode() {
     return (S.settings && S.settings.tui && S.settings.tui.notify) || "desktop";
   }
-  function alertUser(title, body) {
-    if (!document.hidden || notifyMode() === "off") return;
+  async function openNotificationSession(session) {
+    if (typeof session !== "string" || !session) return;
+    if (!S.daemonOnline || (!S.local && !S.channel)) {
+      S.linkedSession = session;
+      return;
+    }
+    if (!S.sessions.some((item) => item.id === session)) await refreshSessions();
+    if (S.sessions.some((item) => item.id === session)) await openSession(session);
+    else note("That Session link points to a Session that no longer exists.", true);
+  }
+  async function showChatNotification(title, body, kind, session) {
+    const options = {
+      body, tag: "formless:" + encodeURIComponent(session || "") + ":" + kind,
+      renotify: true, data: { session },
+    };
+    try {
+      const registration = await navigator.serviceWorker?.getRegistration();
+      if (registration?.active) {
+        // The worker can identify the sending tab and use the mobile
+        // notification API even after this page is backgrounded.
+        registration.active.postMessage({ type: "formless-chat-notification", title, options });
+        return;
+      }
+    } catch (_) { /* The page API is available on some browsers without a worker. */ }
+    try {
+      const notification = new Notification(title, options);
+      notification.onclick = () => {
+        notification.close();
+        window.focus();
+        openNotificationSession(session).catch(() => {});
+      };
+    } catch (_) { /* Notifications are unavailable in this browser. */ }
+  }
+  function alertUser(title, body, kind, session) {
+    const mode = notifyMode();
+    if (!document.hidden || mode === "off") return;
     unseen++;
     document.title = "(" + unseen + ") " + baseTitle;
-    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "granted") {
-      try { new Notification(title, { body, tag: "formless" }); } catch (_) { /* some browsers need a service worker */ }
+    if (mode === "desktop" && "Notification" in window && Notification.permission === "granted") {
+      void showChatNotification(title, body, kind, session);
     }
   }
   document.addEventListener("visibilitychange", () => {
@@ -7295,15 +7334,15 @@
         const took = Date.now() - (runStarts.get(ev.session_id) || Date.now());
         runStarts.delete(ev.session_id);
         const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
-        if (took >= min * 1000 && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + recordedDuration(took));
+        if (took >= min * 1000 && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + recordedDuration(took), ev.type, ev.session_id);
         return;
       }
-      case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
-      case "provider_stalled": return alertUser("Run stalled", sessionName(ev.session_id) + ": no reply for " + ev.idle_secs + "s");
-      case "approval_requested": return alertUser("Approval needed", sessionName(ev.session_id) + ": " + (ev.tool_name || ""));
+      case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120), ev.type, ev.session_id);
+      case "provider_stalled": return alertUser("Run stalled", sessionName(ev.session_id) + ": no reply for " + ev.idle_secs + "s", ev.type, ev.session_id);
+      case "approval_requested": return alertUser("Approval needed", sessionName(ev.session_id) + ": " + (ev.tool_name || ""), ev.type, ev.session_id);
       case "user_question": {
         const q = (ev.questions && ev.questions[0] && ev.questions[0].question) || ev.question || "";
-        return alertUser("Question for you", sessionName(ev.session_id) + ": " + truncate(q, 120));
+        return alertUser("Question for you", sessionName(ev.session_id) + ": " + truncate(q, 120), ev.type, ev.session_id);
       }
     }
   }
