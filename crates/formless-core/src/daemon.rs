@@ -2456,6 +2456,7 @@ impl Daemon {
             }
             Request::RetryRun {
                 session_id,
+                expected_run_id,
                 model,
                 keep_original,
             } => {
@@ -2465,6 +2466,15 @@ impl Daemon {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before retrying",
                     )));
+                }
+                if let Some(expected) = expected_run_id.as_deref() {
+                    let latest = self.with_store(|st| st.last_run(&session_id))?;
+                    if latest.as_ref().map(|(id, _)| id.as_str()) != Some(expected) {
+                        return Err(RequestFailure::invalid(
+                            "the latest Run changed; open Retry again",
+                        )
+                        .into());
+                    }
                 }
                 let cfg = self.config()?;
                 let model = model
@@ -3006,10 +3016,24 @@ impl Daemon {
                 } else {
                     "now"
                 };
-                Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
-                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
-                )
+                let mut response = json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                    "override_source": override_source, "effective_value": effective.setting_value(&key)?});
+                if matches!(
+                    key.as_str(),
+                    "provider.routing_models"
+                        | "provider.fallback_models"
+                        | "provider.routing_fast_models"
+                        | "provider.routing_strong_models"
+                        | "provider.aliases"
+                ) || key.starts_with("provider.aliases.")
+                {
+                    let warnings =
+                        crate::routing_policy::routing_subset_warnings(&effective.provider);
+                    if !warnings.is_empty() {
+                        response["routing_warnings"] = json!(warnings);
+                    }
+                }
+                Ok(response)
             }
             Request::RevokeApproval {
                 tool_id,
@@ -6940,7 +6964,7 @@ impl Daemon {
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
                                     crate::provider::StructuredOutputError::InvalidJson { .. }
-                                        | crate::provider::StructuredOutputError::SchemaViolation
+                                        | crate::provider::StructuredOutputError::SchemaViolation { .. }
                                 )
                             )
                         })
@@ -8518,6 +8542,7 @@ impl Daemon {
             }
         };
         if bootstrap {
+            builtin_progress.close();
             let elapsed_ms = started.elapsed().as_millis() as i64;
             let (ok, kind) = builtin_outcome(&tc.name, &text);
             let kind = if created_kind.is_empty() {
@@ -12272,9 +12297,10 @@ impl Daemon {
         let active = self.with_reader(|st| st.has_active_jobs()).ok()?;
         let stays = cfg.daemon.keep_alive_for_jobs || std::env::var_os(STAY_ENV).is_some();
         (active && !stays).then(|| {
-            "jobs run only while Formless is running (the daemon stops when idle). To run them \
-             on schedule, run `formless daemon install-service` (starts it at login) or set \
-             daemon.keep_alive_for_jobs = true (/settings or config.toml)."
+            "jobs run only while Formless is running (the daemon stops when idle). To prevent \
+             idle exit, install a login service with `formless daemon install-service` or set \
+             daemon.keep_alive_for_jobs = true (/settings or config.toml). Linux user services \
+             also need systemd lingering to continue after logout."
                 .to_string()
         })
     }
@@ -14443,6 +14469,7 @@ impl Daemon {
             let ops_dyn: Arc<dyn HostOps> = ops.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
+            progress.close();
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
                 this.broadcast(Event::ToolCallFinished {
@@ -15815,7 +15842,17 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let listener = tokio::net::UnixListener::bind(&sock)
+            .with_context(|| format!("bind {}", sock.display()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(&sock)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
+            bail!("socket ownership or permissions changed during bind");
+        }
+        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -15825,6 +15862,10 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if !unix_peer_is_owner(&stream) {
+                        tracing::warn!("rejecting Unix socket peer without owner credentials");
+                        continue;
+                    }
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(stream).await });
                 }
@@ -16495,6 +16536,12 @@ impl NestedOps {
     }
 }
 
+impl Drop for NestedOps {
+    fn drop(&mut self) {
+        self.progress.close();
+    }
+}
+
 impl HostOps for NestedOps {
     fn path_policy(
         &self,
@@ -16584,6 +16631,36 @@ impl HostOps for NestedOps {
                 depth: self.depth.saturating_sub(1),
                 fraction: value.fraction,
                 label: value.label,
+            });
+        }
+        if let Some(mut deadline) = update.flush_at {
+            let progress = Arc::downgrade(&self.progress);
+            let daemon = Arc::downgrade(&self.daemon);
+            let session_id = self.session_id.clone();
+            let run_id = self.run_id.clone();
+            let tool_name = self.tool_name.clone();
+            let depth = self.depth.saturating_sub(1);
+            self.handle.spawn(async move {
+                loop {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    let (Some(progress), Some(daemon)) = (progress.upgrade(), daemon.upgrade())
+                    else {
+                        break;
+                    };
+                    let next = progress.flush_due(std::time::Instant::now(), |value| {
+                        daemon.broadcast(Event::ToolProgress {
+                            invocation_id: Some(progress.id.clone()),
+                            session_id: session_id.clone(),
+                            run_id: run_id.clone(),
+                            tool_name: tool_name.clone(),
+                            depth,
+                            fraction: value.fraction,
+                            label: value.label,
+                        });
+                    });
+                    let Some(next) = next else { break };
+                    deadline = next;
+                }
             });
         }
     }
@@ -16878,7 +16955,7 @@ impl HostOps for NestedOps {
         if matches!(
             &value,
             Err(crate::provider::StructuredOutputError::InvalidJson { .. }
-                | crate::provider::StructuredOutputError::SchemaViolation)
+                | crate::provider::StructuredOutputError::SchemaViolation { .. })
         ) {
             routing_call.claim_contract(identity.clone());
         }
@@ -17221,6 +17298,9 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".netrc",
         ".npmrc",
         ".pypirc",
+        "credentials.tfrc.json",
+        ".terraformrc",
+        "terraform.rc",
         "credentials",
         ".git-credentials",
     ]
@@ -17410,9 +17490,59 @@ fn harness_target(op: &str, args: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+fn unix_peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    unix_peer_uid_matches(stream, uid)
+}
+
+#[cfg(unix)]
+fn unix_peer_uid_matches(stream: &tokio::net::UnixStream, uid: libc::uid_t) -> bool {
+    stream.peer_cred().is_ok_and(|peer| peer.uid() == uid)
+}
+
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_and_owner_can_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::Path::new("/tmp").join(format!("fl-ipc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _client = tokio::net::UnixStream::connect(paths.socket_path())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(unix_peer_is_owner(&peer));
+        let actual_uid = peer.peer_cred().unwrap().uid();
+        assert!(!unix_peer_uid_matches(&peer, actual_uid.wrapping_add(1)));
+        drop(listener);
+        drop(daemon);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {

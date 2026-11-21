@@ -147,7 +147,7 @@ fn replay_input_accepts(
     use formless_runtime::structured_output::StructuredOutputError;
     match schema.parse_and_validate(input) {
         Ok(_) => Ok(true),
-        Err(StructuredOutputError::SchemaViolation) => Ok(false),
+        Err(StructuredOutputError::SchemaViolation { .. }) => Ok(false),
         Err(error) => Err(anyhow!(
             "Held-out input cannot be validated within the offline replay bounds: {error}"
         )),
