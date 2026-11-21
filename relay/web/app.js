@@ -1722,6 +1722,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const toml = lang === "toml";
     const php = L === HL.php;
     const out = [];
     let plain = "";
@@ -1757,8 +1758,11 @@
         }
       }
       if (lineStart && L.key) {
-        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
-        if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
+        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
+        const key = m?.[2].trim();
+        // A multiline TOML array value can start where a key normally would.
+        if (key && !(L.lc || []).some((p) => key.startsWith(p)) &&
+            (!toml || !/^(['"])\1\1/.test(key) && !/[^\t ]/.test(m[3]))) {
           plain += m[1];
           tok("tok-key", m[2]);
           i += m[0].length;
@@ -1792,7 +1796,7 @@
         continue;
       }
       const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
-        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]));
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]));
       if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
           (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
@@ -1804,12 +1808,20 @@
         continue;
       }
       if (L.q.includes(c)) {
-        let j = i + 1;
-        const multiline = c === "`" || L.mysqlComments;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
-          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+        const multiline = toml && code.startsWith(c.repeat(3), i);
+        const delimiter = multiline ? c.repeat(3) : c;
+        const escapes = !(toml && c === "'" || L.mysqlComments && c === "`");
+        let j = i + delimiter.length;
+        while (j < code.length && !code.startsWith(delimiter, j) &&
+            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
+          j += code[j] === "\\" && escapes ? 2 : 1;
         }
-        const stop = Math.min(j + 1, code.length);
+        let stop = Math.min(j + delimiter.length, code.length);
+        // Include up to two quotes immediately before the TOML closing delimiter.
+        if (multiline) {
+          const trailing = stop + 2;
+          while (stop < trailing && code[stop] === c) stop++;
+        }
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
