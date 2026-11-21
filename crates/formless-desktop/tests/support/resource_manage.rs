@@ -220,6 +220,93 @@ fn resource_management_confirms_cancels_and_invalidates_on_selection_refresh_and
 }
 
 #[gpui_kit::test]
+fn rejected_skill_and_job_adds_keep_their_drafts_until_success(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        for (destination, text, schedule) in [
+            (Destination::Skills, "/missing/skill", ""),
+            (
+                Destination::Jobs,
+                "Review the project",
+                "unparseable schedule",
+            ),
+        ] {
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::Page {
+                        destination,
+                        result: Ok(json!([])),
+                    },
+                    window,
+                    cx,
+                );
+                s.run_command(Command::GoTo(destination), window, cx);
+                s.take_client_commands();
+            });
+            settle_frames(window, cx);
+            window.click("resource-text-field", cx);
+            window.input(text, cx);
+            if !schedule.is_empty() {
+                window.click("resource-schedule-field", cx);
+                window.input(schedule, cx);
+            }
+            settle_frames(window, cx);
+            window.click("resource-add", cx);
+            let first = shell.update(cx, |s, _| s.take_client_commands());
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::ManagementNotice {
+                        destination,
+                        notice: "Could not add: rejected".into(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            settle_frames(window, cx);
+            window.click("resource-add", cx);
+            let retry = shell.update(cx, |s, _| s.take_client_commands());
+            let requests = |commands: Vec<WireCommand>| {
+                commands
+                    .into_iter()
+                    .filter_map(|command| {
+                        if let WireCommand::Manage { request, .. } = command {
+                            Some(serde_json::to_value(request).unwrap())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let first = requests(first);
+            assert_eq!(first.len(), 1);
+            assert_eq!(requests(retry), first);
+            shell.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::ResourceAdded {
+                        destination,
+                        text: text.into(),
+                        schedule: schedule.into(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            settle_frames(window, cx);
+            window.click("resource-add", cx);
+            assert!(requests(shell.update(cx, |s, _| s.take_client_commands())).is_empty());
+            window.render_frame(cx);
+            assert!(window
+                .find("resource-validation-error")
+                .value()
+                .unwrap()
+                .contains("must not be empty"));
+        }
+    });
+}
+
+#[gpui_kit::test]
 fn resource_add_form_validates_submits_clears_and_shows_receipts(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     daemon_view(cx, handle, &shell);
@@ -250,6 +337,31 @@ fn resource_add_form_validates_submits_clears_and_shows_receipts(cx: &mut TestAp
         window.click("resource-add", cx);
         let commands = shell.update(cx, |s, _| s.take_client_commands());
         assert!(commands.iter().any(|c| matches!(c, WireCommand::Manage { destination: Destination::Memory, request: Request::UpsertMemory { id: None, text: Some(text), .. }, .. } if text == "Remember this")));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::ManagementNotice {
+                    destination: Destination::Memory,
+                    notice: "Could not add memory: rejected".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.click("resource-add", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(commands.iter().any(|c| matches!(c, WireCommand::Manage { request: Request::UpsertMemory { text: Some(text), .. }, .. } if text == "Remember this")));
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::ResourceAdded {
+                    destination: Destination::Memory,
+                    text: "Remember this".into(),
+                    schedule: String::new(),
+                },
+                window,
+                cx,
+            );
+        });
         window.render_frame(cx);
         window.click("resource-add", cx);
         window.render_frame(cx);

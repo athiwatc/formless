@@ -2737,6 +2737,21 @@ impl Shell {
                 }
             }
             ClientUpdate::Notice(notice) => self.client_status = notice,
+            ClientUpdate::ResourceAdded {
+                destination,
+                text,
+                schedule,
+            } => {
+                if self.destination == destination
+                    && self.resource_input.read(cx).value().trim() == text
+                    && self.resource_schedule.read(cx).value().trim() == schedule
+                {
+                    self.resource_input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    self.resource_schedule
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+            }
             ClientUpdate::ManagementNotice {
                 destination,
                 notice,

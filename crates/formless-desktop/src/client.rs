@@ -214,6 +214,11 @@ pub enum Update {
         error: String,
     },
     Notice(String),
+    ResourceAdded {
+        destination: Destination,
+        text: String,
+        schedule: String,
+    },
     ManagementNotice {
         destination: Destination,
         notice: String,
@@ -825,6 +830,7 @@ enum Pending {
         destination: Destination,
         label: String,
         undo: bool,
+        add: Option<(String, String)>,
     },
     RunReconcile(run_actions::Recovery),
     RestoreSession(crate::run_actions::DeleteUndo),
@@ -2131,12 +2137,25 @@ impl Engine {
             } => {
                 if self.ready {
                     let undo = matches!(request, Request::UndoRegistryChange);
+                    let add = match &request {
+                        Request::AddSkill { source, .. } => Some((source.clone(), String::new())),
+                        Request::AddJob { prompt, cron, .. } => {
+                            Some((prompt.clone(), cron.clone().unwrap_or_default()))
+                        }
+                        Request::UpsertMemory {
+                            id: None,
+                            text: Some(text),
+                            ..
+                        } => Some((text.clone(), String::new())),
+                        _ => None,
+                    };
                     self.request(
                         request,
                         Pending::Manage {
                             destination,
                             label,
                             undo,
+                            add,
                         },
                     );
                 } else {
@@ -3076,7 +3095,9 @@ impl Engine {
                 destination,
                 label,
                 undo,
+                add,
             } => {
+                let succeeded = result.is_ok();
                 let notice = match result {
                     Ok(value) if undo => {
                         let summary = value
@@ -3092,6 +3113,15 @@ impl Engine {
                     destination,
                     notice,
                 });
+                if succeeded {
+                    if let Some((text, schedule)) = add {
+                        self.updates.push(Update::ResourceAdded {
+                            destination,
+                            text,
+                            schedule,
+                        });
+                    }
+                }
                 if self.page == Some(destination) {
                     self.load_page(destination);
                 }

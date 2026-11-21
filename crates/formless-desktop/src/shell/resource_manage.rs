@@ -197,10 +197,6 @@ impl Shell {
                     },
                     cx,
                 );
-                self.resource_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.resource_schedule
-                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
             Err(error) => self.resource_error = Some(error),
         }
