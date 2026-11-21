@@ -3605,7 +3605,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   `/storage`, web Settings → Storage → Disk use) lists the database (and
   roughly what fills it: messages, Invocation logs, Tool versions, file
   snapshots), artifacts, daemon and MCP logs, skills and backups, with the
-  data folder's total.
+  data folder's total. The report reuses measurements where path and category
+  rules agree. Concurrent changes can affect counts within one report.
 - **Clean-up.** `Gc {dry_run}` (`formless gc [--dry-run]`, TUI `/gc` then
   `/gc run`, web Clean up… which shows the dry run before "Free"):
   artifacts past their retention, `/rewind` payload beyond `run_files.*`
@@ -3713,12 +3714,15 @@ refresh a cache, nightly cleanup.
     leading-wildcard flag. For example, `0 9 */2 * 1` runs on Mondays
     with odd day-of-month numbers, rather than every 48 hours. Invalid field
     values and range endpoints identify their field in both entry points.
+    A repeated local minute during a clock change can match at both actual
+    instants. Cron skips local minutes that the clock passes over.
     `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    at 8pm", "every monday morning" (09:00), and
+    "yearly"/"annually"/"every year at 9am" (January 1).
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron. Minute and hour
@@ -4076,7 +4080,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   folded in. `[`/`]` on an empty input focus the previous/next call and
   scroll it into view. `[`/`]` also stop on messages with text (yours
   and the answers). While a call is focused, Enter expands or collapses
-  it, and `z`/`Z` expand or collapse all calls. On a focused message or
+  its preview, F6 opens its full stored input and available result, and
+  `z`/`Z` expand or collapse all calls. Esc closes the pager and returns
+  to the same call. On a focused message or
   call, `c` copies its text and `C` copies it as Markdown (a call as its
   name, input and result in fences). Esc or typing leaves the focus.
   `/copy N` copies the Nth message from the bottom.
@@ -4085,8 +4091,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   discarded, the first Enter asks and a second confirms, and Esc cancels
   the edit. `f` forks a new Session with everything before that message
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
-  pretty-printed and highlighted when JSON (capped at a few hundred lines;
-  `/open` shows stored outputs in full).
+  pretty-printed and highlighted when JSON (input and ordinary result
+  previews are capped). The full call pager preserves the stored text and
+  shows control characters as visible escapes.
 - **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
   `/vim [on|off]`, enables modal editing in the composer and internal Tool,
   module, schema, description and run-input editors. The setting persists;
@@ -5300,7 +5307,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
-| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE`, `--overwrite` | Write a portable setup bundle, optionally including Session transcripts. To replace a file, pass `--overwrite` with `--output`. |
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
@@ -5331,8 +5338,15 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
-| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human UTC day rows mark a truncated cutoff day. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`providers test NAME [--model MODEL] [--json]` lists the available model IDs
+or reports a model probe. JSON emits one object with the known listing or
+probe fields, including recorded usage when present. A completed model probe
+prints its report before returning exit 0 for success or 1 for a negative
+verdict. An empty model list still exits 0. Usage errors exit 2 and other
+request failures exit 1.
 
 `formless prices list [--provider NAME] [--json]` reads the configuration file
 and defaults. Rates are USD per million tokens. It shows stored entries and
@@ -5744,8 +5758,13 @@ previous headless Run's Session.
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
   `--plain`/`-c`/`--new` only go with starting the TUI. `relay enable`
   keeps the configured `relay.url` unless `--url` is given. `tools run`
-  exits from the daemon's `ok`, not the result's wording. `formless man`
-  documents every subcommand's options, two levels deep.
+  exits from the daemon's `ok` when present. Supply an inline
+  JSON object with `--input JSON` or read one from a UTF-8 regular file or
+  stdin with `--input-file FILE|-` (1 MiB maximum). The flags are mutually
+  exclusive and the default input is `{}`. Invalid input exits 2 before
+  profile setup or daemon dispatch. `tools run --json` prints one complete
+  daemon result, including dry-run effects and logs. Request errors go
+  to stderr. `formless man` documents every subcommand's options, two levels deep.
 - The CLI is a client of the same protocol; **no behaviour lives only in
   the CLI**.
 
@@ -6287,7 +6306,9 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   command instead) or on Windows (a running program can't delete itself:
   it says to). `formless reset` deletes the same secrets.
 - **Moving to a new machine.** `formless export-all [--sessions] [-o
-  FILE]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600):
+  FILE [--overwrite]]` (`ExportAll`) writes one `formless.all/1` JSON file (mode 0600).
+  The default name includes local hours, minutes, and seconds. Existing
+  destinations require `--overwrite` with an explicit output path. The bundle includes
   every active registry Tool (MCP tools come back with their server), the
   shared modules, Skills, memories, recurring jobs and the config
   (providers, Roles, MCP servers, settings) with every value that can
@@ -6802,15 +6823,15 @@ are addressed separately (#889).
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
 an active Run query exits 0, and cancel exits 0 when its request succeeds.
-Existing `runs --limit N --json` remains a list (default limit 20).
+`runs --limit N --json` lists stored Runs (default limit 20). An explicit
+`--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
 Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
 returned stalled/abandoned flags and optional progress fraction/label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
-Outer `runs --json running` is also supported. An explicitly supplied
-`--limit` conflicts with this unbounded snapshot and fails before connection.
+Outer `runs --json running` is also supported.
 There is no polling or Invocation control action.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
