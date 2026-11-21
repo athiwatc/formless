@@ -532,20 +532,23 @@ impl Daemon {
                 } else {
                     None
                 };
-                let missing_marker = if !record.existed {
-                    original.as_ref().and_then(|missing| {
-                        store.as_ref().and_then(|store| {
-                            store
-                                .lookup_missing(
-                                    &retained_owner(session, &recorded.run_id, &record.path),
-                                    missing,
-                                )
-                                .ok()
-                                .flatten()
-                        })
-                    })
-                } else {
-                    None
+                let missing_marker = match (!record.existed, original.as_ref(), store.as_ref()) {
+                    (true, Some(missing), Some(store)) => match store.lookup_missing(
+                        &retained_owner(session, &recorded.run_id, &record.path),
+                        missing,
+                    ) {
+                        Ok(marker) => marker,
+                        Err(error) => {
+                            entry.view.files.push(excluded(
+                                &record.path,
+                                error.to_string(),
+                                before_hash,
+                                image.hash(),
+                            ));
+                            continue;
+                        }
+                    },
+                    _ => None,
                 };
                 if !record.existed && missing_marker.is_none() {
                     entry.view.files.push(excluded(&record.path,

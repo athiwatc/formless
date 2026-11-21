@@ -6902,17 +6902,24 @@ handles. Cross-volume, unknown identity/security, untracked aliases, unsupported
 filesystems or uncertain I/O refuse mutations. Every native hard link waived by
 review is accounted for by a verified store manifest and exact object identity;
 an extra public alias is never treated as an internal retention link. The store
-admits at most 64 manifests and 32 MiB of serialized immutable receipts plus
-reserved bounded object bytes. Seven-day cleanup skips live review leases and
-uses verified original handles, never recursive or database-path deletion.
+admits at most 64 logical records and 32 MiB of serialized receipts and
+retained object bytes. A private missing-state receipt reserves one slot and
+4 KiB before the Tool runs. Reject can use that slot when the immutable
+created-image receipt and retained object fit the remaining byte budget.
+Existing-file hard links reserve their full bounded object allowance.
+Seven-day cleanup skips live review leases and uses verified original handles.
 The 32 MiB limit is an admission budget for serialized immutable images and
 reserved retained bytes, not an instantaneous OS disk quota. Later writes to a
 shared object and already-open handles can retain additional bytes. Inventory
 charges the actual observed size without reading an oversized body; admission
 refuses excess use. Cleanup can reclaim an inactive verified retained alias as
 soon as it becomes oversized, without waiting seven days or touching its public
-name. Active Run/review leases still protect their owned objects. Unknown entries
-fail closed rather than counting as zero or supplying deletion authority.
+name. Active Run/review leases still protect their owned objects.
+Receipts publish after a private staging file has been flushed. Recovery can
+remove verified private staging files and legacy truncated receipts with
+absent objects. Other corrupt token entries remain charged to the store for
+manual recovery. Affected tokens cannot authorize review or deletion, and
+verified tokens can still expire. Unknown filenames fail closed.
 Already-deleted legacy files without a captured original object remain read-only.
 
 
