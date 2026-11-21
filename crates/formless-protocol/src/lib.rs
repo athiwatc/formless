@@ -884,7 +884,7 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
     {
         return Some((true, "holds account credentials".into()));
     }
-    if is_pulumi_credentials_path(std::path::Path::new(path)) {
+    if is_pulumi_credentials_path(std::path::Path::new(&*path)) {
         return Some((true, "holds Pulumi credentials".into()));
     }
     if segments.first() == Some(&"etc") {
