@@ -37,7 +37,9 @@ impl Fixture {
     }
     fn output(&self, args: &[&str]) -> Output {
         let mut cmd = self.command(args);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.current_dir(&self.root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
@@ -113,6 +115,82 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn export_all_requires_explicit_overwrite_and_publishes_private_bundles() {
+    let fixture = Fixture::new();
+    let target = fixture.root.join("nested/export.json");
+    let args = ["export-all", "--sessions", "-o", "nested/export.json"];
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| fixture.output(&args));
+        let second = fixture.output(&args);
+        (first.join().unwrap(), second)
+    });
+    assert_ne!(
+        first.status.success(),
+        second.status.success(),
+        "{first:?}, {second:?}"
+    );
+    let refused = if first.status.success() {
+        second
+    } else {
+        first
+    };
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    let contents = std::fs::read(&target).unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&contents).unwrap();
+    assert_eq!(bundle["format"], "formless.all/1");
+    assert!(bundle["sessions"].is_array());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+        1
+    );
+
+    std::fs::write(&target, b"previous bundle").unwrap();
+    let refused = fixture.output(&args);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"previous bundle");
+
+    let overwritten = fixture.output(&[
+        "export-all",
+        "--sessions",
+        "-o",
+        "nested/export.json",
+        "--overwrite",
+    ]);
+    assert!(overwritten.status.success(), "{overwritten:?}");
+    let replacement: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+    assert_eq!(replacement["format"], "formless.all/1");
+    assert_eq!(replacement["sessions"], bundle["sessions"]);
+
+    let invalid = fixture.output(&["export-all", "--overwrite"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    let default = fixture.output(&["export-all"]);
+    assert!(default.status.success(), "{default:?}");
+    let name = String::from_utf8(default.stdout).unwrap();
+    let filename = name
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("exported:  ")
+        .unwrap();
+    let stamp = filename
+        .strip_prefix("formless-export-")
+        .unwrap()
+        .strip_suffix(".json")
+        .unwrap();
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").unwrap();
+    assert!(fixture.root.join(filename).is_file());
 }
 
 #[test]
