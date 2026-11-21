@@ -224,14 +224,15 @@ pub struct Candidate {
     pub preview: String,
 }
 
-/// Only persisted user messages can become features. No draft or inferred IDs.
+/// Only persisted, human-authored user messages can become features.
+/// Generated messages are identified by Core, never by their wording.
 pub fn candidates(value: &serde_json::Value) -> Vec<Candidate> {
     value["messages"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|m| {
-            if m["role"].as_str()? != "user" {
+            if m["role"].as_str()? != "user" || !m["generated_by"].is_null() {
                 return None;
             }
             let id = m["id"].as_str()?;
@@ -517,6 +518,21 @@ impl State {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn generated_user_messages_are_never_move_candidates_but_user_wording_is_not_filtered() {
+        let rows = json!({"messages": [
+            {"id":"request", "seq":1,"role":"user","content":"Do X and Y"},
+            {"id":"kickoff", "seq":2,"role":"user","content":"Internal setup", "generated_by":"topic_kickoff"},
+            {"id":"future-generated", "seq":3,"role":"user","content":"Generated continuation", "generated_by":"future_generator"},
+            {"id":"real-request", "seq":4,"role":"user","content":"You are the Formless topic orchestrator. Explain this text.", "generated_by":null},
+            {"id":"assistant", "seq":5,"role":"assistant","content":"Not a user request"}
+        ]});
+        let ids = candidates(&rows)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["request", "real-request"]);
+    }
     #[test]
     fn user_rule_drafts_preserve_exact_patterns_and_never_grant_by_default() {
         assert!(RuleDraft::default().action("topic".into()).is_err());
