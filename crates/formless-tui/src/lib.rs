@@ -348,6 +348,7 @@ enum Pending {
     ListMcpPrompts,
     GetMcpPrompt,
     ListSkills,
+    LoadSkill,
     ListMemories,
     RunMetrics,
     ListBuiltinStats,
@@ -4268,14 +4269,23 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::LoadSkill => {
+                            if let Some(name) = result["loaded"].as_str() {
+                                self.notes.push(format!("loaded skill {name}"));
+                            }
+                        }
                         Pending::SkillPreview => {
                             let name = result["skill"]["name"].as_str().unwrap_or_default();
+                            let retired = result["skill"]["retired"] == true;
+                            let enabled = result["skill"]["enabled"] == true && !retired;
                             let mut lines = vec![
                                 format!(
                                     "{} v{} · {} · {}",
                                     name,
                                     result["skill"]["version"],
-                                    if result["skill"]["enabled"] == true {
+                                    if retired {
+                                        "retired"
+                                    } else if enabled {
                                         "enabled"
                                     } else {
                                         "disabled"
@@ -4322,7 +4332,11 @@ impl App {
                                 );
                             }
                             lines.push(String::new());
-                            lines.push(format!("/skill:{name} loads it into this Session"));
+                            lines.push(if enabled {
+                                format!("/skill:{name} loads it into this Session")
+                            } else {
+                                format!("/skills enable {name} {} it for loading", if retired { "restores" } else { "enables" })
+                            });
                             self.pager = Some(Pager {
                                 title: format!("Skill {name}"),
                                 lines,
@@ -7786,14 +7800,13 @@ impl App {
                 match (self.current.clone(), name.is_empty()) {
                     (Some(session_id), false) => {
                         self.request(
-                            Pending::RunControl,
+                            Pending::LoadSkill,
                             Request::LoadSkill {
                                 session_id,
                                 name: name.to_string(),
                                 args: (!args.trim().is_empty()).then(|| args.trim().to_string()),
                             },
                         );
-                        self.notes.push(format!("loaded skill {name}"));
                     }
                     (None, _) => self.notes.push("no current session".into()),
                     _ => self.notes.push("usage: /skill:NAME [arguments]".into()),
@@ -21456,6 +21469,29 @@ mod tests {
                 .value,
             "daemon mode unknown"
         );
+    }
+
+    #[test]
+    fn manual_skill_load_reports_only_confirmed_success() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (reply, inbox) = std::sync::mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        for ok in [false, true] {
+            app.notes.clear();
+            app.slash("skill:foo");
+            assert!(app.notes.is_empty());
+            let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            reply.send(ServerMessage::Response {
+                id: request.id,
+                ok,
+                result: ok.then(|| serde_json::json!({"loaded":"foo"})),
+                error: (!ok).then(|| "skill 'foo' is retired".into()),
+            }).unwrap();
+            app.drain_daemon();
+            assert_eq!(app.notes.last().map(String::as_str), Some(if ok { "loaded skill foo" } else { "daemon: skill 'foo' is retired" }));
+        }
     }
 
     #[test]

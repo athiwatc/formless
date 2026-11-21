@@ -2719,11 +2719,12 @@ Tools fill capability gaps; skills say how to use them well.
   enabled state instead of previewing a name beginning with the verb.
   The web "Review" does the same preview. `/skill:NAME [args]`
   (`LoadSkill {session_id, name, args}`) loads an enabled skill into the
-  Session: its instructions and arguments join the chat as a note, and
-  the load counts like the agent's.
+  Session. Once its note is saved, the manual load counts toward skill usage.
+  Run completion metrics count skill loads associated with a Run.
 - **Retired skills say why.** An auto-retired skill keeps
   `retire_reason` ("unused: …" or "unhelpful: N of M Runs that loaded it
-  completed"), shown by `/skills` and the web; enabling it clears it.
+  completed"), shown by `/skills` and the web. Enabling the skill or
+  installing a new version clears the reason.
 
 ### 7.11 User memory
 
