@@ -36,6 +36,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
+pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,12 +56,20 @@ pub enum HarnessRole {
 pub struct TopicProposalRequest {
     pub source_session_id: String,
     pub message_ids: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<TopicFeatureProposal>,
     pub name: String,
     pub repo: std::path::PathBuf,
     pub builder: HarnessKind,
     pub builder_model: Option<String>,
     pub reviewer: HarnessKind,
     pub reviewer_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFeatureProposal {
+    pub source_message_id: String,
+    pub request: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +164,7 @@ pub struct TopicInfo {
     pub reviewer: HarnessKind,
     pub reviewer_model: Option<String>,
     pub features: Vec<TopicFeatureInfo>,
+    pub attempts: Vec<TopicAttemptInfo>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -163,6 +173,7 @@ pub struct TopicInfo {
 #[serde(rename_all = "snake_case")]
 pub enum TopicAttemptStatus {
     Building,
+    AwaitingReview,
     Reviewing,
     Passed,
     Findings,
@@ -178,7 +189,9 @@ pub struct TopicAttemptInfo {
     pub feature_id: String,
     pub round: u32,
     pub role: HarnessRole,
+    pub harness: HarnessKind,
     pub status: TopicAttemptStatus,
+    pub conversation_session_id: String,
     pub revision: Option<String>,
     pub harness_session_id: Option<String>,
     pub detail: Option<String>,
@@ -241,6 +254,7 @@ pub const FEATURES: &[&str] = &[
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
+    TOPIC_ORCHESTRATION_FEATURE,
     IDLE_STEP_OFF_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
@@ -2269,6 +2283,42 @@ pub enum Request {
     GetSession {
         id: String,
     },
+    /// Persistent singleton identity for the user's primary chat conversation.
+    GetMainChat,
+    /// Persist a pending topic proposal; this never relocates messages or starts a harness.
+    ProposeTopic {
+        proposal: TopicProposalRequest,
+    },
+    /// Human-client consent gate. No harness MCP operation can approve a topic.
+    ApproveTopic {
+        approval: TopicApprovalRequest,
+    },
+    RejectTopic {
+        rejection: TopicRejectionRequest,
+    },
+    ListTopics,
+    GetTopic {
+        topic_id: String,
+    },
+    /// Start the approved topic workflow in the daemon. Repeated calls are idempotent.
+    StartTopicWorkflow {
+        topic_id: String,
+    },
+    ListTopicAttempts {
+        topic_id: String,
+    },
+    GetTopicAttempt {
+        attempt_id: String,
+    },
+    RecoverTopic {
+        recovery: TopicRecoveryRequest,
+    },
+    RetryTopicFeature {
+        retry: TopicFeatureRetryRequest,
+    },
+    TopicMcp {
+        request: TopicMcpRequest,
+    },
     ForkSession {
         id: String,
         name: Option<String>,
@@ -3400,6 +3450,9 @@ pub enum DroppedEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    TopicChanged {
+        topic_id: String,
+    },
     /// Opt-in, correlated ephemeral answer attempt. Not canonical history.
     TranscriptAttempt {
         update: TranscriptAttemptEvent,
@@ -3837,6 +3890,7 @@ impl Event {
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
+            | Event::TopicChanged { .. }
             | Event::McpServersChanged
             | Event::ModelPullProgress { .. }
             | Event::SkillsChanged
