@@ -4659,7 +4659,7 @@ impl Shell {
                         .when(self.live_overlay.unavailable, |view| view.child(readable("live-overlay-unavailable", "Live preview unavailable after skipped updates or size limit; reloading persisted history.").text_sm()))
                         .when(!self.live_overlay.reasoning.is_empty(), |view| view.child(
                             v_flex().text_color(cx.theme().muted_foreground)
-                                .child(readable("live-reasoning-label", "Reasoning (not saved)").text_xs())
+                                .child(readable("live-reasoning-label", "Reasoning (live preview)").text_xs())
                                 .child(readable("live-reasoning", crate::live_overlay::View::preview(&self.live_overlay.reasoning).to_owned()).text_sm())
                         ))
                         .when(!self.live_overlay.answer.is_empty(), |view| view.child(

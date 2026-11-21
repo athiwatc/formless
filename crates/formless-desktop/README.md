@@ -126,7 +126,7 @@ The current protocol has no snapshot watermark or token offset. Connected
 production clients request legacy deltas when the daemon advertises
 `subscribe_filter`. Assistant text and reasoning appear in a separate,
 explicitly provisional live preview, never appended to canonical history.
-Reasoning is labelled separately and is not saved. The combined live text
+Reasoning is labelled separately as a live preview; the daemon decides what reasoning it persists. The combined live text
 is limited to 1 MiB; each displayed tail is limited to 32 KiB / 400 lines.
 Updates coalesce at the existing 250 ms client refresh interval. Completion,
 persisted assistant messages, Run end and accepted canonical refreshes retire
