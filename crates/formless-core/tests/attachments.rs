@@ -84,6 +84,24 @@ fn yarn_credentials_are_detected_for_attachment_warnings() {
 }
 
 #[test]
+fn detects_terraform_config_in_attachment_paths() {
+    for name in [
+        ".terraform.d/credentials.tfrc.json",
+        ".terraformrc",
+        "AppData/Roaming/TERRAFORM.RC",
+    ] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in [
+        ".terraform/notes.txt",
+        "credentials.tfrc.json.example",
+        ".terraformrc.sample",
+    ] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn types_come_from_the_bytes() {
     let png = b"\x89PNG\r\n\x1a\nrest";
     assert_eq!(resolve_mime(None, "noext", png), "image/png");
