@@ -10,6 +10,14 @@ impl Drop for Fixture {
     }
 }
 async fn get(paths: &Paths, key: &str, json: bool, model_override: Option<&str>) -> Output {
+    let mut args = vec!["get", key];
+    if json {
+        args.push("--json");
+    }
+    config_command(paths, &args, model_override).await
+}
+
+async fn config_command(paths: &Paths, args: &[&str], model_override: Option<&str>) -> Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_formless"));
     command.env_clear();
     for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
@@ -17,11 +25,9 @@ async fn get(paths: &Paths, key: &str, json: bool, model_override: Option<&str>)
             command.env(key, value);
         }
     }
-    command.args(["config", "get", key]);
-    if json {
-        command.arg("--json");
-    }
     command
+        .arg("config")
+        .args(args)
         .env("FORMLESS_DATA_DIR", &paths.data_dir)
         .env("FORMLESS_CONFIG_DIR", &paths.config_dir)
         .kill_on_drop(true);
@@ -32,6 +38,88 @@ async fn get(paths: &Paths, key: &str, json: bool, model_override: Option<&str>)
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn config_list_exposes_documented_local_values_without_credentials() {
+    let fixture = Fixture(std::env::temp_dir().join(format!(
+        "formless-config-list-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    let paths = Paths::from_dirs(fixture.0.join("data"), fixture.0.join("config")).unwrap();
+    let fresh = config_command(&paths, &["list", "--json"], None).await;
+    assert!(
+        fresh.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    let fresh: Value = serde_json::from_slice(&fresh.stdout).unwrap();
+    assert_eq!(fresh["scope"], "local");
+    let rows = fresh["settings"].as_object().unwrap();
+    let docs = formless_core::config::setting_docs_json();
+    assert!(rows.keys().eq(docs.as_object().unwrap().keys()));
+    assert!(!rows.contains_key("provider.extra_headers"));
+    assert_eq!(
+        rows["tui.timestamps"]["effective"],
+        Config::default().tui.timestamps
+    );
+    assert_eq!(rows["tui.timestamps"]["changed"], false);
+    assert_eq!(rows["limits.run_usd"]["default_kind"], "null");
+    assert_eq!(rows["provider.model"]["default_kind"], "empty");
+    assert_eq!(
+        rows["security.sensitive_paths[].kind"]["effective_kind"],
+        "missing"
+    );
+    assert_eq!(
+        rows["security.sensitive_paths[].kind"]["default_kind"],
+        "documentation"
+    );
+    assert_eq!(rows["provider.base_url"]["settable"], false);
+
+    let mut config = Config::default();
+    config.limits.run_usd = Some(12.5);
+    config.provider.model = "from-file".into();
+    config.provider.base_url = "https://fixture:fixture-password@example.invalid".into();
+    config
+        .provider
+        .extra_headers
+        .insert("Authorization".into(), "fixture-header-value".into());
+    config
+        .provider
+        .query_params
+        .insert("opaque".into(), "fixture-query-value".into());
+    config.save(&paths).unwrap();
+    let output = config_command(&paths, &["list", "--json"], Some("env-model")).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let rows = serde_json::from_str::<Value>(&text).unwrap()["settings"].clone();
+    assert_eq!(rows["limits.run_usd"]["effective"], 12.5);
+    assert_eq!(rows["limits.run_usd"]["changed"], true);
+    assert_eq!(rows["limits.run_usd"]["settable"], true);
+    assert_eq!(rows["provider.model"]["effective"], "env-model");
+    assert_eq!(rows["provider.base_url"]["effective_kind"], "redacted");
+    assert_eq!(rows["provider.query_params"]["effective_kind"], "redacted");
+    for value in [
+        "fixture-password",
+        "fixture-header-value",
+        "fixture-query-value",
+    ] {
+        assert!(!text.contains(value));
+    }
+    let filtered = config_command(&paths, &["list", "--filter", "LIMITS"], None).await;
+    assert!(filtered.status.success());
+    let filtered = String::from_utf8(filtered.stdout).unwrap();
+    assert!(filtered.contains("limits.run_usd") && filtered.contains("12.5 (changed)"));
+    assert!(!filtered.contains("provider.model"));
+    assert!(!paths.data_dir.join("daemon.pid").exists());
 }
 #[tokio::test]
 async fn config_get_json_encodes_local_values_and_keeps_human_errors_and_overrides() {
