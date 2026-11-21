@@ -13,7 +13,11 @@ fn urls_resolve_to_what_holds_the_bundle() {
     );
     assert_eq!(
         resolve("https://gist.github.com/ada/0123456789abcdef0123456789abcdef#file-x").unwrap(),
-        Source::Gist("0123456789abcdef0123456789abcdef".into())
+        Source::Gist {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            revision: None,
+            file_anchor: Some("file-x".into()),
+        }
     );
     assert!(resolve("https://gist.github.com/ada").is_err());
     assert_eq!(
@@ -78,7 +82,11 @@ fn service_urls_use_normalized_scheme_host_and_default_port() {
         let url = format!("HTTPS://{authority}/ada/0123456789abcdef0123456789abcdef#file-x");
         assert_eq!(
             resolve(&url).unwrap(),
-            Source::Gist("0123456789abcdef0123456789abcdef".into()),
+            Source::Gist {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                revision: None,
+                file_anchor: Some("file-x".into()),
+            },
             "{url}"
         );
     }
@@ -123,10 +131,44 @@ fn github_bundle_mapping_drops_userinfo_from_the_destination() {
     let id = "0123456789abcdef0123456789abcdef";
     for host in ["gist.github.com", "gist.githubusercontent.com"] {
         let url = format!("https://fixture-user@{host}/ada/{id}");
-        assert_eq!(resolve(&url).unwrap(), Source::Gist(id.into()));
+        assert_eq!(
+            resolve(&url).unwrap(),
+            Source::Gist {
+                id: id.into(),
+                revision: None,
+                file_anchor: None
+            }
+        );
     }
     let error = resolve("https://fixture-user:fixture-secret@gist.github.com/ada").unwrap_err();
     let message = format!("{error:#}");
     assert!(message.contains("no gist id in https://gist.github.com/ada"));
     assert!(!message.contains("fixture-user") && !message.contains("fixture-secret"));
+}
+
+#[test]
+fn gist_urls_retain_the_raw_file_or_page_revision_and_anchor() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let sha = "abcdef0123456789abcdef0123456789abcdef01";
+    let raw = format!("https://gist.githubusercontent.com/ada/{id}/raw/{sha}/fetch%20data.json");
+    assert_eq!(resolve(&raw).unwrap(), Source::Direct(raw));
+    let with_userinfo = format!(
+        "https://sample:placeholder@gist.githubusercontent.com/ada/{id}/raw/{sha}/fetch.json"
+    );
+    assert_eq!(
+        resolve(&with_userinfo).unwrap(),
+        Source::Direct(format!(
+            "https://gist.githubusercontent.com/ada/{id}/raw/{sha}/fetch.json"
+        ))
+    );
+    let page = format!("https://gist.github.com/ada/{id}/{sha}#file-fetch-json");
+    assert_eq!(
+        resolve(&page).unwrap(),
+        Source::Gist {
+            id: id.into(),
+            revision: Some(sha.into()),
+            file_anchor: Some("file-fetch-json".into()),
+        }
+    );
+    assert!(resolve(&format!("https://gist.github.com/ada/{id}/latest/other")).is_err());
 }
