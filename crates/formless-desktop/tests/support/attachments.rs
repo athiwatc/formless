@@ -558,6 +558,119 @@ fn composer_attachment_only_send_uses_review_and_success_refreshes_chips(cx: &mu
 }
 
 #[gpui_kit::test]
+fn retired_upload_completion_refreshes_inventory_after_returning_to_its_session(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.attach_paths(vec!["/finished-upload.png".into()], cx)
+        });
+        let upload = queued(&shell, cx).pop().unwrap();
+        let original_session = upload.session_id.clone();
+        let other_session = shell
+            .read(cx)
+            .sidebar()
+            .rows()
+            .iter()
+            .find(|row| row.id != original_session)
+            .unwrap()
+            .id
+            .clone();
+        window.render_frame(cx);
+        window.click(session_row_id(&other_session), cx);
+        shell.update(cx, |shell, cx| shell.poll_client(window, cx));
+        let refresh = queued(&shell, cx).pop().unwrap();
+        assert!(matches!(refresh.intake, Intake::Refresh));
+        assert_eq!(refresh.session_id, other_session);
+        complete(&shell, refresh, vec![], window, cx);
+
+        window.click(session_row_id(&original_session), cx);
+        shell.update(cx, |shell, cx| shell.poll_client(window, cx));
+        let refresh = queued(&shell, cx).pop().unwrap();
+        assert!(matches!(refresh.intake, Intake::Refresh));
+        assert_eq!(refresh.session_id, original_session);
+        complete(&shell, refresh, vec![], window, cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("composer-attachment", 0_usize)).is_none());
+        assert!(queued(&shell, cx).is_empty());
+
+        complete(
+            &shell,
+            upload,
+            vec![file("stale", "stale-snapshot.png", "image/png")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.try_find(("composer-attachment", 0_usize)).is_none());
+        shell.update(cx, |shell, cx| shell.poll_client(window, cx));
+        let mut operations = queued(&shell, cx);
+        let refresh = operations
+            .pop()
+            .expect("late upload must schedule a fresh inventory read");
+        assert!(operations.is_empty());
+        assert!(matches!(refresh.intake, Intake::Refresh));
+        assert_eq!(refresh.session_id, original_session);
+        complete(
+            &shell,
+            refresh,
+            vec![file("finished", "finished-upload.png", "image/png")],
+            window,
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.find(("composer-attachment", 0_usize)).visible());
+        let text = painted(window).join(" ");
+        assert!(text.contains("finished-upload.png"));
+        assert!(!text.contains("stale-snapshot.png"));
+    });
+}
+
+#[gpui_kit::test]
+fn untracked_attachment_completions_from_other_owners_do_not_refresh(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        let active = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let (client, connection) = shell.read(cx).client_identity().unwrap();
+        for owner in 0..3 {
+            let session_id = if owner == 0 {
+                "another-session".to_string()
+            } else {
+                active.clone()
+            };
+            let pending = Report::decode(&session_id, json!({"session_id": session_id, "attachments": [file("stale", "stale.png", "image/png")]})).unwrap();
+            shell.update(cx, |shell, cx| {
+                shell.apply_client_update(
+                    Update::AttachmentStaged(Outcome {
+                        client: if owner == 1 {
+                            uuid::Uuid::new_v4()
+                        } else {
+                            client
+                        },
+                        connection: if owner == 2 {
+                            connection + 1
+                        } else {
+                            connection
+                        },
+                        operation: uuid::Uuid::new_v4(),
+                        session_id,
+                        errors: vec![],
+                        pending: Ok(pending),
+                    }),
+                    window,
+                    cx,
+                );
+                shell.poll_client(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(queued(&shell, cx).is_empty());
+            assert!(window.try_find(("composer-attachment", 0_usize)).is_none());
+        }
+    });
+}
+
+#[gpui_kit::test]
 fn composer_attachment_stale_result_ignored_after_session_switch_and_return(
     cx: &mut TestAppContext,
 ) {

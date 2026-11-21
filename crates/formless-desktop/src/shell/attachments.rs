@@ -324,6 +324,7 @@ impl Shell {
             return;
         }
         let Some(names) = self.attachments.operations.remove(&outcome.operation) else {
+            self.attachments.needs_refresh = true;
             return;
         };
         let notice_revision = self
