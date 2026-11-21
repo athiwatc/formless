@@ -6630,6 +6630,8 @@ Tool schemas without starting a Run or contacting a provider. The calibrated
 prompt count is approximate. Completed Runs with recorded, comparable provider,
 model/role, folder/Session, Tool snapshot and prompt size supply empirical p50/p90
 steps, tokens, USD and duration. Legacy Runs without those inputs are excluded.
+A quote binds the selected comparable Run IDs and measurements. Changes to
+unrelated history leave an otherwise identical quote valid.
 No history means prompt size only; missing prices mean no dollar range. Cache
 fractions and compaction probabilities describe comparable history, not guarantees.
 A draft already above the local compaction trigger is flagged immediately.
