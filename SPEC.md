@@ -7183,7 +7183,7 @@ rejected. Raising increments the hit cap by its default (3 or 20, saturating)
 and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
 a model or harness automatically. SetTopicLimits itself changes limits only.
 
-ListHarnesses refreshes all seven kinds concurrently. Every probe is capped at
+ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
 10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
@@ -7191,10 +7191,10 @@ and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Neither sends
 a model turn, and no auth output is copied into detail or logs.
 
-Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
 the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
 and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-ACP and Muse have dedicated dispatch arms currently reporting lookup-only
+and Muse have dedicated dispatch arms currently reporting lookup-only
 availability with unknown auth. Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
@@ -7202,6 +7202,10 @@ temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
 Adapter blocking probes must enforce their own internal deadline and kill
 child processes on drop: core's outer timeout cannot abort spawn_blocking.
+Core does not own the ACP agent registry and omits the bare ACP entry from
+ListHarnesses; the ACP adapter's registry supplies per-agent entries.
+The per-kind probe dispatch receives the selected acp_agent id, including
+for its current executable-only fallback. ACP is a protocol, not a CLI.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.

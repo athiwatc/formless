@@ -1197,7 +1197,12 @@ async fn topic_readiness_rejects_missing_harness_and_user_can_approve_one_step_s
         .contains("not ready"));
     assert!(state(&f, &topic.id).attempts.is_empty());
     let values = f.daemon().handle(Request::ListHarnesses).await.unwrap();
-    assert_eq!(values.as_array().unwrap().len(), 7);
+    assert_eq!(values.as_array().unwrap().len(), 6);
+    assert!(!values
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value["kind"] == "acp"));
     assert_eq!(values[0]["installed"], false);
     assert_eq!(values[1]["installed"], true);
     let request = json!({"feature_id":topic.features[0].id,"step_title":args["title"],"wanted":{"harness":"claude"},"substitute":{"harness":"codex"},"reason":"Claude is unavailable"});
