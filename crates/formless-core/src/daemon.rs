@@ -11593,13 +11593,11 @@ impl Daemon {
         } else {
             (std::path::PathBuf::from(path), None)
         };
+        let (input_path, full) = crate::files::resolve_file_mention(&root, input_path)
+            .with_context(|| format!("no file '{path}'"))?;
         // Preserve the configured root spelling as well as its resolved
         // destination: a credential/profile namespace can itself be an alias.
         let requested = raw_root.join(&input_path);
-        let full = root
-            .join(input_path)
-            .canonicalize()
-            .with_context(|| format!("no file '{path}'"))?;
         // A mention reaches only the working folder (or an explicit home path),
         // and never a credential, whoever pasted it (#863).
         let authority_root = if full.starts_with(&root) {

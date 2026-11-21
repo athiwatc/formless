@@ -353,7 +353,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             .await
         }
     };
-    for bad in denied {
+    for bad in denied.iter().copied().chain([".env:4"]) {
         let e = attach(bad).await.unwrap_err().to_string();
         assert!(e.contains("credential"), "{bad}: {e}");
     }
@@ -384,6 +384,22 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             credential_path(std::path::Path::new(name)).is_some(),
             "{name}"
         );
+    }
+    assert!(attach("notes.txt").await.is_ok());
+    for citation in ["notes.txt:42", "notes.txt:42:8"] {
+        let attached = attach(citation).await.unwrap();
+        assert_eq!(attached["name"], "notes.txt");
+        assert_eq!(attached["reference"], false);
+    }
+    assert!(attach("missing.txt:12")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("missing.txt:12"));
+    #[cfg(unix)]
+    for name in ["notes.txt:42", "notes:final"] {
+        std::fs::write(root.join(name), "literal filename").unwrap();
+        assert_eq!(attach(name).await.unwrap()["name"], name);
     }
     let home_leaf = format!("fl-mention-{}.txt", uuid::Uuid::new_v4().simple());
     let native_home = directories::BaseDirs::new().unwrap();

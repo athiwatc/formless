@@ -7312,7 +7312,9 @@
         (S.chips[sid] = S.chips[sid] || []).push(a);
         fresh.push(a.name);
       } catch (e) {
-        if (!/^no file/.test(e.message)) note("cannot attach @" + path + ": " + e.message, true);
+        if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(e.message)) {
+          note("cannot attach @" + path + ": " + e.message, true);
+        }
       }
     }
     if (fresh.length) {
