@@ -101,7 +101,8 @@ fn accumulate(
     stat.usd = stat.usd.zip(cost.usd).map(|(a, b)| a + b);
 }
 impl Store {
-    pub(crate) fn routing_auto_choice(
+    /// Current provider-scoped choice and the windowed evidence used to pick it.
+    pub fn routing_auto_choice(
         &self,
         cfg: &crate::Config,
         provider: &str,

@@ -3980,6 +3980,78 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+fn doctor_auto_routing(store: &formless_core::Store, cfg: &Config) -> Result<Vec<String>> {
+    let mut lines = vec![format!(
+        "routing:    auto, last {} days of eligible calls",
+        cfg.provider.routing_window_days
+    )];
+    for (task, complex) in [("simple", false), ("complex", true)] {
+        let Some(choice) =
+            store.routing_auto_choice(cfg, formless_core::config::DEFAULT_PROVIDER, complex)?
+        else {
+            lines.push(format!("            {task} task: no candidates"));
+            continue;
+        };
+        let reason = choice.explanation["reason"].as_str().unwrap_or_default();
+        lines.push(format!(
+            "            {task} task: {} ({reason})",
+            choice.model
+        ));
+        for row in choice.explanation["candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let model = row["model"].as_str().unwrap_or_default();
+            let samples = row["samples"].as_u64().unwrap_or_default();
+            let rate = row["good_rate"]
+                .as_f64()
+                .map(|rate| format!(", {:.0}% successful", 100.0 * rate))
+                .unwrap_or_default();
+            let cost = row["usd_per_success"]
+                .as_f64()
+                .map(|usd| format!(", ${usd:.6} per success"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "              {model}: {samples} samples{rate}{cost}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_auto_routing_ignores_all_time_counters_and_matches_the_live_selector() {
+    let store = formless_core::Store::open_in_memory().unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.model = "auto".into();
+    cfg.provider.routing_models = vec!["configured-first".into(), "historical-fast".into()];
+    cfg.provider.routing_window_days = 7;
+    for _ in 0..20 {
+        store
+            .record_model_outcome("historical-fast", true, 5)
+            .unwrap();
+    }
+    let lines = doctor_auto_routing(&store, &cfg).unwrap().join("\n");
+    let choice = store
+        .routing_auto_choice(&cfg, formless_core::config::DEFAULT_PROVIDER, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(choice.model, "configured-first");
+    assert!(lines.contains("last 7 days of eligible calls"));
+    let reason = choice.explanation["reason"].as_str().unwrap();
+    assert!(
+        lines.contains(&format!("simple task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(
+        lines.contains(&format!("complex task: configured-first ({reason})")),
+        "{lines}"
+    );
+    assert!(lines.contains("historical-fast: 0 samples"), "{lines}");
+}
+
 fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     // `quiet`: only the problems (for --json and bug reports).
     macro_rules! say {
@@ -4225,28 +4297,14 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         cfg.provider.tool_mode,
         cfg.provider.fallback_models.join(", ")
     );
-    if formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
-        say!(
-            "routing:    auto over [{}]",
-            cfg.provider.routing_candidates().join(", ")
-        );
-        if let Ok(store) = Store::open(&paths.db_file()) {
-            if let Ok(stats) = store.list_model_stats() {
-                let picked = formless_core::routing::select_model(&cfg.provider, &stats, false);
-                say!(
-                    "            simple task now routes to: {}",
-                    picked.as_deref().unwrap_or("(no candidates)")
-                );
-                for st in &stats {
-                    say!(
-                        "            {}: ok={} fail={} total_ms={}",
-                        st.model,
-                        st.successes,
-                        st.failures,
-                        st.total_ms
-                    );
+    if !quiet && formless_core::config::ProviderCfg::is_auto_model(&cfg.provider.model) {
+        match Store::open(&paths.db_file()).and_then(|store| doctor_auto_routing(&store, &cfg)) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
             }
+            Err(error) => println!("routing:    preview unavailable ({error:#})"),
         }
     }
     for provider in oauth_provider_statuses(&paths, &cfg) {
