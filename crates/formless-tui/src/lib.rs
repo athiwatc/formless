@@ -1,8 +1,10 @@
 mod branch_summary;
 pub mod client;
+mod clipboard_write;
 mod clipimg;
 mod commands;
 mod external_editor;
+pub use external_editor::windows_editor_command;
 mod external_editor_ui;
 mod highlight;
 mod history_search_view;
@@ -835,7 +837,7 @@ impl Wizard {
         // Remember previous startup options: a saved config starts at the
         // API-key step (Esc returns to the URL), with model/effort restored.
         let has_saved = !cfg.provider.base_url.trim().is_empty();
-        let preset = formless_core::presets::for_url(&cfg.provider.base_url);
+        let preset = formless_core::presets::for_provider(&cfg.provider);
         let (step, status) = if has_saved {
             (
                 WizardStep::ApiKey,
@@ -1121,6 +1123,14 @@ impl Wizard {
         self.status = status;
     }
 
+    fn apply_provider_endpoint(&self, provider: &mut formless_core::config::ProviderCfg) {
+        provider.base_url = self.base_url.trim().to_string();
+        provider.preset = self.preset.map(|preset| preset.id.to_string());
+        if let Some(preset) = self.preset {
+            provider.api_style = preset.api_style.to_string();
+        }
+    }
+
     /// List the endpoint's models in the background (`FetchModels`).
     fn fetch_models(&mut self) {
         if !self.normalize_key() {
@@ -1131,12 +1141,10 @@ impl Wizard {
         let generation = self.generation;
         self.step = WizardStep::FetchModels;
         self.status = format!("Fetching models from {}…", self.base_url.trim());
-        let (tx, mut cfg) = (self.job_tx.clone(), Config::default());
-        cfg.provider.base_url = self.base_url.trim().to_string();
-        if let Some(p) = self.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
-        let (pcfg, key) = (cfg.provider.clone(), self.api_key.clone());
+        let tx = self.job_tx.clone();
+        let mut pcfg = formless_core::config::ProviderCfg::default();
+        self.apply_provider_endpoint(&mut pcfg);
+        let key = self.api_key.clone();
         std::thread::spawn(move || {
             let _ = tx.send(WizardJob::Models(
                 generation,
@@ -1167,10 +1175,16 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
-        let endpoint = self
-            .local_offer_for(p.id)
-            .map(|offer| offer.base_url.clone())
-            .unwrap_or_else(|| p.base_url.to_string());
+        let endpoint = if p.local
+            && self.preset.is_some_and(|old| old.id == p.id)
+            && !self.base_url.trim().is_empty()
+        {
+            self.base_url.trim().to_string()
+        } else {
+            self.local_offer_for(p.id)
+                .map(|offer| offer.base_url.clone())
+                .unwrap_or_else(|| p.base_url.to_string())
+        };
         if self.preset.map(|old| old.id) != Some(p.id)
             || self.credential_endpoint != endpoint.trim()
         {
@@ -1706,6 +1720,7 @@ struct App {
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
     inbox: Option<mpsc::Receiver<ServerMessage>>,
+    clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
     session_idx: usize,
     session_filter: lists::ListFilter,
@@ -2095,6 +2110,7 @@ impl App {
             view: View::Chat,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -3966,6 +3982,13 @@ impl App {
                             }
                         }
                         Pending::SaveSetting => {
+                            if let Some(warnings) = result["routing_warnings"].as_array() {
+                                self.notes.extend(
+                                    warnings
+                                        .iter()
+                                        .filter_map(|warning| warning.as_str().map(str::to_owned)),
+                                );
+                            }
                             if let Some(key) = self.settings_saving.take() {
                                 self.notes.push(format!(
                                     "saved {key} = {} (used from the next Run)",
@@ -6804,6 +6827,7 @@ impl App {
                     Pending::RetryRun,
                     Request::RetryRun {
                         session_id,
+                        expected_run_id: None,
                         model,
                         keep_original,
                     },
@@ -8848,10 +8872,7 @@ impl App {
             w.status = "This endpoint uses no new key. Enter to confirm removing the previous endpoint's stored key, or Esc to go back. Nothing has been saved yet.".into();
             return Ok(());
         }
-        cfg.provider.base_url = w.base_url.trim().to_string();
-        if let Some(p) = w.preset {
-            cfg.provider.api_style = p.api_style.to_string();
-        }
+        w.apply_provider_endpoint(&mut cfg.provider);
         cfg.provider.model = w.model();
         cfg.provider.reasoning_effort = EFFORTS[w.effort_idx].map(str::to_string);
         if w.prompt_fallback {
@@ -9084,13 +9105,8 @@ impl App {
                     w.status = "Probing endpoint (connectivity + streaming + tool-calling)…".into();
                     let tx = w.job_tx.clone();
                     // The preset's API style (native Anthropic) applies to the probe too.
-                    let pcfg = formless_core::config::ProviderCfg {
-                        base_url: w.base_url.trim().to_string(),
-                        api_style: w
-                            .preset
-                            .map_or_else(|| "chat".into(), |p| p.api_style.to_string()),
-                        ..Default::default()
-                    };
+                    let mut pcfg = formless_core::config::ProviderCfg::default();
+                    w.apply_provider_endpoint(&mut pcfg);
                     let (key2, model) = (w.api_key.clone(), w.model());
                     std::thread::spawn(move || {
                         let _ = tx.send(WizardJob::Probe(
@@ -9503,6 +9519,15 @@ impl App {
                 return;
             }
             self.ctrl_c();
+            return;
+        }
+        if self.wizard.is_none()
+            && self.editor.is_none()
+            && self
+                .pager
+                .as_mut()
+                .is_some_and(|pager| pager_view::search_key(pager, &key))
+        {
             return;
         }
         if self.branch_summary.intent.is_some() && key.code == KeyCode::Esc {
@@ -11737,9 +11762,10 @@ impl App {
             ed.apply_modal_line(line);
             return;
         }
-        // Neither a pager nor a confirmation should interpret pasted text
-        // as typed commands, or let it reach a covered surface.
-        if self.pager.is_some() {
+        // Paste is literal query text while searching the pager. Otherwise
+        // it stops here so it cannot reach the covered surface.
+        if let Some(pager) = &mut self.pager {
+            pager.viewport.search_paste(text);
             return;
         }
         if let Some((query, selected)) = &mut self.switcher {
@@ -15766,13 +15792,23 @@ impl App {
     /// system clipboard too.
     fn copy_text(&mut self, text: &str, what: &str) {
         let mut out = stdout();
-        let _ = out.write_all(osc52(text).as_bytes());
-        let _ = out.flush();
-        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
-            let _ = formless_runtime::clipboard_write(text);
+        match out
+            .write_all(osc52(text).as_bytes())
+            .and_then(|()| out.flush())
+        {
+            Ok(()) => self.notes.push(format!(
+                "sent {what} to the terminal clipboard ({} chars)",
+                text.chars().count()
+            )),
+            Err(error) => self
+                .notes
+                .push(format!("terminal clipboard write failed: {error}")),
         }
-        self.notes
-            .push(format!("copied {what} ({} chars)", text.chars().count()));
+        if std::env::var_os("SSH_CONNECTION").is_none() && !cfg!(test) {
+            if let Err(error) = self.clipboard_write.submit(text.to_owned()) {
+                self.notes.push(format!("system clipboard: {error}"));
+            }
+        }
     }
 
     /// The queue binding to advertise: one that works in this terminal.
@@ -19484,7 +19520,10 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     );
 }
 
-pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use theme::{
+    colorblind_rgb, colorblind_rgb_on_background, terminal_has_light_background, tone_marker,
+    SemanticTone,
+};
 pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
@@ -19529,7 +19568,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         && std::env::var_os("COLORFGBG").is_none()
     {
         if let Some(bg) = theme::query_background(Duration::from_millis(150)) {
-            theme::set_kind(theme::kind_for_background(bg));
+            theme::set_background(theme::kind_for_background(bg));
         }
     }
     let mut out = stdout();
@@ -19559,6 +19598,9 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
+            if let Err(error) = app.clipboard_write.poll() {
+                app.notes.push(format!("system clipboard: {error}"));
+            }
             // SettingsChanged may have arrived through any connected client.
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
@@ -19764,6 +19806,7 @@ mod tests {
             wizard: None,
             client: None,
             inbox: None,
+            clipboard_write: Default::default(),
             sessions: Vec::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
@@ -25434,7 +25477,10 @@ mod tests {
         assert_eq!(app.call_focus.as_deref(), Some("msg:a2"));
         assert!(render(&mut app, 100, 30).contains("c copy · C copy as Markdown"));
         app.key(key(KeyCode::Char('c')));
-        assert_eq!(app.notes.last().unwrap(), "copied the answer (17 chars)");
+        assert_eq!(
+            app.notes.last().unwrap(),
+            "sent the answer to the terminal clipboard (17 chars)"
+        );
         app.key(key(KeyCode::Char('[')));
         app.key(key(KeyCode::Char('C')));
         assert_eq!(
@@ -25599,6 +25645,243 @@ mod tests {
         app.messages[1].content = "No tables in the newest answer".into();
         app.open_table("");
         assert!(app.notes.last().unwrap().contains("0 table(s)"));
+    }
+
+    #[test]
+    fn pager_search_finds_help_and_cycles_matching_lines() {
+        let mut app = test_app();
+        app.slash("help");
+        assert!(render(&mut app, 64, 8).contains("/ find"));
+        app.key(key(KeyCode::Char('/')));
+        app.paste("/mcp");
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 64, 8);
+        assert!(screen.contains("match 1/") && screen.contains("/mcp"));
+
+        app.pager = Some(Pager {
+            title: "fixture".into(),
+            lines: (0..24)
+                .map(|i| {
+                    if [3, 11, 21].contains(&i) {
+                        format!("needle {i:02} needle")
+                    } else {
+                        format!("row {i:02}")
+                    }
+                })
+                .collect(),
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Char('/')));
+        app.paste("needle");
+        app.key(key(KeyCode::Enter));
+        let enter = key(KeyCode::Enter);
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        for (movement, index, row) in [
+            (None, 1, 3),
+            (Some(enter), 2, 11),
+            (Some(shift_enter), 1, 3),
+            (Some(shift_enter), 3, 21),
+            (Some(key(KeyCode::Char('n'))), 1, 3),
+            (Some(key(KeyCode::Char('n'))), 2, 11),
+            (Some(key(KeyCode::Char('N'))), 1, 3),
+            (Some(key(KeyCode::Char('N'))), 3, 21),
+        ] {
+            if let Some(movement) = movement {
+                app.key(movement);
+            }
+            let screen = render(&mut app, 52, 6);
+            assert!(screen.contains(&format!("match {index}/3")), "{screen}");
+            assert!(screen.contains(&format!("needle {row:02}")), "{screen}");
+            let footer = screen.lines().last().unwrap();
+            assert!(footer.contains("needle") && footer.contains("Enter/Shift+Enter"));
+        }
+    }
+
+    #[test]
+    fn pager_search_owns_literal_keys_and_paste_in_each_review() {
+        for branch in [false, true] {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input.set("unsent fixture");
+            let (title, lines, needle) = if branch {
+                let (basis, preview) = branch_summary::fixture();
+                let lines = branch_summary::review_lines(&basis, &preview);
+                app.current = Some(preview.target_id.clone());
+                app.branch_summary.intent =
+                    Some((basis.source_id.clone(), basis.target_id.clone()));
+                app.branch_summary.basis = Some(basis);
+                app.branch_summary.review = Some(preview);
+                (
+                    "Branch summary · review exact note",
+                    lines,
+                    "Exact candidate note",
+                )
+            } else {
+                app.reviewing = Some("proposal-fixture".into());
+                (
+                    "proposal review",
+                    vec!["fixture match".into()],
+                    "fixture match",
+                )
+            };
+            app.pager = Some(Pager {
+                title: title.into(),
+                lines,
+                top: 0,
+                left: 0,
+                viewport: Default::default(),
+                styled: vec![],
+            });
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            app.key(key(KeyCode::Char('/')));
+            app.paste(needle);
+            app.key(key(KeyCode::Enter));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            let top = app.pager.as_ref().unwrap().top;
+
+            app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            for letter in "qgjarin".chars() {
+                app.key(key(KeyCode::Char(letter)));
+            }
+            app.paste("arqi\r\nไทย");
+            app.paste("e\u{301}");
+            app.key(key(KeyCode::Backspace));
+            let screen = render(&mut app, 62, 8);
+            assert!(screen.contains("Enter find · Esc cancel"), "{screen}");
+            assert!(screen.contains("qgjarinarqi ไทย▏"), "{screen}");
+            assert_eq!(app.pager.as_ref().unwrap().top, top);
+            assert!(
+                sent.try_recv().is_err(),
+                "query keys and paste must emit no requests"
+            );
+
+            app.key(key(KeyCode::Esc));
+            assert!(render(&mut app, 62, 8).contains("match 1/1"));
+            assert_eq!(app.branch_summary_review_is_visible(), branch);
+            assert_eq!(app.reviewing.is_some(), !branch);
+            app.paste("arqi");
+            assert!(sent.try_recv().is_err());
+            app.key(key(KeyCode::Esc));
+            assert!(app.pager.is_none() && app.reviewing.is_none());
+            assert!(app.branch_summary.review.is_none() && app.branch_summary.intent.is_none());
+            assert_eq!(app.input, "unsent fixture");
+        }
+    }
+
+    #[test]
+    fn pager_search_reveals_a_styled_unicode_match_after_resize() {
+        let mut app = test_app();
+        let prefix = "x".repeat(45);
+        let styled = Line::from(vec![
+            Span::styled("1 │ ", Style::default().fg(Color::Blue)),
+            Span::styled(prefix.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled("Stra", Style::default().fg(Color::Red)),
+            Span::styled("ße ไทย", Style::default().fg(Color::Green)),
+            Span::styled(" tail", Style::default().fg(Color::Yellow)),
+        ]);
+        app.pager = Some(Pager {
+            title: "code fixture".into(),
+            lines: vec![styled.to_string()],
+            top: 0,
+            left: 0,
+            viewport: pager_view::View::with_gutter(4),
+            styled: vec![styled],
+        });
+        app.key(key(KeyCode::Char('/')));
+        app.paste("STRASSE\r\nไทย");
+        app.key(key(KeyCode::Enter));
+        let screen = render(&mut app, 80, 8);
+        assert!(screen.contains("match 1/1") && screen.contains("Straße ไทย"));
+        assert_eq!(app.pager.as_ref().unwrap().left, 0);
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "1");
+        assert!(!buffer[(1, 1)].modifier.contains(Modifier::REVERSED));
+        for (symbol, color) in [("S", Color::Red), ("ß", Color::Green)] {
+            let cell = (5..23)
+                .map(|x| &buffer[(x, 1)])
+                .find(|cell| cell.symbol() == symbol)
+                .unwrap();
+            assert_eq!(cell.fg, color);
+            assert!(cell
+                .modifier
+                .contains(Modifier::UNDERLINED | Modifier::REVERSED));
+        }
+        let tail = (5..23)
+            .map(|x| &buffer[(x, 1)])
+            .find(|cell| cell.fg == Color::Yellow && cell.symbol() == "t")
+            .unwrap();
+        assert!(!tail.modifier.contains(Modifier::REVERSED));
+        let revealed = app.pager.as_ref().unwrap().left;
+        assert!(revealed > 0);
+        app.key(key(KeyCode::Left));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.pager.as_ref().unwrap().left, revealed - 8);
+        assert!(!term.backend().buffer()[(1, 1)]
+            .modifier
+            .contains(Modifier::REVERSED));
+
+        app.key(key(KeyCode::Char('/')));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste("missing");
+        app.key(key(KeyCode::Enter));
+        assert!(render(&mut app, 24, 8).contains("no match"));
+        app.key(key(KeyCode::Char('n')));
+        assert!(render(&mut app, 24, 8).contains("no match"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run only by the owned synthetic PTY driver"]
+    fn pager_search_owned_pty_fixture() {
+        use std::io::IsTerminal;
+
+        assert_eq!(std::env::var("PAGER_PTY_FIXTURE").as_deref(), Ok("1"));
+        assert!(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+        struct RawMode;
+        impl Drop for RawMode {
+            fn drop(&mut self) {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        }
+        crossterm::terminal::enable_raw_mode().unwrap();
+        let _raw = RawMode;
+        let mut app = test_app();
+        let prefix = "x".repeat(45);
+        let content = format!(
+            "{prefix}ไทย first\n{}{prefix}ไทย second",
+            "fixture row\n".repeat(12)
+        );
+        app.pager = Some(code_pager("PTY search fixture", &content, false));
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+        for phase in 0..=9 {
+            terminal.clear().unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            print!("\r\nPAGER-FRAME-{phase}\r\n");
+            std::io::stdout().flush().unwrap();
+            if app.pager.is_none() {
+                assert_eq!(phase, 9);
+                return;
+            }
+            assert!(
+                event::poll(Duration::from_secs(5)).unwrap(),
+                "phase {phase}"
+            );
+            match event::read().unwrap() {
+                CtEvent::Key(key) => app.key(key),
+                CtEvent::Paste(text) => app.paste(&text),
+                CtEvent::Resize(_, _) => app.resized(),
+                event => panic!("unexpected event in phase {phase}: {event:?}"),
+            }
+        }
+        panic!("pager did not close");
     }
 
     #[test]
