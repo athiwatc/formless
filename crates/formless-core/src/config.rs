@@ -822,6 +822,62 @@ pub const SETTABLE: &[&str] = &[
     "limits.",
 ];
 
+fn is_settable(key: &str) -> bool {
+    SETTABLE
+        .iter()
+        .any(|allowed| key == *allowed || (allowed.ends_with('.') && key.starts_with(allowed)))
+}
+
+fn documented_value<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    setting_key_parts(key)
+        .into_iter()
+        .try_fold(config, |value, part| value.get(part))
+}
+
+fn value_kind(value: Option<&serde_json::Value>) -> &'static str {
+    match value {
+        None => "missing",
+        Some(serde_json::Value::Null) => "null",
+        Some(serde_json::Value::String(value)) if value.is_empty() => "empty",
+        Some(_) => "value",
+    }
+}
+
+fn listing_redacts(key: &str, value: Option<&serde_json::Value>) -> bool {
+    let Some(value) = value else { return false };
+    if value.is_null()
+        || value.as_str().is_some_and(str::is_empty)
+        || value.as_array().is_some_and(Vec::is_empty)
+        || value.as_object().is_some_and(serde_json::Map::is_empty)
+    {
+        return false;
+    }
+    match key {
+        "provider.extra_body"
+        | "provider.query_params"
+        | "security.secret_patterns"
+        | "security.sensitive_paths"
+        | "security.trusted_paths"
+        | "security.trusted_hosts" => true,
+        "provider.base_url" | "provider.proxy" | "relay.url" => {
+            // Only show endpoint origins. Arbitrary paths, query parameters,
+            // fragments and user information can all carry credentials.
+            value
+                .as_str()
+                .and_then(|text| reqwest::Url::parse(text).ok())
+                .is_none_or(|url| {
+                    !url.username().is_empty()
+                        || url.password().is_some()
+                        || !matches!(url.path(), "" | "/")
+                        || url.query().is_some()
+                        || url.fragment().is_some()
+                        || crate::secrets::scan(url.as_str()).is_some()
+                })
+        }
+        _ => crate::secrets::scan(&value.to_string()).is_some(),
+    }
+}
+
 /// External MCP servers ((SPEC §7.9)). None ship by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1828,6 +1884,37 @@ impl NamingCfg {
 }
 
 impl Config {
+    /// Documented settings as loaded by this process, with credential-bearing
+    /// values withheld and actual defaults distinguished from SPEC prose.
+    pub fn local_settings(&self, filter: Option<&str>) -> Result<serde_json::Value> {
+        let loaded = serde_json::to_value(self)?;
+        let defaults = serde_json::to_value(Self::default())?;
+        let filter = filter.map(str::to_ascii_lowercase);
+        let rows: serde_json::Map<_, _> = setting_docs()
+            .into_iter()
+            .filter(|(key, _)| !CREDENTIAL_KEYS.contains(&key.as_str()))
+            .filter(|(key, _)| filter.as_ref().is_none_or(|filter| key.contains(filter)))
+            .map(|(key, (description, documented_default))| {
+                let effective = documented_value(&loaded, &key);
+                let default = documented_value(&defaults, &key);
+                let hidden = listing_redacts(&key, effective);
+                let changed = if hidden { None } else { effective.zip(default).map(|(a, b)| a != b) };
+                let row = serde_json::json!({
+                    "description": description,
+                    "settable": is_settable(&key),
+                    "effective": if hidden { None } else { effective },
+                    "effective_kind": if hidden { "redacted" } else { value_kind(effective) },
+                    "default": default,
+                    "default_kind": if default.is_none() { "documentation" } else { value_kind(default) },
+                    "default_documentation": documented_default,
+                    "changed": changed
+                });
+                (key, row)
+            })
+            .collect();
+        Ok(serde_json::json!({"scope": "local", "settings": rows}))
+    }
+
     /// The config to carry to another machine (`export-all`, SPEC §15):
     /// everything, with values that can hold credentials blanked —
     /// providers' `extra_headers` and auth secrets/tokens, MCP servers'
@@ -1907,11 +1994,7 @@ impl Config {
             .as_object()
             .into_iter()
             .flat_map(|docs| docs.keys())
-            .filter(|key| {
-                SETTABLE.iter().any(|allowed| {
-                    key.as_str() == *allowed || (allowed.ends_with('.') && key.starts_with(allowed))
-                })
-            })
+            .filter(|key| is_settable(key))
             .map(|key| {
                 (
                     key.clone(),
@@ -2048,9 +2131,7 @@ impl Config {
         if parts.iter().any(|p| p.is_empty()) {
             anyhow::bail!("empty setting key segment");
         }
-        if !SETTABLE
-            .iter()
-            .any(|p| key == *p || (p.ends_with('.') && key.starts_with(p)))
+        if !is_settable(key)
             && !SETTING_MAPS.iter().any(|root| {
                 key.strip_prefix(root)
                     .is_some_and(|s| s.starts_with('.') && s.len() > 1)
