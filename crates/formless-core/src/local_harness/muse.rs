@@ -381,13 +381,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 None => self.receive().await?,
             };
             if event.get("method").is_none() {
-                let method = event["id"]
-                    .as_u64()
-                    .and_then(|id| pending.remove(&id))
-                    .context("Muse Code sent an unexpected MSP response")?;
-                if response_result(event, method)?["status"] != "accepted" {
-                    bail!("Muse Code did not accept {method}");
-                }
+                confirm_decision(event, &mut pending)?;
                 continue;
             }
             let method = event["method"]
@@ -461,10 +455,21 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                 continue;
             }
             if method == "turn/completed" && params["turnId"] == turn {
-                if !pending.is_empty() {
-                    bail!("Muse Code completed the turn with unconfirmed decisions");
-                }
-                return output.complete(params);
+                let message = output.complete(params)?;
+                tokio::time::timeout(START_TIMEOUT, async {
+                    while !pending.is_empty() {
+                        let event = self.receive().await?;
+                        if event.get("method").is_none() {
+                            confirm_decision(event, &mut pending)?;
+                        } else if event.get("id").is_some() {
+                            bail!("Muse Code presented another request after the turn ended");
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .context("Muse Code completed the turn with unconfirmed decisions")??;
+                return Ok(message);
             }
             if let Some(message) = output.message(method, params, turn) {
                 handler.on_update(HarnessUpdate::Message {
@@ -473,6 +478,18 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
             }
         }
     }
+}
+
+fn confirm_decision(event: Value, pending: &mut BTreeMap<u64, &str>) -> Result<()> {
+    let method = event["id"]
+        .as_u64()
+        .and_then(|id| pending.remove(&id))
+        .context("Muse Code sent an unexpected MSP response")?;
+    anyhow::ensure!(
+        response_result(event, method)?["status"] == "accepted",
+        "Muse Code did not accept {method}"
+    );
+    Ok(())
 }
 
 fn decode<T: serde::de::DeserializeOwned>(value: &Value, kind: &str) -> Result<T> {
@@ -1067,13 +1084,6 @@ mod tests {
                 answer["params"]["answers"],
                 json!([{"questionId": "format", "selectedLabel": "CSV"}])
             );
-            server
-                .send(
-                    json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": "accepted"}}),
-                )
-                .await
-                .unwrap();
-
             let item = json!({"itemId": "message", "kind": "agentMessage", "turnId": "turn", "messagePhase": "finalAnswer", "text": "Fixture done"});
             for (method, params) in [
                 (
@@ -1102,6 +1112,12 @@ mod tests {
                     .await
                     .unwrap();
             }
+            server
+                .send(
+                    json!({"jsonrpc": "2.0", "id": answer["id"], "result": {"status": "accepted"}}),
+                )
+                .await
+                .unwrap();
         };
         let (result, ()) = tokio::time::timeout(START_TIMEOUT, async {
             tokio::join!(
