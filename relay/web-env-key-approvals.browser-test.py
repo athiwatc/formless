@@ -74,8 +74,13 @@ def check(page):
         ('OPENAIAPIKEY', 'hour'),
         ('ENCRYPTIONKEY', 'always'),
         ('HMACKEY', 'session'),
+        ('MYSQL_PWD', 'session'),
+        ('db_pwd', 'always'),
         ('PRIMARY_KEY_TOKEN', 'session'),
         ('SSH_AUTH_SOCK', 'hour'),
+        ('DATABASE_URL', 'session'),
+        ('redis_url', 'hour'),
+        ('MONGODB_URI', 'always'),
     ]:
         queue(name)
         assert labels.all_text_contents() == [f'env:{name}'], name
@@ -86,7 +91,8 @@ def check(page):
         decided(scope)
 
     for name in ('MONKEY', 'TURKEY', 'DONKEY', 'HOCKEY', 'JOCKEY', 'HOTKEY', 'PRIMARY_KEY',
-                 'foreign_key', 'UNIQUE_KEY', 'CANDIDATE_KEY', 'SORT_KEY', 'PARTITION_KEY', 'HOME'):
+                 'foreign_key', 'UNIQUE_KEY', 'CANDIDATE_KEY', 'SORT_KEY', 'PARTITION_KEY', 'HOME',
+                 'PUBLIC_URL', 'DATABASE_URL_SAMPLE'):
         queue(name)
         assert labels.count() == 0, name
         click('always')
@@ -96,6 +102,11 @@ def check(page):
     assert labels.all_text_contents() == ['env:AWS_ACCESS_KEY_ID']
     click('once')
     decided('once')
+
+    queue('PWD', 'OLDPWD')
+    assert labels.count() == 0
+    click('always')
+    decided('always')
 
 
 def main():
