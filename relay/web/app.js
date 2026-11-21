@@ -3592,6 +3592,7 @@
   }
 
   async function setSessionModel(model, effort) {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     if (!S.current) return toast("No current session.", true);
     const req = { type: "set_session_model", id: S.current, model };
     if (effort !== undefined) req.reasoning_effort = effort;
@@ -3646,6 +3647,7 @@
   }
   let modelPickerSequence = 0;
   async function openModelPicker(onPick) {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     const selectionOnly = typeof onPick === "function";
     const session = S.sessions.find((x) => x.id === S.current);
     const model = storedSessionModel(session);
@@ -5086,6 +5088,7 @@
     $("send-btn").disabled = !!attempt;
     $("attach-btn").disabled = !!attempt;
     $("fork-btn").disabled = !!attempt;
+    $("status-model").disabled = !!attempt;
     $("propose-topic").hidden = !S.topicsAvailable || !S.current || !!attempt;
     if (attempt) {
       $("input").placeholder = "Read-only harness transcript · continue in the topic chat";
