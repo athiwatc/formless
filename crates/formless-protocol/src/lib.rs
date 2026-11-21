@@ -80,6 +80,9 @@ pub enum WorkspaceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TopicArtifact {
+    Directory {
+        path: String,
+    },
     GitRevision {
         revision: String,
     },
@@ -196,6 +199,12 @@ pub struct TopicFeatureInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicInfo {
     pub id: String,
+    #[serde(default)]
+    pub allow_external_context: bool,
+    #[serde(default)]
+    pub permission_rules: Vec<TopicPermissionRule>,
+    #[serde(default)]
+    pub limits: TopicLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_topic_id: Option<String>,
     pub name: String,
@@ -212,6 +221,113 @@ pub struct TopicInfo {
     pub updated_at: String,
 }
 
+#[cfg(test)]
+mod topic_context_wire_tests {
+    use super::*;
+    #[test]
+    fn topic_context_access_defaults_and_client_only_operations() {
+        let request = Request::SetTopicContextAccess {
+            topic_id: "topic".into(),
+            allow: true,
+        };
+        assert!(matches!(
+            serde_json::from_value::<Request>(serde_json::to_value(request).unwrap()).unwrap(),
+            Request::SetTopicContextAccess { allow: true, .. }
+        ));
+        let topic:TopicInfo=serde_json::from_value(serde_json::json!({"id":"t","name":"T","workspace":null,"workspace_kind":"scratch","base_revision":null,"outline":[],"source_session_id":"s","topic_session_id":null,"status":"pending_approval","features":[],"attempts":[],"created_at":"2026","updated_at":"2026"})).unwrap();
+        assert!(!topic.allow_external_context);
+        let op = TopicMcpOperation::SearchConversations {
+            query: "needle".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(op).unwrap(),
+            serde_json::json!({"operation":"search_conversations","query":"needle"})
+        );
+        assert!(serde_json::from_value::<TopicMcpOperation>(
+            serde_json::json!({"operation":"set_topic_context_access","topic_id":"t","allow":true})
+        )
+        .is_err());
+    }
+    #[test]
+    fn topic_round_additive_types_and_defaults() {
+        let limits: TopicLimits = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(limits, TopicLimits::default());
+        assert_eq!(
+            (limits.max_retries_per_step, limits.max_attempts_per_topic),
+            (3, 20)
+        );
+        assert!(serde_json::from_value::<TopicLimits>(
+            serde_json::json!({"max_retries_per_step":-1})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<TopicLimits>(
+            serde_json::json!({"max_attempts_per_topic":4294967296_u64})
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::to_value(TopicArtifact::Directory {
+                path: "copy".into()
+            })
+            .unwrap(),
+            serde_json::json!({"kind":"directory","path":"copy"})
+        );
+        assert_eq!(
+            serde_json::to_value(Request::ListHarnesses).unwrap(),
+            serde_json::json!({"type":"list_harnesses"})
+        );
+        let event: Event = serde_json::from_value(
+            serde_json::json!({"type":"user_question_closed","question_id":"q"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::UserQuestionClosed {
+                answered_by: None,
+                ..
+            }
+        ));
+        for op in [
+            "add_topic_permission_rule",
+            "remove_topic_permission_rule",
+            "set_topic_limits",
+            "list_harnesses",
+        ] {
+            assert!(serde_json::from_value::<TopicMcpOperation>(
+                serde_json::json!({"operation":op})
+            )
+            .is_err());
+        }
+        let availability = HarnessAvailability {
+            kind: HarnessKind::Claude,
+            acp_agent: None,
+            installed: true,
+            signed_in: None,
+            version: None,
+            detail: None,
+        };
+        assert_eq!(
+            serde_json::from_value::<HarnessAvailability>(
+                serde_json::to_value(&availability).unwrap()
+            )
+            .unwrap(),
+            availability
+        );
+        let rule = TopicPermissionRule {
+            rule_id: "r".into(),
+            harness: None,
+            acp_agent: None,
+            kind: None,
+            pattern: "cargo *".into(),
+            decision: TopicRuleDecision::AllowOnce,
+        };
+        assert_eq!(
+            serde_json::from_value::<TopicPermissionRule>(serde_json::to_value(&rule).unwrap())
+                .unwrap(),
+            rule
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopicAttemptStatus {
@@ -221,6 +337,52 @@ pub enum TopicAttemptStatus {
     Failed,
     Abandoned,
     Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicPermissionRule {
+    pub rule_id: String,
+    pub harness: Option<HarnessKind>,
+    pub acp_agent: Option<String>,
+    pub kind: Option<String>,
+    /// Case-sensitive full-string glob: '*' spans any characters, '?' one.
+    /// Match the title OR raw_input.command when that field is a string.
+    pub pattern: String,
+    pub decision: TopicRuleDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicRuleDecision {
+    AllowOnce,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TopicLimits {
+    /// Inclusive u32 range; zero allows a first attempt but no retry.
+    pub max_retries_per_step: u32,
+    /// Inclusive u32 range; zero prevents launching any attempt.
+    pub max_attempts_per_topic: u32,
+}
+impl Default for TopicLimits {
+    fn default() -> Self {
+        Self {
+            max_retries_per_step: 3,
+            max_attempts_per_topic: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessAvailability {
+    pub kind: HarnessKind,
+    pub acp_agent: Option<String>,
+    pub installed: bool,
+    pub signed_in: Option<bool>,
+    pub version: Option<String>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +420,9 @@ pub enum TopicMcpOperation {
         questions: Vec<Question>,
     },
     ListConversations,
+    SearchConversations {
+        query: String,
+    },
     ReadConversation {
         session_id: String,
     },
@@ -2360,6 +2525,27 @@ pub enum Request {
         rejection: TopicRejectionRequest,
     },
     ListTopics,
+    AddTopicPermissionRule {
+        topic_id: String,
+        harness: Option<HarnessKind>,
+        acp_agent: Option<String>,
+        kind: Option<String>,
+        pattern: String,
+        decision: TopicRuleDecision,
+    },
+    RemoveTopicPermissionRule {
+        topic_id: String,
+        rule_id: String,
+    },
+    SetTopicLimits {
+        topic_id: String,
+        limits: TopicLimits,
+    },
+    ListHarnesses,
+    SetTopicContextAccess {
+        topic_id: String,
+        allow: bool,
+    },
     GetTopic {
         topic_id: String,
     },
@@ -3728,6 +3914,8 @@ pub enum Event {
     /// structured form (1–4); `question`/`options` summarise it for
     /// clients that predate it.
     UserQuestion {
+        #[serde(default)]
+        user_only: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         topic_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3760,6 +3948,8 @@ pub enum Event {
     },
     /// A question was answered (or abandoned): clients close their prompt.
     UserQuestionClosed {
+        #[serde(default)]
+        answered_by: Option<String>,
         question_id: String,
     },
     /// The clients showing a Session (subscribed to it), sent to them

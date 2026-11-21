@@ -647,7 +647,7 @@ async fn acknowledged_question_survives_both_ready_cancel_exactly_once() {
     );
     let mut closed = 0;
     while let Ok(message) = events.try_recv() {
-        if matches!(message, ServerMessage::Event(Event::UserQuestionClosed {question_id:id}) if id == question_id)
+        if matches!(message, ServerMessage::Event(Event::UserQuestionClosed {question_id:id, .. }) if id == question_id)
         {
             closed += 1;
         }

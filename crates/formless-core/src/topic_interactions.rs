@@ -178,6 +178,7 @@ impl Drop for Lease {
                 .is_some()
             {
                 self.daemon.broadcast(Event::UserQuestionClosed {
+                    answered_by: None,
                     question_id: self.id.clone(),
                 });
             }
@@ -365,7 +366,10 @@ impl Daemon {
         for id in ids {
             self.questions.locked().remove(&id);
             if self.topic_questions.locked().remove(&id).is_some() {
-                self.broadcast(Event::UserQuestionClosed { question_id: id });
+                self.broadcast(Event::UserQuestionClosed {
+                    answered_by: None,
+                    question_id: id,
+                });
             }
         }
     }
@@ -427,6 +431,7 @@ impl Daemon {
                     .locked()
                     .insert(id.clone(), (attempt.topic_id.clone(), attempt.id.clone()));
                 self.broadcast(Event::UserQuestion {
+                    user_only: false,
                     question_id: id.clone(),
                     session_id: attempt.conversation_session_id.clone(),
                     topic_id: Some(attempt.topic_id.clone()),

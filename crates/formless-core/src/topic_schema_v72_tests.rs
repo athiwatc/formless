@@ -155,7 +155,53 @@ fn topic_schema_v72_preserves_v2_v71_topics_and_relaxes_source_fk() {
     );
     drop(store);
     let reopened = Store::open(&file).unwrap();
+    assert!(
+        !reopened
+            .get_topic("legacy")
+            .unwrap()
+            .unwrap()
+            .allow_external_context
+    );
+    reopened.set_topic_context_access("legacy", true).unwrap();
+    drop(reopened);
+    let reopened = Store::open(&file).unwrap();
+    assert!(
+        reopened
+            .get_topic("legacy")
+            .unwrap()
+            .unwrap()
+            .allow_external_context
+    );
     assert_eq!(reopened.list_topics().unwrap().len(), 1);
     drop(reopened);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn topic_schema_v72_preserves_legacy_parent_links_and_cascades() {
+    for source_is_parent in [true, false] {
+        let (root, file) = legacy_file(true);
+        let c = Connection::open(&file).unwrap();
+        c.execute_batch("INSERT INTO sessions(id,name,created_at,updated_at,parent_session_id,session_kind,topic_id)
+            VALUES('child-chat','Child','2026','2026','chat','topic','child');").unwrap();
+        c.execute("INSERT INTO topics(id,name,repo,base_revision,source_session_id,topic_session_id,status,builder_kind,reviewer_kind,created_at,updated_at)
+            SELECT 'child','Child',repo,base_revision,?1,'child-chat','approved',builder_kind,reviewer_kind,created_at,updated_at FROM topics WHERE id='legacy'",
+            [if source_is_parent {"chat"}else{"source"}]).unwrap();
+        drop(c);
+        let store = Store::open(&file).unwrap();
+        assert_eq!(
+            store
+                .get_topic("child")
+                .unwrap()
+                .unwrap()
+                .parent_topic_id
+                .as_deref(),
+            Some("legacy")
+        );
+        store.delete_session("chat").unwrap();
+        assert!(store.get_topic("child").unwrap().is_none());
+        assert!(store.get_session("child-chat").unwrap().is_none());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

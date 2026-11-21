@@ -468,6 +468,7 @@ mod tests {
     use super::*;
     fn event() -> Event {
         Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: "q".into(),
@@ -574,6 +575,7 @@ mod tests {
         let json = serde_json::to_value(&question).unwrap();
         directory.event(&question);
         directory.event(&Event::UserQuestionClosed {
+            answered_by: None,
             question_id: "q".into(),
         });
         assert!(!directory.snapshot(std::slice::from_ref(&json), revision));
@@ -595,6 +597,7 @@ mod tests {
         let mut directory = Directory::default();
         for index in 0..MAX_CLOSED + 20 {
             directory.event(&Event::UserQuestionClosed {
+                answered_by: None,
                 question_id: format!("closed-{index}"),
             });
         }
