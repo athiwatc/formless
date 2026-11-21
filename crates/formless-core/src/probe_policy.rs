@@ -27,6 +27,36 @@ struct Inner {
     timed_out: AtomicBool,
     incomplete_transport: AtomicBool,
     observed: Mutex<Observed>,
+    model: Mutex<Option<ModelIdentity>>,
+}
+
+struct ModelIdentity {
+    requested: String,
+    mismatch: Option<String>,
+}
+
+fn same_model(requested: &str, reported: &str) -> bool {
+    if requested == reported {
+        return true;
+    }
+    let alias = if requested.starts_with("claude-") {
+        requested.strip_suffix("-latest").unwrap_or(requested)
+    } else {
+        requested
+    };
+    let Some(suffix) = reported.strip_prefix(alias) else {
+        return false;
+    };
+    if suffix == ":latest" && !requested.contains(':') {
+        return true;
+    }
+    let Some(date) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    (date.len() == 10 && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok())
+        || (alias.starts_with("claude-")
+            && date.len() == 8
+            && chrono::NaiveDate::parse_from_str(date, "%Y%m%d").is_ok())
 }
 #[derive(Default)]
 struct Observed {
@@ -60,7 +90,60 @@ impl ProbePolicy {
             timed_out: AtomicBool::new(false),
             incomplete_transport: AtomicBool::new(false),
             observed: Mutex::new(Observed::default()),
+            model: Mutex::new(None),
         }))
+    }
+
+    /// Azure's URL identifies the deployment, while the reply names its
+    /// backing model. Those identifiers describe different things.
+    pub(crate) fn verify_model(&self, model: &str, base_url: &str) {
+        let deployment = reqwest::Url::parse(base_url).ok().is_some_and(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .rsplit_once('/')
+                .is_some_and(|(path, name)| path.ends_with("/openai/deployments") && name == model)
+        });
+        if !deployment {
+            *self.0.model.locked() = Some(ModelIdentity {
+                requested: model.into(),
+                mismatch: None,
+            });
+        }
+    }
+
+    pub(crate) fn observe_model(&self, response: &Value) {
+        let mut guard = self.0.model.locked();
+        let Some(identity) = guard
+            .as_mut()
+            .filter(|identity| identity.mismatch.is_none())
+        else {
+            return;
+        };
+        let reports = [
+            &response["model"],
+            &response["response"]["model"],
+            &response["message"]["model"],
+        ];
+        for reported in reports.into_iter().filter_map(Value::as_str).map(str::trim) {
+            if !reported.is_empty() && !same_model(&identity.requested, reported) {
+                identity.mismatch = Some(
+                    reported
+                        .chars()
+                        .take(160)
+                        .flat_map(char::escape_default)
+                        .collect(),
+                );
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn model_mismatch(&self) -> Option<String> {
+        self.0
+            .model
+            .locked()
+            .as_ref()
+            .and_then(|model| model.mismatch.clone())
     }
     #[cfg(test)]
     pub(crate) fn limited(duration: Duration, sends: usize) -> Self {
@@ -311,6 +394,36 @@ impl ProbePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_identity_accepts_documented_snapshot_and_deployment_names() {
+        for (requested, reported, equal) in [
+            ("gpt-4o", "gpt-4o-2024-08-06", true),
+            ("gpt-4o-2024-08-06", "gpt-4o-2024-11-20", false),
+            ("gpt-4o", "gpt-4o-mini-2024-07-18", false),
+            ("gpt-4o", "gpt-4o-2024-21-45", false),
+            (
+                "claude-3-5-sonnet-latest",
+                "claude-3-5-sonnet-20241022",
+                true,
+            ),
+            ("qwen3", "qwen3:latest", true),
+            ("qwen3:8b", "qwen3:latest", false),
+        ] {
+            assert_eq!(
+                same_model(requested, reported),
+                equal,
+                "{requested} vs {reported}"
+            );
+        }
+        let policy = ProbePolicy::default();
+        policy.verify_model("daily", "https://example.test/openai/deployments/daily");
+        policy.observe_model(&json!({"model":"gpt-4o-2024-08-06"}));
+        assert!(policy.model_mismatch().is_none());
+        policy.verify_model("daily", "https://example.test/v1");
+        policy.observe_model(&json!({"response":{"model":"other"}}));
+        assert_eq!(policy.model_mismatch().as_deref(), Some("other"));
+    }
     #[test]
     fn finalization_overrules_hostile_fields_and_never_drops_a_rejected_cap() {
         let policy = ProbePolicy::default();
