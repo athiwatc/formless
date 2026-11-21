@@ -5,8 +5,16 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard,
 };
+
+fn lock_executable_fixture() -> MutexGuard<'static, ()> {
+    // A concurrent fork can inherit a writable descriptor while another test
+    // copies an executable, causing ETXTBSY until the child closes it.
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[test]
 #[ignore = "private executable helper"]
@@ -39,6 +47,7 @@ fn effective_path_helper() {
             assert!(!f.root.join("started").exists());
         }
         println!("PRIVATE_PARENT_PATH_PROBE_PASSED");
+        drop(f);
         std::process::exit(0);
     }
     let Some(marker) = std::env::var_os("FL_EFFECTIVE_PATH_MARKER") else {
@@ -60,9 +69,11 @@ struct Fixture {
     project: PathBuf,
     private: PathBuf,
     program: String,
+    _lock: MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
+        let lock = lock_executable_fixture();
         let root = std::env::temp_dir().join(format!("fl-effective-path-{}", uuid::Uuid::new_v4()));
         let project = root.join("project");
         let private = project.join("profile");
@@ -81,6 +92,7 @@ impl Fixture {
             project,
             private,
             program,
+            _lock: lock,
         }
     }
     fn request(&self, api: &str, relative: bool) -> ExecRequest {
@@ -305,6 +317,7 @@ fn explicit_child_relative_programs_are_guarded_and_bound_without_path_lookup() 
 }
 
 fn parent_path_probe(probe: &str) {
+    let _lock = lock_executable_fixture();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

@@ -53,15 +53,55 @@ fn name_tokens(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn schema_fields(schema: &str) -> BTreeSet<String> {
-    serde_json::from_str::<serde_json::Value>(schema)
-        .ok()
-        .and_then(|v| {
-            v["properties"]
-                .as_object()
-                .map(|p| p.keys().cloned().collect())
-        })
-        .unwrap_or_default()
+fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(schema).ok()?;
+    let schema = value.as_object()?;
+    // A list of top-level properties cannot describe composed or dynamic
+    // input shapes. Leave their field similarity unknown.
+    if schema.keys().any(|keyword| {
+        matches!(
+            keyword.as_str(),
+            "$ref"
+                | "$dynamicRef"
+                | "$recursiveRef"
+                | "allOf"
+                | "anyOf"
+                | "oneOf"
+                | "const"
+                | "enum"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "patternProperties"
+                | "propertyNames"
+                | "dependentSchemas"
+                | "dependentRequired"
+                | "dependencies"
+        )
+    }) || schema.get("type").is_some_and(|kind| kind != "object")
+        || ["additionalProperties", "unevaluatedProperties"]
+            .iter()
+            .any(|name| schema.get(*name).is_some_and(|policy| policy != false))
+    {
+        return None;
+    }
+    let mut fields = match schema.get("properties") {
+        Some(properties) => properties.as_object()?.keys().cloned().collect(),
+        None => BTreeSet::new(),
+    };
+    if let Some(required) = schema.get("required") {
+        for field in required.as_array()? {
+            fields.insert(field.as_str()?.to_owned());
+        }
+    }
+    let minimum = schema
+        .get("minProperties")
+        .map_or(Some(0), serde_json::Value::as_u64)?;
+    if minimum > fields.len() as u64 {
+        return None;
+    }
+    Some(fields)
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
@@ -100,10 +140,9 @@ pub fn similarity(
     }
     let name = jaccard(&name_tokens(&a.0.name), &name_tokens(&b.0.name));
     let desc = jaccard(&words(&a.0.description), &words(&b.0.description));
-    let fields = fields_alike(
-        &schema_fields(&a.1.input_schema),
-        &schema_fields(&b.1.input_schema),
-    );
+    let fields = schema_fields(&a.1.input_schema)
+        .zip(schema_fields(&b.1.input_schema))
+        .map_or(0.0, |(a, b)| fields_alike(&a, &b));
     let score = 0.4 * name + 0.3 * desc + 0.3 * fields;
     let mut why = Vec::new();
     if name >= 0.5 {

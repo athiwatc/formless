@@ -1,7 +1,7 @@
 // Room teardown and controls use the production bounded protocol over real
 // SQLite, with only native WebSocket runtime objects replaced by fixtures.
 import assert from 'node:assert/strict';
-import {SECURITY_HEADERS} from './worker.js';
+import worker, {SECURITY_HEADERS} from './worker.js';
 import {roomFixture,controls,ackControls} from './test-room-state.mjs';
 const f=roomFixture();
 try{
@@ -20,6 +20,32 @@ try{
  assert.match(SECURITY_HEADERS['content-security-policy'],/connect-src 'self';/);
  console.log('room ok');
 }finally{f.close();}
-const worker=(await import('./worker.js')).default;
-const health=await(await worker.fetch(new Request('https://relay.test/health'),{VAPID_PUBLIC_KEY:'x',VAPID_PRIVATE_JWK:'{bad'})).json();
-assert.equal(health.push,'misconfigured');assert.ok(!JSON.stringify(health).includes('{bad'));console.log('health ok');
+
+function assertFrontendHeaders(response, https = true) {
+  assert.equal(response.headers.get('strict-transport-security'), https ? 'max-age=31536000; includeSubDomains' : null);
+  assert.equal(response.headers.get('permissions-policy'), 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  assert.equal(response.headers.get('cross-origin-opener-policy'), 'same-origin');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.match(response.headers.get('content-security-policy'), /connect-src 'self';/);
+}
+
+const healthResponse = await worker.fetch(new Request('https://relay.test/health'), {VAPID_PUBLIC_KEY: 'x', VAPID_PRIVATE_JWK: '{bad'});
+assertFrontendHeaders(healthResponse);
+assert.match(healthResponse.headers.get('content-type'), /^application\/json/);
+const health = await healthResponse.json();
+assert.equal(health.push, 'misconfigured');
+assert.ok(!JSON.stringify(health).includes('{bad'));
+const noPush = await worker.fetch(new Request('https://relay.test/push/key'), {});
+assert.equal(noPush.status, 404);
+assertFrontendHeaders(noPush);
+
+const source = new Response('fixture', {headers: {'content-type': 'text/html', 'etag': '"fixture"'}});
+const asset = await worker.fetch(new Request('https://relay.test/'), {ASSETS: {fetch: () => source}});
+assertFrontendHeaders(asset);
+assert.equal(asset.headers.get('content-type'), 'text/html');
+assert.equal(asset.headers.get('etag'), '"fixture"');
+assert.equal(await asset.text(), 'fixture');
+assert.equal(source.headers.get('strict-transport-security'), null);
+const localHealth = await worker.fetch(new Request('http://127.0.0.1:8787/health'), {});
+assertFrontendHeaders(localHealth, false);
+console.log('frontend response headers ok');

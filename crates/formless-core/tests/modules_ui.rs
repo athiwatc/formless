@@ -5,6 +5,76 @@ use formless_protocol::Request;
 use formless_runtime::Capabilities;
 use std::sync::Arc;
 
+#[test]
+fn module_dependents_scan_current_active_code_with_literal_unicode_matching() {
+    let root = std::env::temp_dir().join(format!("fl-module-dependents-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("registry.db");
+    let store = Store::open(&db).unwrap();
+    let name = "Módulo_日本語";
+    assert!(store.module_dependents(name).unwrap().is_empty());
+
+    let save = |tool, code| {
+        store
+            .create_tool_version(
+                tool,
+                "fixture",
+                "{}",
+                "{}",
+                code,
+                &Capabilities::default(),
+                64,
+                "user",
+            )
+            .unwrap()
+            .0
+    };
+    for (tool, code) in [
+        ("Zulu", "ReQuIrEmOdUlE('MÓDULO_日本語')"),
+        ("alpha", "Modules.Load(\"módulo_日本語\")"),
+        ("Bravo", "requireModule(`módulo_日本語`)"),
+        ("d_comment", "// modules.load('módulo_日本語')"),
+        ("e_space", "requireModule ('módulo_日本語')"),
+        ("f_computed", "modules.load(prefix + 'módulo_日本語')"),
+        ("g_different", "modules.load('módulo_日本語-other')"),
+        ("h_stale", "requireModule('módulo_日本語')"),
+    ] {
+        save(tool, code);
+    }
+    save("h_stale", "function run() {}");
+    let retired = save("i_retired", "modules.load('módulo_日本語')");
+    store.set_tool_retired(&retired.id, true).unwrap();
+
+    assert_eq!(
+        store.module_dependents(name).unwrap(),
+        ["alpha", "Bravo", "d_comment", "Zulu"]
+    );
+    assert!(store.module_dependents("unrelated").unwrap().is_empty());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE tools SET current_version=999 WHERE id=?1",
+        [&retired.id],
+    )
+    .unwrap();
+    assert!(store.module_dependents(name).is_ok());
+    conn.execute(
+        "UPDATE tools SET current_version=999 WHERE name_lower='g_different'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .module_dependents(name)
+            .unwrap_err()
+            .downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::QueryReturnedNoRows)
+    ));
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn modules_open_edit_roll_back_and_delete() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
