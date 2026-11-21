@@ -36,6 +36,196 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
+pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessKind {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessRole {
+    Build,
+    Review,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicProposalRequest {
+    pub source_session_id: String,
+    pub message_ids: Vec<String>,
+    #[serde(default)]
+    pub features: Vec<TopicFeatureProposal>,
+    pub name: String,
+    pub repo: std::path::PathBuf,
+    pub builder: HarnessKind,
+    pub builder_model: Option<String>,
+    pub reviewer: HarnessKind,
+    pub reviewer_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFeatureProposal {
+    pub source_message_id: String,
+    pub request: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicApprovalRequest {
+    pub topic_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicRejectionRequest {
+    pub topic_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicAttemptRequest {
+    pub topic_id: String,
+    pub feature_id: String,
+    pub capability_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicAttemptFailureRequest {
+    pub attempt_id: String,
+    pub capability_token: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicRecoveryRequest {
+    pub topic_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFeatureRetryRequest {
+    pub topic_id: String,
+    pub feature_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicMcpRequest {
+    pub attempt_id: String,
+    pub capability_token: String,
+    pub operation: TopicMcpOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicStatus {
+    PendingApproval,
+    Approved,
+    Rejected,
+    Running,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicFeatureStatus {
+    Pending,
+    Building,
+    Reviewing,
+    Ready,
+    NeedsUser,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicFeatureInfo {
+    pub id: String,
+    pub source_message_id: String,
+    pub source_seq: i64,
+    pub request: String,
+    pub status: TopicFeatureStatus,
+    pub active_attempt_id: Option<String>,
+    pub ready_revision: Option<String>,
+    pub review_round: u32,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicInfo {
+    pub id: String,
+    pub name: String,
+    pub repo: std::path::PathBuf,
+    pub base_revision: String,
+    pub source_session_id: String,
+    pub topic_session_id: Option<String>,
+    pub status: TopicStatus,
+    pub builder: HarnessKind,
+    pub builder_model: Option<String>,
+    pub reviewer: HarnessKind,
+    pub reviewer_model: Option<String>,
+    pub features: Vec<TopicFeatureInfo>,
+    pub attempts: Vec<TopicAttemptInfo>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicAttemptStatus {
+    Building,
+    AwaitingReview,
+    Reviewing,
+    Passed,
+    Findings,
+    NeedsUser,
+    Failed,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicAttemptInfo {
+    pub id: String,
+    pub topic_id: String,
+    pub feature_id: String,
+    pub round: u32,
+    pub role: HarnessRole,
+    pub harness: HarnessKind,
+    pub status: TopicAttemptStatus,
+    pub conversation_session_id: String,
+    pub revision: Option<String>,
+    pub harness_session_id: Option<String>,
+    pub detail: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TopicReviewOutcome {
+    Passed,
+    Findings { detail: String },
+    NeedsUser { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum TopicMcpOperation {
+    ListConversations,
+    ReadConversation {
+        session_id: String,
+    },
+    AppendConversation {
+        content: String,
+    },
+    ReadyForReview {
+        revision: String,
+        test_report: String,
+    },
+    SubmitReview {
+        revision: String,
+        outcome: TopicReviewOutcome,
+    },
+}
 /// Disable Step mode only if the Session is still idle at the daemon.
 pub const IDLE_STEP_OFF_FEATURE: &str = "idle_step_off_v1";
 
@@ -64,6 +254,7 @@ pub const FEATURES: &[&str] = &[
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
+    TOPIC_ORCHESTRATION_FEATURE,
     IDLE_STEP_OFF_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
@@ -2092,6 +2283,42 @@ pub enum Request {
     GetSession {
         id: String,
     },
+    /// Persistent singleton identity for the user's primary chat conversation.
+    GetMainChat,
+    /// Persist a pending topic proposal; this never relocates messages or starts a harness.
+    ProposeTopic {
+        proposal: TopicProposalRequest,
+    },
+    /// Human-client consent gate. No harness MCP operation can approve a topic.
+    ApproveTopic {
+        approval: TopicApprovalRequest,
+    },
+    RejectTopic {
+        rejection: TopicRejectionRequest,
+    },
+    ListTopics,
+    GetTopic {
+        topic_id: String,
+    },
+    /// Start the approved topic workflow in the daemon. Repeated calls are idempotent.
+    StartTopicWorkflow {
+        topic_id: String,
+    },
+    ListTopicAttempts {
+        topic_id: String,
+    },
+    GetTopicAttempt {
+        attempt_id: String,
+    },
+    RecoverTopic {
+        recovery: TopicRecoveryRequest,
+    },
+    RetryTopicFeature {
+        retry: TopicFeatureRetryRequest,
+    },
+    TopicMcp {
+        request: TopicMcpRequest,
+    },
     ForkSession {
         id: String,
         name: Option<String>,
@@ -3223,6 +3450,9 @@ pub enum DroppedEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    TopicChanged {
+        topic_id: String,
+    },
     /// Opt-in, correlated ephemeral answer attempt. Not canonical history.
     TranscriptAttempt {
         update: TranscriptAttemptEvent,
@@ -3660,6 +3890,7 @@ impl Event {
             Event::SessionUpdated { session } => Some(&session.id),
             Event::SessionDeleted { id } => Some(id),
             Event::SettingsChanged
+            | Event::TopicChanged { .. }
             | Event::McpServersChanged
             | Event::ModelPullProgress { .. }
             | Event::SkillsChanged
