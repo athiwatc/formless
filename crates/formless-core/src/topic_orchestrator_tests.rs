@@ -619,6 +619,110 @@ async fn topic_async_normal_model_end_keeps_attempt_and_waiting_alive() {
     );
     assert!(f.daemon().runs.locked().is_empty());
 }
+
+#[tokio::test]
+async fn topic_idle_watcher_keeps_live_harnesses_and_pending_interactions_alive() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove(STAY_ENV);
+    env.set("TOPIC_FIXTURE_MODE", "release");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    f.daemon().config().unwrap();
+    f.daemon()
+        .config
+        .locked()
+        .as_mut()
+        .unwrap()
+        .1
+        .daemon
+        .idle_grace_secs = 0;
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let started = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let id = started["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+    assert!(f.daemon().runs.locked().is_empty());
+    assert_eq!(f.daemon().subscriber_count(), 0);
+    assert!(!f.daemon().nothing_in_flight());
+    let mut watcher = tokio::spawn(f.daemon().clone().idle_watcher());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), &mut watcher)
+            .await
+            .is_err()
+    );
+    assert!(!f.daemon().shutdown.is_cancelled());
+    std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    let token = "idle watcher interaction capability token";
+    let attempt = f
+        .daemon()
+        .with_store(|st| {
+            st.begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Idle question",
+                StepAccess::ReadOnly,
+                HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                token,
+                topic.workspace.as_ref().unwrap(),
+            )
+        })
+        .unwrap();
+    let handler = f
+        .daemon()
+        .topic_interaction_handler(&attempt.id, token)
+        .unwrap();
+    let question = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Continue?".into(), vec!["Yes".into()])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    wait_until(|| !f.daemon().topic_questions.locked().is_empty()).await;
+    assert!(f.daemon().topic_steps.locked().is_empty());
+    assert!(!f.daemon().nothing_in_flight());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), &mut watcher)
+            .await
+            .is_err()
+    );
+    assert!(!f.daemon().shutdown.is_cancelled());
+    f.daemon().close_topic_interactions(&topic.id, None);
+    assert!(question.await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(2), watcher)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(f.daemon().shutdown.is_cancelled());
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();

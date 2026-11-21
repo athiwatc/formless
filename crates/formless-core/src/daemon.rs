@@ -16284,7 +16284,15 @@ impl Daemon {
             .unwrap()
             .values()
             .any(|e| e.result.locked().is_none());
-        !held && self.runs.locked().is_empty() && self.subscriber_count() == 0
+        !held
+            && self.runs.locked().is_empty()
+            && !self.topic_work_in_flight()
+            && self.subscriber_count() == 0
+    }
+    fn topic_work_in_flight(&self) -> bool {
+        !self.topic_steps.locked().is_empty()
+            || !self.topic_questions.locked().is_empty()
+            || !self.harness_permissions.locked().is_empty()
     }
 
     async fn idle_watcher(self: Arc<Self>) {
@@ -16354,6 +16362,7 @@ impl Daemon {
                 || stay
                 || jobs_waiting
                 || !self.runs.locked().is_empty()
+                || self.topic_work_in_flight()
                 || self.subscriber_count() > 0;
             if busy {
                 idle_since = None;
