@@ -73,6 +73,63 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn topic_approval_moves_owned_attachments_without_granting_foreign_artifacts() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/topic.txt");
+    std::fs::write(&file, b"topic attachment").unwrap();
+    let id = f.record(&file, 16, Some(&f.session));
+    let unrelated = f.record(&file, 16, Some(&f.session));
+    let foreign_session = f
+        .daemon()
+        .with_store(|st| Ok(st.create_session(None)?.id))
+        .unwrap();
+    let foreign = f.record(&file, 16, Some(&foreign_session));
+    let topic = f.daemon().with_store(|st| {
+        let message = st.append_message_meta(&f.session, "user", "Inspect attached file", Some(json!({
+            "attachments":[{"id":id,"path":file,"bytes":16,"mime":"text/plain"},{"id":foreign}]
+        }).to_string()))?;
+        let proposal = TopicProposalRequest {
+            source_session_id: f.session.clone(), message_ids: vec![message.id], features: vec![],
+            name: "Attachment".into(), repo: std::env::current_dir()?,
+            builder: HarnessKind::Claude, builder_model: None,
+            reviewer: HarnessKind::Codex, reviewer_model: None,
+        };
+        let topic = st.propose_topic(&proposal, &"a".repeat(40))?;
+        st.approve_topic(&topic.id)
+    }).unwrap();
+    let topic_session = topic.topic_session_id.unwrap();
+    let page: Value = serde_json::from_str(
+        &f.daemon()
+            .read_artifact_impl(&topic_session, &json!({"id":id}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["text"], "topic attachment");
+    let access = crate::attachment_access::AttachmentAccess::profile(&f.paths);
+    let attachment =
+        json!({"id":id,"path":file,"bytes":16,"_source_session":topic_session,"_source_seq":1});
+    assert_eq!(access.read(&attachment, 100).unwrap(), b"topic attachment");
+    assert!(f
+        .daemon()
+        .read_artifact_impl(&topic_session, &json!({"id":foreign}))
+        .is_err());
+    f.daemon()
+        .with_reader(|st| {
+            assert_eq!(
+                st.get_artifact(&unrelated)?.unwrap().0.as_deref(),
+                Some(f.session.as_str())
+            );
+            assert_eq!(
+                st.get_artifact(&foreign)?.unwrap().0.as_deref(),
+                Some(foreign_session.as_str())
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[tokio::test]
 async fn text_pages_preserve_both_reader_shapes_defaults_caps_and_grep() {
     let env = crate::credential_env::EnvGuard::isolated();
