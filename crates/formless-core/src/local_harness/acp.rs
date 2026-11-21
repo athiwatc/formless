@@ -206,29 +206,17 @@ pub async fn run_interactive(
         };
         adapter(&request, &mut interactions, &blocking_cancel)
     });
-    let mut failure = None;
     let result = loop {
         tokio::select! {
             biased;
-            Some(ask) = asks.recv() => {
-                if let Err(error) = answer(handler, ask, &run_cancel).await {
-                    run_cancel.cancel();
-                    failure.get_or_insert(error);
-                }
-            }
+            Some(ask) = asks.recv() => answer(handler, ask, &run_cancel).await,
             result = &mut job => break result,
         }
     };
     while let Ok(ask) = asks.try_recv() {
-        if let Err(error) = answer(handler, ask, &run_cancel).await {
-            failure.get_or_insert(error);
-        }
+        answer(handler, ask, &run_cancel).await;
     }
-    let result = result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?;
-    match failure {
-        Some(error) => Err(error),
-        None => result,
-    }
+    result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?
 }
 
 enum Ask {
@@ -243,11 +231,8 @@ enum Ask {
     Update(HarnessUpdate),
 }
 
-async fn answer(
-    handler: &dyn InteractionHandler,
-    ask: Ask,
-    cancel: &CancellationToken,
-) -> Result<()> {
+/// A failed update (e.g. the attempt already reported its result) never fails the run.
+async fn answer(handler: &dyn InteractionHandler, ask: Ask, cancel: &CancellationToken) {
     match ask {
         Ask::Permission(request, reply) => {
             let _ = reply.send(handler.request_permission(request, cancel).await);
@@ -255,9 +240,10 @@ async fn answer(
         Ask::Question(questions, reply) => {
             let _ = reply.send(handler.ask_question(questions, cancel).await);
         }
-        Ask::Update(update) => handler.on_update(update)?,
+        Ask::Update(update) => {
+            let _ = handler.on_update(update);
+        }
     }
-    Ok(())
 }
 
 /// Hands each interaction from the blocking adapter thread to `run_interactive`'s task.
@@ -1627,6 +1613,54 @@ mod tests {
             .ask_question(&json!([{"question": "which?"}]), &CancellationToken::new())
             .unwrap();
         assert_eq!(answers, json!([{"selected": [], "text": "which?"}]));
+    }
+
+    #[tokio::test]
+    async fn run_interactive_survives_rejected_updates() {
+        use crate::local_harness::InteractionFuture;
+        struct Reported;
+        impl InteractionHandler for Reported {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                Box::pin(async { Some("allow".into()) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async { None })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                bail!("attempt already reported")
+            }
+        }
+        fn adapter(
+            request: &HarnessRequest,
+            permissions: &mut dyn PermissionHandler,
+            _: &CancellationToken,
+        ) -> Result<HarnessResult> {
+            let lines = [
+                LIVE_INITIALIZE.into(),
+                SESSION_NEW.into(),
+                permission(90, "execute"),
+                update("done"),
+                stop(3, "end_turn"),
+            ];
+            drive_lines(request, &lines, permissions).0
+        }
+        let result = run_interactive(
+            adapter,
+            request(StepAccess::Write),
+            &Reported,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.message, "done");
     }
 
     #[test]
