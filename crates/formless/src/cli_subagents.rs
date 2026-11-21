@@ -4,7 +4,7 @@ use formless_protocol::Request;
 use serde_json::Value;
 use std::io::Write;
 
-fn record(agent: &Value) -> Result<String> {
+fn record(agent: &Value) -> String {
     let mut text = String::new();
     for (label, key) in [
         ("Id", "id"),
@@ -21,13 +21,27 @@ fn record(agent: &Value) -> Result<String> {
             crate::comparison_terminal_text(agent[key].as_str().unwrap_or("(not reported)"))
         ));
     }
-    for (label, key) in [("Depth", "depth"), ("Steps", "steps"), ("Result", "result")] {
+    for (label, key) in [("Depth", "depth"), ("Steps", "steps")] {
         text.push_str(&format!(
             "{label}: {}\n",
-            serde_json::to_string(&agent[key])?
+            agent[key]
+                .as_i64()
+                .map_or_else(|| "(not reported)".into(), |number| number.to_string())
         ));
     }
-    Ok(text)
+    match agent["result"].as_str() {
+        None => text.push_str("Result: (not reported)\n"),
+        Some("") => text.push_str("Result: (empty)\n"),
+        Some(result) => {
+            text.push_str("Result:\n");
+            for line in result.split('\n') {
+                text.push_str("  ");
+                text.push_str(&crate::comparison_terminal_text(line));
+                text.push('\n');
+            }
+        }
+    }
+    text
 }
 
 pub(crate) fn list(
@@ -52,7 +66,7 @@ pub(crate) fn list(
         };
         for agent in agents {
             text.push('\n');
-            text.push_str(&record(agent)?);
+            text.push_str(&record(agent));
         }
         text
     };
@@ -80,8 +94,8 @@ pub(crate) fn detail(
             .context("daemon sub-agent detail did not contain a messages array")?;
         format!(
             "{}\nMessages (unpaged transcript returned by daemon):\n{}\n",
-            record(agent)?,
-            serde_json::to_string_pretty(messages)?
+            record(agent),
+            crate::escape_json_terminal_controls(&serde_json::to_string_pretty(messages)?)
         )
     };
     out.write_all(text.as_bytes())?;
@@ -125,6 +139,47 @@ mod tests {
     }
 
     #[test]
+    fn human_reports_escape_controls_in_multiline_results_and_transcripts() {
+        let result = "first\nsecond \u{1b} \u{9b} \u{202e}";
+        let subagent = agent("fixture", json!(result));
+        let messages = json!([{"role":"assistant", "content":result, "key\u{202e}":true}]);
+        let report = json!({"subagent":subagent,"messages":messages});
+        let mut inventory = Vec::new();
+        list(
+            "session".into(),
+            false,
+            |_| Ok(json!([subagent])),
+            &mut inventory,
+        )
+        .unwrap();
+        let mut detail_text = Vec::new();
+        detail(
+            "fixture".into(),
+            false,
+            |_| Ok(report.clone()),
+            &mut detail_text,
+        )
+        .unwrap();
+        let inventory = String::from_utf8(inventory).unwrap();
+        let detail_text = String::from_utf8(detail_text).unwrap();
+        for text in [&inventory, &detail_text] {
+            assert!(
+                text.contains("Result:\n  first\n  second \\u{1b} \\u{9b} \\u{202e}"),
+                "{text}"
+            );
+            assert!(!text.contains(['\u{1b}', '\u{9b}', '\u{202e}']), "{text}");
+        }
+        let (_, transcript) = detail_text
+            .split_once("Messages (unpaged transcript returned by daemon):\n")
+            .unwrap();
+        assert!(transcript.contains("\\u001b \\u009b \\u202e"));
+        assert_eq!(serde_json::from_str::<Value>(transcript).unwrap(), messages);
+        let mut machine = Vec::new();
+        detail("fixture".into(), true, |_| Ok(report.clone()), &mut machine).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&machine).unwrap(), report);
+    }
+
+    #[test]
     fn reports_retain_full_ids_null_empty_results_and_provider_messages() {
         let id = "subagent-".to_owned() + &"日本語".repeat(100);
         let inventory = json!([agent(&id, Value::Null), agent("second", json!(""))]);
@@ -140,8 +195,8 @@ mod tests {
             } else {
                 let text = String::from_utf8(bytes).unwrap();
                 assert!(text.contains(&format!("Id: {id}\n")));
-                assert!(text.contains("Result: null"));
-                assert!(text.contains("Result: \"\""));
+                assert!(text.contains("Result: (not reported)"));
+                assert!(text.contains("Result: (empty)"));
                 assert!(text.find(&id).unwrap() < text.find("Id: second").unwrap());
                 assert!(text.contains("Depth: 2"));
                 assert!(text.contains("Steps: 3"));
