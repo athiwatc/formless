@@ -146,13 +146,23 @@ impl TranscriptState {
             Err(error) => return self.need_reload(ReloadReason::InvalidMessage(error)),
         };
         let kind = block_kind(&message.role);
+        let attachments = if kind == BlockKind::User {
+            crate::transcript_attachments::decode(message.meta.as_deref())
+        } else {
+            Vec::new()
+        };
         let hidden = kind == BlockKind::Assistant && message.content.trim().is_empty();
         if self.last_seq.is_some_and(|last| seq <= last) {
             let old = timeline.block(seq);
             // Exact duplicate events are idempotent, including an old
             // completion delivered while a newer step is streaming.
             let same = match old {
-                Some(old) => !hidden && old.kind == kind && old.markdown() == message.content,
+                Some(old) => {
+                    !hidden
+                        && old.kind == kind
+                        && old.markdown() == message.content
+                        && old.attachments() == attachments
+                }
                 None => hidden, // empty assistant turns stay hidden
             };
             return if same {
@@ -172,7 +182,10 @@ impl TranscriptState {
         };
         self.last_seq = Some(seq);
         if !hidden {
-            timeline.append_persisted(TimelineBlock::new(seq, kind, message.content.clone()));
+            timeline.append_persisted(
+                TimelineBlock::new(seq, kind, message.content.clone())
+                    .with_attachments(attachments),
+            );
             changed = true;
         }
         Change {
@@ -351,6 +364,36 @@ mod tests {
             session_id: "s1".into(),
             message: message(seq, role, text),
         }
+    }
+
+    #[test]
+    fn live_user_attachments_match_snapshot_projection_and_duplicates_check_metadata() {
+        let mut transcript = transcript();
+        let mut message = message(2, "user", "");
+        message.meta = Some(
+            json!({"attachments":[{"name":"sent.png","mime":"image/png","bytes":8},{"name":null}]})
+                .to_string(),
+        );
+        let event = Event::MessageAppended {
+            session_id: "s1".into(),
+            message: message.clone(),
+        };
+        assert!(transcript.apply(&event).timeline_changed);
+        let snapshot = snapshot(&[message.clone()]);
+        assert_eq!(
+            transcript.timeline().block(2).unwrap().attachments(),
+            snapshot.blocks[0].attachments()
+        );
+        assert!(!transcript.apply(&event).timeline_changed);
+        message.meta = Some(json!({"attachments":[{"name":"sent.png","mime":"image/png","bytes":8,"expired":true}]}).to_string());
+        assert!(
+            transcript
+                .apply(&Event::MessageAppended {
+                    session_id: "s1".into(),
+                    message
+                })
+                .reload_changed
+        );
     }
 
     fn complete(run: &str, seq: i64, text: &str) -> Event {

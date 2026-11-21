@@ -256,7 +256,12 @@ fn native_step_truncation_stale_context_and_unknown_write_cannot_be_retried(
         shell.update(cx, |s, cx| {
             s.submit_step_review(Choice::Continue, window, cx)
         });
-        assert!(shell.update(cx, |s, _| s.take_client_commands()).is_empty());
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(
+            matches!(commands.as_slice(), [Wire::StageAttachments(operation)]
+            if operation.session_id == id
+                && matches!(operation.intake, formless_desktop::client::attachments::Intake::Refresh))
+        );
     });
 }
 #[gpui_kit::test]

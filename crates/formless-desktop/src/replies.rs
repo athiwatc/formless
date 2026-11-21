@@ -231,13 +231,37 @@ fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlo
     if kind == BlockKind::Assistant && message.content.trim().is_empty() {
         return Ok(None);
     }
-    Ok(Some(TimelineBlock::new(id, kind, message.content)))
+    let attachments = if kind == BlockKind::User {
+        crate::transcript_attachments::decode(message.meta.as_deref())
+    } else {
+        Vec::new()
+    };
+    Ok(Some(
+        TimelineBlock::new(id, kind, message.content).with_attachments(attachments),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn snapshots_keep_bounded_user_attachment_metadata_and_tolerate_bad_entries() {
+        let meta = json!({"attachments":[{"name":"photo.png","mime":"image/png","bytes":42},{"name":false},{"name":"old.txt","expired":true},{"name":"folder","reference":true}]}).to_string();
+        let value = json!({"session":{"id":"s1"},"running":false,"messages":[
+            {"id":"m1","session_id":"s1","seq":1,"role":"user","content":"","created_at":"","meta":meta},
+            {"id":"m2","session_id":"s1","seq":2,"role":"user","content":"bad metadata is not a bad snapshot","created_at":"","meta":"{"},
+            {"id":"m3","session_id":"s1","seq":3,"role":"assistant","content":"response","created_at":"","meta":meta}
+        ]});
+        let snapshot = session_snapshot("s1", &value).unwrap();
+        assert_eq!(snapshot.blocks.len(), 3);
+        assert_eq!(snapshot.blocks[0].attachments().len(), 3);
+        assert!(snapshot.blocks[0].attachments()[1].expired);
+        assert!(snapshot.blocks[0].attachments()[2].reference);
+        assert!(snapshot.blocks[1].attachments().is_empty());
+        assert!(snapshot.blocks[2].attachments().is_empty());
+    }
 
     #[test]
     fn recovery_requires_a_valid_idle_snapshot_and_does_not_guess_unknown_statuses() {

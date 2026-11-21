@@ -418,6 +418,7 @@ pub enum Anchor {
 pub struct TimelineBlock {
     pub id: u64,
     pub kind: BlockKind,
+    attachments: Vec<crate::transcript_attachments::Attachment>,
     markdown: String,
     fences: FenceIndex,
     anchor: Anchor,
@@ -435,6 +436,7 @@ impl TimelineBlock {
         let mut block = Self {
             id,
             kind,
+            attachments: Vec::new(),
             markdown,
             fences: FenceIndex::default(),
             anchor: Anchor::Head,
@@ -446,6 +448,18 @@ impl TimelineBlock {
         block.fences.extend(&block.markdown);
         block.refresh();
         block
+    }
+
+    pub fn attachments(&self) -> &[crate::transcript_attachments::Attachment] {
+        &self.attachments
+    }
+
+    pub(crate) fn with_attachments(
+        mut self,
+        attachments: Vec<crate::transcript_attachments::Attachment>,
+    ) -> Self {
+        self.attachments = attachments;
+        self
     }
 
     /// Recompute the window for the current anchor and the text to lay out.

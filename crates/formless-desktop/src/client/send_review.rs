@@ -66,6 +66,13 @@ impl Engine {
             crate::pending_files::Report::decode(work.intent.session_id(), value)
         });
         match result {
+            Ok(report) if report.rows.is_empty() && matches!(&work.intent, Intent::SendMessage { content, .. } if content.trim().is_empty()) => {
+                self.updates.push(Update::PreparationFailed {
+                    id: work.id,
+                    epoch: work.epoch,
+                    error: "Write a message or attach a file before sending. Nothing was started.".into(),
+                });
+            }
             Ok(report) if work.expected_run_id.as_deref().is_none_or(|id| report.steer_run_id() == Some(id)) => {
                 work.attachments = Some(report);
                 self.request_send_forecast(work);

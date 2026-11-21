@@ -232,6 +232,94 @@ fn chat_pending_files_keeps_reads_and_explicit_removal_with_their_sessions(
 }
 
 #[gpui_kit::test]
+fn removing_last_reference_refreshes_composer_and_disables_empty_send(cx: &mut TestAppContext) {
+    use formless_desktop::client::attachments::{Intake, Outcome as AttachmentOutcome};
+    let (h, s) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, h, &s);
+    let session = &sessions[0];
+    step(cx, h, |w, cx| {
+        w.click(session_row_id(&session.id), cx);
+        s.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Snapshot {
+                    generation: s.client_generation(),
+                    snapshot: replies::session_snapshot(
+                        &session.id,
+                        &json!({"session":{"id":session.id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                w,
+                cx,
+            );
+            s.poll_client(w, cx);
+        });
+        let commands = s.update(cx, |s, _| s.take_client_commands());
+        let operation = commands
+            .into_iter()
+            .find_map(|c| match c {
+                Wire::StageAttachments(op) => Some(op),
+                _ => None,
+            })
+            .unwrap();
+        let (client, connection) = s.read(cx).client_identity().unwrap();
+        s.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::AttachmentStaged(AttachmentOutcome {
+                    client,
+                    connection,
+                    operation: operation.id,
+                    session_id: session.id.clone(),
+                    errors: vec![],
+                    pending: Report::decode(&session.id, value(&session.id, 1)),
+                }),
+                w,
+                cx,
+            )
+        });
+        w.render_frame(cx);
+        assert_ne!(w.find("composer-primary").disabled(), Some(true));
+        w.click("chat-pending-files", cx);
+        load_chat_details(w, cx, &s, session);
+    });
+    read(cx, h, &s, &session.id, value(&session.id, 1));
+    step(cx, h, |w, cx| activate(w, cx, "reference-review-0"));
+    let removal = confirm(cx, h, &s);
+    step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| {
+            s.finish_reference_for_test(&removal, Ok(json!({"removed":true,"session_id":session.id,"index":0,"operation_id":removal.action().operation.to_string()})), true);
+            s.poll_client(w, cx);
+        });
+        let commands = s.update(cx, |s, _| s.take_client_commands());
+        let [Wire::StageAttachments(operation)] = commands.as_slice() else {
+            panic!("removal must refresh composer inventory");
+        };
+        assert!(matches!(operation.intake, Intake::Refresh));
+        let (client, connection) = s.read(cx).client_identity().unwrap();
+        s.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::AttachmentStaged(AttachmentOutcome {
+                    client,
+                    connection,
+                    operation: operation.id,
+                    session_id: session.id.clone(),
+                    errors: vec![],
+                    pending: Report::decode(&session.id, value(&session.id, 0)),
+                }),
+                w,
+                cx,
+            )
+        });
+        w.press("escape", cx);
+        settle_frames(w, cx);
+        assert_eq!(w.find("composer-primary").disabled(), Some(true));
+        assert!(w.try_find(("composer-attachment", 0_usize)).is_none());
+        s.update(cx, |s, cx| s.poll_client(w, cx));
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+    });
+}
+
+#[gpui_kit::test]
 fn chat_pending_files_button_remains_keyboard_reachable_at_200_percent(cx: &mut TestAppContext) {
     let (h, s) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, h, &s);

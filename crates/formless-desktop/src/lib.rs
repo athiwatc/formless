@@ -35,6 +35,7 @@ pub mod thai;
 pub mod theme;
 pub mod timeline;
 pub mod transcript;
+pub mod transcript_attachments;
 
 pub mod reading_positions;
 

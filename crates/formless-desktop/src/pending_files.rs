@@ -92,6 +92,12 @@ impl Report {
             .and_then(|a| a.get(index as usize))
             .is_some_and(|row| row["reference"] == true)
     }
+    pub fn stored_id(&self, index: usize) -> Option<&str> {
+        let row = self.raw["attachments"].as_array()?.get(index)?;
+        (row["reference"] != true)
+            .then(|| row["id"].as_str())
+            .flatten()
+    }
     pub fn reference_metadata(&self, index: u32) -> Option<String> {
         let row = self.raw["attachments"].as_array()?.get(index as usize)?;
         if row["reference"] != true {
