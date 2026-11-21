@@ -45,7 +45,7 @@ fn narrow_status_shows_context_beside_activity_with_long_identity() {
     app.sessions[0].name = "界e\u{301}".repeat(40);
     app.model_label = "long-model-name".repeat(40);
     let text = screen(
-        |frame| draw_status(frame, Rect::new(0, 0, 30, 1), &app),
+        |frame| draw_status(frame, Rect::new(0, 0, 30, 1), &app, None),
         30,
         1,
     );
@@ -63,7 +63,7 @@ fn narrow_status_reserves_context_using_rendered_grapheme_widths() {
     let nominal = format!(" ● ready │ {} │ {context}", app.sessions[0].name);
     let width = u16::try_from(text::width(&nominal)).unwrap();
     let text = screen(
-        |frame| draw_status(frame, Rect::new(0, 0, width, 1), &app),
+        |frame| draw_status(frame, Rect::new(0, 0, width, 1), &app, None),
         width,
         1,
     );
@@ -142,7 +142,7 @@ fn wide_status_keeps_field_order_and_hint_selection() {
     );
     let width: u16 = 150;
     let text = screen(
-        |frame| draw_status(frame, Rect::new(0, 0, width, 1), &app),
+        |frame| draw_status(frame, Rect::new(0, 0, width, 1), &app, None),
         width,
         1,
     );
@@ -198,7 +198,7 @@ fn wizard_and_status_identify_profile_and_cache_alternate_setup_hints() {
     let mut app = crate::tests::test_app();
     app.paths = scratch;
     let text = screen(
-        |frame| draw_status(frame, Rect::new(0, 0, 120, 1), &app),
+        |frame| draw_status(frame, Rect::new(0, 0, 120, 1), &app, None),
         120,
         1,
     );
