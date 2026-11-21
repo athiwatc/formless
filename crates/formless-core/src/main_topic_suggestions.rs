@@ -201,8 +201,10 @@ impl Store {
                 .kv_get(NAMESPACE, MAIN_KEY)?
                 .and_then(|v| v.as_str().map(str::to_owned))
             {
-                if let Some(session) = st.get_session(&id)? {
-                    return Ok(session);
+                if !st.session_deleted(&id)? {
+                    if let Some(session) = st.get_session(&id)? {
+                        return Ok(session);
+                    }
                 }
             }
             let session = st.create_session(Some("Main".into()))?;
