@@ -2857,6 +2857,11 @@ fn upgrade_command() -> &'static str {
 }
 
 fn is_homebrew_executable(exe: &str) -> bool {
+    let resolved = std::fs::canonicalize(exe).ok();
+    let exe = resolved
+        .as_deref()
+        .map(std::path::Path::to_string_lossy)
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed(exe));
     exe.contains("/Cellar/") || exe.contains("/homebrew/") || exe.contains("/linuxbrew/")
 }
 
@@ -10343,6 +10348,46 @@ mod tests {
             Some("winget uninstall --id athiwatc.formless --exact")
         );
         assert_eq!(super::package_uninstall_command("/tmp/formless"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_intel_homebrew_binary_uses_brew_for_update_and_uninstall() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("formless-brew-{}-{stamp}", std::process::id()));
+        let prefix = root.join("usr/local");
+        let bin = prefix.join("bin");
+        let keg = prefix.join("Cellar/formless/0.2.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::write(keg.join("formless"), b"fixture").unwrap();
+        let exe = bin.join("formless");
+        std::os::unix::fs::symlink("../Cellar/formless/0.2.0/bin/formless", &exe).unwrap();
+
+        assert_eq!(
+            super::upgrade_command_for_exe(exe.to_str().unwrap()),
+            "brew upgrade formless"
+        );
+        assert_eq!(
+            super::package_uninstall_command(exe.to_str().unwrap()),
+            Some("brew uninstall formless")
+        );
+        assert_eq!(
+            std::fs::read_link(&exe).unwrap(),
+            std::path::PathBuf::from("../Cellar/formless/0.2.0/bin/formless")
+        );
+        let ordinary = root.join(".local/bin/formless");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, b"unmanaged fixture").unwrap();
+        assert_eq!(
+            super::package_uninstall_command(ordinary.to_str().unwrap()),
+            None
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Root presentation order is deliberate (#1609), independently of inventory.
