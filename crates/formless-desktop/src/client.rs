@@ -3954,6 +3954,7 @@ mod tests {
 
     fn question(id: &str) -> formless_protocol::Event {
         Event::UserQuestion {
+            user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: id.into(),
@@ -4056,6 +4057,7 @@ mod tests {
         engine.receive(ServerMessage::Event(event.clone())).unwrap();
         engine
             .receive(ServerMessage::Event(Event::UserQuestionClosed {
+                answered_by: None,
                 question_id: "q".into(),
             }))
             .unwrap();
