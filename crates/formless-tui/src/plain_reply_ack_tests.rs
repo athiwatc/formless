@@ -145,7 +145,7 @@ fn cancellation_close_retires_only_matching_approval_without_a_denial() {
     remove_resolved_prompt(&mut prompts, &event);
     assert_eq!(prompts.len(), 2);
     assert!(matches!(prompts.front(), Some(Prompt::Approval { id, .. }) if id == "next"));
-    let text = format_event(&event, &mut false).unwrap();
+    let text = format_event(&event, &mut false, "").unwrap();
     assert_eq!(text, "Approval prompt closed.");
     assert!(!text.contains("Denied"));
     assert!(!text.contains("Approved"));
