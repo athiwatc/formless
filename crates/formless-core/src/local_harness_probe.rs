@@ -194,6 +194,22 @@ pub async fn claude_probe(ctx: &ProbeContext) -> HarnessAvailability {
 pub async fn codex_probe(ctx: &ProbeContext) -> HarnessAvailability {
     official_probe(HarnessKind::Codex, ctx).await
 }
+async fn fallback_probe(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
+    let mut value = availability(kind, Some(&ctx.executable));
+    if !value.installed {
+        return value;
+    }
+    let probe = async {
+        let cwd = ProbeDirectory::new()?;
+        Ok::<_, anyhow::Error>(version(&output(ctx, &["--version"], &cwd.0).await?))
+    };
+    match tokio::time::timeout(ctx.timeout.min(Duration::from_secs(10)), probe).await {
+        Ok(Ok(Some(version))) => value.version = Some(version),
+        Ok(Ok(None)) | Ok(Err(_)) => value.detail = Some("version probe failed".into()),
+        Err(_) => return timed_out(value),
+    }
+    value
+}
 async fn official_probe(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
     let base = availability(kind, Some(&ctx.executable));
     if !base.installed {
@@ -276,15 +292,15 @@ async fn dispatch(
     match kind {
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
-        HarnessKind::Pi => availability(kind, Some(&ctx.executable)),
-        HarnessKind::OpenCode => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Antigravity => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Pi => fallback_probe(kind, ctx).await,
+        HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
+        HarnessKind::Antigravity => fallback_probe(kind, ctx).await,
         HarnessKind::Acp => {
             let mut value = availability(kind, Some(&ctx.executable));
             value.acp_agent = agent.map(str::to_owned);
             value
         }
-        HarnessKind::Muse => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Muse => fallback_probe(kind, ctx).await,
     }
 }
 async fn probe_environment(

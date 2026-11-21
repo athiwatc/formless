@@ -7194,8 +7194,10 @@ a model turn, and no auth output is copied into detail or logs.
 CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
 the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
 and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-and Muse have dedicated dispatch arms currently reporting lookup-only
-availability with unknown auth. Adapter owners can replace those fallbacks
+and Muse have dedicated dispatch arms that look up the executable and run
+--version in a private cwd under the probe deadline, with kill-on-drop and
+process-group cleanup. Their auth remains unknown, including version failures.
+Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
