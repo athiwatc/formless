@@ -61,7 +61,7 @@ jobs:
           "${ci_privilege[@]}" apt-get update
           "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config python3
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
