@@ -133,6 +133,26 @@ test('transient first topic load is retried without reconnecting', async () => {
   assert.equal(c.S.topicsUnsupported, false);
 });
 
+test('a topic snapshot from before rejection cannot restore a rejected proposal', async () => {
+  const reads = [];
+  const c = setup(['refreshTopics', 'topicAction', 'storeTopic', 'rejectTopic'], { request: req => {
+    if (req.type === 'reject_topic') return Promise.resolve(topic('rejected'));
+    const wait = defer(); reads.push(wait); return wait.promise;
+  } });
+  vm.runInContext('let topicRefresh = null;', c);
+  const oldRead = c.refreshTopics();
+  await c.rejectTopic(topic());
+  assert.equal(c.S.topics[0].status, 'rejected');
+  const newRead = c.refreshTopics();
+  assert.equal(reads.length, 2, 'a mutation prevents coalescing into the old read');
+  reads[0].resolve([topic()]);
+  await oldRead;
+  assert.equal(c.S.topics[0].status, 'rejected');
+  reads[1].resolve([topic('rejected')]);
+  await newRead;
+  assert.equal(c.S.topics[0].status, 'rejected');
+});
+
 test('nested harness transcripts cannot dispatch native send, attachment, edit or fork actions', async () => {
   const c = setup(['topicForSession', 'currentTopicAttempt', 'submit', 'attachFiles', 'beginEdit', 'forkSession', 'stop', 'ensureRunTarget', 'retryRun', 'resumeRun'], {
     $: () => { throw new Error('Read-only action touched the composer'); },

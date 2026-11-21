@@ -97,6 +97,7 @@
     mainChat: null,
     topicsAvailable: false,
     topicsUnsupported: false,
+    topicRevision: 0,
     topicFocus: null,
     current: null,
     messages: [],
@@ -1870,12 +1871,13 @@
     if (!channel || !S.daemonOnline) return;
     if (initial) S.topicsUnsupported = false;
     initial = initial || !S.mainChat;
-    if (topicRefresh?.channel === channel) return topicRefresh.promise;
-    const refresh = { channel };
+    const revision = S.topicRevision || 0;
+    if (topicRefresh?.channel === channel && topicRefresh.revision === revision) return topicRefresh.promise;
+    const refresh = { channel, revision };
     refresh.promise = (async () => {
       try {
         const [main, topics] = await Promise.all([initial ? request({ type: "get_main_chat" }) : S.mainChat, request({ type: "list_topics" })]);
-        if (S.channel !== channel) return;
+        if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
         if (!main?.id || !Array.isArray(topics)) throw new Error("Invalid topic response");
         S.mainChat = main;
         S.topics = topics;
@@ -1884,7 +1886,7 @@
         S.topicsError = false;
         if (!S.sessions.some(session => session.id === main.id)) S.sessions.unshift(main);
       } catch (error) {
-        if (S.channel !== channel) return;
+        if (S.channel !== channel || revision !== (S.topicRevision || 0)) return;
         if (initial && error.daemonResponse && ["bad_request", "unsupported"].includes(error.code)) {
           S.topicsUnsupported = true;
           S.topicsAvailable = false; S.mainChat = null; S.topics = [];
@@ -1937,12 +1939,14 @@
     renderTopicContext();
   }
   function storeTopic(topic) {
+    S.topicRevision = (S.topicRevision || 0) + 1;
     S.topics = [topic, ...S.topics.filter(item => item.id !== topic.id)];
     renderSessions();
     renderComposer();
   }
   async function topicAction(label, action) {
     if (S.topicBusy) return;
+    S.topicRevision = (S.topicRevision || 0) + 1;
     S.topicBusy = label;
     renderTopicContext();
     try { await action(); }
