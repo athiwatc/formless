@@ -4,9 +4,13 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 /// Largest bundle we fetch.
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
+const FETCH_BUDGET: Duration = Duration::from_secs(20);
+type ResolveHost = fn(&str, u16, Instant) -> Result<Vec<SocketAddr>, String>;
 
 /// Where a bundle URL really points.
 #[derive(Debug, PartialEq)]
@@ -200,19 +204,28 @@ fn gist_metadata_error(error: anyhow::Error) -> anyhow::Error {
 /// redirects itself: every hop must be https and resolve only to public
 /// addresses, and the connection is pinned to what was checked, so a
 /// bundle URL can't make the daemon reach its own network (#825).
-async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
+async fn get_json_until(
+    url: &str,
+    allow_private: bool,
+    deadline: Instant,
+    resolve: ResolveHost,
+) -> Result<Value> {
     use futures_util::StreamExt;
     let mut url = reqwest::Url::parse(url).context("invalid bundle URL")?;
     for _ in 0..=5 {
         let label = display_url(&url);
-        let client = checked_client(&url, allow_private)?;
+        let client = checked_client(&url, allow_private, deadline, resolve).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out fetching {label}");
+        }
         let resp = client
             .get(url.clone())
             .header(
                 "User-Agent",
                 concat!("formless/", env!("CARGO_PKG_VERSION")),
             )
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(remaining)
             .send()
             .await
             .map_err(reqwest::Error::without_url)
@@ -254,8 +267,12 @@ async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
 
 /// A client for one hop: https only, pinned to the host's checked
 /// addresses, no redirects, no proxy.
-fn checked_client(url: &reqwest::Url, allow_private: bool) -> Result<reqwest::Client> {
-    use std::net::ToSocketAddrs;
+async fn checked_client(
+    url: &reqwest::Url,
+    allow_private: bool,
+    deadline: Instant,
+    resolve: ResolveHost,
+) -> Result<reqwest::Client> {
     if url.scheme() != "https" && !allow_private {
         bail!("only https:// URLs can be imported ({})", display_url(url));
     }
@@ -265,10 +282,20 @@ fn checked_client(url: &reqwest::Url, allow_private: bool) -> Result<reqwest::Cl
         .trim_matches(['[', ']'])
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
-        .to_socket_addrs()
-        .with_context(|| format!("cannot resolve {host}"))?
-        .collect();
+    let addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        if Instant::now() >= deadline {
+            bail!("timed out resolving {host}");
+        }
+        let name = host.clone();
+        let lookup = tokio::task::spawn_blocking(move || resolve(&name, port, deadline));
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), lookup)
+            .await
+            .with_context(|| format!("timed out resolving {host}"))?
+            .with_context(|| format!("cannot resolve {host}"))?
+            .map_err(anyhow::Error::msg)?
+    };
     if addrs.is_empty() {
         bail!("cannot resolve {host}");
     }
@@ -291,20 +318,41 @@ pub async fn fetch(url: &str) -> Result<Value> {
 
 /// [`fetch`]; `allow_private` lets tests use a local server.
 pub async fn fetch_from(url: &str, allow_private: bool) -> Result<Value> {
+    fetch_from_until(
+        url,
+        allow_private,
+        Instant::now() + FETCH_BUDGET,
+        formless_runtime::resolve_host_until,
+    )
+    .await
+}
+
+async fn fetch_from_until(
+    url: &str,
+    allow_private: bool,
+    deadline: Instant,
+    resolve: ResolveHost,
+) -> Result<Value> {
     let (source, label) = resolve_with_label(url)?;
     let (file, bundle) = match source {
-        Source::Direct(u) => (None, get_json(&u, allow_private).await?),
+        Source::Direct(u) => (
+            None,
+            get_json_until(&u, allow_private, deadline, resolve).await?,
+        ),
         Source::Gist(id) => {
-            let gist = get_json(&format!("https://api.github.com/gists/{id}"), allow_private)
-                .await
-                .map_err(gist_metadata_error)?;
+            let gist = get_json_until(
+                &format!("https://api.github.com/gists/{id}"),
+                allow_private,
+                deadline,
+                resolve,
+            )
+            .await
+            .map_err(gist_metadata_error)?;
             // Every raw candidate uses the same checked, capped downloader.
-            let (name, bundle) =
-                fetch_gist_bundle(
-                    &gist,
-                    |raw| async move { get_json(&raw, allow_private).await },
-                )
-                .await?;
+            let (name, bundle) = fetch_gist_bundle(&gist, |raw| async move {
+                get_json_until(&raw, allow_private, deadline, resolve).await
+            })
+            .await?;
             (Some(name), bundle)
         }
     };
@@ -315,6 +363,86 @@ pub async fn fetch_from(url: &str, allow_private: bool) -> Result<Value> {
 #[cfg(test)]
 mod fetch_tests {
     use super::*;
+
+    async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
+        get_json_until(
+            url,
+            allow_private,
+            Instant::now() + FETCH_BUDGET,
+            formless_runtime::resolve_host_until,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stalled_bundle_dns_expires_without_blocking_the_executor() {
+        let resolve: ResolveHost = |host, _port, _deadline| {
+            assert_eq!(host, "fixture.invalid");
+            std::thread::sleep(Duration::from_millis(500));
+            Err("fixture resolver finished after the deadline".into())
+        };
+        let started = Instant::now();
+        let (result, heartbeat) = tokio::join!(
+            fetch_from_until(
+                "https://fixture.invalid/file.json",
+                false,
+                started + Duration::from_millis(100),
+                resolve
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                started.elapsed()
+            },
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("timed out resolving fixture.invalid"),
+            "{error:#}"
+        );
+        assert!(
+            heartbeat < Duration::from_millis(350),
+            "executor was blocked for {heartbeat:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_share_the_original_bundle_fetch_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/first",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    axum::response::Redirect::temporary("/last")
+                }),
+            )
+            .route(
+                "/last",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    axum::Json(serde_json::json!({"format":"formless.tool/1"}))
+                }),
+            );
+        let peer = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = get_json_until(
+            &format!("http://{address}/first"),
+            true,
+            Instant::now() + Duration::from_millis(200),
+            formless_runtime::resolve_host_until,
+        )
+        .await;
+        peer.abort();
+        let error = result.unwrap_err();
+        assert!(
+            error.chain().any(|source| source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn source_labels_drop_userinfo_and_keep_ordinary_url_spelling() {
