@@ -359,6 +359,7 @@ async fn the_agent_loads_enabled_skills() {
     )
     .unwrap();
     assert_eq!(found["skills"][0]["name"], "report-writer");
+    let before_manual = store.get_skill("report-writer").unwrap().unwrap();
     // The user loads it by hand: a note in the chat, counted as a load.
     daemon
         .handle(formless_protocol::Request::LoadSkill {
@@ -379,7 +380,36 @@ async fn the_agent_loads_enabled_skills() {
         note.content.contains("Step 1: read the sheet.")
             && note.content.contains("Arguments: Q3 sheet")
     );
+    let after_manual = store.get_skill("report-writer").unwrap().unwrap();
+    assert_eq!(after_manual.loads, 2);
+    assert_eq!(after_manual.runs, before_manual.runs);
+    let original = formless_protocol::Request::LoadSkill {
+        session_id: "missing-session".into(),
+        name: "report-writer".into(),
+        args: None,
+    };
+    assert!(daemon
+        .handle(original)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("session not found"));
     assert_eq!(store.get_skill("report-writer").unwrap().unwrap().loads, 2);
+    store.set_skill_enabled("report-writer", false).unwrap();
+    for (name, message) in [
+        ("report-writer", "disabled"),
+        ("missing-skill", "no skill named"),
+    ] {
+        let error = daemon
+            .handle(formless_protocol::Request::LoadSkill {
+                session_id: session.clone(),
+                name: name.into(),
+                args: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(message));
+    }
 }
 
 #[test]
@@ -494,6 +524,64 @@ fn auto_skills_are_measured_and_retired() {
     store.set_skill_enabled("idle-skill", true).unwrap();
     let restored = store.get_skill("idle-skill").unwrap().unwrap();
     assert!(!restored.retired && restored.retire_reason.is_none());
+    let updated = install_text(&paths, &store, &md("bad-skill"), "auto", "auto").unwrap();
+    assert_eq!(updated.version, 2);
+    assert!(!updated.retired && updated.retire_reason.is_none());
+}
+
+#[tokio::test]
+async fn manual_loads_and_legacy_blank_run_ids_do_not_trigger_unhelpful_retirement() {
+    use formless_core::skills::install_text;
+    let (_fixture, paths) = temp_paths("manual-retire");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let name = "manual-skill";
+    install_text(
+        &paths,
+        &store,
+        "---\nname: manual-skill\ndescription: d\n---\nbody\n",
+        "auto",
+        "auto",
+    )
+    .unwrap();
+    store.set_skill_enabled(name, true).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let raw = rusqlite::Connection::open(paths.db_file()).unwrap();
+    raw.execute(
+        "INSERT INTO skill_loads(skill_id,session_id,run_id,created_at) SELECT id,?1,'','2000-01-01T00:00:00Z' FROM skills WHERE name=?2",
+        rusqlite::params![session, name],
+    ).unwrap();
+    let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let load = || formless_protocol::Request::LoadSkill {
+        session_id: session.clone(),
+        name: name.into(),
+        args: None,
+    };
+    assert_eq!(daemon.handle(load()).await.unwrap()["loaded"], name);
+    let skill = store.get_skill(name).unwrap().unwrap();
+    assert_eq!((skill.loads, skill.runs, skill.runs_completed), (2, 0, 0));
+    assert!(store.retire_auto_skills(None, 0.9, 1).unwrap().is_empty());
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM skill_loads WHERE run_id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .retire_auto_skills(Some("2999-01-01T00:00:00Z"), 0.0, 1)
+            .unwrap(),
+        vec![name]
+    );
+    assert!(daemon
+        .handle(load())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("is retired"));
+    assert_eq!(store.get_skill(name).unwrap().unwrap().loads, 2);
 }
 
 #[test]

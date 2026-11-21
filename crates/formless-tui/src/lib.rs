@@ -3,6 +3,7 @@ pub mod client;
 mod clipboard_write;
 mod clipimg;
 mod commands;
+mod editor_viewport;
 mod external_editor;
 pub use external_editor::windows_editor_command;
 mod external_editor_ui;
@@ -255,6 +256,11 @@ enum Pending {
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
+    QueuedSave {
+        session_id: String,
+        edit: QueuedEdit,
+        draft: String,
+    },
     /// `/revoke TOOL [CAP]`: the reply says what config trust still allows.
     Revoked,
     /// `/test`, Ctrl+T in the picker: a model test (SPEC §4.3).
@@ -356,6 +362,7 @@ enum Pending {
     ListMcpPrompts,
     GetMcpPrompt,
     ListSkills,
+    LoadSkill,
     ListMemories,
     RunMetrics,
     ListBuiltinStats,
@@ -530,6 +537,13 @@ const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 struct Draft {
     input: input::InputLine,
     attachments: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueuedEdit {
+    id: i64,
+    revision: i64,
+    stale: bool,
 }
 
 /// Where text drafts persist between TUI starts.
@@ -1663,6 +1677,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
     text::truncate(&flat, max)
 }
 
+fn memory_activity_note(memory: &formless_protocol::MemoryInfo) -> String {
+    let source = match memory.session_id.as_deref() {
+        Some(session) => format!(
+            "from session {}",
+            plain::display_text(&truncate_chars(session, 8))
+        ),
+        None => plain::display_text(&memory.author),
+    };
+    format!(
+        "memory {} [{}{}] {} · {source}",
+        plain::display_text(&memory.id),
+        plain::display_text(&memory.scope),
+        if memory.enabled { "" } else { ", off" },
+        plain::display_text(&memory.text),
+    )
+}
+
 /// Borrow this Session's user payloads; collecting the iterator copies only
 /// references. Rendering selects a single entry without collecting at all.
 fn input_history<'a>(
@@ -2011,7 +2042,7 @@ struct App {
     /// the chat and editable with `/queue`.
     queued: Vec<formless_protocol::QueuedMessage>,
     /// `/queue edit N`: the queued message the input replaces.
-    editing_queued: Option<i64>,
+    editing_queued: Option<QueuedEdit>,
     /// The last long Run's "What I did" recap, and whether `/recap`
     /// expanded it.
     recap: Option<formless_protocol::RunRecap>,
@@ -2752,7 +2783,7 @@ impl App {
         self.input.invalidate_history();
         self.messages = messages;
         self.md_cache.borrow_mut().clear();
-        self.queued = queued;
+        self.apply_queued_items(queued);
         self.plan = plan;
         self.plan_state = plan_state;
         let same_recap =
@@ -2915,6 +2946,21 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if let Pending::QueuedSave {
+                session_id,
+                edit,
+                draft,
+            } = &kind
+            {
+                self.finish_queued_save(
+                    session_id,
+                    *edit,
+                    draft,
+                    false,
+                    Some("no daemon acknowledgement"),
+                );
+                continue;
+            }
             if self.stale_search(&kind) {
                 continue;
             }
@@ -3157,6 +3203,16 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::QueuedSave {
+                        session_id,
+                        edit,
+                        draft,
+                    } = &kind
+                    {
+                        let saved = ok && result.as_ref().is_some_and(|value| value["ok"] == true);
+                        self.finish_queued_save(session_id, *edit, draft, saved, error.as_deref());
+                        continue;
+                    }
                     if self.stale_search(&kind) {
                         continue;
                     }
@@ -3317,6 +3373,9 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::QueuedSave { .. } => {
+                            unreachable!("queued saves are acknowledged above")
+                        }
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
                         Pending::ListSessions => {
@@ -4327,14 +4386,23 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::LoadSkill => {
+                            if let Some(name) = result["loaded"].as_str() {
+                                self.notes.push(format!("loaded skill {name}"));
+                            }
+                        }
                         Pending::SkillPreview => {
                             let name = result["skill"]["name"].as_str().unwrap_or_default();
+                            let retired = result["skill"]["retired"] == true;
+                            let enabled = result["skill"]["enabled"] == true && !retired;
                             let mut lines = vec![
                                 format!(
                                     "{} v{} · {} · {}",
                                     name,
                                     result["skill"]["version"],
-                                    if result["skill"]["enabled"] == true {
+                                    if retired {
+                                        "retired"
+                                    } else if enabled {
                                         "enabled"
                                     } else {
                                         "disabled"
@@ -4381,7 +4449,14 @@ impl App {
                                 );
                             }
                             lines.push(String::new());
-                            lines.push(format!("/skill:{name} loads it into this Session"));
+                            lines.push(if enabled {
+                                format!("/skill:{name} loads it into this Session")
+                            } else {
+                                format!(
+                                    "/skills enable {name} {} it for loading",
+                                    if retired { "restores" } else { "enables" }
+                                )
+                            });
                             self.pager = Some(Pager {
                                 title: format!("Skill {name}"),
                                 lines,
@@ -4457,16 +4532,7 @@ impl App {
                                 );
                             }
                             for m in list {
-                                self.notes.push(format!(
-                                    "memory {} [{}{}] {} · {}",
-                                    m.id,
-                                    m.scope,
-                                    if m.enabled { "" } else { ", off" },
-                                    m.text,
-                                    m.session_id
-                                        .map(|s| format!("from session {}", truncate_chars(&s, 8)))
-                                        .unwrap_or(m.author)
-                                ));
+                                self.notes.push(memory_activity_note(&m));
                             }
                         }
                         Pending::ListSkills => {
@@ -5110,8 +5176,10 @@ impl App {
                                     r["error"].as_str().unwrap_or_default().to_string(),
                                 )
                             });
-                            self.queued = serde_json::from_value(result["queued_items"].clone())
-                                .unwrap_or_default();
+                            self.apply_queued_items(
+                                serde_json::from_value(result["queued_items"].clone())
+                                    .unwrap_or_default(),
+                            );
                             if restore_state {
                                 self.plan = serde_json::from_value(result["plan"].clone())
                                     .unwrap_or_default();
@@ -5164,7 +5232,21 @@ impl App {
         };
         match verb {
             "edit" => {
-                self.editing_queued = Some(item.id);
+                let Some(revision) = item.revision else {
+                    self.notes
+                        .push("Update the daemon to edit queued messages safely.".into());
+                    return;
+                };
+                if self.queue_save_pending(&session_id) {
+                    self.notes
+                        .push("Waiting for the queued edit acknowledgement.".into());
+                    return;
+                }
+                self.editing_queued = Some(QueuedEdit {
+                    id: item.id,
+                    revision,
+                    stale: false,
+                });
                 self.input.set(&item.content);
                 self.input.set_literal(true);
                 self.notes
@@ -5181,6 +5263,96 @@ impl App {
                 up: verb == "up",
             }),
             _ => self.notes.push("usage: /queue edit|rm|up|down N".into()),
+        }
+    }
+
+    fn queue_save_pending(&self, session_id: &str) -> bool {
+        self.pending.values().any(|pending| {
+            matches!(pending, Pending::QueuedSave { session_id: owner, .. } if owner == session_id)
+        })
+    }
+
+    fn apply_queued_items(&mut self, queued: Vec<QueuedMessage>) {
+        let pending = self
+            .current
+            .as_deref()
+            .is_some_and(|id| self.queue_save_pending(id));
+        if let Some(edit) = self
+            .editing_queued
+            .as_mut()
+            .filter(|edit| !edit.stale && !pending)
+        {
+            let current = queued.iter().find(|message| message.id == edit.id);
+            if current.and_then(|message| message.revision) != Some(edit.revision) {
+                edit.stale = true;
+                self.notes.push(if current.is_some() {
+                    "The queued message changed or moved. Your draft is still here. Review the queue before editing again."
+                } else {
+                    "The message left the queue. Your draft is still here."
+                }.into());
+            }
+        }
+        self.queued = queued;
+    }
+
+    fn submit_queued_edit(&mut self, edit: QueuedEdit) {
+        let Some(session_id) = self.current.clone() else {
+            return;
+        };
+        if edit.stale {
+            self.notes.push("The queue changed. Review the latest message with /queue edit N, or press Esc to cancel this edit.".into());
+            return;
+        }
+        if self.queue_save_pending(&session_id) {
+            return;
+        }
+        let draft = self.input.expanded();
+        let content = draft.trim().to_owned();
+        if content.is_empty() {
+            self.notes
+                .push("A queued message cannot be empty. Use /queue rm N to remove it.".into());
+            return;
+        }
+        self.request(
+            Pending::QueuedSave {
+                session_id: session_id.clone(),
+                edit,
+                draft,
+            },
+            Request::EditQueuedIfCurrent {
+                session_id,
+                id: edit.id,
+                revision: edit.revision,
+                content,
+            },
+        );
+    }
+
+    fn finish_queued_save(
+        &mut self,
+        session_id: &str,
+        edit: QueuedEdit,
+        draft: &str,
+        saved: bool,
+        error: Option<&str>,
+    ) {
+        if self.is_current(session_id) && self.editing_queued == Some(edit) {
+            if saved {
+                self.editing_queued = None;
+                if self.input.expanded() == draft {
+                    self.input.clear();
+                }
+            } else if let Some(edit) = &mut self.editing_queued {
+                edit.stale = true;
+            }
+        }
+        if saved {
+            self.notes.push("Queued message saved.".into());
+        } else {
+            self.notes.push(format!(
+                "Queued edit was not confirmed. Your draft is still here. {}",
+                error.unwrap_or("Review the latest queue before retrying.")
+            ));
         }
     }
 
@@ -5914,15 +6086,7 @@ impl App {
             }
             Event::QueueChanged { session_id, queued } => {
                 if self.is_current(&session_id) {
-                    if self
-                        .editing_queued
-                        .is_some_and(|id| !queued.iter().any(|q| q.id == id))
-                    {
-                        self.editing_queued = None;
-                        self.notes
-                            .push("the queued message you were editing was sent".into());
-                    }
-                    self.queued = queued;
+                    self.apply_queued_items(queued);
                 }
             }
             Event::ProviderRetrying {
@@ -6724,7 +6888,7 @@ impl App {
         let paths: Vec<_> = formless_core::files::mentions(&text)
             .iter()
             .map(|p| {
-                let path = mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
+                let path = file_mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
                 let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
                 (path, stamp)
             })
@@ -6746,18 +6910,21 @@ impl App {
             .iter()
             .map(|(name, bytes)| formless_core::forecast::attachment(name.clone(), bytes))
             .collect();
-        let root = self.work_dir();
-        for mention in formless_core::files::mentions(&self.input.expanded()) {
-            let Some(candidate) = mention_path_in(&root, &mention) else {
+        let canonical_root = root.canonicalize().ok();
+        for mention in formless_core::files::mentions(&text) {
+            let Some(candidate) = file_mention_path_in(&root, &mention) else {
                 continue;
             };
             let Ok(path) = candidate.canonicalize() else {
                 continue;
             };
-            let inside = path.starts_with(&root)
-                || (mention.starts_with("~/")
+            let inside = canonical_root
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
+                || (formless_core::files::home_path_suffix(&mention).is_some()
                     && directories::BaseDirs::new()
-                        .is_some_and(|b| path.starts_with(b.home_dir())));
+                        .and_then(|base| base.home_dir().canonicalize().ok())
+                        .is_some_and(|home| path.starts_with(home)));
             if !inside
                 || formless_core::daemon::credential_path(&path).is_some()
                 || formless_core::daemon::credential_path(&candidate).is_some()
@@ -6915,13 +7082,17 @@ impl App {
     }
 
     fn submit_chat(&mut self, queued: bool) {
-        if !self.expand_user_command() {
-            return;
-        }
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
                 .push("not sent — offline; your input is kept as a draft".into());
+            return;
+        }
+        if let Some(edit) = self.editing_queued {
+            self.submit_queued_edit(edit);
+            return;
+        }
+        if !self.expand_user_command() {
             return;
         }
         let text = self.input.expanded();
@@ -6929,7 +7100,6 @@ impl App {
             && (!text.starts_with('/') || self.input.is_literal())
             && !self.running()
             && self.current.is_some()
-            && self.editing_queued.is_none()
             && Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some())
         {
             let generation = self.forecast_generation();
@@ -7035,16 +7205,6 @@ impl App {
             self.step_decide("edit", Some(text.trim().to_string()));
             return;
         }
-        if let Some(id) = self.editing_queued.take() {
-            if let Some(session_id) = self.current.clone() {
-                self.fire(Request::EditQueued {
-                    session_id,
-                    id,
-                    content: Some(text),
-                });
-            }
-            return;
-        }
         if let Some(message_id) = self.editing_id.take() {
             if let Some(session_id) = self.current.clone() {
                 self.follow_chat_bottom();
@@ -7091,7 +7251,7 @@ impl App {
             .into_iter()
             .filter(|p| {
                 root.as_ref()
-                    .is_some_and(|r| mention_path_in(r, p).is_some_and(|p| p.exists()))
+                    .is_some_and(|r| file_mention_path_in(r, p).is_some_and(|p| p.exists()))
             })
             .collect();
         let held = std::mem::take(&mut self.attachments);
@@ -7862,14 +8022,13 @@ impl App {
                 match (self.current.clone(), name.is_empty()) {
                     (Some(session_id), false) => {
                         self.request(
-                            Pending::RunControl,
+                            Pending::LoadSkill,
                             Request::LoadSkill {
                                 session_id,
                                 name: name.to_string(),
                                 args: (!args.trim().is_empty()).then(|| args.trim().to_string()),
                             },
                         );
-                        self.notes.push(format!("loaded skill {name}"));
                     }
                     (None, _) => self.notes.push("no current session".into()),
                     _ => self.notes.push("usage: /skill:NAME [arguments]".into()),
@@ -8086,13 +8245,11 @@ impl App {
             }
             cmd if cmd.starts_with("attach ") => {
                 let path = cmd["attach ".len()..].trim().trim_matches(['"', '\'']);
-                let path = match path.strip_prefix("~/") {
-                    Some(rest) => std::env::var("HOME")
-                        .map(|h| format!("{h}/{rest}"))
-                        .unwrap_or_else(|_| path.to_string()),
-                    None => path.to_string(),
-                };
-                self.attach_path_file(std::path::Path::new(&path));
+                if let Some(path) = mention_path_in(std::path::Path::new(""), path) {
+                    self.attach_path_file(&path);
+                } else {
+                    self.notes.push("native home is unavailable for this attachment".into());
+                }
             }
             "paste" => self.paste_image(),
             "tag" | "tags" => self.tag_cmd("", true),
@@ -12130,7 +12287,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // and other modal overlays below keep their existing priority.
     if app.view == View::Settings {
         if let Some(form) = &app.settings_form {
-            draw_settings_form(f, form, app.color);
+            draw_settings_form(f, form, app.color, false);
         }
     }
     if app.view == View::Chat && app.renaming.is_none() {
@@ -13163,7 +13320,9 @@ fn draw_input(
     // per file it will attach; removing the @ removes the chip.
     let root = app.work_dir();
     for path in formless_core::files::mentions(&app.input.expanded()) {
-        let full = root.join(&path);
+        let Some(full) = file_mention_path_in(&root, &path) else {
+            continue;
+        };
         if !full.exists() || app.tools.iter().any(|t| t.name == path) {
             continue;
         }
@@ -14802,19 +14961,30 @@ fn short_dir(dir: &str) -> String {
 /// Resolve the same native-home spelling used by daemon AttachPath. Merely
 /// constructing this path grants no access; the daemon still validates intake.
 fn mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
-    Some(match path.strip_prefix("~/") {
-        Some(rest) => directories::BaseDirs::new()?.home_dir().join(rest),
+    Some(match formless_core::files::home_path_suffix(path) {
+        Some(rest) => directories::BaseDirs::new()
+            .filter(|dirs| dirs.home_dir().is_absolute())?
+            .home_dir()
+            .join(rest),
         None => base.join(path),
     })
 }
 
+/// Use the daemon's literal-file precedence for mentions with a location.
+fn file_mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    let candidate = mention_path_in(base, path)?;
+    if formless_core::files::path_and_line(path).1.is_none() {
+        return Some(candidate);
+    }
+    let (requested, _) =
+        formless_core::files::resolve_file_mention(std::path::Path::new(""), candidate).ok()?;
+    Some(requested)
+}
+
 /// A file a chat mentions, resolved against `base` (the Session's working
-/// directory), or absolute, or under `~/`, when it exists.
+/// directory), or absolute, or under the native home, when it exists.
 fn resolve_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
-    let p = match path.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest),
-        None => base.join(path),
-    };
+    let p = mention_path_in(base, path)?;
     p.is_file().then(|| p.canonicalize().unwrap_or(p))
 }
 
@@ -16843,7 +17013,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             ui::dim(app.color),
         ));
         for (i, q) in app.queued.iter().enumerate() {
-            let editing = app.editing_queued == Some(q.id);
+            let editing = app.editing_queued.is_some_and(|edit| edit.id == q.id);
             let first = q.content.lines().next().unwrap_or_default();
             lines.push(Line::styled(
                 format!(
@@ -17282,10 +17452,14 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let rows = app.settings_rows();
     let sel = app.settings_sel.min(rows.len().saturating_sub(1));
+    let panel = ui::panel(" Settings ", app.color, Color::Cyan);
+    let inner = panel.inner(area);
+    let focused = !app.list_wheel_blocked();
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line = 0;
     let mut sel_end = 0;
     let mut section = "";
+    let mut cursor = None;
     for (i, row) in rows.iter().enumerate() {
         if row.section != section {
             if !section.is_empty() {
@@ -17304,9 +17478,16 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         } else {
             ui::dim(app.color)
         };
+        let mut label = format!("{mark}{}", ui::pad(&row.label, 20));
         let value = match &app.settings_edit {
             Some((k, edit)) if *k == row.key => {
-                Span::styled(format!("{}▏", &**edit), bold_fg(app.color, Color::Yellow))
+                let width = usize::from(inner.width);
+                label.truncate(text::take_width(&label, width.saturating_sub(8)).len());
+                let label_width = text::width(&label);
+                let (visible, col) =
+                    editor_viewport::field(edit, width.saturating_sub(label_width), false, true);
+                cursor = Some((lines.len(), label_width + col));
+                Span::styled(visible, bold_fg(app.color, Color::Yellow))
             }
             _ if row.value.is_empty() && matches!(row.kind, settings::Kind::Choice(_)) => {
                 Span::styled("default", ui::dim(app.color))
@@ -17314,10 +17495,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             _ if row.value.is_empty() => Span::raw(""),
             _ => Span::raw(row.value.clone()),
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark}{}", ui::pad(&row.label, 20)), label_style),
-            value,
-        ]));
+        lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
@@ -17347,16 +17525,19 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     // Keep the selection on screen.
-    let height = area.height.saturating_sub(2) as usize;
+    let height = usize::from(inner.height);
     let top = sel_end.saturating_sub(height).min(sel_line);
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(ui::panel(
-            " Settings ",
-            app.color,
-            Color::Cyan,
-        )),
+        Paragraph::new(lines.into_iter().skip(top).take(height).collect::<Vec<_>>()).block(panel),
         area,
     );
+    if let Some(form) = &app.settings_form {
+        draw_settings_form(f, form, app.color, focused);
+    } else if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused && (top..top + height).contains(row) && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
+    }
 }
 
 /// The normal word wrapper can overhang the last column with a wide
@@ -17388,7 +17569,9 @@ fn settings_form_rows(line: Line<'_>, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
+fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused: bool) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let area = f.area();
     if area.width == 0 || area.height == 0 {
         form.viewport.set(Default::default());
@@ -17408,10 +17591,11 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
         }
     }
     let mut active_rows = None;
+    let mut cursor = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
         let mut text = if field.masked {
-            "•".repeat(field.input.chars().count())
+            "•".repeat(field.input.graphemes(true).count())
         } else {
             field.input.to_string()
         };
@@ -17419,6 +17603,23 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
             text.push('▏');
         }
         let start = body.len();
+        if active {
+            let (before, _) = field.input.split_at(field.input.cursor_byte());
+            let before = if field.masked {
+                "•".repeat(before.graphemes(true).count())
+            } else {
+                before.to_owned()
+            };
+            let prefix = format!("› {:<12}{before}", field.label);
+            let rows = wrap(Line::raw(prefix));
+            let last_width = rows.last().map_or(0, Line::width);
+            cursor = Some((
+                start
+                    + rows.len().saturating_sub(1)
+                    + usize::from(last_width == usize::from(inner_width)),
+                last_width % usize::from(inner_width),
+            ));
+        }
         for (row, line) in text.split('\n').enumerate() {
             if row == 0 {
                 body.extend(wrap(Line::from(vec![
@@ -17510,6 +17711,13 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
         .chain(footer)
         .collect();
     f.render_widget(review_wrap::Rows(rows), inner);
+    if let Some((row, col)) = cursor.filter(|(row, col)| {
+        focused
+            && (viewport.top..viewport.top + viewport.page).contains(row)
+            && *col < usize::from(inner.width)
+    }) {
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - viewport.top) as u16));
+    }
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
@@ -20223,6 +20431,19 @@ mod credential_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_activity_note_escapes_controls_in_stored_fields() {
+        let memory = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "scope":"project:test\u{202e}", "text":"note\r\n\u{1b}\u{9b}",
+            "author":"agent\u{9b}", "session_id":null, "enabled":false, "created_at":"", "updated_at":"",
+        })).unwrap();
+        let note = memory_activity_note(&memory);
+        assert_eq!(
+            note,
+            "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
+        );
+    }
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
@@ -20784,12 +21005,13 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_follows_events_and_drops_a_sent_edit() {
+    fn the_queue_follows_events_and_keeps_a_stale_draft_from_being_sent() {
         use formless_protocol::QueuedMessage;
         let mut app = test_app();
         let q = |id: i64, t: &str| QueuedMessage {
             id,
             content: t.into(),
+            revision: Some(0),
         };
         app.on_event(Event::QueueChanged {
             session_id: "s1".into(),
@@ -20797,20 +21019,94 @@ mod tests {
         });
         assert_eq!(app.queued.len(), 2);
         app.queue_command("queue edit 2");
-        assert_eq!(app.editing_queued, Some(2));
+        assert_eq!(app.editing_queued.map(|edit| edit.id), Some(2));
         assert_eq!(app.input.expanded(), "second");
-        // It is sent meanwhile: the edit is dropped.
+        // It is sent meanwhile. The previous draft cannot become a chat send.
         app.on_event(Event::QueueChanged {
             session_id: "s1".into(),
             queued: vec![q(1, "first")],
         });
-        assert_eq!(app.editing_queued, None);
+        assert!(app.editing_queued.unwrap().stale);
+        app.submit_chat(false);
+        assert_eq!(app.input.expanded(), "second");
         // Another Session's queue is not shown here.
         app.on_event(Event::QueueChanged {
             session_id: "s2".into(),
             queued: vec![],
         });
         assert_eq!(app.queued.len(), 1);
+    }
+
+    #[test]
+    fn queued_save_uses_opened_revision_and_preserves_a_rejected_draft() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (reply, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let item = QueuedMessage {
+            id: 9,
+            content: "original".into(),
+            revision: Some(1),
+        };
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![item.clone()],
+        });
+        app.queue_command("queue edit 1");
+        app.input.set("edit from this client");
+        app.submit_chat(false);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(request.request, Request::EditQueuedIfCurrent { id:9, revision:1, ref content, .. } if content == "edit from this client")
+        );
+        reply
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: None,
+                error: Some("queued message moved".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+        assert!(app.editing_queued.unwrap().stale);
+        assert_eq!(app.input.expanded(), "edit from this client");
+        assert!(app.notes.last().unwrap().contains("queued message moved"));
+        app.submit_chat(false);
+        assert!(sent.try_recv().is_err());
+
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![QueuedMessage {
+                revision: Some(2),
+                ..item
+            }],
+        });
+        app.queue_command("queue edit 1");
+        app.submit_chat(false);
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            request.request,
+            Request::EditQueuedIfCurrent {
+                id: 9,
+                revision: 2,
+                ..
+            }
+        ));
+        app.on_event(Event::QueueChanged {
+            session_id: "s1".into(),
+            queued: vec![],
+        });
+        reply
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: true,
+                result: Some(serde_json::json!({"ok":true})),
+                error: None,
+            })
+            .unwrap();
+        app.drain_daemon();
+        assert!(app.editing_queued.is_none() && app.input.is_empty());
     }
 
     #[test]
@@ -21196,6 +21492,7 @@ mod tests {
                 queued: vec![QueuedMessage {
                     id: 8,
                     content: "new queue".into(),
+                    revision: Some(0),
                 }],
             },
             Event::PlanUpdated {
@@ -21948,6 +22245,38 @@ mod tests {
                 .value,
             "daemon mode unknown"
         );
+    }
+
+    #[test]
+    fn manual_skill_load_reports_only_confirmed_success() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (reply, inbox) = std::sync::mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        for ok in [false, true] {
+            app.notes.clear();
+            app.slash("skill:foo");
+            assert!(app.notes.is_empty());
+            let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            reply
+                .send(ServerMessage::Response {
+                    id: request.id,
+                    ok,
+                    result: ok.then(|| serde_json::json!({"loaded":"foo"})),
+                    error: (!ok).then(|| "skill 'foo' is retired".into()),
+                })
+                .unwrap();
+            app.drain_daemon();
+            assert_eq!(
+                app.notes.last().map(String::as_str),
+                Some(if ok {
+                    "loaded skill foo"
+                } else {
+                    "daemon: skill 'foo' is retired"
+                })
+            );
+        }
     }
 
     #[test]
@@ -24016,7 +24345,7 @@ mod tests {
         app.settings_form = Some(form);
 
         let first = render(&mut app, 65, 9);
-        assert!(first.contains("•••••▏"), "{first}");
+        assert!(first.contains("••••▏"), "{first}");
         assert!(first.contains("Enter next, then save"), "{first}");
         assert!(first.contains("PgUp/PgDn scroll form"), "{first}");
         assert!(!first.contains("ab界"), "{first}");
@@ -24053,11 +24382,11 @@ mod tests {
 
         app.key(key(KeyCode::Left));
         let followed = render(&mut app, 65, 9);
-        assert!(followed.contains("•••••▏"), "{followed}");
+        assert!(followed.contains("••••▏"), "{followed}");
         assert!(!followed.contains("ab界"), "{followed}");
         app.paste("X");
         let edited = render(&mut app, 65, 9);
-        assert!(edited.contains("••••••▏"), "{edited}");
+        assert!(edited.contains("•••••▏"), "{edited}");
         assert!(!edited.contains("ab界"), "{edited}");
         app.key(key(KeyCode::Tab));
         let next_field = render(&mut app, 65, 9);
@@ -24070,7 +24399,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_settings_form(frame, form, false))
+            .draw(|frame| draw_settings_form(frame, form, false, true))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -24405,6 +24734,83 @@ mod tests {
         assert!(screen.contains("Downloads and runs code"), "{screen}");
         assert!(!screen.contains("SecretForMcpOnly"));
         assert!(screen.contains("••••"));
+    }
+
+    #[test]
+    fn settings_editors_place_the_hardware_cursor_in_the_focused_field() {
+        use ratatui::backend::{Backend, TestBackend};
+        let mut app = test_app();
+        Config::default().save(&app.paths).unwrap();
+        app.view = View::Settings;
+        let setting = "provider.stall_notice_secs";
+        app.settings_sel = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == setting)
+            .unwrap();
+        app.settings_edit = Some((setting.into(), input::InputLine::from("abc")));
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let caret = terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x - 1, caret.y)].symbol(),
+            "a"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "b"
+        );
+        app.key(key(KeyCode::Char('X')));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        terminal
+            .backend_mut()
+            .assert_cursor_position((caret.x + 1, caret.y));
+        assert_eq!(
+            terminal.backend().buffer()[(caret.x, caret.y)].symbol(),
+            "X"
+        );
+
+        app.slash("mcp add postgres");
+        let form = app.settings_form.as_mut().unwrap();
+        form.idx = 1;
+        form.fields[1].input = input::InputLine::from("界e\u{301}S");
+        app.key(key(KeyCode::Left));
+        app.key(key(KeyCode::Left));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let masked = terminal.backend_mut().get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(masked.x - 1, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x, masked.y)].symbol(), "•");
+        assert_eq!(buffer[(masked.x + 1, masked.y)].symbol(), "•");
+        assert_ne!(buffer[(masked.x + 2, masked.y)].symbol(), "•");
+        assert!(!render(&mut app, 80, 25).contains("界e\u{301}S"));
+
+        app.paste(&"a".repeat(30));
+        let mut narrow = Terminal::new(TestBackend::new(16, 9)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let scrolled = narrow.backend_mut().get_cursor_position().unwrap();
+        assert!(scrolled.x > 0 && scrolled.x < 15 && scrolled.y > 0 && scrolled.y < 8);
+        app.pager = Some(Pager {
+            title: "Topmost pager".into(),
+            lines: vec!["visible".into()],
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        narrow.backend_mut().set_cursor_position((0, 0)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        narrow.backend_mut().assert_cursor_position((0, 0));
+        app.pager = None;
+        for size in [1, 2, 3] {
+            let mut tiny = Terminal::new(TestBackend::new(size, size)).unwrap();
+            tiny.draw(|frame| draw_settings(frame, frame.area(), &app))
+                .unwrap();
+            let pos = tiny.backend_mut().get_cursor_position().unwrap();
+            assert!(pos.x < size && pos.y < size);
+        }
     }
 
     #[test]
@@ -27857,6 +28263,36 @@ mod tests {
     }
 
     #[test]
+    fn home_mentions_and_explicit_attachments_use_the_native_home() {
+        let base = directories::BaseDirs::new().unwrap();
+        let leaf = format!("fl-mention-{}.txt", uuid::Uuid::new_v4().simple());
+        let file = base.home_dir().join(&leaf);
+        std::fs::write(&file, "fixture").unwrap();
+        struct RemoveFile(std::path::PathBuf);
+        impl Drop for RemoveFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = RemoveFile(file.clone());
+        let path = format!("~{}{leaf}", std::path::MAIN_SEPARATOR);
+        let mut app = test_app();
+        assert_eq!(mention_path_in(&app.work_dir(), &path).unwrap(), file);
+        assert_eq!(
+            resolve_path_in(&app.work_dir(), &path).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        app.input.set(&format!("@{path}"));
+        assert!(render(&mut app, 140, 24)
+            .contains(&format!("[@~{}fl-mention-", std::path::MAIN_SEPARATOR)));
+        let forecast = app.forecast_input();
+        assert_eq!(forecast.attachments.len(), 1);
+        assert_eq!(forecast.attachments[0].name, leaf);
+        app.slash(&format!("attach {path}"));
+        assert_eq!(app.attachments, [(leaf, b"fixture".to_vec())]);
+    }
+
+    #[test]
     fn list_help_lists_real_bindings_and_preserves_the_view_and_draft() {
         let mut app = test_app();
         let (client, sent) = DaemonClient::recording();
@@ -30256,6 +30692,32 @@ mod tests {
                 .any(|r| matches!(r, Request::AttachPath { .. })),
             "{requests:?}"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cited_file_mentions_preview_the_file_and_submit_the_citation() {
+        let mut app = test_app();
+        let root = app
+            .paths
+            .data_dir
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("report.md"), "fixture").unwrap();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"mention-session","name":"mentions","created_at":"","updated_at":"","cwd":root.to_string_lossy()})).unwrap()];
+        app.current = Some("mention-session".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("read @report.md:42:8");
+        assert!(render(&mut app, 140, 24).contains("[@report.md:42:8]"));
+        assert_eq!(app.forecast_input().attachments[0].name, "report.md");
+        app.submit_chat(false);
+        let attached = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| serde_json::from_str::<RequestEnvelope>(&line).unwrap().request)
+            .any(|request| matches!(request, Request::AttachPath { path, .. } if path == "report.md:42:8"));
+        assert!(attached);
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 

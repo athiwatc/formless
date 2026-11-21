@@ -27,6 +27,7 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
             input: 1.0,
             output: 2.0,
             cached_input: None,
+            cache_write_input: Some(2.0),
             ..Default::default()
         },
     );
@@ -34,19 +35,20 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
     let store = Store::open(&paths.db_file()).unwrap();
     let a = store.create_session(Some("Alpha".into())).unwrap().id;
     let b = store.create_session(Some("Beta".into())).unwrap().id;
-    let use_ = |p, c| Usage {
+    let use_ = |p, c, cw| Usage {
         prompt_tokens: p,
         completion_tokens: c,
+        cache_write_tokens: cw,
         ..Default::default()
     };
     store
-        .record_usage(&a, "r1", "cheap", &use_(1_000_000, 0))
+        .record_usage(&a, "r1", "cheap", &use_(1_000_000, 0, 250_000))
         .unwrap();
     store
-        .record_usage(&a, "r1", "pricey", &use_(10, 10))
+        .record_usage(&a, "r1", "pricey", &use_(10, 10, 3))
         .unwrap();
     store
-        .record_usage(&b, "r2", "cheap", &use_(0, 1_000_000))
+        .record_usage(&b, "r2", "cheap", &use_(0, 1_000_000, 0))
         .unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
 
@@ -58,12 +60,14 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
     let days = days.as_array().unwrap();
     assert_eq!(days.len(), 1, "all today");
     assert_eq!(days[0]["prompt_tokens"], 1_000_010);
+    assert_eq!(days[0]["cache_write_tokens"], 250_003);
     assert!(days[0]["cost"].is_null(), "a model without a price");
     assert!(days[0].get("session_id").is_none());
 
     let models = daemon.handle(by(Some("model"))).await.unwrap();
     assert_eq!(models[0]["key"], "cheap");
-    assert_eq!(models[0]["cost"], 3.0);
+    assert_eq!(models[0]["cache_write_tokens"], 250_000);
+    assert_eq!(models[0]["cost"], 3.25);
     assert!(models[1]["cost"].is_null());
 
     let sessions = daemon.handle(by(Some("session"))).await.unwrap();
@@ -139,7 +143,7 @@ async fn session_usage_groups_keep_identity_when_names_match_or_disappear() {
     let expected = |id: &str, key: &str, prompt_tokens, completion_tokens, cost: Value| {
         json!({
             "session_id": id, "key": key, "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens, "cached_tokens": 0, "cost": cost,
+            "completion_tokens": completion_tokens, "cached_tokens": 0, "cache_write_tokens": 0, "cost": cost,
         })
     };
     let before = daemon.handle(request()).await.unwrap();
