@@ -159,6 +159,34 @@ fn topic_context_branch_scope_search_and_external_opt_in() {
 }
 
 #[test]
+fn topic_context_search_snippet_maps_unicode_expansion_to_original_characters() {
+    let (store, _, _, proposal) = fixture();
+    let pending = store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap();
+    let topic = store.approve_topic(&pending.id).unwrap();
+    let session = topic.topic_session_id.unwrap();
+    store
+        .append_message(&session, "user", &format!("{} needle", "İ".repeat(100)))
+        .unwrap();
+    let found = store
+        .topic_search_conversations(&topic.id, "NEEDLE")
+        .unwrap();
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    let snippet = found[0]["snippet"].as_str().unwrap();
+    assert!(snippet.ends_with(" needle"));
+    assert!(snippet.starts_with('İ'));
+    assert!(snippet.chars().count() <= 240);
+    let inside_expansion = store
+        .topic_search_conversations(&topic.id, "\u{307}")
+        .unwrap();
+    assert!(inside_expansion[0]["snippet"]
+        .as_str()
+        .unwrap()
+        .starts_with('İ'));
+}
+
+#[test]
 fn topic_needs_user_feature_does_not_block_active_sibling() {
     let (store, _, message, mut request) = fixture();
     request.features = vec![
