@@ -141,6 +141,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
             }
+            args.push("--".into());
             args.push(request.prompt.as_str().into());
         }
         HarnessKind::Codex => {
@@ -190,6 +191,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             if let Some(model) = &request.model {
                 args.extend(["--model".into(), model.into()]);
             }
+            args.push("--".into());
             args.push(request.prompt.as_str().into());
         }
         HarnessKind::Antigravity => unreachable!(),
@@ -465,5 +467,17 @@ mod tests {
         request.prompt = "ok".into();
         request.mcp_command = PathBuf::from("formless");
         assert!(command_spec(&request).is_err());
+    }
+
+    #[test]
+    fn leading_dash_prompts_are_after_an_end_of_options_separator() {
+        for kind in [HarnessKind::Claude, HarnessKind::Codex] {
+            let mut request = request(kind, HarnessRole::Build);
+            request.prompt = "- implement X".into();
+            let spec = command_spec(&request).unwrap();
+            let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
+            assert_eq!(args[args.len() - 2], "--");
+            assert_eq!(args.last().unwrap(), "- implement X");
+        }
     }
 }
