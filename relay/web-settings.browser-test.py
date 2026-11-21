@@ -112,7 +112,7 @@ def run_engine(p, engine, url, artifacts, payload):
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.goto(url)
     page.wait_for_function('!!window.__settings822')
-    page.evaluate(r'''()=>{const d=__settings822;d.S.view='settings';d.S.channel={};d.S.daemonOnline=true;d.S.local=true;
+    page.evaluate(r'''()=>{const d=__settings822;d.S.view='settings';d.S.ws={readyState:1};d.S.channel={local:true};d.S.daemonOnline=true;d.S.local=true;
       d.S.settings=structuredClone(d.data);d.S.status={secure:true,protocol:1,pid:42,sessions:0};
       document.querySelector('#pair').classList.add('hidden');document.querySelector('#app').classList.remove('hidden');d.renderAll();}''')
     for key in payload['values']:
