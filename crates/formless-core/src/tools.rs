@@ -952,7 +952,7 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
 
 /// The built-in tools' definitions, as listed to the model.
 fn topic_step_definition() -> Value {
-    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Launch one independent harness step asynchronously; returns attempt_id and conversation_session_id immediately. Use topic_wait for results and pending interactions. One step per feature may run at a time. Inputs must be exact artifacts from this feature's outputs. Never merge or push.","parameters":{
+    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Launch one isolated harness step asynchronously; returns attempt_id and conversation_session_id immediately. Use topic_wait for results and pending interactions. One step per feature may run at a time, with concurrent writes in separate workspaces. Inputs must be exact artifacts from finalized outputs of any feature in this topic. All selected inputs are supplied, allowing an explicitly requested combining step. Never push or change the source workspace or its branch.","parameters":{
         "type":"object","properties":{"feature_id":{"type":"string"},"title":{"type":"string"},"instructions":{"type":"string"},"harness":{"type":"string","enum":["claude","codex","pi","opencode","antigravity","acp","muse"]},"acp_agent":{"type":"string"},"model":{"type":"string"},"access":{"type":"string","enum":["read_only","write"]},"inputs":{"type":"array","items":{"type":"object"}}},
         "required":["feature_id","title","instructions","harness","access"],"additionalProperties":false}}})
 }

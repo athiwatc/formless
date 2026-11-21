@@ -7213,3 +7213,30 @@ Terminal topic transitions close pending limit/substitute decisions with
 UserQuestionClosed answered_by=None. Finalizing one feature also closes its
 own decisions while leaving sibling work alone. Closed decisions no longer
 keep the daemon busy or leave stale user prompts.
+
+Every step owns a private attempt area. Git Write uses a worktree on
+formless/topic/<topic>/<attempt>, starting at the first selected GitRevision
+or otherwise its feature's latest revision/base. ReadOnly Git is detached.
+Every selected revision is also exposed through a detached input worktree
+whose path and exact revision are in the harness prompt. Cleanup removes
+worktrees on completion, failure and cancel; attempt branches retain commits.
+No operation changes the source checkout or moves the user's branch.
+
+Directory Write and ReadOnly steps recursively copy the source into their
+private workspace; a selected Directory input becomes the starting copy.
+Copies skip .git, reject special files and symlinks escaping the source
+tree, and rewrite internal links to stay within the copy. File data copying
+runs off the async executor and checks cancellation. The attempt area must
+be outside the source tree to avoid recursive/self-copying. Scratch steps
+get an empty private workspace. Directory Write automatically reports a
+Directory artifact pointing at its retained attempt workspace.
+
+Inputs may reference exact finalized artifacts from any feature of this
+topic. Every Directory input is copied to a distinct private input path;
+every File is copied and SHA-256 checked, and text inputs remain inline.
+Harness-reported directories must be inside that attempt's private outputs.
+Concurrent workflows and Write steps may share a source workspace because
+the old exclusive source-workspace lock is no longer acquired. Per-attempt
+leases/cancel tokens remain live through validation and are released on stop.
+Combining outputs is explicit work in a later isolated step, never an
+automatic merge or push into the source workspace.
