@@ -17380,30 +17380,49 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool, focused
     let mut cursor = None;
     for (i, field) in form.fields.iter().enumerate() {
         let active = i == form.idx;
-        let label = format!("{} {:<12}", if active { "›" } else { " " }, field.label);
-        let label = text::take_width(&label, usize::from(inner_width).saturating_sub(8)).to_owned();
-        let label_width = text::width(&label);
-        let (visible, col) = editor_viewport::field(
-            &field.input,
-            usize::from(inner_width).saturating_sub(label_width),
-            field.masked,
-            active,
-        );
+        let mut text = if field.masked {
+            "•".repeat(field.input.chars().count())
+        } else {
+            field.input.to_string()
+        };
+        if active {
+            text.push('▏');
+        }
         let start = body.len();
         if active {
-            cursor = Some((start, label_width + col));
+            let (before, _) = field.input.split_at(field.input.cursor_byte());
+            let before = if field.masked {
+                "•".repeat(before.chars().count())
+            } else {
+                before.to_owned()
+            };
+            let prefix = format!("› {:<12}{before}", field.label);
+            let rows = wrap(Line::raw(prefix));
+            let last_width = rows.last().map_or(0, Line::width);
+            cursor = Some((
+                start
+                    + rows.len().saturating_sub(1)
+                    + usize::from(last_width == usize::from(inner_width)),
+                last_width % usize::from(inner_width),
+            ));
         }
-        body.push(Line::from(vec![
-            Span::styled(
-                label,
-                if active {
-                    bold_fg(color, Color::Green)
-                } else {
-                    ui::dim(color)
-                },
-            ),
-            Span::raw(visible),
-        ]));
+        for (row, line) in text.split('\n').enumerate() {
+            if row == 0 {
+                body.extend(wrap(Line::from(vec![
+                    Span::styled(
+                        format!("{} {:<12}", if active { "›" } else { " " }, field.label),
+                        if active {
+                            bold_fg(color, Color::Green)
+                        } else {
+                            ui::dim(color)
+                        },
+                    ),
+                    Span::raw(line),
+                ])));
+            } else {
+                body.extend(wrap(Line::raw(line)));
+            }
+        }
         if active {
             active_rows = Some(start..body.len());
             body.extend(wrap(Line::styled(
