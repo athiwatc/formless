@@ -6815,15 +6815,15 @@ are addressed separately (#889).
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
 an active Run query exits 0, and cancel exits 0 when its request succeeds.
-Existing `runs --limit N --json` remains a list (default limit 20).
+`runs --limit N --json` lists stored Runs (default limit 20). An explicit
+`--limit` with any `runs` subcommand is a usage error before connection.
 `runs running [--json]` reads `ListInvocations` once through the existing
 CLI connection. It reports live Invocations, in daemon order, with full handles,
 Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
 returned stalled/abandoned flags and optional progress fraction/label.
 Abandoned means no longer awaited and may still finish. Human metadata is
 terminal-escaped; JSON retains the original array and millisecond values.
-Outer `runs --json running` is also supported. An explicitly supplied
-`--limit` conflicts with this unbounded snapshot and fails before connection.
+Outer `runs --json running` is also supported.
 There is no polling or Invocation control action.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
