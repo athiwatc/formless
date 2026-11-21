@@ -3139,7 +3139,12 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         }
         DaemonAction::Status { json, check: false } => {
             if daemon_reachable(&paths) {
-                let v = formless_tui::client::request_once(&paths, Request::Status)?;
+                let mut v = formless_tui::client::request_once(&paths, Request::Status)?;
+                #[cfg(unix)]
+                let endpoint = paths.socket_path().to_string_lossy().into_owned();
+                #[cfg(windows)]
+                let endpoint = paths.pipe_name();
+                v["endpoint"] = serde_json::Value::String(endpoint);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&v)?);
                 } else {

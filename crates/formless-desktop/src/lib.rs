@@ -4,6 +4,7 @@
 //! [`fixture`] carry no GUI dependency. [`shell`] is the GPUI Kit view over them and is
 //! only built with the `gui` feature.
 
+pub mod bootstrap;
 pub mod client;
 pub mod commands;
 pub mod comparison;

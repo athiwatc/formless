@@ -4,6 +4,9 @@
 //!
 //! Options:
 //! - `--connect PATH`: use a local daemon socket or full Windows pipe name.
+//! - `--start-daemon`: start/reuse the profile daemon via the CLI, then connect.
+//!   This is implicit inside a macOS app bundle without fixture/diagnostic flags.
+//!   `--connect` wins; startup failures show an alert, then quit.
 //! - `--sessions N`, `--blocks N`: size the fixture.
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
 //! - `--text-scale P`: override saved text size (100 to 200) for this launch.
@@ -55,13 +58,14 @@ use formless_desktop::{fixture, shell};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
-const USAGE: &str = "usage: formless-desktop [--connect LOCAL_SOCKET_OR_PIPE] [--sessions N] [--blocks N] [--huge-block-mb N] \
+const USAGE: &str = "usage: formless-desktop [--connect LOCAL_SOCKET_OR_PIPE | --start-daemon] [--sessions N] [--blocks N] [--huge-block-mb N] \
                      [--text-scale P] [--preferences PATH | --no-preferences] [--window WxH] [--keep-window] \
                      [--background] [--lifetime S] [--dump-a11y PATH] \
                      [--dump-platform-a11y PATH] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
+    start_daemon: bool,
     connect: Option<std::path::PathBuf>,
     sessions: usize,
     blocks: usize,
@@ -103,6 +107,7 @@ fn parse_options() -> Result<Options, String> {
 
 fn parse_options_from(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options {
+        start_daemon: false,
         connect: None,
         sessions: 10_000,
         blocks: 10_000,
@@ -131,6 +136,7 @@ fn parse_options_from(mut args: impl Iterator<Item = String>) -> Result<Options,
                 .map_err(|_| format!("{name}: {value:?} is not a number"))
         };
         match arg.as_str() {
+            "--start-daemon" => options.start_daemon = true,
             "--connect" => {
                 options.connect = Some(
                     args.next()
@@ -600,9 +606,21 @@ fn run_stream(
     .detach();
 }
 
+struct StartupErrorWindow;
+
+impl gpui_kit::Render for StartupErrorWindow {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        _: &mut gpui_kit::Context<Self>,
+    ) -> impl gpui_kit::IntoElement {
+        gpui_kit::div()
+    }
+}
+
 fn main() {
     let started = Instant::now();
-    let options = match parse_options() {
+    let mut options = match parse_options() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("formless-desktop: {message}");
@@ -611,9 +629,49 @@ fn main() {
         }
     };
 
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let executable = std::env::current_exe().unwrap_or_default();
+    let mut startup_error = None;
+    if formless_desktop::bootstrap::should_start(
+        &executable,
+        &args,
+        options.start_daemon,
+        options.connect.is_some(),
+    ) {
+        match formless_desktop::bootstrap::start() {
+            Ok(endpoint) => options.connect = Some(endpoint),
+            Err(error) => {
+                eprintln!("formless-desktop: daemon startup failed: {error}");
+                startup_error = Some(error);
+            }
+        }
+    }
+
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
         shell::bind_keys(cx);
+
+        if let Some(error) = startup_error {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                window.set_window_title("Formless");
+                let view = cx.new(|_| StartupErrorWindow);
+                let answer = window.prompt(
+                    gpui_kit::PromptLevel::Critical,
+                    "Formless couldn't start its daemon",
+                    Some(&error),
+                    &["Quit"],
+                    cx,
+                );
+                cx.spawn(async move |cx| {
+                    let _ = answer.await;
+                    cx.update(|cx| cx.quit());
+                })
+                .detach();
+                view
+            })
+            .expect("failed to open startup error window");
+            return;
+        }
 
         let app_ready = started.elapsed();
         let sessions = if options.connect.is_some() {
@@ -862,6 +920,14 @@ fn main() {
 #[cfg(test)]
 mod preference_option_tests {
     use super::*;
+    #[test]
+    fn daemon_option_parsing() {
+        assert!(!options(&[]).unwrap().start_daemon);
+        assert!(options(&["--start-daemon"]).unwrap().start_daemon);
+        let both = options(&["--start-daemon", "--connect", "socket"]).unwrap();
+        assert_eq!(both.connect, Some("socket".into()));
+        assert!(options(&["--start-daemon", "--unknown"]).is_err());
+    }
     fn options(args: &[&str]) -> Result<Options, String> {
         parse_options_from(args.iter().map(|s| s.to_string()))
     }
