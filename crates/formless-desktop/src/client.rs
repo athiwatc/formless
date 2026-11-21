@@ -830,6 +830,7 @@ enum Pending {
         destination: Destination,
         label: String,
         undo: bool,
+        run_job: bool,
         add: Option<(String, String)>,
     },
     RunReconcile(run_actions::Recovery),
@@ -2137,6 +2138,7 @@ impl Engine {
             } => {
                 if self.ready {
                     let undo = matches!(request, Request::UndoRegistryChange);
+                    let run_job = matches!(request, Request::RunJobNow { .. });
                     let add = match &request {
                         Request::AddSkill { source, .. } => Some((source.clone(), String::new())),
                         Request::AddJob { prompt, cron, .. } => {
@@ -2155,6 +2157,7 @@ impl Engine {
                             destination,
                             label,
                             undo,
+                            run_job,
                             add,
                         },
                     );
@@ -3095,10 +3098,27 @@ impl Engine {
                 destination,
                 label,
                 undo,
+                run_job,
                 add,
             } => {
                 let succeeded = result.is_ok();
                 let notice = match result {
+                    Ok(value)
+                        if value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .is_some_and(|error| !error.is_empty()) =>
+                    {
+                        format!("Could not {label}: {}", value["error"].as_str().unwrap())
+                    }
+                    Ok(value) if run_job => match value
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .filter(|status| !status.is_empty())
+                    {
+                        Some(status) => format!("{label}: {status}"),
+                        None => format!("Could not {label}: daemon returned no execution status."),
+                    },
                     Ok(value) if undo => {
                         let summary = value
                             .get("undone")
@@ -3106,7 +3126,14 @@ impl Engine {
                             .unwrap_or("registry change");
                         format!("Undone: {summary}")
                     }
-                    Ok(_) => format!("Done: {label}"),
+                    Ok(value) => match value
+                        .get("warning")
+                        .and_then(Value::as_str)
+                        .filter(|warning| !warning.is_empty())
+                    {
+                        Some(warning) => format!("Done: {label} · Warning: {warning}"),
+                        None => format!("Done: {label}"),
+                    },
                     Err(error) => format!("Could not {label}: {error}"),
                 };
                 self.updates.push(Update::ManagementNotice {
@@ -5529,6 +5556,102 @@ mod tests {
                 assert!(matches!(engine.outgoing[0].request, Request::ListSkills));
             }
             assert_eq!(engine.page, Some(current));
+        }
+    }
+
+    #[test]
+    fn management_reports_payload_errors_job_statuses_and_warnings() {
+        let cases = [
+            (
+                Request::RestartMcpServer {
+                    name: "demo".into(),
+                },
+                json!({"restarted":"demo", "tools":null, "error":"startup failed"}),
+                "Could not action: startup failed",
+            ),
+            (
+                Request::RestartMcpServer {
+                    name: "demo".into(),
+                },
+                json!({"restarted":"demo", "tools":0, "error":null}),
+                "Done: action",
+            ),
+            (
+                Request::AddMcpServer {
+                    name: "demo".into(),
+                    server: json!({}),
+                },
+                json!({"added":"demo", "tools":null, "error":"startup failed"}),
+                "Could not action: startup failed",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"skipped: the previous firing is still running"}),
+                "action: skipped: the previous firing is still running",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"prompt delivery failed: provider unavailable"}),
+                "action: prompt delivery failed: provider unavailable",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"id":"j", "status":"started in session s"}),
+                "action: started in session s",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({}),
+                "Could not action: daemon returned no execution status.",
+            ),
+            (
+                Request::RunJobNow { id: "j".into() },
+                json!({"status":""}),
+                "Could not action: daemon returned no execution status.",
+            ),
+            (
+                Request::SetJobEnabled {
+                    id: "j".into(),
+                    enabled: true,
+                },
+                json!({"id":"j", "enabled":true, "warning":"Keep the daemon running"}),
+                "Done: action · Warning: Keep the daemon running",
+            ),
+        ];
+        for (request, payload, expected) in cases {
+            let mut engine = ready();
+            engine.command(Command::Manage {
+                destination: Destination::Jobs,
+                request,
+                label: "action".into(),
+            });
+            let outgoing = engine.outgoing.pop_front().unwrap();
+            respond(&mut engine, outgoing.id, payload);
+            assert!(engine.updates.iter().any(|update| matches!(update, Update::ManagementNotice { notice, .. } if notice == expected)), "{:?}", engine.updates);
+        }
+    }
+
+    #[test]
+    fn add_receipts_only_clear_drafts_after_success() {
+        for success in [false, true] {
+            let mut engine = ready();
+            engine.command(Command::Manage {
+                destination: Destination::Jobs,
+                request: crate::manage::add_job("Review", "bad schedule").unwrap(),
+                label: "add job".into(),
+            });
+            let outgoing = engine.outgoing.pop_front().unwrap();
+            if success {
+                respond(&mut engine, outgoing.id, json!({"id":"j"}));
+            } else {
+                engine
+                    .receive(ServerMessage::err(
+                        outgoing.id,
+                        "unparseable schedule".into(),
+                    ))
+                    .unwrap();
+            }
+            assert_eq!(engine.updates.iter().any(|update| matches!(update, Update::ResourceAdded { destination: Destination::Jobs, text, schedule } if text == "Review" && schedule == "bad schedule")), success);
         }
     }
 
