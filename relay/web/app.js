@@ -6376,18 +6376,34 @@
     else note("Saved " + key + " (in effect now).");
     refreshSettings();
   }
-  let auditSeq = 0;
-  async function loadAudit(older) {
-    const seq = ++auditSeq;
-    const ws = S.ws, channel = S.channel;
+  let auditRequest = null, auditOwner = null;
+  function ownsAudit(scope, filter) {
+    return scope?.ws === S.ws && scope?.channel === S.channel && scope?.filter === filter;
+  }
+  async function loadAudit(older, background = false) {
     const filter = S.auditFilter || null;
-    const last = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1] : null;
+    const loaded = ownsAudit(auditOwner, filter);
+    const explicitPending = ownsAudit(auditRequest, filter) && !auditRequest.background;
+    // A background refresh may replace another background read, but must
+    // not discard an explicit filter or pagination response in flight.
+    if (background && (explicitPending || (loaded && S.auditPages > 1))) return;
+    if (older && (!loaded || explicitPending || !S.audit?.length)) return;
+    const stamp = auditRequest = { ws: S.ws, channel: S.channel, filter, background };
+    const last = older ? S.audit[S.audit.length - 1] : null;
     const before = last ? (last.cursor || last.created_at) : null;
-    const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
-    if (seq !== auditSeq || filter !== (S.auditFilter || null) || ws !== S.ws || channel !== S.channel) return;
-    S.audit = older ? (S.audit || []).concat(page) : page;
-    S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
-    renderView();
+    try {
+      const page = await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null);
+      if (stamp !== auditRequest || !ownsAudit(stamp, S.auditFilter || null)) return;
+      // A failed Older request did not advance the cursor. Preserve its page
+      // count, so Older remains available and retry sends the same cursor.
+      if (older && !Array.isArray(page)) return;
+      S.audit = older ? S.audit.concat(page) : (page || []);
+      S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
+      auditOwner = stamp;
+      renderView();
+    } finally {
+      if (auditRequest === stamp) auditRequest = null;
+    }
   }
   /** Settings → Providers & Roles (SPEC §4.5): list, add or edit (keys
    * are write-only), test a connection, and edit Roles. */
@@ -6903,7 +6919,7 @@
         await refreshDescriptionReviews();
         break;
       case "audit":
-        if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
+        await loadAudit(false, true);
         break;
       default: {
         const list = await request({ type: settingsLists[domain] }).catch(() => null);
