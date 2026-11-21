@@ -1000,6 +1000,40 @@ test('relay reconnect registers only existing push opt-in on the current authent
   await c.restorePushSubscription(ws);assert.equal(frames.length,1,'no existing opt-in creates no subscription');
 });
 
+test('relay reconnect skips a refused endpoint and a successful manual retry clears the refusal', async () => {
+  const endpoint = 'https://push.example/private';
+  const subscription = { endpoint, toJSON: () => ({ endpoint }) };
+  const frames = [], toasts = [];
+  const socket = () => ({
+    readyState: 1, addEventListener() {}, removeEventListener() {},
+    send: frame => frames.push(JSON.parse(frame)),
+  });
+  const c = setup(['restorePushSubscription', 'registerRelayPush', 'pushRefused'], {
+    navigator: { serviceWorker: { getRegistration: async () => ({
+      pushManager: { getSubscription: async () => subscription },
+    }) } },
+    toast: message => toasts.push(message),
+  });
+  const first = socket(), reconnect = socket();
+  Object.assign(c.S, { ws: first, room: 'room', channel: {}, daemonOnline: true });
+  await c.restorePushSubscription(first);
+  const pending = c.S.pushRegistration.settled;
+  c.pushRefused(first, { operation: 'subscribe', reason: 'invalid' });
+  await pending;
+  assert.equal(c.S.pushRegistration, null);
+  assert.match(toasts[0], /refused/);
+
+  c.S.ws = reconnect;
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 1);
+  c.registerRelayPush(reconnect, subscription, true);
+  assert.equal(frames.length, 2);
+  c.S.pushRegistration.finish(reconnect, 'accepted');
+  assert.equal(c.S.pushRefusal, null);
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 3);
+});
+
 test('Session selection pruning retains filter-hidden IDs and removes missing IDs', () => {
   const list=node('ul');
   const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession(){},sessionMenu(){},bulkSessions(){}});
