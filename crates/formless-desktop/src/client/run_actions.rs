@@ -70,7 +70,7 @@ impl Engine {
             .collect::<Vec<_>>();
         for recovery in recoveries {
             if !self.pending.values().any(|p| matches!(p, Pending::RunReconcile(r) if r.dispatch.action.operation == recovery.dispatch.action.operation)) {
-                self.request(Request::GetSession { id: recovery.dispatch.action.owner.session.clone() }, Pending::RunReconcile(recovery));
+                self.request(Request::GetSession { id: recovery.dispatch.action.owner.session.clone() }, Pending::RunReconcile(Box::new(recovery)));
             }
         }
     }
@@ -199,6 +199,7 @@ impl Engine {
                 matches!(
                     p,
                     Pending::RunInspect(_)
+                        | Pending::QueueInventory(_, _)
                         | Pending::RunForecast(_)
                         | Pending::RunConsent(_)
                         | Pending::RunCommitInspect(_)
@@ -225,7 +226,7 @@ impl Engine {
     }
     pub(super) fn action_inspected(
         &mut self,
-        mut work: Box<Work>,
+        work: Box<Work>,
         value: Result<Value, String>,
         commit: bool,
     ) {
@@ -242,6 +243,42 @@ impl Engine {
             );
             return;
         }
+        if matches!(
+            a.kind,
+            crate::run_actions::Kind::Queue(crate::message_queue::Operation::Enqueue)
+        ) {
+            self.request(
+                Request::ListPendingAttachments {
+                    session_id: a.owner.session.clone(),
+                },
+                Pending::QueueInventory(work, commit),
+            );
+            return;
+        }
+        self.action_checked(work, commit);
+    }
+    pub(super) fn queue_inventory(
+        &mut self,
+        work: Box<Work>,
+        value: Result<Value, String>,
+        commit: bool,
+    ) {
+        if !self.action_current(&work) {
+            return;
+        }
+        let empty = value
+            .and_then(|v| {
+                crate::pending_files::Report::decode(&work.dispatch.action.owner.session, v)
+            })
+            .is_ok_and(|r| r.expected().is_empty());
+        if !empty {
+            work.dispatch.reject("Queue supports text only. Remove all pending attachments before reviewing again; nothing was sent.");
+            return;
+        }
+        self.action_checked(work, commit);
+    }
+    fn action_checked(&mut self, mut work: Box<Work>, commit: bool) {
+        let a = &work.dispatch.action;
         if commit {
             if !work.confirmed || (a.forecast().is_some() && !work.consent) {
                 work.dispatch
@@ -474,6 +511,55 @@ mod tests {
     use super::*;
     use crate::run_actions::{Action, Kind, Ledger, Status};
     use serde_json::json;
+    #[test]
+    fn enqueue_requires_empty_attachments_forecast_confirmation_and_rechecks_before_write() {
+        use crate::message_queue::Operation;
+        for attachments in [false, true] {
+            let (mut e, ledger, mut d) = setup(Kind::Cwd);
+            let mut v = snapshot();
+            v["running"] = json!(true);
+            v["queued_items"] = json!([]);
+            d.action.target = Target::decode("s", &v).unwrap();
+            d.action.kind = Kind::Queue(Operation::Enqueue);
+            d.action.text = "follow up".into();
+            e.command(Command::PrepareRunAction(d.clone()));
+            reply(&mut e, v.clone());
+            let inventory = if attachments {
+                json!({"session_id":"s","attachments":[{"id":"a","name":"text","mime":"text/plain","path":"/a","bytes":1}]})
+            } else {
+                json!({"session_id":"s","attachments":[]})
+            };
+            reply(&mut e, inventory);
+            if attachments {
+                assert!(matches!(ledger.status(), Status::Rejected(_)));
+                assert!(e.outgoing.is_empty());
+                continue;
+            }
+            assert!(matches!(
+                reply(
+                    &mut e,
+                    serde_json::to_value(crate::fixture::run_forecast("s", true)).unwrap()
+                ),
+                Request::ForecastRun { for_send: true, .. }
+            ));
+            e.command(Command::ConfirmRunAction(d.action.operation));
+            reply(&mut e, json!({"confirmed":true}));
+            e.command(Command::CommitRunAction(d.action.operation));
+            reply(&mut e, v);
+            reply(&mut e, json!({"session_id":"s","attachments":[]}));
+            let request = e.outgoing.pop_front().unwrap();
+            assert!(matches!(
+                request.request,
+                Request::SendMessage {
+                    mode: formless_protocol::SendMode::Queue,
+                    ..
+                }
+            ));
+            e.generation += 1;
+            assert!(!e.action_before_write(request.id));
+            assert!(e.outgoing.is_empty());
+        }
+    }
     fn snapshot() -> Value {
         json!({"session":{"id":"s","cwd":null},"running":false,"latest_run":{"session_id":"s","run_id":"r","status":"completed"},"messages":[{"id":"u","session_id":"s","role":"user","seq":1,"content":"original"}]})
     }

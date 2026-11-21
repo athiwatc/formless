@@ -33,7 +33,7 @@ cargo run --locked -- --connect /path/to/profile/daemon.sock
 cargo test --no-default-features --features daemon-tests --test daemon --locked
 ```
 
-This mode loads real Sessions, supports New Session, Send/Steer/Stop (Queue uses Formless TUI) and
+This mode loads real Sessions, supports New Session, Send/Steer/Stop and text-only Queue, and
 Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
 Session details (palette or Sessions > Details) edits name, tags, pin, archive or standing instructions using
@@ -170,7 +170,7 @@ inventory and daemon forecast, then explicit native confirmation even when the
 inventory is empty or no cost consent is required. Cancel starts focused; the
 full bounded draft/metadata, estimates and warnings are scrollable and copyable.
 The confirmed message uses the daemon's atomic reviewed-send operation with no
-legacy fallback. Queue and drafts above 64 KiB require Formless TUI. Resume
+legacy fallback. Queue uses the existing plain Queue RPC as described below. Drafts above 64 KiB require Formless TUI. Resume
 retains its existing forecast/cost-consent path. See the
 [native send-review contract](../../docs/desktop/native-send-review-20261116.md).
 
@@ -502,7 +502,7 @@ is being streamed, and has Start, Earlier, Later and End controls when
 there is more. In the Sessions list, Up/Down move
 the selection and Enter opens it. In the composer, Enter is the primary
 action and Shift+Enter adds a line. The synthetic fixture also demonstrates
-Cmd/Ctrl+Enter for Queue during a Run; daemon-backed Queue is unavailable.
+Cmd/Ctrl+Enter for Queue during a Run; daemon-backed Queue opens explicit review.
 In fixture mode, composer actions are recorded in the status line and never sent.
 In daemon mode they retain the existing forecast/consent and acknowledgement
 path described above.
@@ -524,8 +524,18 @@ inspector also shows provider retry/stall state, Run usage and compaction notice
 Commands offers Use Enter for newlines / Use Enter to send. The default
 remains Enter for Send/Steer and Shift+Enter for a newline. In newline mode,
 Enter and Shift+Enter insert newlines and Cmd/Ctrl+Enter invokes Send/Steer.
-Queue remains a synthetic-fixture demonstration; daemon-backed deferred
-messages require Formless TUI. The composer displays the current keys. Changing this per-window choice preserves
+The compact queue panel lists canonical follow-ups and supports revision-checked
+editing, moving up/down and removal. It collapses by default below the scale-aware
+1120px three-pane breakpoint;
+Commands → Manage queued follow-ups reopens it. Queue requires a present, bounded
+`queued_items` inventory. Old peers without item revisions cannot edit safely.
+Enqueue is offered only during an active Run, checks for an empty pending-file
+inventory before review and commit, and keeps the composer draft. It uses
+`SendMessage(Queue)`: the message may start a new Run immediately if the current
+one ends first. A forecast and explicit confirmation are always required; deferred
+work is re-estimated by the daemon and may remain queued for cost confirmation.
+No queue-to-send/steer shortcut or mutation replay is implemented.
+The composer displays the current keys. Changing this per-window choice preserves
 the draft, selection and undo/redo; it survives Session switches. When desktop
 preferences are enabled, Save desktop preferences persists the choice for
 later launches. Finish active input-method composition before changing
@@ -659,7 +669,7 @@ reconciliation remain in Formless TUI. See the
 The daemon-backed composer now confirms complete pending metadata atomically
 with Send/Steer, including an empty inventory. Failed/missing/malformed send
 receipts remain Unknown and block new work in that Client; replacing a Profile
-or restarting is not a safe retry. Queue ownership, attachment mutations and
+or restarting is not a safe retry. Durable queue ownership, attachment mutations and
 durable reconciliation remain unfinished. See the
 [native send-review contract](../../docs/desktop/native-send-review-20261116.md).
 
@@ -669,6 +679,7 @@ This branch retains the reviewed ordinary client/Core workflows through
 `032703d`, using the same schema 67 as verified main. The complete later durable
 journal/identity prototype is preserved separately at `8cd88cf`; it is excluded
 from this preview. No existing prototype database can be downgraded by this
-client/Core pairing. Streaming and Queue remain disabled; Unknown guards remain
+client/Core pairing. The preview originally disabled streaming and Queue; current
+desktop support is documented above. Unknown guards remain
 Client-lifetime. The client-only packager is carried over unchanged.
 See [the exact split, compatibility tests and remaining gates](../../docs/desktop/schema67-preview-20261116.md).

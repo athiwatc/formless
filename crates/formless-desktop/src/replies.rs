@@ -68,6 +68,7 @@ impl std::error::Error for DecodeError {}
 /// A `GetSession` reply as the shell uses it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSnapshot {
+    pub queue: Option<Vec<crate::message_queue::Item>>,
     pub session_id: String,
     /// Read-only Step identities sampled with this reply; absent on older daemons.
     pub steps: crate::steps::Inventory,
@@ -199,6 +200,7 @@ pub fn session_snapshot(
         }
     }
     Ok(SessionSnapshot {
+        queue: crate::message_queue::decode(result.get("queued_items")),
         steps: crate::steps::Inventory::decode(asked, result.get("pending_steps")),
         step_mode: result.get("step_mode").and_then(serde_json::Value::as_bool),
         session_id,

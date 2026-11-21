@@ -54,7 +54,7 @@ async fn target(c: &Client, session: &str) -> (Owner, Target) {
 
 async fn perform(c: &Client, session: &str, kind: Kind, text: &str) -> String {
     c.send(Command::Refresh).unwrap();
-    until(c,"current run state before review",|u| matches!(u,Update::Snapshot { snapshot,.. } if snapshot.running == (kind == Kind::ProviderRetry))).await;
+    until(c,"current run state before review",|u| matches!(u,Update::Snapshot { snapshot,.. } if snapshot.running == matches!(kind, Kind::ProviderRetry | Kind::Queue(_)))).await;
     let (owner, target) = target(c, session).await;
     let operation = uuid::Uuid::new_v4();
     let ledger = Arc::new(Ledger::default());
@@ -76,7 +76,15 @@ async fn perform(c: &Client, session: &str, kind: Kind, text: &str) -> String {
         } = u
         {
             if op == operation {
-                assert_eq!(quote.is_some(), matches!(kind, Kind::Edit | Kind::Retry));
+                assert_eq!(
+                    quote.is_some(),
+                    matches!(
+                        kind,
+                        Kind::Edit
+                            | Kind::Retry
+                            | Kind::Queue(formless_desktop::message_queue::Operation::Enqueue)
+                    )
+                );
                 return true;
             }
         }
@@ -135,6 +143,77 @@ fn response(body: &Value) -> axum::response::Response {
         .header("content-type", content_type)
         .body(axum::body::Body::from(text))
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_queue_rpc_receipts_edit_revisions_and_order_are_canonical() {
+    use formless_desktop::message_queue::Operation;
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-queue-test-key");
+    let gate = Arc::new(Notify::new());
+    let f =
+        Fixture::start(
+            app(axum::routing::post({
+                let gate = gate.clone();
+                move || {
+                    let gate = gate.clone();
+                    async move {
+                        gated_response(prefix("Active queue test"), Some(tail(" complete")), gate)
+                    }
+                }
+            })),
+            0,
+        )
+        .await;
+    let mut observer = Observer::connect(&f.endpoint, &f.session).await;
+    send(&mut observer, &f.session).await;
+    wait(&mut observer, |e| matches!(e, Event::MessageDelta { .. })).await;
+    let c = selected(&f).await;
+    for text in ["First queued", "Second queued"] {
+        perform(&c, &f.session, Kind::Queue(Operation::Enqueue), text).await;
+    }
+    let queued = snapshot(&mut observer, &f.session).await;
+    let first = queued["queued_items"][0]["id"].as_i64().unwrap();
+    let second = queued["queued_items"][1]["id"].as_i64().unwrap();
+    let revision = queued["queued_items"][0]["revision"].as_i64().unwrap();
+    perform(
+        &c,
+        &f.session,
+        Kind::Queue(Operation::Edit(first)),
+        "Changed queued text",
+    )
+    .await;
+    assert!(f
+        .daemon
+        .handle(Request::EditQueuedIfCurrent {
+            session_id: f.session.clone(),
+            id: first,
+            revision,
+            content: "stale edit".into()
+        })
+        .await
+        .is_err());
+    perform(&c, &f.session, Kind::Queue(Operation::Up(second)), "").await;
+    assert_eq!(
+        snapshot(&mut observer, &f.session).await["queued_items"][0]["id"],
+        second
+    );
+    perform(&c, &f.session, Kind::Queue(Operation::Down(second)), "").await;
+    let ordered = snapshot(&mut observer, &f.session).await;
+    assert_eq!(ordered["queued_items"][0]["content"], "Changed queued text");
+    assert_eq!(ordered["queued_items"][1]["id"], second);
+    for id in [first, second] {
+        perform(&c, &f.session, Kind::Queue(Operation::Remove(id)), "").await;
+    }
+    assert!(snapshot(&mut observer, &f.session).await["queued_items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    gate.notify_one();
+    idle(&mut observer, &f.session).await;
+    drop(c);
+    drop(observer);
+    f.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

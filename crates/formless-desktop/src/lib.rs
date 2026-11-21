@@ -14,6 +14,7 @@ pub mod forecast;
 pub mod full_view;
 pub mod live_overlay;
 pub mod memory;
+pub mod message_queue;
 pub mod model;
 pub mod pages;
 pub mod preferences;
