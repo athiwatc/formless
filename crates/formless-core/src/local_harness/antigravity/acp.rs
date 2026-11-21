@@ -168,9 +168,9 @@ impl AgentProcess {
     }
 
     fn pipes(&mut self) -> Result<(BufReader<ChildStdout>, ChildStdin)> {
-        let child = self.0.child_mut();
-        let stdout = child.stdout.take().context("agy acp stdout unavailable")?;
-        let stdin = child.stdin.take().context("agy acp stdin unavailable")?;
+        let (stdin, stdout, _) = self.0.take_pipes();
+        let stdout = stdout.context("agy acp stdout unavailable")?;
+        let stdin = stdin.context("agy acp stdin unavailable")?;
         Ok((BufReader::new(stdout), stdin))
     }
 }

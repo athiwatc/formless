@@ -125,8 +125,18 @@ impl SupervisedProcess {
         }
     }
 
-    pub fn child_mut(&mut self) -> &mut Child {
-        &mut self.child
+    pub fn take_pipes(
+        &mut self,
+    ) -> (
+        Option<std::process::ChildStdin>,
+        Option<std::process::ChildStdout>,
+        Option<std::process::ChildStderr>,
+    ) {
+        (
+            self.child.stdin.take(),
+            self.child.stdout.take(),
+            self.child.stderr.take(),
+        )
     }
 }
 
@@ -320,7 +330,7 @@ mod tests {
             .stdout(std::process::Stdio::piped());
         let mut process = SupervisedProcess::spawn(command).unwrap();
         let mut line = String::new();
-        BufReader::new(process.child_mut().stdout.take().unwrap())
+        BufReader::new(process.take_pipes().1.unwrap())
             .read_line(&mut line)
             .unwrap();
         let descendant: libc::pid_t = line.trim().parse().unwrap();
