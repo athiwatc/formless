@@ -3,7 +3,7 @@
 use formless_core::{Config, Paths, Store};
 use std::{
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -19,26 +19,37 @@ struct Fixture {
     paths: Paths,
     provider: std::net::TcpListener,
 }
+
+fn create_fixture_root(parent: &Path, nonce: u128) -> PathBuf {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+
+    // Parallel fixtures can observe the same clock tick. Claim the directory
+    // exclusively so the daemon and its database belong to one fixture.
+    for attempt in 0..100 {
+        let root = parent.join(format!("f635-{}-{nonce:x}-{attempt}", std::process::id()));
+        match builder.create(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create private fixture directory: {error}"),
+        }
+    }
+    panic!("could not reserve a private fixture directory");
+}
+
 impl Fixture {
     fn new() -> Self {
         #[cfg(unix)]
         let temp = PathBuf::from("/tmp");
         #[cfg(not(unix))]
         let temp = std::env::temp_dir();
-        let root = temp.join(format!(
-            "f635-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = create_fixture_root(&temp, nonce);
         let paths = Paths {
             data_dir: root.join("d"),
             config_dir: root.join("c"),
@@ -161,6 +172,47 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+#[test]
+fn fixture_roots_with_the_same_timestamp_are_distinct() {
+    struct TestRoot(PathBuf);
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Test allocation directly without constructing the socket-bound fixture.
+    let parent = TestRoot(create_fixture_root(&std::env::temp_dir(), 0));
+    let start = std::sync::Barrier::new(2);
+    let allocate = || {
+        start.wait();
+        create_fixture_root(&parent.0, 0)
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(allocate);
+        let second = allocate();
+        (first.join().unwrap(), second)
+    });
+    assert_ne!(first, second);
+
+    let marker = first.join("owner");
+    std::fs::write(&marker, "first").unwrap();
+    let third = create_fixture_root(&parent.0, 0);
+    assert_ne!(third, first);
+    assert_ne!(third, second);
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "first");
+    assert!(!second.join("owner").exists());
+    assert!(!third.join("owner").exists());
+
+    #[cfg(unix)]
+    for directory in [&first, &second, &third] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(directory).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+}
+
 fn finish(child: Child) -> Output {
     let mut child = Owned(child);
     let mut stdout = child.0.stdout.take().unwrap();
@@ -255,7 +307,7 @@ fn shipped_piped_tables_keep_original_cells_even_with_no_color_or_colorblind_the
 }
 
 #[cfg(unix)]
-fn terminal(f: &Fixture, no_color: Option<&str>) -> String {
+fn terminal(f: &Fixture, no_color: Option<&str>, colorfgbg: &str) -> String {
     use std::os::fd::FromRawFd;
     let (mut master, mut slave) = (-1, -1);
     let mut size = libc::winsize {
@@ -282,7 +334,9 @@ fn terminal(f: &Fixture, no_color: Option<&str>) -> String {
     if let Some(value) = no_color {
         command.env("NO_COLOR", value);
     }
-    command.stdout(Stdio::from(slave));
+    command
+        .env("COLORFGBG", colorfgbg)
+        .stdout(Stdio::from(slave));
     let mut child = Owned(command.spawn().unwrap());
     drop(command);
     let reader = std::thread::spawn(move || {
@@ -317,35 +371,141 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
     let f = Fixture::new();
     let daemon = f.daemon();
     success(f.run(&["config", "set", "tui.theme", "colorblind"], None));
-    let colored = terminal(&f, None);
-    for tone in [
-        formless_tui::SemanticTone::Good,
-        formless_tui::SemanticTone::Warn,
-        formless_tui::SemanticTone::Bad,
-    ] {
-        let (r, g, b) = formless_tui::colorblind_rgb(tone);
-        assert!(
-            colored.contains(&format!("\x1b[38;2;{r};{g};{b}m")),
-            "canonical RGB missing"
-        );
-    }
     let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
-    let visible = ansi.replace_all(&colored, "");
-    assert_eq!(
-        terminal(&f, Some("")),
-        colored,
-        "empty NO_COLOR keeps terminal colors"
-    );
-    for no_color in ["1", "0"] {
-        let plain = terminal(&f, Some(no_color));
-        assert!(!plain.contains('\x1b'));
+    let mut previous = None;
+    for (colorfgbg, light) in [("7;0", false), ("0;15", true)] {
+        let colored = terminal(&f, None, colorfgbg);
+        for tone in [
+            formless_tui::SemanticTone::Good,
+            formless_tui::SemanticTone::Warn,
+            formless_tui::SemanticTone::Bad,
+        ] {
+            let (r, g, b) = formless_tui::colorblind_rgb_on_background(tone, light);
+            assert!(
+                colored.contains(&format!("\x1b[38;2;{r};{g};{b}m")),
+                "canonical RGB missing for {colorfgbg}"
+            );
+        }
+        let visible = ansi.replace_all(&colored, "");
+        if let Some(previous) = previous.replace(visible.to_string()) {
+            assert_eq!(previous, visible, "background keeps status text and layout");
+        }
         assert_eq!(
-            plain, visible,
-            "NO_COLOR preserves status information and layout"
+            terminal(&f, Some(""), colorfgbg),
+            colored,
+            "empty NO_COLOR keeps terminal colors"
         );
+        for no_color in ["1", "0"] {
+            let plain = terminal(&f, Some(no_color), colorfgbg);
+            assert!(!plain.contains('\x1b'));
+            assert_eq!(
+                plain, visible,
+                "NO_COLOR preserves status information and layout"
+            );
+        }
     }
     f.no_provider_contact();
     drop(daemon);
+}
+
+#[test]
+fn static_session_preview_marks_clipped_tool_output_while_json_keeps_it() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("preview fixture".into()))
+        .unwrap();
+    let prefix = "x".repeat(119);
+    let tool = format!("{prefix}👍🏽\r\nsecond tool line");
+    let assistant = "first answer line\nsecond answer line";
+    store.append_message(&session.id, "tool", &tool).unwrap();
+    store
+        .append_message(&session.id, "assistant", assistant)
+        .unwrap();
+    let _daemon = fixture.daemon();
+
+    let human = fixture.run(&["sessions", "show", &session.id], Some("1"));
+    assert!(human.status.success(), "{human:?}");
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text
+        .lines()
+        .any(|line| line == format!("  tool result: {prefix}…")));
+    assert!(!text.contains("second tool line"));
+    assert!(text.contains(assistant));
+
+    let json = fixture.run(&["sessions", "show", &session.id, "--json"], Some("1"));
+    assert!(json.status.success(), "{json:?}");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["messages"][0]["content"], tool);
+    assert_eq!(value["messages"][1]["content"], assistant);
+    fixture.no_provider_contact();
+}
+
+#[test]
+fn static_session_last_bounds_output_before_human_formatting() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let session = store.create_session(Some("last fixture".into())).unwrap();
+    for (role, content) in [
+        ("user", "old request"),
+        ("assistant", "old response"),
+        ("assistant", " \n "),
+        ("user", "recent request"),
+        ("tool", "short result\nextra tool data"),
+        ("assistant", "recent response"),
+    ] {
+        store.append_message(&session.id, role, content).unwrap();
+    }
+    let _daemon = fixture.daemon();
+    let run = |flags: &[&str]| {
+        let mut args = vec!["sessions", "show", &session.id];
+        args.extend_from_slice(flags);
+        fixture.run(&args, Some("1"))
+    };
+    let show = |flags: &[&str]| {
+        let out = run(flags);
+        assert!(out.status.success(), "{out:?}");
+        out.stdout
+    };
+
+    let full = show(&[]);
+    assert_eq!(show(&["--last", "6"]), full);
+    let human = String::from_utf8(show(&["--last", "3"])).unwrap();
+    let request = human.find("recent request").unwrap();
+    let tool = human.find("short result…").unwrap();
+    let response = human.find("recent response").unwrap();
+    assert!(request < tool && tool < response);
+    assert!(human.contains("Showing last 3 of 6 stored messages."));
+    assert!(!human.contains("old request") && !human.contains("extra tool data"));
+    let including_blank = String::from_utf8(show(&["--last", "4"])).unwrap();
+    assert_eq!(
+        including_blank,
+        human.replace("Showing last 3", "Showing last 4")
+    );
+
+    let full_json = show(&["--json"]);
+    assert_eq!(show(&["--last", "100", "--json"]), full_json);
+    let mut expected: serde_json::Value = serde_json::from_slice(&full_json).unwrap();
+    assert_eq!(expected["session"]["message_count"], 6);
+    let mut recent = expected["messages"].as_array().unwrap()[3..].to_vec();
+    expected["messages"] = serde_json::json!(recent);
+    expected["total_messages"] = serde_json::json!(6);
+    let bounded: serde_json::Value =
+        serde_json::from_slice(&show(&["--last", "3", "--json"])).unwrap();
+    assert_eq!(bounded, expected);
+
+    let bounded: serde_json::Value =
+        serde_json::from_slice(&show(&["--last", "4", "--json"])).unwrap();
+    assert_eq!(bounded["messages"][0]["content"], " \n ");
+    recent.insert(0, bounded["messages"][0].clone());
+    assert_eq!(bounded["messages"], serde_json::json!(recent));
+
+    for flags in [&["--last", "0"][..], &["--last", "3", "--follow"]] {
+        let invalid = run(flags);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+    }
+    fixture.no_provider_contact();
 }
 
 #[test]
@@ -410,10 +570,72 @@ fn jobs_history_distinguishes_missing_empty_and_populated_jobs_in_both_formats()
                 text.contains("completed") && text.contains("รายละเอียด 日本語"),
                 "{text}"
             );
+            assert!(!text.contains("More may exist."), "{text}");
         }
     }
     assert_eq!(
         fixture.provider.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn jobs_history_limits_the_newest_firings_in_both_formats() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let job = store
+        .create_job(
+            "private limit fixture",
+            None,
+            None,
+            "2999-01-01T00:00:00Z",
+            false,
+            "user",
+        )
+        .unwrap();
+    for n in 1..=501 {
+        store
+            .job_run_start(&job.id, None, "manual", "completed", &format!("firing-{n}"))
+            .unwrap();
+    }
+    let _daemon = fixture.daemon();
+    for (option, limit, notice) in [
+        (None, 20, "Showing newest 20 firings. More may exist."),
+        (Some("50"), 50, "Showing newest 50 firings. More may exist."),
+        (
+            Some("500"),
+            500,
+            "Showing the maximum of 500 firings. More may exist.",
+        ),
+    ] {
+        let mut args = vec!["jobs", "history", &job.id];
+        if let Some(option) = option {
+            args.extend(["--limit", option]);
+        }
+        let expected = store.job_runs(&job.id, limit).unwrap();
+        assert_eq!(expected.len(), limit);
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<_> = text
+            .split_whitespace()
+            .filter(|s| s.starts_with("firing-"))
+            .collect();
+        assert_eq!(
+            lines,
+            expected
+                .iter()
+                .map(|row| row.detail.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(text.contains(notice), "{text}");
+
+        args.push("--json");
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
 }
