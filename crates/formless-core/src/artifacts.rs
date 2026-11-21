@@ -329,20 +329,13 @@ pub fn remove_for_session(store: &Store, session_id: &str) -> Result<()> {
 }
 
 pub(crate) fn remove_retained_for_topic_purge(store: &Store, family: &[String]) -> Result<()> {
-    let sessions = store
-        .list_topics()?
-        .into_iter()
-        .filter_map(|topic| topic.topic_session_id)
-        .collect::<Vec<_>>();
-    if !sessions.iter().any(|session| family.contains(session)) {
-        return Ok(());
-    }
+    let sessions = store.artifact_reference_sessions()?;
     let mut doomed = std::collections::HashSet::new();
     for (id, owner) in store.orphaned_artifact_records()? {
         let mut referenced_by_doomed = false;
         let mut referenced_by_survivor = false;
         for session in &sessions {
-            if store.topic_artifact_access(&id, session, None, Some(&owner))? {
+            if store.session_references_artifact(&id, session, &owner)? {
                 if family.contains(session) {
                     referenced_by_doomed = true;
                 } else {

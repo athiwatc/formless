@@ -26,6 +26,13 @@ def rpc(op):
 if mode=='permission':
     answer=rpc({'operation':'request_permission','title':'Fixture write','kind':'write','options':[{'option_id':'allow','name':'Allow once','kind':'allow_once'},{'option_id':'deny','name':'Deny','kind':'reject_once'}]})
     if answer!='allow':sys.exit(9)
+if mode=='question':
+    answer=rpc({'operation':'ask_user','questions':[{'question':'Use the user-approved accounting inputs?','options':[{'label':'Yes'},{'label':'No'}]}]})
+    assert answer[0]['selected']==['Yes']
+if mode=='release':
+    gate=pathlib.Path(os.environ['TOPIC_FIXTURE_RELEASE_DIR'])/os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
+    gate.with_suffix('.ready').write_text(str(os.getpid()))
+    while not gate.with_suffix('.go').exists():time.sleep(0.01)
 if mode=='scratch':
     prompt=sys.argv[-1];inputs=json.loads(prompt.split('Inputs: ',1)[1].split('\n',1)[0])
     if inputs:
@@ -57,6 +64,7 @@ else:print(json.dumps({'result':result,'session_id':'fixture-claude'}))
     env.set("FORMLESS_TOPIC_CODEX_EXE", &path);
     env.set("TOPIC_FIXTURE_SOCKET", f.paths.socket_path());
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
+    env.set("TOPIC_FIXTURE_RELEASE_DIR", &f.root);
     path
 }
 fn topic(f: &Fixture, workspace: Option<PathBuf>, two: bool) -> TopicInfo {
@@ -230,12 +238,18 @@ async fn model(
         async move{
             if fail{return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,"fixture provider failure").into_response();}
             let round=count.fetch_add(1,Ordering::SeqCst);
-            if empty||round<features.len()*3{assert!(body["tools"].as_array().unwrap().iter().any(|tool|tool["function"]["name"]=="topic_run_step"));}
-            let delta=if empty||round>=features.len()*3{json!({"content":"Done"})}else{
-                let feature=&features[round/3];
-                let (name,args)=match round%3{
+            if empty||round<features.len()*5{assert!(body["tools"].as_array().unwrap().iter().any(|tool|tool["function"]["name"]=="topic_run_step"));}
+            let delta=if empty||round>=features.len()*5{json!({"content":"Done"})}else{
+                let feature=&features[round/5];
+                let (name,args)=match round%5{
                     0=>("topic_run_step",step(feature,builder,StepAccess::Write,&[])),
-                    1=>{
+                    1|3=>{
+                        let tool=body["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
+                        let mut result:Value=serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+                        if result["formless_data"]==1{result=serde_json::from_str(result["content"].as_str().unwrap()).unwrap();}
+                        ("topic_wait",json!({"attempt_ids":[result["attempt_id"]]}))
+                    },
+                    2=>{
                         let tool=body["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap();
                         let mut result:Value=serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
                         if result["formless_data"]==1{result=serde_json::from_str(result["content"].as_str().unwrap()).unwrap();}
@@ -262,6 +276,347 @@ async fn model(
     cfg.provider.tool_use_nudge = false;
     cfg.save(&f.paths).unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })
+}
+impl Daemon {
+    async fn run_topic_step_until_done(
+        self: &Arc<Self>,
+        session: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let launched = self.run_topic_step(session, args, cancel).await?;
+        let id = launched["attempt_id"]
+            .as_str()
+            .context("missing attempt_id")?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let wake = self.topic_activity.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            let saved = self
+                .with_reader(|st| st.get_topic_attempt(id))?
+                .context("attempt missing")?;
+            if !self
+                .topic_steps
+                .locked()
+                .contains_key(&(saved.topic_id.clone(), saved.feature_id.clone()))
+            {
+                return Ok(serde_json::to_value(saved)?);
+            }
+            tokio::select! {_=&mut wake=>{},_=tokio::time::sleep_until(deadline)=>bail!("attempt did not finish within fixture deadline"),}
+        }
+    }
+}
+
+#[tokio::test]
+async fn topic_async_wait_concurrent_completions_empty_errors_and_cancel() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "release");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({}), &cancel)
+            .await
+            .unwrap()["event"],
+        "snapshot"
+    );
+    for args in [
+        json!({"timeout_secs":0}),
+        json!({"timeout_secs":601}),
+        json!({"attempt_ids":["foreign"]}),
+    ] {
+        assert!(f
+            .daemon()
+            .wait_topic_steps(&session, &args, &cancel)
+            .await
+            .is_err());
+    }
+    let first = tokio::time::timeout(
+        Duration::from_secs(1),
+        f.daemon().run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let second = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[1].id,
+                HarnessKind::Codex,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let a = first["attempt_id"].as_str().unwrap();
+    let b = second["attempt_id"].as_str().unwrap();
+    wait_until(|| {
+        f.root.join(format!("{a}.ready")).exists() && f.root.join(format!("{b}.ready")).exists()
+    })
+    .await;
+    assert_eq!(f.daemon().topic_steps.locked().len(), 2);
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[]}), &cancel)
+            .await
+            .unwrap()["attempts"],
+        json!([])
+    );
+    let timed = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({"timeout_secs":1}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(timed["event"], "snapshot");
+    assert_eq!(timed["attempts"].as_array().unwrap().len(), 2);
+    std::fs::write(f.root.join(format!("{b}.go")), "").unwrap();
+    let done = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(done["attempt_id"], b);
+    assert_eq!(done["status"], "succeeded");
+    std::fs::write(f.root.join(format!("{a}.go")), "").unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({}), &cancel)
+            .await
+            .unwrap()["attempt_id"],
+        a
+    );
+    let started = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let id = started["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+    let d = f.daemon().clone();
+    let s = session.clone();
+    let c = cancel.clone();
+    let waiting = tokio::spawn(async move { d.wait_topic_steps(&s, &json!({}), &c).await });
+    cancel.cancel();
+    assert_eq!(waiting.await.unwrap().unwrap()["event"], "cancelled");
+    wait_until(|| f.daemon().topic_steps.locked().is_empty()).await;
+    assert_eq!(
+        state(&f, &topic.id)
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == id)
+            .unwrap()
+            .status,
+        TopicAttemptStatus::Cancelled
+    );
+    let cancel = CancellationToken::new();
+    let launched = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let id = launched["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+    let d = f.daemon().clone();
+    let s = session.clone();
+    let c = cancel.clone();
+    let waiting = tokio::spawn(async move { d.wait_topic_steps(&s, &json!({}), &c).await });
+    f.daemon()
+        .handle(Request::CancelTopic {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.await.unwrap().unwrap()["event"], "cancelled");
+    wait_until(|| f.daemon().topic_steps.locked().is_empty()).await;
+}
+
+#[tokio::test]
+async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_permission() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "question");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let launched = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let question = f
+        .daemon()
+        .wait_topic_steps(
+            &session,
+            &json!({"attempt_ids":[launched["attempt_id"]]}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(question["event"], "question");
+    assert_eq!(question["user_only"], false);
+    assert_eq!(f.daemon().topic_steps.locked().len(), 1);
+    let answered=f.daemon().answer_topic_question_tool(&session,&json!({"question_id":question["question_id"],"answers":[{"selected":["Yes"]}],"basis":"The user's moved request says: Account for X and Y."})).unwrap();
+    assert_eq!(answered["answered"], true);
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(
+                &session,
+                &json!({"attempt_ids":[launched["attempt_id"]]}),
+                &cancel
+            )
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    env.set("TOPIC_FIXTURE_MODE", "permission");
+    let permission_step = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[1].id,
+                HarnessKind::Codex,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let permission = f
+        .daemon()
+        .wait_topic_steps(
+            &session,
+            &json!({"attempt_ids":[permission_step["attempt_id"]]}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(permission["event"], "permission");
+    assert_eq!(permission["informational_only"], true);
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":permission["permission_id"],"answers":[{"selected":["allow"]}],"basis":"Not a permission decision path"})).is_err());
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id: permission["permission_id"].as_str().unwrap().into(),
+            option_id: Some("allow".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(
+                &session,
+                &json!({"attempt_ids":[permission_step["attempt_id"]]}),
+                &cancel
+            )
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    f.daemon().request_shutdown();
+    ipc.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn topic_async_normal_model_end_keeps_attempt_and_waiting_alive() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "release");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let started = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let id = started["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{id}.ready")).exists()).await;
+    f.daemon().topic_orchestrator_ended(&session, "completed");
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
+    assert!(!f
+        .daemon()
+        .topic_steps
+        .locked()
+        .values()
+        .next()
+        .unwrap()
+        .is_cancelled());
+    std::fs::write(f.root.join(format!("{id}.go")), "").unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert!(f.daemon().runs.locked().is_empty());
 }
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
@@ -402,7 +757,7 @@ async fn topic_orchestrator_fixture_duplicate_cancel_kills_cli_and_prevents_late
     let (s, a) = (session.clone(), args.clone());
     let task = tokio::spawn(async move {
         daemon
-            .run_topic_step(&s, &a, &CancellationToken::new())
+            .run_topic_step_until_done(&s, &a, &CancellationToken::new())
             .await
     });
     wait_until(|| {
@@ -414,7 +769,7 @@ async fn topic_orchestrator_fixture_duplicate_cancel_kills_cli_and_prevents_late
     .await;
     assert!(f
         .daemon()
-        .run_topic_step(&session, &args, &CancellationToken::new())
+        .run_topic_step_until_done(&session, &args, &CancellationToken::new())
         .await
         .unwrap_err()
         .to_string()
@@ -433,7 +788,7 @@ async fn topic_orchestrator_fixture_duplicate_cancel_kills_cli_and_prevents_late
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     assert!(f
         .daemon()
-        .run_topic_step(&session, &args, &CancellationToken::new())
+        .run_topic_step_until_done(&session, &args, &CancellationToken::new())
         .await
         .is_err());
     assert_eq!(state(&f, &topic.id).attempts.len(), 1);
@@ -459,7 +814,7 @@ async fn topic_shutdown_cancels_live_step_token_and_harness() {
     let daemon = f.daemon().clone();
     let running = tokio::spawn(async move {
         daemon
-            .run_topic_step(&session, &args, &CancellationToken::new())
+            .run_topic_step_until_done(&session, &args, &CancellationToken::new())
             .await
     });
     wait_until(|| {
@@ -488,6 +843,56 @@ async fn topic_shutdown_cancels_live_step_token_and_harness() {
 }
 
 #[tokio::test]
+async fn topic_interrupt_run_stops_live_harness_and_releases_chat() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "hold");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    let server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Codex,
+        false,
+    )
+    .await;
+    f.daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    wait_until(|| {
+        std::fs::read_to_string(f.root.join("pid"))
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .is_some()
+    })
+    .await;
+    let pid: i32 = std::fs::read_to_string(f.root.join("pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    f.daemon()
+        .handle(Request::InterruptRun {
+            session_id: session.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f, &session).await;
+    wait_until(
+        || unsafe { libc::kill(pid, 0) } == -1 && f.daemon().topic_steps.locked().is_empty(),
+    )
+    .await;
+    assert!(f.daemon().topic_steps.locked().is_empty());
+    assert!(!f.daemon().shutdown.is_cancelled());
+    server.abort();
+}
+
+#[tokio::test]
 async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_are_step_failures() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
@@ -498,7 +903,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     let session = topic.topic_session_id.clone().unwrap();
     let result = f
         .daemon()
-        .run_topic_step(
+        .run_topic_step_until_done(
             &session,
             &step(
                 &topic.features[0].id,
@@ -518,7 +923,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     env.set("FORMLESS_TOPIC_CLAUDE_EXE", f.root.join("missing"));
     let result = f
         .daemon()
-        .run_topic_step(
+        .run_topic_step_until_done(
             &session,
             &step(
                 &topic.features[0].id,
@@ -538,7 +943,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     );
     assert!(f
         .daemon()
-        .run_topic_step(
+        .run_topic_step_until_done(
             &f.session,
             &step(
                 &topic.features[0].id,
@@ -660,7 +1065,7 @@ async fn topic_orchestrator_fixture_recover_stops_live_harness_before_retry() {
     let a = args.clone();
     let task = tokio::spawn(async move {
         daemon
-            .run_topic_step(&s, &a, &CancellationToken::new())
+            .run_topic_step_until_done(&s, &a, &CancellationToken::new())
             .await
     });
     wait_until(|| {
@@ -703,7 +1108,7 @@ async fn topic_orchestrator_fixture_recover_stops_live_harness_before_retry() {
     env.set("TOPIC_FIXTURE_MODE", "done");
     let result = f
         .daemon()
-        .run_topic_step(&session, &args, &CancellationToken::new())
+        .run_topic_step_until_done(&session, &args, &CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(result["status"], "succeeded");
@@ -734,7 +1139,7 @@ async fn topic_orchestrator_fixture_permission_answer_and_undecided_denial() {
         let daemon = f.daemon().clone();
         let task = tokio::spawn(async move {
             daemon
-                .run_topic_step(&session, &args, &CancellationToken::new())
+                .run_topic_step_until_done(&session, &args, &CancellationToken::new())
                 .await
         });
         wait_until(|| !f.daemon().harness_permissions.locked().is_empty()).await;
@@ -918,7 +1323,16 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "provider_error");
     let f = Fixture::new(&env);
-    let topic = topic(&f, None, false);
+    let repo = repository(&f);
+    let topic = topic(&f, Some(repo.clone()), false);
+    let (tx, mut events) = mpsc::channel(256);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 97,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
     let server = model(
         &f,
         &env,
@@ -935,7 +1349,29 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
         .await
         .unwrap();
     settled(&f, topic.topic_session_id.as_ref().unwrap()).await;
-    assert_eq!(state(&f, &topic.id).status, TopicStatus::Failed);
+    let failed = state(&f, &topic.id);
+    assert_eq!(failed.status, TopicStatus::Failed);
+    assert_eq!(failed.features[0].status, TopicFeatureStatus::Failed);
+    let last = f
+        .daemon()
+        .with_reader(|st| st.last_run(topic.topic_session_id.as_ref().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.1, "paused");
+    let mut changed = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event,ServerMessage::Event(Event::TopicChanged{topic_id}) if topic_id==topic.id)
+        {
+            changed = true;
+        }
+    }
+    assert!(changed, "provider failure must publish TopicChanged");
+    let another = self::topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&another.id))
+        .unwrap();
+    f.daemon().cancel_topic_work(&another.id).unwrap();
+    server.abort();
     f.daemon()
         .handle(Request::RetryTopicFeature {
             retry: TopicFeatureRetryRequest {
@@ -945,8 +1381,32 @@ async fn topic_orchestrator_fixture_run_error_fails_topic_and_releases_workspace
         })
         .await
         .unwrap();
+    env.set("TOPIC_FIXTURE_MODE", "done");
+    let retry_server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Claude,
+        true,
+    )
+    .await;
     f.daemon()
-        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
         .unwrap();
-    server.abort();
+    settled(&f, topic.topic_session_id.as_ref().unwrap()).await;
+    let retried = state(&f, &topic.id);
+    assert_eq!(retried.status, TopicStatus::NeedsUser);
+    assert_eq!(retried.features[0].status, TopicFeatureStatus::Pending);
+    let next = f
+        .daemon()
+        .with_reader(|st| st.last_run(topic.topic_session_id.as_ref().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_ne!(next.0, last.0);
+    assert_eq!(next.1, "completed");
+    retry_server.abort();
 }

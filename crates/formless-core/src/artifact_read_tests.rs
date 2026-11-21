@@ -589,7 +589,28 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
     let discarded = f.paths.data_dir.join("artifacts/nested/discarded.txt");
     std::fs::write(&discarded, b"discarded").unwrap();
     let discarded_id = f.record(&discarded, 9, Some(&f.session));
-    let (topic, sibling) = f
+    f.daemon()
+        .with_store(|st| {
+            let unrelated = st.create_session(None)?;
+            assert!(!st.session_references_artifact(&id, &unrelated.id, &f.session)?);
+            st.append_message_meta(
+                &unrelated.id,
+                "user",
+                "Malformed metadata",
+                Some("{".into()),
+            )?;
+            assert!(!st.session_references_artifact(&id, &unrelated.id, &f.session)?);
+            st.append_message_meta(
+                &unrelated.id,
+                "user",
+                "Forged reference",
+                Some(json!({"attachments":[{"id":id,"path":file,"bytes":19}]}).to_string()),
+            )?;
+            assert!(!st.session_references_artifact(&id, &unrelated.id, &f.session)?);
+            Ok(())
+        })
+        .unwrap();
+    let (topic, sibling, ordinary_fork) = f
         .daemon()
         .with_store(|st| {
             let message = st.append_message_meta(
@@ -599,6 +620,7 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
                 Some(json!({"attachments":[{"id":id,"path":file,"bytes":19}]}).to_string()),
             )?;
             let fork = st.fork_session(&f.session, None, None)?.unwrap();
+            let ordinary_fork = st.fork_session(&f.session, None, None)?.unwrap();
             let topic = st.propose_topic(
                 &TopicProposalRequest {
                     parent_topic_id: None,
@@ -626,7 +648,7 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
                 WorkspaceKind::Directory,
                 None,
             )?;
-            Ok((topic, st.approve_topic(&sibling.id)?))
+            Ok((topic, st.approve_topic(&sibling.id)?, ordinary_fork))
         })
         .unwrap();
     let session = topic.topic_session_id.unwrap();
@@ -663,6 +685,9 @@ async fn topic_surviving_source_purge_retains_moved_attachment_bytes() {
         .unwrap()
         .contains("retained attachment"));
     f.daemon().purge_session(&sibling_session).await.unwrap();
+    assert!(file.exists());
+    assert_eq!(access.read(&json!({"id":id,"path":file,"bytes":19,"_source_session":ordinary_fork.id,"_source_seq":1}),100).unwrap(),b"retained attachment");
+    f.daemon().purge_session(&ordinary_fork.id).await.unwrap();
     assert!(!file.exists());
     assert!(f
         .daemon()
