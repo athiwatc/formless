@@ -31,8 +31,8 @@ const POLL: Duration = Duration::from_millis(50);
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const CANCEL_GRACE: Duration = Duration::from_millis(200);
-/// ACP tool kinds a read-only run may approve; every other kind is rejected.
-const READ_ONLY_TOOL_KINDS: &[&str] = &["read", "search", "think", "fetch"];
+/// ACP tool kinds a read-only run rejects without asking; other kinds go to the handler.
+const WRITE_TOOL_KINDS: &[&str] = &["edit", "delete", "move"];
 
 /// How one harness is launched and checked over ACP.
 pub struct AgentSpec {
@@ -55,13 +55,19 @@ pub struct AgentSpec {
     /// Fail a review run when no read-only mode can be selected. When false, the run
     /// relies on the spec's arguments (such as a sandbox) and the read-only tool allow-list.
     pub read_only_fail_closed: bool,
+    /// Session modes for write runs, most preferred first, selected like
+    /// `read_only_modes`; the run fails if none can be set. Empty keeps the agent's default.
+    pub write_modes: &'static [&'static str],
+    /// Adds harness-specific entries (for example `elicitation`) to the
+    /// `clientCapabilities` sent in `initialize`.
+    pub client_capabilities: fn(&mut Value),
     /// Extra variables removed from the agent environment, besides the bridge's.
     pub strip_env: &'static [&'static str],
     /// Variables set on the agent process after the request environment, e.g. to turn
     /// off a self-updater.
     pub set_env: &'static [(&'static str, &'static str)],
-    /// Identifies approval requests for the Formless bridge's own tools, which review
-    /// runs may approve whatever their kind.
+    /// Identifies approval requests for this run's Formless bridge tools (for example by
+    /// MCP server name), which are approved once without asking, whatever the run's access.
     pub bridge_tool: fn(&Value) -> bool,
     /// Serves agent requests the shared loop does not handle, such as a vendor question
     /// method. `None` answers JSON-RPC -32601; `Some` is sent as the result or error.
@@ -85,6 +91,9 @@ pub fn no_vendor_requests(
 ) -> Option<std::result::Result<Value, i64>> {
     None
 }
+
+/// For [`AgentSpec::client_capabilities`] when the harness needs nothing beyond ACP's.
+pub fn no_extra_capabilities(_: &mut Value) {}
 
 /// For [`AgentSpec::bridge_tool`] when the harness gives no reliable way to tell.
 pub fn no_bridge_tools(_: &Value) -> bool {
@@ -120,7 +129,7 @@ pub struct RejectAll;
 
 impl PermissionHandler for RejectAll {
     fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String> {
-        reject_option(request.options)
+        option_of_kind(request.options, &["reject_once", "reject_always"])
     }
 }
 
@@ -283,15 +292,17 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
         role: request.role,
     };
 
+    let mut client_capabilities = json!({
+        "fs": {"readTextFile": false, "writeTextFile": false},
+        "terminal": false
+    });
+    (spec.client_capabilities)(&mut client_capabilities);
     let initialized = rpc
         .call(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": false, "writeTextFile": false},
-                    "terminal": false
-                },
+                "clientCapabilities": client_capabilities,
                 "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
             }),
             permissions,
@@ -366,7 +377,32 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     rpc.session_id = Some(session_id.clone());
 
     if request.role == HarnessRole::Review {
-        select_read_only_mode(spec, &mut rpc, &session, &session_id, permissions)?;
+        let purpose = "keep a review session read-only";
+        let fail_closed = spec.read_only_fail_closed;
+        let modes = spec.read_only_modes;
+        select_mode(
+            spec,
+            &mut rpc,
+            &session,
+            &session_id,
+            modes,
+            fail_closed,
+            purpose,
+            permissions,
+        )?;
+    } else if !spec.write_modes.is_empty() {
+        let purpose = "start a write session";
+        let modes = spec.write_modes;
+        select_mode(
+            spec,
+            &mut rpc,
+            &session,
+            &session_id,
+            modes,
+            true,
+            purpose,
+            permissions,
+        )?;
     }
     if let Some(model) = &request.model {
         let option = find_config_option(&session, "model", model).with_context(|| {
@@ -424,19 +460,18 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     })
 }
 
-fn select_read_only_mode<W: Write>(
+#[allow(clippy::too_many_arguments)]
+fn select_mode<W: Write>(
     spec: &AgentSpec,
     rpc: &mut Rpc<W>,
     session: &Value,
     session_id: &str,
+    candidates: &[&str],
+    fail_closed: bool,
+    purpose: &str,
     permissions: &mut dyn PermissionHandler,
 ) -> Result<()> {
-    let refused = |detail: String| {
-        anyhow!(
-            "{} {detail}, so Formless cannot keep a review session read-only.",
-            spec.name
-        )
-    };
+    let refused = |detail: String| anyhow!("{} {detail}, so Formless cannot {purpose}.", spec.name);
     let available_modes: Vec<&str> = session
         .pointer("/modes/availableModes")
         .and_then(Value::as_array)
@@ -444,7 +479,7 @@ fn select_read_only_mode<W: Write>(
         .flatten()
         .filter_map(|mode| mode.get("id").and_then(Value::as_str))
         .collect();
-    for &mode in spec.read_only_modes {
+    for &mode in candidates {
         if let Some(option) = find_config_option(session, "mode", mode) {
             return rpc.set_config(session_id, &option, mode, permissions);
         }
@@ -454,13 +489,13 @@ fn select_read_only_mode<W: Write>(
             });
         }
     }
-    let attempt = match spec.read_only_modes.first() {
+    let attempt = match candidates.first() {
         Some(&mode) => set_mode(rpc, session_id, mode, permissions)
             .map_err(|code| format!("refused its `{mode}` mode (JSON-RPC error {code})")),
-        None => Err("has no read-only mode over ACP".to_owned()),
+        None => Err("has no suitable mode over ACP".to_owned()),
     };
     match attempt {
-        Err(detail) if spec.read_only_fail_closed => Err(refused(detail)),
+        Err(detail) if fail_closed => Err(refused(detail)),
         _ => Ok(()),
     }
 }
@@ -529,14 +564,14 @@ fn find_config_option(session: &Value, category: &str, value: &str) -> Option<St
         .map(str::to_owned)
 }
 
-fn reject_option(options: &[Value]) -> Option<String> {
-    options
+/// The first option whose kind is listed, in the order of `kinds`.
+fn option_of_kind(options: &[Value], kinds: &[&str]) -> Option<String> {
+    kinds
         .iter()
-        .find(|option| option.get("kind").and_then(Value::as_str) == Some("reject_once"))
-        .or_else(|| {
+        .find_map(|&kind| {
             options
                 .iter()
-                .find(|option| option.get("kind").and_then(Value::as_str) == Some("reject_always"))
+                .find(|option| option.get("kind").and_then(Value::as_str) == Some(kind))
         })
         .and_then(|option| option.get("optionId"))
         .and_then(Value::as_str)
@@ -753,15 +788,16 @@ impl<W: Write> Rpc<W> {
             .get("options")
             .and_then(Value::as_array)
             .ok_or(-32602)?;
-        let read_only_safe = tool_call
+        let writes = tool_call
             .get("kind")
             .and_then(Value::as_str)
-            .is_some_and(|kind| READ_ONLY_TOOL_KINDS.contains(&kind))
-            || (self.bridge_tool)(tool_call);
+            .is_some_and(|kind| WRITE_TOOL_KINDS.contains(&kind));
         let choice = if self.cancel.is_cancelled() {
             None
-        } else if self.role == HarnessRole::Review && !read_only_safe {
-            reject_option(options)
+        } else if (self.bridge_tool)(tool_call) {
+            option_of_kind(options, &["allow_once", "allow_always"])
+        } else if self.role == HarnessRole::Review && writes {
+            option_of_kind(options, &["reject_once", "reject_always"])
         } else {
             permissions
                 .decide(&PermissionRequest {
@@ -1036,6 +1072,93 @@ mod tests {
     }
 
     #[test]
+    fn bridge_tools_are_allowed_and_other_review_tools_go_to_the_handler() {
+        fn formless_server(tool_call: &Value) -> bool {
+            tool_call["title"] == "formless.report"
+        }
+        let spec = AgentSpec {
+            bridge_tool: formless_server,
+            ..SPEC
+        };
+        let bridge =
+            permission(90, "other").replace(r#""title":"tool""#, r#""title":"formless.report""#);
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            ok(3),
+            bridge,
+            permission(91, "execute"),
+            update("done"),
+            stop(4, "end_turn"),
+        ];
+        let (result, sent) =
+            drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut RejectAll);
+        result.unwrap();
+        let answer = |id: u64| {
+            sent.iter()
+                .find(|message| message["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(answer(90)["result"]["outcome"]["optionId"], "allow");
+        assert_eq!(answer(91)["result"]["outcome"]["optionId"], "deny");
+
+        let mut handler = Choose("deny", 0);
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            ok(3),
+            permission(91, "execute"),
+            update("done"),
+            stop(4, "end_turn"),
+        ];
+        let (result, sent) = drive_spec(&spec, &request(HarnessRole::Review), &lines, &mut handler);
+        result.unwrap();
+        assert_eq!(handler.1, 1, "execute in review is the user's decision");
+        let answer = sent.iter().find(|message| message["id"] == 91).unwrap();
+        assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
+    }
+
+    #[test]
+    fn write_runs_select_spec_write_mode_and_extra_client_capabilities() {
+        fn elicitation(capabilities: &mut Value) {
+            capabilities["elicitation"] = json!({"form": {}});
+        }
+        let spec = AgentSpec {
+            write_modes: &["accept-edits"],
+            client_capabilities: elicitation,
+            ..SPEC
+        };
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            ok(3),
+            update("done"),
+            stop(4, "end_turn"),
+        ];
+        let (result, sent) =
+            drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut RejectAll);
+        result.unwrap();
+        assert_eq!(
+            sent[0]["params"]["clientCapabilities"]["elicitation"],
+            json!({"form": {}})
+        );
+        assert_eq!(sent[0]["params"]["clientCapabilities"]["terminal"], false);
+        assert_eq!(sent[2]["method"], "session/set_config_option");
+        assert_eq!(sent[2]["params"]["value"], "accept-edits");
+
+        let refused =
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"unknown mode"}}"#;
+        let session = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#;
+        let lines = [LIVE_INITIALIZE.into(), session.into(), refused.into()];
+        let (result, _) = drive_spec(&spec, &request(HarnessRole::Build), &lines, &mut RejectAll);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot start a write session"));
+    }
+
+    #[test]
     fn streams_each_update_to_the_handler() {
         struct Collect(Vec<Value>);
         impl PermissionHandler for Collect {
@@ -1127,7 +1250,7 @@ mod tests {
             LIVE_INITIALIZE.into(),
             session.into(),
             ok(3),
-            permission(90, "other"),
+            permission(90, "edit"),
             update("done"),
             stop(4, "end_turn"),
         ];
@@ -1135,7 +1258,7 @@ mod tests {
         let (result, sent) = drive_lines(&request(HarnessRole::Review), &lines, &mut handler);
         result.unwrap();
         assert_eq!(sent[2]["method"], "session/set_mode");
-        assert_eq!(handler.1, 0, "review runs never ask about non-read tools");
+        assert_eq!(handler.1, 0, "review runs never ask about edits");
         let answer = sent.iter().find(|message| message["id"] == 90).unwrap();
         assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
     }

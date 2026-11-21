@@ -19,6 +19,8 @@ pub const SPEC: AgentSpec = AgentSpec {
     auth_error_codes: &[-32000],
     read_only_modes: &["plan"],
     read_only_fail_closed: true,
+    write_modes: &[],
+    client_capabilities: acp::no_extra_capabilities,
     strip_env: &[],
     set_env: &[],
     bridge_tool: acp::no_bridge_tools,
