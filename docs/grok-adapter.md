@@ -14,8 +14,8 @@ It is not wired into `HarnessKind` or command/result dispatch and cannot yet
 run a topic step. No Grok-specific ACP transport or permission engine is
 duplicated here. `grok::run` delegates directly to shared `acp::run`.
 `SPEC.set_env` forces `GROK_DISABLE_AUTOUPDATER=1` after user overrides.
-The current `HarnessRole::Review` maps to read-only access;
-the shared contract's planned `StepAccess::ReadOnly` will replace that mapping.
+`StepAccess::ReadOnly` selects the read-only sandbox and plan mode; write steps
+use `StepAccess::Write`. Access is independent of the harness selection.
 
 Launch write steps with:
 
@@ -58,7 +58,8 @@ to `HarnessPermissionRequest`. Only the user selects an option. `None` means
 reject/cancel; `allow_always` is attempt-scoped and must never be persisted.
 Fixtures drive the real shared ACP transport with supplied user choices,
 permission acceptance/rejection/cancellation, authentication failure, and
-read-only mode selection/denial. The pending v2 wire mapping remains separate.
+read-only mode selection/denial. Core's `acp::Interactions` adapts these handlers
+to the v2 `InteractionHandler` contract.
 
 Grok's native question tool sends this **client request**, not an ACP permission:
 
@@ -72,7 +73,9 @@ optional descriptions/header, multi-select). `question_reply` converts ordered
 and free text are comma-separated. Empty/malformed requests, duplicate questions
 or option labels, and invalid selections fail closed without logging payloads.
 `vendor_request` uses the announced shared hook signature and calls the supplied
-handler with `{"questions": [...]}`, expecting an ordered answer array. Its
+handler with a bare `Question` array, expecting an ordered `QuestionAnswer` array.
+This matches `acp::Interactions::ask_question` and is fixture-tested through the
+core `InteractionHandler`, including user decline. Its
 `PermissionHandler` is the shared ACP trait providing `ask_question`. The
 shared layer must validate session ownership and surface questions to the user,
 and its blocking handler must respect cancellation. No question is auto-answered.

@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::acp::{self, AgentSpec, PermissionHandler};
-use super::{HarnessRequest, HarnessResult, HarnessRole};
+use super::{HarnessRequest, HarnessResult, StepAccess};
 
 pub const MIN_VERSION: (u64, u64, u64) = (1, 0, 92);
 pub const AUTH_HINT: &str =
@@ -45,7 +45,7 @@ pub fn program(request: &HarnessRequest) -> PathBuf {
 
 pub fn args(request: &HarnessRequest) -> Vec<&'static str> {
     let mut args = vec!["--permission-mode", "default"];
-    if request.role == HarnessRole::Review {
+    if request.access == StepAccess::ReadOnly {
         args.extend(["--sandbox", "read-only"]);
     }
     args.extend(["agent", "--no-leader", "stdio"]);
@@ -169,7 +169,7 @@ pub fn vendor_request(
         if cancel.is_cancelled() {
             return Ok(cancelled());
         }
-        let request = serde_json::json!({"questions": questions});
+        let request = serde_json::json!(questions);
         let response = handler.ask_question(&request, cancel);
         if cancel.is_cancelled() {
             return Ok(cancelled());
@@ -209,11 +209,11 @@ mod tests {
     const SESSION: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"smoke-session","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"grok-4.6","options":[{"value":"grok-4.6","name":"grok-4.6"}]}]}}"#;
 
     fn drive_spec(
-        role: HarnessRole,
+        access: StepAccess,
         lines: Vec<Value>,
         handler: &mut dyn PermissionHandler,
     ) -> (Result<HarnessResult>, Vec<Value>) {
-        let mut request = request(role);
+        let mut request = request(access);
         request.environment.insert(
             "FORMLESS_TOPIC_CAPABILITY".into(),
             "fixture-capability".into(),
@@ -285,7 +285,7 @@ mod tests {
                 },
             );
             let mut handler = Choose(choice, 0);
-            let (result, sent) = drive_spec(HarnessRole::Build, lines, &mut handler);
+            let (result, sent) = drive_spec(StepAccess::Write, lines, &mut handler);
             assert_eq!(handler.1, 1);
             assert_eq!(result.is_ok(), choice == Some("allow-once"));
             assert_eq!(
@@ -305,7 +305,7 @@ mod tests {
     fn shared_driver_uses_grok_version_and_auth_hint() {
         let mut lines = initialization();
         lines[1] = json!({"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"private-auth-payload"}});
-        let error = drive_spec(HarnessRole::Build, lines, &mut Choose(None, 0))
+        let error = drive_spec(StepAccess::Write, lines, &mut Choose(None, 0))
             .0
             .unwrap_err()
             .to_string();
@@ -313,7 +313,7 @@ mod tests {
         assert!(!error.contains("private-auth-payload"));
         let mut lines = initialization();
         lines[0]["result"]["_meta"]["agentVersion"] = json!("1.0.91");
-        assert!(drive_spec(HarnessRole::Build, lines, &mut Choose(None, 0))
+        assert!(drive_spec(StepAccess::Write, lines, &mut Choose(None, 0))
             .0
             .is_err());
     }
@@ -332,7 +332,7 @@ mod tests {
             lines.push(permission());
             finish(&mut lines, 4, "cancelled");
             let mut handler = Choose(Some("reject-once"), 0);
-            let (result, sent) = drive_spec(HarnessRole::Review, lines, &mut handler);
+            let (result, sent) = drive_spec(StepAccess::ReadOnly, lines, &mut handler);
             assert!(result.is_err());
             assert_eq!(handler.1, usize::from(response.get("result").is_some()));
             assert_eq!(sent[2]["method"], "session/set_mode");
@@ -358,14 +358,14 @@ mod tests {
             lines.push(permission);
             finish(&mut lines, 4, "end_turn");
             let mut handler = Choose(Some("allow-once"), 0);
-            let (result, sent) = drive_spec(HarnessRole::Review, lines.clone(), &mut handler);
+            let (result, sent) = drive_spec(StepAccess::ReadOnly, lines.clone(), &mut handler);
             assert!(result.is_ok());
             assert_eq!(handler.1, 1);
             assert!(sent.iter().any(|message| message["id"] == 90
                 && message["result"]["outcome"]["optionId"] == "allow-once"));
 
             lines.last_mut().unwrap()["result"]["stopReason"] = json!("cancelled");
-            let (result, sent) = drive_spec(HarnessRole::Review, lines, &mut acp::RejectAll);
+            let (result, sent) = drive_spec(StepAccess::ReadOnly, lines, &mut acp::RejectAll);
             assert!(result.is_err());
             assert!(sent.iter().any(|message| message["id"] == 90
                 && message["result"]["outcome"]["optionId"] == "reject-once"));
@@ -380,7 +380,7 @@ mod tests {
             finish(&mut lines, 3, "end_turn");
             let accepted = answer.is_some();
             let mut handler = Answers(answer);
-            let (result, sent) = drive_spec(HarnessRole::Build, lines, &mut handler);
+            let (result, sent) = drive_spec(StepAccess::Write, lines, &mut handler);
             assert_eq!(result.unwrap().message, "Smoke complete.");
             let reply = sent.iter().find(|message| message["id"] == 90).unwrap();
             assert_eq!(
@@ -396,13 +396,82 @@ mod tests {
         }
     }
 
-    fn request(role: HarnessRole) -> HarnessRequest {
+    #[test]
+    fn native_questions_round_trip_through_core_interactions() {
+        use crate::local_harness::{
+            HarnessPermissionRequest, HarnessUpdate, InteractionFuture, InteractionHandler,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct User {
+            accepted: bool,
+            calls: AtomicUsize,
+        }
+        impl InteractionHandler for User {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                panic!("question fixture unexpectedly requested permission")
+            }
+            fn ask_question<'a>(
+                &'a self,
+                questions: Vec<Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<QuestionAnswer>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(questions[0].question, "Pick");
+                assert_eq!(questions[0].options[0].label, "A");
+                assert!(questions[0].multi_select);
+                Box::pin(async move {
+                    self.accepted.then(|| {
+                        vec![QuestionAnswer {
+                            selected: vec!["A".into()],
+                            text: Some("extra".into()),
+                        }]
+                    })
+                })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for accepted in [true, false] {
+            let user = User {
+                accepted,
+                calls: AtomicUsize::new(0),
+            };
+            let mut handler = acp::Interactions {
+                handler: &user,
+                runtime: runtime.handle().clone(),
+            };
+            let mut lines = initialization();
+            lines.push(json!({"jsonrpc":"2.0","id":90,"method":"_x.ai/ask_user_question","params":{"sessionId":"smoke-session","questions":[{"question":"Pick","options":[{"label":"A"}],"multiSelect":true}]}}));
+            finish(&mut lines, 3, "end_turn");
+            let (result, sent) = drive_spec(StepAccess::Write, lines, &mut handler);
+            result.unwrap();
+            assert_eq!(user.calls.load(Ordering::SeqCst), 1);
+            let reply = sent.iter().find(|message| message["id"] == 90).unwrap();
+            assert_eq!(
+                reply["result"]["outcome"],
+                if accepted { "accepted" } else { "cancelled" }
+            );
+            if accepted {
+                assert_eq!(reply["result"]["answers"]["Pick"], "A, extra");
+            }
+        }
+    }
+
+    fn request(access: StepAccess) -> HarnessRequest {
         HarnessRequest {
-            kind: HarnessKind::Antigravity,
+            kind: HarnessKind::Acp,
+            acp_agent: Some("grok".into()),
             model: None,
             cwd: PathBuf::from("/workspace"),
             prompt: "review".into(),
-            role,
+            access,
             mcp_command: PathBuf::from("/usr/bin/formless"),
             mcp_args: Vec::new(),
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
@@ -413,7 +482,7 @@ mod tests {
 
     #[test]
     fn launch_hooks_are_access_scoped_and_keep_credentials_out_of_argv() {
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.environment.extend([
             ("XAI_API_KEY".into(), "fixture-key".into()),
             ("GROK_HOME".into(), "/private/grok".into()),
@@ -439,7 +508,7 @@ mod tests {
         assert_eq!(env[&OsString::from("GROK_HOME")], "/private/grok");
         assert_eq!(env[&OsString::from("GROK_DISABLE_AUTOUPDATER")], "1");
         assert!(!env.contains_key(&OsString::from("FORMLESS_TOPIC_CAPABILITY")));
-        request.role = HarnessRole::Review;
+        request.access = StepAccess::ReadOnly;
         request.executable = Some("/opt/grok".into());
         assert_eq!(program(&request), PathBuf::from("/opt/grok"));
         assert_eq!(
@@ -461,7 +530,7 @@ mod tests {
     #[test]
     fn empty_environment_still_disables_updates() {
         assert_eq!(SPEC.set_env, &[("GROK_DISABLE_AUTOUPDATER", "1")]);
-        let env = environment(&request(HarnessRole::Build));
+        let env = environment(&request(StepAccess::Write));
         assert_eq!(env.len(), 1);
         assert_eq!(env[&OsString::from("GROK_DISABLE_AUTOUPDATER")], "1");
     }
@@ -541,8 +610,7 @@ mod tests {
             panic!("question fixture unexpectedly requested permission")
         }
         fn ask_question(&mut self, request: &Value, _: &CancellationToken) -> Option<Value> {
-            let questions: Vec<Question> =
-                serde_json::from_value(request["questions"].clone()).unwrap();
+            let questions: Vec<Question> = serde_json::from_value(request.clone()).unwrap();
             assert!(!questions.is_empty());
             self.0.take()
         }
@@ -698,7 +766,7 @@ mod tests {
             eprintln!("FORMLESS_LIVE_GROK not set; skipping");
             return;
         }
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.cwd = std::env::current_dir().unwrap();
         request.executable = std::env::var_os("FORMLESS_GROK_BIN").map(PathBuf::from);
         request.mcp_command = PathBuf::from("/usr/bin/python3");
@@ -722,10 +790,7 @@ mod tests {
             }
             fn ask_question(&mut self, request: &Value, _: &CancellationToken) -> Option<Value> {
                 self.questions += 1;
-                assert_eq!(
-                    request["questions"][0]["question"],
-                    "Which smoke option should be used?"
-                );
+                assert_eq!(request[0]["question"], "Which smoke option should be used?");
                 Some(json!([{"selected":["Local (Recommended)"]}]))
             }
         }
@@ -746,7 +811,7 @@ mod tests {
             eprintln!("FORMLESS_LIVE_GROK not set; skipping");
             return;
         }
-        let mut request = request(HarnessRole::Build);
+        let mut request = request(StepAccess::Write);
         request.executable = std::env::var_os("FORMLESS_GROK_BIN").map(PathBuf::from);
         let mut command = Command::new(program(&request));
         command
