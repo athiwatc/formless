@@ -6457,10 +6457,19 @@ fn config_edit(paths: &Paths) -> Result<()> {
         Config::default().save(paths)?;
     }
     let draft = file.with_extension("toml.edit");
-    std::fs::copy(&file, &draft)?;
+    #[cfg(unix)]
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
+    #[cfg(not(unix))]
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "notepad".into());
+    #[cfg(not(unix))]
+    let mut editor_command = windows_config_editor(&editor, &draft)?;
+    std::fs::copy(&file, &draft)?;
     loop {
         // $EDITOR may carry arguments and quotes ("code --wait"): let the
         // shell read it, as git does.
@@ -6472,14 +6481,14 @@ fn config_edit(paths: &Paths) -> Result<()> {
             .arg(&draft)
             .status();
         #[cfg(not(unix))]
-        let status = {
-            let mut words = editor.split_whitespace();
-            std::process::Command::new(words.next().unwrap_or("notepad"))
-                .args(words)
-                .arg(&draft)
-                .status()
-        };
-        let status = status.with_context(|| format!("start editor '{editor}'"))?;
+        let status = editor_command.status();
+        let status = status.with_context(|| {
+            if cfg!(unix) {
+                format!("start editor '{editor}'")
+            } else {
+                format!("start editor '{editor}'. Put double quotes around an executable path containing spaces.")
+            }
+        })?;
         if !status.success() {
             let _ = std::fs::remove_file(&draft);
             anyhow::bail!("the editor exited with {status}; config.toml unchanged");
@@ -6521,6 +6530,44 @@ fn config_edit(paths: &Paths) -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn windows_config_editor(editor: &str, draft: &std::path::Path) -> Result<std::process::Command> {
+    let mut command = formless_tui::windows_editor_command(editor)?;
+    command.arg(draft);
+    Ok(command)
+}
+
+#[cfg(test)]
+#[test]
+fn config_edit_windows_argument_parsing_preserves_literal_paths() {
+    use std::path::Path;
+
+    let draft = Path::new(r"C:\Profile Folder\config.toml.edit");
+    let quoted = windows_config_editor(
+        r#""C:\Program Files\Editor\edit.exe" --wait "--name=two words""#,
+        draft,
+    )
+    .unwrap();
+    assert_eq!(quoted.get_program(), r"C:\Program Files\Editor\edit.exe");
+    assert_eq!(
+        quoted.get_args().collect::<Vec<_>>(),
+        [
+            std::ffi::OsStr::new("--wait"),
+            std::ffi::OsStr::new("--name=two words"),
+            draft.as_os_str(),
+        ]
+    );
+
+    let unquoted = r"C:\Program Files\Editor\edit.exe --wait";
+    let shared = formless_tui::windows_editor_command(unquoted).unwrap();
+    let config = windows_config_editor(unquoted, draft).unwrap();
+    assert_eq!(config.get_program(), shared.get_program());
+    assert!(config
+        .get_args()
+        .eq(shared.get_args().chain([draft.as_os_str()])));
+    assert!(windows_config_editor("\"unclosed", draft).is_err());
 }
 
 /// First-line tool output for the static human Session transcript.
