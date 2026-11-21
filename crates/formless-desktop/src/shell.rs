@@ -2027,7 +2027,7 @@ impl Shell {
         self.include_archived = false;
         self.directory.rebuild(&self.directory_rows, "");
         self.client_sessions.clear();
-        self.topic_ui = topics::Ui::new(window, cx);
+        self.topic_ui.reset_connection();
         self.resource_pages.clear();
         self.resource_confirm = None;
         self.resource_error = None;
@@ -4495,9 +4495,10 @@ impl Shell {
     /// inside it until it is dismissed.
     fn render_sidebar(&self, modal: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.sidebar_focus.is_focused(window);
-        let navigation = Destination::NAVIGATION.into_iter().map(|destination| {
-            let button =
-                Button::new(SharedString::from(format!(
+        let navigation = Destination::NAVIGATION
+            .into_iter()
+            .map(|destination| {
+                let button = Button::new(SharedString::from(format!(
                     "destination-{}",
                     destination.label()
                 )))
@@ -4508,14 +4509,15 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_destination(destination, window, cx)
                 }));
-            if self.client.is_some()
-                || matches!(destination, Destination::Chat | Destination::Sessions)
-            {
-                button
-            } else {
-                button.tooltip("Scaffold: this destination has no view yet")
-            }
-        });
+                if self.client.is_some()
+                    || matches!(destination, Destination::Chat | Destination::Sessions)
+                {
+                    button
+                } else {
+                    button.tooltip("Scaffold: this destination has no view yet")
+                }
+            })
+            .collect::<Vec<_>>();
         let panel = v_flex()
             .id("region-sidebar")
             .test_support()

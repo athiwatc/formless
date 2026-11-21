@@ -19,6 +19,13 @@ pub(super) struct Ui {
 }
 
 impl Ui {
+    pub fn reset_connection(&mut self) {
+        self.state = Default::default();
+        self.proposing = false;
+        self.source = None;
+        self.selected.clear();
+        self.pending_open = None;
+    }
     pub fn retain_candidates(&mut self, available: &HashSet<&str>) {
         self.selected.retain(|id| available.contains(id.as_str()));
     }
@@ -262,6 +269,7 @@ impl Shell {
         let proposal = formless_protocol::TopicProposalRequest {
             source_session_id: ui.source.clone().unwrap(),
             message_ids,
+            features: vec![],
             name,
             repo: repo.into(),
             builder: ui.builder,
@@ -278,7 +286,7 @@ impl Shell {
             .is_some_and(|id| self.topic_ui.state.attempt_for(id).is_some())
     }
 
-    pub(super) fn render_topic_tree(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_topic_tree(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.topic_ui.state;
         let mut tree = v_flex()
             .id("topic-navigation")

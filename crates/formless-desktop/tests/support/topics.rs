@@ -183,3 +183,124 @@ fn narrow_topic_navigation_remains_available_in_sidebar_overlay(cx: &mut TestApp
             .contains("read only"));
     });
 }
+
+#[gpui_kit::test]
+fn pending_proposal_opens_from_settings_but_archived_topic_never_relabels_another_chat(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let (mut sessions, mut topic) = fixture::topic_workspace();
+        sessions[1].archived = true;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::Sessions(sessions), window, cx)
+        });
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("main"));
+        assert!(window.try_find("topic-detail-name").is_none());
+
+        topic.status = formless_protocol::TopicStatus::PendingApproval;
+        topic.topic_session_id = None;
+        topic.attempts.clear();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![topic])),
+                },
+                window,
+                cx,
+            );
+            s.run_command(Command::GoTo(Destination::Settings), window, cx);
+        });
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert!(window.find("topic-consent").visible());
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("main"));
+    });
+}
+
+#[gpui_kit::test]
+fn inventory_refresh_keeps_proposal_edits_and_a_cwdless_source_clears_old_repository(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(
+                        "main",
+                        &serde_json::json!({"session":{"id":"main"},"messages":[],"running":false}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::TopicCandidates {
+                    generation,
+                    session_id: "main".into(),
+                    messages: vec![formless_desktop::topics::Candidate {
+                        id: "message-x".into(),
+                        seq: 1,
+                        preview: "Add X".into(),
+                    }],
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.click("topic-move-open", cx);
+        let inputs = shell.read(cx).topic_inputs();
+        inputs[0].update(cx, |s, cx| s.set_value("My topic", window, cx));
+        inputs[1].update(cx, |s, cx| s.set_value("/old/repo", window, cx));
+        window.render_frame(cx);
+        window.click("topic-message-message-x", cx);
+        window.click("topics-refresh", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            WireCommand::Topic {
+                operation: None,
+                action: Action::List,
+                ..
+            }
+        )));
+        let (_, topic) = fixture::topic_workspace();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![topic])),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.find("topic-propose").visible());
+        assert_eq!(window.find("topic-propose").disabled(), Some(false));
+        assert_eq!(inputs[0].read(cx).value().as_ref(), "My topic");
+        assert_eq!(inputs[1].read(cx).value().as_ref(), "/old/repo");
+        window.click("topic-move-open", cx);
+        window.render_frame(cx);
+        window.click("topic-move-open", cx);
+        assert!(
+            inputs[1].read(cx).value().is_empty(),
+            "new proposal cannot inherit a repository from an earlier source"
+        );
+    });
+}
