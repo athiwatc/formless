@@ -1330,6 +1330,7 @@ dependencies = [
  "clap_complete",
  "clap_mangen",
  "crossterm",
+ "directories",
  "formless-core",
  "formless-protocol",
  "formless-runtime",
@@ -1418,6 +1419,7 @@ dependencies = [
  "rquickjs",
  "serde",
  "serde_json",
+ "tokio",
  "uuid",
  "windows-sys 0.59.0",
 ]
