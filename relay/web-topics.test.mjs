@@ -188,3 +188,24 @@ test('proposal request binds selected messages and workflow without moving or st
   assert.deepEqual(calls, [{ type: 'propose_topic', proposal: { source_session_id: 'main', message_ids: ['x'], name: 'Formless', repo: '/repos/formless',
     builder: 'claude', builder_model: null, reviewer: 'codex', reviewer_model: null } }]);
 });
+
+test('existing topic chats surface proposals and preview independent features from one source message', () => {
+  let nodes;
+  const c = setup(['topicForSession', 'currentTopicAttempt', 'topicStatusLabel', 'harnessLabel', 'topicBadge', 'topicWorkflowLabel', 'renderTopicContext'], {
+    $: () => ({ classList: { toggle() {} } }), h: (tag, props, ...children) => ({ tag, props, children }),
+    replaceTopicContent: (_, signature, children) => { nodes = children; } });
+  const proposal = { ...topic(), id: 'new-topic', name: 'New focused work', source_session_id: 'side', attempts: [], features: [
+    { id: 'x', source_message_id: 'xy', request: 'Build feature X', status: 'pending' },
+    { id: 'y', source_message_id: 'xy', request: 'Build feature Y', status: 'pending' }] };
+  c.S.topics = [topic('running'), proposal]; c.S.current = 'side';
+  c.renderTopicContext();
+  assert.match(JSON.stringify(nodes), /Review proposal/);
+  c.S.topicFocus = 'new-topic';
+  c.renderTopicContext();
+  const preview = JSON.stringify(nodes);
+  assert.match(preview, /New focused work/);
+  assert.match(preview, /Move & start/);
+  assert.match(preview, /Keep in original chat/);
+  assert.match(preview, /Build feature X/);
+  assert.match(preview, /Build feature Y/);
+});

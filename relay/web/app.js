@@ -1821,8 +1821,8 @@
     const root = $("topic-context");
     if (!root) return;
     const attempt = currentTopicAttempt();
-    const topic = topicForSession() || S.topics.find(item => item.id === S.topicFocus);
-    const pending = !topic ? S.topics.filter(item => item.source_session_id === S.current && item.status === "pending_approval") : [];
+    const topic = S.topics.find(item => item.id === S.topicFocus) || topicForSession();
+    const pending = S.topics.filter(item => item.source_session_id === S.current && item.status === "pending_approval" && item.id !== topic?.id);
     root.classList.toggle("hidden", !S.topicsAvailable || !topic && !pending.length);
     if (!S.topicsAvailable) return;
     const signature = JSON.stringify([topic, attempt?.id, pending, S.topicBusy, S.topicsError, S.attemptTranscriptError]);
@@ -1856,10 +1856,9 @@
           feature.ready_revision ? h("p", { class: "topic-revision" }, "Reviewed revision ", h("code", null, feature.ready_revision)) : null,
           ["failed", "needs_user"].includes(feature.status) ? control("Retry feature", "retry-" + feature.id, () => retryTopicFeature(topic, feature)) : null))));
       children.push(h("p", { class: "topic-no-merge muted" }, "Formless handles build → review → fixes. Ready features wait for you; nothing merges automatically."));
-    } else {
-      children.push(...pending.map(item => h("div", { class: "topic-proposal-notice" }, h("span", null, "Move focused work to ", h("strong", null, item.name), "?"),
-        topicBadge("pending_approval"), control("Review proposal", "proposal-" + item.id, () => openTopic(item), true))));
     }
+    children.push(...pending.map(item => h("div", { class: "topic-proposal-notice" }, h("span", null, "Move focused work to ", h("strong", null, item.name), "?"),
+      topicBadge("pending_approval"), control("Review proposal", "proposal-" + item.id, () => openTopic(item), true))));
     if (S.topicBusy) children.push(h("p", { class: "muted", role: "status" }, S.topicBusy));
     if (S.topicsError) children.push(h("p", { class: "error", role: "status" }, "Could not refresh topics. Status may be out of date."));
     replaceTopicContent(root, signature, children);
