@@ -164,6 +164,21 @@ fn topic_accept_and_cancel_emit_distinct_single_intents(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
+fn harness_topic_chat_does_not_block_editing_a_selected_regular_session(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.click("topic-attempt-build-x", cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("claude-chat"));
+    });
+    let (sessions, _) = fixture::topic_workspace();
+    super::session_edit_tests::show(cx, handle, &shell, &sessions[0]);
+    step(cx, handle, |_window, cx| {
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("claude-chat"));
+    });
+}
+
+#[gpui_kit::test]
 fn narrow_topic_navigation_remains_available_in_sidebar_overlay(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, size(px(560.), px(800.)), 0, 0);
     workspace(cx, handle, &shell);

@@ -296,6 +296,13 @@ impl Shell {
         }
     }
 
+    pub(super) fn topic_session_edit_allowed(&self) -> bool {
+        (!self.topic_ui.state.supported || self.topic_ui.state.inventory_loaded)
+            && self
+                .session_edit_target()
+                .is_some_and(|id| self.topic_ui.state.attempt_for(id).is_none())
+    }
+
     pub(super) fn render_topic_tree(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let state = &self.topic_ui.state;
         let mut tree = v_flex()

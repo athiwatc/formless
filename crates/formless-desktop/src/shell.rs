@@ -3509,9 +3509,7 @@ impl Shell {
                 && self.mode_disable_action().is_none())
             .then_some("Step mode is not available for this Session"),
             can_search_profile: self.client.is_some(),
-            can_edit_session: self.topic_write_notice().is_none()
-                && self.client_connected
-                && self.session_edit_target().is_some(),
+            can_edit_session: self.client_connected && self.topic_session_edit_allowed(),
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
             composing,
