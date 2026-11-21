@@ -18,10 +18,10 @@ pub mod tokens {
     pub const INSPECTOR_MIN: f32 = 300.0;
     pub const INSPECTOR_DEFAULT: f32 = 340.0;
     pub const INSPECTOR_MAX: f32 = 420.0;
-    pub const READING_MIN: f32 = 680.0;
+    pub const READING_MIN: f32 = 496.0;
     pub const READING_MAX: f32 = 900.0;
     /// Below this the inspector stops being a docked third pane.
-    pub const THREE_PANE_MIN: f32 = 1280.0;
+    pub const THREE_PANE_MIN: f32 = 1120.0;
     /// Below this a docked sidebar would squeeze the conversation under its
     /// minimum reading width, so the sidebar collapses too.
     pub const SIDEBAR_DOCK_MIN: f32 = SIDEBAR_DEFAULT + READING_MIN;
@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(at_threshold.inspector, InspectorMode::Docked);
 
         // Narrowing alone never puts a panel over the conversation.
-        let medium = Layout::for_width(1279.0, prefs);
+        let medium = Layout::for_width(tokens::THREE_PANE_MIN - 1.0, prefs);
         assert_eq!(medium.sidebar, SidebarMode::Docked);
         assert_eq!(medium.inspector, InspectorMode::Hidden);
 
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn only_one_overlay_is_up_at_a_time() {
-        let narrow = 800.0;
+        let narrow = 720.0;
         let mut prefs = PanelPrefs::default();
         prefs.toggle_sidebar(narrow);
         prefs.toggle_inspector(narrow);
@@ -1051,6 +1051,26 @@ mod tests {
     }
 
     #[test]
+    fn responsive_panels_dock_at_scaled_reading_breakpoints() {
+        for (width, sidebar, inspector) in [
+            (759., SidebarMode::Collapsed, InspectorMode::Hidden),
+            (760., SidebarMode::Docked, InspectorMode::Hidden),
+            (1119., SidebarMode::Docked, InspectorMode::Hidden),
+            (1120., SidebarMode::Docked, InspectorMode::Docked),
+        ] {
+            for percent in [100, 200] {
+                let scale = TextScale::from_percent(percent);
+                let layout = Layout::for_width(
+                    scale.layout_width(width * scale.factor(), 1800.),
+                    PanelPrefs::default(),
+                );
+                assert_eq!(layout.sidebar, sidebar);
+                assert_eq!(layout.inspector, inspector);
+            }
+        }
+    }
+
+    #[test]
     fn widening_forgets_an_overlay_so_narrowing_again_does_not_reopen_it() {
         let mut prefs = PanelPrefs::default();
         prefs.toggle_inspector(1100.0);
@@ -1061,10 +1081,10 @@ mod tests {
             InspectorMode::Hidden
         );
 
-        prefs.toggle_sidebar(800.0);
+        prefs.toggle_sidebar(720.0);
         assert!(prefs.settle(1000.0));
         assert_eq!(
-            Layout::for_width(800.0, prefs).sidebar,
+            Layout::for_width(720.0, prefs).sidebar,
             SidebarMode::Collapsed
         );
     }
