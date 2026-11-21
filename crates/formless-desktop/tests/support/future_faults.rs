@@ -1,7 +1,7 @@
 //! Unix-only IPC fault schedules, using a real private daemon and fake provider.
 #![cfg(unix)]
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 enum Fault {
@@ -16,6 +16,7 @@ struct Proxy {
     value: Arc<Mutex<Option<Value>>>,
     upstream_eof: Arc<AtomicBool>,
     closed_by: Arc<Mutex<Option<&'static str>>>,
+    discarded_transcript_deltas: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Proxy {
@@ -28,6 +29,7 @@ impl Proxy {
         let value = Arc::new(Mutex::new(None));
         let upstream_eof = Arc::new(AtomicBool::new(false));
         let closed_by = Arc::new(Mutex::new(None));
+        let discarded_transcript_deltas = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn({
             let upstream = fixture.endpoint.clone();
             let arm = arm.clone();
@@ -36,6 +38,7 @@ impl Proxy {
             let value = value.clone();
             let upstream_eof = upstream_eof.clone();
             let closed_by = closed_by.clone();
+            let discarded_transcript_deltas = discarded_transcript_deltas.clone();
             async move {
                 loop {
                     let (front, _) = listener.accept().await.unwrap();
@@ -93,7 +96,11 @@ impl Proxy {
                                         }
                                     };
                                     let frame:ServerMessage=serde_json::from_str(&line).unwrap();
-                                    let provisional = matches!(&frame, ServerMessage::Event(Event::MessageDelta { .. } | Event::RunUsage { .. }));
+                                    // This client subscribes to opt-in attempt envelopes,
+                                    // not just the legacy MessageDelta stream.
+                                    let transcript_delta = matches!(&frame, ServerMessage::Event(Event::TranscriptAttempt { update })
+                                        if matches!(&update.change, formless_protocol::TranscriptAttemptChange::Delta { .. }));
+                                    let provisional = transcript_delta || matches!(&frame, ServerMessage::Event(Event::MessageDelta { .. } | Event::RunUsage { .. }));
                                     let intercept=match (&frame,fault) {
                                         (ServerMessage::Response{id,..},Fault::StatusReply)=>*selected.lock().unwrap()==Some(*id),
                                         (_,Fault::ServerRead)=>arm.swap(false,Ordering::SeqCst),
@@ -113,7 +120,10 @@ impl Proxy {
                                         // complete canonical baseline on a new connection.
                                         draining_finished_run = true;
                                     }
-                                    if draining_finished_run && provisional {continue;}
+                                    if draining_finished_run && provisional {
+                                        if transcript_delta { discarded_transcript_deltas.fetch_add(1, Ordering::SeqCst); }
+                                        continue;
+                                    }
                                     front_write.write_all(line.as_bytes()).await?;
                                 }
                             }
@@ -132,6 +142,7 @@ impl Proxy {
             value,
             upstream_eof,
             closed_by,
+            discarded_transcript_deltas,
             task,
         }
     }
@@ -324,9 +335,14 @@ async fn future_server_queue_saturation_disconnects_and_recovers_canonically() {
         proxy.upstream_eof.load(Ordering::SeqCst),
         "the upstream server, rather than the UI consumer, must end its saturated connection"
     );
+    let discarded = proxy.discarded_transcript_deltas.load(Ordering::SeqCst);
+    assert!(
+        discarded > 0,
+        "the fault must drain real opt-in transcript deltas, not only legacy MessageDelta frames"
+    );
     eprintln!(
         "reader_server_pressure_metrics {}",
-        json!({"provider_delta_frames":PRESSURE_FRAMES,"canonical_payload_bytes":expected.len(),"server_closure_observed":proxy.closed_by.lock().unwrap().as_ref(),"provider_calls":calls.load(Ordering::SeqCst),"ui_consumer_deliberately_stalled":false})
+        json!({"provider_delta_frames":PRESSURE_FRAMES,"canonical_payload_bytes":expected.len(),"server_closure_observed":proxy.closed_by.lock().unwrap().as_ref(),"discarded_transcript_deltas":discarded,"provider_calls":calls.load(Ordering::SeqCst),"ui_consumer_deliberately_stalled":false})
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(client);
