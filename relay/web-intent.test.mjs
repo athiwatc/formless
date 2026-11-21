@@ -7,6 +7,9 @@ import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+test('web actions avoid native synchronous prompt and confirm calls', () => {
+  assert.doesNotMatch(source.replace(/^\s*\/\/.*$/gm, ''), /\b(?:prompt|confirm)\s*\(/);
+});
 const fn = (name) => {
   const start = source.search(new RegExp('  (?:async )?function ' + name + '\\('));
   assert.ok(start >= 0, name);
@@ -29,10 +32,29 @@ function setup(names, extras = {}) {
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
-  const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
+    vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
+  }
+  const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
+  if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('wrapped file mentions attach and highlight the same paths without matching email addresses', () => {
+  const c = setup(['mentionMatches', 'mentionsIn', 'withMentions', 'mentionAtCaret'], {
+    h: (tag, attrs, text) => ({ tag, attrs, text }),
+  });
+  const message = 'mail a@b.c, then `@src/main.rs` ([@README.md]) {@Cargo.toml} and @src/main.rs]}>';
+  assert.deepEqual([...c.mentionsIn(message)], ['src/main.rs', 'README.md', 'Cargo.toml']);
+  const parts = c.withMentions(message);
+  assert.equal(parts.map(part => typeof part === 'string' ? part : part.text).join(''), message);
+  assert.equal(parts.filter(part => typeof part === 'object').length, 4);
+  const input = c.$('input');
+  input.value = 'see [@src/';
+  input.selectionStart = input.value.length;
+  assert.equal(c.mentionAtCaret().query, 'src/');
+  assert.equal(c.mentionAtCaret().start, 5);
+});
 test('malformed fragment pairs preserve independently valid pairs and plus signs', () => {
   const c = setup(['hashParams'], { location: { hash: '' } });
   for (const hash of ['#k=%E0%A4%A', '#s=%', '#local=%zz', '#k=abc%&s=valid']) {
@@ -43,6 +65,19 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   }
   c.location.hash = '#k=a+b%3D&s=session';
   assert.equal(c.hashParams().k, 'a+b=');
+});
+
+test('Windows drive roots, home folders and credential paths use native separators', () => {
+  const c = setup(['broadWhy', 'pathNote', 'normalizeApprovalPath']);
+  for (const path of ['C:\\', 'c:/', 'D:\\Users', 'C:\\Users\\Ada', '\\\\?\\C:\\USERS\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), 'writing anywhere in your files', path);
+  }
+  for (const path of ['C:', 'C:Users\\Ada', 'C:\\Users\\Ada\\project', '/work\\Users\\Ada']) {
+    assert.equal(c.broadWhy('fs:write:' + path), null, path);
+  }
+  assert.deepEqual(Array.from(c.pathNote('fs:read:C:\\Users\\Ada\\.SSH\\id_rsa', 'C:\\Users\\Ada')), [true, 'holds SSH keys']);
+  assert.deepEqual(Array.from(c.pathNote('fs:read:c:/Users/Ada/project/file', 'C:\\USERS\\Ada\\project\\')), [false, 'inside the working folder']);
+  assert.equal(c.pathNote('fs:read:c:/Users/Ada/project-other/file', 'C:\\Users\\Ada\\project')[0], true);
 });
 test('init and hashchange recover malformed links through pairing guidance', () => {
   for (const kind of ['init', 'hashchange']) {
@@ -63,7 +98,6 @@ test('init and hashchange recover malformed links through pairing guidance', () 
 });
 test('summary close-review labels do not leak into later ordinary dialogs', async () => {
   const c=setup(['ask','showNextAsk','closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];',c);
   const visibility=[];c.$('ask-cancel').classList.toggle=(name,hidden)=>visibility.push([name,hidden]);
   const review=c.ask({title:'Generating branch summary',ok:'Close review',cancelLabel:'Close review',hideCancel:true});
   assert.equal(c.$('ask-ok').textContent,'Close review');assert.equal(c.$('ask-cancel').textContent,'Close review');assert.deepEqual(visibility.at(-1),['hidden',true]);
@@ -75,7 +109,6 @@ test('summary close-review labels do not leak into later ordinary dialogs', asyn
 
 test('overlapping asks preserve typed text and both settle in FIFO order', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const first = c.ask({ title: 'Rename', input: true });
   c.$('ask-input').value = 'typed name';
   const second = c.ask({ title: 'Agent question', input: true });
@@ -89,7 +122,6 @@ test('overlapping asks preserve typed text and both settle in FIFO order', async
 });
 test('secret prompts mask their field and ordinary prompts reset the input type', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const secret = c.ask({ title: 'Connection URL', input: true, secret: true });
   assert.equal(c.$('ask-input').type, 'password');
   c.closeAsk('hidden'); await secret;
@@ -321,7 +353,6 @@ test('parallel questions queue across Sessions; closing queued question preserve
     renderStatus() {}, questionForm: () => ({ querySelector: () => null }),
     readQuestionForm: () => [{ selected: [], text: 'answer' }], act: async () => ({ answered: true }),
   });
-  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
   const settings = c.ask({ title: 'Setting', input: true }); c.$('ask-input').value = 'unsaved';
   c.queueQuestion({ question_id: 'one', session_id: 'A', question: 'first' });
   c.queueQuestion({ question_id: 'two', session_id: 'B', question: 'second' });
@@ -826,8 +857,8 @@ test('web tree toggle and row actions operate on the rendered Session identity',
   const toggle=all(list).find(n=>n.tag==='button'&&plainText(n)==='Tree off');assert.ok(toggle);toggle.attrs.onclick();
   const rows=list.children.filter(n=>n.attrs?.class==='session');
   assert.match(plainText(rows[0]),/Parent/);assert.match(plainText(rows[1]),/Child.*fork at seq 3/);assert.match(plainText(rows[2]),/parent unavailable: deleted/);
-  rows[1].attrs.onclick();assert.deepEqual(opened,['child']);
-  all(rows[1]).find(n=>n.tag==='input').attrs.onclick({stopPropagation(){},target:{checked:true}});
+  all(rows[1]).find(n=>n.attrs?.class==='session-open').attrs.onclick();assert.deepEqual(opened,['child']);
+  all(rows[1]).find(n=>n.tag==='input').attrs.onchange({target:{checked:true}});
   assert.equal(c.S.marked.has('child'),true);assert.equal(c.S.marked.has('parent'),false);
 });
 
@@ -969,13 +1000,14 @@ test('late old-generation basis cannot cancel a newer summary operation', {timeo
 test('relay reconnect registers only existing push opt-in on the current authenticated room', async () => {
   const subscription={toJSON:()=>({endpoint:'https://push.example/private'})};
   const registration=deferred();
-  const c=setup(['restorePushSubscription'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
-  const frames=[];const ws={readyState:1,send:frame=>frames.push(JSON.parse(frame))};
+  const c=setup(['restorePushSubscription','registerRelayPush'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
+  const frames=[];const ws={readyState:1,addEventListener(){},removeEventListener(){},send:frame=>frames.push(JSON.parse(frame))};
   Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
   const current=c.restorePushSubscription(ws);
   registration.resolve({pushManager:{getSubscription:async()=>subscription}});
   await current;
   assert.deepEqual(frames,[{relay:'push_subscribe',sub:{endpoint:'https://push.example/private'}}]);
+  c.S.pushRegistration.finish(ws);
   for(const change of ['socket','room','channel']){
     const held=deferred();c.navigator.serviceWorker.getRegistration=()=>held.promise;
     Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
@@ -987,6 +1019,40 @@ test('relay reconnect registers only existing push opt-in on the current authent
   c.navigator.serviceWorker.getRegistration=async()=>({pushManager:{getSubscription:async()=>null}});
   Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
   await c.restorePushSubscription(ws);assert.equal(frames.length,1,'no existing opt-in creates no subscription');
+});
+
+test('relay reconnect skips a refused endpoint and a successful manual retry clears the refusal', async () => {
+  const endpoint = 'https://push.example/private';
+  const subscription = { endpoint, toJSON: () => ({ endpoint }) };
+  const frames = [], toasts = [];
+  const socket = () => ({
+    readyState: 1, addEventListener() {}, removeEventListener() {},
+    send: frame => frames.push(JSON.parse(frame)),
+  });
+  const c = setup(['restorePushSubscription', 'registerRelayPush', 'pushRefused'], {
+    navigator: { serviceWorker: { getRegistration: async () => ({
+      pushManager: { getSubscription: async () => subscription },
+    }) } },
+    toast: message => toasts.push(message),
+  });
+  const first = socket(), reconnect = socket();
+  Object.assign(c.S, { ws: first, room: 'room', channel: {}, daemonOnline: true });
+  await c.restorePushSubscription(first);
+  const pending = c.S.pushRegistration.settled;
+  c.pushRefused(first, { operation: 'subscribe', reason: 'invalid' });
+  await pending;
+  assert.equal(c.S.pushRegistration, null);
+  assert.match(toasts[0], /refused/);
+
+  c.S.ws = reconnect;
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 1);
+  c.registerRelayPush(reconnect, subscription, true);
+  assert.equal(frames.length, 2);
+  c.S.pushRegistration.finish(reconnect, 'accepted');
+  assert.equal(c.S.pushRefusal, null);
+  await c.restorePushSubscription(reconnect);
+  assert.equal(frames.length, 3);
 });
 
 test('Session selection pruning retains filter-hidden IDs and removes missing IDs', () => {

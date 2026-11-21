@@ -62,6 +62,40 @@ mod tests {
     fn session(id: &str, name: &str, archived: bool) -> SessionInfo {
         serde_json::from_value(serde_json::json!({"id":id,"name":name,"created_at":"","updated_at":"","archived":archived})).unwrap()
     }
+
+    #[test]
+    fn empty_selector_is_a_usage_error_regardless_of_session_count() {
+        let rows = [
+            session("first", "One", false),
+            session("second", "Two", true),
+        ];
+        for count in 0..=rows.len() {
+            let err = find_session_in(&rows[..count], "").unwrap_err();
+            assert_eq!(exit_code(&err), 2);
+            assert_eq!(err.to_string(), "Session selector must not be empty");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_empty_session_arguments_before_dispatch() {
+        for args in [
+            &["sessions", "fork", ""][..],
+            &["sessions", "restore", ""],
+            &["sessions", "show", "", "--follow"],
+            &["sessions", "compare", "", "right"],
+            &["sessions", "compare", "left", ""],
+            &["run", "--estimate", "--session", "", "task"],
+        ] {
+            let result =
+                Cli::try_parse_from(std::iter::once("formless").chain(args.iter().copied()));
+            let Err(error) = result else {
+                panic!("accepted an empty Session selector in {args:?}");
+            };
+            assert_eq!(error.exit_code(), 2, "{args:?}: {error}");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        }
+    }
+
     #[test]
     fn resolution_priority_ascii_names_and_archived_eligibility_stay_unchanged() {
         let rows = vec![

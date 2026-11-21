@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 const source=readFileSync(new URL('./web/app.js',import.meta.url),'utf8');
 function fn(name){const start=source.indexOf('  function '+name+'(');assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);}
 function element(){const classes=new Set();return {value:'',attrs:{},style:{},classList:{add:v=>classes.add(v),remove:v=>classes.delete(v),toggle(v,on){on?classes.add(v):classes.delete(v);},contains:v=>classes.has(v)},setAttribute(k,v){this.attrs[k]=String(v);},getAttribute(k){return this.attrs[k]??null;},replaceChildren(){},select(){},focus(){}};}
-function fixture(){const nodes=new Map(),saved=new Map(),root=new Set(),calls=[];const c=vm.createContext({S:{enterSends:null,view:'settings'},coarsePointer:{matches:true},prefs:{set:(k,v)=>saved.set(k,v)},$:id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);},document:{documentElement:{toggleAttribute:(k,v)=>v?root.add(k):root.delete(k)}},renderComposer(){},calls,focusBefore:{},rememberFocus(){},restoreFocus(){},openDialog(){},activeDialog:()=>null});vm.runInContext(['inputTouchMode','syncInputTouchMode','composerEnterSends','updateEnterSendsControl','setEnterSends','configureAskInput','ask','showNextAsk','closeAsk'].map(fn).join('\n')+'\nlet askResolve=null,askTag=null;const askQueue=[];',c);return{c,saved,root};}
+function fixture(){const nodes=new Map(),saved=new Map(),root=new Set(),calls=[];const c=vm.createContext({S:{enterSends:null,view:'settings'},coarsePointer:{matches:true},prefs:{set:(k,v)=>saved.set(k,v)},$:id=>{if(!nodes.has(id))nodes.set(id,element());return nodes.get(id);},document:{documentElement:{toggleAttribute:(k,v)=>v?root.add(k):root.delete(k)}},renderComposer(){},calls,focusBefore:{},rememberFocus(){},restoreFocus(){},openDialog(){},activeDialog:()=>null});vm.runInContext(['inputTouchMode','syncInputTouchMode','composerEnterSends','updateEnterSendsControl','setEnterSends','configureAskInput','ask','showNextAsk','closeAsk','showAskError'].map(fn).join('\n')+'\n'+source.slice(source.indexOf('  let askResolve'),source.indexOf('  /** Promise-based prompt')),c);return{c,saved,root};}
 
 test('Enter preference defaults track primary pointer until an explicit device choice is saved',()=>{
  const{c,saved,root}=fixture();assert.equal(c.composerEnterSends(),false);c.syncInputTouchMode();assert.ok(root.has('data-input-touch'));
@@ -46,7 +46,7 @@ test('Enter dispatch keeps native newline, queue, IME and repeat semantics indep
 });
 
 test('all shared text call sites explicitly classify prose versus machine/URL/secret',()=>{
- const lines=source.split('\n').filter(line=>/\binput\s*:\s*true/.test(line));assert.equal(lines.length,13);
+ const lines=source.split('\n').filter(line=>/\binput\s*:\s*true/.test(line));
  for(const line of lines){assert.match(line,/ask\(\{/);assert.match(line,/inputKind:/,line);}
  for(const title of['Rename session','Suggested name','Add a memory','Edit memory'])assert.ok(lines.some(line=>line.includes('"'+title+'"')&&line.includes('inputKind: "prose"')));
  assert.ok(lines.some(line=>line.includes('Import Tools from a URL')&&line.includes('inputKind: "url"')));

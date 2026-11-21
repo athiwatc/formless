@@ -63,7 +63,7 @@ fn human(report: &Value, terminal: bool, color: bool, width: Option<usize>) -> R
                     value(row, "invocations"),
                     row["success_rate"]
                         .as_f64()
-                        .map(|rate| format!("{}%", rate * 100.0))
+                        .map(formless_core::success_rate::label)
                         .unwrap_or_else(|| "-".into()),
                 ],
                 _ => {
@@ -133,7 +133,14 @@ mod tests {
     fn replies() -> Value {
         json!({
             "models":[{"model":"β-日本語","successes":2,"failures":1,"total_ms":1000,"prompt_tokens":0,"completion_tokens":4,"cached_tokens":0,"future":null},{"model":"α-ไทย","successes":0,"failures":0,"total_ms":0,"prompt_tokens":0,"completion_tokens":0,"cached_tokens":0}],
-            "tools":[{"tool_id":"ไทย-null","invocations":2,"success_rate":null,"future":{"key":false}},{"tool_id":"zero","invocations":3,"success_rate":0.0}],
+            "tools":[
+                {"tool_id":"ไทย-null","invocations":2,"success_rate":null,"future":{"key":false}},
+                {"tool_id":"zero","invocations":3,"success_rate":0.0},
+                {"tool_id":"fraction","invocations":3,"success_rate":2.0 / 3.0},
+                {"tool_id":"near","invocations":200,"success_rate":0.995},
+                {"tool_id":"rare","invocations":10000,"success_rate":0.9999},
+                {"tool_id":"perfect","invocations":4,"success_rate":1.0}
+            ],
             "builtins":[{"name":"zeta","calls":4,"failures":1,"avg_ms":0.5,"kinds":{"z":2,"a":1}},{"name":"alpha","calls":0,"failures":0,"avg_ms":0,"kinds":{}}]
         })
     }
@@ -175,6 +182,15 @@ mod tests {
         let zero = text.lines().find(|line| line.starts_with("zero")).unwrap();
         assert!(null.ends_with('-') && !null.contains("0%"), "{null}");
         assert!(zero.ends_with("0%"), "{zero}");
+        for (id, label) in [
+            ("fraction", "67%"),
+            ("near", ">99%"),
+            ("rare", ">99%"),
+            ("perfect", "100%"),
+        ] {
+            let row = text.lines().find(|line| line.starts_with(id)).unwrap();
+            assert_eq!(row.split_whitespace().last(), Some(label), "{row}");
+        }
         assert!(text.contains("1000") && text.contains("0.5") && text.contains("a=1 z=2"));
     }
 
