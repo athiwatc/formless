@@ -185,3 +185,132 @@ async fn import_reports_cache_only_changes_and_preserves_dry_run_and_selection()
         .iter()
         .all(|r| r == "GET /v1/models HTTP/1.1"));
 }
+
+#[tokio::test]
+async fn list_reads_file_only_prices_and_separates_model_resolution() {
+    use formless_core::config::{ProviderCfg, RoleCfg};
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fixture = Fixture(std::env::temp_dir().join(format!("fl-prices-{nonce}")));
+    let paths = Paths::from_dirs(fixture.0.join("d"), fixture.0.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.model = "vendor/文".into();
+    cfg.provider.fallback_models = vec!["unknown".into(), "vendor/文".into()];
+    let rate = |input| ModelPrice {
+        input,
+        output: 2.0,
+        cached_input: Some(0.25),
+        cache_write_input: Some(0.75),
+        retrieved_at: Some("2026-10-01T00:00:00Z".into()),
+    };
+    cfg.provider.prices.extend([
+        ("b/文".into(), rate(4.0)),
+        ("a/文".into(), rate(1.0)),
+        ("vendor/exact".into(), rate(3.0)),
+        ("exact".into(), rate(5.0)),
+    ]);
+    cfg.roles.insert(
+        "explicit-default".into(),
+        RoleCfg {
+            model: "vendor/exact".into(),
+            ..Default::default()
+        },
+    );
+    cfg.roles.insert(
+        "explicit-empty-provider".into(),
+        RoleCfg {
+            model: "empty-provider-model".into(),
+            provider: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    cfg.roles.insert(
+        "routing".into(),
+        RoleCfg {
+            model: "auto".into(),
+            candidates: vec!["dynamic".into()],
+            ..Default::default()
+        },
+    );
+    cfg.roles.insert(
+        "explicit-local".into(),
+        RoleCfg {
+            model: " missing role price ".into(),
+            provider: Some("日本".into()),
+            ..Default::default()
+        },
+    );
+    cfg.providers.insert(
+        "日本".into(),
+        ProviderCfg {
+            model: "priced".into(),
+            prices: [("priced".into(), rate(6.0))].into(),
+            ..Default::default()
+        },
+    );
+    cfg.save(&paths).unwrap();
+    let before = std::fs::read(paths.config_file()).unwrap();
+
+    let raw = stdout(cli(&paths, &["prices", "list", "--json"]).await);
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["source"], "config_file_and_defaults");
+    assert_eq!(value["unit"], "usd_per_million_tokens");
+    let default = &value["providers"]["default"];
+    assert_eq!(default["prices"], json!(cfg.provider.prices));
+    assert_eq!(
+        value["providers"]["日本"]["prices"],
+        json!(cfg.providers["日本"].prices)
+    );
+    assert_eq!(
+        default["configured_models"],
+        json!({
+            "vendor/文": { "matched_key": "a/文", "price": rate(1.0) },
+            "vendor/exact": { "matched_key": "vendor/exact", "price": rate(3.0) },
+            "unknown": { "matched_key": null, "price": null },
+            "empty-provider-model": { "matched_key": null, "price": null },
+        })
+    );
+    assert_eq!(
+        value["providers"]["日本"]["configured_models"][" missing role price "],
+        json!({ "matched_key": null, "price": null })
+    );
+    let selected = stdout(
+        cli(
+            &paths,
+            &["prices", "list", "--provider", "default", "--json"],
+        )
+        .await,
+    );
+    let selected: serde_json::Value = serde_json::from_str(&selected).unwrap();
+    assert_eq!(selected["providers"], json!({ "default": default }));
+    let selected = stdout(cli(&paths, &["prices", "list", "--provider", "日本", "--json"]).await);
+    let selected: serde_json::Value = serde_json::from_str(&selected).unwrap();
+    assert_eq!(
+        selected["providers"],
+        json!({ "日本": value["providers"]["日本"] })
+    );
+    let human = stdout(cli(&paths, &["prices", "list"]).await);
+    for text in [
+        "Stored prices",
+        "CACHE WRITE",
+        "0.75",
+        "2026-10-01T00:00:00Z",
+        "vendor/文",
+        "日本",
+        "no price",
+    ] {
+        assert!(human.contains(text), "{text} missing from {human}");
+    }
+    let unknown = cli(
+        &paths,
+        &["prices", "list", "--provider", "unknown-provider"],
+    )
+    .await;
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("unknown-provider"));
+    assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+    assert!(!paths.db_file().exists());
+}

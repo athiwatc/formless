@@ -21,6 +21,34 @@
     "effective_password": "query pw"
   },
   {
+    "input": "postgresql://u@h/db?Password=query%20pw&sslmode=require",
+    "argument": "postgresql://u@h/db?sslmode=require",
+    "literal_password": "query pw",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "query pw"
+  },
+  {
+    "input": "postgresql://u:ignored@h/db?password=first&%50ASSWORD=last%2Bvalue&application_name=review",
+    "argument": "postgresql://u@h/db?application_name=review",
+    "literal_password": "last+value",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "last+value"
+  },
+  {
+    "input": "postgresql://u:userinfo@h/db?password=first&Password=&application_name=review",
+    "argument": "postgresql://u@h/db?application_name=review",
+    "literal_password": "userinfo",
+    "daemon_password": "ignored-daemon-password",
+    "effective_password": "userinfo"
+  },
+  {
+    "input": "postgresql://u@h/db?PASSWORD=&sslmode=require",
+    "argument": "postgresql://u@h/db?sslmode=require",
+    "literal_password": null,
+    "daemon_password": "from-daemon-environment",
+    "effective_password": "from-daemon-environment"
+  },
+  {
     "input": "postgresql://u:userinfo@h/db?password=first&password=&application_name=review",
     "argument": "postgresql://u@h/db?application_name=review",
     "literal_password": "userinfo",

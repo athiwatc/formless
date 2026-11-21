@@ -200,3 +200,90 @@ async fn models_cli_reports_listing_and_partial_failure_without_testing_or_selec
         "only listing calls: {recorded:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn azure_provider_add_migrates_from_a_dated_route_to_v1() {
+    let env = credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_MODEL");
+    env.remove("FORMLESS_IDLE_GRACE_SECS");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let fixture = Fixture(std::env::temp_dir().join(format!("fl-azure-{nonce}")));
+    let paths = Paths::from_dirs(fixture.0.join("d"), fixture.0.join("c")).unwrap();
+    let prefix = ["providers", "add", "azure", "--no-key", "--azure-resource"];
+    let bad = cli(
+        &paths,
+        &[
+            prefix.as_slice(),
+            &[
+                "http://contoso.openai.azure.com",
+                "--azure-deployment",
+                "model",
+            ],
+        ]
+        .concat(),
+    )
+    .await;
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("HTTPS endpoint"));
+    assert!(!paths.db_file().exists());
+
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.daemon.idle_grace_secs = 3600;
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+    let _serve = Task(tokio::spawn(async move { daemon.serve().await.unwrap() }));
+    for _ in 0..100 {
+        if formless_core::daemon::daemon_reachable(&paths) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(formless_core::daemon::daemon_reachable(&paths));
+
+    let common = [
+        prefix.as_slice(),
+        &[
+            "contoso.openai.azure.com",
+            "--azure-deployment",
+            "fixture-model",
+        ],
+    ]
+    .concat();
+    let dated = cli(
+        &paths,
+        &[common.as_slice(), &["--api-version", "2024-10-21"]].concat(),
+    )
+    .await;
+    assert!(
+        dated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dated.stderr)
+    );
+    let cfg = Config::load_file_only(&paths).unwrap();
+    let provider = &cfg.providers["azure"];
+    assert_eq!(
+        provider.base_url,
+        "https://contoso.openai.azure.com/openai/deployments/fixture-model"
+    );
+    assert_eq!(provider.query_params["api-version"], "2024-10-21");
+
+    let v1 = cli(&paths, &common).await;
+    assert!(
+        v1.status.success(),
+        "{}",
+        String::from_utf8_lossy(&v1.stderr)
+    );
+    let cfg = Config::load_file_only(&paths).unwrap();
+    let provider = &cfg.providers["azure"];
+    assert_eq!(
+        provider.base_url,
+        "https://contoso.openai.azure.com/openai/v1"
+    );
+    assert_eq!(provider.model, "fixture-model");
+    assert_eq!(provider.api_key_header.as_deref(), Some("api-key"));
+    assert!(provider.query_params.is_empty());
+}
