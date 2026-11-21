@@ -927,6 +927,7 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    topic_decisions: StdMutex<HashMap<String, topic_interactions::TopicDecision>>,
     question_answered_by: StdMutex<HashMap<String, String>>,
     #[cfg(test)]
     topic_notifications: StdMutex<Vec<(String, String)>>,
@@ -1179,6 +1180,7 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            topic_decisions: StdMutex::new(HashMap::new()),
             question_answered_by: StdMutex::new(HashMap::new()),
             #[cfg(test)]
             topic_notifications: StdMutex::new(vec![]),
@@ -2162,7 +2164,12 @@ impl Daemon {
                 self.broadcast(Event::TopicChanged { topic_id });
                 Ok(serde_json::to_value(topic)?)
             }
-            Request::SetTopicLimits { .. } | Request::ListHarnesses => {
+            Request::SetTopicLimits { topic_id, limits } => {
+                let topic = self.with_store(|st| st.set_topic_limits(&topic_id, &limits))?;
+                self.broadcast(Event::TopicChanged { topic_id });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::ListHarnesses => {
                 bail!("topic control request is not implemented yet");
             }
             Request::CancelTopic { topic_id } => {
@@ -4173,6 +4180,9 @@ impl Daemon {
                 answer,
                 answers,
             } => {
+                if self.topic_decisions.locked().contains_key(&question_id) {
+                    return self.answer_topic_decision(&question_id, &answer, &answers);
+                }
                 // First answer wins; the others find it gone.
                 let answered = {
                     let mut waiters = self.questions.locked();
@@ -16329,6 +16339,7 @@ impl Daemon {
         !self.topic_steps.locked().is_empty()
             || !self.topic_questions.locked().is_empty()
             || !self.harness_permissions.locked().is_empty()
+            || !self.topic_decisions.locked().is_empty()
     }
 
     async fn idle_watcher(self: Arc<Self>) {

@@ -10,6 +10,12 @@ pub(super) struct PendingPermission {
     sender: oneshot::Sender<Option<String>>,
 }
 
+pub(super) struct TopicDecision {
+    topic_id: String,
+    feature_id: String,
+    total: bool,
+}
+
 pub(super) type AlwaysPermissions = Arc<StdMutex<HashMap<String, HarnessPermissionOptionKind>>>;
 
 fn rule_eligible(kind: &str) -> bool {
@@ -254,6 +260,111 @@ impl Drop for Lease {
 }
 
 impl Daemon {
+    pub(super) fn raise_topic_limit_question(
+        &self,
+        topic: &TopicInfo,
+        feature: &str,
+        total: bool,
+    ) -> Result<()> {
+        if self.topic_decisions.locked().values().any(|decision| {
+            decision.topic_id == topic.id
+                && decision.feature_id == feature
+                && decision.total == total
+        }) {
+            return Ok(());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let title = format!(
+            "Limit reached: {}",
+            if total {
+                "attempts per topic"
+            } else {
+                "retries for this step"
+            }
+        );
+        let message = self.with_store(|st| {
+            st.append_message(
+                topic
+                    .topic_session_id
+                    .as_ref()
+                    .context("missing Topic Chat")?,
+                "system-note",
+                &title,
+            )
+        })?;
+        self.broadcast(Event::MessageAppended {
+            session_id: message.session_id.clone(),
+            message,
+        });
+        self.topic_decisions.locked().insert(
+            id.clone(),
+            TopicDecision {
+                topic_id: topic.id.clone(),
+                feature_id: feature.into(),
+                total,
+            },
+        );
+        self.broadcast(Event::UserQuestion {
+            question_id: id,
+            session_id: topic
+                .topic_session_id
+                .clone()
+                .context("missing Topic Chat")?,
+            topic_id: Some(topic.id.clone()),
+            attempt_id: None,
+            user_only: true,
+            question: title.clone(),
+            options: vec!["Raise limit and continue".into(), "Stop".into()],
+            questions: vec![Question::single(
+                title,
+                vec!["Raise limit and continue".into(), "Stop".into()],
+            )],
+        });
+        self.broadcast(Event::TopicChanged {
+            topic_id: topic.id.clone(),
+        });
+        Ok(())
+    }
+    pub(super) fn answer_topic_decision(
+        &self,
+        id: &str,
+        answer: &str,
+        answers: &[QuestionAnswer],
+    ) -> Result<Value> {
+        let selected = if answers.is_empty() {
+            answer
+        } else {
+            if answers.len() != 1
+                || answers[0].selected.len() != 1
+                || answers[0]
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| !text.trim().is_empty())
+            {
+                bail!("select one offered option");
+            }
+            &answers[0].selected[0]
+        };
+        if !matches!(selected, "Raise limit and continue" | "Stop") {
+            bail!("select one offered option");
+        }
+        let topic = self.with_store(|st| {
+            let mut decisions = self.topic_decisions.locked();
+            let decision = decisions.get(id).context("question no longer pending")?;
+            if selected == "Raise limit and continue" {
+                st.raise_topic_limit(&decision.topic_id, &decision.feature_id, decision.total)?;
+            }
+            let topic = decision.topic_id.clone();
+            decisions.remove(id);
+            Ok(topic)
+        })?;
+        self.broadcast(Event::UserQuestionClosed {
+            question_id: id.into(),
+            answered_by: Some("user".into()),
+        });
+        self.broadcast(Event::TopicChanged { topic_id: topic });
+        Ok(json!({"answered":true}))
+    }
     fn apply_topic_permission_rule(
         &self,
         attempt: &TopicAttemptInfo,
@@ -647,6 +758,26 @@ impl Daemon {
     }
 
     pub(super) fn close_topic_interactions(&self, topic_id: &str, attempt_id: Option<&str>) {
+        if attempt_id.is_none() {
+            let ids = {
+                let mut decisions = self.topic_decisions.locked();
+                let ids: Vec<_> = decisions
+                    .iter()
+                    .filter(|(_, decision)| decision.topic_id == topic_id)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &ids {
+                    decisions.remove(id);
+                }
+                ids
+            };
+            for question_id in ids {
+                self.broadcast(Event::UserQuestionClosed {
+                    question_id,
+                    answered_by: None,
+                });
+            }
+        }
         let attempts = match attempt_id {
             Some(id) => vec![id.to_owned()],
             None => self

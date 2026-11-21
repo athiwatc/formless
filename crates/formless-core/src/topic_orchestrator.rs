@@ -214,7 +214,9 @@ impl Daemon {
                                 attempt_id.as_ref().is_some_and(|id| ids.contains(id))
                             }) =>
                         {
-                            if !self.questions.locked().contains_key(&question_id) {
+                            if !self.questions.locked().contains_key(&question_id)
+                                && !self.topic_decisions.locked().contains_key(&question_id)
+                            {
                                 continue;
                             }
                             if !user_only || seen.insert(format!("question:{question_id}")) {
@@ -493,6 +495,25 @@ impl Daemon {
             let _launch = self.topic_launch.locked();
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
+            }
+            if let Some(total) = self.with_store(|st| {
+                st.transaction(|st| {
+                    let hit = st.topic_step_limit(&topic.id, &feature.id, &step.title)?;
+                    if hit.is_some() {
+                        st.mark_topic_limit(&topic.id, &feature.id)?;
+                    }
+                    Ok(hit)
+                })
+            })? {
+                self.raise_topic_limit_question(&topic, &feature.id, total)?;
+                bail!(
+                    "Limit reached: {}; ask the user to raise the limit or stop",
+                    if total {
+                        "attempts per topic"
+                    } else {
+                        "retries for this feature and step title"
+                    }
+                );
             }
             let attempt = self.with_store(|st| {
                 st.begin_topic_attempt(

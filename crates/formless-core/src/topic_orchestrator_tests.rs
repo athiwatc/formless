@@ -962,6 +962,134 @@ async fn topic_wait_returns_old_attempt_while_newer_attempt_of_same_feature_runs
         second
     );
 }
+
+#[tokio::test]
+async fn topic_limits_refuse_fourth_retry_require_user_and_allow_explicit_increase() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "plain");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Claude,
+        StepAccess::Write,
+        &[],
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            f.daemon()
+                .run_topic_step_until_done(&session, &args, &cancel)
+                .await
+                .unwrap()["status"],
+            "succeeded"
+        );
+    }
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("Limit reached"));
+    let snapshot = state(&f, &topic.id);
+    assert_eq!(snapshot.attempts.len(), 4);
+    assert_eq!(snapshot.status, TopicStatus::NeedsUser);
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    assert_eq!(question["event"], "question");
+    assert_eq!(question["user_only"], true);
+    let id = question["question_id"].as_str().unwrap().to_owned();
+    assert!(f.daemon().answer_topic_question_tool(&session,&json!({"question_id":id,"answers":[{"selected":["Raise limit and continue"]}],"basis":"made up"})).unwrap_err().to_string().contains("user_only"));
+    assert!(f
+        .daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id.clone(),
+            answer: "invalid".into(),
+            answers: vec![]
+        })
+        .await
+        .is_err());
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: id,
+            answer: "Raise limit and continue".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).limits.max_retries_per_step, 6);
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::Running);
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 5,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .daemon()
+        .run_topic_step(&session, &args, &cancel)
+        .await
+        .is_err());
+    let question = f
+        .daemon()
+        .wait_topic_steps(&session, &json!({}), &cancel)
+        .await
+        .unwrap();
+    f.daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: question["question_id"].as_str().unwrap().into(),
+            answer: "Stop".into(),
+            answers: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&f, &topic.id).status, TopicStatus::NeedsUser);
+    f.daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: topic.id.clone(),
+            limits: TopicLimits {
+                max_retries_per_step: 6,
+                max_attempts_per_topic: 6,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.daemon()
+            .run_topic_step_until_done(&session, &args, &cancel)
+            .await
+            .unwrap()["status"],
+        "succeeded"
+    );
+    assert!(f
+        .daemon()
+        .handle(Request::SetTopicLimits {
+            topic_id: "missing".into(),
+            limits: TopicLimits::default()
+        })
+        .await
+        .is_err());
+}
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
     std::fs::create_dir(&repo).unwrap();
