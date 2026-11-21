@@ -3006,10 +3006,24 @@ impl Daemon {
                 } else {
                     "now"
                 };
-                Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
-                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
-                )
+                let mut response = json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                    "override_source": override_source, "effective_value": effective.setting_value(&key)?});
+                if matches!(
+                    key.as_str(),
+                    "provider.routing_models"
+                        | "provider.fallback_models"
+                        | "provider.routing_fast_models"
+                        | "provider.routing_strong_models"
+                        | "provider.aliases"
+                ) || key.starts_with("provider.aliases.")
+                {
+                    let warnings =
+                        crate::routing_policy::routing_subset_warnings(&effective.provider);
+                    if !warnings.is_empty() {
+                        response["routing_warnings"] = json!(warnings);
+                    }
+                }
+                Ok(response)
             }
             Request::RevokeApproval {
                 tool_id,

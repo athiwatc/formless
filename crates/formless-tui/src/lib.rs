@@ -3978,6 +3978,13 @@ impl App {
                             }
                         }
                         Pending::SaveSetting => {
+                            if let Some(warnings) = result["routing_warnings"].as_array() {
+                                self.notes.extend(
+                                    warnings
+                                        .iter()
+                                        .filter_map(|warning| warning.as_str().map(str::to_owned)),
+                                );
+                            }
                             if let Some(key) = self.settings_saving.take() {
                                 self.notes.push(format!(
                                     "saved {key} = {} (used from the next Run)",

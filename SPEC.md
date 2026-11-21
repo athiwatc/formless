@@ -143,6 +143,9 @@ without redesign.
   model-calibrated prompt estimator, including Tool schemas and images; an
   unresolved auto choice conservatively uses the largest candidate estimate. No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
+  An unmatched subset entry appears in configuration diagnostics. If the
+  entire subset is unmatched, auto-routing uses the first configured
+  candidate and explains the fallback in `/routing`.
   **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
   daemon start. A `primary` role is created with `model = "auto"` and the
   former routing pool as `candidates`, `provider.model` becomes

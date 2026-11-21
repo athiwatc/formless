@@ -3426,6 +3426,15 @@ fn doctor_local_problems(paths: &Paths) -> Vec<Problem> {
         }
     }
     if let Ok(cfg) = Config::load(paths) {
+        out.extend(
+            formless_core::routing_policy::routing_subset_warnings(&cfg.provider)
+                .into_iter()
+                .map(|what| Problem {
+                    what,
+                    next: None,
+                    fix: None,
+                }),
+        );
         if cfg.relay.enabled {
             if let Err(e) = cfg.relay.check() {
                 out.push(Problem {
@@ -6364,6 +6373,11 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
             };
             formless_core::daemon::ensure_daemon(&paths)?;
             let r = formless_tui::client::request_once(&paths, request)?;
+            if let Some(warnings) = r["routing_warnings"].as_array() {
+                for warning in warnings.iter().filter_map(serde_json::Value::as_str) {
+                    eprintln!("warning: {warning}");
+                }
+            }
             if r["applies"] == "env_override" {
                 println!(
                     "saved {key} = {value}; daemon uses {} from {} (environment override)",
