@@ -22,6 +22,7 @@ mod markdown;
 mod mermaid;
 mod metrics_tools;
 mod notify;
+mod pager_view;
 mod palette_view;
 mod picker;
 pub mod plain;
@@ -31,6 +32,7 @@ pub mod qr;
 mod query;
 mod review_wrap;
 mod search_jump;
+mod session_rename;
 mod session_ui;
 mod settings;
 mod tab_view;
@@ -149,6 +151,41 @@ fn format_elapsed(d: Duration) -> String {
         format!("{s}s")
     } else {
         format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+fn format_live_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 3600 {
+        format_elapsed(d)
+    } else {
+        format!("{}h{:02}m{:02}s", s / 3600, s % 3600 / 60, s % 60)
+    }
+}
+
+fn format_recorded_duration(ms: u64) -> String {
+    match ms {
+        0 => "0s".into(),
+        1..=999 => format!("{ms}ms"),
+        1000..=59_999 if ms / 100 % 10 != 0 => format!("{}.{}s", ms / 1000, ms / 100 % 10),
+        _ => format_live_elapsed(Duration::from_millis(ms)),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn recorded_invocation_durations_keep_short_and_long_times_readable() {
+    for (ms, expected) in [
+        (0, "0s"),
+        (499, "499ms"),
+        (1000, "1s"),
+        (1175, "1.1s"),
+        (59_999, "59.9s"),
+        (60_000, "1m00s"),
+        (3_600_000, "1h00m00s"),
+        (7_200_000, "2h00m00s"),
+    ] {
+        assert_eq!(format_recorded_duration(ms), expected);
     }
 }
 
@@ -353,7 +390,9 @@ enum Pending {
     SetTags,
     ContextReport,
     Security,
-    SuggestName,
+    SuggestName {
+        target: String,
+    },
     ToolMetrics,
     ProposalDiff,
     /// Apply, reject or roll back a Proposal: the answer is a note (errors already are).
@@ -510,6 +549,15 @@ enum Click {
     Proposal(usize),
     /// A persisted tool call's header in the chat.
     Call(String),
+}
+
+/// Pasted search queries stay on one line without joining separate words.
+fn single_line_query_paste(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// The Ctrl+F find bar: the query, the current match and, from the last
@@ -1428,9 +1476,9 @@ struct Pager {
     top: usize,
     /// Columns scrolled to the right (←/→), for wide content.
     left: usize,
-    /// Highlighted lines, shown instead of `lines` while not scrolled
-    /// sideways.
+    /// Highlighted lines for entries that carry presentation styles.
     styled: Vec<Line<'static>>,
+    viewport: pager_view::View,
 }
 
 struct LiveToolCall {
@@ -1827,7 +1875,6 @@ struct App {
     /// The chat's inner area in the last frame, and the OSC 8 links
     /// painted over it (SPEC §10.2).
     chat_area: Option<Rect>,
-    painted_links: Vec<links::Painted>,
     hyperlinks: bool,
     /// Path words already checked against the filesystem: their
     /// `file://` target when the file exists.
@@ -1877,7 +1924,7 @@ struct App {
     subagents: Vec<SubagentInfo>,
     import_mode: Option<ImportKind>,
     /// The Session being renamed (the input holds its new name).
-    renaming: Option<String>,
+    renaming: Option<session_rename::Rename>,
     /// The Session whose instructions the input is editing.
     instructing: Option<String>,
     /// Sessions marked with Space for a bulk action (SPEC §10.4), and a
@@ -1970,6 +2017,8 @@ struct App {
     /// Clickable regions of the last frame (SPEC §10.5), and the last
     /// click for double-click detection.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
+    /// The visible list panel in the last frame, if it can show a selectable row.
+    list_wheel_region: std::cell::Cell<Option<(View, Rect)>>,
     draft_hits: std::cell::RefCell<Vec<(Rect, usize)>>,
     selecting_draft: bool,
     last_click: Option<(Click, Instant)>,
@@ -2154,7 +2203,6 @@ impl App {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
@@ -2232,6 +2280,7 @@ impl App {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -2263,6 +2312,13 @@ impl App {
 
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(session_rename::Rename::suggesting)
+        {
+            self.cancel_rename();
+        }
         self.cancel_branch_summary();
         self.hunk_review.clear();
         self.clear_attention();
@@ -2327,6 +2383,13 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(session_rename::Rename::suggesting)
+        {
+            self.cancel_rename();
+        }
         self.cancel_branch_summary();
         self.hunk_review.clear();
         self.forecast = ForecastUi::default();
@@ -2461,6 +2524,7 @@ impl App {
         }
         self.reconnect_read_failed(id);
         if self.current.as_deref() == Some(session_id.as_str()) {
+            self.cancel_rename();
             // Do not move an old Session's retained input into another Session.
             self.stash_current_draft(&session_id);
             self.current = None;
@@ -2835,6 +2899,9 @@ impl App {
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
+            if matches!(kind, Pending::SuggestName { .. }) {
+                self.cancel_rename();
+            }
             if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation == self.branch_summary.generation)
             {
                 self.cancel_branch_summary();
@@ -3046,6 +3113,14 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::SuggestName { target } = &kind {
+                        self.finish_rename_suggestion(
+                            target,
+                            if ok { result } else { None },
+                            if ok { None } else { error },
+                        );
+                        continue;
+                    }
                     if let Pending::ProviderRetry { session_id } = &kind {
                         let text = if ok {
                             match result.as_ref().and_then(|r| r["retrying"].as_bool()) {
@@ -3213,6 +3288,7 @@ impl App {
                                         continue;
                                     }
                                     if self.on_start == "picker" {
+                                        self.cancel_rename();
                                         self.view = View::Sessions;
                                     }
                                     if let Some(first) = self.start_session() {
@@ -3316,7 +3392,7 @@ impl App {
                                 self.notes.push(format!("{} search hit(s)", v.len()));
                                 self.search_hits = v;
                                 self.search_idx = 0;
-                                self.view = View::Search;
+                                self.open_view(View::Search);
                             }
                         }
                         Pending::ListBuiltinStats => {
@@ -3452,6 +3528,7 @@ impl App {
                                 lines: approval_lines(&grants, family.as_deref()),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3524,6 +3601,7 @@ impl App {
                                 lines: dry_run_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3538,6 +3616,7 @@ impl App {
                                 lines: body.lines().map(str::to_string).collect(),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3640,13 +3719,16 @@ impl App {
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| truncate_chars(&i.session_id, 8));
                                 self.notes.push(format!(
-                                    "{} {} · {}s · {}{}{}{} · /kill or /drop {}",
+                                    "{} {} · {} · {}{}{}{} · /kill or /drop {}",
                                     if i.stalled { "⚠" } else { "•" },
                                     i.tool_name,
-                                    i.elapsed_ms / 1000,
+                                    format_recorded_duration(i.elapsed_ms),
                                     session,
                                     if i.stalled {
-                                        format!(" · silent {}s", i.silent_ms / 1000)
+                                        format!(
+                                            " · silent {}",
+                                            format_recorded_duration(i.silent_ms)
+                                        )
                                     } else {
                                         String::new()
                                     },
@@ -3838,17 +3920,8 @@ impl App {
                                 })
                                 .collect();
                         }
-                        Pending::SuggestName => {
-                            match (self.current.clone(), result["name"].as_str()) {
-                                (Some(id), Some(name)) => {
-                                    self.start_rename(&id, name);
-                                    self.notes.push(
-                                        "suggested name: Enter to use it, edit it first, or Esc"
-                                            .into(),
-                                    );
-                                }
-                                _ => self.notes.push("no name to suggest yet".into()),
-                            }
+                        Pending::SuggestName { .. } => {
+                            unreachable!("name suggestions handled above")
                         }
                         Pending::Security => {
                             self.pager = Some(Pager {
@@ -3859,6 +3932,7 @@ impl App {
                                     .collect(),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -3986,6 +4060,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4062,6 +4137,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             }
@@ -4096,6 +4172,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             } else if current {
@@ -4126,6 +4203,7 @@ impl App {
                                     lines,
                                     top: 0,
                                     left: 0,
+                                    viewport: Default::default(),
                                     styled: Vec::new(),
                                 });
                             } else {
@@ -4250,6 +4328,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4402,6 +4481,7 @@ impl App {
                                 lines: status_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4417,6 +4497,7 @@ impl App {
                                 lines: storage_lines(&result, gc),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4447,6 +4528,7 @@ impl App {
                                 },
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4487,6 +4569,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4542,6 +4625,7 @@ impl App {
                                 lines,
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4665,6 +4749,7 @@ impl App {
                                 lines: routing_lines(&result),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -4762,6 +4847,7 @@ impl App {
                                         lines,
                                         top: 0,
                                         left: 0,
+                                        viewport: Default::default(),
                                         styled: Vec::new(),
                                     });
                                     self.branch_summary.review = Some(preview);
@@ -4804,6 +4890,7 @@ impl App {
                                         lines: session_ui::comparison_lines(&comparison),
                                         top: 0,
                                         left: 0,
+                                        viewport: Default::default(),
                                         styled: Vec::new(),
                                     })
                                 }
@@ -4839,6 +4926,7 @@ impl App {
                                 ),
                                 top: 0,
                                 left: 0,
+                                viewport: Default::default(),
                                 styled: Vec::new(),
                             });
                         }
@@ -5039,6 +5127,11 @@ impl App {
 
     fn invalidate_rollback_viewport(&self) {
         self.rollback_visible_version.set(None);
+    }
+
+    fn resized(&self) {
+        self.invalidate_rollback_viewport();
+        self.list_wheel_region.set(None);
     }
 
     fn rollback_key(&mut self, key: KeyEvent) {
@@ -5372,7 +5465,7 @@ impl App {
                 "{} {}… ({})",
                 self.spinner(),
                 i18n::tr_str(&a.label),
-                format_elapsed(a.since.elapsed())
+                format_live_elapsed(a.since.elapsed())
             )
         })
     }
@@ -5419,6 +5512,7 @@ impl App {
     /// Make `id` the session on screen, dropping the previous one's live
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
+        self.cancel_rename();
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
             self.cancel_branch_summary();
@@ -5573,6 +5667,9 @@ impl App {
         }
         self.maybe_notify(&ev);
         match ev {
+            // This client keeps legacy Subscribe. Correlated answer frames
+            // belong only to explicit future-attempt consumers.
+            Event::TranscriptAttempt { .. } => {}
             Event::MessageAppended {
                 session_id,
                 message,
@@ -5679,6 +5776,7 @@ impl App {
                     lines: compare_lines(&results, width),
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 });
             }
@@ -6521,6 +6619,14 @@ impl App {
                 }
             }
             Event::SessionDeleted { id } => {
+                if self.is_current(&id)
+                    || self
+                        .renaming
+                        .as_ref()
+                        .is_some_and(|rename| rename.target == id)
+                {
+                    self.cancel_rename();
+                }
                 let selected = self.selected_session().map(|s| s.id.clone());
                 self.sessions.retain(|s| s.id != id);
                 self.running_sessions.remove(&id);
@@ -6836,13 +6942,6 @@ impl App {
         }
         if let Some(id) = self.instructing.take() {
             self.set_instructions(id, &text);
-            return;
-        }
-        if let Some(id) = self.renaming.take() {
-            let name = text.trim().to_string();
-            if !name.is_empty() {
-                self.fire(Request::RenameSession { id, name });
-            }
             return;
         }
         if self.search_mode {
@@ -7380,6 +7479,7 @@ impl App {
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
         if view != View::Chat {
+            self.cancel_rename();
             self.search_jump = None;
         }
         self.view = view;
@@ -7939,6 +8039,7 @@ impl App {
                     lines: self.notes.clone(),
                     top: self.notes.len().saturating_sub(20),
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 })
             }
@@ -7989,6 +8090,7 @@ impl App {
                         lines: raw.lines().map(str::to_string).collect(),
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                         styled: Vec::new(),
                     })
                 }
@@ -8168,7 +8270,7 @@ impl App {
                             self.pager = Some(Pager {
                                 title: format!("Guide · {} (bundled {})", if topic.is_empty() { "gallery" } else { &topic }, env!("CARGO_PKG_VERSION")),
                                 lines: body.lines().map(str::to_owned).collect(),
-                                top: 0, left: 0, styled: Vec::new(),
+                                top: 0, left: 0, styled: Vec::new(), viewport: Default::default(),
                             });
                             self.notes.push(format!("Current online copy (may differ from this build): {}", guide.url));
                         } else {
@@ -8440,6 +8542,7 @@ impl App {
                     lines,
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 })
             }
@@ -9011,12 +9114,12 @@ impl App {
         use crossterm::event::{MouseButton, MouseEventKind};
         if self.hunk_review_is_visible() {
             match m.kind {
-                MouseEventKind::ScrollUp => {
-                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_sub(3)
-                }
-                MouseEventKind::ScrollDown => {
-                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_add(3)
-                }
+                MouseEventKind::ScrollUp => self
+                    .hunk_review
+                    .move_viewport(hunk_ui::ViewportMove::Rows(-3)),
+                MouseEventKind::ScrollDown => self
+                    .hunk_review
+                    .move_viewport(hunk_ui::ViewportMove::Rows(3)),
                 _ => {}
             }
             return;
@@ -9027,7 +9130,11 @@ impl App {
         if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) {
             self.selecting_draft = false;
         }
-        if matches!(
+        if self.editor.is_none() && self.renaming.is_some() {
+            if self.rename_mouse(m) {
+                return;
+            }
+        } else if matches!(
             m.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
         ) {
@@ -9068,8 +9175,13 @@ impl App {
         if self.editor.is_some() {
             return;
         }
-        if self.view != View::Chat && !matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
+        if self.view != View::Chat {
+            match m.kind {
+                MouseEventKind::ScrollUp => return self.wheel_list(m.column, m.row, false),
+                MouseEventKind::ScrollDown => return self.wheel_list(m.column, m.row, true),
+                MouseEventKind::Down(MouseButton::Left) => {}
+                _ => return,
+            }
         }
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(3),
@@ -9097,6 +9209,51 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn list_wheel_blocked(&self) -> bool {
+        self.renaming.is_some()
+            || !self.approvals.is_empty()
+            || !self.promotions.is_empty()
+            || self.rollback_pick.is_some()
+            || self.model_overlay.is_some()
+            || self.forecast.modal.is_some()
+            || self.quit_confirm
+            || self.switcher.is_some()
+            || self.pager.is_some()
+            || self.external_edit.awaiting_confirmation()
+    }
+
+    fn record_list_wheel_region(&self, view: View, area: Rect, rows: usize) {
+        self.list_wheel_region
+            .set((rows > 0 && area.width > 2).then_some((view, area)));
+    }
+
+    fn wheel_list(&mut self, column: u16, row: u16, down: bool) {
+        let Some((view, area)) = self.list_wheel_region.get() else {
+            return;
+        };
+        // A modal may have opened since the last paint.
+        if view != self.view
+            || !(area.x..area.right()).contains(&column)
+            || !(area.y..area.bottom()).contains(&row)
+            || self.list_wheel_blocked()
+        {
+            return;
+        }
+        let (len, index) = match view {
+            View::Sessions => (self.visible_sessions().len(), &mut self.session_idx),
+            View::Tools => (self.visible_tools().len(), &mut self.tool_idx),
+            View::Proposals => (self.visible_proposals().len(), &mut self.proposal_idx),
+            _ => return,
+        };
+        let last = len.saturating_sub(1);
+        let current = (*index).min(last);
+        *index = if down {
+            current.saturating_add(3).min(last)
+        } else {
+            current.saturating_sub(3)
+        };
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
@@ -9317,6 +9474,18 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            // Some application shortcuts act before they reach Vim.
+            if self.renaming.is_none() {
+                self.vim_input.cancel_pending_argument();
+            }
+            if let Some(editor) = &mut self.editor {
+                editor.vim.cancel_pending_argument();
+            }
+        }
         if self.hunk_review_is_visible() {
             self.hunk_review_key(key);
             return;
@@ -9382,22 +9551,11 @@ impl App {
             }
         }
         if let Some(p) = &mut self.pager {
-            let page = 20;
-            let last = p.lines.len().saturating_sub(1);
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.pager = None;
-                    self.branch_summary.clear();
-                }
-                KeyCode::Down | KeyCode::Char('j') => p.top = (p.top + 1).min(last),
-                KeyCode::Up | KeyCode::Char('k') => p.top = p.top.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => p.top = (p.top + page).min(last),
-                KeyCode::PageUp => p.top = p.top.saturating_sub(page),
-                KeyCode::Home | KeyCode::Char('g') => p.top = 0,
-                KeyCode::End | KeyCode::Char('G') => p.top = last,
-                KeyCode::Right | KeyCode::Char('l') => p.left += 8,
-                KeyCode::Left | KeyCode::Char('h') => p.left = p.left.saturating_sub(8),
-                _ => {}
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.pager = None;
+                self.branch_summary.clear();
+            } else {
+                p.viewport.key(key.code);
             }
             return;
         }
@@ -9424,7 +9582,10 @@ impl App {
             self.rollback_key(key);
             return;
         }
-        if self.model_overlay.is_some() {
+        if self.model_overlay.is_some()
+            && (self.renaming.is_none()
+                || (self.approvals.is_empty() && self.promotions.is_empty()))
+        {
             self.model_key(key);
             return;
         }
@@ -9520,6 +9681,7 @@ impl App {
                         lines,
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                         styled: Vec::new(),
                     });
                 }
@@ -9692,6 +9854,21 @@ impl App {
                 }
             }
         }
+        if self.view == View::Chat && self.renaming.is_some() {
+            if modal_keys {
+                return;
+            }
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                self.cycle_view(key.code == KeyCode::Tab);
+            } else if self.find.is_some()
+                || (key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.find_key(&key);
+            } else {
+                self.rename_key(key);
+            }
+            return;
+        }
         // The first composer Insert Escape only changes mode. Thereafter
         // completion dialogs keep their normal Escape/navigation ownership
         // before a Normal Escape can stop the Run.
@@ -9728,6 +9905,7 @@ impl App {
         if self.vim_mode
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
+            && !self.vim_input.waiting_for_argument()
             && self.current_question().is_none()
             && self.find.is_none()
             && (self.approvals.is_empty() || self.input_focus)
@@ -10808,6 +10986,7 @@ impl App {
                     lines: wrap_rows(&text, 40),
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: Vec::new(),
                 });
             }
@@ -11424,8 +11603,7 @@ impl App {
             KeyCode::Esc if !self.running() && self.toasts.iter().any(|t| t.2) => {
                 self.toasts.clear();
             }
-            KeyCode::Esc if self.renaming.is_some() || self.instructing.is_some() => {
-                self.renaming = None;
+            KeyCode::Esc if self.instructing.is_some() => {
                 self.instructing = None;
                 self.input.clear();
                 self.notes.push("cancelled".into());
@@ -11515,6 +11693,20 @@ impl App {
 
     /// A bracketed paste: one block, wherever text is being typed.
     fn paste(&mut self, text: &str) {
+        // These full-screen views return before drawing the ordinary overlays.
+        if let Some(wizard) = &self.wizard {
+            if !wizard.confirm_key_change
+                && matches!(
+                    wizard.step,
+                    WizardStep::BaseUrl | WizardStep::ApiKey | WizardStep::PickModel
+                )
+            {
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.wizard_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+            }
+            return;
+        }
         if self.hunk_review_is_visible() {
             if !self.hunk_review.busy {
                 if let Some(comment) = &mut self.hunk_review.comment {
@@ -11523,13 +11715,13 @@ impl App {
             }
             return;
         }
-        if self.wizard.is_some() || self.model_overlay.is_some() {
-            for c in text.chars().filter(|c| !c.is_control()) {
-                self.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-            }
+        if self.external_edit.awaiting_confirmation() {
             return;
         }
         if let Some(ed) = &mut self.editor {
+            if ed.confirm_exit || self.editor_review.is_some() || self.vim_help {
+                return;
+            }
             self.editor_generation = self.editor_generation.wrapping_add(1);
             if ed.original.is_none() {
                 ed.original = Some(ed.text());
@@ -11540,27 +11732,91 @@ impl App {
                 ed.apply_modal_line(line);
                 return;
             }
-            if ed.original.is_none() {
-                ed.original = Some(ed.text());
-            }
             let mut line = ed.take_modal_line();
             line.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
             ed.apply_modal_line(line);
             return;
         }
-        if let Some(f) = &mut self.settings_form {
-            f.fields[f.idx].input.paste(text.trim());
+        // Neither a pager nor a confirmation should interpret pasted text
+        // as typed commands, or let it reach a covered surface.
+        if self.pager.is_some() {
             return;
         }
-        if let Some((_, edit)) = &mut self.settings_edit {
-            edit.paste(text.trim());
+        if let Some((query, selected)) = &mut self.switcher {
+            query.push_str(&single_line_query_paste(text));
+            *selected = 0;
+            return;
+        }
+        if self.rollback_pick.is_some() || self.forecast.modal.is_some() || self.quit_confirm {
+            return;
+        }
+        let approval_open = !self.approvals.is_empty() || !self.promotions.is_empty();
+        if approval_open && !self.input_focus {
+            return;
+        }
+        // An approval covers the model picker, even when the composer has focus.
+        if let Some(model) = self.model_overlay.as_mut().filter(|_| !approval_open) {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                model.picker.type_char(c);
+            }
+            return;
+        }
+        if self.view == View::Settings {
+            if let Some(f) = &mut self.settings_form {
+                f.fields[f.idx].input.paste(text.trim());
+            } else if let Some((_, edit)) = &mut self.settings_edit {
+                edit.paste(text.trim());
+            }
             return;
         }
         if self.view == View::Chat {
-            // A file dragged into the terminal arrives as its path.
-            if let Some(path) = clipimg::dropped_file(text) {
-                self.attach_path_file(&path);
+            if let Some(find) = &mut self.find {
+                find.query.push_str(&single_line_query_paste(text));
+                find.current = usize::MAX;
+                find.scroll = true;
                 return;
+            }
+            if self.renaming.is_some() {
+                self.rename_paste(text);
+                return;
+            }
+            if self.input.searching().is_some() {
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
+                self.input
+                    .search_paste(&single_line_query_paste(text), &history);
+                return;
+            }
+        }
+        let filter = match self.view {
+            View::Sessions => Some((&mut self.session_filter, &mut self.session_idx)),
+            View::Tools => Some((&mut self.tool_filter, &mut self.tool_idx)),
+            View::Proposals => Some((&mut self.proposal_filter, &mut self.proposal_idx)),
+            _ => None,
+        };
+        if let Some((filter, selected)) = filter {
+            if filter.editing {
+                filter.query.push_str(&single_line_query_paste(text));
+                *selected = 0;
+            }
+            return;
+        }
+        if self.view == View::Chat {
+            // A dragged file arrives as a pasted path. Only the message
+            // composer uses that path as an attachment.
+            if self.bulk.is_none()
+                && self.instructing.is_none()
+                && !self.search_mode
+                && self.import_mode.is_none()
+                && self.editing_id.is_none()
+                && self.editing_queued.is_none()
+                && !self.editing_step
+                && self.current_question().is_none()
+            {
+                if let Some(path) = clipimg::dropped_file(text) {
+                    self.attach_path_file(&path);
+                    return;
+                }
             }
             if self.vim_mode {
                 self.vim_input.paste(&mut self.input, text);
@@ -11576,7 +11832,11 @@ impl App {
 fn draw(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
+    app.list_wheel_region.set(None);
     app.draft_hits.borrow_mut().clear();
+    if let Some(rename) = &app.renaming {
+        rename.clear_hits();
+    }
     app.refresh_toasts();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
@@ -11626,7 +11886,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         typing && (modal.is_none() || app.input_focus),
     );
     draw_status(f, chunks[3], app);
-    if app.view == View::Chat {
+    if app.view == View::Chat && app.renaming.is_none() {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
         if let Some(q) = question.filter(|_| palette.is_empty() && modal.is_none()) {
@@ -11712,32 +11972,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     if let Some((query, sel)) = &app.switcher {
         draw_switcher(f, app, query, *sel);
     }
-    if let Some(p) = &app.pager {
-        let area = f.area();
-        let height = area.height.saturating_sub(2) as usize;
-        let body: Vec<Line> = if p.left == 0 && !p.styled.is_empty() {
-            p.styled.iter().skip(p.top).take(height).cloned().collect()
-        } else {
-            p.lines
-                .iter()
-                .skip(p.top)
-                .take(height)
-                .map(|l| Line::raw(l.chars().skip(p.left).collect::<String>()))
-                .collect()
-        };
-        let title = format!(
-            " {} · line {}/{} · ↑↓ ←→ PgUp PgDn g G · Esc close ",
-            p.title,
-            (p.top + 1).min(p.lines.len().max(1)),
-            p.lines.len()
-        );
-        f.render_widget(ratatui::widgets::Clear, area);
-        f.render_widget(
-            Paragraph::new(body).block(ui::panel(title, app.color, Color::Cyan)),
-            area,
-        );
+    if let Some(p) = &mut app.pager {
+        pager_view::draw(f, p, app.color);
     }
     external_editor_ui::draw_confirmation(f, app);
+    // Dismissing a modal in an input burst must wait for an unobscured
+    // frame before the list can receive wheel events.
+    if app.list_wheel_blocked() {
+        app.list_wheel_region.set(None);
+    }
     if let Some(target) = rollback.filter(|target| target.is_visible(f.buffer_mut())) {
         app.rollback_visible_version.set(Some(target.version));
     }
@@ -12197,37 +12440,64 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
     );
 }
 
-/// The `@` completions, just above the input box.
+fn mention_path_label(path: &str, columns: usize) -> std::borrow::Cow<'_, str> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if columns == 0 {
+        return "".into();
+    }
+    // Ratatui paints one grapheme at a time, even for scripts whose combined
+    // string width can be narrower than the sum of their grapheme widths.
+    if path.graphemes(true).map(text::width).sum::<usize>() <= columns {
+        return path.into();
+    }
+    let mut remaining = columns - 1;
+    let mut start = path.len();
+    for (i, grapheme) in path.grapheme_indices(true).rev() {
+        let width = text::width(grapheme);
+        if width > remaining {
+            break;
+        }
+        remaining -= width;
+        start = i;
+    }
+    format!("…{}", &path[start..]).into()
+}
+
+/// The `@` completions, just above the input box and scrolled to the selection.
 fn draw_mention_popup(f: &mut Frame, input: Rect, m: &MentionPopup, color: bool) {
-    if m.files.is_empty() || input.y < 3 {
+    let area = f.area();
+    let x = input.x.max(area.x);
+    let y = input.y.min(area.bottom());
+    let width = input.right().min(area.right()).saturating_sub(x).min(72);
+    let height = y.saturating_sub(area.y);
+    if width < 3 || height < 3 || m.files.is_empty() {
         return;
     }
-    let lines: Vec<Line> = m
-        .files
+
+    let rows = usize::from(height - 2).min(m.files.len());
+    let sel = m.sel.min(m.files.len() - 1);
+    let start = sel.saturating_sub(rows - 1).min(m.files.len() - rows);
+    let columns = usize::from(width - 2);
+    let gap = if columns > 2 { " " } else { "" };
+    let path_columns = columns - 1 - gap.len();
+    let lines: Vec<Line> = m.files[start..start + rows]
         .iter()
         .enumerate()
         .map(|(i, file)| {
-            let text = format!(
-                "{} {}{}",
-                if i == m.sel { "›" } else { " " },
-                file.path,
-                if file.dir { "/" } else { "" }
-            );
-            if i == m.sel {
-                Line::styled(text, bold_fg(color, Color::Green))
+            let selected = start + i == sel;
+            let marker = if selected { '›' } else { ' ' };
+            let path = format!("{}{}", file.path, if file.dir { "/" } else { "" });
+            let label = format!("{marker}{gap}{}", mention_path_label(&path, path_columns));
+            if selected {
+                Line::styled(label, bold_fg(color, Color::Green))
             } else {
-                Line::raw(text)
+                Line::raw(label)
             }
         })
         .collect();
-    let h = (lines.len() as u16 + 2).min(input.y);
-    let w = 72.min(input.width).max(1);
-    let rect = Rect {
-        x: input.x,
-        y: input.y - h,
-        width: w,
-        height: h,
-    };
+    let height = rows as u16 + 2;
+    let rect = Rect::new(x, y - height, width, height);
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(ui::panel(
@@ -12497,10 +12767,9 @@ fn selection_navigation(line: &mut input::InputLine, key: KeyEvent) -> bool {
 }
 
 /// Hit regions follow rendered grapheme cells, not UTF-8 bytes or char counts.
-fn draft_row_hits(app: &App, row: &str, byte: usize, area: Rect, left: usize) {
+fn draft_row_hits(hits: &mut Vec<(Rect, usize)>, row: &str, byte: usize, area: Rect, left: usize) {
     use unicode_segmentation::UnicodeSegmentation;
     let mut col = 0usize;
-    let mut hits = app.draft_hits.borrow_mut();
     for (at, g) in row.grapheme_indices(true) {
         let end = col + text::width(g);
         if end > left && col < left + area.width as usize {
@@ -12527,8 +12796,39 @@ fn draft_row_hits(app: &App, row: &str, byte: usize, area: Rect, left: usize) {
     }
 }
 
+fn composer_find(app: &App) -> Option<&FindBar> {
+    app.find.as_ref().filter(|_| app.view == View::Chat)
+}
+
+fn composer_prompt(app: &App) -> (&'static str, Color) {
+    if let Some((action, ids)) = &app.bulk {
+        (
+            match action {
+                BulkAction::Delete if ids.len() == 1 => "type delete to delete 1 Session › ",
+                BulkAction::Delete => "type delete to delete these Sessions › ",
+                BulkAction::Tag => "tags to add › ",
+            },
+            Color::Red,
+        )
+    } else if app.instructing.is_some() {
+        ("instructions › ", Color::Magenta)
+    } else if app.search_mode {
+        ("search › ", Color::Magenta)
+    } else if app.import_mode.is_some() {
+        ("import path › ", Color::Magenta)
+    } else if app.editing_id.is_some() {
+        ("edit › ", Color::Magenta)
+    } else if app.editing_queued.is_some() {
+        ("queued › ", Color::Magenta)
+    } else if app.running() {
+        ("steer › ", Color::Yellow)
+    } else {
+        ("› ", Color::Cyan)
+    }
+}
+
 fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
-    if let Some(find) = app.find.as_ref().filter(|_| app.view == View::Chat) {
+    if let Some(find) = composer_find(app) {
         let n = find.rows.len();
         let count = if find.query.is_empty() {
             String::new()
@@ -12549,33 +12849,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         f.render_widget(Paragraph::new(line).block(block), area);
         return;
     }
-    let (prompt, color) = if let Some((action, ids)) = &app.bulk {
-        (
-            match action {
-                BulkAction::Delete if ids.len() == 1 => "type delete to delete 1 Session › ",
-                BulkAction::Delete => "type delete to delete these Sessions › ",
-                BulkAction::Tag => "tags to add › ",
-            },
-            Color::Red,
-        )
-    } else if app.renaming.is_some() {
-        ("rename › ", Color::Magenta)
-    } else if app.instructing.is_some() {
-        ("instructions › ", Color::Magenta)
-    } else if app.search_mode {
-        ("search › ", Color::Magenta)
-    } else if app.import_mode.is_some() {
-        ("import path › ", Color::Magenta)
-    } else if app.editing_id.is_some() {
-        ("edit › ", Color::Magenta)
-    } else if app.editing_queued.is_some() {
-        ("queued › ", Color::Magenta)
-    } else if app.running() {
-        ("steer › ", Color::Yellow)
-    } else {
-        ("› ", Color::Cyan)
-    };
-    let prompt_w = Span::raw(prompt).width();
+    if let Some(rename) = app.renaming.as_ref().filter(|_| app.view == View::Chat) {
+        rename.draw(f, area, app, show_cursor);
+        return;
+    }
+    let (prompt, color) = composer_prompt(app);
     let avail = input_text_width(area.width, prompt);
     app.composer_text_width.set(avail);
     let mut lines: Vec<Line> = Vec::new();
@@ -12597,55 +12875,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
             Span::styled("Ask Formless to do something…", ui::dim(app.color)),
         ]));
     } else {
-        let (rows, cur) = app.input.layout(avail);
-        let height = area.height.saturating_sub(2).max(1) as usize;
-        // Keep the cursor row on screen.
-        let top = cur.0.saturating_sub(height - 1);
-        let styled = app.input.styled_rows(avail, top, height);
-        let mut byte = 0;
-        let offsets: Vec<_> = rows
-            .iter()
-            .map(|row| {
-                let at = byte;
-                byte += row.len();
-                if app.input.as_bytes().get(byte) == Some(&b'\n') {
-                    byte += 1;
-                }
-                at
-            })
-            .collect();
-        for (i, row) in rows.into_iter().enumerate().skip(top).take(height) {
-            draft_row_hits(
-                app,
-                &row,
-                offsets[i],
-                Rect::new(
-                    area.x + 1 + prompt_w as u16,
-                    area.y + 1 + (i - top) as u16,
-                    avail as u16,
-                    1,
-                ),
-                0,
-            );
-            let lead = if i == 0 {
-                Span::styled(prompt, bold_fg(app.color, color))
-            } else {
-                Span::raw(" ".repeat(prompt_w))
-            };
-            let mut spans = vec![lead];
-            spans.extend(styled[i - top].iter().map(|(text, selected)| {
-                Span::styled(
-                    text.clone(),
-                    if *selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    },
-                )
-            }));
-            lines.push(Line::from(spans));
-        }
-        cursor = Some((cur.0 - top, cur.1));
+        let (rows, position) = draft_editor_rows(
+            &app.input,
+            area,
+            prompt,
+            bold_fg(app.color, color),
+            Some(&app.draft_hits),
+        );
+        lines = rows;
+        cursor = Some(position);
     }
     // Which Session gets this message (SPEC §10.2).
     let target = app
@@ -12713,14 +12951,76 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         ));
     }
     f.render_widget(Paragraph::new(lines).block(block), area);
-    if let Some((row, col)) = cursor.filter(|_| show_cursor) {
-        let x = area.x + 1 + prompt_w as u16 + col as u16;
-        let y = area.y + 1 + row as u16;
-        f.set_cursor_position((
-            x.min(area.right().saturating_sub(2)),
-            y.min(area.bottom().saturating_sub(2)),
-        ));
+    if let Some(cursor) = cursor.filter(|_| show_cursor) {
+        set_draft_cursor(f, area, prompt, cursor);
     }
+}
+
+fn set_draft_cursor(f: &mut Frame, area: Rect, prompt: &str, (row, col): (usize, usize)) {
+    let x = usize::from(area.x) + 1 + text::width(prompt) + col;
+    let y = usize::from(area.y) + 1 + row;
+    f.set_cursor_position((
+        x.min(usize::from(area.right().saturating_sub(2))) as u16,
+        y.min(usize::from(area.bottom().saturating_sub(2))) as u16,
+    ));
+}
+
+fn draft_editor_rows(
+    input: &input::InputLine,
+    area: Rect,
+    prompt: &'static str,
+    prompt_style: Style,
+    hits: Option<&std::cell::RefCell<Vec<(Rect, usize)>>>,
+) -> (Vec<Line<'static>>, (usize, usize)) {
+    let prompt_w = Span::raw(prompt).width();
+    let avail = input_text_width(area.width, prompt);
+    let (rows, cursor) = input.layout(avail);
+    let height = area.height.saturating_sub(2).max(1) as usize;
+    let top = cursor.0.saturating_sub(height - 1);
+    let styled = input.styled_rows(avail, top, height);
+    let mut byte = 0;
+    let mut hits = hits.map(|hits| hits.borrow_mut());
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if i >= top && i < top + height {
+            if let Some(hits) = &mut hits {
+                draft_row_hits(
+                    hits,
+                    row,
+                    byte,
+                    Rect::new(
+                        area.x + 1 + prompt_w as u16,
+                        area.y + 1 + (i - top) as u16,
+                        avail as u16,
+                        1,
+                    ),
+                    0,
+                );
+            }
+            let lead = if i == 0 {
+                Span::styled(prompt, prompt_style)
+            } else {
+                Span::raw(" ".repeat(prompt_w))
+            };
+            let mut spans = vec![lead];
+            spans.extend(styled[i - top].iter().map(|(text, selected)| {
+                Span::styled(
+                    text.clone(),
+                    if *selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }));
+            lines.push(Line::from(spans));
+        }
+        byte += row.len();
+        if input.as_bytes().get(byte) == Some(&b'\n') {
+            byte += 1;
+        }
+    }
+    (lines, (cursor.0 - top, cursor.1))
 }
 
 /// `240 KB`, `1.2 MB`.
@@ -12741,11 +13041,17 @@ fn input_text_width(box_width: u16, prompt: &str) -> usize {
 
 /// The input box's height: its wrapped rows (up to 8) plus borders.
 fn input_height(app: &App, width: u16) -> u16 {
-    let rows = app
-        .input
-        .layout(input_text_width(width, "steer › "))
-        .0
-        .len();
+    if composer_find(app).is_some() {
+        return 3;
+    }
+    if let Some(rename) = app.renaming.as_ref().filter(|_| app.view == View::Chat) {
+        return rename.height(width);
+    }
+    if app.input.searching().is_some() {
+        return 3;
+    }
+    let (prompt, _) = composer_prompt(app);
+    let rows = app.input.layout(input_text_width(width, prompt)).0.len();
     rows.clamp(1, 8) as u16 + 2
 }
 
@@ -12972,7 +13278,7 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
     }
     let when = |t: &Option<String>| {
         t.as_deref()
-            .map(|s| s.get(..16).unwrap_or(s).replace('T', " "))
+            .map(|s| ui::local_timestamp(s).replace('T', " "))
             .unwrap_or_else(|| "-".into())
     };
     let w = rows
@@ -12987,8 +13293,10 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
         .max()
         .unwrap_or(10)
         .max(10);
+    // The minute stamp includes a space and a six-column numeric offset.
+    const TIME_WIDTH: usize = 23;
     let mut out = vec![format!(
-        "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  LAST USED",
+        "{:w$}  {:cw$}  {:7}  {:TIME_WIDTH$}  {:6}  {:TIME_WIDTH$}  LAST USED",
         "TOOL", "CAPABILITY", "SCOPE", "GRANTED", "BY", "ENDS"
     )];
     for g in rows {
@@ -12998,7 +13306,7 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
             _ => "always",
         };
         out.push(format!(
-            "{:w$}  {:cw$}  {:7}  {:16}  {:6}  {:16}  {}",
+            "{:w$}  {:cw$}  {:7}  {:TIME_WIDTH$}  {:6}  {:TIME_WIDTH$}  {}",
             g.tool_name,
             g.capability,
             scope,
@@ -14271,6 +14579,7 @@ fn code_pager(title: &str, code: &str, color: bool) -> Pager {
             .collect(),
         top: 0,
         left: 0,
+        viewport: pager_view::View::with_gutter(w + 3),
         styled,
     }
 }
@@ -14597,14 +14906,14 @@ impl App {
                 let name = self.session_name(&id);
                 self.start_rename(&id, &name);
             }
-            "auto" => {
-                self.notes.push("suggesting a name…".into());
-                self.request(Pending::SuggestName, Request::SuggestSessionName { id });
+            "auto" => self.suggest_rename(id),
+            name => {
+                self.cancel_rename();
+                self.fire(Request::RenameSession {
+                    id,
+                    name: name.to_string(),
+                });
             }
-            name => self.fire(Request::RenameSession {
-                id,
-                name: name.to_string(),
-            }),
         }
     }
 
@@ -14791,6 +15100,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled,
         });
     }
@@ -14964,6 +15274,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled,
         });
     }
@@ -15021,6 +15332,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -15039,16 +15351,6 @@ impl App {
             self.call_focus = Some(id);
             self.scroll_to_focus = true;
         }
-    }
-
-    /// Rename Session `id` in the input, starting from `name` (Esc
-    /// cancels).
-    fn start_rename(&mut self, id: &str, name: &str) {
-        self.renaming = Some(id.to_string());
-        self.view = View::Chat;
-        self.input.set(name);
-        self.notes
-            .push("Edit the name, then Enter (Esc cancels).".into());
     }
 
     /// Sessions matching the switcher's query, best first (newest first
@@ -15363,6 +15665,7 @@ impl App {
                 .collect(),
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -15410,6 +15713,7 @@ impl App {
                     lines: plain,
                     top: 0,
                     left: 0,
+                    viewport: Default::default(),
                     styled: d.lines,
                 });
             }
@@ -15453,6 +15757,7 @@ impl App {
             lines,
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
     }
@@ -15487,6 +15792,10 @@ impl App {
         if self.wizard.is_some() {
             self.flush_wizard_draft(true);
             self.should_quit = true;
+            return;
+        }
+        if self.renaming.is_some() {
+            self.cancel_rename();
             return;
         }
         let armed = self.ctrl_c_at.is_some_and(|t| t.elapsed() < CTRL_C_WINDOW);
@@ -16071,7 +16380,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             };
             let elapsed = match call.elapsed_ms {
                 Some(ms) => format!("{:.1}s", ms as f64 / 1000.0),
-                None => format_elapsed(call.started.elapsed()),
+                None => format_live_elapsed(call.started.elapsed()),
             };
             let mut spans = vec![Span::styled(
                 format!(
@@ -16485,8 +16794,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     let now = chrono::Utc::now();
-    let name_w = (area.width as usize / 3).clamp(10, 40);
+    // Leave room for the border, highlight, three status markers and the
+    // metadata separator. In a narrow panel, give metadata at least half
+    // of the remaining content columns. A zero-width name cell is omitted.
+    let content_w = usize::from(area.width).saturating_sub(11);
+    let name_w = (content_w / 3).clamp(10, 40).min(content_w / 2);
     let rows = app.session_rows();
     let visible: Vec<_> = rows.iter().map(|row| row.index).collect();
     let archived = app.sessions.iter().filter(|s| s.archived).count();
@@ -16520,13 +16835,8 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                 if !row.note.is_empty() {
                     meta.push_str(&format!(" · {}", row.note));
                 }
-                let name = format!(
-                    "{}{}{}",
-                    "  ".repeat(row.depth),
-                    if row.depth > 0 { "↳ " } else { "" },
-                    s.name
-                );
-                ListItem::new(Line::from(vec![
+                let name = session_ui::name_cell(&s.name, row.depth, name_w);
+                let mut spans = vec![
                     Span::styled(
                         if app.marked.contains(&s.id) {
                             "✓ "
@@ -16542,7 +16852,15 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         if s.pinned { "★ " } else { "  " },
                         fg(app.color, Color::Yellow),
                     ),
-                    Span::raw(ui::pad(&name, name_w.max(text::width(&name)))),
+                ];
+                if text::width(&name) == name_w {
+                    spans.push(Span::raw(name));
+                } else {
+                    // Span advances by whole-string width, even though
+                    // it draws each grapheme separately.
+                    spans.extend(name.graphemes(true).map(|g| Span::raw(g.to_owned())));
+                }
+                spans.extend([
                     Span::styled(format!(" {meta}"), ui::dim(app.color)),
                     Span::styled(
                         s.preview
@@ -16551,7 +16869,8 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                             .unwrap_or_default(),
                         fg(app.color, Color::Gray),
                     ),
-                ]))
+                ]);
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
@@ -16598,10 +16917,9 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         &mut state,
     );
     clickable_rows(app, area, 0, state.offset(), count, Click::Session);
-    app.record_list_capacity(
-        View::Sessions,
-        count.min(area.height.saturating_sub(2) as usize),
-    );
+    let rows = count.min(area.height.saturating_sub(2) as usize);
+    app.record_list_capacity(View::Sessions, rows);
+    app.record_list_wheel_region(View::Sessions, area, rows);
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -17054,6 +17372,7 @@ fn model_metrics_pager(stats: &[formless_protocol::ModelStatInfo], color: bool) 
         lines,
         top: 0,
         left: 0,
+        viewport: Default::default(),
         styled: Vec::new(),
     }
 }
@@ -17390,10 +17709,9 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_proposals();
-    app.record_list_capacity(
-        View::Proposals,
-        visible.len().min(area.height.saturating_sub(3) as usize),
-    );
+    let rows = visible.len().min(area.height.saturating_sub(3) as usize);
+    app.record_list_capacity(View::Proposals, rows);
+    app.record_list_wheel_region(View::Proposals, area, rows);
     let mut title = app.proposal_filter.title(
         "Prompt proposals",
         visible.len(),
@@ -17533,6 +17851,12 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                             Span::raw(format!("  {}", d.tool.description)),
                         ]),
                         Line::from(versions),
+                        Line::from(vec![
+                            label("Last used"),
+                            Span::raw(d.tool.last_used_at.as_deref()
+                                .map(|ts| ui::relative_time(ts, now))
+                                .unwrap_or_else(|| "—".into())),
+                        ]),
                         Line::from(vec![
                             label("uses"),
                             Span::raw(dependency_text(&d.uses, &d.modules)),
@@ -17995,15 +18319,14 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         // Clicks select Tools; headers between them take rows too.
         let top = parts[0].y + 2;
         let height = parts[0].height.saturating_sub(3) as usize;
-        app.record_list_capacity(
-            View::Tools,
-            layout
-                .iter()
-                .skip(state.offset())
-                .take(height)
-                .filter(|row| row.is_ok())
-                .count(),
-        );
+        let rows = layout
+            .iter()
+            .skip(state.offset())
+            .take(height)
+            .filter(|row| row.is_ok())
+            .count();
+        app.record_list_capacity(View::Tools, rows);
+        app.record_list_wheel_region(View::Tools, parts[0], rows);
         for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
             if let Ok(p) = r {
                 clickable(
@@ -18639,7 +18962,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     for (i, row) in text.split('\n').enumerate() {
         if i >= scroll_y && i < scroll_y + height {
             draft_row_hits(
-                app,
+                &mut app.draft_hits.borrow_mut(),
                 row,
                 byte,
                 Rect::new(
@@ -19162,6 +19485,7 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
 }
 
 pub use theme::{colorblind_rgb, tone_marker, SemanticTone};
+pub use ui::{local_timestamp, local_timestamp_seconds};
 
 /// Canonical reserved slash roots, shared by template discovery and the CLI.
 /// Subcommands reserve their leading root rather than a separate namespace.
@@ -19225,8 +19549,10 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             ))
             .is_ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    let mut painted_links = links::PaintCache::default();
     let result = (|| -> Result<()> {
         while !app.should_quit {
+            painted_links.recover_terminal(&mut stdout())?;
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.user_commands_tick();
@@ -19237,7 +19563,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
-                app.painted_links.clear();
+                painted_links.clear();
             }
             if !app.notifications.is_empty() {
                 let mode = Config::load(&app.paths)
@@ -19253,21 +19579,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             }
             app.chat_area = None;
             let frame = terminal.draw(|f| draw(f, &mut app))?;
-            // Clickable links: repaint them with OSC 8 when they change.
-            if let Some(proto) = app.image_proto {
-                if app.image_placed != app.painted_images {
-                    if app.painted_images.is_empty() {
-                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
-                        app.painted_images = app.image_placed.clone();
-                    } else {
-                        // Old thumbnails stay on screen until cleared:
-                        // redraw from scratch, then paint the new ones.
-                        app.painted_images.clear();
-                        app.force_redraw = true;
-                    }
-                }
-            }
-            if app.hyperlinks {
+            let found = if app.hyperlinks {
                 let base = app.work_dir();
                 let cache = &mut app.path_cache;
                 let mut resolve = |p: &str| {
@@ -19281,13 +19593,27 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                         })
                         .clone()
                 };
-                let found = app
-                    .chat_area
+                app.chat_area
                     .map(|a| links::scan(frame.buffer, a, &mut resolve))
-                    .unwrap_or_default();
-                if found != app.painted_links {
-                    let _ = links::paint(&mut stdout(), frame.buffer, &found);
-                    app.painted_links = found;
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let links_ready = painted_links
+                .update(&mut stdout(), frame.buffer, found)
+                .is_ok();
+            // Defer new thumbnails when a link repaint will retry on their cells.
+            if let Some(proto) = app.image_proto.filter(|_| links_ready) {
+                if app.image_placed != app.painted_images {
+                    if app.painted_images.is_empty() {
+                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
+                        app.painted_images = app.image_placed.clone();
+                    } else {
+                        // Old thumbnails stay on screen until cleared:
+                        // redraw from scratch, then paint the new ones.
+                        app.painted_images.clear();
+                        app.force_redraw = true;
+                    }
                 }
             }
             // Handle everything queued before the next draw, so a burst of
@@ -19301,7 +19627,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::Paste(text) => app.paste(&text),
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
-                    CtEvent::Resize(_, _) => app.invalidate_rollback_viewport(),
+                    CtEvent::Resize(_, _) => app.resized(),
                 }
                 wait = Duration::ZERO;
                 if started.elapsed() > Duration::from_millis(100) {
@@ -19311,6 +19637,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = painted_links.recover_terminal(&mut stdout());
     app.flush_wizard_draft(true);
     app.save_drafts();
     if app.enhanced_keys {
@@ -19541,7 +19868,6 @@ mod tests {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
             pane_widths: (22, 26),
@@ -19620,6 +19946,7 @@ mod tests {
             should_quit: false,
             md_cache: Default::default(),
             click_targets: Default::default(),
+            list_wheel_region: Default::default(),
             draft_hits: Default::default(),
             selecting_draft: false,
             last_click: None,
@@ -19817,12 +20144,47 @@ mod tests {
         app.key(key(KeyCode::Esc));
         assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
         assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.editor.as_ref().unwrap().vim.waiting_for_argument());
         app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
         assert_eq!(app.editor.as_ref().unwrap().text(), "α");
+        assert!(!app.editor.as_ref().unwrap().vim.waiting_for_argument());
         assert_eq!(app.editor.as_ref().unwrap().review_base_version, Some(7));
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
         assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
         assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+    }
+
+    #[test]
+    fn composer_vim_pending_arguments_preserve_shortcuts_and_guard_focused_calls() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Chat);
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.vim_input.waiting_for_argument());
+        app.key(key(KeyCode::Tab));
+        assert_ne!(app.view, View::Chat);
+        assert!(!app.vim_input.waiting_for_argument());
+
+        app.view = View::Chat;
+        app.key(key(KeyCode::Char('r')));
+        app.call_focus = Some("synthetic-call".into());
+        let notes = app.notes.len();
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.call_focus.as_deref(), Some("synthetic-call"));
+        assert_eq!(app.notes.len(), notes);
+        assert!(!app.vim_input.waiting_for_argument());
+        assert!(app.input.is_empty());
+
+        app.call_focus = None;
+        app.input.set("draft");
+        app.key(key(KeyCode::Char('r')));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert!(!app.vim_input.waiting_for_argument());
+        app.key(key(KeyCode::Char('i')));
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
     }
 
     #[test]
@@ -20202,7 +20564,7 @@ mod tests {
         }
     }
 
-    fn reconnect_approval(id: &str, session: &str) -> Event {
+    pub(super) fn reconnect_approval(id: &str, session: &str) -> Event {
         Event::ApprovalRequested {
             context: None,
             session_id: session.into(),
@@ -21294,6 +21656,35 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_rolls_minutes_into_hours() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m00s"),
+            (65, "1m05s"),
+            (3599, "59m59s"),
+            (3600, "1h00m00s"),
+            (3601, "1h00m01s"),
+            (3661, "1h01m01s"),
+            (5400, "1h30m00s"),
+            (86399, "23h59m59s"),
+            (86400, "24h00m00s"),
+            (3_600_000, "1000h00m00s"),
+        ] {
+            assert_eq!(format_live_elapsed(Duration::from_secs(seconds)), expected);
+        }
+        assert_eq!(
+            format_live_elapsed(Duration::from_millis(3_599_999)),
+            "59m59s"
+        );
+        assert_eq!(
+            format_live_elapsed(Duration::from_millis(3_600_999)),
+            "1h00m00s"
+        );
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "60m00s");
+    }
+
+    #[test]
     fn thinking_toggle_and_elapsed_and_spinner() {
         let mut app = test_app();
         app.slash("thinking");
@@ -21869,6 +22260,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             },
@@ -21889,6 +22281,7 @@ mod tests {
                 needs_attention: true,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             },
@@ -22917,6 +23310,7 @@ mod tests {
             lines: vec!["first".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: Vec::new(),
         });
         app.key(key(KeyCode::Tab));
@@ -23166,9 +23560,10 @@ mod tests {
         assert!(all.contains("Configuredvalue:matchesdefault"));
         assert!(all.contains("Everytextcolour"));
         app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        render(&mut app, 80, 10);
         assert_eq!(
             app.pager.as_ref().unwrap().top,
-            app.pager.as_ref().unwrap().lines.len() - 1
+            app.pager.as_ref().unwrap().lines.len().saturating_sub(8)
         );
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.pager.is_none());
@@ -23451,6 +23846,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -24119,6 +24515,17 @@ mod tests {
                 && all[1].contains("web")
         );
         assert!(all[2].contains("env:HOME") && all[2].contains("hour"));
+        let when = chrono::DateTime::parse_from_rfc3339("2026-10-24T13:43:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string();
+        let by = all[0].find("BY").unwrap();
+        let granted = all[0].find("GRANTED").unwrap();
+        let ends = all[0].find("ENDS").unwrap();
+        assert_eq!(all[1][granted..by].trim_end(), when);
+        assert_eq!(&all[1][by..by + 3], "web");
+        assert_eq!(&all[1][ends..ends + 1], "-");
         let env = approval_lines(&grants, Some("env"));
         assert_eq!(env.iter().filter(|l| l.contains("netty")).count(), 1);
         assert_eq!(
@@ -24151,6 +24558,7 @@ mod tests {
         let mut app = test_app();
         app.on_event(Event::RegistryChanged {
             change: formless_protocol::RegistryChange {
+                change_id: None,
                 tool_id: "t".into(),
                 name: "fetch_page".into(),
                 action: "updated".into(),
@@ -24199,6 +24607,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -24365,6 +24774,382 @@ mod tests {
         app.key(key(KeyCode::Char('}')));
         app.key(key(KeyCode::Char('}')));
         assert_eq!(app.chat_scroll_top, None);
+    }
+
+    #[test]
+    fn composer_height_uses_the_drawn_prompt_and_keeps_exact_edge_rows() {
+        let mut app = test_app();
+        let width = 16;
+        app.input.set("ab界cd");
+        assert_eq!(composer_prompt(&app).0, "› ");
+        assert_eq!(input_height(&app, width), 3);
+
+        app.instructing = Some("fixture".into());
+        assert_eq!(composer_prompt(&app).0, "instructions › ");
+        let text_width = input_text_width(width, "instructions › ");
+        let rows = app.input.layout(text_width).0.len();
+        assert!(rows > 2);
+        assert_eq!(input_height(&app, width), rows as u16 + 2);
+
+        app.instructing = None;
+        let text_width = input_text_width(width, "› ");
+        app.input.set(&format!("{}界", "x".repeat(text_width - 2)));
+        assert_eq!(input_height(&app, width), 4);
+    }
+
+    #[test]
+    fn paste_routes_to_find_and_switcher_without_editing_the_draft() {
+        let payload = "กิ中\r\nnext\rline\nlast\t\u{1b}";
+        let normalized = "กิ中 next line last";
+        let mut app = test_app();
+        app.input.set("private draft");
+        app.messages.push(msg("user", normalized));
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.paste(payload);
+        let find = app.find.as_ref().unwrap();
+        assert_eq!(find.query, normalized);
+        assert_eq!(find.current, usize::MAX);
+        assert!(find.scroll);
+        render(&mut app, 100, 24);
+        assert!(!app.find.as_ref().unwrap().rows.is_empty());
+        assert_eq!(app.input.expanded(), "private draft");
+        assert!(app.attachments.is_empty());
+        app.sessions = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "first",
+                "name": format!("prefix {normalized}"),
+                "created_at": "",
+                "updated_at": ""
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": "second",
+                "name": "prefix unrelated",
+                "created_at": "",
+                "updated_at": ""
+            }))
+            .unwrap(),
+        ];
+        for view in [View::Chat, View::Sessions] {
+            app.view = view;
+            app.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+            app.paste("prefix ");
+            app.switcher.as_mut().unwrap().1 = 1;
+            app.paste(payload);
+            let query = format!("prefix {normalized}");
+            assert_eq!(app.switcher, Some((query.clone(), 0)));
+            assert_eq!(app.switcher_matches(&query), vec![0]);
+            assert_eq!(app.find.as_ref().unwrap().query, normalized);
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn paste_routes_to_each_editing_list_filter_only() {
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            let mut app = test_app();
+            app.view = view;
+            app.input.set("private draft");
+            app.session_filter.editing = true;
+            app.tool_filter.editing = true;
+            app.proposal_filter.editing = true;
+            app.session_idx = 7;
+            app.tool_idx = 7;
+            app.proposal_idx = 7;
+            app.paste("ไทย\r\n中文");
+            let (query, selected) = match view {
+                View::Sessions => (&app.session_filter.query, app.session_idx),
+                View::Tools => (&app.tool_filter.query, app.tool_idx),
+                View::Proposals => (&app.proposal_filter.query, app.proposal_idx),
+                _ => unreachable!(),
+            };
+            assert_eq!(query, "ไทย 中文");
+            assert_eq!(selected, 0);
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.attachments.is_empty());
+            assert_eq!(
+                [&app.session_filter, &app.tool_filter, &app.proposal_filter]
+                    .iter()
+                    .filter(|filter| !filter.query.is_empty())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn paste_is_consumed_by_read_only_overlays_before_hidden_inputs() {
+        for overlay in ["pager", "quit", "rollback", "forecast", "approval"] {
+            let mut app = test_app();
+            app.input.set("private draft");
+            app.find = Some(FindBar::default());
+            match overlay {
+                "pager" => {
+                    app.pager = Some(code_pager("Read only", "text", app.color));
+                    app.switcher = Some(("hidden query".into(), 3));
+                }
+                "quit" => app.quit_confirm = true,
+                "rollback" => {
+                    app.rollback_pick = Some(RollbackPick {
+                        tool_id: "tool".into(),
+                        idx: 0,
+                        armed_version: None,
+                    });
+                }
+                "forecast" => {
+                    app.forecast.modal = Some((
+                        app.forecast_generation(),
+                        forecast_reply("preview", true),
+                        ForecastAction::Send { queued: false },
+                    ));
+                }
+                "approval" => app.on_event(reconnect_approval("fixture", "s1")),
+                _ => unreachable!(),
+            }
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            let file = app.paths.data_dir.join("paste-routing.txt");
+            std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+            std::fs::write(&file, "attachment fixture").unwrap();
+            let path = format!("'{}'", file.display());
+            assert!(clipimg::dropped_file(&path).is_some());
+            app.paste(&path);
+            app.paste("ynq");
+            assert_eq!(app.input.expanded(), "private draft");
+            assert!(app.find.as_ref().unwrap().query.is_empty());
+            assert!(app.attachments.is_empty());
+            assert!(sent.try_recv().is_err());
+            assert!(!app.should_quit);
+            match overlay {
+                "pager" => {
+                    assert!(app.pager.is_some());
+                    assert_eq!(app.switcher, Some(("hidden query".into(), 3)));
+                }
+                "quit" => assert!(app.quit_confirm),
+                "rollback" => assert!(app.rollback_pick.is_some()),
+                "forecast" => assert!(app.forecast.modal.is_some()),
+                "approval" => assert_eq!(app.approvals.len(), 1),
+                _ => unreachable!(),
+            }
+            std::fs::remove_file(file).unwrap();
+        }
+        let mut app = test_app();
+        app.input.set("visible ");
+        app.paste("ordinary text");
+        assert_eq!(app.input.expanded(), "visible ordinary text");
+    }
+
+    #[test]
+    fn paste_respects_settings_visibility_and_history_search() {
+        let mut app = test_app();
+        app.input.set("draft");
+        let mut form = settings::Form::provider(None);
+        form.fields[0].input.set("provider");
+        app.settings_form = Some(form);
+        app.view = View::Chat;
+        app.paste(" edit");
+        assert_eq!(app.input.expanded(), "draft edit");
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().fields[0]
+                .input
+                .expanded(),
+            "provider"
+        );
+        app.view = View::Settings;
+        app.paste(" name");
+        assert_eq!(
+            app.settings_form.as_ref().unwrap().fields[0]
+                .input
+                .expanded(),
+            "providername"
+        );
+        assert_eq!(app.input.expanded(), "draft edit");
+
+        app.view = View::Chat;
+        app.messages = vec![msg("user", "some ไทย 中 text")];
+        app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.paste("ไทย\r\n中");
+        assert_eq!(app.input.searching(), Some(("ไทย 中", Some(0))));
+        assert_eq!(app.input.expanded(), "draft edit");
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn paste_treats_a_path_as_text_in_non_message_chat_prompts() {
+        let mut app = test_app();
+        let file = app.paths.data_dir.join("query-fixture.txt");
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        std::fs::write(&file, "search fixture").unwrap();
+        let path = format!("'{}'", file.display());
+        assert!(clipimg::dropped_file(&path).is_some());
+        app.search_mode = true;
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        app.search_mode = false;
+
+        app.input.clear();
+        app.editing_step = true;
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        app.editing_step = false;
+
+        app.input.clear();
+        app.on_event(Event::UserQuestion {
+            question_id: "question-fixture".into(),
+            session_id: "s1".into(),
+            question: "Which path?".into(),
+            options: vec![],
+            questions: vec![],
+        });
+        assert!(app.current_question().is_some());
+        app.paste(&path);
+        assert_eq!(app.input.expanded(), path);
+        assert!(app.attachments.is_empty());
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn paste_reaches_model_and_wizard_text_without_using_picker_shortcuts() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("draft");
+        app.model_overlay = Some(ModelOverlay {
+            picker: picker::ModelPicker::new(Vec::new()),
+            meta: serde_json::Value::Null,
+            effort_idx: 0,
+            default_only: false,
+        });
+        app.paste("literal\nmodel");
+        assert_eq!(
+            app.model_overlay.as_ref().unwrap().picker.query,
+            "literalmodel"
+        );
+
+        app.quit_confirm = true;
+        app.paste("hidden");
+        assert!(app.quit_confirm);
+        assert_eq!(
+            app.model_overlay.as_ref().unwrap().picker.query,
+            "literalmodel"
+        );
+        app.quit_confirm = false;
+        app.model_overlay = None;
+
+        let mut wizard = Wizard::new(&Config::default());
+        wizard.step = WizardStep::PickPreset;
+        app.wizard = Some(wizard);
+        app.paste("1");
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::PickPreset);
+        let wizard = app.wizard.as_mut().unwrap();
+        wizard.step = WizardStep::BaseUrl;
+        wizard.base_url.clear();
+        app.paste("synthetic\nendpoint");
+        assert_eq!(app.wizard.as_ref().unwrap().base_url, "syntheticendpoint");
+        assert_eq!(app.input.expanded(), "draft");
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_reaches_focused_composer_when_approval_covers_model_picker() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.model_overlay = Some(ModelOverlay {
+            picker: picker::ModelPicker::new(Vec::new()),
+            meta: serde_json::Value::Null,
+            effort_idx: 0,
+            default_only: false,
+        });
+        app.on_event(reconnect_approval("fixture", "s1"));
+        app.input.set("draft");
+        app.input_focus = true;
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("draft"));
+        app.paste(" y");
+        assert_eq!(app.input.expanded(), "draft y");
+        assert!(app.model_overlay.as_ref().unwrap().picker.query.is_empty());
+        assert_eq!(app.approvals.len(), 1);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_consumes_editor_review_and_confirmations_before_editing_code() {
+        let mut app = test_app();
+        app.input.set("draft");
+        app.editor = Some(EditorState {
+            viewport: Default::default(),
+            draft: None,
+            original: None,
+            confirm_exit: true,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "test-tool".into(),
+            name: "fixture".into(),
+            chars: "code".chars().collect(),
+            cursor: 4,
+            mode: EditMode::Code,
+        });
+        app.paste("ynq");
+        assert!(app.editor.as_ref().unwrap().confirm_exit);
+        app.editor.as_mut().unwrap().confirm_exit = false;
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff: "fixture review".into(),
+            verdict: "checked".into(),
+            ok: true,
+        });
+        app.paste("hidden");
+        assert!(app.editor_review.is_some());
+        app.editor_review = None;
+        app.vim_help = true;
+        app.paste("hidden");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "code");
+        assert_eq!(app.editor_generation, 0);
+        app.vim_help = false;
+        app.switcher = Some(("covered".into(), 2));
+        app.pager = Some(code_pager("Hidden pager", "text", app.color));
+        assert!(render(&mut app, 100, 24).contains("Edit fixture"));
+        app.paste(" edit\r\nline");
+        assert_eq!(app.switcher, Some(("covered".into(), 2)));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "code edit\nline");
+        assert_eq!(app.input.expanded(), "draft");
+    }
+
+    #[test]
+    fn composer_height_ignores_hidden_drafts_in_visible_search_bars() {
+        let mut app = test_app();
+        let (width, height) = (40, 24);
+        // The content row sits just above the bottom border and status bar.
+        let search_row = (height - 3) as usize;
+        let draft = "draft\n".repeat(12);
+        app.input.set(&draft);
+        assert_eq!(input_height(&app, width), 10);
+
+        app.find = Some(FindBar::default());
+        assert_eq!(input_height(&app, width), 3);
+        let screen = render(&mut app, width, height);
+        assert!(screen.lines().nth(search_row).unwrap().contains("find ›"));
+        app.view = View::Sessions;
+        assert_eq!(input_height(&app, width), 10);
+        app.view = View::Chat;
+        app.find = None;
+
+        app.input.search_older(&["past message"]);
+        assert!(app.input.searching().is_some());
+        assert_eq!(input_height(&app, width), 3);
+        let screen = render(&mut app, width, height);
+        assert!(screen
+            .lines()
+            .nth(search_row)
+            .unwrap()
+            .contains("(history search)"));
+        app.input.search_cancel();
+        assert_eq!(input_height(&app, width), 10);
+        assert_eq!(app.input.expanded(), draft);
     }
 
     #[test]
@@ -24817,6 +25602,108 @@ mod tests {
     }
 
     #[test]
+    fn pager_moves_by_visible_rows_and_clamps_the_bottom_after_resize() {
+        let mut app = test_app();
+        app.pager = Some(Pager {
+            title: "pager fixture".into(),
+            lines: (0..40).map(|n| format!("pager row {n:02}")).collect(),
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: vec![],
+        });
+        app.key(key(KeyCode::PageDown));
+        let screen = render(&mut app, 60, 10);
+        assert_eq!(app.pager.as_ref().unwrap().top, 8);
+        assert!(screen.contains("line 9/40") && screen.contains("pager row 08"));
+
+        app.key(key(KeyCode::Char(' ')));
+        assert!(render(&mut app, 60, 16).contains("pager row 22"));
+        assert_eq!(app.pager.as_ref().unwrap().top, 22);
+        app.key(key(KeyCode::PageUp));
+        render(&mut app, 60, 16);
+        assert_eq!(app.pager.as_ref().unwrap().top, 8);
+
+        app.key(key(KeyCode::End));
+        app.key(key(KeyCode::Down));
+        app.key(key(KeyCode::PageDown));
+        let screen = render(&mut app, 60, 20);
+        assert_eq!(app.pager.as_ref().unwrap().top, 22);
+        assert!(screen.contains("line 23/40") && screen.contains("pager row 39"));
+        let screen = render(&mut app, 60, 26);
+        assert_eq!(app.pager.as_ref().unwrap().top, 16);
+        assert!(screen.contains("pager row 16") && screen.contains("pager row 39"));
+        app.key(key(KeyCode::Char('g')));
+        render(&mut app, 1, 1);
+        assert_eq!(app.pager.as_ref().unwrap().top, 0);
+    }
+
+    #[test]
+    fn pager_horizontal_scrolling_keeps_diff_styles_and_code_gutter() {
+        let mut app = test_app();
+        let lines = vec![
+            format!("+{} tail", "a".repeat(120)),
+            format!("-{} tail", "b".repeat(120)),
+        ];
+        app.pager = Some(Pager {
+            title: "proposal diff".into(),
+            styled: vec![
+                Line::styled(lines[0].clone(), Style::default().fg(Color::Green)),
+                Line::styled(lines[1].clone(), Style::default().fg(Color::Red)),
+            ],
+            lines,
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+        });
+        for _ in 0..30 {
+            app.key(key(KeyCode::Right));
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].fg, Color::Green);
+        assert_eq!(buffer[(1, 2)].fg, Color::Red);
+        assert_eq!(buffer[(58, 1)].symbol(), "l");
+        let left = app.pager.as_ref().unwrap().left;
+        app.key(key(KeyCode::Right));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.pager.as_ref().unwrap().left, left);
+
+        let code = code_pager(
+            "Tool source",
+            &format!("{}return 42;", " ".repeat(120)),
+            true,
+        );
+        let keyword_color = code.styled[0]
+            .spans
+            .iter()
+            .find(|span| span.content == "return")
+            .and_then(|span| span.style.fg)
+            .unwrap();
+        app.pager = Some(code);
+        for _ in 0..30 {
+            app.key(key(KeyCode::Right));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].symbol(), "1");
+        assert_eq!(buffer[(3, 1)].symbol(), "│");
+        let keyword = (5..59).find(|&x| buffer[(x, 1)].symbol() == "r").unwrap();
+        assert_eq!(buffer[(keyword, 1)].fg, keyword_color);
+        assert_eq!(buffer[(58, 1)].symbol(), ";");
+
+        app.pager = Some(code_pager("Tool source", "界x", false));
+        let mut tiny = Terminal::new(ratatui::backend::TestBackend::new(7, 8)).unwrap();
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(tiny.backend().buffer()[(5, 1)].symbol(), " ");
+        app.key(key(KeyCode::Right));
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(tiny.backend().buffer()[(1, 1)].symbol(), "1");
+        assert_eq!(tiny.backend().buffer()[(5, 1)].symbol(), "x");
+    }
+
+    #[test]
     fn tables_open_full_width_in_the_pager() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -24839,8 +25726,8 @@ mod tests {
         assert_eq!(p.title, "table 1 of 2");
         assert!(p.lines.iter().any(|l| l.chars().count() > 200), "unshrunk");
         app.key(key(KeyCode::Right));
-        assert_eq!(app.pager.as_ref().unwrap().left, 8);
         assert!(render(&mut app, 60, 20).contains("←→"));
+        assert_eq!(app.pager.as_ref().unwrap().left, 8);
         app.key(key(KeyCode::Esc));
         app.slash("table 3");
         assert!(app.notes.last().unwrap().contains("2 table(s)"));
@@ -25295,6 +26182,170 @@ mod tests {
         assert!(app.notes.last().unwrap().starts_with("usage: /panes"));
     }
 
+    fn list_wheel(app: &mut App, column: u16, row: u16, down: bool) {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.mouse(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn wheel_fixture_sessions(count: usize) -> Vec<SessionInfo> {
+        (0..count)
+            .map(|i| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"),
+                    "name": format!("Session {i}"),
+                    "archived": i % 2 == 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_moves_filtered_sessions_and_reveals_selection_without_opening() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.input_focus = true;
+        assert_eq!(app.visible_sessions().len(), 4);
+        let current = app.current.clone();
+        let pending = app.pending.len();
+        render(&mut app, 100, 9);
+        let region = {
+            let targets = app.click_targets.borrow();
+            assert!(!targets.iter().any(|(_, hit)| hit == &Click::Session(3)));
+            targets
+                .iter()
+                .find_map(|(r, hit)| (hit == &Click::Session(0)).then_some(*r))
+                .unwrap()
+        };
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        list_wheel(&mut app, region.x, region.y, true);
+        assert_eq!(app.session_idx, 3);
+        render(&mut app, 100, 9);
+        assert!(app
+            .click_targets
+            .borrow()
+            .iter()
+            .any(|(_, hit)| hit == &Click::Session(3)));
+        list_wheel(&mut app, region.x, region.y, false);
+        assert_eq!(app.session_idx, 0);
+        assert_eq!(app.current, current);
+        assert_eq!(app.pending.len(), pending);
+        assert!(app.input_focus);
+    }
+
+    fn wheel_fixture_proposals() -> Vec<PromptProposalInfo> {
+        (0..2)
+            .map(|i| PromptProposalInfo {
+                id: format!("p{i}"),
+                kind: "prompt".into(),
+                content: "synthetic".into(),
+                rationale: String::new(),
+                status: "measured".into(),
+                baseline_score: None,
+                candidate_score: None,
+                eval_total: 0,
+                est_tokens: 0,
+                created_at: String::new(),
+                applied_at: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wheel_clamps_short_and_empty_proposals_without_review() {
+        let mut app = test_app();
+        app.view = View::Proposals;
+        render(&mut app, 100, 16);
+        assert!(app.list_wheel_region.get().is_none());
+        list_wheel(&mut app, 5, 5, true);
+        assert_eq!(app.proposal_idx, 0);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.proposal_idx, 0);
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.proposal_idx, 1);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.proposal_idx, 0);
+        assert!(app.reviewing.is_none());
+        assert!(app.pager.is_none());
+        assert_eq!(app.pending.len(), pending);
+    }
+
+    #[test]
+    fn wheel_rejects_stale_regions_during_modal_view_and_size_changes() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        render(&mut app, 100, 16);
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let (column, row) = (area.x + 1, area.y + 2);
+        app.quit_confirm = true;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal opened before redraw");
+        render(&mut app, 100, 16);
+        app.quit_confirm = false;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.session_idx, 0, "modal dismissed before redraw");
+        render(&mut app, 100, 16);
+        app.view = View::Proposals;
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "tab switched before redraw");
+        render(&mut app, 100, 16);
+        app.resized();
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 0, "terminal resized before redraw");
+        render(&mut app, 100, 16);
+        list_wheel(&mut app, column, row, true);
+        assert_eq!(app.proposal_idx, 1, "fresh unobscured frame");
+    }
+
+    #[test]
+    fn wheel_ignores_lists_without_room_for_a_rendered_row() {
+        let mut app = test_app();
+        app.sessions = wheel_fixture_sessions(9);
+        app.proposals = wheel_fixture_proposals();
+        app.tools = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let mut tool = description_fixture_detail().tool;
+                tool.id = name.into();
+                tool.name = name.into();
+                tool
+            })
+            .collect();
+        for view in [View::Sessions, View::Tools, View::Proposals] {
+            app.view = view;
+            for (width, height) in [(1, 1), (2, 16), (100, 5)] {
+                render(&mut app, width, height);
+                assert!(
+                    app.list_wheel_region.get().is_none(),
+                    "{view:?} at {width}x{height}"
+                );
+                for row in 0..height {
+                    list_wheel(&mut app, width / 2, row, true);
+                }
+                assert_eq!((app.session_idx, app.tool_idx, app.proposal_idx), (0, 0, 0));
+            }
+        }
+    }
+
     #[test]
     fn mouse_clicks_switch_tabs_select_rows_and_toggle_calls() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
@@ -25334,6 +26385,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -25513,6 +26565,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "agent".into(),
             })
@@ -25804,6 +26857,7 @@ mod tests {
             lines: vec!["Different content".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: vec![],
         });
         app.key(key(KeyCode::Char('i')));
@@ -26198,6 +27252,86 @@ mod tests {
     }
 
     #[test]
+    fn session_list_bounds_names_and_lineage_without_losing_row_targets() {
+        let mut app = test_app();
+        let long_name = "研究👩‍💻e\u{301} plus a very long session name";
+        app.view = View::Sessions;
+        app.session_filter.tree = true;
+        app.sessions = (0..=9)
+            .map(|depth| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{depth}"),
+                    "name": if depth == 9 { long_name } else { "short" },
+                    "forked_from": (depth > 0).then(|| format!("s{}", depth - 1)),
+                    "fork_point_seq": (depth > 0).then_some(3),
+                    "message_count": 12,
+                    "created_at": "2000-01-01T00:00:00Z",
+                    "updated_at": "2099-01-01T00:00:00Z"
+                }))
+                .unwrap()
+            })
+            .collect();
+        app.session_idx = 9;
+        let before = app.session_rows();
+        assert_eq!(before[9].depth, 9);
+        let screen = render(&mut app, 48, 18);
+        let row = screen.lines().find(|row| row.contains('研')).unwrap();
+        assert!(row.replace(' ', "").contains("↳研究👩‍💻e\u{301}…"), "{row}");
+        assert!(row.contains("just now · 12 msgs"), "{row}");
+        assert!(screen
+            .lines()
+            .any(|row| row.contains("short") && row.contains("12 msgs")));
+
+        for width in [1, 7, 11, 12, 13, 20, 48, 80] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+            app.click_targets.borrow_mut().clear();
+            terminal
+                .draw(|frame| draw_sessions(frame, Rect::new(0, 0, width, 18), &app))
+                .unwrap();
+            let targets = app.click_targets.borrow();
+            assert_eq!(targets.len(), 10);
+            assert_eq!(
+                targets[9],
+                (
+                    Rect::new(1, 10, width.saturating_sub(2), 1),
+                    Click::Session(9)
+                )
+            );
+        }
+        assert_eq!(app.session_rows(), before);
+        assert_eq!(app.session_idx, 9);
+        assert_eq!(app.sessions[9].name, long_name);
+
+        app.sessions[0].name = "لا".repeat(9);
+        let screen = render(&mut app, 48, 18);
+        let row = screen.lines().find(|row| row.contains('ل')).unwrap();
+        assert!(row.contains("لالالالالال… just now · 12 msgs"), "{row}");
+    }
+
+    #[test]
+    fn session_name_column_measures_the_graphemes_the_list_paints() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let arabic = "لا".repeat(9);
+        assert_eq!(session_ui::name_cell(&arabic, 0, 12), "لالالالالال…");
+        for name in [arabic.as_str(), "研究👩‍💻e\u{301} sample", "short"] {
+            for depth in [0, 1, 9, 12] {
+                for width in 0..=40 {
+                    let cell = session_ui::name_cell(name, depth, width);
+                    assert_eq!(
+                        cell.graphemes(true).map(text::width).sum::<usize>(),
+                        width,
+                        "{name}, depth {depth}: {cell}"
+                    );
+                    if depth > 0 && width > 0 {
+                        assert!(cell.contains('↳'));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pinned_sessions_sort_first() {
         let mut app = test_app();
         let session = |id: &str, at: &str, pinned: bool| SessionInfo {
@@ -26439,56 +27573,40 @@ mod tests {
     }
 
     #[test]
-    fn rename_starts_from_the_current_name() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    fn cancel_session_rename_preserves_the_existing_draft_and_cursor() {
         let mut app = test_app();
-        app.sessions = vec![SessionInfo {
-            forked_from: None,
-            fork_point_seq: None,
-            id: "a".into(),
-            name: "Refactor auth".into(),
-            model: None,
-            reasoning_effort: None,
-            created_at: "2026-01-01".into(),
-            updated_at: "2026-01-01".into(),
-            cwd: None,
-            message_count: 0,
-            preview: None,
-            last_run_status: None,
-            pinned: false,
-            archived: false,
-            tags: vec![],
-            instructions: None,
-        }];
-        app.view = View::Sessions;
+        app.sessions = vec![serde_json::from_value(serde_json::json!({
+            "id": "other",
+            "name": "Other Session",
+            "created_at": "2026-01-01",
+            "updated_at": "2026-01-01",
+        }))
+        .unwrap()];
+        app.input.set("draft for the current Session");
+        app.input.left();
+        let cursor = app.input.cursor_byte();
+        app.open_view(View::Sessions);
         app.key(key(KeyCode::Char('r')));
-        assert_eq!(app.view, View::Chat);
-        assert_eq!(&*app.input, "Refactor auth");
         assert!(render(&mut app, 80, 20).contains("rename ›"));
         app.key(key(KeyCode::Esc));
-        assert!(app.renaming.is_none());
-        assert_eq!(&*app.input, "");
-        // `/rename auto` offers the daemon's suggestion for editing.
-        app.current = Some("a".into());
-        app.slash("rename auto");
-        let (tx, rx) = mpsc::channel();
-        app.inbox = Some(rx);
-        app.pending.insert(7, Pending::SuggestName);
-        tx.send(ServerMessage::Response {
-            id: 7,
-            ok: true,
-            result: Some(serde_json::json!({"name": "Token code split"})),
-            error: None,
-        })
-        .unwrap();
-        app.drain_daemon();
-        assert_eq!(app.renaming.as_deref(), Some("a"));
-        assert_eq!(&*app.input, "Token code split");
-        // `/instructions` edits them the same way.
-        app.renaming = None;
+        assert_eq!(app.current.as_deref(), Some("s1"));
+        assert_eq!(app.input.expanded(), "draft for the current Session");
+        assert_eq!(app.input.cursor_byte(), cursor);
+    }
+
+    #[test]
+    fn instructions_start_from_the_current_session() {
+        let mut app = test_app();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({
+            "id": "s1",
+            "name": "Current Session",
+            "created_at": "",
+            "updated_at": "",
+        }))
+        .unwrap()];
         app.sessions[0].instructions = Some("answer in Thai".into());
         app.slash("instructions");
-        assert_eq!(app.instructing.as_deref(), Some("a"));
+        assert_eq!(app.instructing.as_deref(), Some("s1"));
         assert_eq!(&*app.input, "answer in Thai");
         assert!(render(&mut app, 80, 20).contains("instructions ›"));
         app.key(key(KeyCode::Esc));
@@ -26625,6 +27743,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: falling,
             author: "agent".into(),
         }];
@@ -26655,6 +27774,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -26976,6 +28096,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         }];
@@ -27135,6 +28256,7 @@ mod tests {
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         };
@@ -27152,6 +28274,16 @@ mod tests {
             screen.contains("▾ fs (1)") && screen.contains("▾ net (1)"),
             "{screen}"
         );
+        let (_, area) = app.list_wheel_region.get().unwrap();
+        let pending = app.pending.len();
+        list_wheel(&mut app, area.x + 1, area.bottom(), true);
+        assert_eq!(app.tool_idx, 0, "details pane does not move selection");
+        list_wheel(&mut app, area.x + 1, area.y + 2, true);
+        assert_eq!(app.selected_tool().unwrap().name, "http_get");
+        assert!(app.tool_detail.is_none());
+        assert_eq!(app.pending.len(), pending);
+        list_wheel(&mut app, area.x + 1, area.y + 2, false);
+        assert_eq!(app.selected_tool().unwrap().name, "read_file");
         // The first Tool (fs) is selected; z folds its group.
         app.key(key('z'));
         let screen = render(&mut app, 140, 30);
@@ -27182,6 +28314,7 @@ mod tests {
             needs_attention: true,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: "sf".into(),
             author: "agent".into(),
         };
@@ -27624,6 +28757,126 @@ mod tests {
     }
 
     #[test]
+    fn mention_popup_keeps_every_selection_in_short_viewports() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let mut popup = MentionPopup {
+            query: "file".into(),
+            files: (0..8)
+                .map(|i| FileEntry {
+                    path: format!("file-{i:02}.rs"),
+                    dir: false,
+                    bytes: 0,
+                })
+                .collect(),
+            sel: 0,
+            dismissed: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        for y in [3, 4, 6, 10] {
+            for sel in (0..8).chain((0..7).rev()) {
+                popup.sel = sel;
+                terminal
+                    .draw(|frame| draw_mention_popup(frame, Rect::new(2, y, 36, 2), &popup, false))
+                    .unwrap();
+                let shown: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    shown.contains(&format!("› file-{sel:02}.rs")),
+                    "{y}: {shown}"
+                );
+                assert_eq!(shown.matches("file-").count(), usize::from(y - 2));
+            }
+        }
+    }
+
+    #[test]
+    fn mention_popup_ellipsizes_paths_at_grapheme_boundaries() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let mixed = "long parent path/資料/e\u{301}👩‍💻.rs";
+        for (path, dir, width, expected) in [
+            (mixed, true, 12, "│›…e\u{301}👩‍💻.rs/│"),
+            (mixed, true, 10, "│›….rs/│"),
+            ("لالالا", false, 8, "│›…الا│"),
+        ] {
+            let popup = MentionPopup {
+                query: "path".into(),
+                files: vec![FileEntry {
+                    path: path.into(),
+                    dir,
+                    bytes: 0,
+                }],
+                sel: 0,
+                dismissed: false,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, 4)).unwrap();
+            terminal
+                .draw(|frame| draw_mention_popup(frame, Rect::new(0, 3, width, 1), &popup, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(row.replace(' ', ""), expected);
+            assert_eq!(popup.files[0].path, path);
+            assert_eq!(popup.files[0].dir, dir);
+        }
+    }
+
+    #[test]
+    fn mention_popup_handles_tiny_or_clipped_geometry() {
+        use formless_core::files::FileEntry;
+        use ratatui::backend::TestBackend;
+
+        let popup = MentionPopup {
+            query: "path".into(),
+            files: vec![FileEntry {
+                path: "document.txt".into(),
+                dir: false,
+                bytes: 0,
+            }],
+            sel: 0,
+            dismissed: false,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(8, 6)).unwrap();
+        for rect in [
+            Rect::new(0, 3, 0, 1),
+            Rect::new(0, 3, 1, 1),
+            Rect::new(0, 3, 2, 1),
+            Rect::new(0, 0, 8, 1),
+            Rect::new(0, 2, 8, 1),
+            Rect::new(6, 3, 5, 1),
+        ] {
+            terminal
+                .draw(|frame| draw_mention_popup(frame, rect, &popup, false))
+                .unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| cell.symbol() == " "),
+                "{rect}"
+            );
+        }
+        for (width, expected) in [(3, "│›│"), (4, "│›…│")] {
+            terminal
+                .draw(|frame| draw_mention_popup(frame, Rect::new(0, 3, width, 1), &popup, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(row, expected);
+        }
+    }
+
+    #[test]
     fn mention_popup_completes_paths_and_send_waits_for_attachments() {
         use formless_core::files::FileEntry;
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
@@ -27961,7 +29214,7 @@ mod tests {
             "keeps the latest rows"
         );
     }
-    fn forecast_reply(hint: &str, required: bool) -> RunForecast {
+    pub(super) fn forecast_reply(hint: &str, required: bool) -> RunForecast {
         let st = formless_core::Store::open_in_memory().unwrap();
         let mut cfg = Config::default();
         cfg.provider.model = "model".into();
@@ -28381,21 +29634,18 @@ mod tests {
             assert!(lines[i * 3 + 1].contains("AVG 308ms"));
             assert!(lines[i * 3 + 1].contains(&cache_hit_text(model)));
         }
-        for i in 0..lines.len() {
-            let p = app.pager.as_ref().unwrap();
-            assert_eq!(p.top, i);
-            assert_eq!(p.lines[p.top], lines[i]);
-            app.key(key(KeyCode::Down));
-        }
         app.key(key(KeyCode::Right));
+        render(&mut app, 80, 24);
         assert_eq!(app.pager.as_ref().unwrap().left, 8);
         for size in [(80, 24), (40, 12), (120, 40)] {
             let _ = render(&mut app, size.0, size.1);
         }
         app.key(key(KeyCode::Home));
+        render(&mut app, 120, 40);
         assert_eq!(app.pager.as_ref().unwrap().top, 0);
         app.key(key(KeyCode::End));
-        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 1);
+        render(&mut app, 120, 40);
+        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 38);
         app.key(key(KeyCode::Esc));
         assert!(app.pager.is_none());
         assert_eq!(app.tool_idx, index);
@@ -28417,6 +29667,29 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("forecast vs actual (f"), "{screen}");
     }
+    #[test]
+    fn tool_detail_shows_retained_use_or_a_dash_for_missing_history() {
+        let mut app = test_app();
+        let stamp = "2020-06-15T12:00:00+00:00";
+        let mut detail = description_fixture_detail();
+        detail.tool.updated_at = "2025-07-01T12:00:00+00:00".into();
+        detail.tool.last_used_at = Some(stamp.into());
+        app.tool_detail = Some(detail);
+        let last_use_line = |app: &App| {
+            tool_detail_lines(app)
+                .iter()
+                .map(ToString::to_string)
+                .find(|line| line.starts_with("Last used "))
+                .unwrap()
+        };
+        assert_eq!(
+            last_use_line(&app),
+            format!("Last used {}", ui::relative_time(stamp, chrono::Utc::now()))
+        );
+        app.tool_detail.as_mut().unwrap().tool.last_used_at = None;
+        assert_eq!(last_use_line(&app), "Last used —");
+    }
+
     pub(super) fn description_fixture_detail() -> ToolDetail {
         ToolDetail {
             description_review: formless_core::descriptions::screen("Plain inventory reader"),
@@ -28438,6 +29711,7 @@ mod tests {
                 needs_attention: false,
                 created_at: String::new(),
                 updated_at: String::new(),
+                last_used_at: None,
                 recent: String::new(),
                 author: "user".into(),
             },
@@ -29264,6 +30538,7 @@ mod tests {
                 lines: vec!["Different visible data".into()],
                 top: 0,
                 left: 0,
+                viewport: Default::default(),
                 styled: vec![],
             });
             app.key(key(KeyCode::Char('i')));
@@ -29425,6 +30700,7 @@ mod tests {
             lines: vec!["private data".into()],
             top: 0,
             left: 0,
+            viewport: Default::default(),
             styled: vec![],
         });
         app.key(key(KeyCode::Esc));

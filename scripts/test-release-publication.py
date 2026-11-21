@@ -90,8 +90,16 @@ elif args[0] not in ['tag','push','image']: sys.exit(10)
         self.assertIn("load: true", docker)
         self.assertNotIn("push: true", docker)
         self.assertLess(docker.index("Smoke private container"), docker.index("bash scripts/push-release-image.sh"))
-        self.assertRegex(workflow, r"uses: softprops/action-gh-release@v2\n        id: release")
+        self.assertRegex(workflow, r"uses: softprops/action-gh-release@[0-9a-f]{40} #[^\n]+\n        id: release")
         self.assertIn("'${{ steps.release.outcome }}'", workflow)
+
+    def test_release_uses_immutable_action_revisions(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        actions = re.findall(r"^\s*(?:- )?uses:\s+(\S+)", workflow, re.M)
+        self.assertTrue(actions)
+        for action in actions:
+            with self.subTest(action=action):
+                self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
 
 
 if __name__ == "__main__":

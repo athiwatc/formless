@@ -20,7 +20,20 @@ One-shot times accept relative minutes, hours or days, a local
 `YYYY-MM-DD HH:MM` time, or RFC 3339. The time must be in the future.
 Relative offsets are limited to 366 days.
 
-For a recurring task, choose plain English or five-field cron:
+Preview a recurring schedule before adding a Job. Use supported plain English
+or five-field cron:
+
+```sh
+formless jobs preview "every weekday at 9am"
+formless jobs preview "0 9 * * 1-5" --json
+```
+
+The daemon interprets the schedule and projects up to three times from its
+current local time. The preview leaves Jobs unchanged. It can return fewer
+times or none, and does not guarantee that `jobs add` will accept the schedule
+or that a Job will fire. Use `jobs add --at` for one-shot times.
+
+To create a recurring Job:
 
 ```sh
 formless jobs add "Summarize this project's open work" --every "every weekday at 9am"

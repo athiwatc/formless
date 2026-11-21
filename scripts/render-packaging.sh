@@ -31,14 +31,40 @@ windows=$(sha_of x86_64-pc-windows-msvc zip)
 # The exe sits in a folder named after the archive (Compress-Archive -Path).
 nested="formless-v$version-x86_64-pc-windows-msvc/formless.exe"
 zip="$assets/formless-v$version-x86_64-pc-windows-msvc.zip"
-if [[ -f "$zip" ]]; then
-  listing=$(unzip -Z1 "$zip" | tr '\\' '/')
-  grep -qx "$nested" <<<"$listing" \
-    || { echo "error: $zip does not hold $nested (the manifest's RelativeFilePath)" >&2; exit 1; }
+zip_has_member() {
+  local archive=$1 expected=$2 listing
+  if command -v unzip >/dev/null; then
+    listing=$(unzip -Z1 "$archive" | tr '\\' '/') || return 1
+    grep -Fxq -- "$expected" <<<"$listing"
+  elif command -v python3 >/dev/null; then
+    python3 - "$archive" "$expected" <<'PY'
+import sys
+from zipfile import ZipFile
+
+archive, expected = sys.argv[1:]
+with ZipFile(archive) as files:
+    sys.exit(not any(name.replace("\\", "/") == expected for name in files.namelist()))
+PY
+  else
+    echo "error: python3 or unzip is required to inspect $archive" >&2
+    exit 1
+  fi
+}
+if [[ -f "$zip" ]] && ! zip_has_member "$zip" "$nested"; then
+  echo "error: $zip does not hold $nested (the manifest's RelativeFilePath)" >&2
+  exit 1
 fi
 src_url="https://github.com/athiwatc/formless/archive/refs/tags/v$version.tar.gz"
 src_sha="${SRC_SHA:-}"
 if [[ -z "$src_sha" ]]; then
+  if command -v sha256sum >/dev/null; then
+    hasher=(sha256sum)
+  elif command -v shasum >/dev/null; then
+    hasher=(shasum -a 256)
+  else
+    echo "error: sha256sum or shasum is required to verify the source archive (set SRC_SHA to skip)" >&2
+    exit 1
+  fi
   src_archive=$(mktemp)
   trap 'rm -f -- "$src_archive"' EXIT
   if ! curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 --retry-all-errors \
@@ -46,7 +72,7 @@ if [[ -z "$src_sha" ]]; then
     echo "error: could not download $src_url to compute its checksum (set SRC_SHA to skip)" >&2
     exit 1
   fi
-  src_sha=$(shasum -a 256 < "$src_archive" | cut -d' ' -f1)
+  src_sha=$("${hasher[@]}" < "$src_archive" | cut -d' ' -f1)
 fi
 [[ "$src_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no checksum for $src_url" >&2; exit 1; }
 # Field-scoped edits: the url line and the formula's top-level sha256.

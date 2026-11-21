@@ -70,10 +70,16 @@ test('service worker install actually precaches the shared browser transport',as
 
 test('push registration receipts do not impersonate daemon offline controls',async()=>{
   const b=await browser();b.S.daemonOnline=true;const channel={fixture:true};b.S.channel=channel;
-  for(const [relay,receipt] of [['push_subscribed','B'.repeat(22)],['push_unsubscribed','C'.repeat(22)]]){
-    b.control({relay},receipt);await until(()=>b.sent.some(frame=>frame.relay==='ack_control'&&frame.receipt===receipt));
+  const registration=[],removal=[];
+  b.S.pushRegistration={finish:socket=>registration.push(socket)};
+  b.S.pushRemovalAck=(socket,id)=>removal.push({socket,id});
+  const id='f0ae9f18-2a8b-45c9-a338-53dfdc62c127';
+  for(const [body,receipt] of [[{relay:'push_subscribed'},'B'.repeat(22)],[{relay:'push_unsubscribed',id},'C'.repeat(22)]]){
+    b.control(body,receipt);await until(()=>b.sent.some(frame=>frame.relay==='ack_control'&&frame.receipt===receipt));
     assert.equal(b.S.daemonOnline,true);assert.equal(b.S.channel,channel);
   }
+  assert.deepEqual(registration,[b.ws]);
+  assert.deepEqual(removal,[{socket:b.ws,id}]);
   assert.deepEqual(b.closes,[]);b.ws.close(1000);
 });
 

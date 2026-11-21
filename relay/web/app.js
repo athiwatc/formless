@@ -292,6 +292,8 @@
       "Send": "ส่ง", "Steer": "ปรับทิศ", "Re-run": "ส่งใหม่", "Stop": "หยุด",
       "Message Formless…": "พิมพ์ข้อความถึง Formless…",
       "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
+      "Recent retained calls": "การเรียกใช้ล่าสุดที่เก็บไว้", "Succeeded": "สำเร็จ", "Failed": "ล้มเหลว",
+      "Recent sample trend": "แนวโน้มตัวอย่างล่าสุด", "up": "เพิ่มขึ้น", "down": "ลดลง", "no arrow": "ไม่มีลูกศร",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
@@ -360,8 +362,11 @@
     const s = (Date.parse(ts) - Date.now()) / 1000;
     if (isNaN(s)) return ts || "";
     if (s <= 0) return "ended";
-    if (s < 3600) return "in " + uiFormat(Math.max(1, Math.ceil(s / 60))) + "m";
-    return "in " + uiFormat(Math.round(s / 3600)) + "h";
+    if (s < 60) return "in less than 1m";
+    const minutes = Math.floor(s / 60);
+    const hours = Math.floor(minutes / 60), remainder = minutes % 60;
+    return "in " + (hours ? uiFormat(hours) + "h" + (remainder ? " " : "") : "")
+      + (!hours || remainder ? uiFormat(remainder) + "m" : "");
   }
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
@@ -369,7 +374,22 @@
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
+    if (s >= 3600) {
+      const pad = { minimumIntegerDigits: 2, useGrouping: false };
+      return uiFormat(Math.floor(s / 3600)) + "h" + uiFormat(Math.floor(s % 3600 / 60), pad) + "m" + uiFormat(s % 60, pad) + "s";
+    }
     return s < 60 ? uiFormat(s) + "s" : uiFormat(Math.floor(s / 60)) + "m" + uiFormat(s % 60, { minimumIntegerDigits: 2, useGrouping: false }) + "s";
+  }
+  /** Durations recorded in ms: keep short calls visible and long calls readable. */
+  function recordedDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "—";
+    if (ms === 0) return "0s";
+    if (ms < 1000) return uiFormat(Math.floor(ms)) + "ms";
+    if (ms < 60000) return uiFormat(Math.floor(ms / 100) / 10) + "s";
+    const seconds = Math.floor(ms / 1000);
+    const padded = { minimumIntegerDigits: 2, useGrouping: false };
+    if (seconds < 3600) return uiFormat(Math.floor(seconds / 60)) + "m" + uiFormat(seconds % 60, padded) + "s";
+    return uiFormat(Math.floor(seconds / 3600)) + "h" + uiFormat(Math.floor(seconds % 3600 / 60), padded) + "m" + uiFormat(seconds % 60, padded) + "s";
   }
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
@@ -404,6 +424,28 @@
   }
   function bar(r) {
     return h("span", { class: "bar " + rateClass(r) }, h("i", { style: "width:" + Math.round((r || 0) * 100) + "%" }));
+  }
+  // Same two-window descriptive rule as the TUI; retained outcomes, not a forecast.
+  function recentCalls(recent) {
+    if (typeof recent !== "string" || !recent.length || /[^sf]/.test(recent)) return null;
+    const outcomes = recent.slice(-40), now = outcomes.slice(-20), before = outcomes.slice(0, -20);
+    const successes = text => [...text].filter(c => c === "s").length;
+    const succeeded = successes(now), failed = now.length - succeeded;
+    const delta = before.length >= 5 && now.length >= 5 ? succeeded / now.length - successes(before) / before.length : 0;
+    return { now, succeeded, failed, trend: delta >= 0.1 ? "up" : delta <= -0.1 ? "down" : "none" };
+  }
+  function toolRecent(recent) {
+    const sample = recentCalls(recent);
+    if (!sample) return null;
+    const { now, succeeded, failed, trend } = sample;
+    const arrow = trend === "up" ? " ↑" : trend === "down" ? " ↓" : "";
+    const label = tr("Recent retained calls") + ": " + uiFormat(now.length) + "; " +
+      tr("Succeeded") + ": " + uiFormat(succeeded) + "; " + tr("Failed") + ": " + uiFormat(failed) +
+      "; " + tr("Recent sample trend") + ": " + tr(trend === "up" ? "up" : trend === "down" ? "down" : "no arrow");
+    return h("span", { class: "tool-recent", role: "img", "aria-label": label },
+      h("span", { class: "tool-recent-bars", "aria-hidden": "true" }, [...now].map(c =>
+        h("span", { class: c === "s" ? "rate-good success" : "rate-bad failure" }))),
+      h("span", { class: "tool-recent-counts", "aria-hidden": "true" }, uiFormat(succeeded) + "/" + uiFormat(now.length) + " ✓" + arrow));
   }
   function summarizeArgs(args) {
     let obj;
@@ -442,7 +484,14 @@
     }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
-      if (["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w)) || k.endsWith("KEY") || k.endsWith("_PAT")) return "a secret from your environment";
+      const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
+      const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
+        ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "HMACKEY", "CLIENTKEY", "ACCOUNTKEY",
+          "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
+      if (credentialKey || k.endsWith("_PAT") ||
+          ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
+        return "a secret from your environment";
+      }
     }
     return null;
   }
@@ -495,14 +544,20 @@
   function note(text, err) {
     S.notes.push({ text, err: !!err, at: Date.now() });
     if (S.notes.length > 200) S.notes.shift();
-    if ($("notes-panel").classList.contains("hidden")) S.unread++;
+    if ($("notes-panel").classList.contains("hidden")) S.unread = Math.min(S.notes.length, S.unread + 1);
     renderNotes();
     renderStatus();
   }
   /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
   function toast(text, err, action) {
+    const button = action && h("button", { class: "btn small", type: "button", onclick: () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      t.remove();
+      action.run();
+    } }, action.label);
     const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
-      action ? h("button", { class: "btn small", type: "button", onclick: () => { t.remove(); action.run(); } }, action.label) : null);
+      button);
     $("toasts").append(t);
     setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
   }
@@ -510,6 +565,8 @@
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
   let askTag = null;
+  let askOptions = null;
+  let askSaving = false;
   const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
@@ -536,10 +593,12 @@
     const { opts, resolve } = askQueue.shift();
     askResolve = resolve;
     askTag = opts.tag || null;
+    askOptions = opts;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
+    $("ask-form").setAttribute("autocomplete", opts.secretFields ? "off" : "on");
     const input = $("ask-input");
     configureAskInput(input, opts);
     input.classList.toggle("hidden", !opts.input);
@@ -558,13 +617,18 @@
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
+    if (askSaving) return;
     // Callers pass/capture the resolved value before the shared DOM is cleared.
     $("ask-input").value = "";
+    for (const field of askOptions?.secretFields || []) field.value = "";
+    $("ask-body").replaceChildren();
+    showAskError("");
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
     const resolve = askResolve;
     askResolve = null;
     askTag = null;
+    askOptions = null;
     if (resolve) resolve(value);
     showNextAsk();
   }
@@ -574,9 +638,51 @@
     }
     if (askTag === tag) closeAsk(null);
   }
-  $("ask-form").addEventListener("submit", (e) => {
+  function showAskError(message) {
+    const error = $("ask-error");
+    error.classList.toggle("hidden", !message);
+    error.textContent = message;
+  }
+  function setAskSaving(saving) {
+    askSaving = saving;
+    $("ask-fields").disabled = $("ask-ok").disabled = $("ask-cancel").disabled = saving;
+    $("ask-ok").textContent = saving ? "Saving…" : askOptions.ok || "OK";
+    $("ask-saving").textContent = saving ? "Saving…" : "";
+    const dialog = activeDialog();
+    if (saving && dialog?.node === $("ask-backdrop")) focusDialog(dialog);
+  }
+  function recordValue(field, message) {
+    const value = field.value.trim();
+    if (!value) throw Object.assign(new Error(message), { field });
+    return value;
+  }
+  $("ask-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    if (!askOptions || askSaving) return;
+    if (!askOptions.saveRequest) {
+      return closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    }
+    const opts = askOptions;
+    showAskError("");
+    let req;
+    try { req = opts.saveRequest(); }
+    catch (error) { showAskError(error.message); error.field?.focus(); return; }
+    if (!req) return closeAsk(null);
+    const focused = document.activeElement;
+    setAskSaving(true);
+    try {
+      const result = await request(req, opts.timeoutMs);
+      setAskSaving(false);
+      closeAsk(result ?? true);
+    } catch (error) {
+      setAskSaving(false);
+      // Daemon errors can echo request fields. Secret-bearing forms use
+      // field-specific guidance without including the server's error text.
+      showAskError(error.daemonResponse
+        ? opts.saveError || error.message
+        : "Save was not confirmed. Check the connection and whether the record was saved before trying again.");
+      if (activeDialog()?.node === $("ask-backdrop")) focusDialog(activeDialog(), focused);
+    }
   });
   $("ask-cancel").onclick = () => closeAsk(null);
 
@@ -1075,26 +1181,82 @@
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
-  async function refreshRunning() {
-    const revision = S.invocationRefresh = (S.invocationRefresh || 0) + 1;
-    const connection = [S.ws, S.conn, S.channel];
+  let runningRefresh = null, runningExposed = false, runningExposureQueued = false;
+  function runningPanelExposed() {
+    const sidebar = $("sidebar");
+    // Read the actual layout; both viewport and container queries can hide
+    // this drawer. The Running box itself is hidden when its list is empty.
+    return !document.hidden && S.view === "chat" && !!sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden";
+  }
+  function syncRunningExposure() {
+    const exposed = runningPanelExposed();
+    if (exposed && !runningExposed && !runningExposureQueued) {
+      runningExposureQueued = true;
+      queueMicrotask(() => {
+        runningExposureQueued = false;
+        if (runningPanelExposed()) refreshRunning("exposure");
+      });
+    }
+    runningExposed = exposed;
+  }
+  function sameRunningConnection(query) {
+    return query.ws === S.ws && query.conn === S.conn && query.channel === S.channel;
+  }
+  async function refreshRunning(reason = "event") {
+    if (!S.channel || S.ws?.readyState !== 1 || (!S.local && !S.relayReady)) return;
+    if (runningRefresh && sameRunningConnection(runningRefresh)) {
+      // A change may have happened after the read began; keep one follow-up.
+      // A periodic tick or a visibility change can reuse the current read.
+      if (reason === "event") runningRefresh.followUp = true;
+      return;
+    }
+    const query = runningRefresh = { ws: S.ws, conn: S.conn, channel: S.channel, followUp: false };
     const list = await request({ type: "list_invocations" }).catch(() => null);
-    if (!list || revision !== S.invocationRefresh || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+    if (runningRefresh !== query) return;
+    runningRefresh = null;
+    if (!sameRunningConnection(query)) {
+      // A Session subscription may change its client identifier without
+      // reconnecting. Retry on this socket, but never paint that old reply.
+      if (query.ws === S.ws && query.channel === S.channel) refreshRunning();
+      return;
+    }
+    if (query.followUp) {
+      refreshRunning();
+      return;
+    }
+    if (!list) return;
     S.invocations = list;
     reconcileInvocationProgress(list);
+    renderRunning(list);
+  }
+  function pollRunning() {
+    if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
+  }
+  function renderRunning(list) {
     const box = $("running");
+    const focused = document.activeElement;
+    const previous = box.contains(focused) ? focused.dataset : null;
+    const controls = [];
+    const control = (action, i, attrs, ...children) => {
+      const button = h("button", { type: "button", "data-running-action": action, "data-running-handle": i.handle, ...attrs }, ...children);
+      if (previous?.runningAction === action && previous.runningHandle === String(i.handle)) controls.push(button);
+      return button;
+    };
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
       const s = S.sessions.find((x) => x.id === i.session_id);
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
-        i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
+        control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
+          h("strong", null, i.tool_name), " · " + recordedDuration(i.elapsed_ms) + (s ? " · " + s.name : "") +
+          (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
+        control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
+        i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
     }));
+    if (focusVisible(controls[0])) controls[0].focus({ preventScroll: true });
   }
-  setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
+  setInterval(pollRunning, 2000);
+  document.addEventListener("visibilitychange", syncRunningExposure);
 
   function sessionRows(sessions, visible, tree) {
     if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));
@@ -1287,6 +1449,9 @@
 
   function renderSessions() {
     const list = $("sessions");
+    const focused = document.activeElement;
+    const focusedRow = focused?.closest("#sessions [data-session-id]");
+    const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
     list.replaceChildren();
     S.marked = S.marked || new Set();
     if (S.marked.size) {
@@ -1326,26 +1491,37 @@
     const appendRows = (visible) => {
       for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
         const s = row.session;
+        const running = S.running.has(s.id);
+        const paused = !running && s.last_run_status === "paused";
+        const state = [s.pinned && "Pinned", running && "Running", paused && "Paused"].filter(Boolean).join(", ");
+        const stateId = "session-state-" + s.id;
         const menu = h("button", {
           class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
           onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
           onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
         }, "⋯");
-        list.append(h("li", {
+        const item = h("li", {
           class: "session" + (s.id === S.current ? " active" : ""),
-          tabindex: 0,
-          onclick: () => openSession(s.id),
-          onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
+          "data-session-id": s.id,
         },
         h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-          onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
-        S.running.has(s.id) ? h("span", { class: "running", title: "running" })
-          : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-        h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
-          row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
-          s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-        h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
-        menu));
+          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+        h("button", { class: "session-open", type: "button", "aria-label": s.name,
+          "aria-current": s.id === S.current ? "true" : null, "aria-describedby": state ? stateId : null,
+          onclick: () => openSession(s.id) },
+          running ? h("span", { class: "running", title: "running", "aria-hidden": "true" })
+            : paused ? h("span", { class: "state", title: "paused", "aria-hidden": "true" }, "⏸") : null,
+          h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+            row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
+            s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+          h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
+        state ? h("span", { id: stateId, class: "sr-only" }, state) : null, menu);
+        list.append(item);
+        if (focusedRow?.dataset.sessionId === s.id && focusedControl) {
+          const control = item.querySelector("." + focusedControl);
+          if (focusedControl === "menu" && !focusVisible(control)) item.querySelector(".session-open").focus({ preventScroll: true });
+          control.focus({ preventScroll: true });
+        }
       }
     };
     appendRows(active);
@@ -1365,20 +1541,61 @@
     box.classList.remove("hidden");
     box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
-    const lower = query.toLowerCase();
+    const literal = query.trim();
+    const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
+    const terms = words && new Set(words.map((word) => foldMap(word, foldSearchCharacter).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
-      const at = text.toLowerCase().indexOf(lower);
-      if (at >= 0 && lower) {
-        snippet.append(text.slice(0, at), h("mark", null, text.slice(at, at + query.length)), text.slice(at + query.length));
-      } else snippet.append(text);
+      let cursor = 0;
+      for (const [start, end] of searchHighlightRanges(text, literal, terms)) {
+        if (cursor < start) snippet.append(text.slice(cursor, start));
+        snippet.append(h("mark", null, text.slice(start, end)));
+        cursor = end;
+      }
+      if (cursor < text.length) snippet.append(text.slice(cursor));
       box.append(h("div", {
         class: "hit", tabindex: 0,
         onclick: () => openSession(hit.session_id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(hit.session_id); },
       }, h("div", { class: "meta" }, hit.session_name + " · #" + hit.seq + " " + hit.role), snippet));
     }
+  }
+
+  function foldSearchCharacter(ch) {
+    // Standalone combining characters that unicode61 treats as diacritics.
+    if (/[\u0300-\u0304\u0306-\u030c\u030f\u0311\u031b\u0323-\u0328\u032d-\u032e\u0330-\u0331]/u.test(ch)) return "";
+    const base = ch.normalize("NFD").replace(/\p{M}/gu, "");
+    // unicode61's precomposed diacritic table folds to ASCII Latin.
+    const lower = (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+    return lower === "ς" ? "σ" : lower;
+  }
+
+  function searchHighlightRanges(text, literal, terms) {
+    if (!terms) {
+      // The daemon searches literally when the query has no word terms.
+      const start = literal ? text.indexOf(literal) : -1;
+      return start < 0 ? [] : [[start, start + literal.length]];
+    }
+    const { folded, from } = foldMap(text, foldSearchCharacter);
+    const remaining = new Set(terms);
+    const spans = [];
+    // Approximate unicode61's boundaries within this snippet. Highlight the
+    // first visible prefix per term, sharing a mark for overlapping prefixes.
+    for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
+      let end = index;
+      for (const term of remaining) {
+        if (!word.startsWith(term)) continue;
+        const stop = index + term.length;
+        // A prefix must cover the complete original character.
+        if (from[stop] === from[stop - 1]) continue;
+        remaining.delete(term);
+        end = Math.max(end, stop);
+      }
+      if (end > index) spans.push([from[index], from[end]]);
+      if (!remaining.size) break;
+    }
+    return spans;
   }
 
   // ---------------------------------------------------------- markdown
@@ -1446,6 +1663,8 @@
     sh: { lc: ["#"], q: "\"'", kw: W("alias case cd do done echo elif else end esac exit export fi for function if in local return set source then unset while"), lit: W("true false") },
     c: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W("abstract auto break case catch class const continue default do else enum extends extern final for fun func goto if implements import include interface let namespace new override package private protected public return sizeof static struct switch template throw throws try typedef union using val var virtual void volatile while"), lit: W("true false null nullptr nil this self super") },
     json: { q: "\"", kw: W(""), lit: W("true false null") },
+    jsonc: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W(""), lit: W("true false null") },
+    json5: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W(""), lit: W("true false null") },
     config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
@@ -1453,15 +1672,17 @@
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
+  HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.php = { ...HL.c, lc: ["//", "#"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
-    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
-    jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
+    yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
@@ -1473,6 +1694,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const php = L === HL.php;
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1523,16 +1745,24 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
+      const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]));
+      if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
+          (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
-        const stop = end < 0 ? code.length : end;
+        const lineEnd = end < 0 ? code.length : end;
+        const tag = php ? code.slice(i, lineEnd).indexOf("?>") : -1;
+        const stop = tag < 0 ? lineEnd : i + tag;
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
       }
       if (L.q.includes(c)) {
         let j = i + 1;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || c === "`")) j += code[j] === "\\" ? 2 : 1;
+        const multiline = c === "`" || L.mysqlComments;
+        while (j < code.length && code[j] !== c && (code[j] !== "\n" || multiline)) {
+          j += code[j] === "\\" && !(L.mysqlComments && c === "`") ? 2 : 1;
+        }
         const stop = Math.min(j + 1, code.length);
         tok("tok-str", code.slice(i, stop));
         i = stop;
@@ -2040,8 +2270,11 @@
       h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
-  function toolResultChip(content) {
-    const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
+  function toolResultChip(content, meta) {
+    // The daemon stores the error outcome separately from arbitrary output.
+    // Older or incomplete transcripts may not carry a recorded failure.
+    let failed = false;
+    try { failed = JSON.parse(meta || "{}")?.is_error === true; } catch (_) {}
     const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
@@ -2707,7 +2940,7 @@
             ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
             ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
         } else if (m.role === "tool") {
-          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
+          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || "", m.meta))));
         } else if (m.role === "system-note") {
           open("system-note", m.created_at).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
         } else {
@@ -3563,7 +3796,7 @@
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
   function planStateLabel(state) {
     if (!state) return "";
-    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", state.updated_at ? "updated " + state.updated_at : ""].filter(Boolean).join(" · ");
+    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", Number.isFinite(Date.parse(state.updated_at)) ? "updated " + relTime(state.updated_at) : ""].filter(Boolean).join(" · ");
   }
   function renderPlan() {
     const box = $("plan");
@@ -3571,10 +3804,20 @@
     box.classList.toggle("hidden", !items.length);
     if (!items.length) return box.replaceChildren();
     const done = items.filter((i) => i.status === "completed").length;
-    const lifecycle = planStateLabel(S.planState);
-    if (done === items.length && !isRunning() && !lifecycle) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    const state = S.planState, lifecycle = planStateLabel(state);
+    const updated = Date.parse(state?.updated_at);
+    const title = Number.isFinite(updated) ? uiFormat(new Date(updated), {
+      year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+    }) : null;
+    // A successful resumed current task is complete too; copied/imported/legacy
+    // and previous-task plans retain their provenance and checklist.
+    const completedCurrent = state && !state.previous_task && state.run_status === "completed" &&
+      (state.origin === "live" || state.origin === "resumed");
+    if (done === items.length && !isRunning() && ((!lifecycle && !state?.updated_at) || completedCurrent)) {
+      return box.replaceChildren(h("span", { class: "muted", title }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    }
     const mark = { completed: "✓", in_progress: "▸" };
-    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
+    box.replaceChildren(h("span", { class: "muted", title }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
       h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
@@ -3753,6 +3996,16 @@
     const badge = $("notes-badge");
     badge.textContent = S.unread > 99 ? "99+" : String(S.unread);
     badge.classList.toggle("hidden", !S.unread);
+    const activityToggle = $("notes-btn");
+    const activityLabel = "Activity log, " + S.unread + " unread";
+    if (activityToggle.getAttribute("aria-label") !== activityLabel) activityToggle.setAttribute("aria-label", activityLabel);
+  }
+
+  function setActivityDrawer(open) {
+    $("notes-panel").classList.toggle("hidden", !open);
+    $("notes-btn").setAttribute("aria-expanded", String(open));
+    if (open) { S.unread = 0; renderStatus(); }
+    (open ? $("notes-close") : $("notes-btn")).focus({ preventScroll: true });
   }
 
   function renderNotes() {
@@ -3799,7 +4052,7 @@
           h("tbody", null, result.runs.map((r) => h("tr", null,
             h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
             h("td", null, r.trigger),
-            h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+            h("td", { class: r.status === "failed" ? "error" : r.status === "skipped" ? "warn" : "" }, r.status),
             h("td", { class: "muted" }, secs(r)),
             h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
             h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
@@ -3989,7 +4242,7 @@
   }
   function focusVisible(el) {
     return !!(el && el !== document.body && el.isConnected && typeof el.focus === "function"
-      && !el.disabled && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
+      && !el.matches(":disabled") && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
       && getComputedStyle(el).visibility !== "hidden");
   }
   function dialogItems(node) {
@@ -4136,7 +4389,7 @@
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
-      dismissDialog(top);
+      if (!e.repeat) dismissDialog(top);
     } else if (e.key === "Tab") {
       const items = dialogItems(top.node);
       const first = items[0], last = items[items.length - 1];
@@ -4229,9 +4482,9 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
-  for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
+  for (const id of ["tools-filter", "tools-quick"]) $(id).addEventListener("input", () => renderToolsTable());
   // The Sort menu picks a column in its natural order.
-  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderTools(); });
+  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderToolsTable(); });
   for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
@@ -4271,12 +4524,13 @@
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
-          renderTools();
+          renderToolsTable();
         } }, label, glyph) : label);
       return th;
     }))));
     const body = h("tbody");
-    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length }, "No Tools yet — the agent builds them with create_tool.")));
+    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length },
+      opts.emptyMessage || "No Tools yet — the agent builds them with create_tool.")));
     for (const t of tools) {
       body.append(h("tr", {
         class: opts.selected === t.id ? "selected" : null, tabindex: 0,
@@ -4286,8 +4540,8 @@
       h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
-      h("td", { class: "num" }, rateCell(t.success_rate)),
-      h("td", { class: "muted" }, t.invocations ? relTime(t.updated_at) : "—"),
+      h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
+      h("td", { class: "muted" }, t.last_used_at ? relTime(t.last_used_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
     table.append(body);
@@ -4313,19 +4567,33 @@
       name: (a, b) => a.name.localeCompare(b.name),
       version: (a, b) => a.current_version - b.current_version,
       rate: (a, b) => (b.success_rate ?? -1) - (a.success_rate ?? -1),
-      used: (a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""),
       calls: (a, b) => b.invocations - a.invocations,
     };
     const sort = S.toolSort || { key: $("tools-sort").value, reverse: false };
+    if (sort.key === "used") {
+      return rows.sort((a, b) => {
+        const left = a.last_used_at || "", right = b.last_used_at || "";
+        // Binary order matches the retained UTC timestamps in SQLite,
+        // including whole seconds next to fractional ones.
+        const order = left < right ? -1 : left > right ? 1 : 0;
+        return Number(!left) - Number(!right) ||
+          (sort.reverse ? order : -order) ||
+          a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+      });
+    }
     const cmp = by[sort.key];
     if (!cmp) return rows;
     rows.sort(cmp);
     return sort.reverse ? rows.reverse() : rows;
   }
-  function renderTools() {
+  function renderToolsTable() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
-    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true });
+    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true,
+      emptyMessage: S.tools.length ? "No Tools match the current filters." : null });
+  }
+  function renderTools() {
+    renderToolsTable();
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -4347,9 +4615,16 @@
 
   // --------------------------------------------------- approvals (§10.3)
   const capFamily = (c) => String(c).split(":")[0];
+  let approvalListSeq = 0;
   async function refreshApprovals() {
+    const seq = ++approvalListSeq;
     const list = await act({ type: "list_approvals" });
-    if (list) { S.grants = list; S.grantsSelected = new Set(); renderApprovals(); }
+    if (seq !== approvalListSeq || !Array.isArray(list)) return false;
+    S.grants = list;
+    S.grantsSelected = new Set();
+    S.unconfirmedGrants?.clear();
+    renderApprovals();
+    return true;
   }
   const grantKey = (g) => [g.tool_id, g.capability, g.scope, g.session_id || ""].join("|");
   function shownGrants() {
@@ -4390,18 +4665,64 @@
   }
   async function revokeGrants(grants) {
     if (!grants.length) return toast("Select grants to revoke first.", true);
-    const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
-    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
-      ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
-      : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
-    const still = new Set();
-    for (const g of grants) {
-      const r = await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
-      ((r && r.still_trusted) || []).forEach((c) => still.add(c));
+    if (S.revokingGrants) return;
+    S.revokingGrants = true;
+    const feedback = $("revocation-feedback");
+    try {
+      // A lost response may have followed a write. Re-read before retrying
+      // any unconfirmed grant so the user can review what still exists.
+      if (grants.some((g) => S.unconfirmedGrants?.has(grantKey(g)))) {
+        if (await refreshApprovals()) return toast("Grant list refreshed. Review it before retrying.");
+        return toast("Refresh the grants before retrying.", true);
+      }
+      const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
+      if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
+        ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
+        : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
+      const still = new Set(), revoked = new Set(), unconfirmed = new Set(), failures = [];
+      for (const g of grants) {
+        const key = grantKey(g);
+        try {
+          const r = await request({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+          if (r?.revoked !== true) throw new Error("The daemon did not confirm revocation.");
+          revoked.add(key);
+          if (Array.isArray(r.still_trusted)) r.still_trusted.forEach((c) => still.add(c));
+        } catch (e) {
+          unconfirmed.add(key);
+          failures.push(g.tool_name + " · " + g.capability + " (" + g.scope
+            + (g.session_id ? " " + g.session_id.slice(0, 8) : "") + "): " + e.message);
+        }
+      }
+      S.unconfirmedGrants = new Set([...(S.unconfirmedGrants || []), ...unconfirmed]);
+      S.grants = (S.grants || []).filter((g) => !revoked.has(grantKey(g)));
+      for (const key of revoked) S.grantsSelected.delete(key);
+      renderApprovals();
+      const revokedText = "Revoked " + revoked.size + " grant" + (revoked.size === 1 ? "" : "s");
+      const summary = failures.length ? (revoked.size ? revokedText + ". " : "")
+        + failures.length + (failures.length === 1 ? " revocation unconfirmed." : " revocations unconfirmed.") : revokedText;
+      toast(summary, failures.length > 0);
+      feedback.replaceChildren(...(failures.length ? [
+        h("p", { class: "error" }, summary),
+        h("ul", null, failures.map((message) => h("li", null, message))),
+      ] : []));
+      if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
+      if (await refreshApprovals()) {
+        if (failures.length) feedback.append(h("p", { class: "muted" }, "Check the updated list and retry any grants that are still shown."));
+      } else {
+        feedback.append(h("p", { class: "error" }, "The grant list could not be refreshed. Refresh it before retrying an unconfirmed revocation."),
+          h("button", { class: "btn small", type: "button", onclick: async (e) => {
+            const button = e.currentTarget;
+            button.disabled = true;
+            if (await refreshApprovals()) {
+              button.previousElementSibling.textContent = "Check the updated list and retry any grants that are still shown.";
+              button.remove();
+              focusReturn($("revoke-selected"));
+            } else button.disabled = false;
+          } }, "Refresh grants"));
+      }
+    } finally {
+      S.revokingGrants = false;
     }
-    toast("Revoked " + grants.length + " grant" + (grants.length === 1 ? "" : "s"));
-    if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
-    refreshApprovals();
   }
   $("approvals-family").addEventListener("input", () => renderApprovals());
   $("revoke-selected").onclick = () => revokeGrants(shownGrants().filter((g) => S.grantsSelected.has(grantKey(g))));
@@ -4565,6 +4886,48 @@
     const approved = await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" });
     return approved && current() ? metadata : null;
   }
+  // One selected version pair only; never persisted or shared across connections.
+  function toolVersionChanges(id, from, to) {
+    const channel = S.channel, ws = S.ws, conn = S.conn;
+    const valid = () => {
+      const d = S.toolDetail;
+      const idx = d && d.versions.findIndex((v) => v.version === to);
+      return S.channel === channel && S.ws === ws && S.conn === conn &&
+        S.selectedTool === id && d && d.tool.id === id && d.tool.current_version === to &&
+        idx > 0 && d.versions[idx - 1].version === from;
+    };
+    const pre = h("pre", { class: "diff" }, "Open to load changes.");
+    const details = h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + to), pre);
+    details.addEventListener("toggle", async () => {
+      if (!details.open || !details.isConnected || !valid()) return;
+      let cached = S.toolVersionDiff;
+      if (!cached || cached.channel !== channel || cached.ws !== ws || cached.conn !== conn ||
+          cached.id !== id || cached.from !== from || cached.to !== to) {
+        cached = { channel, ws, conn, id, from, to };
+        S.toolVersionDiff = cached;
+        // Keep the settled result (including errors) to avoid repeated requests
+        // on toggles. A new selection/connection permits a new attempt.
+        cached.result = request({ type: "diff_tool_versions", id, from, to })
+          .then((value) => ({ value }), (error) => ({ error }));
+      }
+      pre.textContent = "loading…";
+      const result = await cached.result;
+      if (!valid() || S.toolVersionDiff !== cached || !details.isConnected) return;
+      if (result.error) pre.textContent = String(result.error.message || result.error);
+      else if (typeof result.value?.diff === "string") pre.replaceChildren(...renderDiffLines(result.value.diff, "div"));
+      else pre.textContent = "No version diff returned.";
+    });
+    return details;
+  }
+  function focusToolEditor(area) {
+    const editing = S.editingCode;
+    if (!editing || !editing.focusPending) return;
+    editing.focusPending = false;
+    const active = document.activeElement;
+    setTimeout(() => {
+      if (S.editingCode === editing && area.isConnected && document.activeElement === active) area.focus();
+    }, 0);
+  }
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
@@ -4605,16 +4968,11 @@
     if (idx > 0) {
       // What the current version changed (optimiser promotion or agent edit).
       const from = d.versions[idx - 1].version;
-      const pre = h("pre", { class: "diff" }, "loading…");
-      box.append(h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + t.current_version), pre));
-      request({ type: "diff_tool_versions", id: t.id, from, to: t.current_version }).then((r) => {
-        pre.replaceChildren(...String(r.diff).split("\n").map((l) =>
-          h("div", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : l[0] === "@" ? "muted" : null }, l)));
-      }).catch((e) => { pre.textContent = String(e.message || e); });
+      box.append(toolVersionChanges(t.id, from, t.current_version));
     }
     const editing = S.editingCode && S.editingCode.toolId === t.id;
     box.append(h("div", { class: "detail-actions" },
-      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),
+      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "", focusPending: true }; renderTools(); } }, "Edit code"),
       t.retired ? null : h("button", { class: "btn small", type: "button", onclick: () => tryTool(t, current) }, "Try it"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => retireTool(t, d) }, t.retired ? "Restore" : "Retire"),
@@ -4659,7 +5017,7 @@
         h("button", { class: "btn primary small", type: "button", onclick: () => saveCode(t) }, "Save new version"),
         h("button", { class: "btn ghost small", type: "button", onclick: () => { S.editingCode = null; renderTools(); } }, "Cancel"),
         h("span", { class: "muted", style: "font-size:0.75rem" }, "Ctrl/⌘+S save · Esc cancel")));
-      setTimeout(() => area.focus(), 0);
+      focusToolEditor(area);
     } else if (current) {
       box.append(h("h3", null, "Code v" + current.version));
       const rows = current.code.split("\n").map((l, i) => h("tr", null, h("td", { class: "ln" }, i + 1), h("td", { class: "src" }, l)));
@@ -5063,8 +5421,7 @@
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
-              const text = await ask({ title: "Edit memory", inputKind: "prose", input: true, value: m.text, ok: "Save" });
-              if (text && text !== m.text) { await act({ type: "upsert_memory", id: m.id, text }, "Saved"); refreshSettings(); }
+              await editMemory(m);
             } }, "Edit"),
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
@@ -5072,10 +5429,7 @@
             } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
-        h("button", { class: "btn small", type: "button", onclick: async () => {
-          const text = await ask({ title: "Add a memory", inputKind: "prose", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
-          if (text) { await act({ type: "upsert_memory", text }, "Added"); refreshSettings(); }
-        } }, "Add"))));
+        h("button", { class: "btn small", type: "button", onclick: () => editMemory(null) }, "Add"))));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     const enterSends = h("input", { id: "enter-sends", type: "checkbox", onchange: e => setEnterSends(e.target.checked) });
@@ -5122,7 +5476,9 @@
     const parents = new Set();
     for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
     for (const p of parents) p.normalize();
-    for (const sec of $("settings").querySelectorAll("section")) {
+    const sections = $("settings").querySelectorAll("section");
+    let visibleSections = 0;
+    for (const sec of sections) {
       const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
@@ -5138,19 +5494,29 @@
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      const hidden = !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec));
+      sec.classList.toggle("hidden", hidden);
+      if (!hidden) visibleSections++;
     }
+    const noMatch = keys.length > 0 && sections.length > 0 && visibleSections === 0;
+    const status = $("settings-filter-status");
+    const message = noMatch ? "No Settings match the current filter." : "";
+    if (status.textContent !== message) status.textContent = message;
+    const clear = $("settings-filter-clear");
+    if (!noMatch && document.activeElement === clear) $("settings-filter").focus({ preventScroll: true });
+    clear.hidden = !noMatch;
   }
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
-   * letter and NFC/NFD spellings match each other. */
-  function foldMap(text) {
+   * letter and NFC/NFD spellings match each other. The default is the
+   * Settings fold. Session search supplies its own tokenizer fold. */
+  function foldMap(text, foldCharacter = (ch) => ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2)) {
     let folded = "";
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2);
+      const f = foldCharacter(ch);
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
@@ -5187,6 +5553,12 @@
     }
   }
   $("settings-filter").addEventListener("input", filterSettings);
+  $("settings-filter-clear").addEventListener("click", () => {
+    const input = $("settings-filter");
+    input.value = "";
+    input.focus({ preventScroll: true });
+    filterSettings();
+  });
 
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
@@ -5208,19 +5580,27 @@
     return Uint8Array.from(b, (c) => c.charCodeAt(0));
   }
   async function pushOn() {
+    if (S.forgetting || S.pushRemoval || S.pushEnabling) return;
+    S.pushEnabling = true;
     try {
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
       if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
-      S.ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      if (S.forgetting || S.pushRemoval) return;
+      S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+      const sub = await S.pushSubscribe;
+      if (S.forgetting || S.pushRemoval) return;
+      registerRelayPush(S.ws, sub);
       note("This device gets a notification when an approval or question waits.");
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
+    } finally {
+      S.pushSubscribe = null;
+      S.pushEnabling = false;
+      if (!S.forgetting) renderView();
     }
-    renderView();
   }
   /** Re-register only an existing opt-in after an authenticated connection.
    * Room-v3 migration never copies subscriptions from an unverified old room. */
@@ -5230,20 +5610,101 @@
     try {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
-      if (sub && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
-        ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
+        registerRelayPush(ws, sub);
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
-  async function pushOff(sub) {
+  const PUSH_CLEANUP_MS = 1500;
+  function registerRelayPush(ws, sub) {
+    if (ws?.readyState !== 1) throw new Error("not connected to the relay");
+    if (S.pushRegistration?.socket === ws) return;
+    let resolve;
+    const settled = new Promise((done) => { resolve = done; });
+    const finish = (socket) => {
+      if (socket !== ws) return;
+      ws.removeEventListener("close", closed);
+      if (S.pushRegistration === pending) S.pushRegistration = null;
+      resolve();
+    };
+    const closed = () => finish(ws);
+    const pending = { socket: ws, settled, finish };
+    S.pushRegistration = pending;
+    ws.addEventListener("close", closed, { once: true });
+    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() })); }
+    catch (error) { finish(ws); throw error; }
+  }
+  async function boundedPushCleanup(promise) {
+    let timer;
     try {
-      if (S.ws) S.ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint: sub.endpoint }));
-      await sub.unsubscribe();
-      note("Notifications are off on this device.");
-    } catch (e) {
-      toast(e.message, true);
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Notification cleanup timed out")), PUSH_CLEANUP_MS);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  async function removeRelayPush(endpoint) {
+    const ws = S.ws;
+    if (!S.relayReady || ws?.readyState !== 1) return false;
+    // A registration already sent by this socket can still be writing. The
+    // relay permits only one push write per socket at a time.
+    const registration = S.pushRegistration;
+    if (registration?.socket === ws) await boundedPushCleanup(registration.settled);
+    if (S.ws !== ws || !S.relayReady || ws.readyState !== 1) return false;
+    return new Promise((resolve) => {
+      const id = crypto.randomUUID();
+      const done = (confirmed) => {
+        clearTimeout(timer);
+        ws.removeEventListener("close", closed);
+        S.pushRemovalAck = null;
+        resolve(confirmed);
+      };
+      const closed = () => done(false);
+      const timer = setTimeout(closed, PUSH_CLEANUP_MS);
+      S.pushRemovalAck = (socket, ack) => { if (ws === socket && ack === id) done(true); };
+      ws.addEventListener("close", closed, { once: true });
+      try { ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint, id })); }
+      catch (_) { closed(); }
+    });
+  }
+  async function browserPushSubscription() {
+    if (!("serviceWorker" in navigator)) return null;
+    const reg = await navigator.serviceWorker.getRegistration();
+    return reg?.pushManager ? reg.pushManager.getSubscription() : null;
+  }
+  function removePushSubscription(knownSub) {
+    if (S.pushRemoval) return S.pushRemoval;
+    S.pushRemoval = (async () => {
+      let sub = knownSub;
+      try {
+        if (!sub) {
+          if (S.pushSubscribe) sub = await boundedPushCleanup(S.pushSubscribe.catch(() => null));
+          sub ||= await boundedPushCleanup(browserPushSubscription());
+        }
+      } catch (_) {
+        return "Could not check this browser's notification subscription or confirm its removal.";
+      }
+      if (!sub) return "";
+      const [remote, local] = await Promise.all([
+        removeRelayPush(sub.endpoint).catch(() => false),
+        boundedPushCleanup((async () => {
+          if (await sub.unsubscribe()) return true;
+          return (await browserPushSubscription())?.endpoint !== sub.endpoint;
+        })()).catch(() => false),
+      ]);
+      return [
+        !local && "Could not confirm that notifications are off in this browser. Check this site's notification permissions.",
+        !remote && "The relay did not confirm removal of the notification subscription.",
+      ].filter(Boolean).join(" ");
+    })().finally(() => { S.pushRemoval = null; });
+    return S.pushRemoval;
+  }
+  async function pushOff(sub) {
+    const warning = await removePushSubscription(sub);
+    if (!S.forgetting) {
+      if (warning) { toast(warning, true); note(warning, true); }
+      else note("Notifications are off on this device.");
+      renderView();
     }
-    renderView();
   }
 
   // ============================================================ actions
@@ -5365,7 +5826,12 @@
         h("td", { class: "muted" }, "since " + relTime(c.first_seen) + " · active " + relTime(c.last_seen)),
         h("td", null, h("button", { class: "btn small danger", type: "button", onclick: async () => {
           if (!(await ask({ title: "Disconnect this browser?", text: "It can reconnect with the pairing link. To revoke access for good, run formless relay enable --rotate.", ok: "Disconnect", danger: true }))) return;
-          if (await act({ type: "disconnect_relay_client", cid: c.cid }, "Disconnected")) refreshSettings();
+          const result = await act({ type: "disconnect_relay_client", cid: c.cid });
+          if (!result) return;
+          if (result.disconnected === true) toast("Disconnected");
+          else if (result.disconnected === false) toast("That browser is already disconnected.");
+          else toast("The daemon did not confirm disconnection.", true);
+          refreshSettings();
         } }, "Disconnect"))))))
         : h("p", { class: "muted" }, "No browsers on the relay right now."));
   }
@@ -5440,6 +5906,11 @@
     } }, "Free " + humanBytes(r.total_bytes));
     close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)), { trigger });
   }
+  function daemonUptime(seconds) {
+    return seconds >= 3600
+      ? Math.floor(seconds / 3600) + "h " + Math.floor(seconds % 3600 / 60) + "m"
+      : Math.floor(seconds / 60) + "m " + Math.floor(seconds % 60) + "s";
+  }
   // The daemon and what it is using (SPEC §9.3).
   async function showStatus() {
     const trigger = document.activeElement;
@@ -5448,7 +5919,7 @@
     const r = v.resources || {};
     const rows = [
       ["daemon", "pid " + v.pid + " · " + v.version],
-      ["uptime", r.uptime_secs != null ? Math.floor(r.uptime_secs / 60) + " min" : "?"],
+      ["uptime", r.uptime_secs != null ? daemonUptime(r.uptime_secs) : "?"],
       ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? uiFixed(r.cpu_percent, 1) : "?") + "%" : "n/a"],
       ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
       ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
@@ -5552,9 +6023,9 @@
     const name = h("input", { type: "text", placeholder: "github", spellcheck: "false" });
     const transport = h("select", null, h("option", { value: "stdio" }, "Command (stdio)"), h("option", { value: "http" }, "URL (HTTP)"));
     const command = h("input", { type: "text", placeholder: "npx -y @modelcontextprotocol/server-github", spellcheck: "false" });
-    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false" });
+    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false", autocomplete: "off" });
     const url = h("input", { type: "text", placeholder: "https://example.com/mcp", spellcheck: "false" });
-    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false" });
+    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false", autocomplete: "off" });
     const stdio = [field("Command", command), field("Environment", env)];
     const http = [field("URL", url), field("Headers", headers)];
     const sync = () => {
@@ -5564,20 +6035,26 @@
     transport.onchange = sync;
     sync();
     const body = h("div", { class: "try-form" }, field("Name", name), field("Connect with", transport), stdio, http);
-    if (!(await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test" }))) return;
-    const server = { transport: transport.value };
-    if (transport.value === "stdio") {
-      const words = splitArgs(command.value.trim());
-      if (!words.length) return toast("A command is needed.", true);
-      Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
-    } else {
-      if (!url.value.trim()) return toast("A URL is needed.", true);
-      Object.assign(server, { url: url.value.trim(), headers: pairs(headers.value, ":") });
-    }
-    toast("Connecting to " + name.value.trim() + "…");
-    const r = await act({ type: "add_mcp_server", name: name.value.trim(), server }, null, 120000);
+    const r = await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test",
+      timeoutMs: 120000, secretFields: [command, env, url, headers],
+      saveError: "Could not save the MCP server. Check the name, connection type, and command or URL.",
+      saveRequest: () => {
+        const serverName = recordValue(name, "An MCP server name is needed.");
+        if (!/^[a-z0-9_-]+$/i.test(serverName) || serverName.includes("__")) {
+          throw Object.assign(new Error("Use letters, digits, '-' and '_' in the server name, with no double underscore."), { field: name });
+        }
+        const server = { transport: transport.value };
+        if (transport.value === "stdio") {
+          const words = splitArgs(recordValue(command, "A command is needed."));
+          if (!words[0]) throw Object.assign(new Error("A command is needed."), { field: command });
+          Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
+        } else {
+          Object.assign(server, { url: recordValue(url, "A URL is needed."), headers: pairs(headers.value, ":") });
+        }
+        return { type: "add_mcp_server", name: serverName, server };
+      } });
     if (!r) return;
-    if (r.error) note("Added " + r.added + ", but it didn't connect: " + r.error + " (Restart retries)", true);
+    if (r.error) note("Saved " + r.added + ", but it didn't connect. Check its settings and use Restart to retry.", true);
     else note("Added " + r.added + ": " + (r.tools || []).length + " tools");
     refreshSettings();
   }
@@ -5588,9 +6065,10 @@
     const subdir = h("input", { type: "text", placeholder: "subfolder (optional)", spellcheck: "false" });
     const ref = h("input", { type: "text", placeholder: "branch or tag (optional)", spellcheck: "false" });
     const body = h("div", { class: "try-form" }, field("Path, zip or git URL", source), field("Subfolder", subdir), field("Git ref", ref));
-    if (!(await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add" }))) return;
-    if (!source.value.trim()) return toast("A source is needed.", true);
-    const r = await act({ type: "add_skill", source: source.value.trim(), subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }, null, 120000);
+    const r = await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add", timeoutMs: 120000,
+      secretFields: [source], saveError: "Could not add the skill. Check the source, subfolder, and Git ref.",
+      saveRequest: () => ({ type: "add_skill", source: recordValue(source, "A source is needed."),
+        subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }) });
     if (r) { note("Added skill " + (r.name || "")); await reviewSkill(r.name); refreshSettings(); }
   }
   /** A `formless.skill/1` or `formless.skills/1` bundle from this browser
@@ -5668,16 +6146,27 @@
     const body = h("div", { class: "try-form" }, field("Task", prompt), field("Schedule", when),
       fields.time, fields.day, fields.at, fields.cron, preview, field("Session", session),
       h("p", { class: "muted" }, "It runs with the Session's model; pick a Session set to the model or Role you want."));
-    if (!(await ask({ title: "New job", body, ok: "Schedule" }))) return;
-    const s = schedule();
-    if (!prompt.value.trim()) return toast("The job needs a task.", true);
-    if (!s.cron && !s.at) return toast("Pick when it runs.", true);
-    const j = await act({ type: "add_job", prompt: prompt.value.trim(), session_id: session.value || null, cron: s.cron || null, at: s.at || null });
+    const j = await ask({ title: "New job", body, ok: "Schedule", saveRequest: () => {
+      const task = recordValue(prompt, "The job needs a task.");
+      const s = schedule();
+      if (!s.cron && !s.at) recordValue(when.value === "once" ? at : cron, "Pick when it runs.");
+      return { type: "add_job", prompt: task, session_id: session.value || null, cron: s.cron || null, at: s.at || null };
+    } });
     if (j) { note("Scheduled: next run " + uiFormat(new Date(j.next_run))); refreshSettings(); }
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
     return h("label", { class: "try-field" }, h("span", null, label), input);
+  }
+  async function editMemory(memory) {
+    const result = await ask({ title: memory ? "Edit memory" : "Add a memory", inputKind: "prose", input: true,
+      value: memory?.text, placeholder: "e.g. Use pnpm, not npm", ok: memory ? "Save" : "Add", saveRequest: () => {
+        const input = $("ask-input");
+        recordValue(input, "Enter a memory first.");
+        if (input.value === memory?.text) return null;
+        return { type: "upsert_memory", id: memory?.id, text: input.value };
+      } });
+    if (result) { toast(memory ? "Saved" : "Added"); refreshSettings(); }
   }
   async function testProvider(name) {
     toast("Testing " + name + "…");
@@ -5691,10 +6180,13 @@
     // Write-only: an existing key is never sent back; blank keeps it.
     const key = h("input", { type: "password", value: "", placeholder: p && p.has_key ? "stored · leave blank to keep" : "API key (stored in the keychain)", autocomplete: "off" });
     const body = h("div", { class: "try-form" }, field("Name", name), field("Base URL", base), field("Model", model), field("API key", key));
-    if (!(await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save" }))) return;
-    const r = await act({ type: "upsert_provider", name: name.value.trim(), base_url: base.value.trim(), model: model.value.trim() || null, api_key: key.value || null }, "Saved " + name.value.trim());
-    key.value = "";
-    if (r) refreshSettings();
+    const r = await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save",
+      secretFields: [key, base], saveError: "Could not save the provider. Check the name, base URL, and key storage on the daemon.",
+      saveRequest: () => ({
+        type: "upsert_provider", name: recordValue(name, "A provider name is needed."),
+        base_url: recordValue(base, "A base URL is needed."), model: model.value.trim() || null, api_key: key.value || null,
+      }) });
+    if (r) { toast("Saved " + name.value.trim()); refreshSettings(); }
   }
   async function editRole(existing, r, providers) {
     const name = h("input", { type: "text", value: existing, disabled: !!existing, placeholder: "fast", spellcheck: "false" });
@@ -5703,9 +6195,11 @@
     const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
     const effort = h("select", null, ["", "minimal", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
     const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
-    if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
-    const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
-    if (await act({ type: "upsert_role", name: name.value.trim(), role }, "Saved role " + name.value.trim())) refreshSettings();
+    const saved = await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save", saveRequest: () => {
+      const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
+      return { type: "upsert_role", name: recordValue(name, "A Role name is needed."), role };
+    } });
+    if (saved) { toast("Saved role " + name.value.trim()); refreshSettings(); }
   }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
@@ -5757,6 +6251,7 @@
   let toolSeq = 0;
   async function selectTool(id, quiet) {
     const seq = ++toolSeq;
+    if (S.selectedTool !== id) S.toolVersionDiff = null;
     S.selectedTool = id;
     S.toolDetailError = null;
     renderView();
@@ -5787,6 +6282,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    S.toolVersionDiff = null;
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
@@ -5872,6 +6368,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    renderSessions();
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
@@ -6442,6 +6939,30 @@
     let text = changed.length ? changed.length + " tracked path(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + (changed.length > 5 ? ", +" + (changed.length - 5) + " more" : "") + " · /files shows tracked changes; /rewind attempts safe restoration." : files.length ? "No current changes among tracked paths." : "No tracked path changes.";
     return text + (untracked ? " " + runFilesCaveat() : "");
   }
+  // Hunk counts distinguish real +/- content from unified-diff file headers.
+  function renderDiffLines(diff, tag) {
+    let oldLeft = 0, newLeft = 0;
+    return String(diff).split("\n").map((line) => {
+      let cls = null;
+      const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk) {
+        oldLeft = Number(hunk[2] ?? 1);
+        newLeft = Number(hunk[4] ?? 1);
+        cls = "muted";
+      } else if (oldLeft > 0 || newLeft > 0) {
+        if (line[0] === "+") { newLeft = Math.max(0, newLeft - 1); cls = "add"; }
+        else if (line[0] === "-") { oldLeft = Math.max(0, oldLeft - 1); cls = "del"; }
+        else if (line[0] === " ") {
+          oldLeft = Math.max(0, oldLeft - 1);
+          newLeft = Math.max(0, newLeft - 1);
+        }
+      } else if (/^(?:\+\+\+|---)(?:\s|$)/.test(line) || line.startsWith("@@")) {
+        cls = "muted";
+      } else if (line[0] === "+") cls = "add";
+      else if (line[0] === "-") cls = "del";
+      return h(tag, { class: cls }, line + (tag === "span" ? "\n" : ""));
+    });
+  }
   // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
   async function showRunFiles() {
     const trigger = document.activeElement;
@@ -6462,7 +6983,7 @@
       h("div", { class: "run-file-head" }, h("code", null, (mark[f.status] || "M") + " " + f.path),
         h("span", { class: "spacer" }),
         f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
-      f.diff ? h("pre", { class: "diff" }, f.diff.split("\n").map((l) => h("span", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : "" }, l + "\n"))) : null)));
+      f.diff ? h("pre", { class: "diff" }, renderDiffLines(f.diff, "span")) : null)));
     const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
@@ -6476,7 +6997,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + uiFormat(Math.round(r.duration_ms / 1000)) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + recordedDuration(r.duration_ms) + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
       r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
@@ -6628,6 +7149,7 @@
     const visible = !!(sidebar.getClientRects().length
       && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
     menu.setAttribute("aria-expanded", String(visible));
+    syncRunningExposure();
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
@@ -6683,10 +7205,10 @@
     switch (ev.type) {
       case "run_started": runStarts.set(ev.session_id, Date.now()); return;
       case "run_finished": {
-        const took = (Date.now() - (runStarts.get(ev.session_id) || Date.now())) / 1000;
+        const took = Date.now() - (runStarts.get(ev.session_id) || Date.now());
         runStarts.delete(ev.session_id);
         const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
-        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + uiFormat(Math.round(took)) + "s");
+        if (took >= min * 1000 && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + recordedDuration(took));
         return;
       }
       case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
@@ -6980,10 +7502,13 @@
       }
       case "registry_changed": {
         refreshDescriptionReviews();
-        // Every registry change offers Undo for a few seconds (SPEC §7.2).
+        // Only daemons advertising a change identity can undo this toast safely.
         const c = ev.change;
         toast(c.author + " " + (c.action === "rolled_back" ? "rolled " + c.name + " back to v" + c.to_version : c.action + " " + c.name + (c.action === "retired" || c.action === "restored" ? "" : " v" + c.to_version)), false,
-          { label: "Undo", ms: 10000, run: async () => { const r = await act({ type: "undo_registry_change" }); if (r) toast("Undone: " + r.undone); } });
+          c.change_id ? { label: "Undo", ms: 10000, run: async () => {
+            const r = await act({ type: "undo_registry_change_if_current", change_id: c.change_id });
+            if (r) toast("Undone: " + r.undone);
+          } } : null);
         break;
       }
       case "module_deleted":
@@ -7067,6 +7592,7 @@
         break;
       }
       case "invocation_completed": {
+        refreshRunning();
         const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
         if (t) { t.status = ev.ok ? "ok" : "failed"; t.stalledSecs = null; }
         note(ev.tool_name + " background invocation " + (ev.ok ? "finished" : "failed"), !ev.ok);
@@ -7085,6 +7611,7 @@
 
   // =========================================================== connection
   async function loadAll() {
+    if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
     const saved = prefs.get("session", null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
@@ -7113,6 +7640,7 @@
     S.stableTimer = setTimeout(() => { S.backoff = 1000; }, 30000);
   }
   async function connect(secret) {
+    S.toolVersionDiff = null;
     $("pair-error").textContent = "";
     if (!secureOrigin()) {
       $("pair-error").textContent = "This page was not loaded over HTTPS, so it will not take a pairing secret. Open the relay's https:// address.";
@@ -7198,7 +7726,8 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed" || value.relay === "push_unsubscribed") return;
+              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws); return; }
+              if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");
                 S.relayRoomReady = true;
@@ -7320,6 +7849,7 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    S.toolVersionDiff = null;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;
     S.local = true;
@@ -7404,12 +7934,26 @@
     $("pair").classList.remove("hidden");
     $("secret").focus();
   }
-  function forget() {
+  async function forget() {
+    if (S.forgetting) return;
+    S.forgetting = true;
     S.userClosed = true;
+    clearTimeout(S.reconnect?.timer);
+    S.reconnect = null;
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
+    let warning = "";
+    try {
+      if (!S.local) {
+        toast("Turning off notifications and forgetting this device…");
+        warning = await removePushSubscription();
+      }
+    } catch (_) {
+      warning = "Could not confirm removal of this browser's notification subscription.";
+    }
     if (S.ws) S.ws.close();
     S.ws = null;
-    history.replaceState(null, "", location.pathname);
+    // Carry only cleanup feedback across the reload that discards the page's state.
+    history.replaceState(warning ? { forgetWarning: warning } : null, "", location.pathname);
     location.reload();
   }
 
@@ -7467,12 +8011,8 @@
   $("generate-proposal").onclick = () => { act({ type: "generate_proposal" }, "Generating and measuring a proposal…"); };
   $("stop-btn").onclick = stop;
   $("menu-btn").onclick = () => setSidebar(!$("sidebar").classList.contains("open"), { focus: true });
-  $("notes-btn").onclick = () => {
-    const panel = $("notes-panel");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) { S.unread = 0; renderStatus(); }
-  };
-  $("notes-close").onclick = () => $("notes-panel").classList.add("hidden");
+  $("notes-btn").onclick = () => setActivityDrawer($("notes-panel").classList.contains("hidden"));
+  $("notes-close").onclick = () => setActivityDrawer(false);
   // Attachments (SPEC §5.6): stored by the daemon, sent with the next message.
   /** Upload `file` in pieces (#909): the daemon checks the size first, then
    * each piece is read, encoded and sent on its own, so neither side holds
@@ -7588,10 +8128,6 @@
     if (paletteKey(e) || mentionKey(e)) return;
     if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
-    else if (e.key === "Escape") {
-      if (S.editMessageId) cancelEdit();
-      else stop();
-    }
   });
   coarsePointer.addEventListener("change", () => {
     syncInputTouchMode();
@@ -7665,11 +8201,15 @@
       if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
-      if (modalOpen) { S.approvalLater = true; renderApproval(); }
-      else if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
-      else if (popover) closePopover();
-      else if (!$("notes-panel").classList.contains("hidden")) $("notes-panel").classList.add("hidden");
-      else closeSidebar();
+      e.preventDefault();
+      if (e.repeat) return;
+      if (popover) closePopover();
+      else if (!$("notes-panel").classList.contains("hidden")) setActivityDrawer(false);
+      else if ($("sidebar").classList.contains("open")) closeSidebar();
+      else if (e.target === $("input")) {
+        if (S.editMessageId) cancelEdit();
+        else stop();
+      }
     }
   });
   // Tick elapsed timers (activity + running Tools) once a second.
@@ -7726,6 +8266,10 @@
   });
 
   (function init() {
+    if (history.state?.forgetWarning) {
+      $("pair-error").textContent = history.state.forgetWarning;
+      history.replaceState(null, "", location.pathname);
+    }
     const frag = hashParams();
     if (frag.malformed) {
       history.replaceState(null, "", location.pathname);
