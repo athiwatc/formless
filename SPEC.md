@@ -2180,6 +2180,10 @@ pattern (§4.4).
     memory) require `net`. They support HTTP(S) and check the scope on each
     redirect. The configured connection and total deadlines apply to both
     APIs, with one total budget for redirects and body reads (§13).
+    For fetchChunks, size is a maximum. The callback receives available data
+    as each chunk is read. At the end of a stream, incomplete UTF-8 is decoded
+    with replacement characters. A terminal read error is thrown after any
+    available data has been delivered.
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at

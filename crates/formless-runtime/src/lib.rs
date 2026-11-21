@@ -333,8 +333,57 @@ struct Stream {
     resp: reqwest::blocking::Response,
     timeouts: FetchTimeouts,
     enc: Enc,
-    /// Bytes read but not yet handed out (an incomplete UTF-8 sequence).
-    carry: Vec<u8>,
+    scratch: Vec<u8>,
+    /// Incomplete UTF-8 bytes at the beginning of scratch.
+    buffered: usize,
+    terminal_error: Option<String>,
+}
+
+impl Stream {
+    fn read_chunk(&mut self, size: usize) -> Result<(Value, bool), String> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        self.scratch.resize(size, 0);
+        let mut used = self.buffered;
+        loop {
+            let eof = match self.resp.read(&mut self.scratch[used..]) {
+                Ok(0) => true,
+                Ok(count) => {
+                    used += count;
+                    false
+                }
+                Err(error) => {
+                    let error = fetch_error(&error, self.timeouts, "reading response body");
+                    self.terminal_error = Some(error.clone());
+                    if used == 0 {
+                        return Err(error);
+                    }
+                    // Deliver the incomplete text using the same lossy policy
+                    // as EOF. The next read still reports the terminal error.
+                    self.buffered = 0;
+                    return Ok((encode(&self.scratch[..used], self.enc), false));
+                }
+            };
+            let mut cut = used;
+            if self.enc == Enc::Text && !eof {
+                let possible = utf8_cut(&self.scratch[..used]);
+                if std::str::from_utf8(&self.scratch[possible..used])
+                    .is_err_and(|error| error.error_len().is_none())
+                {
+                    cut = possible;
+                }
+            }
+            if cut != 0 || eof {
+                let data = encode(&self.scratch[..cut], self.enc);
+                self.scratch.copy_within(cut..used, 0);
+                self.buffered = used - cut;
+                return Ok((data, eof));
+            }
+            // Read again only when none of the bytes can yet be delivered.
+            // A valid UTF-8 carry is at most three bytes and size is at least four.
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2214,7 +2263,9 @@ impl State {
                 resp,
                 timeouts,
                 enc,
-                carry: Vec::new(),
+                scratch: Vec::new(),
+                buffered: 0,
+                terminal_error: None,
             },
         );
         meta["id"] = json!(id);
@@ -2230,40 +2281,16 @@ impl State {
             // Smoke stub (id 0) or an already-closed stream: empty body.
             return Ok(json!({"data": "", "eof": true}));
         };
-        let (mut s, read) = self.cancellable(move || {
-            let mut buf = std::mem::take(&mut s.carry);
-            let mut eof = false;
-            while buf.len() < size {
-                let mut chunk = vec![0u8; size - buf.len()];
-                let n = match s.resp.read(&mut chunk) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let error = fetch_error(&e, s.timeouts, "reading response body");
-                        return Ok((s, Err(error)));
-                    }
-                };
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Ok((s, Ok((buf, eof))))
+        let (s, read) = self.cancellable(move || {
+            let read = s.read_chunk(size);
+            Ok((s, read))
         })?;
-        let (mut buf, eof) = match read {
-            Ok(r) => r,
-            Err(e) => {
-                self.streams.locked().insert(id, s);
-                return Err(e);
-            }
-        };
-        if s.enc == Enc::Text && !eof {
-            let cut = utf8_cut(&buf).max(1);
-            s.carry = buf.split_off(cut);
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err("interrupted".into());
         }
-        let out = json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()});
         self.streams.locked().insert(id, s);
-        Ok(out)
+        let (data, eof) = read?;
+        Ok(json!({"data": data, "eof": eof}))
     }
 
     fn process_start(&self, a: &Value) -> Result<Option<processes::Process>, String> {
