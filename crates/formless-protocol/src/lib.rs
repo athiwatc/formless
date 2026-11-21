@@ -20,6 +20,22 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest protocol this build still accepts.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
+/// A reviewed Send requires idle state and a reviewed Steer requires an active Run.
+pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
+/// A Steer review identifies one active Run and dispatch checks that identity.
+pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
+/// Disable Step mode only if the Session is still idle at the daemon.
+pub const IDLE_STEP_OFF_FEATURE: &str = "idle_step_off_v1";
+
+/// Run IDs displayed and sent by the exact Steer review use a bounded ASCII form.
+pub fn valid_reviewed_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// Named optional capabilities, advertised by `Ping` and `Status`.
 pub const FEATURES: &[&str] = &[
     "setting_env_override",
@@ -31,7 +47,83 @@ pub const FEATURES: &[&str] = &[
     "explicit_net_subdomains",
     "unsupported_error",
     "dropped_event_kinds",
+    "future_transcript_attempts_v1",
+    "pending_attachment_inventory_v1",
+    "reviewed_attachment_send_v1",
+    REVIEWED_SEND_MODE_FEATURE,
+    REVIEWED_STEER_RUN_FEATURE,
+    IDLE_STEP_OFF_FEATURE,
+    "reviewed_reference_detach_v1",
+    "session_model_compare_set_v1",
 ];
+
+/// Explicit nullable pair; both keys must be present even when inheriting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionModelSelection {
+    #[serde(deserialize_with = "required_selection_value")]
+    pub model: Option<String>,
+    #[serde(deserialize_with = "required_selection_value")]
+    pub reasoning_effort: Option<String>,
+}
+fn required_selection_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+pub const SESSION_MODEL_MAX_BYTES: usize = 512;
+pub const SESSION_EFFORT_MAX_BYTES: usize = 64;
+
+/// Complete pending-attachment metadata inventory limits. No file bodies are read.
+pub const PENDING_ATTACHMENT_MAX_ENTRIES: usize = 64;
+pub const PENDING_ATTACHMENT_METADATA_BYTES: usize = 64 * 1024;
+
+/// A daemon-lifetime producer boundary, sampled AFTER a canonical snapshot.
+/// This admits future attempt starts only; it cannot replay an active prefix
+/// or classify canonical commits that race with delayed event publication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptBarrier {
+    pub epoch: String,
+    pub cursor: u64,
+}
+
+/// Explicit correlation for ephemeral answer text. Canonical messages remain
+/// authoritative and must be obtained through a new owned snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptAttemptEvent {
+    pub epoch: String,
+    pub cursor: u64,
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_id: String,
+    pub attempt_id: String,
+    #[serde(flatten)]
+    pub change: TranscriptAttemptChange,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum TranscriptAttemptChange {
+    Started {
+        base_seq: i64,
+    },
+    Delta {
+        offset: u64,
+        text: String,
+    },
+    /// Always invalidates the provisional view. Returned means only that the
+    /// provider future ended, not that its candidate was accepted/persisted.
+    Closed {
+        bytes: u64,
+        reason: TranscriptAttemptClose,
+    },
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptAttemptClose {
+    Returned,
+    Restarted,
+    Dropped,
+}
 
 /// The highest version both peers speak, if any.
 pub fn negotiate(their_min: u32, their_max: u32) -> Option<u32> {
@@ -457,6 +549,10 @@ pub struct ToolInfo {
     pub needs_attention: bool,
     pub created_at: String,
     pub updated_at: String,
+    /// Start time of the latest retained Invocation, regardless of outcome.
+    /// Missing when the daemon has no retained history for this Tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
     /// Outcomes of the last 40 finished Invocations, oldest first: `s`
     /// success, `f` failure (SPEC §10.4 sparkline and trend).
     #[serde(default)]
@@ -1739,6 +1835,29 @@ impl QuestionAnswer {
     }
 }
 
+/// Read-only Step inventory sampled by GetSession. A preview is not decision authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingStep {
+    pub session_id: String,
+    pub run_id: String,
+    pub step_id: String,
+    pub tool_name: String,
+    pub arguments_preview: String,
+    pub arguments_bytes: usize,
+    pub index: usize,
+    pub count: usize,
+}
+
+/// Bounded inventory; omitted by older daemons. Decisions may change after sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSteps {
+    pub prompts: Vec<PendingStep>,
+    pub more: bool,
+}
+
+pub const STEP_PREVIEW_BYTES: usize = 4096;
+pub const MAX_PENDING_STEPS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -1864,6 +1983,15 @@ pub enum Request {
         model: Option<String>,
         reasoning_effort: Option<String>,
     },
+    /// Atomic metadata-only update of the complete reviewed pair in schema67.
+    /// Both stored values must still match expected, including NULL. Returns
+    /// SessionInfo. Does not rewrite auto, start a Run or invoke model tests.
+    /// Mismatch is an error; clients must not fall back to SetSessionModel.
+    CompareSetSessionModel {
+        id: String,
+        expected: SessionModelSelection,
+        desired: SessionModelSelection,
+    },
     /// Local-only preview; does not freeze Tools, upload files or start a Run.
     ForecastRun {
         input: ForecastInput,
@@ -1883,6 +2011,30 @@ pub enum Request {
         /// reply) returns the first outcome instead of sending twice (#891).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
+    },
+    /// Append only if the complete, ordered pending metadata still matches
+    /// the reviewed inventory. Comparison and consumption share a transaction.
+    /// Queue/deferred sends are unsupported. When `reviewed_send_mode_v1` is
+    /// advertised, a change between idle and active rejects the reviewed mode.
+    /// Never fall back to SendMessage.
+    /// This binds metadata, not mutable referenced file contents or permission.
+    SendReviewedMessage {
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        expected_attachments: Vec<serde_json::Value>,
+        /// Required per-action key; same connection-local retention as SendMessage.
+        client_msg_id: String,
+    },
+    /// Steer one exact Run using the complete ordered inventory from its review.
+    /// Replies with `{steered:true,run_id}`. Replacements, closed Runs and
+    /// changed inventory reject. Callers must not substitute another send RPC.
+    SendReviewedSteer {
+        session_id: String,
+        run_id: String,
+        content: String,
+        expected_attachments: Vec<serde_json::Value>,
+        client_msg_id: String,
     },
     /// Start an idle Session with immutable Run-only pipeline options. Older
     /// daemons must reject this request; clients never silently drop policy.
@@ -2016,6 +2168,18 @@ pub enum Request {
         #[serde(default)]
         client: Option<String>,
     },
+    /// Opt in on this connection to correlated answer attempts for one Session.
+    /// Suppresses legacy answer/reasoning chunks. Subscribe resets this mode.
+    /// Requires future_transcript_attempts_v1; use GetTranscriptBarrier next.
+    SubscribeTranscriptAttempts {
+        session_id: String,
+    },
+    /// Canonical GetSession data plus a later producer barrier. Only attempts
+    /// started strictly after that barrier may be admitted. This is NOT a
+    /// canonical event cutoff: never discard canonical invalidations by cursor.
+    GetTranscriptBarrier {
+        id: String,
+    },
     ListSubagents {
         session_id: String,
     },
@@ -2066,6 +2230,11 @@ pub enum Request {
     SetStepMode {
         session_id: String,
         on: bool,
+    },
+    /// Turn Step mode off only for a live, idle Session without recovery or
+    /// waiting Steps. Returns `{session_id,on:false}`. Starts no work.
+    DisableStepModeIfIdle {
+        session_id: String,
     },
     /// Answer a `StepPending`: `action` is "continue", "skip", "edit"
     /// (run it with `arguments`, a JSON object as text) or "all" (run this
@@ -2248,6 +2417,28 @@ pub enum Request {
     /// pairing link; rotating the secret is what revokes access.
     DisconnectRelayClient {
         cid: String,
+    },
+    /// Read the complete pending metadata for this Session's next user message.
+    /// Returns `{session_id, attachments}`; bounded by the inventory constants.
+    /// Overflow/corrupt metadata is an error, never a partial or empty success.
+    /// Reads no attachment bytes and mutates/consumes nothing.
+    ListPendingAttachments {
+        session_id: String,
+    },
+    /// Read the current steerable Run and complete pending attachment metadata.
+    /// Returns `{session_id,run_id,attachments}` without consuming anything.
+    ReadSteerReview {
+        session_id: String,
+    },
+    /// Remove exactly one reviewed pending reference by its position in the
+    /// complete inventory. Never reads/deletes reference targets or artifacts.
+    /// Returns `{removed:true,session_id,index,operation_id}`. No legacy fallback.
+    DetachReviewedReference {
+        session_id: String,
+        expected_attachments: Vec<serde_json::Value>,
+        index: u32,
+        /// One identity per user action; receipts are connection-local/10 min.
+        operation_id: String,
     },
     /// Take back a pending attachment before the message is sent: `id` is
     /// the attachment's id (or, for a referenced path, the path). Returns
@@ -2841,6 +3032,10 @@ pub enum DroppedEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// Opt-in, correlated ephemeral answer attempt. Not canonical history.
+    TranscriptAttempt {
+        update: TranscriptAttemptEvent,
+    },
     RunStarted {
         session_id: String,
         run_id: String,
@@ -3230,6 +3425,7 @@ impl Event {
     /// The Session this event belongs to, or `None` for global events.
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            Event::TranscriptAttempt { update } => Some(&update.session_id),
             Event::RunStarted { session_id, .. }
             | Event::MessageAppended { session_id, .. }
             | Event::MessageDelta { session_id, .. }
@@ -3407,6 +3603,36 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_usage_timestamp_is_an_optional_additive_wire_field() {
+        let legacy = serde_json::json!({
+            "id": "tool", "name": "tool", "description": "", "retired": false,
+            "current_version": 1, "capabilities": [], "memory_mb": 64,
+            "invocations": 2, "success_rate": 0.5, "needs_attention": false,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-02-01T00:00:00+00:00"
+        });
+        let mut decoded: super::ToolInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.last_used_at, None);
+        let before = serde_json::to_value(&decoded).unwrap();
+        assert!(before.get("last_used_at").is_none());
+        decoded.last_used_at = Some("2026-01-10T00:00:00+00:00".into());
+        let mut after = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(
+            serde_json::from_value::<super::ToolInfo>(after.clone()).unwrap(),
+            decoded
+        );
+        assert_eq!(
+            after
+                .as_object_mut()
+                .unwrap()
+                .remove("last_used_at")
+                .unwrap(),
+            "2026-01-10T00:00:00+00:00"
+        );
+        assert_eq!(after, before);
+    }
+
     #[test]
     fn unanswered_approval_close_is_global_and_has_no_decision_value() {
         let event: super::Event = serde_json::from_value(
@@ -3851,5 +4077,195 @@ mod tests {
         }
         assert_eq!(sensitive_read_warning("fs:read:/private/project"), None);
         assert_eq!(sensitive_read_warning("fs:write:/private/project"), None);
+    }
+}
+
+#[cfg(test)]
+mod future_attempt_wire_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn future_attempt_requests_are_additive_and_legacy_subscribe_is_unchanged() {
+        for value in [
+            json!({"type":"subscribe_transcript_attempts","session_id":"s"}),
+            json!({"type":"get_transcript_barrier","id":"s"}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let old = json!({"type":"subscribe","sessions":["s"],"deltas":false,"client":"old client"});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Request>(old.clone()).unwrap()).unwrap(),
+            old
+        );
+        assert!(FEATURES.contains(&"future_transcript_attempts_v1"));
+    }
+    #[test]
+    fn attempts_have_explicit_scope_identity_offset_and_terminal_semantics() {
+        for change in [
+            TranscriptAttemptChange::Started { base_seq: 0 },
+            TranscriptAttemptChange::Delta {
+                offset: 13,
+                text: "ไทย😀".into(),
+            },
+            TranscriptAttemptChange::Closed {
+                bytes: 26,
+                reason: TranscriptAttemptClose::Returned,
+            },
+        ] {
+            let event = Event::TranscriptAttempt {
+                update: TranscriptAttemptEvent {
+                    epoch: "e".into(),
+                    cursor: u64::MAX,
+                    session_id: "s".into(),
+                    run_id: "r".into(),
+                    turn_id: "t".into(),
+                    attempt_id: "a".into(),
+                    change,
+                },
+            };
+            assert_eq!(event.session_id(), Some("s"));
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::to_value(serde_json::from_value::<Event>(value.clone()).unwrap())
+                    .unwrap(),
+                value
+            );
+            assert_eq!(value["type"], "transcript_attempt");
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_step_off_wire_tests {
+    use super::*;
+
+    #[test]
+    fn idle_step_off_requires_a_session_and_uses_its_own_capability() {
+        let value = serde_json::json!({"type":"disable_step_mode_if_idle","session_id":"s"});
+        let request = serde_json::from_value::<Request>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        assert!(serde_json::from_value::<Request>(
+            serde_json::json!({"type":"disable_step_mode_if_idle"})
+        )
+        .is_err());
+        assert!(FEATURES.contains(&IDLE_STEP_OFF_FEATURE));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod pending_attachment_inventory_wire_tests {
+    use super::*;
+    #[test]
+    fn pending_inventory_is_an_additive_advertised_request() {
+        let request = Request::ListPendingAttachments {
+            session_id: "s".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"list_pending_attachments","session_id":"s"})
+        );
+        assert!(
+            matches!(serde_json::from_value::<Request>(value).unwrap(),Request::ListPendingAttachments{session_id}if session_id=="s")
+        );
+        assert!(FEATURES.contains(&"pending_attachment_inventory_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod reviewed_attachment_send_tests {
+    use super::*;
+    #[test]
+    fn reviewed_send_is_an_explicit_additive_operation_with_required_expected_metadata_and_identity(
+    ) {
+        let value = serde_json::json!({"type":"send_reviewed_message","session_id":"s","content":"draft ไทย😀","mode":"send","expected_attachments":[],"client_msg_id":"one-action"});
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            matches!(&request, Request::SendReviewedMessage {expected_attachments, ..} if expected_attachments.is_empty())
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        for field in ["expected_attachments", "client_msg_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        assert!(FEATURES.contains(&"reviewed_attachment_send_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+    #[test]
+    fn exact_steer_requires_run_id_and_separate_optional_operations() {
+        let value = serde_json::json!({"type":"send_reviewed_steer","session_id":"s","run_id":"run-a","content":"exact","expected_attachments":[],"client_msg_id":"one"});
+        let request = serde_json::from_value::<Request>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for field in ["run_id", "expected_attachments", "client_msg_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        let read = Request::ReadSteerReview {
+            session_id: "s".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(read).unwrap(),
+            serde_json::json!({"type":"read_steer_review","session_id":"s"})
+        );
+        assert!(valid_reviewed_run_id("run-a"));
+        for invalid in ["", "a b", "a\n", "a\u{202e}", &"a".repeat(257)] {
+            assert!(!valid_reviewed_run_id(invalid));
+        }
+        assert!(FEATURES.contains(&REVIEWED_STEER_RUN_FEATURE));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod reviewed_reference_detach_tests {
+    use super::*;
+    #[test]
+    fn reviewed_reference_detach_is_additive_and_requires_position_inventory_and_identity() {
+        let value = serde_json::json!({"type":"detach_reviewed_reference","session_id":"s","expected_attachments":[],"index":0,"operation_id":"one"});
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for field in ["expected_attachments", "index", "operation_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        assert!(FEATURES.contains(&"reviewed_reference_detach_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod session_selection_cas_tests {
+    use super::*;
+    #[test]
+    fn session_selection_cas_requires_explicit_complete_nullable_pairs() {
+        let value = serde_json::json!({"type":"compare_set_session_model","id":"s","expected":{"model":null,"reasoning_effort":null},"desired":{"model":"role:reviewer","reasoning_effort":"high"}});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Request>(value.clone()).unwrap())
+                .unwrap(),
+            value
+        );
+        for side in ["expected", "desired"] {
+            for key in ["model", "reasoning_effort"] {
+                let mut bad = value.clone();
+                bad[side].as_object_mut().unwrap().remove(key);
+                assert!(serde_json::from_value::<Request>(bad).is_err());
+            }
+            let mut bad = value.clone();
+            bad[side]["extra"] = serde_json::json!(1);
+            assert!(serde_json::from_value::<Request>(bad).is_err());
+        }
+        for key in ["id", "expected", "desired"] {
+            let mut bad = value.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Request>(bad).is_err());
+        }
+        assert!(FEATURES.contains(&"session_model_compare_set_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

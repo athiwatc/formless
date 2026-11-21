@@ -87,6 +87,7 @@ pub struct State {
     pub focus: usize,
     pub scroll: usize,
     pub left: usize,
+    viewport_moves: Vec<ViewportMove>,
     pub comment: Option<InputLine>,
     pub busy: bool,
     pub error: Option<String>,
@@ -107,14 +108,50 @@ pub enum Action {
     Decision,
     Comment,
 }
+
+pub enum ViewportMove {
+    Rows(isize),
+    Columns(isize),
+    Top,
+    Bottom,
+}
+
 impl State {
+    pub fn reset_viewport(&mut self) {
+        self.scroll = 0;
+        self.left = 0;
+        self.viewport_moves.clear();
+    }
+
+    pub fn move_viewport(&mut self, movement: ViewportMove) {
+        self.viewport_moves.push(movement);
+    }
+
+    pub fn layout_viewport(&mut self, max_scroll: usize, max_left: usize) {
+        self.scroll = self.scroll.min(max_scroll);
+        self.left = self.left.min(max_left);
+        // Multiple key, wheel and resize events can arrive before a frame.
+        // Apply each move in order against the geometry of that frame.
+        for movement in self.viewport_moves.drain(..) {
+            match movement {
+                ViewportMove::Rows(rows) => {
+                    self.scroll = self.scroll.saturating_add_signed(rows).min(max_scroll);
+                }
+                ViewportMove::Columns(columns) => {
+                    self.left = self.left.saturating_add_signed(columns).min(max_left);
+                }
+                ViewportMove::Top => self.scroll = 0,
+                ViewportMove::Bottom => self.scroll = max_scroll,
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.context = None;
         self.document = None;
         self.focus = 0;
-        self.scroll = 0;
-        self.left = 0;
+        self.reset_viewport();
         self.comment = None;
         self.busy = false;
         self.error = None;
@@ -139,8 +176,7 @@ impl State {
             })
             .unwrap_or_else(|| self.focus.min(positions.len().saturating_sub(1)));
         self.document = Some(document);
-        self.scroll = 0;
-        self.left = 0;
+        self.reset_viewport();
         self.comment = None;
         self.busy = false;
         self.error = None;

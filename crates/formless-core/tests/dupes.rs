@@ -24,6 +24,7 @@ fn tool(name: &str, desc: &str, schema: &str, code: &str) -> (ToolInfo, ToolVers
             needs_attention: false,
             created_at: String::new(),
             updated_at: String::new(),
+            last_used_at: None,
             recent: String::new(),
             author: "agent".into(),
         },

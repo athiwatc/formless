@@ -25,10 +25,16 @@ without redesign.
    limits. The only terminators are completion, fault, or the user.
 4. **Deny by default.** Tools run sandboxed with only their declared
    Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls
-   to the user-configured provider endpoint, the user-enabled Relay, and
-   explicit user-run commands (e.g. `formless update check`). No automatic
-   update checker, no phone-home.
+5. **Local-first, zero telemetry.** Network activity can include requests to
+   a configured provider, a [user-enabled Relay](#relay-and-web-frontend-v2),
+   explicit user-run commands, and automatic [naming asset downloads](README.md#7-sessions-runs-and-steer).
+   Naming and auto-download are enabled by default. When both are enabled
+   in a build with embedded naming, an eligible Session can trigger a
+   download of its missing configured catalogue model and tokenizer from
+   Hugging Face. `naming.auto_download = false` disables
+   automatic naming downloads; `naming.enabled = false` disables automatic
+   naming. These settings do not block explicit `formless naming pull`.
+   There is no automatic update checker.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI,
    CLI, and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config, and
@@ -3386,6 +3392,14 @@ such as `read_file`, `read_text_file` and `file_read`.
   `deltas`) reach it. Tool/module/proposal events, approvals, the Session
   list and Run start/end stay global. A new connection receives everything;
   the TUI, web and headless clients subscribe to the Session they show.
+- Optional capability `future_transcript_attempts_v1` adds per-connection
+  `SubscribeTranscriptAttempts`, `GetTranscriptBarrier`, and correlated
+  answer-only `TranscriptAttempt` start/delta/close frames. It admits complete
+  future attempts after a later producer barrier; it is not mid-attempt replay
+  or a canonical commit watermark. Canonical events cannot be discarded by
+  that cursor. Existing Subscribe restores legacy mode. The native desktop
+  keeps this path disabled pending full transport acceptance. See
+  [the exact contract and acceptance gates](docs/desktop/future-attempt-protocol-20261115.md).
 - **Compatibility.** `Ping` and `Status` report `min_protocol`,
   `max_protocol` and `features` (named optional capabilities); peers use
   the highest version both speak, and the daemon accepts any envelope
@@ -3691,8 +3705,12 @@ refresh a cache, nightly cleanup.
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron.
-    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
-    which `jobs add` prints to confirm.
+    `PreviewSchedule {schedule}` returns the cron and up to three projected
+    recurring times from the daemon's current local time. `jobs add` prints
+    them after creation. `formless jobs preview SCHEDULE [--json]` requests
+    the same preview without creating or updating a Job. An empty preview
+    means no upcoming times were returned. Adding a Job performs its own
+    validation.
   - Both entry points require a nonblank prompt and a one-shot time strictly
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
@@ -3735,8 +3753,11 @@ refresh a cache, nightly cleanup.
 - **History:** every firing is a `job_runs` row: trigger (`schedule` or
   `manual`), outcome (the Run's final status, or `skipped`), duration,
   cost, Session and details. `JobRuns {id}`, `formless jobs history ID`,
-  `/jobs history ID` and the web "History" button show it. A firing whose
-  Run doesn't complete posts a note to every client.
+  `/jobs history ID` and the web "History" button show it. The CLI shows the
+  newest 20 firings by default. `--limit N` accepts 1–500, and the human
+  output warns when that many rows were returned. JSON remains an array of
+  firings in newest-first order. A firing whose Run doesn't complete posts
+  a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
   schedule is unchanged. A successful manual retry records its outcome in
@@ -4608,6 +4629,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   sort by that column on click or Enter; a second click reverses it. Each
   column's natural order is names A→Z and numbers or dates biggest first.
   The headers carry `aria-sort`, and the Sort menu follows.
+  Tool usage time is the start of the latest retained Invocation, regardless
+  of outcome. Web Tools and Metrics show that time as of the latest Tool
+  refresh, and the TUI shows it in Tool details. An absent time is unknown,
+  including when all call history was pruned or the daemon predates the field.
+  The last-used sort puts unknown times after known ones and breaks ties by
+  name and Tool ID.
 - **Settings view:** edits file-backed config (§13) and per-Session
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
@@ -4922,6 +4949,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   it and a double-click opens it (as Enter), and clicking a tool call's
   header in the chat expands or collapses it. Each frame records its
   clickable regions, list rows from the widgets' own scroll offsets.
+  The wheel over an active Sessions, Tools or Proposals list moves the
+  selection by up to three filtered items without activating a row.
 
 - **Plain mode for screen readers.** `formless --plain` (or
   `tui.screen_reader = true`) runs a line-oriented client instead of the
@@ -5248,8 +5277,8 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
-| `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
-| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless jobs` | `list`, `add`, `run`, `history ID [--limit N]`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines`, `--jsonl` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
@@ -5310,6 +5339,13 @@ reported separately from an empty archive selection, which names the alternate
 list command and count. Static human `sessions show` includes stored archived,
 pinned, tags and last recorded Run status metadata; absent status is "not
 recorded". JSON and `--follow` retain their existing contracts.
+
+`formless sessions show ID --last N` displays the newest N stored messages
+in their original order, including blank entries in the selection before
+human formatting. N must be positive. When earlier messages are omitted,
+the human display reports the selected and total counts and `--json` adds
+`total_messages` next to the shortened `messages` array. The bound applies
+to display after fetching the full snapshot and conflicts with `--follow`.
 
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
@@ -5448,7 +5484,7 @@ previous headless Run's Session.
   values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
   keys, long opaque tokens, and the home path (shown as `~`). The file says
   to read it before attaching it.
-- `formless logs [-f] [--level warn] [--since 10m] [-n 200]` shows the
+- `formless logs [-f | --jsonl] [--level warn] [--since 10m] [-n 200]` shows the
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
@@ -5462,6 +5498,13 @@ previous headless Run's Session.
   `info` and above by default (other commands only errors), `RUST_LOG`
   overrides it, and colour codes are only used on a terminal, never in the
   file.
+  `--jsonl` is snapshot-only and conflicts with `--follow`. It emits one JSON
+  object per selected entry with `timestamp` (RFC 3339 or null),
+  `filter_level` (the lowercase effective filter level, defaulting to
+  `info` for missing or unknown levels), and `text` (the same grouped,
+  normalized and possibly truncated entry as in raw output). `--since`
+  excludes undated entries. No matches leave stdout empty and print the
+  usual diagnostic on stderr.
 - `formless config`:
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
@@ -5508,7 +5551,10 @@ previous headless Run's Session.
   - `json`: one `{session_id, status, answer, result, error}` object at the end;
     `answer` retains its text form. `result` carries the validated JSON value
     on a successful schema Run and is null otherwise;
-  - `jsonl-events`: every event, one per line; `--json` is the same.
+  - `jsonl-events`: every event, one per line; `--json` is the same for a Run.
+  - With `--estimate`, `text` prints the human forecast and `json` prints one
+    forecast object. `--json` is an alias for the forecast object in this
+    mode. `final` and `jsonl-events` are usage errors for estimates.
 
   Pipeline options are per Run, never edits to the profile configuration or
   Session's standing instructions. `--system TEXT` appends exact bounded

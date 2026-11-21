@@ -302,7 +302,6 @@ impl App {
     pub(super) fn expand_user_command(&mut self) -> bool {
         if self.input.is_literal()
             || self.search_mode
-            || self.renaming.is_some()
             || self.instructing.is_some()
             || self.import_mode.is_some()
             || self.bulk.is_some()

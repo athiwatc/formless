@@ -292,6 +292,8 @@
       "Send": "ส่ง", "Steer": "ปรับทิศ", "Re-run": "ส่งใหม่", "Stop": "หยุด",
       "Message Formless…": "พิมพ์ข้อความถึง Formless…",
       "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
+      "Recent retained calls": "การเรียกใช้ล่าสุดที่เก็บไว้", "Succeeded": "สำเร็จ", "Failed": "ล้มเหลว",
+      "Recent sample trend": "แนวโน้มตัวอย่างล่าสุด", "up": "เพิ่มขึ้น", "down": "ลดลง", "no arrow": "ไม่มีลูกศร",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
@@ -360,8 +362,11 @@
     const s = (Date.parse(ts) - Date.now()) / 1000;
     if (isNaN(s)) return ts || "";
     if (s <= 0) return "ended";
-    if (s < 3600) return "in " + uiFormat(Math.max(1, Math.ceil(s / 60))) + "m";
-    return "in " + uiFormat(Math.round(s / 3600)) + "h";
+    if (s < 60) return "in less than 1m";
+    const minutes = Math.floor(s / 60);
+    const hours = Math.floor(minutes / 60), remainder = minutes % 60;
+    return "in " + (hours ? uiFormat(hours) + "h" + (remainder ? " " : "") : "")
+      + (!hours || remainder ? uiFormat(remainder) + "m" : "");
   }
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
@@ -369,7 +374,22 @@
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
+    if (s >= 3600) {
+      const pad = { minimumIntegerDigits: 2, useGrouping: false };
+      return uiFormat(Math.floor(s / 3600)) + "h" + uiFormat(Math.floor(s % 3600 / 60), pad) + "m" + uiFormat(s % 60, pad) + "s";
+    }
     return s < 60 ? uiFormat(s) + "s" : uiFormat(Math.floor(s / 60)) + "m" + uiFormat(s % 60, { minimumIntegerDigits: 2, useGrouping: false }) + "s";
+  }
+  /** Durations recorded in ms: keep short calls visible and long calls readable. */
+  function recordedDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "—";
+    if (ms === 0) return "0s";
+    if (ms < 1000) return uiFormat(Math.floor(ms)) + "ms";
+    if (ms < 60000) return uiFormat(Math.floor(ms / 100) / 10) + "s";
+    const seconds = Math.floor(ms / 1000);
+    const padded = { minimumIntegerDigits: 2, useGrouping: false };
+    if (seconds < 3600) return uiFormat(Math.floor(seconds / 60)) + "m" + uiFormat(seconds % 60, padded) + "s";
+    return uiFormat(Math.floor(seconds / 3600)) + "h" + uiFormat(Math.floor(seconds % 3600 / 60), padded) + "m" + uiFormat(seconds % 60, padded) + "s";
   }
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
@@ -404,6 +424,28 @@
   }
   function bar(r) {
     return h("span", { class: "bar " + rateClass(r) }, h("i", { style: "width:" + Math.round((r || 0) * 100) + "%" }));
+  }
+  // Same two-window descriptive rule as the TUI; retained outcomes, not a forecast.
+  function recentCalls(recent) {
+    if (typeof recent !== "string" || !recent.length || /[^sf]/.test(recent)) return null;
+    const outcomes = recent.slice(-40), now = outcomes.slice(-20), before = outcomes.slice(0, -20);
+    const successes = text => [...text].filter(c => c === "s").length;
+    const succeeded = successes(now), failed = now.length - succeeded;
+    const delta = before.length >= 5 && now.length >= 5 ? succeeded / now.length - successes(before) / before.length : 0;
+    return { now, succeeded, failed, trend: delta >= 0.1 ? "up" : delta <= -0.1 ? "down" : "none" };
+  }
+  function toolRecent(recent) {
+    const sample = recentCalls(recent);
+    if (!sample) return null;
+    const { now, succeeded, failed, trend } = sample;
+    const arrow = trend === "up" ? " ↑" : trend === "down" ? " ↓" : "";
+    const label = tr("Recent retained calls") + ": " + uiFormat(now.length) + "; " +
+      tr("Succeeded") + ": " + uiFormat(succeeded) + "; " + tr("Failed") + ": " + uiFormat(failed) +
+      "; " + tr("Recent sample trend") + ": " + tr(trend === "up" ? "up" : trend === "down" ? "down" : "no arrow");
+    return h("span", { class: "tool-recent", role: "img", "aria-label": label },
+      h("span", { class: "tool-recent-bars", "aria-hidden": "true" }, [...now].map(c =>
+        h("span", { class: c === "s" ? "rate-good success" : "rate-bad failure" }))),
+      h("span", { class: "tool-recent-counts", "aria-hidden": "true" }, uiFormat(succeeded) + "/" + uiFormat(now.length) + " ✓" + arrow));
   }
   function summarizeArgs(args) {
     let obj;
@@ -1139,26 +1181,82 @@
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
-  async function refreshRunning() {
-    const revision = S.invocationRefresh = (S.invocationRefresh || 0) + 1;
-    const connection = [S.ws, S.conn, S.channel];
+  let runningRefresh = null, runningExposed = false, runningExposureQueued = false;
+  function runningPanelExposed() {
+    const sidebar = $("sidebar");
+    // Read the actual layout; both viewport and container queries can hide
+    // this drawer. The Running box itself is hidden when its list is empty.
+    return !document.hidden && S.view === "chat" && !!sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden";
+  }
+  function syncRunningExposure() {
+    const exposed = runningPanelExposed();
+    if (exposed && !runningExposed && !runningExposureQueued) {
+      runningExposureQueued = true;
+      queueMicrotask(() => {
+        runningExposureQueued = false;
+        if (runningPanelExposed()) refreshRunning("exposure");
+      });
+    }
+    runningExposed = exposed;
+  }
+  function sameRunningConnection(query) {
+    return query.ws === S.ws && query.conn === S.conn && query.channel === S.channel;
+  }
+  async function refreshRunning(reason = "event") {
+    if (!S.channel || S.ws?.readyState !== 1 || (!S.local && !S.relayReady)) return;
+    if (runningRefresh && sameRunningConnection(runningRefresh)) {
+      // A change may have happened after the read began; keep one follow-up.
+      // A periodic tick or a visibility change can reuse the current read.
+      if (reason === "event") runningRefresh.followUp = true;
+      return;
+    }
+    const query = runningRefresh = { ws: S.ws, conn: S.conn, channel: S.channel, followUp: false };
     const list = await request({ type: "list_invocations" }).catch(() => null);
-    if (!list || revision !== S.invocationRefresh || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+    if (runningRefresh !== query) return;
+    runningRefresh = null;
+    if (!sameRunningConnection(query)) {
+      // A Session subscription may change its client identifier without
+      // reconnecting. Retry on this socket, but never paint that old reply.
+      if (query.ws === S.ws && query.channel === S.channel) refreshRunning();
+      return;
+    }
+    if (query.followUp) {
+      refreshRunning();
+      return;
+    }
+    if (!list) return;
     S.invocations = list;
     reconcileInvocationProgress(list);
+    renderRunning(list);
+  }
+  function pollRunning() {
+    if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
+  }
+  function renderRunning(list) {
     const box = $("running");
+    const focused = document.activeElement;
+    const previous = box.contains(focused) ? focused.dataset : null;
+    const controls = [];
+    const control = (action, i, attrs, ...children) => {
+      const button = h("button", { type: "button", "data-running-action": action, "data-running-handle": i.handle, ...attrs }, ...children);
+      if (previous?.runningAction === action && previous.runningHandle === String(i.handle)) controls.push(button);
+      return button;
+    };
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
       const s = S.sessions.find((x) => x.id === i.session_id);
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
-        i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
+        control("open", i, { class: "linklike", title: "Open its session", onclick: () => openSession(i.session_id) },
+          h("strong", null, i.tool_name), " · " + recordedDuration(i.elapsed_ms) + (s ? " · " + s.name : "") +
+          (i.stalled ? " · silent " + recordedDuration(i.silent_ms) : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
+        control("cancel", i, { class: "btn ghost small", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(() => refreshRunning()) }, "Cancel"),
+        i.abandoned ? null : control("abandon", i, { class: "btn ghost small", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(() => refreshRunning()) }, "Abandon"));
     }));
+    if (focusVisible(controls[0])) controls[0].focus({ preventScroll: true });
   }
-  setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
+  setInterval(pollRunning, 2000);
+  document.addEventListener("visibilitychange", syncRunningExposure);
 
   function sessionRows(sessions, visible, tree) {
     if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));
@@ -1565,6 +1663,8 @@
     sh: { lc: ["#"], q: "\"'", kw: W("alias case cd do done echo elif else end esac exit export fi for function if in local return set source then unset while"), lit: W("true false") },
     c: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W("abstract auto break case catch class const continue default do else enum extends extern final for fun func goto if implements import include interface let namespace new override package private protected public return sizeof static struct switch template throw throws try typedef union using val var virtual void volatile while"), lit: W("true false null nullptr nil this self super") },
     json: { q: "\"", kw: W(""), lit: W("true false null") },
+    jsonc: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W(""), lit: W("true false null") },
+    json5: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W(""), lit: W("true false null") },
     config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
@@ -1572,15 +1672,17 @@
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
+  HL.mysql = { ...HL.sql, lc: ["--", "#"], hashAnywhere: true, mysqlComments: true, q: "'\"`" };
+  HL.php = { ...HL.c, lc: ["//", "#"] };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
     dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
-    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", zig: "c",
     "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
-    jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
+    yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     cfg: "conf", editorconfig: "conf", gitconfig: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
@@ -1593,6 +1695,7 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const toml = lang === "toml";
+    const php = L === HL.php;
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1646,10 +1749,14 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) &&
-          (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]))) {
+      const hashComment = c !== "#" || (php ? code[i + 1] !== "[" :
+        L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]));
+      if (hashComment && (L.lc || []).some(p => code.startsWith(p, i) &&
+          (!L.mysqlComments || p !== "--" || i + 2 === code.length || /[\x00-\x20\x7f]/.test(code[i + 2])))) {
         const end = code.indexOf("\n", i);
-        const stop = end < 0 ? code.length : end;
+        const lineEnd = end < 0 ? code.length : end;
+        const tag = php ? code.slice(i, lineEnd).indexOf("?>") : -1;
+        const stop = tag < 0 ? lineEnd : i + tag;
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1657,9 +1764,10 @@
       if (L.q.includes(c)) {
         const multiline = toml && code.startsWith(c.repeat(3), i);
         const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = !toml || c !== "'";
+        const escapes = !(toml && c === "'" || L.mysqlComments && c === "`");
         let j = i + delimiter.length;
-        while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || c === "`" || multiline)) {
+        while (j < code.length && !code.startsWith(delimiter, j) &&
+            (code[j] !== "\n" || c === "`" || L.mysqlComments || multiline)) {
           j += code[j] === "\\" && escapes ? 2 : 1;
         }
         let stop = Math.min(j + delimiter.length, code.length);
@@ -2174,8 +2282,11 @@
       h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
-  function toolResultChip(content) {
-    const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
+  function toolResultChip(content, meta) {
+    // The daemon stores the error outcome separately from arbitrary output.
+    // Older or incomplete transcripts may not carry a recorded failure.
+    let failed = false;
+    try { failed = JSON.parse(meta || "{}")?.is_error === true; } catch (_) {}
     const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
@@ -2841,7 +2952,7 @@
             ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
             ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
         } else if (m.role === "tool") {
-          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
+          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || "", m.meta))));
         } else if (m.role === "system-note") {
           open("system-note", m.created_at).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
         } else {
@@ -3697,7 +3808,7 @@
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
   function planStateLabel(state) {
     if (!state) return "";
-    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", state.updated_at ? "updated " + state.updated_at : ""].filter(Boolean).join(" · ");
+    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", Number.isFinite(Date.parse(state.updated_at)) ? "updated " + relTime(state.updated_at) : ""].filter(Boolean).join(" · ");
   }
   function renderPlan() {
     const box = $("plan");
@@ -3705,10 +3816,20 @@
     box.classList.toggle("hidden", !items.length);
     if (!items.length) return box.replaceChildren();
     const done = items.filter((i) => i.status === "completed").length;
-    const lifecycle = planStateLabel(S.planState);
-    if (done === items.length && !isRunning() && !lifecycle) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    const state = S.planState, lifecycle = planStateLabel(state);
+    const updated = Date.parse(state?.updated_at);
+    const title = Number.isFinite(updated) ? uiFormat(new Date(updated), {
+      year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+    }) : null;
+    // A successful resumed current task is complete too; copied/imported/legacy
+    // and previous-task plans retain their provenance and checklist.
+    const completedCurrent = state && !state.previous_task && state.run_status === "completed" &&
+      (state.origin === "live" || state.origin === "resumed");
+    if (done === items.length && !isRunning() && ((!lifecycle && !state?.updated_at) || completedCurrent)) {
+      return box.replaceChildren(h("span", { class: "muted", title }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    }
     const mark = { completed: "✓", in_progress: "▸" };
-    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
+    box.replaceChildren(h("span", { class: "muted", title }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
       h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
@@ -3943,7 +4064,7 @@
           h("tbody", null, result.runs.map((r) => h("tr", null,
             h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
             h("td", null, r.trigger),
-            h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+            h("td", { class: r.status === "failed" ? "error" : r.status === "skipped" ? "warn" : "" }, r.status),
             h("td", { class: "muted" }, secs(r)),
             h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
             h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
@@ -4373,9 +4494,9 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
-  for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
+  for (const id of ["tools-filter", "tools-quick"]) $(id).addEventListener("input", () => renderToolsTable());
   // The Sort menu picks a column in its natural order.
-  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderTools(); });
+  $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderToolsTable(); });
   for (const id of ["proposals-filter", "proposals-quick"]) $(id).addEventListener("input", () => renderProposals());
   $("modal-approve").onclick = () => decide(true);
   $("modal-once").onclick = () => decide(true, "once");
@@ -4415,7 +4536,7 @@
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
-          renderTools();
+          renderToolsTable();
         } }, label, glyph) : label);
       return th;
     }))));
@@ -4431,8 +4552,8 @@
       h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
-      h("td", { class: "num" }, rateCell(t.success_rate)),
-      h("td", { class: "muted" }, t.invocations ? relTime(t.updated_at) : "—"),
+      h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
+      h("td", { class: "muted" }, t.last_used_at ? relTime(t.last_used_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
     table.append(body);
@@ -4458,20 +4579,33 @@
       name: (a, b) => a.name.localeCompare(b.name),
       version: (a, b) => a.current_version - b.current_version,
       rate: (a, b) => (b.success_rate ?? -1) - (a.success_rate ?? -1),
-      used: (a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""),
       calls: (a, b) => b.invocations - a.invocations,
     };
     const sort = S.toolSort || { key: $("tools-sort").value, reverse: false };
+    if (sort.key === "used") {
+      return rows.sort((a, b) => {
+        const left = a.last_used_at || "", right = b.last_used_at || "";
+        // Binary order matches the retained UTC timestamps in SQLite,
+        // including whole seconds next to fractional ones.
+        const order = left < right ? -1 : left > right ? 1 : 0;
+        return Number(!left) - Number(!right) ||
+          (sort.reverse ? order : -order) ||
+          a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+      });
+    }
     const cmp = by[sort.key];
     if (!cmp) return rows;
     rows.sort(cmp);
     return sort.reverse ? rows.reverse() : rows;
   }
-  function renderTools() {
+  function renderToolsTable() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
     toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true,
       emptyMessage: S.tools.length ? "No Tools match the current filters." : null });
+  }
+  function renderTools() {
+    renderToolsTable();
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -4764,6 +4898,48 @@
     const approved = await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" });
     return approved && current() ? metadata : null;
   }
+  // One selected version pair only; never persisted or shared across connections.
+  function toolVersionChanges(id, from, to) {
+    const channel = S.channel, ws = S.ws, conn = S.conn;
+    const valid = () => {
+      const d = S.toolDetail;
+      const idx = d && d.versions.findIndex((v) => v.version === to);
+      return S.channel === channel && S.ws === ws && S.conn === conn &&
+        S.selectedTool === id && d && d.tool.id === id && d.tool.current_version === to &&
+        idx > 0 && d.versions[idx - 1].version === from;
+    };
+    const pre = h("pre", { class: "diff" }, "Open to load changes.");
+    const details = h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + to), pre);
+    details.addEventListener("toggle", async () => {
+      if (!details.open || !details.isConnected || !valid()) return;
+      let cached = S.toolVersionDiff;
+      if (!cached || cached.channel !== channel || cached.ws !== ws || cached.conn !== conn ||
+          cached.id !== id || cached.from !== from || cached.to !== to) {
+        cached = { channel, ws, conn, id, from, to };
+        S.toolVersionDiff = cached;
+        // Keep the settled result (including errors) to avoid repeated requests
+        // on toggles. A new selection/connection permits a new attempt.
+        cached.result = request({ type: "diff_tool_versions", id, from, to })
+          .then((value) => ({ value }), (error) => ({ error }));
+      }
+      pre.textContent = "loading…";
+      const result = await cached.result;
+      if (!valid() || S.toolVersionDiff !== cached || !details.isConnected) return;
+      if (result.error) pre.textContent = String(result.error.message || result.error);
+      else if (typeof result.value?.diff === "string") pre.replaceChildren(...renderDiffLines(result.value.diff, "div"));
+      else pre.textContent = "No version diff returned.";
+    });
+    return details;
+  }
+  function focusToolEditor(area) {
+    const editing = S.editingCode;
+    if (!editing || !editing.focusPending) return;
+    editing.focusPending = false;
+    const active = document.activeElement;
+    setTimeout(() => {
+      if (S.editingCode === editing && area.isConnected && document.activeElement === active) area.focus();
+    }, 0);
+  }
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
@@ -4804,16 +4980,11 @@
     if (idx > 0) {
       // What the current version changed (optimiser promotion or agent edit).
       const from = d.versions[idx - 1].version;
-      const pre = h("pre", { class: "diff" }, "loading…");
-      box.append(h("details", { class: "chip" }, h("summary", null, "Changes v" + from + " → v" + t.current_version), pre));
-      request({ type: "diff_tool_versions", id: t.id, from, to: t.current_version }).then((r) => {
-        pre.replaceChildren(...String(r.diff).split("\n").map((l) =>
-          h("div", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : l[0] === "@" ? "muted" : null }, l)));
-      }).catch((e) => { pre.textContent = String(e.message || e); });
+      box.append(toolVersionChanges(t.id, from, t.current_version));
     }
     const editing = S.editingCode && S.editingCode.toolId === t.id;
     box.append(h("div", { class: "detail-actions" },
-      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "" }; renderTools(); } }, "Edit code"),
+      editing ? null : h("button", { class: "btn small", type: "button", onclick: () => { S.editingCode = { toolId: t.id, code: current ? current.code : "", focusPending: true }; renderTools(); } }, "Edit code"),
       t.retired ? null : h("button", { class: "btn small", type: "button", onclick: () => tryTool(t, current) }, "Try it"),
       h("button", { class: "btn small", type: "button", onclick: () => act({ type: "run_optimiser", tool_id: t.id }, "Optimiser started for " + t.name) }, "Optimise"),
       h("button", { class: "btn small", type: "button", onclick: () => retireTool(t, d) }, t.retired ? "Restore" : "Retire"),
@@ -4858,7 +5029,7 @@
         h("button", { class: "btn primary small", type: "button", onclick: () => saveCode(t) }, "Save new version"),
         h("button", { class: "btn ghost small", type: "button", onclick: () => { S.editingCode = null; renderTools(); } }, "Cancel"),
         h("span", { class: "muted", style: "font-size:0.75rem" }, "Ctrl/⌘+S save · Esc cancel")));
-      setTimeout(() => area.focus(), 0);
+      focusToolEditor(area);
     } else if (current) {
       box.append(h("h3", null, "Code v" + current.version));
       const rows = current.code.split("\n").map((l, i) => h("tr", null, h("td", { class: "ln" }, i + 1), h("td", { class: "src" }, l)));
@@ -5747,6 +5918,11 @@
     } }, "Free " + humanBytes(r.total_bytes));
     close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)), { trigger });
   }
+  function daemonUptime(seconds) {
+    return seconds >= 3600
+      ? Math.floor(seconds / 3600) + "h " + Math.floor(seconds % 3600 / 60) + "m"
+      : Math.floor(seconds / 60) + "m " + Math.floor(seconds % 60) + "s";
+  }
   // The daemon and what it is using (SPEC §9.3).
   async function showStatus() {
     const trigger = document.activeElement;
@@ -5755,7 +5931,7 @@
     const r = v.resources || {};
     const rows = [
       ["daemon", "pid " + v.pid + " · " + v.version],
-      ["uptime", r.uptime_secs != null ? Math.floor(r.uptime_secs / 60) + " min" : "?"],
+      ["uptime", r.uptime_secs != null ? daemonUptime(r.uptime_secs) : "?"],
       ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? uiFixed(r.cpu_percent, 1) : "?") + "%" : "n/a"],
       ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
       ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
@@ -6087,6 +6263,7 @@
   let toolSeq = 0;
   async function selectTool(id, quiet) {
     const seq = ++toolSeq;
+    if (S.selectedTool !== id) S.toolVersionDiff = null;
     S.selectedTool = id;
     S.toolDetailError = null;
     renderView();
@@ -6117,6 +6294,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    S.toolVersionDiff = null;
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
@@ -6773,6 +6951,30 @@
     let text = changed.length ? changed.length + " tracked path(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + (changed.length > 5 ? ", +" + (changed.length - 5) + " more" : "") + " · /files shows tracked changes; /rewind attempts safe restoration." : files.length ? "No current changes among tracked paths." : "No tracked path changes.";
     return text + (untracked ? " " + runFilesCaveat() : "");
   }
+  // Hunk counts distinguish real +/- content from unified-diff file headers.
+  function renderDiffLines(diff, tag) {
+    let oldLeft = 0, newLeft = 0;
+    return String(diff).split("\n").map((line) => {
+      let cls = null;
+      const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (hunk) {
+        oldLeft = Number(hunk[2] ?? 1);
+        newLeft = Number(hunk[4] ?? 1);
+        cls = "muted";
+      } else if (oldLeft > 0 || newLeft > 0) {
+        if (line[0] === "+") { newLeft = Math.max(0, newLeft - 1); cls = "add"; }
+        else if (line[0] === "-") { oldLeft = Math.max(0, oldLeft - 1); cls = "del"; }
+        else if (line[0] === " ") {
+          oldLeft = Math.max(0, oldLeft - 1);
+          newLeft = Math.max(0, newLeft - 1);
+        }
+      } else if (/^(?:\+\+\+|---)(?:\s|$)/.test(line) || line.startsWith("@@")) {
+        cls = "muted";
+      } else if (line[0] === "+") cls = "add";
+      else if (line[0] === "-") cls = "del";
+      return h(tag, { class: cls }, line + (tag === "span" ? "\n" : ""));
+    });
+  }
   // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
   async function showRunFiles() {
     const trigger = document.activeElement;
@@ -6793,7 +6995,7 @@
       h("div", { class: "run-file-head" }, h("code", null, (mark[f.status] || "M") + " " + f.path),
         h("span", { class: "spacer" }),
         f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
-      f.diff ? h("pre", { class: "diff" }, f.diff.split("\n").map((l) => h("span", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : "" }, l + "\n"))) : null)));
+      f.diff ? h("pre", { class: "diff" }, renderDiffLines(f.diff, "span")) : null)));
     const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
@@ -6807,7 +7009,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + uiFormat(Math.round(r.duration_ms / 1000)) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + recordedDuration(r.duration_ms) + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
       r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
@@ -6959,6 +7161,7 @@
     const visible = !!(sidebar.getClientRects().length
       && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
     menu.setAttribute("aria-expanded", String(visible));
+    syncRunningExposure();
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
@@ -7014,10 +7217,10 @@
     switch (ev.type) {
       case "run_started": runStarts.set(ev.session_id, Date.now()); return;
       case "run_finished": {
-        const took = (Date.now() - (runStarts.get(ev.session_id) || Date.now())) / 1000;
+        const took = Date.now() - (runStarts.get(ev.session_id) || Date.now());
         runStarts.delete(ev.session_id);
         const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
-        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + uiFormat(Math.round(took)) + "s");
+        if (took >= min * 1000 && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + recordedDuration(took));
         return;
       }
       case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
@@ -7401,6 +7604,7 @@
         break;
       }
       case "invocation_completed": {
+        refreshRunning();
         const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
         if (t) { t.status = ev.ok ? "ok" : "failed"; t.stalledSecs = null; }
         note(ev.tool_name + " background invocation " + (ev.ok ? "finished" : "failed"), !ev.ok);
@@ -7419,6 +7623,7 @@
 
   // =========================================================== connection
   async function loadAll() {
+    if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
     const saved = prefs.get("session", null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
@@ -7447,6 +7652,7 @@
     S.stableTimer = setTimeout(() => { S.backoff = 1000; }, 30000);
   }
   async function connect(secret) {
+    S.toolVersionDiff = null;
     $("pair-error").textContent = "";
     if (!secureOrigin()) {
       $("pair-error").textContent = "This page was not loaded over HTTPS, so it will not take a pairing secret. Open the relay's https:// address.";
@@ -7655,6 +7861,7 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    S.toolVersionDiff = null;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;
     S.local = true;

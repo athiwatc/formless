@@ -3,12 +3,13 @@
 //! the re-importable format.
 
 use formless_protocol::MessageInfo;
-use pulldown_cmark::{html, Event, Options, Parser};
+use pulldown_cmark::{html, CodeBlockKind, Event, Options, Parser, Tag};
 use serde_json::Value;
 use std::collections::HashMap;
 
 /// Each Tool argument/result longer than this is cut in exports.
 const MAX_CALL_CHARS: usize = 4000;
+const MARKDOWN_OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_STRIKETHROUGH);
 
 /// One turn of the transcript, ready to render.
 enum Part {
@@ -103,15 +104,59 @@ fn html_arguments(args: &str) -> String {
 }
 
 /// Remove complete leading blank lines, retaining indentation on the first
-/// content line. Keep the existing trailing-boundary policy.
-fn turn_boundaries(mut text: &str) -> &str {
+/// content line.
+fn trim_turn_start(mut text: &str) -> &str {
     while let Some((line, rest)) = text.split_once('\n') {
         if !line.trim().is_empty() {
             break;
         }
         text = rest;
     }
-    text.trim_end()
+    text
+}
+
+fn append_markdown_turn(out: &mut String, heading: &str, text: &str) {
+    let text = trim_turn_start(text);
+    out.push_str(heading);
+    let start = out.len();
+    let probe = text.trim_end_matches([' ', '\t', '\r', '\n']);
+    let fence_start = if probe.contains("```") || probe.contains("~~~") {
+        // Ask the Markdown parser whether a fenced block consumes a following
+        // top-level heading. Fences in a quote or list may end with their
+        // container. Trim ASCII whitespace so the probe accepts a final
+        // closer padded with spaces or tabs as the export already does.
+        out.push_str(probe);
+        out.push_str("\n\n##");
+        let boundary = probe.len() + 2;
+        let fence = Parser::new_ext(&out[start..], MARKDOWN_OPTIONS)
+            .into_offset_iter()
+            .find_map(|(event, range)| {
+                (matches!(
+                    event,
+                    Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_)))
+                ) && range.contains(&boundary))
+                .then_some(range.start)
+            });
+        out.truncate(start);
+        fence
+    } else {
+        None
+    };
+    if let Some(fence_start) = fence_start {
+        // Reuse the original delimiter. Retain trailing whitespace here
+        // because it is still part of the open fenced block.
+        let opener = &text[fence_start..];
+        let delimiter = opener.as_bytes()[0];
+        let width = opener.bytes().take_while(|&c| c == delimiter).count();
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&opener[..width]);
+    } else {
+        out.push_str(text.trim_end());
+    }
+    out.push('\n');
 }
 
 /// The transcript as Markdown: user and assistant turns, notes as quotes,
@@ -121,10 +166,8 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
     for part in parts(msgs, clip) {
         out.push('\n');
         match part {
-            Part::User(t) => out.push_str(&format!("## You\n\n{}\n", turn_boundaries(&t))),
-            Part::Assistant(t) => {
-                out.push_str(&format!("## Assistant\n\n{}\n", turn_boundaries(&t)))
-            }
+            Part::User(t) => append_markdown_turn(&mut out, "## You\n\n", &t),
+            Part::Assistant(t) => append_markdown_turn(&mut out, "## Assistant\n\n", &t),
             Part::Note(t) => out.push_str(&format!("> *{}*\n", t.trim().replace('\n', " "))),
             Part::Call(tool, args, result) => {
                 out.push_str(&format!(
@@ -165,11 +208,11 @@ fn escape(s: &str) -> String {
 /// when the file is opened), and links keep only http(s) and mailto
 /// destinations (#826).
 fn md_html(s: &str) -> String {
-    use pulldown_cmark::{Tag, TagEnd};
+    use pulldown_cmark::TagEnd;
     let mut in_image: Option<String> = None;
     let mut dropped_link = Vec::new();
     let mut events = Vec::new();
-    for e in Parser::new_ext(s, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH) {
+    for e in Parser::new_ext(s, MARKDOWN_OPTIONS) {
         match e {
             Event::Html(t) | Event::InlineHtml(t) => events.push(Event::Text(t)),
             Event::Start(Tag::Image { dest_url, .. }) => {
@@ -306,6 +349,85 @@ mod tests {
         assert!(md.contains("````\na.rs: 3"), "{md}");
         assert!(md.contains("> *The working directory is now /x.*"));
         assert!(md.trim_end().ends_with("There are **3**."));
+    }
+
+    #[test]
+    fn markdown_repairs_fences_that_consume_following_turns() {
+        for (content, closing) in [
+            ("```rust\nlet x = 1;  \n   \n", "```"),
+            (
+                " ~~~~~text\r\n  ~~~\r\n  ~~~~~ still code\r\n```\r\n",
+                "~~~~~",
+            ),
+            ("   ````rust\n```\n````\u{a0}", "````"),
+            ("~~~", "~~~"),
+            ("```rust\r\nvalue\r", "```"),
+        ] {
+            for (role, next_role, heading, next_heading) in [
+                ("assistant", "user", "Assistant", "You"),
+                ("user", "assistant", "You", "Assistant"),
+            ] {
+                let messages = [msg(role, content, None), msg(next_role, "Continue", None)];
+                let before = serde_json::to_value(&messages).unwrap();
+                let md = markdown("fixture", &messages);
+                let newline = if content.ends_with('\n') { "" } else { "\n" };
+                assert_eq!(
+                    md,
+                    format!(
+                        "# fixture\n\n## {heading}\n\n{content}{newline}{closing}\n\n## {next_heading}\n\nContinue\n"
+                    )
+                );
+                let mut rendered = String::new();
+                html::push_html(&mut rendered, Parser::new(&md));
+                assert!(
+                    rendered.contains(&format!("<h2>{next_heading}</h2>\n<p>Continue</p>")),
+                    "{rendered}"
+                );
+                assert_eq!(serde_json::to_value(&messages).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_repairs_transcript_fences_before_tool_results() {
+        let mut messages = sample();
+        messages[1].content = "~~~text\nincomplete".into();
+        let md = markdown("fixture", &messages);
+        assert!(md.contains("~~~text\nincomplete\n~~~\n\n<details>"), "{md}");
+        assert!(
+            md.contains("Result:\n\n````\na.rs: 3\n```b```\n````"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn markdown_keeps_balanced_fences_and_other_blocks_unchanged() {
+        for content in [
+            "````rust\n```\n   `````",
+            " ~~~text\n  ~~~~ \t",
+            "    ```rust\n    code",
+            "\t~~~text\n\tcode",
+            "```invalid`info\nplain",
+            "inline ````code````",
+            "> ```rust\n> code",
+            "- ~~~text\n  code",
+            "<div>\n```rust\n</div>",
+        ] {
+            let md = markdown(
+                "fixture",
+                &[
+                    msg("assistant", content, None),
+                    msg("user", "Continue", None),
+                ],
+            );
+            assert_eq!(
+                md,
+                format!(
+                    "# fixture\n\n## Assistant\n\n{}\n\n## You\n\nContinue\n",
+                    content.trim_end()
+                )
+            );
+        }
     }
 
     #[test]
