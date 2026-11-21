@@ -63,5 +63,6 @@ jobs:
             ${{ runner.temp }}/formless-desktop-package/*.zip
             ${{ runner.temp }}/formless-desktop-package/SHA256SUMS
           if-no-files-found: error
+          retention-days: 2
       - name: Scope of evidence
         run: echo 'Build, model, daemon/provider and headless layout coverage only. Actual OS IME, screen-reader use, foreground input and 200% visual acceptance remain separate native gates.' >> "$GITHUB_STEP_SUMMARY"
