@@ -5,6 +5,8 @@
 //! config formats and tags for markup. Block comments carry across lines.
 //! Unknown languages return `None` and the caller falls back to plain code.
 
+use std::collections::VecDeque;
+
 use ratatui::prelude::*;
 
 use super::fg;
@@ -598,6 +600,7 @@ pub(crate) struct Highlighter {
     rust_numbers: bool,
     powershell: bool,
     python_comments: bool,
+    shell: Option<ShellComments>,
     raw_backticks: bool,
     toml_strings: bool,
     mysql_comments: bool,
@@ -627,6 +630,392 @@ fn postgres_dollar_delimiter(chars: &[char]) -> Option<&[char]> {
         _ => return None,
     };
     (chars.get(end) == Some(&'$')).then(|| &chars[..=end])
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ShellContext {
+    Command,
+    Parameter,
+    Pattern,
+    Condition,
+    RegexStart,
+    Regex(usize),
+    CaseHeader,
+    CasePattern { started: bool },
+    CaseBody,
+}
+
+struct HereDoc {
+    delimiter: String,
+    strip_tabs: bool,
+    quoted: bool,
+    continued: String,
+}
+
+struct ShellComments {
+    posix: bool,
+    ansi_quotes: bool,
+    localized_quotes: bool,
+    contexts: Vec<ShellContext>,
+    here_docs: VecDeque<HereDoc>,
+    in_here_doc: bool,
+    line_boundary: bool,
+    ansi_quote: bool,
+}
+
+impl ShellComments {
+    // Reserved words such as `[[` and `case` also occur as plain arguments.
+    fn command_position(mut prefix: &[char], line_boundary: bool) -> bool {
+        loop {
+            let Some(end) = prefix.iter().rposition(|c| !c.is_whitespace()) else {
+                return line_boundary;
+            };
+            if ";|&({)".contains(prefix[end]) {
+                return !Self::escaped(&prefix[..end]);
+            }
+            let start = prefix[..=end]
+                .iter()
+                .rposition(|c| c.is_whitespace() || ";|&({)".contains(*c))
+                .map_or(0, |i| i + 1);
+            let word: String = prefix[start..=end].iter().collect();
+            if !matches!(
+                word.as_str(),
+                "if" | "elif" | "then" | "else" | "do" | "while" | "until" | "!" | "time"
+            ) {
+                return false;
+            }
+            prefix = &prefix[..start];
+        }
+    }
+
+    fn escaped(prefix: &[char]) -> bool {
+        !prefix
+            .iter()
+            .rev()
+            .take_while(|&&c| c == '\\')
+            .count()
+            .is_multiple_of(2)
+    }
+
+    fn ansi_escape(chars: &[char], end: &mut usize, bytes: &mut Vec<u8>) -> Option<()> {
+        let c = *chars.get(*end)?;
+        *end += 1;
+        let simple = match c {
+            'a' => Some(7),
+            'b' => Some(8),
+            'e' | 'E' => Some(27),
+            'f' => Some(12),
+            'n' => Some(b'\n'),
+            'r' => Some(b'\r'),
+            't' => Some(b'\t'),
+            'v' => Some(11),
+            '\\' | '\'' | '"' | '?' => Some(c as u8),
+            _ => None,
+        };
+        if let Some(byte) = simple {
+            bytes.push(byte);
+            return Some(());
+        }
+        let (radix, digits) = match c {
+            'c' => {
+                let c = chars.get(*end)?.to_ascii_uppercase();
+                *end += 1;
+                return c.is_ascii().then(|| bytes.push((c as u8) ^ 0x40));
+            }
+            '0'..='7' => {
+                *end -= 1;
+                (8, 3)
+            }
+            'x' => (16, 2),
+            'u' => (16, 4),
+            'U' => (16, 8),
+            _ => {
+                *end -= 1;
+                bytes.push(b'\\');
+                return Some(());
+            }
+        };
+        let start = *end;
+        let mut value = 0;
+        while *end - start < digits {
+            let Some(digit) = chars.get(*end).and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            value = value * radix + digit;
+            *end += 1;
+        }
+        if *end == start {
+            *end -= 1;
+            bytes.push(b'\\');
+        } else if matches!(c, 'u' | 'U') {
+            bytes.extend_from_slice(char::from_u32(value)?.encode_utf8(&mut [0; 4]).as_bytes());
+        } else {
+            bytes.push(value as u8);
+        }
+        Some(())
+    }
+
+    fn context(&self) -> ShellContext {
+        self.contexts
+            .last()
+            .copied()
+            .unwrap_or(ShellContext::Command)
+    }
+
+    fn track(&mut self, chars: &[char], i: usize) {
+        use ShellContext::*;
+
+        let prefix = &chars[..i];
+        let current = chars[i];
+        let context = self.context();
+        if (current == '\\' && context != RegexStart) || Self::escaped(prefix) {
+            return;
+        }
+        let previous = prefix.last().copied();
+        let next = chars.get(i + 1).copied();
+        let mut replace = |mode| *self.contexts.last_mut().expect("context exists") = mode;
+        match (context, current) {
+            (RegexStart, c) if !c.is_whitespace() => replace(Regex(usize::from(c == '('))),
+            (Regex(depth), '(') => replace(Regex(depth + 1)),
+            (Regex(depth), ')') => replace(Regex(depth.saturating_sub(1))),
+            (Regex(0), c) if c.is_whitespace() => replace(Condition),
+            (Regex(_) | RegexStart, _) => {}
+            (Condition, '~')
+                if previous == Some('=')
+                    && prefix[..i - 1].last().is_none_or(|c| c.is_whitespace()) =>
+            {
+                replace(RegexStart);
+            }
+            (Condition, ']')
+                if next == Some(']')
+                    && previous.is_none_or(char::is_whitespace)
+                    && chars
+                        .get(i + 2)
+                        .is_none_or(|c| c.is_whitespace() || ";|&)".contains(*c)) =>
+            {
+                self.contexts.pop();
+            }
+            (Parameter, '}') | (Pattern, ')') | (Command, ')') => {
+                self.contexts.pop();
+            }
+            (CasePattern { .. }, ')') => replace(CaseBody),
+            (CaseBody, ';') if previous == Some(';') && next != Some('&') => {
+                replace(CasePattern { started: false })
+            }
+            (CaseBody, '&') if previous == Some(';') => replace(CasePattern { started: false }),
+            (_, '{') if previous == Some('$') && !Self::escaped(&prefix[..i - 1]) => {
+                self.contexts.push(Parameter);
+            }
+            (_, '(')
+                if context == Pattern
+                    || previous.is_some_and(|c| "@!?+*$".contains(c))
+                        && !Self::escaped(&prefix[..i - 1]) =>
+            {
+                let mode = if context != Pattern && previous == Some('$') && next != Some('(') {
+                    Command
+                } else {
+                    Pattern
+                };
+                self.contexts.push(mode);
+            }
+            (CasePattern { started: false }, '(' | '|') => replace(CasePattern { started: true }),
+            (Command | CaseBody, '(') => {
+                self.contexts
+                    .push(if next == Some('(') { Pattern } else { Command })
+            }
+            (Command | CaseBody, '[')
+                if next == Some('[')
+                    && previous.is_none_or(|c| c.is_whitespace() || ";|&(".contains(c))
+                    && chars.get(i + 2).is_none_or(|c| c.is_whitespace())
+                    && Self::command_position(prefix, self.line_boundary) =>
+            {
+                self.contexts.push(Condition);
+            }
+            _ => {}
+        }
+    }
+
+    fn word(&mut self, chars: &[char], start: usize, end: usize, word: &str) {
+        use ShellContext::*;
+
+        if !self.posix
+            || !matches!(word, "case" | "in" | "esac")
+            || chars
+                .get(start.wrapping_sub(1))
+                .is_some_and(|c| !c.is_whitespace() && !";|&({)".contains(*c))
+            || chars
+                .get(end)
+                .is_some_and(|c| !c.is_whitespace() && !";|&()".contains(*c))
+            || Self::escaped(&chars[..start.saturating_sub(1)])
+        {
+            return;
+        }
+        match (self.context(), word) {
+            (Command | CaseBody, "case")
+                if Self::command_position(&chars[..start], self.line_boundary) =>
+            {
+                self.contexts.push(CaseHeader);
+            }
+            (CaseHeader, "in") => {
+                *self.contexts.last_mut().expect("case header exists") =
+                    CasePattern { started: false };
+            }
+            (CasePattern { started: false }, "esac") => {
+                self.contexts.pop();
+            }
+            (CaseBody, "esac") if Self::command_position(&chars[..start], self.line_boundary) => {
+                self.contexts.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn comment(&self, prefix: &[char]) -> bool {
+        use ShellContext::*;
+
+        let context = self.context();
+        if matches!(context, Parameter | Pattern | Regex(_)) {
+            return false;
+        }
+        let Some((&previous, before)) = prefix.split_last() else {
+            return self.line_boundary;
+        };
+        let separator = match context {
+            Command | CaseBody => ";|&(".contains(previous),
+            CasePattern { .. } => {
+                "|(".contains(previous) || before.last() == Some(&';') && ";&".contains(previous)
+            }
+            Condition | RegexStart => {
+                "|&".contains(previous)
+                    && before.last() == Some(&previous)
+                    && !Self::escaped(&before[..before.len() - 1])
+            }
+            _ => false,
+        };
+        (previous.is_whitespace() || separator) && !Self::escaped(before)
+    }
+
+    fn end_line(&mut self, chars: &[char], ended_by_comment: bool, in_string: bool) {
+        let chars = chars.strip_suffix(&['\r']).unwrap_or(chars);
+        let continued = !ended_by_comment && Self::escaped(chars);
+        self.line_boundary = !continued || self.comment(&chars[..chars.len() - 1]);
+        if !continued && !in_string {
+            if let Some(context @ ShellContext::Regex(0)) = self.contexts.last_mut() {
+                *context = ShellContext::Condition;
+            }
+            self.in_here_doc = !self.here_docs.is_empty();
+        }
+    }
+
+    fn here_doc(&mut self, chars: &[char], i: usize) -> Option<usize> {
+        use ShellContext::*;
+
+        if chars[i] != '<'
+            || !self.posix
+            || !matches!(self.context(), Command | CaseBody)
+            || Self::escaped(&chars[..i])
+            || chars.get(i + 1) != Some(&'<')
+            || chars.get(i + 2) == Some(&'<')
+            || i > 0 && chars[i - 1] == '<' && !Self::escaped(&chars[..i - 1])
+        {
+            return None;
+        }
+        let mut end = i + 2;
+        let strip_tabs = chars.get(end) == Some(&'-');
+        end += usize::from(strip_tabs);
+        while chars.get(end).is_some_and(|c| " \t".contains(*c)) {
+            end += 1;
+        }
+        let start = end;
+        let mut quote = None;
+        let mut quoted = false;
+        let mut ansi_quote = false;
+        let mut delimiter = Vec::new();
+        if chars.get(end) == Some(&'#') {
+            return None;
+        }
+        while let Some(&c) = chars.get(end) {
+            if quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c)) {
+                break;
+            }
+            end += 1;
+            if quote == Some(c) {
+                quote = None;
+                ansi_quote = false;
+            } else if quote.is_none()
+                && c == '$'
+                && (self.ansi_quotes && chars.get(end) == Some(&'\'')
+                    || self.localized_quotes && chars.get(end) == Some(&'"'))
+            {
+                quote = chars.get(end).copied();
+                quoted = true;
+                ansi_quote = quote == Some('\'');
+                end += 1;
+            } else if quote.is_none() && "\"'".contains(c) {
+                quote = Some(c);
+                quoted = true;
+            } else if c == '\\' && ansi_quote {
+                Self::ansi_escape(chars, &mut end, &mut delimiter)?;
+            } else if c == '\\'
+                && quote != Some('\'')
+                && (quote.is_none() || chars.get(end).is_some_and(|c| "\\\"$`".contains(*c)))
+            {
+                delimiter.extend_from_slice(chars.get(end)?.encode_utf8(&mut [0; 4]).as_bytes());
+                quoted = true;
+                end += 1;
+            } else {
+                delimiter.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+        }
+        if end == start || quote.is_some() || delimiter.contains(&0) {
+            return None;
+        }
+        let delimiter = String::from_utf8(delimiter).ok()?;
+        self.here_docs.push_back(HereDoc {
+            delimiter,
+            strip_tabs,
+            quoted,
+            continued: String::new(),
+        });
+        Some(end)
+    }
+
+    fn literal_line(&mut self, line: &str) -> bool {
+        if !self.in_here_doc {
+            return false;
+        }
+        let doc = self.here_docs.front_mut().expect("active here document");
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !doc.quoted
+            && !line
+                .bytes()
+                .rev()
+                .take_while(|&b| b == b'\\')
+                .count()
+                .is_multiple_of(2)
+        {
+            doc.continued.push_str(&line[..line.len() - 1]);
+            return true;
+        }
+        let line = if doc.continued.is_empty() {
+            line
+        } else {
+            doc.continued.push_str(line);
+            &doc.continued
+        };
+        if (if doc.strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        }) == doc.delimiter
+        {
+            self.here_docs.pop_front();
+            self.in_here_doc = !self.here_docs.is_empty();
+        } else {
+            doc.continued.clear();
+        }
+        true
+    }
 }
 
 /// Rust-shaped literals only. A dot before another dot or an identifier
@@ -767,6 +1156,20 @@ impl Highlighter {
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            shell: matches!(
+                name.as_str(),
+                "sh" | "bash" | "zsh" | "fish" | "shell" | "console"
+            )
+            .then(|| ShellComments {
+                posix: name != "fish",
+                ansi_quotes: matches!(name.as_str(), "bash" | "zsh"),
+                localized_quotes: name == "bash",
+                contexts: Vec::new(),
+                here_docs: VecDeque::new(),
+                in_here_doc: false,
+                line_boundary: true,
+                ansi_quote: false,
+            }),
             raw_backticks: matches!(name.as_str(), "go" | "golang"),
             toml_strings: name == "toml",
             mysql_comments: name == "mysql",
@@ -803,6 +1206,13 @@ impl Highlighter {
     /// Highlight one line; open block comments and multi-line strings
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
+        if self
+            .shell
+            .as_mut()
+            .is_some_and(|shell| shell.literal_line(line))
+        {
+            return vec![Span::raw(line.to_owned())];
+        }
         if self.yaml {
             if let Some(scalar) = &mut self.yaml_scalar {
                 let indent = line.len() - line.trim_start_matches(' ').len();
@@ -840,6 +1250,7 @@ impl Highlighter {
             toks.push((tok, s.iter().collect()));
         };
         let mut i = 0;
+        let mut ended_by_comment = false;
         // Config keys: `  name:` / `name =` at line start.
         if let Some(sep) = l.key_sep.filter(|_| self.in_str.is_none()) {
             let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
@@ -861,9 +1272,12 @@ impl Highlighter {
         // Where the string closed by `close` ends, scanning from `from`:
         // just past the delimiter, or None when it runs past the line.
         let raw_backticks = self.raw_backticks;
-        let close_at = |from: usize, close: &str| -> Option<usize> {
+        let shell = self.shell.is_some();
+        let posix_shell = self.shell.as_ref().is_some_and(|shell| shell.posix);
+        let close_at = |from: usize, close: &str, ansi_quote: bool| -> Option<usize> {
             let escapes = !(l.raw_strings
                 || raw_backticks && close == "`"
+                || posix_shell && close == "'" && !ansi_quote
                 || toml && close.starts_with('\'')
                 || mysql && close == "`");
             let mut j = from;
@@ -892,6 +1306,7 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
+                let ansi_quote = self.shell.as_ref().is_some_and(|shell| shell.ansi_quote);
                 let stop = if self.powershell && close.ends_with('@') {
                     (i == 0 && at(0, &close)).then_some(2)
                 } else if self.powershell {
@@ -901,7 +1316,7 @@ impl Highlighter {
                         .find(|&j| at(j, &close))
                         .map(|j| j + close.chars().count())
                 } else {
-                    close_at(i, &close)
+                    close_at(i, &close, ansi_quote)
                 };
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_some() {
@@ -969,7 +1384,7 @@ impl Highlighter {
                 let hashes = chars[r + 1..].iter().take_while(|&&h| h == '#').count();
                 if chars.get(r + 1 + hashes) == Some(&'"') {
                     let close = format!("\"{}", "#".repeat(hashes));
-                    let stop = close_at(r + 2 + hashes, &close);
+                    let stop = close_at(r + 2 + hashes, &close, false);
                     push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                     if stop.is_none() {
                         self.in_str = Some(close);
@@ -978,16 +1393,20 @@ impl Highlighter {
                     continue;
                 }
             }
+            let hash_is_comment = || {
+                self.shell.as_ref().map_or_else(
+                    || self.python_comments || i == 0 || chars[i - 1].is_whitespace(),
+                    |shell| shell.comment(&chars[..i]),
+                )
+            };
             let hash_comment = c != '#'
                 || if php {
                     chars.get(i + 1) != Some(&'[')
                 } else {
-                    self.python_comments
-                        || mysql
+                    mysql
+                        || hash_is_comment()
                         || self.powershell
-                        || i == 0
-                        || chars[i - 1].is_whitespace()
-                        || toml && l.quotes.contains(&chars[i - 1])
+                        || toml && i > 0 && l.quotes.contains(&chars[i - 1])
                 };
             if hash_comment
                 && l.line_comments.iter().any(|p| {
@@ -1008,8 +1427,33 @@ impl Highlighter {
                     chars.len()
                 };
                 push(Tok::Comment, &chars[i..end]);
+                ended_by_comment = true;
                 i = end;
                 continue;
+            }
+            if let Some(shell) = &mut self.shell {
+                if let Some(end) = shell.here_doc(&chars, i) {
+                    push(Tok::Plain, &chars[i..end]);
+                    i = end;
+                    continue;
+                }
+                shell.track(&chars, i);
+                if l.quotes.contains(&c) && !ShellComments::escaped(&chars[..i]) {
+                    let ansi_quote = (shell.ansi_quotes || self.shell_literal_quotes)
+                        && c == '\''
+                        && i > 0
+                        && chars[i - 1] == '$'
+                        && !ShellComments::escaped(&chars[..i - 1]);
+                    let close = c.to_string();
+                    let stop = close_at(i + 1, &close, ansi_quote);
+                    push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
+                    if stop.is_none() {
+                        self.in_str = Some(close);
+                        shell.ansi_quote = ansi_quote;
+                    }
+                    i = stop.unwrap_or(chars.len());
+                    continue;
+                }
             }
             if self.powershell && c == '@' {
                 if let Some(quote @ ('"' | '\'')) = chars.get(i + 1) {
@@ -1109,7 +1553,7 @@ impl Highlighter {
             // Strings that may span lines: `"""`, backticks (#876).
             if let Some(delim) = l.multiline.iter().find(|d| at(i, d)) {
                 let n = delim.chars().count();
-                let stop = close_at(i + n, delim);
+                let stop = close_at(i + n, delim, false);
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_none() {
                     self.in_str = Some(delim.to_string());
@@ -1127,10 +1571,8 @@ impl Highlighter {
                 i = end;
                 continue;
             }
-            if l.quotes.contains(&c) {
-                // Shell $'…' strings interpret escapes. Ordinary single quotes do not.
-                let literal = c == '\''
-                    && (toml || (self.shell_literal_quotes && (i == 0 || chars[i - 1] != '$')));
+            if !shell && l.quotes.contains(&c) {
+                let literal = toml && c == '\'';
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
                     j += if !literal && chars[j] == '\\' { 2 } else { 1 };
@@ -1197,6 +1639,9 @@ impl Highlighter {
                     j += 1;
                 }
                 let word: String = chars[i..j].iter().collect();
+                if let Some(shell) = &mut self.shell {
+                    shell.word(&chars, i, j, &word);
+                }
                 let is = |set: &[&str]| {
                     if l.ignore_case {
                         set.iter().any(|k| k.eq_ignore_ascii_case(&word))
@@ -1236,6 +1681,9 @@ impl Highlighter {
             }
             push(Tok::Plain, &chars[i..i + 1]);
             i += 1;
+        }
+        if let Some(shell) = &mut self.shell {
+            shell.end_line(&chars, ended_by_comment, self.in_str.is_some());
         }
         // JSON5 needs a fresh escape on every physical line of a
         // continued string, including when the next line is empty.
@@ -1709,6 +2157,117 @@ mod tests {
                     .contains(&("# comment".into(), Some(Color::DarkGray))),
                 "{lang}"
             );
+        }
+    }
+
+    #[test]
+    fn shell_hash_comments_follow_unescaped_word_boundaries() {
+        for lang in ["sh", "bash", "zsh", "fish", "shell", "console"] {
+            for (source, expected) in [
+                ("echo a;# done", "# done"),
+                ("true|# note", "# note"),
+                ("true&# note", "# note"),
+                ("echo a &&# note", "# note"),
+                ("(# note", "# note"),
+                ("echo a; # spaced", "# spaced"),
+                (r"echo a\;#literal", ""),
+                (r"echo a\ #literal", ""),
+                (r"echo a\\;# note", "# note"),
+                ("echo foo#bar", ""),
+                ("echo ${#arr} $#", ""),
+                ("echo 'a;# quoted'", ""),
+                ("echo [[ value;# outside", "# outside"),
+                ("echo ${unset:-x;#literal};# outside", "# outside"),
+                ("echo ${outer:-${inner:-x|#literal}};# outside", "# outside"),
+                (r##"[[ "#foo" == @(other|#foo) ]];# outside"##, "# outside"),
+                (r##"[[ "#foo" =~ (other|#foo) ]];# outside"##, "# outside"),
+                ("echo @(other|#foo);# outside", "# outside"),
+                (r"echo ${name:-x\};#literal};# outside", "# outside"),
+            ] {
+                let comments: String = toks(lang, source)
+                    .into_iter()
+                    .filter(|(_, color)| *color == Some(Color::DarkGray))
+                    .map(|(text, _)| text)
+                    .collect();
+                assert_eq!(comments, expected, "{lang}: {source}");
+            }
+        }
+        for lang in ["yaml", "toml", "ini", "ruby"] {
+            assert!(
+                toks(lang, "a|# literal")
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)),
+                "{lang}"
+            );
+        }
+        assert!(toks("powershell", "a|# literal")
+            .contains(&("# literal".into(), Some(Color::DarkGray))));
+    }
+
+    #[test]
+    fn shell_hash_comments_respect_multiline_context() {
+        for (source, expected) in [
+            ("cat <<EOF\nhello;#literal\nEOF\nprintf done;# real", &["# real"][..]),
+            (
+                "cat <<'FIRST' <<-E\"ND\"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside",
+                &["# outside"],
+            ),
+            ("cat <<$'E\\x4fF'\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<$'caf\\303\\251'\nhello;#literal\ncafé\nprintf done;# real", &["# real"]),
+            ("cat <<$\"EOF\"\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\nleft\\\nEOF\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\nE\\\nOF\nprintf done;# real", &["# real"]),
+            ("cat <<'EOF'\nleft\\\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\r\nhello;#literal\r\nEOF\r\nprintf done;# real\r", &["# real\r"]),
+            ("cat <<''\n# data\n\ntrue;# outside", &["# outside"]),
+            ("cat <<< literal\ntrue;# outside", &["# outside"]),
+            ("cat \\<< literal\ntrue;# outside", &["# outside"]),
+            ("cat <<EOF # header \\\n# data\nEOF\n# outside", &["# header \\", "# outside"]),
+            (
+                "echo ${unset:-$(case a in a) { :; };; esac) x;#literal};# outside",
+                &["# outside"],
+            ),
+            (
+                "echo ${unset:-$(if true; then case a in (esac) :;; esac; fi) x;#literal};# outside",
+                &["# outside"],
+            ),
+            ("echo ${unset:-$(echo hi;# inside\n) x;#literal};# outside", &["# inside", "# outside"]),
+            ("[[ a == a ||# condition\n b == c ]];# outside", &["# condition", "# outside"]),
+            ("[[ a =~ (a||#literal) ]];# outside", &["# outside"]),
+            ("if [[ a =~ a||#literal ]]; then :; fi;# outside", &["# outside"]),
+            ("printf '%s' foo\\\n#literal\nprintf done;# real", &["# real"]),
+            ("printf '%s' foo;\\\n# continued boundary", &["# continued boundary"]),
+            ("echo 'a\n;# inside quote';# outside", &["# outside"]),
+            ("printf '%s' $'it\\'s #inside' # outside", &["# outside"]),
+        ] {
+            let mut highlighter = Highlighter::new("bash", true).unwrap();
+            let mut comments = Vec::new();
+            for line in source.split('\n') {
+                let spans = highlighter.line(line);
+                assert_eq!(spans.iter().map(|span| span.content.as_ref()).collect::<String>(), line);
+                comments.extend(
+                    spans.into_iter()
+                        .filter(|span| span.style.fg == Some(Color::DarkGray))
+                        .map(|span| span.content.into_owned()),
+                );
+            }
+            assert_eq!(comments, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn shell_quote_extensions_respect_the_dialect() {
+        for (lang, delimiter) in [("sh", "$\"EOF\""), ("zsh", "$\"EOF\""), ("sh", "$'EOF'")] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            highlighter.line(&format!("cat <<{delimiter}"));
+            assert_eq!(
+                highlighter.line("hello;#literal"),
+                vec![Span::raw("hello;#literal")]
+            );
+            assert_eq!(highlighter.line("$EOF"), vec![Span::raw("$EOF")]);
+            assert!(highlighter.line("true;# outside").into_iter().any(|span| {
+                span.content == "# outside" && span.style.fg == Some(Color::DarkGray)
+            }));
         }
     }
 
