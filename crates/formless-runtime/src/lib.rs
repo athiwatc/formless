@@ -2875,51 +2875,133 @@ fn run_capture_impl(
     stdin_text: Option<&str>,
     detailed: bool,
 ) -> Result<String, String> {
-    use std::io::Write;
-    // All stdin-bearing callers are clipboard writes. Protect their errors
-    // on every platform, including the legacy non-detailed helper path.
-    let protected_diagnostics = detailed || stdin_text.is_some();
-    let mut child = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if protected_diagnostics {
-                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
-            } else {
-                format!("{cmd}: {e}")
-            }
-        })?;
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-    }
-    let out = child.wait_with_output().map_err(|e| {
-        if protected_diagnostics {
-            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
-        } else {
-            e.to_string()
-        }
-    })?;
-    if !out.status.success() {
-        if protected_diagnostics {
-            return Err(clipboard_diagnostics::failure(
-                cmd,
-                &format!("exited unsuccessfully ({})", out.status),
-                &String::from_utf8_lossy(&out.stderr),
-                stdin_text,
-            ));
-        }
-        return Err(format!(
-            "{cmd} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    run_capture_until(
+        cmd,
+        args,
+        stdin_text,
+        detailed,
+        std::time::Duration::from_secs(2),
+    )
 }
+
+fn run_capture_until(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // and avoid retaining pipes from the background clipboard owner.
+    let protected_diagnostics = detailed || stdin_text.is_some();
+    let write = stdin_text.is_some();
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if write {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let program = cmd.to_owned();
+    let input = stdin_text.map(|text| text.as_bytes().to_vec());
+    std::thread::Builder::new()
+        .name("formless-system-helper".into())
+        .spawn(move || {
+            let failure = |kind: &str, detail: &str| {
+                if protected_diagnostics {
+                    clipboard_diagnostics::failure(&program, kind, detail, write.then_some(""))
+                } else {
+                    format!("{program}: {kind}: {detail}")
+                }
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| failure("could not start helper runtime", &error.to_string()))?;
+            runtime.block_on(async {
+                let mut child = tokio::process::Command::from(command)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| failure("could not spawn", &error.to_string()))?;
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let send = async {
+                    match (stdin, input) {
+                        (Some(mut pipe), Some(input)) => pipe.write_all(&input).await,
+                        _ => Ok(()),
+                    }
+                };
+                async fn read(
+                    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+                ) -> std::io::Result<Vec<u8>> {
+                    let mut bytes = Vec::new();
+                    if let Some(mut pipe) = pipe {
+                        pipe.read_to_end(&mut bytes).await?;
+                    }
+                    Ok(bytes)
+                }
+                let result = tokio::time::timeout(timeout, async {
+                    let (sent, stdout, stderr) = tokio::join!(send, read(stdout), read(stderr));
+                    let status = child.wait().await?;
+                    Ok::<_, std::io::Error>((status, sent, stdout?, stderr?))
+                })
+                .await;
+                let (status, sent, stdout, stderr) = match result {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => return Err(failure("could not wait", &error.to_string())),
+                    Err(_) => {
+                        #[cfg(unix)]
+                        if let Some(pid) = child.id() {
+                            // The leader is still owned until wait succeeds.
+                            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                        }
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            child.kill(),
+                        )
+                        .await;
+                        return Err(format!("{program}: timed out"));
+                    }
+                };
+                if !status.success() {
+                    let detail = String::from_utf8_lossy(&stderr);
+                    return if protected_diagnostics {
+                        Err(failure(
+                            &format!("exited unsuccessfully ({status})"),
+                            &detail,
+                        ))
+                    } else {
+                        Err(format!("{program} failed: {}", detail.trim()))
+                    };
+                }
+                sent.map_err(|error| failure("could not write stdin", &error.to_string()))?;
+                Ok(String::from_utf8_lossy(&stdout).into_owned())
+            })
+        })
+        .map_err(|error| format!("{cmd}: could not start helper worker: {error}"))?
+        .join()
+        .map_err(|_| format!("{cmd}: helper worker failed"))?
+}
+
+#[cfg(windows)]
+const POWERSHELL_CLIPBOARD_WRITE: &str =
+    "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
+     Set-Clipboard -Value ([Console]::In.ReadToEnd()) -ErrorAction Stop";
 
 fn clipboard_read() -> Result<String, String> {
     #[cfg(target_os = "macos")]
@@ -2954,7 +3036,12 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     {
         run_capture(
             "powershell",
-            &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                POWERSHELL_CLIPBOARD_WRITE,
+            ],
             Some(text),
         )
         .map(|_| ())
