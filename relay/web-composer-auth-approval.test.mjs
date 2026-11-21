@@ -7,7 +7,10 @@ const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
 const start = source.indexOf('  function pathNote(');
 const end = source.indexOf('  function capTags(', start);
 assert.ok(start >= 0 && end > start);
-const pathNote = vm.runInNewContext(source.slice(start, end) + '\npathNote');
+const helperStart = source.indexOf('  function normalizeApprovalPath(');
+const helperEnd = source.indexOf('  /** Why a Capability', helperStart);
+assert.ok(helperStart >= 0 && helperEnd > helperStart);
+const pathNote = vm.runInNewContext(source.slice(helperStart, helperEnd) + source.slice(start, end) + '\npathNote');
 
 test('Composer credential warnings match only the auth file in its config folders', () => {
   for (const file of ['/work/.composer/auth.json', '/work/.config/Composer/AUTH.JSON',
