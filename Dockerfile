@@ -2,12 +2,22 @@
 # stays up (`--stay`), so scheduled jobs fire; reach it through the relay
 # or `docker exec … formless`.
 # Bases are pinned by digest (update both together: docs/docker.md).
-FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS build
+FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS build-base
 # The keyring's Secret Service backend links libdbus.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
+RUN cargo install --locked --version 0.1.78 cargo-chef
 WORKDIR /src
+
+FROM build-base AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path /tmp/formless-recipe.json
+
+FROM build-base AS build
+# Only dependency inputs invalidate this layer, which BuildKit can export.
+COPY --from=planner /tmp/formless-recipe.json /tmp/formless-recipe.json
+RUN cargo chef cook --release --locked --bin formless --recipe-path /tmp/formless-recipe.json
 COPY . .
 RUN cargo build --release --locked --bin formless
 
