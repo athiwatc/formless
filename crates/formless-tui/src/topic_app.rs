@@ -125,7 +125,16 @@ impl App {
                 .push("This session is still loading; try /topic again.".into());
             return;
         };
-        let repo = source.cwd.clone().unwrap_or_default();
+        let repo = source
+            .cwd
+            .clone()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
         let name = std::path::Path::new(&repo)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())

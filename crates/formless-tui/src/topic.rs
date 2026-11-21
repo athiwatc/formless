@@ -628,12 +628,12 @@ impl State {
             ["start", topic_id] => self
                 .open_action(topic_id, ConfirmedAction::Start)
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics.")),
+                .ok_or_else(|| self.unavailable_action(&topic_id)),
             ["recover"] => self.open_action_for_selected(ConfirmedAction::Recover),
             ["recover", topic_id] => self
                 .open_action(topic_id, ConfirmedAction::Recover)
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics.")),
+                .ok_or_else(|| self.unavailable_action(&topic_id)),
             ["retry", topic_id, feature_id] => self
                 .open_action(
                     topic_id,
@@ -642,7 +642,7 @@ impl State {
                     },
                 )
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics.")),
+                .ok_or_else(|| self.unavailable_action(&topic_id)),
             ["retry", feature_id] => {
                 let Some(Node::Topic(topic_id)) = self.selected_topic_node() else {
                     return Err("Select a topic with /topics first.".into());
@@ -654,7 +654,7 @@ impl State {
                     },
                 )
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics."))
+                .ok_or_else(|| self.unavailable_action(&topic_id))
             }
             ["reject", topic_id, rest @ ..] if !rest.is_empty() => {
                 let reason = rest.join(" ");
@@ -671,14 +671,25 @@ impl State {
             ["reject", topic_id] => self
                 .open_reject(topic_id)
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics.")),
+                .ok_or_else(|| self.unavailable_action(&topic_id)),
             [topic_id] => self
                 .open_details(topic_id)
                 .then_some(())
-                .ok_or_else(|| format!("No topic named {topic_id}; use /topics.")),
+                .ok_or_else(|| self.unavailable_action(&topic_id)),
             _ => Err(
                 "Usage: /topic [ID|start|recover|retry TOPIC FEATURE|reject TOPIC REASON]".into(),
             ),
+        }
+    }
+
+    fn unavailable_action(&self, topic_id: &str) -> String {
+        match self.topic(topic_id) {
+            Some(topic) => format!(
+                "{} is {}; that action is not available now.",
+                topic.name,
+                topic_status_label(topic)
+            ),
+            None => format!("No topic named {topic_id}; use /topics."),
         }
     }
 
@@ -688,7 +699,7 @@ impl State {
         };
         self.open_action(&topic_id, action)
             .then_some(())
-            .ok_or_else(|| format!("No topic named {topic_id}; use /topics."))
+            .ok_or_else(|| self.unavailable_action(&topic_id))
     }
 
     fn selected_topic_id(&self) -> Option<String> {
@@ -1794,6 +1805,18 @@ mod tests {
         state.paste("formless\n");
         let proposal = state.proposal.as_ref().unwrap();
         assert_eq!(proposal.fields[0].expanded(), "formless ");
+    }
+
+    #[test]
+    fn starting_a_running_topic_explains_why_it_cannot() {
+        let mut state = State::default();
+        state.update_topics(vec![topic("t1", TopicStatus::Running)]);
+        let error = state.open_topic_command("start t1").unwrap_err();
+        assert!(!error.contains("No topic named"), "{error}");
+        assert!(state
+            .open_topic_command("start nope")
+            .unwrap_err()
+            .contains("No topic named"));
     }
 
     #[test]
