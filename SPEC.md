@@ -7189,13 +7189,15 @@ ListHarnesses refreshes all seven kinds concurrently. Every probe is capped at
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
---version and auth status; Codex uses --version and login status. Neither sends
-a model turn, and no auth output is copied into detail or logs.
+--version and auth status; Codex uses --version and login status. Muse Code
+checks its version before using usage --json and only confirms sign-in when
+it receives a Meta account allowance. These probes do not send model turns
+or copy raw auth output into detail or logs.
 
 Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
 the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
 and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-ACP and Muse have dedicated dispatch arms currently reporting lookup-only
+and ACP have dedicated dispatch arms currently reporting lookup-only
 availability with unknown auth. Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private

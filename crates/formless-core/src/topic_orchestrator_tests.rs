@@ -1622,7 +1622,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let executable = script(&f, &env);
-    env.set("FORMLESS_TOPIC_MUSE_EXE", executable);
+    env.set("FORMLESS_TOPIC_OPENCODE_EXE", executable);
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -1690,6 +1690,12 @@ async fn run_muse_fixture(shutdown: bool) {
     let path = f.root.join("fake-muse");
     std::fs::write(&path, r#"#!/usr/bin/env python3
 import json, os, sys, time, uuid
+if sys.argv[1:] == ["--version"]:
+    print("Muse Code 1.4.24")
+    sys.exit()
+if sys.argv[1:] == ["usage", "--json"]:
+    print(json.dumps({"schemaVersion":1,"allowance":{"tier":"fixture"}}))
+    sys.exit()
 session, turn = str(uuid.uuid4()), str(uuid.uuid4())
 def receive(method):
     request = json.loads(sys.stdin.readline())

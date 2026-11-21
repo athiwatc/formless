@@ -8,6 +8,8 @@ The `muse` harness uses Meta's installed [Muse Code](https://dev.meta.ai/docs/mu
 
 **Required bridge.** Formless sends a uniquely named MCP server on private stdin after confirming a memory-only session. Its capability requirements are not inherited by the Muse CLI or the shell. Muse refuses to contact the model unless the required bridge tools are available.
 
+**Readiness.** Muse Code 1.4.13 and later can confirm a Meta account via [`muse usage --json`](https://dev.meta.ai/docs/muse-code/subscriptions), without starting a model turn. Formless shows authentication as unknown if Muse cannot confirm an allowance, including for API keys and local providers. The probe does not sign in, update Muse, or read credential stores directly.
+
 ### Verification
 
 Fixture tests exercise requests and responses without running Muse. Run the separate live smoke test with Muse Code and Python 3 installed:

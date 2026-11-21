@@ -10,7 +10,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use formless_protocol::{
-    HarnessPermissionOption, HarnessPermissionOptionKind, Question, QuestionAnswer, QuestionOption,
+    HarnessAvailability, HarnessPermissionOption, HarnessPermissionOptionKind, Question,
+    QuestionAnswer, QuestionOption,
 };
 use formless_runtime::process_group::SupervisedChild;
 use serde::Deserialize;
@@ -22,14 +23,131 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
+    readiness::{availability, ProbeDirectory},
     validate_request, CommandSpec, HarnessKind, HarnessPermissionRequest, HarnessRequest,
-    HarnessResult, HarnessUpdate, InteractionHandler, StepAccess,
+    HarnessResult, HarnessUpdate, InteractionHandler, ProbeContext, StepAccess,
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 4 * 1024 * 1024;
 const MAX_ANSWER_CHARS: usize = 500;
 const TRUST_ONCE: &str = "trust_once";
+const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+pub async fn probe(ctx: &ProbeContext) -> HarnessAvailability {
+    let mut availability = availability(HarnessKind::Muse, Some(&ctx.executable));
+    if !availability.installed {
+        return availability;
+    }
+    let probe = tokio::time::timeout(ctx.timeout.min(Duration::from_secs(10)), async {
+        let cwd = ProbeDirectory::new().map_err(|_| "Could not prepare the Muse Code probe.")?;
+        let (success, stdout, _) = probe_command(ctx, &cwd.0, &["--version"])
+            .await
+            .ok_or("Could not run the Muse Code version check.")?;
+        let (version, parts) = muse_version(&stdout)
+            .filter(|_| success)
+            .ok_or("Muse Code did not report a recognized version.")?;
+        availability.version = Some(version.to_owned());
+        // Builds before 1.4.13 can interpret the unrecognized command as a prompt.
+        if parts < [1, 4, 13] {
+            return Err("This Muse Code version has no account probe.");
+        }
+        let (success, stdout, stderr) = probe_command(ctx, &cwd.0, &["usage", "--json"])
+            .await
+            .ok_or("Could not check the Muse Code account.")?;
+        interpret_allowance(success, &stdout, &stderr)?;
+        availability.signed_in = Some(true);
+        Ok(())
+    })
+    .await;
+    availability.detail = match probe {
+        Ok(Ok(())) => None,
+        Ok(Err(detail)) => Some(detail.into()),
+        Err(_) => Some("probe timed out".into()),
+    };
+    availability
+}
+
+fn muse_version(stdout: &[u8]) -> Option<(&str, [u32; 3])> {
+    let version = std::str::from_utf8(stdout)
+        .ok()?
+        .trim()
+        .strip_prefix("Muse Code ")?
+        .split_ascii_whitespace()
+        .next()?;
+    let mut fields = version.split('.');
+    let mut parts = [0; 3];
+    for component in &mut parts {
+        let digits = fields.next()?;
+        if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *component = digits.parse().ok()?;
+    }
+    fields.next().is_none().then_some((version, parts))
+}
+
+fn interpret_allowance(success: bool, stdout: &[u8], stderr: &[u8]) -> Result<(), &'static str> {
+    if !success {
+        if stderr
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.trim_ascii() == b"muse usage: not logged in: run `muse login` first")
+        {
+            return Err("No Meta account login detected. Run `muse login` to use a Meta account.");
+        }
+        return Err("Muse Code did not confirm a Meta account login.");
+    }
+    let usage: Value = serde_json::from_slice(stdout)
+        .ok()
+        .filter(|usage: &Value| usage["schemaVersion"] == 1)
+        .ok_or("Muse Code reported an unrecognized usage response.")?;
+    if usage["reason"] == "api_key" {
+        return Err("Muse Code usage does not verify API keys.");
+    }
+    if usage["reason"].is_null()
+        && usage["allowance"]["tier"]
+            .as_str()
+            .is_some_and(|tier| !tier.trim().is_empty())
+    {
+        return Ok(());
+    }
+    Err("Muse Code did not report a Meta account allowance.")
+}
+
+async fn probe_command(
+    ctx: &ProbeContext,
+    cwd: &Path,
+    args: &[&str],
+) -> Option<(bool, Vec<u8>, Vec<u8>)> {
+    let mut command = tokio::process::Command::new(&ctx.executable);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(&ctx.environment)
+        .envs(MUSE_NONINTERACTIVE_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = SupervisedChild::spawn(command).ok()?;
+    let (_, stdout, stderr) = child.take_pipes();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut stdout = stdout?.take(PROBE_OUTPUT_LIMIT + 1);
+    let mut stderr = stderr?.take(PROBE_OUTPUT_LIMIT + 1);
+    tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err)).ok()?;
+    if out.len() as u64 > PROBE_OUTPUT_LIMIT || err.len() as u64 > PROBE_OUTPUT_LIMIT {
+        return None;
+    }
+    child.exited().await.ok()?;
+    Some((child.finish().await.ok()?.success(), out, err))
+}
+
+const MUSE_NONINTERACTIVE_ENV: [(&str, &str); 3] = [
+    ("MUSE_NO_AUTO_UPDATE", "1"),
+    ("MUSE_LOGIN", "0"),
+    ("MUSE_LAUNCHER_INSTALL", "0"),
+];
 
 pub async fn run(
     request: &HarnessRequest,
@@ -121,7 +239,7 @@ fn launch_spec(request: &HarnessRequest, read_only: bool, trust_workspace: bool)
     for name in &request.mcp_env_vars {
         environment.remove(std::ffi::OsStr::new(name));
     }
-    environment.insert("MUSE_NO_AUTO_UPDATE".into(), "1".into());
+    environment.extend(MUSE_NONINTERACTIVE_ENV.map(|(key, value)| (key.into(), value.into())));
     Launch {
         command: CommandSpec {
             program: request
@@ -1039,6 +1157,92 @@ mod tests {
         assert!(handler.trust_path.lock().unwrap().is_none());
     }
 
+    #[test]
+    fn allowance_confirms_only_muse_account_usage() {
+        assert!(interpret_allowance(
+            true,
+            br#"{"schemaVersion":1,"allowance":{"tier":"Muse Code Everyday Usage"}}"#,
+            b"",
+        )
+        .is_ok());
+        for stdout in [
+            br#"{"schemaVersion":1,"reason":"api_key","allowance":null}"#.as_slice(),
+            br#"{"schemaVersion":1,"reason":"no_allowance","allowance":null}"#,
+            br#"{"schemaVersion":1,"allowance":{}}"#,
+            br#"{"schemaVersion":2,"allowance":{}}"#,
+            b"private harness diagnostic",
+        ] {
+            let detail = interpret_allowance(true, stdout, b"").unwrap_err();
+            assert!(!detail.contains("private harness diagnostic"));
+        }
+        assert!(interpret_allowance(
+            false,
+            b"",
+            b"muse usage: not logged in: run `muse login` first\n",
+        )
+        .unwrap_err()
+        .contains("muse login"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_checks_the_version_before_running_usage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ProbeDirectory::new().unwrap();
+        let executable = dir.0.join("fixture-muse");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+test "$MUSE_NO_AUTO_UPDATE:$MUSE_LOGIN:$MUSE_LAUNCHER_INSTALL" = 1:0:0 || exit 7
+if test "$1" = --version; then
+    printf 'Muse Code %s (fixture-build)\n' "$FIXTURE_VERSION"
+elif test "$1:$2" = usage:--json; then
+    : > "$FIXTURE_MARKER"
+    if test "$FIXTURE_HANG" = 1; then
+        exec sleep 30
+    fi
+    printf '{"schemaVersion":1,"allowance":{"tier":"fixture"}}\n'
+else
+    exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = dir.0.join("usage-called");
+        for (version, signed_in) in [("1.4.12", None), ("1.4.13", Some(true))] {
+            let environment = BTreeMap::from([
+                ("MUSE_LAUNCHER_INSTALL".into(), "1".into()),
+                ("FIXTURE_VERSION".into(), version.into()),
+                ("FIXTURE_MARKER".into(), marker.clone().into_os_string()),
+                ("FIXTURE_HANG".into(), "0".into()),
+            ]);
+            let result = probe(&ProbeContext {
+                executable: executable.clone(),
+                environment,
+                timeout: Duration::from_secs(5),
+            })
+            .await;
+            assert_eq!(result.version.as_deref(), Some(version));
+            assert_eq!(result.signed_in, signed_in);
+            assert_eq!(marker.exists(), signed_in.is_some());
+        }
+        let environment = BTreeMap::from([
+            ("FIXTURE_VERSION".into(), "1.4.13".into()),
+            ("FIXTURE_MARKER".into(), marker.into_os_string()),
+            ("FIXTURE_HANG".into(), "1".into()),
+        ]);
+        let result = probe(&ProbeContext {
+            executable,
+            environment,
+            timeout: Duration::from_millis(250),
+        })
+        .await;
+        assert_eq!(result.signed_in, None);
+        assert!(result.detail.unwrap().contains("timed out"));
+    }
+
     #[tokio::test]
     async fn msp_maps_dialogs_denies_unoffered_approvals_and_streams_assistant_text() {
         let (client, server) = tokio::io::duplex(4096);
@@ -1246,14 +1450,7 @@ mod tests {
     async fn live_muse_msp_bridge() {
         use std::{fs, os::unix::fs::PermissionsExt};
 
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let root = Scratch(std::env::temp_dir().join(format!("muse-msp-{}", Uuid::new_v4())));
-        fs::create_dir(&root.0).unwrap();
+        let root = ProbeDirectory::new().unwrap();
         let workspace = root.0.join("workspace");
         fs::create_dir(&workspace).unwrap();
         let bridge = root.0.join("fixture");

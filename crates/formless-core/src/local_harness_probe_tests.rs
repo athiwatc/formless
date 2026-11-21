@@ -6,6 +6,12 @@ fn fixture() -> (ProbeDirectory, ProbeContext) {
     let path = root.0.join("fixture");
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,time,pathlib,subprocess
+if pathlib.Path(sys.argv[0]).name=='muse':
+    if sys.argv[1:]==['--version']:
+        print('Muse Code 1.4.24');sys.exit()
+    if sys.argv[1:]==['usage','--json']:
+        print(json.dumps({'schemaVersion':1,'allowance':{'tier':'fixture'}}));sys.exit()
+    sys.exit(7)
 if '--version' in sys.argv:
     if os.environ.get('PROBE_GATE'):
         gate=pathlib.Path(os.environ['PROBE_GATE'])
@@ -64,7 +70,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
-async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
+async fn list_probes_run_concurrently_and_report_muse_allowance() {
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -95,9 +101,12 @@ async fn list_probes_run_concurrently_and_other_kinds_only_lookup() {
         .iter()
         .all(|value| value.version.as_deref() == Some("fixture 1.0")
             && value.signed_in == Some(true)));
-    assert!(values[2..]
+    assert!(values[2..6]
         .iter()
         .all(|value| value.signed_in.is_none() && value.version.is_none()));
+    assert_eq!(values[6].kind, HarnessKind::Muse);
+    assert_eq!(values[6].version.as_deref(), Some("1.4.24"));
+    assert_eq!(values[6].signed_in, Some(true));
 }
 
 #[tokio::test]

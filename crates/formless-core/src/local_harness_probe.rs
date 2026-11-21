@@ -26,9 +26,9 @@ impl Default for ProbeContext {
     }
 }
 
-struct ProbeDirectory(PathBuf);
+pub(super) struct ProbeDirectory(pub(super) PathBuf);
 impl ProbeDirectory {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("formless-probe-{}", uuid::Uuid::new_v4()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -116,7 +116,7 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
     }
     None
 }
-fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
+pub(super) fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
     HarnessAvailability {
         kind,
         acp_agent: None,
@@ -276,7 +276,7 @@ async fn dispatch(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability 
         HarnessKind::OpenCode => availability(kind, Some(&ctx.executable)),
         HarnessKind::Antigravity => availability(kind, Some(&ctx.executable)),
         HarnessKind::Acp => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Muse => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Muse => super::muse::probe(ctx).await,
     }
 }
 async fn probe_environment(
