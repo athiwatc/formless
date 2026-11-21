@@ -149,6 +149,9 @@ pub fn rate_limits() -> HashMap<String, Value> {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ModelTest {
     pub model: String,
+    /// Model reported by the provider when it differs from the test target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
     pub ok: bool,
     /// A temporary transport/rate/server/deadline failure, eligible for a
     /// bounded background retry when the user already opted into auto tests.
@@ -1605,6 +1608,8 @@ impl Provider {
                 client.proxy(reqwest::Proxy::all(self.cfg.proxy.trim()).context("provider.proxy")?);
         }
         scoped.http = client.build()?;
+        // Streaming and prompt probes share the ordinary dispatch path.
+        // All physical sends in this scope stay on the requested model.
         scoped.cfg.fallback_models.clear();
         let prior = scoped.on_usage.clone();
         let observed = policy.clone();
@@ -2150,9 +2155,14 @@ impl Provider {
         model: &str,
         policy: crate::probe_policy::ProbePolicy,
     ) -> ModelTest {
+        let model = self.cfg.resolve_alias(model);
+        policy.verify_model(&model, &self.cfg.base_url);
         let started = std::time::Instant::now();
         let outcome = match self.scoped_probe(policy.clone()) {
-            Ok(scoped) => policy.run(scoped.test_model_inner(model)).await,
+            Ok(scoped) => {
+                let dispatch = scoped.resolved_dispatch(&model);
+                policy.run(dispatch.test_model_inner(&model, &policy)).await
+            }
             Err(error) => Err(error),
         };
         let mut result = outcome.unwrap_or_else(|error| ModelTest {
@@ -2166,10 +2176,27 @@ impl Provider {
         result.transient =
             model_test_failure_is_transient(&result, usage["deadline_exceeded"] == true);
         result.probe_usage = Some(usage);
+        if let Some(served) = policy.model_mismatch() {
+            result.ok = false;
+            result.transient = false;
+            result.first_token_ms = None;
+            result.streaming = false;
+            result.reasoning = false;
+            result.tool_calling = false;
+            result.prompt_fallback = false;
+            result.error = Some(format!("provider served model '{served}' during the test for '{model}'"));
+            result.served_model = Some(served);
+        }
         result
     }
 
-    async fn test_model_inner(&self, model: &str) -> ModelTest {
+    fn observe_probe_model(&self, response: &Value) {
+        if let Some(policy) = &self.probe_policy {
+            policy.observe_model(response);
+        }
+    }
+
+    async fn test_model_inner(&self, model: &str, policy: &crate::probe_policy::ProbePolicy) -> ModelTest {
         let mut t = ModelTest {
             model: model.to_string(),
             tested_at: chrono::Utc::now().to_rfc3339(),
@@ -2201,6 +2228,9 @@ impl Provider {
             t.error = Some(format!("{e:#}"));
             return t;
         }
+        if policy.model_mismatch().is_some() {
+            return t;
+        }
         t.first_token_ms = first;
         t.total_ms = Some(started.elapsed().as_millis() as u64);
         t.streaming = deltas > 1;
@@ -2219,6 +2249,9 @@ impl Provider {
             }
             r => r,
         };
+        if policy.model_mismatch().is_some() {
+            return t;
+        }
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
@@ -2258,10 +2291,26 @@ impl Provider {
     /// `GET /models`; on the Messages API every page of it
     /// (`has_more` / `after_id`), joined into one `data` list.
     async fn models_body(&self) -> Result<Value> {
+        Ok(self.models_body_with_completeness().await?.0)
+    }
+
+    /// The picker can display any result. The daily check requires an
+    /// authoritative listing before a missing entry is evidence.
+    pub(crate) async fn models_for_health_check(&self) -> Result<Option<Vec<String>>> {
+        let (body, complete) = self.models_body_with_completeness().await?;
+        let mut models = parse_models(&body);
+        models.retain(|model| !model.trim().is_empty());
+        let listed = body["data"].as_array().map_or(0, Vec::len);
+        Ok((complete && !models.is_empty() && models.len() == listed).then_some(models))
+    }
+
+    async fn models_body_with_completeness(&self) -> Result<(Value, bool)> {
         const MAX_PAGES: usize = 20;
         let mut auth = AuthRecovery::default();
         let mut all: Option<Value> = None;
         let mut after: Option<String> = None;
+        let mut complete = false;
+        let mut total = 0;
         for _ in 0..MAX_PAGES {
             let (resp, credential) = self
                 .send_authenticated(
@@ -2287,9 +2336,21 @@ impl Provider {
                     auth.detail()
                 ));
             }
+            let link_continues = resp
+                .headers()
+                .get_all(reqwest::header::LINK)
+                .iter()
+                .any(|header| header.to_str().is_ok_and(model_listing_link_continues));
             let page: Value = resp.json().await.context("parse /models")?;
             let more = self.cfg.anthropic() && page["has_more"] == true;
-            after = page["last_id"].as_str().map(str::to_string);
+            let next = page["last_id"].as_str().filter(|id| !id.is_empty());
+            let next_changed = next != after.as_deref();
+            let can_continue = more && next.is_some() && next_changed;
+            if can_continue {
+                after = next.map(str::to_owned);
+            }
+            total = total.max(model_listing_total(&page));
+            complete = !link_continues && !model_listing_continues(&page);
             match &mut all {
                 None => all = Some(page),
                 Some(a) => {
@@ -2299,7 +2360,7 @@ impl Provider {
                     }
                 }
             }
-            if !more || after.is_none() {
+            if !can_continue {
                 break;
             }
         }
@@ -2311,7 +2372,8 @@ impl Provider {
                 .flatten()
                 .filter_map(|m| Some((m["id"].as_str()?.to_string(), m["max_tokens"].as_u64()?))),
         );
-        Ok(body)
+        let complete = complete && (total == 0 || parse_models(&body).len() as u64 >= total);
+        Ok((body, complete))
     }
 
     /// Prices the endpoint's `/models` listing gives (OpenRouter's
@@ -2678,6 +2740,7 @@ impl Provider {
             };
             dispatch.post_chat_served(&mut body, effort).await?
         };
+        self.observe_probe_model(&v);
         let mut usage = Usage::parse(&v["usage"]);
         if let Some(usage) = &mut usage {
             usage.cost_unknown = unknown_cost && usage.cost.is_none();
@@ -3415,6 +3478,7 @@ impl Provider {
                                 }
                                 pending.clear();
                                 if let Ok(v) = parsed {
+                                    self.observe_probe_model(&v);
                                     // Error/incomplete events can carry usage too. Observe
                                     // before branches that retry or return, not just success.
                                     usage = Usage::parse(&v["usage"])
@@ -3755,6 +3819,7 @@ impl Provider {
                 let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
                     return;
                 };
+                self.observe_probe_model(&v);
                 match f.event(&v) {
                     crate::anthropic::Delta::Text(t) => on_delta(DeltaKind::Content, t),
                     crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
@@ -4787,6 +4852,59 @@ fn merge_tool_fragment(
     Ok(())
 }
 
+fn model_listing_link_continues(header: &str) -> bool {
+    header.split(',').any(|element| {
+        element.split(';').skip(1).any(|attribute| {
+            attribute.split_once('=').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("rel")
+                    && value
+                        .trim()
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .any(|relation| relation.eq_ignore_ascii_case("next"))
+            })
+        })
+    })
+}
+
+fn model_listing_continues(page: &Value) -> bool {
+    fn has_next(value: &Value) -> bool {
+        !value.is_null()
+            && value != false
+            && value.as_str() != Some("")
+            && value.as_u64() != Some(0)
+    }
+    [page, &page["pagination"], &page["links"]]
+        .into_iter()
+        .any(|object| {
+            ["has_more", "hasMore", "truncated", "incomplete"]
+                .iter()
+                .any(|key| object[*key] == true)
+                || [
+                    "next",
+                    "next_page",
+                    "nextPage",
+                    "next_cursor",
+                    "next_page_token",
+                    "nextPageToken",
+                ]
+                .iter()
+                .any(|key| has_next(&object[*key]))
+        })
+}
+
+fn model_listing_total(page: &Value) -> u64 {
+    [page, &page["pagination"]]
+        .into_iter()
+        .flat_map(|object| {
+            ["total", "total_count", "totalCount"]
+                .into_iter()
+                .filter_map(|key| object[key].as_u64())
+        })
+        .max()
+        .unwrap_or_default()
+}
+
 fn parse_models(body: &Value) -> Vec<String> {
     body["data"]
         .as_array()
@@ -5043,6 +5161,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
         }
         let (resp, _, _, permit) = p.post_provider(&mut b, None, false).await?;
         let v = completed_json(resp, permit, "parse probe response").await?;
+        p.observe_probe_model(&v);
         return Ok(!crate::anthropic::response_parts(&v).1.is_empty());
     }
     let mut body = if p.cfg.responses() {
@@ -5070,6 +5189,7 @@ async fn probe_tool_call(p: &Provider, model: &str, tool: &Value, forced: bool) 
     };
     let (resp, _, _, permit) = p.post_provider(&mut body, None, false).await?;
     let v = completed_json(resp, permit, "parse probe response").await?;
+    p.observe_probe_model(&v);
     if p.cfg.responses() {
         return Ok(!responses_tool_calls(&v).is_empty());
     }

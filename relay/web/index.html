@@ -47,6 +47,7 @@
     </nav>
     <div class="spacer"></div>
     <span id="conn" class="pill" aria-live="polite">connecting…</span>
+    <button id="conn-retry" class="btn small ghost" type="button" hidden>Retry now</button>
     <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log, 0 unread" aria-expanded="false" aria-controls="notes-panel">◔<span id="notes-badge" class="badge hidden" aria-hidden="true"></span></button>
     <select id="theme" aria-label="Theme" title="Theme">
       <option value="auto">Auto</option>
@@ -192,9 +193,9 @@
   <footer class="statusbar">
     <span id="state" class="state">● ready</span>
     <span class="sep">│</span><span id="status-session" class="strong"></span><span id="status-others" class="muted hidden"></span>
-    <span class="sep">│</span><span id="status-model" class="muted clickable" title="Change model (/model)"></span>
+    <span class="sep">│</span><button id="status-model" class="muted linkish" type="button" aria-haspopup="dialog" aria-label="Model unavailable. Choose model." title="Change model (/model)">Model unavailable</button>
     <span id="status-usage" class="muted"></span>
-    <span id="status-context" class="muted clickable hidden" title="Context window (/context)"></span>
+    <button id="status-context" class="muted linkish" type="button" hidden title="Context window (/context)"></button>
     <button id="status-approvals" class="warn linkish hidden" type="button" title="Show it (a)"></button>
     <span class="spacer"></span>
     <span id="status-note" class="muted note"></span>
@@ -206,6 +207,7 @@
   <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-body">
     <h2 id="modal-title"></h2>
     <div id="modal-body"></div>
+    <div id="modal-confirm" class="error broad-confirm" role="alert"></div>
     <div class="modal-actions">
       <span id="modal-more" class="muted"></span>
       <span class="spacer"></span>
