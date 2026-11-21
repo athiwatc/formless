@@ -169,6 +169,106 @@ pub fn command_spec_with_extension(
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const STDERR_LIMIT: usize = 8192;
 
+struct PiChild(tokio::process::Child);
+
+impl std::ops::Deref for PiChild {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PiChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PiChild {
+    fn terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            terminate_unix_tree(pid);
+        }
+        let _ = self.0.start_kill();
+    }
+}
+
+impl Drop for PiChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_tree(root: u32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // Retain the waitable leader's identity until group cleanup is complete.
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            root as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return;
+    }
+    unsafe {
+        libc::killpg(root as libc::pid_t, libc::SIGSTOP);
+    }
+    let mut stopped = vec![(root, root)];
+    let mut frontier = BTreeSet::from([root]);
+    // Freeze parents before discovering their children, so they cannot fork or reap them.
+    for _ in 0..64 {
+        let Ok(snapshot) = std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid=,ppid=,pgid="])
+            .output()
+        else {
+            break;
+        };
+        if !snapshot.status.success() {
+            break;
+        }
+        let mut next = BTreeSet::new();
+        for line in String::from_utf8_lossy(&snapshot.stdout).lines() {
+            let fields: Vec<u32> = line
+                .split_whitespace()
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            let [pid, parent, group] = fields.as_slice() else {
+                continue;
+            };
+            if !frontier.contains(parent) || *pid == root {
+                continue;
+            }
+            unsafe {
+                libc::kill(*pid as libc::pid_t, libc::SIGSTOP);
+                if pid == group {
+                    libc::killpg(*group as libc::pid_t, libc::SIGSTOP);
+                }
+            }
+            stopped.push((*pid, *group));
+            next.insert(*pid);
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    // Kill leaves first while their stopped parents still retain their PID identities.
+    for (pid, group) in stopped.into_iter().rev() {
+        unsafe {
+            if pid == group {
+                libc::killpg(group as libc::pid_t, libc::SIGKILL);
+            }
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
 pub async fn run(
     request: &HarnessRequest,
     staged_extension: &Path,
@@ -180,13 +280,26 @@ pub async fn run(
     }
     let spec = command_spec_with_extension(request, staged_extension)?;
     let mut command = tokio::process::Command::from(spec.command());
-    let mut child = command
-        .kill_on_drop(true)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to start Pi RPC process")?;
+    #[cfg(unix)]
+    {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            bail!("Pi process supervision requires waitable children");
+        }
+        command.process_group(0);
+    }
+    let mut child = PiChild(
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start Pi RPC process")?,
+    );
     let mut stdin = child.stdin.take().context("Pi stdin unavailable")?;
     let stdout = child.stdout.take().context("Pi stdout unavailable")?;
     let mut stderr = child.stderr.take().context("Pi stderr unavailable")?;
@@ -225,8 +338,8 @@ pub async fn run(
         result
     });
     let outcome = rpc_session(stdout, input, errors, &request.prompt, handler, cancel).await;
-    if outcome.is_err() && !cancel.is_cancelled() {
-        let _ = child.start_kill();
+    if outcome.is_err() {
+        child.terminate();
     }
     let write_result = match timeout(SHUTDOWN_TIMEOUT, &mut writer).await {
         Ok(result) => result
@@ -240,6 +353,7 @@ pub async fn run(
     let exit = match timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("failed waiting for Pi RPC process"),
         Err(_) => {
+            child.terminate();
             let _ = child.kill().await;
             Err(anyhow::anyhow!("Pi RPC process did not exit in time"))
         }
@@ -1024,6 +1138,80 @@ exec sleep 30
             .to_string()
             .contains("cancelled (abort timed out)"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess fixture for detached descendant cleanup"]
+    fn detached_sleep_fixture() {
+        use std::os::unix::process::CommandExt;
+        let path = std::env::var_os("PI_DETACHED_PID_FILE").expect("PI_DETACHED_PID_FILE");
+        assert!(unsafe { libc::setsid() } >= 0);
+        fs::write(path, std::process::id().to_string()).unwrap();
+        panic!("{}", std::process::Command::new("sleep").arg("60").exec());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_terminates_detached_sleep_on_cancel_and_drop() {
+        for drop_run in [false, true] {
+            let executable = std::env::current_exe().unwrap();
+            let body = format!(
+                r#"{START}
+'{executable}' --exact local_harness::pi::rpc_tests::detached_sleep_fixture --ignored > /dev/null 2>&1 &
+while [ ! -s detached.pid ]; do sleep 0.01; done
+printf '%s\n' '{confirm}'
+while IFS= read -r command; do :; done
+wait
+"#,
+                executable = executable.display(),
+                confirm = ui("confirm")
+            );
+            let (dir, extension, mut request) = fake_pi(&body);
+            request.environment.insert(
+                "PI_DETACHED_PID_FILE".into(),
+                dir.join("detached.pid").into_os_string(),
+            );
+            let handler = RecordingHandler::new(true, true);
+            let cancel = CancellationToken::new();
+            let mut execution = Box::pin(run(&request, &extension, &handler, &cancel));
+            tokio::select! {
+                result = &mut execution => panic!("Pi unexpectedly completed: {result:?}"),
+                _ = handler.asked.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("detached fixture did not start"),
+            }
+            let pid: libc::pid_t = fs::read_to_string(dir.join("detached.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+            if drop_run {
+                drop(execution);
+            } else {
+                cancel.cancel();
+                let error = timeout(Duration::from_secs(8), execution)
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("cancelled"));
+            }
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let status = std::process::Command::new("/bin/ps")
+                        .args(["-p", &pid.to_string(), "-o", "stat="])
+                        .output()
+                        .unwrap();
+                    let state = String::from_utf8_lossy(&status.stdout);
+                    if !status.status.success() || state.trim().starts_with('Z') {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("detached sleep survived Pi cleanup");
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[cfg(unix)]
