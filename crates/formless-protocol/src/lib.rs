@@ -761,6 +761,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     | "ruby"
                     | "php"
                     | "lua"
+                    | "julia"
                     | "tclsh"
                     | "wish"
                     | "expect"
@@ -3962,6 +3963,22 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn julia_require_broad_process_confirmation() {
+        for spec in [
+            "process:julia",
+            "process:julia1.10",
+            "process:/usr/bin/julia",
+            "process:julia.exe",
+            "process:julia:eval",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:juliaup", "process:julian", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
