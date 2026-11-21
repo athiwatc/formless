@@ -427,7 +427,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .statusbar .note { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .statusbar .note.err { color: var(--err); }
 .statusbar .err { color: var(--err); font-weight: 650; }
-#status-context.clickable { cursor: pointer; }
+#status-context { min-height: 1.5rem; }
 /* #1734: long Session, also-open and usage text wraps inside the status bar
    (long unbroken runs too) so the full string stays visible without hover. */
 #status-session, #status-others, #status-usage { white-space: normal; overflow-wrap: anywhere; min-width: 0; max-width: 100%; }
@@ -470,7 +470,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
   .transcript, .chat-head, .composer { padding-left: 1rem; padding-right: 1rem; }
   .compose-key-help { display: none; }
   .statusbar { padding: 0.3125rem 0.75rem; }
-  #status-model, #status-model + .sep, .statusbar .sep:nth-of-type(2) { display: none; }
+  .statusbar .sep:nth-of-type(2) { display: none; }
   .kv { grid-template-columns: 5.625rem minmax(0, 1fr); }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
 }
@@ -575,6 +575,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 
 /* /model picker */
 .modal.picker { max-width: 40rem; }
+.picker-current-model { white-space: normal; overflow-wrap: anywhere; }
 .picker-list { max-height: min(50vh, 26.25rem); overflow-y: auto; border: 1px solid var(--line); border-radius: 0.5rem; }
 .modal .picker-list li { display: flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.625rem; cursor: pointer; }
 .picker-list li.sel { background: var(--accent-soft); }
@@ -583,11 +584,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .picker-tag { font-size: 0.75rem; border: 1px solid var(--line); border-radius: 0.375rem; padding: 0 0.375rem; }
 .picker-list .muted { font-size: 0.75rem; }
 .picker-effort { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
-#status-model.clickable { cursor: pointer; }
-
-/* Connection pill: retry while offline */
-.pill.clickable { cursor: pointer; }
-.pill.clickable:hover { text-decoration: underline; }
+#status-model { min-width: 1.5rem; min-height: 1.5rem; max-width: min(100%, 28ch); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Content never widens the page: wide code and tables scroll in place */
 .md pre, .codeblock pre { overflow-x: auto; max-width: 100%; }
@@ -781,7 +778,7 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
   .chat-view { padding: 0; }
   .transcript, .chat-head, .composer { padding-left: 1rem; padding-right: 1rem; }
   .compose-key-help { display: none; }
-  #status-model, #status-model + .sep, .statusbar .sep:nth-of-type(2) { display: none; }
+  .statusbar .sep:nth-of-type(2) { display: none; }
   .kv { grid-template-columns: 5.625rem minmax(0, 1fr); }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
   .split { grid-template-columns: minmax(0, 1fr); }

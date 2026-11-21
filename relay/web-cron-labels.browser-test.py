@@ -16,7 +16,7 @@ from browser_fixture import chromium_executable
 ROOT = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument('--app', type=Path)
-parser.add_argument('--case', choices=['all', 'hourly', 'yearly'], default='all')
+parser.add_argument('--case', choices=['all', 'hourly', 'yearly', 'weekdays', 'hour-steps'], default='all')
 args = parser.parse_args()
 
 HOURLY = [('0 * * * *', 'every hour'), ('5 * * * *', 'every hour at minute 05'),
@@ -27,16 +27,37 @@ YEARLY = [('@yearly', 'every year on January 1 at 0:00'),
           ('0 0 1 1 *', 'every year on January 1 at 0:00'),
           ('0 9 1 1 *', 'every year on January 1 at 9:00'),
           ('5 9 1 1 *', 'every year on January 1 at 9:05')]
+WEEKDAYS = [('0 9 * * 1-5', 'every weekday at 9:00'),
+            ('0 9 * * MON-FRI', 'every weekday at 9:00'),
+            ('30 8 * * Sun', 'every Sunday at 8:30'),
+            ('0 9 * * mOn,wed,FRI', 'every Monday, Wednesday, Friday at 9:00'),
+            ('0 0 * * 0,7', 'every Sunday at 0:00'),
+            ('0 9 * * 1,1', 'every Monday at 9:00'),
+            ('5 9 * * 7,MON,0,1,SUN,Tue,2', 'every Sunday, Monday, Tuesday at 9:05'),
+            ('0 9 * * MON,XXX', '0 9 * * MON,XXX'),
+            ('0 9 1 * MON', '0 9 1 * MON'),
+            ('0 9 * * MON-FRI/2', '0 9 * * MON-FRI/2')]
+HOUR_STEPS = [('0 */2 * * *', 'every 2 hours'),
+              ('30 */6 * * *', 'every 6 hours at minute 30'),
+              ('5 */3 * * *', 'every 3 hours at minute 05'),
+              ('0 */1 * * *', 'every hour'), ('5 */1 * * *', 'every hour at minute 05'),
+              ('0 */7 * * *', 'every 7 hours starting at 0:00 each day'),
+              ('30 */7 * * *', 'every 7 hours starting at 0:30 each day'),
+              ('5 */24 * * *', 'every day at 0:05'),
+              ('0 */0 * * *', '0 */0 * * *'),
+              ('60 */2 * * *', '60 */2 * * *'),
+              ('0 */4294967296 * * *', '0 */4294967296 * * *'),
+              ('0 */2 * * MON', '0 */2 * * MON')]
 CONTROLS = [('@daily', 'every day at 0:00'), ('0 9 * * *', 'every day at 9:00'),
             ('@weekly', 'every Sunday at 0:00'), ('@monthly', 'on the 1st of each month at 0:00'),
-            ('*/15 * * * *', 'every 15 minutes'), ('0 9 * * 1-5', 'every weekday at 9:00'),
-            ('5 9 * * 0,7', 'every Sunday, Sunday at 9:05'),
+            ('*/15 * * * *', 'every 15 minutes'),
             ('0 9 1 * *', 'on day 1 of each month at 9:00'),
             ('0 9 2 1 *', '0 9 2 1 *'), ('0 9 1 2 *', '0 9 1 2 *'),
             ('0 9 1 1 1', '0 9 1 1 1'), ('0-5 * * * *', '0-5 * * * *'),
             ('every monday morning', 'every monday morning'), ('@unknown', '@unknown'),
             ('  0 9 * * *  ', 'every day at 9:00')]
-CASES = HOURLY if args.case == 'hourly' else YEARLY if args.case == 'yearly' else HOURLY + YEARLY + CONTROLS
+CASES = {'hourly': HOURLY, 'yearly': YEARLY, 'weekdays': WEEKDAYS, 'hour-steps': HOUR_STEPS,
+         'all': HOURLY + YEARLY + WEEKDAYS + HOUR_STEPS + CONTROLS}[args.case]
 
 
 class Quiet(http.server.SimpleHTTPRequestHandler):
