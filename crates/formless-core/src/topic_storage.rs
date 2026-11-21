@@ -728,13 +728,7 @@ impl Store {
                     "topic must be approved and not already running before its workflow can start"
                 );
             }
-            let workspace = topic.workspace.context("approved topic has no workspace")?;
-            st.conn
-                .execute(
-                    "INSERT INTO topic_repo_locks(workspace,topic_id,acquired_at) VALUES(?1,?2,?3)",
-                    params![workspace, topic_id, now()],
-                )
-                .context("workspace already has an active topic workflow")?;
+            topic.workspace.context("approved topic has no workspace")?;
             st.conn.execute(
                 "UPDATE topics SET status='running',updated_at=?2 WHERE id=?1",
                 params![topic_id, now()],
@@ -839,6 +833,13 @@ impl Store {
             let attempt=st.authenticate_topic_attempt(id,token)?;
             let mut outputs=outputs.to_vec();
             for artifact in &mut outputs {
+                if let TopicArtifact::Directory{path}=artifact{
+                    let root:Option<String>=st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1",[id],|row|row.get(0))?;
+                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
+                    let directory=if Path::new(path).is_absolute(){PathBuf::from(&*path)}else{root.join(&*path)}.canonicalize()?;
+                    if !directory.starts_with(&root)||!directory.is_dir(){bail!("directory output must be inside this attempt's private outputs directory");}
+                    *path=directory.to_string_lossy().into_owned();
+                }
                 if let TopicArtifact::File {path,sha256} = artifact {
                     let root: Option<String> = st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1", [id], |r|r.get(0))?;
                     let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;

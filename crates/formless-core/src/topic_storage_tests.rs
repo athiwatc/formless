@@ -96,6 +96,31 @@ fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
 }
 
 #[test]
+fn topic_isolated_workflows_can_share_a_source_workspace() {
+    let (store, source, _, mut request) = fixture();
+    let first = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&first.id).unwrap();
+    let message = store
+        .append_message(&source.id, "user", "Independent work")
+        .unwrap();
+    request.message_ids = vec![message.id];
+    request.name = "Other work".into();
+    let second = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&second.id).unwrap();
+    store.claim_topic_workflow(&first.id).unwrap();
+    store.claim_topic_workflow(&second.id).unwrap();
+    store.cancel_topic(&first.id).unwrap();
+    assert_eq!(
+        store.get_topic(&second.id).unwrap().unwrap().status,
+        TopicStatus::Running
+    );
+}
+
+#[test]
 fn topic_main_identity_is_non_creating_and_persistent() {
     let store = Store::open_in_memory().unwrap();
     assert!(!store.is_main_chat("unknown").unwrap());
