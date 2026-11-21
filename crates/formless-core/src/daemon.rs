@@ -2456,6 +2456,7 @@ impl Daemon {
             }
             Request::RetryRun {
                 session_id,
+                expected_run_id,
                 model,
                 keep_original,
             } => {
@@ -2465,6 +2466,15 @@ impl Daemon {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before retrying",
                     )));
+                }
+                if let Some(expected) = expected_run_id.as_deref() {
+                    let latest = self.with_store(|st| st.last_run(&session_id))?;
+                    if latest.as_ref().map(|(id, _)| id.as_str()) != Some(expected) {
+                        return Err(RequestFailure::invalid(
+                            "the latest Run changed; open Retry again",
+                        )
+                        .into());
+                    }
                 }
                 let cfg = self.config()?;
                 let model = model
@@ -3006,10 +3016,24 @@ impl Daemon {
                 } else {
                     "now"
                 };
-                Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
-                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
-                )
+                let mut response = json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                    "override_source": override_source, "effective_value": effective.setting_value(&key)?});
+                if matches!(
+                    key.as_str(),
+                    "provider.routing_models"
+                        | "provider.fallback_models"
+                        | "provider.routing_fast_models"
+                        | "provider.routing_strong_models"
+                        | "provider.aliases"
+                ) || key.starts_with("provider.aliases.")
+                {
+                    let warnings =
+                        crate::routing_policy::routing_subset_warnings(&effective.provider);
+                    if !warnings.is_empty() {
+                        response["routing_warnings"] = json!(warnings);
+                    }
+                }
+                Ok(response)
             }
             Request::RevokeApproval {
                 tool_id,
@@ -3152,7 +3176,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3195,17 +3219,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -6940,7 +6954,7 @@ impl Daemon {
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
                                     crate::provider::StructuredOutputError::InvalidJson { .. }
-                                        | crate::provider::StructuredOutputError::SchemaViolation
+                                        | crate::provider::StructuredOutputError::SchemaViolation { .. }
                                 )
                             )
                         })
@@ -7514,8 +7528,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
@@ -8518,6 +8532,7 @@ impl Daemon {
             }
         };
         if bootstrap {
+            builtin_progress.close();
             let elapsed_ms = started.elapsed().as_millis() as i64;
             let (ok, kind) = builtin_outcome(&tc.name, &text);
             let kind = if created_kind.is_empty() {
@@ -12272,9 +12287,10 @@ impl Daemon {
         let active = self.with_reader(|st| st.has_active_jobs()).ok()?;
         let stays = cfg.daemon.keep_alive_for_jobs || std::env::var_os(STAY_ENV).is_some();
         (active && !stays).then(|| {
-            "jobs run only while Formless is running (the daemon stops when idle). To run them \
-             on schedule, run `formless daemon install-service` (starts it at login) or set \
-             daemon.keep_alive_for_jobs = true (/settings or config.toml)."
+            "jobs run only while Formless is running (the daemon stops when idle). To prevent \
+             idle exit, install a login service with `formless daemon install-service` or set \
+             daemon.keep_alive_for_jobs = true (/settings or config.toml). Linux user services \
+             also need systemd lingering to continue after logout."
                 .to_string()
         })
     }
@@ -14443,6 +14459,7 @@ impl Daemon {
             let ops_dyn: Arc<dyn HostOps> = ops.clone();
             let outcome =
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
+            progress.close();
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
                 this.broadcast(Event::ToolCallFinished {
@@ -15710,6 +15727,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
@@ -15815,7 +15837,17 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        tokio::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let listener = tokio::net::UnixListener::bind(&sock)
+            .with_context(|| format!("bind {}", sock.display()))?;
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(&sock)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
+            bail!("socket ownership or permissions changed during bind");
+        }
+        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -15825,6 +15857,10 @@ impl Daemon {
                 _ = self.shutdown.cancelled() => break,
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if !unix_peer_is_owner(&stream) {
+                        tracing::warn!("rejecting Unix socket peer without owner credentials");
+                        continue;
+                    }
                     let this = self.clone();
                     tokio::spawn(async move { this.handle_conn(stream).await });
                 }
@@ -16487,6 +16523,12 @@ impl NestedOps {
     }
 }
 
+impl Drop for NestedOps {
+    fn drop(&mut self) {
+        self.progress.close();
+    }
+}
+
 impl HostOps for NestedOps {
     fn path_policy(
         &self,
@@ -16576,6 +16618,36 @@ impl HostOps for NestedOps {
                 depth: self.depth.saturating_sub(1),
                 fraction: value.fraction,
                 label: value.label,
+            });
+        }
+        if let Some(mut deadline) = update.flush_at {
+            let progress = Arc::downgrade(&self.progress);
+            let daemon = Arc::downgrade(&self.daemon);
+            let session_id = self.session_id.clone();
+            let run_id = self.run_id.clone();
+            let tool_name = self.tool_name.clone();
+            let depth = self.depth.saturating_sub(1);
+            self.handle.spawn(async move {
+                loop {
+                    tokio::time::sleep_until(deadline.into()).await;
+                    let (Some(progress), Some(daemon)) = (progress.upgrade(), daemon.upgrade())
+                    else {
+                        break;
+                    };
+                    let next = progress.flush_due(std::time::Instant::now(), |value| {
+                        daemon.broadcast(Event::ToolProgress {
+                            invocation_id: Some(progress.id.clone()),
+                            session_id: session_id.clone(),
+                            run_id: run_id.clone(),
+                            tool_name: tool_name.clone(),
+                            depth,
+                            fraction: value.fraction,
+                            label: value.label,
+                        });
+                    });
+                    let Some(next) = next else { break };
+                    deadline = next;
+                }
             });
         }
     }
@@ -16855,7 +16927,7 @@ impl HostOps for NestedOps {
         if matches!(
             &value,
             Err(crate::provider::StructuredOutputError::InvalidJson { .. }
-                | crate::provider::StructuredOutputError::SchemaViolation)
+                | crate::provider::StructuredOutputError::SchemaViolation { .. })
         ) {
             routing_call.claim_contract(identity.clone());
         }
@@ -17204,31 +17276,55 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
         ".npmrc",
         ".pypirc",
+        "credentials.tfrc.json",
+        ".terraformrc",
+        "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
         || name.ends_with(".p12")
         || name.ends_with(".pfx");
@@ -17409,9 +17505,59 @@ fn harness_target(op: &str, args: &Value) -> String {
     }
 }
 
+#[cfg(unix)]
+fn unix_peer_is_owner(stream: &tokio::net::UnixStream) -> bool {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    unix_peer_uid_matches(stream, uid)
+}
+
+#[cfg(unix)]
+fn unix_peer_uid_matches(stream: &tokio::net::UnixStream, uid: libc::uid_t) -> bool {
+    stream.peer_cred().is_ok_and(|peer| peer.uid() == uid)
+}
+
 #[cfg(test)]
 mod path_scope_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_is_private_and_owner_can_connect() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::path::Path::new("/tmp").join(format!("fl-ipc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _client = tokio::net::UnixStream::connect(paths.socket_path())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        assert!(unix_peer_is_owner(&peer));
+        let actual_uid = peer.peer_cred().unwrap().uid();
+        assert!(!unix_peer_uid_matches(&peer, actual_uid.wrapping_add(1)));
+        drop(listener);
+        drop(daemon);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn duplicate_constructor_is_rejected_before_database_config_or_upload_mutations() {

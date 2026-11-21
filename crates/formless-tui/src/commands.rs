@@ -738,6 +738,9 @@ const KEYS: &[(&str, &str)] = &[
     ("Tab / Shift+Tab", "switch views"),
     ("PgUp / PgDn", "scroll the chat"),
     ("PgUp / PgDn in a Settings form", "scroll the form without changing the active field"),
+    ("[ ]", "move Chat focus on empty input (non-Vim or Vim Normal)"),
+    ("Enter / F6 on focused Tool call", "toggle preview / view full stored input and result"),
+    ("c / C / Esc on Chat focus", "copy / copy as Markdown / leave focus"),
     ("↑ / ↓ (non-Vim composer)", "move within wrapped draft rows; browse Session history at the first/last row, including empty/one-line input"),
     (
         "j / k, g / G, Ctrl+D / Ctrl+U",

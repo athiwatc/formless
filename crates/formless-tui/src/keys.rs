@@ -179,10 +179,34 @@ pub fn table(view: View) -> &'static [Hint] {
 /// The hints that fit in `width` columns, highest-ranked first chosen,
 /// shown in table order: `Enter open · n new · d delete`.
 pub fn line(view: View, width: usize) -> String {
+    line_with_chat_focus(view, width, None)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ChatFocus {
+    Message,
+    Call,
+    Unavailable,
+}
+
+pub(crate) fn line_with_chat_focus(view: View, width: usize, focus: Option<ChatFocus>) -> String {
     let all = table(view);
-    let mut order: Vec<usize> = (0..all.len()).collect();
+    let mut order: Vec<usize> = (0..all.len())
+        .filter(|&i| {
+            !(view == View::Chat
+                && all[i].keys == "Enter"
+                && matches!(focus, Some(ChatFocus::Unavailable)))
+        })
+        .collect();
     order.sort_by_key(|&i| all[i].rank);
-    let item = |i: usize| format!("{} {}", all[i].keys, all[i].action);
+    let item = |i: usize| {
+        let action = match (view, all[i].keys, focus) {
+            (View::Chat, "Enter", Some(ChatFocus::Call)) => "toggle call",
+            (View::Chat, "Enter", Some(ChatFocus::Message)) => "show focus",
+            _ => all[i].action,
+        };
+        format!("{} {}", all[i].keys, action)
+    };
     let mut chosen: Vec<usize> = Vec::new();
     let mut used = 0;
     let show_more = list_footer_truncated(view, width);
