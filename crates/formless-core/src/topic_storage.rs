@@ -22,8 +22,11 @@ impl Store {
 
     pub(crate) fn resume_topic_attempt(&self, id: &str) -> Result<bool> {
         self.transaction(|st| {
-            let changed=st.conn.execute("UPDATE topic_attempts SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user' AND EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status='needs_user' AND t.status='running')",params![id,now()])?;
-            if changed>0 {st.conn.execute("UPDATE topic_features SET status='running',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;}
+            let changed=st.conn.execute("UPDATE topic_attempts SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user' AND EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status='needs_user' AND t.status IN ('running','needs_user'))",params![id,now()])?;
+            if changed>0 {
+                st.conn.execute("UPDATE topic_features SET status='running',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;
+                st.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE id=(SELECT topic_id FROM topic_attempts WHERE id=?1) AND status='needs_user' AND NOT EXISTS(SELECT 1 FROM topic_features f WHERE f.topic_id=topics.id AND f.active_attempt_id IS NOT NULL AND f.status='needs_user')",params![id,now()])?;
+            }
             Ok(changed>0)
         })
     }
@@ -570,7 +573,7 @@ impl Store {
             bail!("invalid topic attempt capability");
         }
         let attempt = topic_attempt(self, id)?.context("attempt not found")?;
-        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status='running')", [id], |r|r.get(0))?;
+        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status IN ('running','needs_user'))", [id], |r|r.get(0))?;
         if !matches!(
             attempt.status,
             TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
@@ -610,7 +613,7 @@ impl Store {
                     *path=file;
                 }
                 if let TopicArtifact::GitRevision {revision} = artifact {
-                    if revision.len()!=40 || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40-character SHA");}
+                    if !matches!(revision.len(),40|64) || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40- or 64-character SHA");}
                 }
             }
             let timestamp=now();

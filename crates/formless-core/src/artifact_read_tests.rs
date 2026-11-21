@@ -438,6 +438,136 @@ fn topic_fixture_proposal(
     }
 }
 
+#[test]
+fn topic_workspace_without_git_executable_is_directory() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let proposal = topic_fixture_proposal(&f, Some(f.root.clone()));
+    let topic = f
+        .daemon()
+        .propose_topic_with_git(&proposal, f.root.join("missing-git").as_os_str())
+        .unwrap();
+    assert_eq!(topic.workspace_kind, WorkspaceKind::Directory);
+    assert_eq!(topic.workspace, Some(f.root.canonicalize().unwrap()));
+    assert!(topic.base_revision.is_none());
+}
+
+#[test]
+fn topic_attachment_provenance_follows_nested_moves_and_topic_forks() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/inherited.txt");
+    std::fs::write(&file, b"inherited").unwrap();
+    let id = f.record(&file, 9, Some(&f.session));
+    let unrelated = f.record(&file, 9, Some(&f.session));
+    let (child, fork) = f
+        .daemon()
+        .with_store(|st| {
+            let message = st.append_message_meta(
+                &f.session,
+                "user",
+                "Inspect",
+                Some(json!({"attachments":[{"id":id,"path":file,"bytes":9}]}).to_string()),
+            )?;
+            let mut proposal = TopicProposalRequest {
+                parent_topic_id: None,
+                source_session_id: f.session.clone(),
+                message_ids: vec![message.id],
+                features: vec![],
+                name: "Parent".into(),
+                workspace: Some(f.root.clone()),
+                outline: vec![],
+            };
+            let parent = st.propose_topic(&proposal, WorkspaceKind::Directory, None)?;
+            let parent = st.approve_topic(&parent.id)?;
+            let session = parent.topic_session_id.unwrap();
+            let fork = st.fork_session(&session, None, None)?.unwrap();
+            proposal.source_session_id = session;
+            proposal.name = "Child".into();
+            let child = st.propose_topic(&proposal, WorkspaceKind::Directory, None)?;
+            Ok((
+                st.approve_topic(&child.id)?.topic_session_id.unwrap(),
+                fork.id,
+            ))
+        })
+        .unwrap();
+    let access = crate::attachment_access::AttachmentAccess::profile(&f.paths);
+    for session in [child, fork] {
+        let content = f
+            .daemon()
+            .read_artifact_impl(&session, &json!({"id":id}))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&content).unwrap()["text"],
+            "inherited"
+        );
+        let attachment =
+            json!({"id":id,"path":file,"bytes":9,"_source_session":session,"_source_seq":1});
+        assert_eq!(access.read(&attachment, 100).unwrap(), b"inherited");
+        f.daemon()
+            .with_reader(|st| {
+                let snapshot = crate::attachment_access::AttachmentAccess::snapshot(
+                    st,
+                    &[json!({"_attachments":[attachment]})],
+                )?
+                .unwrap();
+                assert_eq!(snapshot.read(&attachment, 100).unwrap(), b"inherited");
+                Ok(())
+            })
+            .unwrap();
+        assert!(f
+            .daemon()
+            .read_artifact_impl(&session, &json!({"id":unrelated}))
+            .is_err());
+        let mut wrong = attachment;
+        wrong["_source_seq"] = json!(2);
+        assert!(access.read(&wrong, 100).is_err());
+    }
+}
+
+#[tokio::test]
+async fn topic_parent_purge_stops_descendant_native_run_before_removal() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let proposal = topic_fixture_proposal(&f, None);
+    let topic = f.daemon().propose_topic_request(&proposal).unwrap();
+    let topic = f
+        .daemon()
+        .with_store(|st| st.approve_topic(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.unwrap();
+    let cancel = CancellationToken::new();
+    let flag = Arc::new(AtomicBool::new(false));
+    let (steer_tx, _) = mpsc::unbounded_channel();
+    f.daemon().runs.locked().insert(
+        session.clone(),
+        RunCtl {
+            run_id: "descendant-run".into(),
+            cancel: cancel.clone(),
+            cancel_flag: flag.clone(),
+            steer_tx,
+            steering: Arc::new(Default::default()),
+            retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
+        },
+    );
+    let daemon = f.daemon().clone();
+    let observed = cancel.clone();
+    let child = session.clone();
+    let stopped = tokio::spawn(async move {
+        observed.cancelled().await;
+        daemon.runs.locked().remove(&child);
+    });
+    f.daemon().purge_session(&f.session).await.unwrap();
+    stopped.await.unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(flag.load(Ordering::SeqCst));
+    assert!(f
+        .daemon()
+        .with_reader(|st| st.get_session(&session))
+        .unwrap()
+        .is_none());
+}
+
 #[tokio::test]
 async fn topic_fixture_workspace_classification_and_unavailable_start() {
     let env = crate::credential_env::EnvGuard::isolated();

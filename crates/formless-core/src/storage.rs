@@ -2040,16 +2040,25 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn delete_session(&self, id: &str) -> Result<bool> {
-        self.note_rewrite();
-        self.transaction(|st| {
-            let descendants=st.conn.prepare(
+    pub(crate) fn topic_session_family(&self, id: &str) -> Result<Vec<String>> {
+        let descendants = self
+            .conn
+            .prepare(
                 "WITH RECURSIVE family(id) AS (SELECT id FROM sessions WHERE id=?1 UNION
                  SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
                  WHERE s.session_kind IN ('topic','topic_attempt') UNION
                  SELECT t.topic_session_id FROM topics t JOIN family f ON t.source_session_id=f.id
-                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family"
-            )?.query_map([id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                 WHERE t.topic_session_id IS NOT NULL) SELECT id FROM family",
+            )?
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(descendants)
+    }
+
+    pub fn delete_session(&self, id: &str) -> Result<bool> {
+        self.note_rewrite();
+        self.transaction(|st| {
+            let descendants=st.topic_session_family(id)?;
             let mut deleted=false;
             for session_id in descendants {
                 st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
