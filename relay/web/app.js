@@ -702,8 +702,10 @@
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
     const first = opts.body && opts.body.querySelector("input, select, textarea");
+    // Long read-only content should start at its heading, not at footer actions.
+    if (opts.focusTitle) $("ask-form").scrollTop = 0;
     openDialog($("ask-backdrop"), { trigger: focusBefore["ask-backdrop"],
-      initialFocus: opts.input ? input : first || ok, onDismiss: () => closeAsk(null) });
+      initialFocus: opts.focusTitle ? $("ask-title") : opts.input ? input : first || ok, onDismiss: () => closeAsk(null) });
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
@@ -2114,7 +2116,7 @@
       const items = await request({ type: "list_harnesses" });
       if (channel !== S.channel) return;
       if (!Array.isArray(items)) throw new Error("Invalid harness status response");
-      await ask({ title: "Harness status", text: "Detected on your daemon’s machine. Installed does not guarantee an integrated adapter or a working sign-in. Formless asks before substituting another harness.", ok: "Close",
+      await ask({ title: "Harness status", focusTitle: true, text: "Detected on your daemon’s machine. Installed does not guarantee an integrated adapter or a working sign-in. Formless asks before substituting another harness.", ok: "Close",
         body: h("ul", { class: "topic-outputs" }, items.length ? items.map(item => h("li", null, h("strong", null, harnessLabel(item.kind), item.acp_agent ? " · " + item.acp_agent : ""),
           " · ", harnessAvailabilityLabel(item), item.version ? " · " + item.version : "", item.detail ? h("p", null, item.detail) : null)) : h("li", null, "No harnesses reported.")) });
     } catch (error) { if (channel === S.channel) toast("Harness status unavailable: " + error.message, true); }
