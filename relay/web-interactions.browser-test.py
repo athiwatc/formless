@@ -85,7 +85,7 @@ HOOK = r"""
     S.current="first";
     S.sessions=[session("first","First Session"),session("second","Second Session")];
     S.liveRun={id:"run-a",ended:true};
-    S.queued=[{id:7,content:"  first\r\nsecond  "}];
+    S.queued=[{id:7,revision:1,content:"  first\r\nsecond  "}];
     renderQueue();
     F.reply("list_models", {models:["first-model","other-model"]});
     F.reply("run_files", {run_id:"run-a",files:[{path:"fixture.txt",status:"modified",revertible:true}]});
@@ -468,7 +468,10 @@ def action_dialogs(page):
     expect(modal.get_by_text("Fixture question")).to_be_visible()
     modal.get_by_role("button", name="Cancel").click()
     expect(modal).to_be_hidden()
-    assert page.evaluate("__interaction.calls.find(x=>x.type==='edit_queued').content") == "  first\r\nsecond  "
+    assert page.evaluate("__interaction.calls.find(x=>x.type==='edit_queued_if_current')") == {
+        "type": "edit_queued_if_current", "session_id": "first", "id": 7,
+        "revision": 1, "content": "  first\r\nsecond  ",
+    }
 
     edit.click()
     expect(field).to_be_focused()
@@ -476,12 +479,12 @@ def action_dialogs(page):
     modal.get_by_role("button", name="Save").click()
     expect(modal).to_be_hidden()
     expect(edit).to_be_focused()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').at(-1).content") == "  edited\ntext  "
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').at(-1).content") == "  edited\ntext  "
     edit.click()
     field.fill("discard this edit")
     page.keyboard.press("Escape")
     expect(edit).to_be_focused()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').length") == 2
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').length") == 2
 
     rating = page.locator("#fixture-actions").get_by_role("button", name="👎")
     rating.click()
@@ -536,7 +539,7 @@ def action_dialogs(page):
     field.fill("stale queue edit")
     modal.get_by_role("button", name="Save").click()
     expect(modal).to_be_hidden()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued').length") == 2
+    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').length") == 2
 
 
 CASES = {
