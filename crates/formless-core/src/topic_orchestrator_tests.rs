@@ -11,7 +11,7 @@ use std::{
 fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
     std::fs::write(&path,r#"#!/usr/bin/env python3
-import sys,os,json,socket,pathlib,subprocess,hashlib,time
+import sys,os,json,socket,pathlib,subprocess,hashlib,time,shutil
 if '--version' in sys.argv:print('fixture 1.0');sys.exit()
 if sys.argv[1:]==['auth','status']:print(json.dumps({} if os.environ.get('TOPIC_FIXTURE_AUTH_UNKNOWN') else {'loggedIn':True}));sys.exit()
 if sys.argv[1:]==['login','status']:print('Logged in');sys.exit()
@@ -35,6 +35,27 @@ if mode=='permission':
 if mode=='question':
     answer=rpc({'operation':'ask_user','questions':[{'question':'Use the user-approved accounting inputs?','options':[{'label':'Yes'},{'label':'No'}]}]})
     assert answer[0]['selected']==['Yes']
+if mode in ('report_nonzero','report_dirty_nonzero','report_valid_file_nonzero','report_mutated_file','report_mutated_directory','report_wrong_revision','report_workspace_replaced'):
+    outputs=[]
+    target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'reported'
+    if mode in ('report_valid_file_nonzero','report_mutated_file'):
+        target.write_text('valid bytes')
+        outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
+    if mode=='report_mutated_directory':
+        target.mkdir();outputs=[{'kind':'directory','path':str(target)}]
+    if mode=='report_wrong_revision':
+        old=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+        pathlib.Path('change.txt').write_text('new commit')
+        subprocess.check_call(['git','add','change.txt'])
+        subprocess.check_call(['git','-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','new commit'])
+        outputs=[{'kind':'git_revision','revision':old}]
+    if mode=='report_dirty_nonzero':pathlib.Path('dirty.txt').write_text('uncommitted')
+    rpc({'operation':'report_result','status':'succeeded','summary':'reported success','outputs':outputs})
+    if mode=='report_mutated_file':target.write_text('changed after report')
+    if mode=='report_mutated_directory':target.rmdir();target.symlink_to(pathlib.Path.cwd(),target_is_directory=True)
+    if mode=='report_workspace_replaced':
+        workspace=pathlib.Path.cwd();os.chdir(workspace.parent);shutil.rmtree(workspace);workspace.symlink_to(target.parent,target_is_directory=True)
+    if mode in ('report_nonzero','report_valid_file_nonzero','report_dirty_nonzero'):sys.exit(9)
 if mode in ('report_release','report_dirty'):
     if mode=='report_dirty':pathlib.Path('uncommitted.txt').write_text('not a validated commit')
     rpc({'operation':'report_result','status':'succeeded','summary':'provisional result','outputs':[]})
@@ -889,7 +910,7 @@ async fn topic_retry_refuses_live_steps_after_normal_model_end_without_losing_re
 }
 
 #[tokio::test]
-async fn topic_reported_result_waits_for_exit_and_is_not_overwritten_by_validation_errors() {
+async fn topic_reported_result_cannot_complete_feature_before_exit_and_validation() {
     let env = crate::credential_env::EnvGuard::isolated();
     for dirty in [false, true] {
         env.set(
@@ -949,18 +970,106 @@ async fn topic_reported_result_waits_for_exit_and_is_not_overwritten_by_validati
             .wait_topic_steps(&session, &json!({"attempt_ids":[id]}), &cancel)
             .await
             .unwrap();
-        assert_eq!(done["status"], "succeeded");
-        assert_eq!(done["summary"], "provisional result");
-        assert_eq!(
-            state(&f, &topic.id).features[0].status,
-            TopicFeatureStatus::Pending
-        );
-        assert_eq!(
-            f.daemon()
-                .finish_topic_feature_tool(&session, &args, true)
-                .unwrap()["status"],
-            "complete"
-        );
+        assert_eq!(done["status"], if dirty { "failed" } else { "succeeded" });
+        if dirty {
+            assert!(done["summary"].as_str().unwrap().contains("clean worktree"));
+            assert!(done["outputs"].as_array().unwrap().is_empty());
+            assert!(state(&f, &topic.id).features[0].outputs.is_empty());
+        } else {
+            assert_eq!(done["summary"], "provisional result");
+            assert_eq!(
+                state(&f, &topic.id).features[0].status,
+                TopicFeatureStatus::Pending
+            );
+            assert_eq!(
+                f.daemon()
+                    .finish_topic_feature_tool(&session, &args, true)
+                    .unwrap()["status"],
+                "complete"
+            );
+        }
+        f.daemon().request_shutdown();
+        ipc.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn topic_harness_errors_after_success_still_require_daemon_output_validation() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for (mode, error) in [
+        ("report_nonzero", None),
+        ("report_valid_file_nonzero", None),
+        ("report_dirty_nonzero", Some("clean worktree")),
+        ("report_mutated_file", Some("SHA-256")),
+        (
+            "report_mutated_directory",
+            Some("directory output must be inside"),
+        ),
+        (
+            "report_wrong_revision",
+            Some("does not match workspace HEAD"),
+        ),
+        (
+            "report_workspace_replaced",
+            Some("Directory Write workspace must remain"),
+        ),
+    ] {
+        env.set("TOPIC_FIXTURE_MODE", mode);
+        let f = Fixture::new(&env);
+        script(&f, &env);
+        let workspace = if matches!(mode, "report_dirty_nonzero" | "report_wrong_revision") {
+            Some(repository(&f))
+        } else if mode == "report_workspace_replaced" {
+            let source = f.root.join("source");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("seed.txt"), "source").unwrap();
+            Some(source)
+        } else {
+            None
+        };
+        let topic = topic(&f, workspace, false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let ipc = tokio::spawn(f.daemon().clone().serve());
+        wait_until(|| f.paths.socket_path().exists()).await;
+        let done = f
+            .daemon()
+            .run_topic_step_until_done(
+                topic.topic_session_id.as_ref().unwrap(),
+                &step(
+                    &topic.features[0].id,
+                    HarnessKind::Claude,
+                    StepAccess::Write,
+                    &[],
+                ),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        if let Some(error) = error {
+            assert_eq!(done["status"], "failed", "{mode}: {done}");
+            assert!(
+                done["summary"].as_str().unwrap().contains(error),
+                "{mode}: {done}"
+            );
+            assert!(done["outputs"].as_array().unwrap().is_empty());
+            assert!(state(&f, &topic.id).features[0].outputs.is_empty());
+        } else {
+            assert_eq!(done["status"], "succeeded", "{mode}: {done}");
+            assert_eq!(done["summary"], "reported success");
+            assert_eq!(
+                done["outputs"].as_array().unwrap().len(),
+                usize::from(mode == "report_valid_file_nonzero")
+            );
+        }
+        assert!(state(&f, &topic.id).features[0].active_attempt_id.is_none());
+        if mode == "report_workspace_replaced" {
+            assert_eq!(
+                std::fs::read_to_string(f.root.join("source/seed.txt")).unwrap(),
+                "source"
+            );
+        }
         f.daemon().request_shutdown();
         ipc.await.unwrap().unwrap();
     }
