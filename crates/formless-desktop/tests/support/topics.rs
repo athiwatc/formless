@@ -164,6 +164,136 @@ fn topic_accept_and_cancel_emit_distinct_single_intents(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
+fn claimed_but_unstarted_topic_can_recover_then_retry_without_another_move(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let (_, mut topic) = fixture::topic_workspace();
+        topic.status = formless_protocol::TopicStatus::Running;
+        topic.attempts.clear();
+        for feature in &mut topic.features {
+            feature.status = formless_protocol::TopicFeatureStatus::Pending;
+        }
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![topic.clone()])),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        shell.update(cx, |s, _| s.take_client_commands());
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-detail-name")
+            .value()
+            .unwrap()
+            .contains("No harness attempt yet"));
+        assert!(window
+            .find("topic-recovery-help")
+            .value()
+            .unwrap()
+            .contains("does not move them again"));
+        assert!(window.try_find("topic-approve").is_none());
+        window.click("topic-recover", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(op),
+                    action,
+                    ..
+                } => Some((*op, action)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(operation, action)] = actions.as_slice() else {
+            panic!("one explicit recovery")
+        };
+        assert!(matches!(action, Action::Recover(id) if id == "topic-formless"));
+        topic.status = formless_protocol::TopicStatus::Approved;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(*operation),
+                    result: Ok(Reply::Topic(Box::new(topic))),
+                },
+                window,
+                cx,
+            );
+            assert!(s
+                .take_client_commands()
+                .iter()
+                .all(|c| !matches!(c, WireCommand::Topic { .. })));
+        });
+        window.render_frame(cx);
+        window.click("topic-start", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic { action, .. } => Some(action),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(actions.as_slice(), [Action::Start(id)] if id == "topic-formless"));
+    });
+}
+
+#[gpui_kit::test]
+fn rejected_selection_does_not_hide_the_next_main_chat_proposal(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let (_, mut rejected) = fixture::topic_workspace();
+        rejected.status = formless_protocol::TopicStatus::Rejected;
+        rejected.topic_session_id = None;
+        rejected.attempts.clear();
+        let mut pending = rejected.clone();
+        pending.id = "next-proposal".into();
+        pending.status = formless_protocol::TopicStatus::PendingApproval;
+        pending.name = "New X/Y proposal".into();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Topic(Box::new(rejected.clone()))),
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![rejected, pending])),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("main"));
+        assert!(window
+            .find("topic-consent")
+            .value()
+            .unwrap()
+            .contains("New X/Y proposal"));
+        assert!(window.find("topic-approve").visible());
+    });
+}
+
+#[gpui_kit::test]
 fn harness_topic_chat_does_not_block_editing_a_selected_regular_session(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     workspace(cx, handle, &shell);

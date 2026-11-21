@@ -122,3 +122,62 @@ fn failed_approval_and_unsupported_daemons_never_start_a_workflow() {
         .iter()
         .any(|u| matches!(u, Update::Topics { result: Err(_), .. })));
 }
+
+#[test]
+fn failed_start_preserves_the_move_receipt_and_recovery_never_approves_again() {
+    let mut e = engine();
+    let (_, mut topic) = crate::fixture::topic_workspace();
+    topic.status = formless_protocol::TopicStatus::Approved;
+    let operation = uuid::Uuid::new_v4();
+    e.command(command(
+        TopicAction::MoveAndStart(topic.id.clone()),
+        operation,
+    ));
+    let approve = e.outgoing.pop_front().unwrap();
+    assert!(matches!(approve.request, Request::ApproveTopic { .. }));
+    e.receive(ServerMessage::ok(
+        approve.id,
+        serde_json::to_value(&topic).unwrap(),
+    ))
+    .unwrap();
+    assert!(e.updates.iter().any(|u| matches!(u,
+        Update::Topics { operation: None, result: Ok(Reply::Topic(t)), .. }
+        if t.topic_session_id == topic.topic_session_id && t.status == formless_protocol::TopicStatus::Approved
+    )), "the committed move is visible even if launching later fails");
+    let start = e.outgoing.pop_front().unwrap();
+    assert!(matches!(start.request, Request::StartTopicWorkflow { .. }));
+    e.receive(ServerMessage::err(
+        start.id,
+        "no child was launched; recover before retrying".into(),
+    ))
+    .unwrap();
+    assert!(e.updates.iter().any(|u| matches!(u,
+        Update::Topics { operation: Some(op), result: Err(error), .. }
+        if *op == operation && error.starts_with("Workflow start failed.") && error.contains("no child was launched")
+    )));
+    assert!(
+        e.outgoing.is_empty(),
+        "start failures never replay a mutation"
+    );
+    e.command(command(
+        TopicAction::Recover(topic.id.clone()),
+        uuid::Uuid::new_v4(),
+    ));
+    let recover = e.outgoing.pop_front().unwrap();
+    assert!(matches!(recover.request, Request::RecoverTopic { .. }));
+    e.receive(ServerMessage::ok(
+        recover.id,
+        serde_json::to_value(&topic).unwrap(),
+    ))
+    .unwrap();
+    assert!(
+        e.outgoing.is_empty(),
+        "recovery does not automatically start or move"
+    );
+    e.command(command(TopicAction::Start(topic.id), uuid::Uuid::new_v4()));
+    assert!(matches!(
+        e.outgoing.pop_front().unwrap().request,
+        Request::StartTopicWorkflow { .. }
+    ));
+    assert!(e.outgoing.is_empty());
+}

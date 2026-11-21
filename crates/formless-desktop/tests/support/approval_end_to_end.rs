@@ -173,7 +173,7 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
     step(cx, handle, |window, cx| {
-        window.click(session_row_id(&f.session), cx)
+        open_saved_session(window, cx, &shell, &f.session)
     });
     until(cx, handle, &shell, "loaded Session", |s| {
         s.step_mode_enable_target().is_some()
@@ -364,7 +364,7 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
         s.sidebar().rows().iter().any(|r| r.id == f.session)
             && s.sidebar().rows().iter().any(|r| r.id == other)
     });
-    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
     until(cx, h, &s, "approval current Session", |s| {
         s.step_mode_enable_target().is_some()
     });

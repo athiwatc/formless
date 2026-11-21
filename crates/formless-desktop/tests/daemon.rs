@@ -237,6 +237,11 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::TopicSupport(supported) => format!("topic support {supported}"),
+                Update::Topics { result, .. } => format!("topic update ok={}", result.is_ok()),
+                Update::TopicCandidates { messages, .. } => {
+                    format!("topic candidates {}", messages.len())
+                }
                 Update::AttachmentStaged(outcome) => format!(
                     "attachment staging {}: errors={}",
                     outcome.session_id,
@@ -1374,7 +1379,8 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     until(
         &client,
         "stage-7",
-        |u| matches!(u, Update::Sessions(sessions) if sessions.len() == 4 && [&a,&b,&receipt.child_id].iter().all(|id|sessions.iter().any(|session|&session.id==*id))),
+        // Main Chat is created separately by the topic-enabled connection.
+        |u| matches!(u, Update::Sessions(sessions) if sessions.len() == 5 && [&a,&b,&receipt.child_id].iter().all(|id|sessions.iter().any(|session|&session.id==*id))),
     )
     .await;
 

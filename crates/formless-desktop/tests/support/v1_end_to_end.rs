@@ -311,7 +311,7 @@ fn exercise_v1_view(cx: &mut TestAppContext, retry: bool) {
         s.sidebar().rows().iter().any(|row| row.id == f.session)
     });
     step(cx, handle, |window, cx| {
-        window.click(session_row_id(&f.session), cx)
+        open_saved_session(window, cx, &shell, &f.session)
     });
     until(cx, handle, &shell, "mid-answer baseline", |s, _| {
         s.live_stream_owner().is_some() && s.block_count() == 1
@@ -555,7 +555,7 @@ fn native_step_mode_changes_reach_real_daemon_without_starting_work_and_preserve
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
         step(cx, handle, |window, cx| {
-            window.click(session_row_id(&f.session), cx)
+            open_saved_session(window, cx, &shell, &f.session)
         });
         until(cx, handle, &shell, "mode metadata", |s, _| {
             s.step_mode_enable_target().is_some()
@@ -661,7 +661,7 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
     step(cx, h, |window, cx| {
-        window.click(session_row_id(&f.session), cx)
+        open_saved_session(window, cx, &shell, &f.session)
     });
     until(cx, h, &shell, "model canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
@@ -783,7 +783,7 @@ fn native_model_catalog_read_fill_and_save_follow_real_daemon_without_starting_w
     until(cx, h, &s, "catalog Session list", |s, _| {
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
-    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
     until(cx, h, &s, "catalog canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
     });
@@ -898,7 +898,7 @@ fn native_pending_inventory_reads_shared_metadata_without_consuming_and_refreshe
     until(cx, h, &s, "pending Session", |s, _| {
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
-    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
     until(cx, h, &s, "pending canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
     });
@@ -1072,7 +1072,7 @@ fn native_composer_confirms_pending_files_and_retains_unknown_after_a_peer_chang
         until(cx, h, &s, "native review Session", |s, _| {
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
-        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
         until(cx, h, &s, "native review baseline", |s, _| {
             s.step_mode_enable_target().is_some()
         });
@@ -1361,7 +1361,7 @@ fn native_reference_confirmation_uses_real_ipc_and_unknown_never_replays(cx: &mu
         until(cx, h, &s, "reference Session", |s, _| {
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
-        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
         until(cx, h, &s, "reference baseline", |s, _| {
             s.step_mode_enable_target().is_some()
         });

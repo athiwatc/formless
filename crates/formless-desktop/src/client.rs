@@ -2953,7 +2953,13 @@ impl Engine {
                 if operation.is_none() && revision != self.topics_revision {
                     return Ok(());
                 }
-                let result = result.and_then(|v| action.decode(v));
+                let result = result.and_then(|v| action.decode(v)).map_err(|error| {
+                    if matches!(action, crate::topics::Action::Start(_)) {
+                        format!("Workflow start failed. {error}")
+                    } else {
+                        error
+                    }
+                });
                 if let Ok(crate::topics::Reply::Inventory(topics)) = &result {
                     // A fresh inventory can introduce a topic/harness transcript
                     // before its SessionUpdated event reaches this connection.
@@ -2978,6 +2984,15 @@ impl Engine {
                     {
                         // This continuation exists only for this explicit consent,
                         // never for a polled approval or a move-only operation.
+                        // Publish the committed move without completing the consent
+                        // operation: a failed start must not hide a successful move.
+                        self.dirty_list = true;
+                        self.dirty_session = true;
+                        self.updates.push(Update::Topics {
+                            connection: self.connection,
+                            operation: None,
+                            result,
+                        });
                         self.topic_command(operation, crate::topics::Action::Start(id.clone()));
                         return Ok(());
                     }

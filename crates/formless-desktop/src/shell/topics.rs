@@ -142,6 +142,9 @@ impl Shell {
                         Some("Updated from Formless. Nothing is merged automatically.".into());
                 }
                 self.topic_ui.state.apply(reply);
+                if approved.is_some() {
+                    self.topic_ui.proposing = false;
+                }
                 if let Some(main) = main {
                     if !self.client_sessions.iter().any(|s| s.id == main.id) {
                         self.client_sessions.push(main.clone());
@@ -651,12 +654,22 @@ impl Shell {
                             this.topic_action(Action::Start(id.clone()), cx)
                         })),
                 );
-            } else if topic.status == TopicStatus::Failed {
+            } else if topic.status == TopicStatus::Failed
+                || (topic.status == TopicStatus::Running && topic.attempts.is_empty())
+            {
+                panel = panel.child(
+                    readable(
+                        "topic-recovery-help",
+                        "If launch failed, recover the workflow claim before retrying. Requests stay in this topic; recovery does not move them again.",
+                    )
+                    .text_sm(),
+                );
                 panel = panel.child(
                     Button::new("topic-recover")
                         .small()
                         .outline()
                         .label("Recover topic")
+                        .tooltip("Release the workflow claim so you can retry starting. Requests are not moved again.")
                         .disabled(busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.topic_action(Action::Recover(id.clone()), cx)

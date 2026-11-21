@@ -129,6 +129,7 @@ pub fn status(topic: &TopicInfo) -> &'static str {
         TopicStatus::PendingApproval => "Awaiting approval",
         TopicStatus::Approved => "Ready to start",
         TopicStatus::Rejected => "Kept in main chat",
+        TopicStatus::Running if topic.attempts.is_empty() => "No harness attempt yet",
         TopicStatus::Running => "In progress",
         TopicStatus::Complete => "Ready for you",
         TopicStatus::Failed => "Needs attention",
@@ -166,7 +167,7 @@ impl State {
                 self.inventory_loaded = true;
             }
             Reply::Topic(topic) => {
-                self.selected = Some(topic.id.clone());
+                self.selected = (topic.status != TopicStatus::Rejected).then(|| topic.id.clone());
                 if let Some(old) = self.topics.iter_mut().find(|t| t.id == topic.id) {
                     *old = *topic;
                 } else {
@@ -178,7 +179,7 @@ impl State {
     pub fn selected(&self) -> Option<&TopicInfo> {
         self.topics
             .iter()
-            .find(|t| Some(&t.id) == self.selected.as_ref())
+            .find(|t| Some(&t.id) == self.selected.as_ref() && t.status != TopicStatus::Rejected)
     }
     /// Daemon suggestions use the same consent view as a manual proposal.
     /// Merely receiving a proposal never approves or starts it.
