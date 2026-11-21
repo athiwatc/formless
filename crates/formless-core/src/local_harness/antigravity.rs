@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 pub fn command_spec(_request: &HarnessRequest) -> Result<CommandSpec> {
-    Err(anyhow!("Antigravity CLI does not document per-attempt MCP server injection. This adapter will not modify global or workspace MCP configuration or launch without the requested MCP server. Choose another supported harness. See https://antigravity.google/docs/cli/reference/ and https://antigravity.google/docs/mcp/."))
+    Err(anyhow!("Antigravity headless mode (`agy -p`) has no documented per-invocation MCP server option, and its project `.agents/mcp_config.json` is static with no documented way to pass a per-run capability to a stdio server. This adapter will not modify global or workspace MCP configuration or launch without the requested MCP server. Choose another supported harness; per-session MCP needs an ACP client for `agy acp`, which Formless does not implement yet. See https://antigravity.google/docs/cli/reference/, https://antigravity.google/docs/mcp/ and https://antigravity.google/docs/ide/extensions/acp/."))
 }
 
 pub fn parse_output(output: &str) -> Result<HarnessResult> {
@@ -431,7 +431,8 @@ mod tests {
         let error = dispatch_command_spec(&request(&workspace.0))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("per-attempt MCP server injection"));
+        assert!(error.contains("no documented per-invocation MCP server option"));
+        assert!(error.contains("agy acp"));
         assert!(error.contains("Choose another supported harness"));
         assert!(error.contains("https://antigravity.google/docs/cli/reference/"));
         assert!(error.contains("https://antigravity.google/docs/mcp/"));
