@@ -1,5 +1,6 @@
 use super::*;
 use formless_desktop::preferences::{Settings, Store};
+use gpui_kit::component::ThemeMode;
 use std::path::PathBuf;
 
 struct Directory(PathBuf);
@@ -18,6 +19,64 @@ impl Drop for Directory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[gpui_kit::test]
+fn preferences_attachment_preserves_theme_without_saved_settings(cx: &mut TestAppContext) {
+    let directory = Directory::new();
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    step(cx, handle, |window, cx| {
+        for dark in [true, false] {
+            Theme::change(
+                if dark {
+                    ThemeMode::Dark
+                } else {
+                    ThemeMode::Light
+                },
+                Some(window),
+                cx,
+            );
+            for corrupt in [false, true] {
+                let path = directory.0.join(format!("{dark}-{corrupt}.json"));
+                if corrupt {
+                    std::fs::write(&path, b"invalid preferences").unwrap();
+                }
+                shell.update(cx, |shell, cx| {
+                    shell.attach_preferences(Store::open(path.clone()), window, cx)
+                });
+                assert_eq!(Theme::global(cx).is_dark(), dark);
+                assert_eq!(path.exists(), corrupt);
+            }
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn saved_theme_wins_over_initial_and_later_system_sync(cx: &mut TestAppContext) {
+    let directory = Directory::new();
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    step(cx, handle, |window, cx| {
+        for dark in [true, false] {
+            let path = directory.0.join(format!("{dark}.json"));
+            let settings = Settings::for_view(TextScale::DEFAULT, dark, true, true, true);
+            Store::open(path.clone()).save(settings).unwrap();
+            Theme::change(
+                if dark {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                },
+                Some(window),
+                cx,
+            );
+            shell.update(cx, |shell, cx| {
+                shell.attach_preferences(Store::open(path), window, cx);
+            });
+            assert_eq!(Theme::global(cx).is_dark(), dark);
+            shell.update(cx, |shell, cx| shell.sync_system_appearance(window, cx));
+            assert_eq!(Theme::global(cx).is_dark(), dark);
+        }
+    });
 }
 
 #[gpui_kit::test]

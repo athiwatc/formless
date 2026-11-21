@@ -142,7 +142,7 @@ pub fn render(files: &[ReviewFile], index: usize, color: bool) -> View {
         let label = format!(
             "{} {}",
             display_text(&file.status),
-            display_text(&file.path)
+            display_text(&crate::text::escape_approval_controls(&file.path))
         );
         let row = if let Some(reason) = &file.exclusion_reason {
             format!("{label} · excluded · {}", display_text(reason))
@@ -184,7 +184,7 @@ pub fn render(files: &[ReviewFile], index: usize, color: bool) -> View {
             let mut lines = vec![
                 Line::raw(format!(
                     "{} · hunk {}/{} · {}",
-                    display_text(&file.path),
+                    display_text(&crate::text::escape_approval_controls(&file.path)),
                     index.min(all.len() - 1) + 1,
                     all.len(),
                     display_text(&hunk.decision)
@@ -323,6 +323,17 @@ mod tests {
             .unwrap();
         assert_eq!(word.style.fg, None);
         assert!(word.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn review_paths_reveal_invisible_controls() {
+        let path = "src/config\u{200b}.toml";
+        let files = [file(path, None)];
+        let view = render(&files, 0, true);
+        for line in [&view.overview[1], &view.hunk[0]] {
+            assert!(line.to_string().contains("src/config⟨U+200B⟩.toml"));
+        }
+        assert_eq!(files[0].path, path);
     }
 
     #[test]

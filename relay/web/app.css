@@ -427,7 +427,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .statusbar .note { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .statusbar .note.err { color: var(--err); }
 .statusbar .err { color: var(--err); font-weight: 650; }
-#status-context.clickable { cursor: pointer; }
+#status-context { min-height: 1.5rem; }
 /* #1734: long Session, also-open and usage text wraps inside the status bar
    (long unbroken runs too) so the full string stays visible without hover. */
 #status-session, #status-others, #status-usage { white-space: normal; overflow-wrap: anywhere; min-width: 0; max-width: 100%; }
@@ -585,10 +585,6 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .picker-list .muted { font-size: 0.75rem; }
 .picker-effort { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
 #status-model { min-width: 1.5rem; min-height: 1.5rem; max-width: min(100%, 28ch); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-/* Connection pill: retry while offline */
-.pill.clickable { cursor: pointer; }
-.pill.clickable:hover { text-decoration: underline; }
 
 /* Content never widens the page: wide code and tables scroll in place */
 .md pre, .codeblock pre { overflow-x: auto; max-width: 100%; }

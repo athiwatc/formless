@@ -24,6 +24,7 @@ pub enum HistoryMove {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
+    MessageQueue,
     RunAction(crate::run_actions::Kind),
     /// The composer's primary action: Send, or Steer while a Run is going.
     Send,
@@ -164,7 +165,7 @@ impl Entry {
 pub const NO_COMPOSER: &str = "Only Chat has a composer";
 pub const COMPOSING: &str = "Finish composing text first";
 pub const NO_SECONDARY: &str =
-    "Queue is unavailable in this view or Run; native Queue requires Formless TUI";
+    "Queue needs an active Run and a current queue inventory; text-only review is required";
 pub const NO_RUN: &str = "No Run is in progress";
 pub const NO_RECOVERY: &str = "No confirmed paused or interrupted Run is available";
 pub const LARGEST: &str = "Text is already at its largest size";
@@ -188,7 +189,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         };
     }
     match command {
-        Command::RunAction(_) => &[],
+        Command::RunAction(_) | Command::MessageQueue => &[],
         Command::ToggleSessions => &[primary!("b")],
         Command::ToggleContext => &[primary!("alt-b")],
         Command::IncreaseTextSize => &[primary!("="), primary!("+")],
@@ -294,6 +295,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         commands.push(Command::SendSecondary);
     }
     commands.extend([
+        Command::MessageQueue,
         Command::Stop,
         Command::ResumeRun,
         Command::AbandonRun,
@@ -394,6 +396,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
         ),
         Command::ViewInvocations=>("Invocations", "View unfinished Tool Invocations".into(),Group::Navigation,"Read a Profile-wide snapshot of unfinished Tool work. No cancel, abandon or model call",None,if state.composing {Some(COMPOSING)}else{state.invocations_reason}),
         Command::OpenInvocationSession=>("Open Session", "Open selected Invocation's Session".into(),Group::Navigation,"Navigate to the available unarchived Session associated with the selected read-only record",None,if state.composing {Some(COMPOSING)}else{state.invocation_open_reason}),
+        Command::MessageQueue => ("Queue", "Manage queued follow-ups".into(), Group::Composer, "List, edit, reorder or remove queued messages", None, if state.composing {Some(COMPOSING)} else if state.can_edit_session && state.destination == Destination::Chat {None} else {Some("Open a connected Session in Chat first")}),
         Command::RunAction(kind) => (kind.label(), kind.label().into(), Group::Run, kind.help(), None, if state.composing { Some(COMPOSING) } else if state.can_edit_session && state.destination == Destination::Chat { None } else { Some("Open a connected Session in Chat first") }),
         Command::ReviewFork=>("Review fork", "Review a new Session fork".into(),Group::Session,"Review copying stored history into a new Session. Confirmation creates it; no model call or Run starts",None,if state.composing {Some(COMPOSING)}else{state.fork_reason}),
         Command::InspectRun => ("Inspect Run", "Inspect selected recorded Run".into(),Group::Navigation,"Read exact persisted Run status, counters and reported spend from Metrics. No Run control or model call",None,state.run_inspection_reason),

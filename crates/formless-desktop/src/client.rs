@@ -833,13 +833,14 @@ enum Pending {
         run_job: bool,
         add: Option<(String, String)>,
     },
-    RunReconcile(run_actions::Recovery),
+    RunReconcile(Box<run_actions::Recovery>),
     RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
         owner: crate::run_actions::Owner,
         operation: uuid::Uuid,
     },
     RunInspect(Box<run_actions::Work>),
+    QueueInventory(Box<run_actions::Work>, bool),
     RunForecast(Box<run_actions::Work>),
     RunConsent(Box<run_actions::Work>),
     RunCommitInspect(Box<run_actions::Work>),
@@ -1630,6 +1631,7 @@ impl Engine {
                 matches!(
                     p,
                     Pending::RunInspect(_)
+                        | Pending::QueueInventory(_, _)
                         | Pending::RunForecast(_)
                         | Pending::RunConsent(_)
                         | Pending::RunCommitInspect(_)
@@ -2574,6 +2576,7 @@ impl Engine {
                     Event::RunStarted { .. }
                         | Event::RunFinished { .. }
                         | Event::RunPaused { .. }
+                        | Event::QueueChanged { .. }
                         | Event::StepPending { .. }
                         | Event::StepResolved { .. }
                         | Event::SessionDeleted { .. }
@@ -2667,7 +2670,7 @@ impl Engine {
             return Ok(());
         };
         match pending {
-            Pending::RunReconcile(recovery) => self.run_reconciled(recovery, result),
+            Pending::RunReconcile(recovery) => self.run_reconciled(*recovery, result),
             Pending::RestoreSession(ticket) => {
                 let acknowledged = response_ok
                     && result
@@ -2693,6 +2696,7 @@ impl Engine {
                 }
             }
             Pending::RunInspect(w) => self.action_inspected(w, result, false),
+            Pending::QueueInventory(w, commit) => self.queue_inventory(w, result, commit),
             Pending::RunCommitInspect(w) => self.action_inspected(w, result, true),
             Pending::RunForecast(w) => self.action_forecast(w, result),
             Pending::RunConsent(w) => self.action_consented(w, result),

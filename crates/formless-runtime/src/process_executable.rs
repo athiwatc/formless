@@ -150,24 +150,34 @@ fn default_path() -> Result<OsString, String> {
     Ok(OsString::from_vec(bytes))
 }
 #[cfg(windows)]
-fn native_windows_dirs() -> Result<Vec<PathBuf>, String> {
+fn native_windows_directory(
+    get: unsafe extern "system" fn(*mut u16, u32) -> u32,
+) -> Result<PathBuf, String> {
     use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::{
-        GetSystemDirectoryW, GetWindowsDirectoryW,
-    };
+    let mut buffer = vec![0u16; 32768];
+    // SAFETY: native directory APIs receive a valid sized UTF-16 buffer.
+    let len = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
+}
+
+#[cfg(windows)]
+pub(super) fn native_windows_system_directory() -> Result<PathBuf, String> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    native_windows_directory(GetSystemDirectoryW)
+}
+
+#[cfg(windows)]
+fn native_windows_dirs() -> Result<Vec<PathBuf>, String> {
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
     let mut dirs = Vec::new();
     if let Some(parent) = std::env::current_exe().map_err(|e| e.to_string())?.parent() {
         dirs.push(parent.to_path_buf());
     }
-    for get in [GetSystemDirectoryW, GetWindowsDirectoryW] {
-        let mut buffer = vec![0u16; 32768];
-        // SAFETY: native directory APIs receive a valid sized UTF-16 buffer.
-        let len = unsafe { get(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-        if len == 0 || len >= buffer.len() {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        dirs.push(PathBuf::from(OsString::from_wide(&buffer[..len])));
-    }
+    dirs.push(native_windows_system_directory()?);
+    dirs.push(native_windows_directory(GetWindowsDirectoryW)?);
     Ok(dirs)
 }
 fn search(names: &[OsString], cwd: &Path, env: &ChildEnv) -> Result<Option<Program>, String> {

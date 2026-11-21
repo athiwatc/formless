@@ -1075,6 +1075,9 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | `emit(chunk)` | — | Stream large output to an artifact file |
 | `console.log`, `sleep`, `setTimeout`/`setInterval`/`clearTimeout`, `JSON`, `cryptoRandom()`, `randomBytes(n)` | — | Logging, timing and entropy |
 
+Windows Job and Tool notifications use the BurntToast module in Windows
+PowerShell and require an interactive login for the daemon account.
+
 A complete Tool:
 
 ```js

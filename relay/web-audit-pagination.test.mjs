@@ -11,9 +11,10 @@ function fn(name) {
 }
 const cursor = id => ({ cursor: id });
 function fixture() {
-  const calls = [], S = { ws: {}, channel: {} };
+  const calls = [], S = { ws: { readyState: 1 }, channel: {}, local: true, view: 'settings' };
   const c = vm.createContext({
     S,
+    $: () => ({ classList: { contains: () => false } }),
     request(req) {
       if (req.type !== 'list_audit') return Promise.resolve([]);
       return new Promise((resolve, reject) => calls.push({ req, resolve, reject }));
@@ -24,7 +25,9 @@ function fixture() {
   });
   vm.runInContext([
     'let auditRequest = null, auditOwner = null;',
-    ...['ownsAudit', 'loadAudit', 'refreshSettings'].map(fn),
+    source.slice(source.indexOf('  const settingsLists ='), source.indexOf('  function settingsConnectionReady')),
+    ...['ownsAudit', 'loadAudit', 'settingsConnectionReady', 'isSettingsConnection',
+      'refreshSettings', 'requestSettingsRefresh', 'drainSettingsRefresh', 'loadSettingsDomain'].map(fn),
   ].join('\n'), c);
   const ids = () => Array.from(S.audit || [], e => e.cursor);
   const refresh = async () => { const run = c.refreshSettings(); await tick(); return { run }; };
@@ -103,6 +106,7 @@ test('an old Settings traversal cannot start an audit request after reconnect', 
   f.c.request = req => req.type === 'list_mcp_servers'
     ? new Promise(resolve => { finish = resolve; }) : request(req);
   const refresh = f.c.refreshSettings();
+  await tick();
   f.S.ws = {};
   finish([]);
   await refresh;

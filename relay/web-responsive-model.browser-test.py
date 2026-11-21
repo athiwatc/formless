@@ -106,7 +106,7 @@ def main():
                 button.press('Enter')
                 picker = page.get_by_role('dialog', name='Model', exact=True)
                 expect(picker.get_by_text(f'Current selection: {OVERRIDE}', exact=True)).to_be_visible()
-                expect(picker.get_by_role('textbox', name='Filter models')).to_be_focused()
+                expect(picker.get_by_role('combobox', name='Filter models')).to_be_focused()
                 page.keyboard.press('Escape')
                 expect(picker).to_have_count(0)
                 expect(button).to_be_focused()
