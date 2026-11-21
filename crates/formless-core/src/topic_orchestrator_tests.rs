@@ -2324,3 +2324,120 @@ async fn topic_startup_retires_legacy_failed_kickoffs_but_preserves_resumable_ru
         );
     }
 }
+
+fn agy_script(f: &Fixture, env: &crate::credential_env::EnvGuard) {
+    let path = f.root.join("fake-agy");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import sys,os,json,subprocess,pathlib
+if sys.argv[1:2]==['models']:print('gemini-fixture');sys.exit()
+assert sys.argv[1:3]==['acp','--disable-telemetry'],sys.argv
+assert 'FORMLESS_TOPIC_CAPABILITY' not in os.environ
+mode=os.environ.get('TOPIC_FIXTURE_MODE','permission')
+def send(m):sys.stdout.write(json.dumps(m)+'\n');sys.stdout.flush()
+def read():
+    line=sys.stdin.readline()
+    if not line:sys.exit(0)
+    return json.loads(line)
+while True:
+    m=read();method=m.get('method')
+    if method=='initialize':send({'jsonrpc':'2.0','id':m['id'],'result':{'protocolVersion':1,'agentInfo':{'name':'Antigravity ACP Server','version':'1.5.14'},'authMethods':[]}})
+    elif method=='session/new':
+        bridge=m['params']['mcpServers'][0]
+        assert any(e['name']=='FORMLESS_TOPIC_CAPABILITY' and e['value'] for e in bridge['env'])
+        send({'jsonrpc':'2.0','id':m['id'],'result':{'sessionId':'agy-1'}})
+    elif method=='session/prompt':
+        prompt=m['id']
+        if mode=='hold':
+            subprocess.Popen(['sleep','120'])
+            pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
+            while read().get('method')!='session/cancel':pass
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'cancelled'}});continue
+        send({'jsonrpc':'2.0','id':900,'method':'session/request_permission','params':{'sessionId':'agy-1','toolCall':{'toolCallId':'call-1','kind':'edit','title':'Fixture write'},'options':[{'optionId':'allow','name':'Allow once','kind':'allow_once'},{'optionId':'deny','name':'Reject','kind':'reject_once'}]}})
+        outcome=read()['result']['outcome']
+        if outcome.get('optionId')=='allow':
+            send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'agy-1','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'fixture complete'}}}})
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'end_turn'}})
+        else:send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'cancelled'}})
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    env.set("FORMLESS_TOPIC_ANTIGRAVITY_EXE", &path);
+    env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permissions_and_cancel() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for mode in ["allow", "deny", "hold"] {
+        env.set(
+            "TOPIC_FIXTURE_MODE",
+            if mode == "hold" { "hold" } else { "permission" },
+        );
+        let f = Fixture::new(&env);
+        agy_script(&f, &env);
+        let topic = topic(&f, None, false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let session = topic.topic_session_id.clone().unwrap();
+        let args = step(
+            &topic.features[0].id,
+            HarnessKind::Antigravity,
+            StepAccess::Write,
+            &[],
+        );
+        let daemon = f.daemon().clone();
+        let task = tokio::spawn(async move {
+            daemon
+                .run_topic_step_until_done(&session, &args, &CancellationToken::new())
+                .await
+        });
+        if mode == "hold" {
+            wait_until(|| f.root.join("pid").exists()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            f.daemon()
+                .handle(Request::CancelTopic {
+                    topic_id: topic.id.clone(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(task.await.unwrap().unwrap()["status"], "cancelled");
+            let pid: i32 = std::fs::read_to_string(f.root.join("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            continue;
+        }
+        wait_until(|| !f.daemon().harness_permissions.locked().is_empty()).await;
+        let permission_id = f
+            .daemon()
+            .harness_permissions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        f.daemon()
+            .handle(Request::HarnessPermissionDecision {
+                permission_id,
+                option_id: Some(if mode == "allow" { "allow" } else { "deny" }.into()),
+            })
+            .await
+            .unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(
+            result["status"],
+            if mode == "allow" {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            "{result}"
+        );
+        assert!(f.daemon().harness_permissions.locked().is_empty());
+    }
+}

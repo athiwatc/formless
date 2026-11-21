@@ -883,6 +883,7 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
                 _ => None,
             },
             environment: BTreeMap::from([
@@ -959,11 +960,52 @@ impl Daemon {
                 bail!("OpenCode adapter not integrated yet; choose Claude or Codex")
             }
             HarnessKind::Antigravity => {
-                bail!("Antigravity adapter not integrated yet; choose Claude or Codex")
+                self.run_topic_acp(
+                    attempt,
+                    token,
+                    local_harness::antigravity::run,
+                    request,
+                    handler,
+                    cancel,
+                )
+                .await
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
             HarnessKind::Muse => bail!("Muse adapter not integrated yet; choose Claude or Codex"),
         }
+    }
+
+    async fn run_topic_acp(
+        self: &Arc<Self>,
+        attempt: &TopicAttemptInfo,
+        token: &str,
+        adapter: local_harness::acp::Adapter,
+        request: &HarnessRequest,
+        handler: &dyn InteractionHandler,
+        cancel: &CancellationToken,
+    ) -> Result<HarnessResult> {
+        {
+            let _launch = self.topic_launch.locked();
+            self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                bail!("step cancelled before launch");
+            }
+        }
+        let run_cancel = cancel.child_token();
+        let stop = run_cancel.clone();
+        let shutdown = self.shutdown.clone();
+        let watcher = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            stop.cancel();
+        });
+        let result =
+            local_harness::acp::run_interactive(adapter, request.clone(), handler, &run_cancel)
+                .await;
+        watcher.abort();
+        if self.shutdown.is_cancelled() {
+            bail!("daemon is shutting down");
+        }
+        result
     }
 
     async fn run_topic_cli(
