@@ -191,7 +191,7 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
             .and_then(terminal)
             .filter(|code| *code != 0)
         {
-            std::process::exit(code);
+            crate::exit_cli(code);
         }
     }
     Ok(())
