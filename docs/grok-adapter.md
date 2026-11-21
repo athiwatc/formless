@@ -25,11 +25,15 @@ grok --permission-mode default agent --no-leader stdio
 
 Read-only steps add `--sandbox read-only` before `agent`. The shared launcher
 must require plan mode (`session/set_config_option`, falling back to
-`session/set_mode`), fail if it cannot select it, and reject every tool kind
-except read/search/think/fetch. This profile supplies no bridge-tool exemption:
-Grok MCP `kind:other` calls, including those with `x.ai/tool.read_only:false`,
-must be rejected for read-only steps. Plan acknowledgement alone does not
+`session/set_mode`), fail if it cannot select it, and automatically reject
+edit/delete/move tools. Other kinds, including execute and Grok MCP `kind:other`
+calls with `x.ai/tool.read_only:false`, reach the supplied permission handler;
+`RejectAll` denies them when no user is available. This profile supplies no
+bridge-tool exemption: captured metadata identifies `namespace:grok_build` and
+`name:use_tool`, not a reliable MCP server identity. Plan acknowledgement alone does not
 establish read-only enforcement. On Linux the sandbox needs bubblewrap.
+Write steps retain Grok's default mode (`write_modes` is empty), matching the
+successful live write-turn captures; no additional client capabilities are needed.
 
 The shared ACP launcher owns per-session `session/new.mcpServers`, approval
 handling, cancellation, supervised descendant cleanup, successful `end_turn`

@@ -23,6 +23,8 @@ pub const SPEC: AgentSpec = AgentSpec {
     not_signed_in: AUTH_HINT,
     read_only_modes: &[READ_ONLY_MODE],
     read_only_fail_closed: true,
+    write_modes: &[],
+    client_capabilities: acp::no_extra_capabilities,
     strip_env: &[],
     set_env: &[("GROK_DISABLE_AUTOUPDATER", "1")],
     bridge_tool: acp::no_bridge_tools,
@@ -317,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_driver_review_falls_back_to_plan_and_denies_other_tools() {
+    fn shared_driver_review_falls_back_to_plan_and_routes_other_tools_to_handler() {
         for mode_result in [
             json!({"result":{}}),
             json!({"error":{"code":-32602,"message":"Invalid params"}}),
@@ -329,10 +331,10 @@ mod tests {
             lines.push(response.clone());
             lines.push(permission());
             finish(&mut lines, 4, "cancelled");
-            let mut handler = Choose(Some("allow-once"), 0);
+            let mut handler = Choose(Some("reject-once"), 0);
             let (result, sent) = drive_spec(HarnessRole::Review, lines, &mut handler);
             assert!(result.is_err());
-            assert_eq!(handler.1, 0);
+            assert_eq!(handler.1, usize::from(response.get("result").is_some()));
             assert_eq!(sent[2]["method"], "session/set_mode");
             assert_eq!(sent[2]["params"]["modeId"], "plan");
             if response.get("result").is_some() {
@@ -343,6 +345,30 @@ mod tests {
                     .iter()
                     .any(|message| message["method"] == "session/prompt"));
             }
+        }
+    }
+
+    #[test]
+    fn shared_driver_review_other_and_execute_require_handler_approval() {
+        for kind in ["other", "execute"] {
+            let mut lines = initialization();
+            lines.push(json!({"jsonrpc":"2.0","id":3,"result":{}}));
+            let mut permission = permission();
+            permission["params"]["toolCall"]["kind"] = json!(kind);
+            lines.push(permission);
+            finish(&mut lines, 4, "end_turn");
+            let mut handler = Choose(Some("allow-once"), 0);
+            let (result, sent) = drive_spec(HarnessRole::Review, lines.clone(), &mut handler);
+            assert!(result.is_ok());
+            assert_eq!(handler.1, 1);
+            assert!(sent.iter().any(|message| message["id"] == 90
+                && message["result"]["outcome"]["optionId"] == "allow-once"));
+
+            lines.last_mut().unwrap()["result"]["stopReason"] = json!("cancelled");
+            let (result, sent) = drive_spec(HarnessRole::Review, lines, &mut acp::RejectAll);
+            assert!(result.is_err());
+            assert!(sent.iter().any(|message| message["id"] == 90
+                && message["result"]["outcome"]["optionId"] == "reject-once"));
         }
     }
 
