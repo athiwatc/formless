@@ -206,7 +206,7 @@ impl Engine {
     }
     pub(super) fn action_inspected(
         &mut self,
-        work: Box<Work>,
+        mut work: Box<Work>,
         value: Result<Value, String>,
         commit: bool,
     ) {
@@ -229,7 +229,11 @@ impl Engine {
                     .reject("Forecast consent was not completed. Nothing was sent.");
                 return;
             }
-            self.request(a.request(), Pending::RunWrite(work));
+            if let Err(error) = work.dispatch.action.canonicalize_cwd() {
+                work.dispatch.reject(&error);
+                return;
+            }
+            self.request(work.dispatch.action.request(), Pending::RunWrite(work));
         } else if let Some(input) = a.forecast() {
             self.request(
                 Request::ForecastRun {
@@ -842,7 +846,13 @@ mod tests {
     fn prewrite_rejections_and_unchanged_cwd_fail_definitely() {
         for code in [Some(formless_protocol::codes::INVALID), None] {
             let (mut e, ledger, mut d) = setup(Kind::Cwd);
-            d.action.text = "/missing".into();
+            d.action.text = std::env::current_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .into();
             review(&mut e, d.clone(), false);
             e.command(Command::ConfirmRunAction(d.action.operation));
             e.command(Command::CommitRunAction(d.action.operation));
@@ -867,7 +877,14 @@ mod tests {
     #[test]
     fn canonical_recovery_requires_valid_state_and_never_replays_a_write() {
         let (mut e, ledger, mut d) = setup(Kind::Cwd);
-        d.action.text = "/persisted".into();
+        let directory = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        d.action.text = directory.clone();
         review(&mut e, d.clone(), false);
         e.command(Command::ConfirmRunAction(d.action.operation));
         e.command(Command::CommitRunAction(d.action.operation));
@@ -898,10 +915,72 @@ mod tests {
         assert!(e.outgoing.is_empty());
         e.recover_run_actions();
         let mut canonical = snapshot();
-        canonical["session"]["cwd"] = json!("/persisted");
+        canonical["session"]["cwd"] = json!(directory);
         reply(&mut e, canonical);
         assert_eq!(ledger.status(), Status::Reconciled);
         assert!(e.outgoing.is_empty());
+    }
+    #[test]
+    fn relative_cwd_is_sent_canonically_and_recovers_after_a_lost_ack() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .canonicalize()
+            .unwrap();
+        let directory = base.parent().unwrap().to_str().unwrap().to_string();
+        let (mut e, ledger, mut d) = setup(Kind::Cwd);
+        let mut before = snapshot();
+        before["session"]["cwd"] = json!(base.to_str().unwrap());
+        d.action.target = Target::decode("s", &before).unwrap();
+        d.action.text = " .. ".into();
+        e.command(Command::PrepareRunAction(d.clone()));
+        reply(&mut e, before.clone());
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, before.clone());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(
+            matches!(&request.request, Request::SetSessionCwd { id, cwd: Some(cwd) } if id == "s" && cwd == &directory)
+        );
+        assert!(e.action_before_write(request.id));
+        let recoveries = e.run_recoveries.clone();
+        drop(e);
+        assert_eq!(ledger.status(), Status::Unknown);
+        let (mut e, _, _) = setup(Kind::Cwd);
+        e.run_recoveries = recoveries;
+        e.recover_run_actions();
+        before["session"]["cwd"] = json!(directory);
+        assert!(matches!(reply(&mut e, before), Request::GetSession { .. }));
+        assert_eq!(ledger.status(), Status::Reconciled);
+        assert_eq!(e.reconciled_actions.len(), 1);
+        assert!(e.outgoing.is_empty());
+    }
+    #[test]
+    fn invalid_cwd_is_rejected_before_any_mutation_is_queued() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (input, reason) in [
+            ("..".to_string(), "absolute directory"),
+            (
+                root.join(uuid::Uuid::new_v4().to_string())
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                "Cannot resolve",
+            ),
+            (
+                root.join("Cargo.toml").to_str().unwrap().to_string(),
+                "must be a directory",
+            ),
+        ] {
+            let (mut e, ledger, mut d) = setup(Kind::Cwd);
+            d.action.text = input;
+            review(&mut e, d.clone(), false);
+            e.command(Command::ConfirmRunAction(d.action.operation));
+            e.command(Command::CommitRunAction(d.action.operation));
+            reply(&mut e, snapshot());
+            assert!(matches!(ledger.status(), Status::Rejected(e) if e.contains(reason)));
+            assert!(e.outgoing.is_empty());
+            assert!(e.run_recoveries.lock().unwrap().is_empty());
+        }
     }
     #[test]
     fn rejected_compaction_does_not_keep_history_locked() {

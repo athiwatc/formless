@@ -183,6 +183,40 @@ pub struct Action {
     pub text: String,
 }
 impl Action {
+    pub fn canonicalize_cwd(&mut self) -> Result<(), String> {
+        if self.kind != Kind::Cwd || self.text.trim().is_empty() {
+            return Ok(());
+        }
+        let input = std::path::Path::new(self.text.trim());
+        let path = if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            let base = self
+                .target
+                .cwd
+                .as_deref()
+                .map(std::path::Path::new)
+                .filter(|p| p.is_absolute())
+                .ok_or("Use an absolute directory when the Session working directory is unset.")?;
+            base.join(input)
+        };
+        let path = path
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve working directory: {e}"))?;
+        if !path.is_dir() {
+            return Err("Working directory must be a directory.".into());
+        }
+        self.text = path
+            .to_str()
+            .ok_or("Working directory is not valid UTF-8.")?
+            .to_string();
+        if !self.valid() {
+            return Err(
+                "Resolved working directory is oversized or contains control characters.".into(),
+            );
+        }
+        Ok(())
+    }
     pub fn valid(&self) -> bool {
         identity(&self.owner.session)
             && self.owner.session == self.target.session
