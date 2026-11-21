@@ -2257,8 +2257,8 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
     assert!(inventory.status.success());
     let text = String::from_utf8(inventory.stdout).unwrap();
     assert!(text.contains("subagent-ไทย-full-reusable-id"));
-    assert!(text.contains("Result: null"));
-    assert!(text.contains("Result: \"\""));
+    assert!(text.contains("Result: (not reported)"));
+    assert!(text.contains("Result: (empty)"));
     let before = fixture.requests.lock().unwrap().len();
     for selector in ["abc", "missing"] {
         let output = fixture.run(&["sessions", "subagents", selector]);
