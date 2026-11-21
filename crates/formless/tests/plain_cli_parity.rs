@@ -350,6 +350,8 @@ impl Fixture {
                         }
                         Request::SessionUsage { .. } => session_usage_report(),
                         Request::ContextUsage { .. } => session_context_report(),
+                        Request::ListMemories => json!([memory_note_for_display()]),
+                        Request::UpsertMemory { .. } => memory_note_for_display(),
                         Request::ListSubagents { session_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!([
@@ -2257,8 +2259,8 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
     assert!(inventory.status.success());
     let text = String::from_utf8(inventory.stdout).unwrap();
     assert!(text.contains("subagent-ไทย-full-reusable-id"));
-    assert!(text.contains("Result: null"));
-    assert!(text.contains("Result: \"\""));
+    assert!(text.contains("Result: (not reported)"));
+    assert!(text.contains("Result: (empty)"));
     let before = fixture.requests.lock().unwrap().len();
     for selector in ["abc", "missing"] {
         let output = fixture.run(&["sessions", "subagents", selector]);
@@ -2315,6 +2317,40 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+#[test]
+fn human_memory_list_add_and_edit_escape_stored_controls() {
+    let fixture = Fixture::new();
+    for args in [
+        &["memory", "list"][..],
+        &["memory", "add", "fixture"],
+        &["memory", "edit", "memory-fixture", "--disable"],
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(
+            text.contains("off") && text.contains("note\\u{d}\\u{1b}\\u{9b}\\u{202e}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("project:/fixture\\u{202e}") && text.contains("from session ไทย"),
+            "{text}"
+        );
+        assert!(!text.contains(['\r', '\u{1b}', '\u{9b}', '\u{202e}']));
+    }
+    let output = fixture.run(&["memory", "list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!([memory_note_for_display()])
+    );
+}
+
+fn memory_note_for_display() -> Value {
+    json!({"id":"memory-fixture","enabled":false,"scope":"project:/fixture\u{202e}","text":"note\r\u{1b}\u{9b}\u{202e}","session_id":"ไทยabcdef","author":"agent"})
 }
 
 #[test]
@@ -2454,9 +2490,9 @@ fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete
                 }
                 if status == "paused" {
                     assert!(
-                        text.contains("Known USD subtotal: 0.25")
+                        text.contains("Known USD subtotal: $0.250000")
                             && text.contains("Total USD: -")
-                            && text.contains("Spend complete: false")
+                            && text.contains("Spend complete: no")
                     );
                 }
             }
@@ -2539,6 +2575,14 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                     group.is_none() || group == Some("day")
                 );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
+                assert_eq!(
+                    text.lines()
+                        .last()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>(),
+                    ["TOTAL", "10", "12", "3", "-", "22", "-"]
+                );
                 let cost = |key| {
                     text.lines()
                         .find(|line| line.starts_with(key))

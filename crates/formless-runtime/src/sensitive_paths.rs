@@ -298,9 +298,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
             return Some("credential directory");
         }
         if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
+            || name.ends_with(".p8")
             || name.ends_with(".pem")
             || name.ends_with(".ppk")
             || name.ends_with(".key")
+            || name.ends_with(".jks")
+            || name.ends_with(".keystore")
         {
             return Some("credential-shaped filename");
         }
@@ -365,6 +368,7 @@ fn builtin(path: &Path) -> Option<&'static str> {
     ) || name == "credentials.toml"
         || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
+        || name.ends_with(".kdbx")
     {
         return Some("credential store file");
     }
@@ -512,6 +516,30 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn keepass_databases_are_sensitive_by_suffix() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for name in ["passwords.kdbx", "db.KDBX"] {
+            let path = root.join(name);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{name}"
+            );
+        }
+        for name in ["db.kdbx.lock", "notes.txt"] {
+            let path = root.join(name);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn composer_auth_file_is_classified_before_ordinary_config_files() {
         let root = std::env::temp_dir().join("formless-project");
