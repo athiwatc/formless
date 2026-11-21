@@ -1,5 +1,7 @@
 //! Keyboard/controller boundary for server-owned hunk reviews.
 use crate::*;
+use hunk_ui::ViewportMove;
+use unicode_segmentation::UnicodeSegmentation;
 
 impl App {
     pub(super) fn hunk_review_is_visible(&self) -> bool {
@@ -332,6 +334,7 @@ impl App {
                         styled: lines,
                         top: 0,
                         left: 0,
+                        viewport: Default::default(),
                     });
                 }
             }
@@ -342,26 +345,39 @@ impl App {
                         self.hunk_review.focus,
                         key.code == KeyCode::Char('n'),
                     );
-                    self.hunk_review.scroll = 0;
-                    self.hunk_review.left = 0;
+                    self.hunk_review.reset_viewport();
+                }
+            }
+            KeyCode::Char('N' | 'P') => {
+                if let Some(review) = &self.hunk_review.document {
+                    match hunk_view::navigate_pending(
+                        &review.files,
+                        self.hunk_review.focus,
+                        key.code == KeyCode::Char('N'),
+                    ) {
+                        Some(next) => {
+                            self.hunk_review.focus = next;
+                            self.hunk_review.reset_viewport();
+                        }
+                        None => self.notes.push("All hunks decided.".into()),
+                    }
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.hunk_review.scroll = self.hunk_review.scroll.saturating_add(1)
+                self.hunk_review.move_viewport(ViewportMove::Rows(1))
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.hunk_review.scroll = self.hunk_review.scroll.saturating_sub(1)
+                self.hunk_review.move_viewport(ViewportMove::Rows(-1))
             }
-            KeyCode::PageDown => {
-                self.hunk_review.scroll = self.hunk_review.scroll.saturating_add(15)
-            }
-            KeyCode::PageUp => self.hunk_review.scroll = self.hunk_review.scroll.saturating_sub(15),
-            KeyCode::Home => self.hunk_review.scroll = 0,
+            KeyCode::PageDown => self.hunk_review.move_viewport(ViewportMove::Rows(15)),
+            KeyCode::PageUp => self.hunk_review.move_viewport(ViewportMove::Rows(-15)),
+            KeyCode::Home => self.hunk_review.move_viewport(ViewportMove::Top),
+            KeyCode::End => self.hunk_review.move_viewport(ViewportMove::Bottom),
             KeyCode::Right | KeyCode::Char('l') => {
-                self.hunk_review.left = self.hunk_review.left.saturating_add(8)
+                self.hunk_review.move_viewport(ViewportMove::Columns(8))
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.hunk_review.left = self.hunk_review.left.saturating_sub(8)
+                self.hunk_review.move_viewport(ViewportMove::Columns(-8))
             }
             KeyCode::Char('c') if self.selected_review_ids().is_some() => {
                 self.hunk_review.comment = Some(input::InputLine::default())
@@ -435,7 +451,60 @@ impl App {
     }
 }
 
-pub(super) fn draw(f: &mut Frame, app: &App) {
+fn line_width(line: &Line<'_>, width: usize) -> usize {
+    line.styled_graphemes(Style::default())
+        .map(|grapheme| text::width(grapheme.symbol))
+        .filter(|&columns| columns <= width)
+        .sum()
+}
+
+fn clip_line_left(mut line: Line<'static>, mut columns: usize, width: usize) -> Line<'static> {
+    for span in &mut line.spans {
+        if columns == 0 {
+            break;
+        }
+        let mut end = 0;
+        for (offset, grapheme) in span.content.grapheme_indices(true) {
+            let cells = text::width(grapheme);
+            // Paragraph skips graphemes that cannot fit the entire pane.
+            if cells <= width {
+                columns = columns.saturating_sub(cells);
+            }
+            end = offset + grapheme.len();
+            if columns == 0 {
+                // Drop a partially hidden starting grapheme as a unit so
+                // it cannot displace the last column at the right edge.
+                break;
+            }
+        }
+        match &mut span.content {
+            std::borrow::Cow::Borrowed(text) => *text = &text[end..],
+            std::borrow::Cow::Owned(text) => drop(text.drain(..end)),
+        }
+    }
+    line
+}
+
+#[cfg(test)]
+#[test]
+fn hunk_horizontal_crop_reaches_the_last_cell_at_wide_and_large_offsets() {
+    let style = Style::default().add_modifier(Modifier::UNDERLINED);
+    let line = Line::from(vec![Span::raw("界界"), Span::styled("x", style)]);
+    let clipped = clip_line_left(line, 1, 4);
+    assert_eq!(clipped.to_string(), "界x");
+    assert_eq!(clipped.spans.last().unwrap().style, style);
+
+    let line = Line::raw("界x界z");
+    assert_eq!(line_width(&line, 1), 2);
+    let clipped = clip_line_left(line, 1, 1);
+    assert_eq!(line_width(&clipped, 1), 1);
+    assert!(clipped.to_string().ends_with('z'));
+
+    let line = Line::raw(format!("{}z", "x".repeat(70_000)));
+    assert_eq!(clip_line_left(line, 70_000, 1).to_string(), "z");
+}
+
+pub(super) fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Clear, area);
     let Some(document) = &app.hunk_review.document else {
@@ -459,12 +528,16 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
         return;
     };
     let view = hunk_view::render(&document.files, app.hunk_review.focus, app.color);
-    let comment = app.hunk_review.comment.as_ref();
+    let is_tool = document.tool_id.is_some();
     let overview_height = (view.overview.len() + document.warnings.len() + 2).min(8) as u16;
     let rows = Layout::vertical([
         Constraint::Length(overview_height),
         Constraint::Min(3),
-        Constraint::Length(if comment.is_some() { 6 } else { 5 }),
+        Constraint::Length(if app.hunk_review.comment.is_some() {
+            6
+        } else {
+            5
+        }),
     ])
     .split(area);
     let mut overview = view.overview;
@@ -476,7 +549,7 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(
         Paragraph::new(overview).block(ui::panel(
-            if document.tool_id.is_some() {
+            if is_tool {
                 " Tool draft · not saved "
             } else {
                 " Run file review "
@@ -486,35 +559,45 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
         )),
         rows[0],
     );
+    let block = ui::panel(
+        " Changed words are underlined · old / new line ",
+        app.color,
+        Color::Cyan,
+    );
+    let inner = block.inner(rows[1]);
+    let width = usize::from(inner.width.max(1));
+    let max_width = view
+        .hunk
+        .iter()
+        .map(|line| line_width(line, width))
+        .max()
+        .unwrap_or_default();
+    let state = &mut app.hunk_review;
     let max_scroll = view
         .hunk
         .len()
-        .saturating_sub(rows[1].height.saturating_sub(2) as usize);
+        .saturating_sub(usize::from(inner.height.max(1)));
+    state.layout_viewport(max_scroll, max_width.saturating_sub(width));
     let body = view
         .hunk
         .into_iter()
-        .skip(app.hunk_review.scroll.min(max_scroll))
+        .skip(state.scroll)
+        .take(usize::from(inner.height))
+        .map(|line| clip_line_left(line, state.left, width))
         .collect::<Vec<_>>();
-    f.render_widget(
-        Paragraph::new(body)
-            .scroll((0, app.hunk_review.left.min(u16::MAX as usize) as u16))
-            .block(ui::panel(
-                " Changed words are underlined · old / new line ",
-                app.color,
-                Color::Cyan,
-            )),
-        rows[1],
-    );
+    f.render_widget(Paragraph::new(body).block(block), rows[1]);
     let status = if let Some(error) = &app.hunk_review.error {
         format!("Server: {}", hunk_view::display_text(error))
     } else if app.hunk_review.busy {
         "Waiting for the server; closing does not cancel a dispatched action.".into()
     } else if view.total_hunks == 0 {
         "No editable text hunks. Excluded files remain listed above.".into()
+    } else if view.pending_hunks == 0 {
+        "All hunks decided.".into()
     } else {
         "Comments use server-derived path:line context; idle comments do not start a Run.".into()
     };
-    let footer = if let Some(comment) = comment {
+    let footer = if let Some(comment) = &app.hunk_review.comment {
         format!(
             "Comment on selected hunk · Enter send · Shift+Enter newline · Esc back\n{}{}",
             hunk_view::display_text(&comment.expanded()),
@@ -529,8 +612,8 @@ pub(super) fn draw(f: &mut Frame, app: &App) {
                 })
         )
     } else {
-        format!("n/p hunk · a keep · r reject · u undo · c comment · f all files\n↑↓ PgUp/PgDn scroll · ←→ horizontal · Esc close{}\n{}",
-            if document.tool_id.is_some() { " · Ctrl+S normal save" } else { "" },
+        format!("n/p hunk · N/P pending · a keep · r reject · u undo · c comment · f files\n↑↓ PgUp/PgDn Home/End · ←→ horizontal · Esc close{}\n{}",
+            if is_tool { " · Ctrl+S normal save" } else { "" },
             status)
     };
     f.render_widget(

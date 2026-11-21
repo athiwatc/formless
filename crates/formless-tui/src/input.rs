@@ -1,6 +1,8 @@
 //! The chat input (SPEC §10.2): a small multi-line editor with readline
 //! keys, collapsed large pastes and per-Session history.
 
+use std::ops::Range;
+
 /// Pastes longer than this many lines (or `PASTE_COLLAPSE_CHARS` chars)
 /// show as `[pasted N lines]` in the input; the full text is sent.
 const PASTE_COLLAPSE_LINES: usize = 8;
@@ -26,12 +28,20 @@ pub struct InputLine {
     visual_goal: Option<(usize, usize)>,
     /// Preferred display column across logical-line vertical moves.
     logical_goal: Option<usize>,
-    /// Placeholder shown in `text` -> the pasted text it stands for.
-    pastes: Vec<(String, String)>,
+    /// Owned placeholder ranges in `text`, ordered left to right.
+    pastes: Vec<PasteSegment>,
+    /// Display labels only. Undo can reuse a label from discarded history.
+    paste_sequence: usize,
     /// Browsing history: (index into the history, the draft to restore).
     browsing: Option<(usize, String, bool)>,
     /// Ctrl+R: the query and the history index it matched.
     search: Option<(String, Option<usize>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteSegment {
+    range: Range<usize>,
+    payload: String,
 }
 
 #[derive(Debug, Clone)]
@@ -39,15 +49,17 @@ struct EditSnapshot {
     literal: bool,
     text: String,
     cursor: usize,
-    pastes: Vec<(String, String)>,
+    pastes: Vec<PasteSegment>,
+    paste_sequence: usize,
     anchor: Option<usize>,
 }
 impl crate::text_history::Snapshot for EditSnapshot {
     fn retained_bytes(&self) -> usize {
         self.text
             .len()
-            .saturating_add(self.pastes.iter().fold(0usize, |n, (p, t)| {
-                n.saturating_add(p.len()).saturating_add(t.len())
+            .saturating_add(self.pastes.iter().fold(0usize, |n, paste| {
+                n.saturating_add(std::mem::size_of::<PasteSegment>())
+                    .saturating_add(paste.payload.len())
             }))
     }
 }
@@ -86,7 +98,7 @@ mod history_match;
 fn is_word(g: &str) -> bool {
     g.chars()
         .next()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || text::unspaced_symbol(c))
 }
 
 fn unspaced(g: &str) -> bool {
@@ -101,6 +113,7 @@ impl InputLine {
             text: self.text.clone(),
             cursor: self.cursor,
             pastes: self.pastes.clone(),
+            paste_sequence: self.paste_sequence,
             anchor: self.anchor,
             cut_unavailable: self.cut_unavailable,
             history_notice: self.history_notice,
@@ -113,6 +126,7 @@ impl InputLine {
             text: self.text.clone(),
             cursor: self.cursor,
             pastes: self.pastes.clone(),
+            paste_sequence: self.paste_sequence,
             anchor: self.anchor,
         }
     }
@@ -123,6 +137,7 @@ impl InputLine {
         self.text = s.text;
         self.cursor = s.cursor;
         self.pastes = s.pastes;
+        self.paste_sequence = s.paste_sequence;
         self.anchor = s.anchor;
         self.browsing = None;
         self.search = None;
@@ -283,11 +298,7 @@ impl InputLine {
             .unwrap_or(0);
     }
 
-    pub(crate) fn modal_replace(
-        &mut self,
-        range: std::ops::Range<usize>,
-        replacement: &str,
-    ) -> bool {
+    pub(crate) fn modal_replace(&mut self, range: Range<usize>, replacement: &str) -> bool {
         let boundary =
             |at| at == self.text.len() || self.text.grapheme_indices(true).any(|(i, _)| i == at);
         if range.start > range.end
@@ -298,8 +309,11 @@ impl InputLine {
             return false;
         }
         self.before_edit(false);
-        self.remove(range.start, range.end);
-        self.cursor = range.start;
+        if range.is_empty() {
+            self.cursor = range.start;
+        } else {
+            self.remove(range.start, range.end);
+        }
         self.insert_raw(replacement);
         self.anchor = None;
         self.search = None;
@@ -309,38 +323,31 @@ impl InputLine {
     /// Vim works on actual text. Expand paste placeholders before modal
     /// editing so a partial operator cannot strand or silently discard a paste.
     pub(crate) fn modal_expand_pastes(&mut self) {
-        let mut expanded = false;
-        for (placeholder, full) in std::mem::take(&mut self.pastes) {
-            if let Some(start) = self.text.find(&placeholder) {
-                let end = start + placeholder.len();
-                self.anchor = self.anchor.map(|at| {
-                    if at >= end {
-                        at - placeholder.len() + full.len()
-                    } else if at > start {
-                        start + full.len()
-                    } else {
-                        at
-                    }
-                });
-                self.cursor = if self.cursor >= end {
-                    self.cursor - placeholder.len() + full.len()
-                } else if self.cursor > start {
-                    start + full.len()
-                } else {
-                    self.cursor
-                };
-                self.text.replace_range(start..end, &full);
-                expanded = true;
-            }
-        }
-        if expanded {
-            self.visual_goal = None;
-            self.logical_goal = None;
-            self.snap_after_insert();
-            self.anchor = self.anchor.map(|at| self.boundary_at_or_after(at));
-        } else {
+        if self.pastes.is_empty() {
             self.clamp_modal_cursor(self.cursor);
+            return;
         }
+        self.cursor = self.expanded_offset(self.cursor);
+        self.anchor = self.anchor.map(|at| self.expanded_offset(at));
+        self.text = self.expanded();
+        self.pastes.clear();
+        self.visual_goal = None;
+        self.logical_goal = None;
+        self.snap_after_insert();
+        self.anchor = self.anchor.map(|at| self.boundary_at_or_after(at));
+    }
+
+    /// A position inside a placeholder maps to the end of its payload.
+    fn expanded_offset(&self, offset: usize) -> usize {
+        let mut expanded = offset;
+        for paste in &self.pastes {
+            if offset <= paste.range.start {
+                break;
+            }
+            expanded -= offset.min(paste.range.end) - paste.range.start;
+            expanded += paste.payload.len();
+        }
+        expanded
     }
 
     pub(crate) fn is_literal(&self) -> bool {
@@ -360,6 +367,7 @@ impl InputLine {
         self.text = s.to_string();
         self.cursor = self.text.len();
         self.pastes.clear();
+        self.paste_sequence = 0;
         self.browsing = None;
     }
 
@@ -377,11 +385,7 @@ impl InputLine {
     }
 
     pub fn expanded(&self) -> String {
-        let mut out = self.text.clone();
-        for (placeholder, full) in &self.pastes {
-            out = out.replacen(placeholder.as_str(), full, 1);
-        }
-        out
+        self.expanded_range(0, self.text.len())
     }
 
     pub fn before_cursor(&self) -> &str {
@@ -391,10 +395,7 @@ impl InputLine {
     pub fn insert_char(&mut self, c: char) {
         self.before_edit(c != '\n' && self.selection().is_none());
         self.remove_selection();
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.snap_after_insert();
-        self.browsing = None;
+        self.insert_raw(c.encode_utf8(&mut [0; 4]));
     }
 
     pub fn insert_str(&mut self, s: &str) {
@@ -425,29 +426,68 @@ impl InputLine {
     /// keep that neighbor and restore a full-text cursor boundary afterward.
     pub(crate) fn replace_modal_inserted(
         &mut self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         expected: &str,
         replacement: &str,
     ) -> bool {
         // Mouse/navigation breaks the insertion undo group. Even unchanged
         // bytes then belong to an old location, not the current repeat target.
-        if !self.history.coalesces(true) || self.text.get(range.clone()) != Some(expected) {
+        if !self.history.coalesces(true)
+            || self.text.get(range.clone()) != Some(expected)
+            || self
+                .pastes
+                .iter()
+                .any(|paste| range.start < paste.range.end && paste.range.start < range.end)
+        {
             return false;
         }
         self.before_edit(true);
-        self.text.replace_range(range.clone(), replacement);
-        self.cursor = range.start + replacement.len();
+        let start = range.start;
+        self.replace_raw(range, replacement);
+        self.cursor = start + replacement.len();
         self.anchor = None;
         self.snap_after_insert();
         self.browsing = None;
         true
     }
 
-    fn insert_raw(&mut self, s: &str) {
-        self.text.insert_str(self.cursor, s);
-        self.cursor += s.len();
+    fn insert_raw(&mut self, s: &str) -> usize {
+        // Readline movement can enter a placeholder without expanding it.
+        // Insert at the expanded payload's byte end before snapping the
+        // cursor, since expansion can join the next placeholder's cluster.
+        if let Some(index) = self
+            .pastes
+            .iter()
+            .position(|paste| paste.range.start < self.cursor && self.cursor < paste.range.end)
+        {
+            let paste = self.pastes.remove(index);
+            self.cursor = paste.range.start + paste.payload.len();
+            self.replace_raw(paste.range, &paste.payload);
+        }
+        let start = self.cursor;
+        self.replace_raw(start..start, s);
+        self.cursor = start + s.len();
         self.snap_after_insert();
         self.browsing = None;
+        start
+    }
+
+    /// Replace plain bytes or whole paste segments and rebase later ranges.
+    fn replace_raw(&mut self, range: Range<usize>, replacement: &str) {
+        let tail = range.start + replacement.len();
+        self.text.replace_range(range.clone(), replacement);
+        self.pastes.retain_mut(|paste| {
+            if paste.range.end <= range.start {
+                return true;
+            }
+            if paste.range.start < range.end {
+                debug_assert!(range.start <= paste.range.start && paste.range.end <= range.end);
+                return false;
+            }
+            paste.range =
+                (tail + (paste.range.start - range.end))..(tail + (paste.range.end - range.end));
+            true
+        });
     }
 
     /// Insertion can join neighbors on both sides. Keep the cursor after the
@@ -488,9 +528,19 @@ impl InputLine {
         let s = s.replace("\r\n", "\n").replace('\r', "\n");
         let lines = s.lines().count();
         if lines > PASTE_COLLAPSE_LINES || s.chars().count() > PASTE_COLLAPSE_CHARS {
-            let placeholder = format!("[pasted {lines} lines #{}]", self.pastes.len() + 1);
-            self.insert_raw(&placeholder);
-            self.pastes.push((placeholder, s));
+            self.paste_sequence += 1;
+            let placeholder = format!("[pasted {lines} lines #{}]", self.paste_sequence);
+            let start = self.insert_raw(&placeholder);
+            let index = self
+                .pastes
+                .partition_point(|paste| paste.range.start < start);
+            self.pastes.insert(
+                index,
+                PasteSegment {
+                    range: start..start + placeholder.len(),
+                    payload: s,
+                },
+            );
         } else {
             self.insert_raw(&s);
         }
@@ -588,20 +638,9 @@ impl InputLine {
         if start >= end {
             return;
         }
-        let mut start = start;
-        let mut end = end;
-        for (placeholder, _) in &self.pastes {
-            if let Some(at) = self.text.find(placeholder) {
-                if start < at + placeholder.len() && end > at {
-                    start = start.min(at);
-                    end = end.max(at + placeholder.len());
-                }
-            }
-        }
-        self.text.replace_range(start..end, "");
-        self.cursor = start;
-        let text = &self.text;
-        self.pastes.retain(|(p, _)| text.contains(p.as_str()));
+        let range = self.whole_paste_range(start..end);
+        self.cursor = range.start;
+        self.replace_raw(range, "");
         self.browsing = None;
     }
 
@@ -616,16 +655,6 @@ impl InputLine {
             return;
         }
         self.before_edit(false);
-        // A collapsed paste goes as one unit.
-        if let Some((p, _)) = self
-            .pastes
-            .iter()
-            .find(|(p, _)| self.text[..self.cursor].ends_with(p.as_str()))
-        {
-            let start = self.cursor - p.len();
-            self.remove(start, self.cursor);
-            return;
-        }
         let start = self.prev_boundary(self.cursor);
         self.remove(start, self.cursor);
     }
@@ -676,21 +705,37 @@ impl InputLine {
     fn expanded_range(&self, start: usize, end: usize) -> String {
         // Partial selection of a placeholder expands to that entire paste,
         // rather than copying an unusable fragment of its display label.
-        let mut start = start;
-        let mut end = end;
-        for (p, _) in &self.pastes {
-            if let Some(at) = self.text.find(p) {
-                if start < at + p.len() && end > at {
-                    start = start.min(at);
-                    end = end.max(at + p.len());
-                }
+        let range = self.whole_paste_range(start..end);
+        let mut out = String::with_capacity(range.len());
+        let mut at = range.start;
+        let first = self.pastes.partition_point(|paste| paste.range.end <= at);
+        for paste in &self.pastes[first..] {
+            if paste.range.start >= range.end {
+                break;
             }
+            out.push_str(&self.text[at..paste.range.start]);
+            out.push_str(&paste.payload);
+            at = paste.range.end;
         }
-        let mut text = self.text[start..end].to_string();
-        for (p, full) in &self.pastes {
-            text = text.replacen(p, full, 1);
+        out.push_str(&self.text[at..range.end]);
+        out
+    }
+
+    fn whole_paste_range(&self, mut range: Range<usize>) -> Range<usize> {
+        if range.is_empty() {
+            return range;
         }
-        text
+        let first = self
+            .pastes
+            .partition_point(|paste| paste.range.end <= range.start);
+        for paste in &self.pastes[first..] {
+            if paste.range.start >= range.end {
+                break;
+            }
+            range.start = range.start.min(paste.range.start);
+            range.end = range.end.max(paste.range.end);
+        }
+        range
     }
 
     fn kill_range(&mut self, start: usize, end: usize) {
@@ -731,8 +776,7 @@ impl InputLine {
         let base_literal = self.literal;
         self.before_edit(false);
         self.remove_selection();
-        let start = self.cursor;
-        self.insert_raw(&text);
+        let start = self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(0);
         // Track inserted bytes, not a cursor snapped across a neighboring cluster.
         self.yank = Some((start, start + text.len(), 0, base_literal));
@@ -755,7 +799,7 @@ impl InputLine {
         };
         self.before_edit(false);
         self.remove(start, end);
-        self.insert_raw(&text);
+        let start = self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(index + 1);
         self.yank = Some((start, start + text.len(), index + 1, base_literal));
         true
@@ -871,6 +915,13 @@ impl InputLine {
                     q.pop();
                 }
             }
+            *m = find_back(history, q, history.len());
+        }
+    }
+
+    pub(super) fn search_paste(&mut self, query: &str, history: &[impl AsRef<str>]) {
+        if let Some((q, m)) = &mut self.search {
+            q.push_str(query);
             *m = find_back(history, q, history.len());
         }
     }
@@ -1398,6 +1449,145 @@ mod tests {
     }
 
     #[test]
+    fn editing_collapsed_pastes_preserves_display_order_and_undo() {
+        let a = "A\n".repeat(10);
+        let b = "B\n".repeat(10);
+        let c = "C\n".repeat(10);
+        let d = "D\n".repeat(10);
+        let mut line = InputLine::default();
+        line.paste(&a);
+        line.paste(&b);
+        // These are the editor operations used by Ctrl+A and Ctrl+D.
+        line.home();
+        line.delete();
+        assert_eq!(line.expanded(), b);
+        line.paste(&c);
+        assert_eq!(line.expanded(), format!("{c}{b}"));
+        assert_eq!(&*line, "[pasted 10 lines #3][pasted 10 lines #2]");
+        assert_eq!(line.projection().expanded(), format!("{c}{b}"));
+
+        assert!(line.undo());
+        assert_eq!(line.expanded(), b);
+        assert!(line.undo());
+        assert_eq!(line.expanded(), format!("{a}{b}"));
+        assert!(line.redo());
+        assert!(line.redo());
+        assert_eq!(line.expanded(), format!("{c}{b}"));
+
+        assert!(line.undo());
+        line.paste(&d);
+        assert!(!line.redo());
+        assert_eq!(line.take(), format!("{d}{b}"));
+    }
+
+    #[test]
+    fn paste_labels_in_plain_text_and_payloads_stay_literal() {
+        let literal = "[pasted 10 lines #1]";
+        let first = format!("[pasted 10 lines #2]\n{}", "first\n".repeat(9));
+        let second = "second\n".repeat(10);
+        let mut line = InputLine::default();
+        for character in literal.chars() {
+            line.insert_char(character);
+        }
+        line.paste(&first);
+        line.paste(&second);
+        line.insert_str(literal);
+        assert_eq!(
+            line.expanded(),
+            format!("{literal}{first}{second}{literal}")
+        );
+        line.backspace();
+        assert_eq!(
+            line.expanded(),
+            format!("{literal}{first}{second}{}", &literal[..literal.len() - 1])
+        );
+        line.home();
+        line.delete();
+        let expected = format!(
+            "{}{first}{second}{}",
+            &literal[1..],
+            &literal[..literal.len() - 1]
+        );
+        assert_eq!(line.expanded(), expected);
+        line.prepare_selection(false);
+        assert_eq!(&*line, expected);
+        assert_eq!(line.cursor_byte(), 0);
+    }
+
+    #[test]
+    fn partial_paste_selection_cuts_only_the_owned_segment() {
+        let first = "ไทย\n".repeat(10);
+        let second = "second\n".repeat(10);
+        let literal = "前 [pasted 10 lines #1] ";
+        let mut line = InputLine::from(literal);
+        line.paste(&first);
+        line.paste(&second);
+        line.set_modal_cursor(literal.len() + 3);
+        line.anchor = Some(literal.len() + 1);
+        assert_eq!(line.selected_text().as_deref(), Some(first.as_str()));
+        assert_eq!(line.cut_selection().as_deref(), Some(first.as_str()));
+        assert_eq!(line.expanded(), format!("{literal}{second}"));
+        assert!(line.yank());
+        assert_eq!(line.expanded(), format!("{literal}{first}{second}"));
+        assert!(line.undo());
+        assert!(line.undo());
+        assert_eq!(line.selected_text().as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn insertion_inside_a_placeholder_preserves_its_payload() {
+        let first = "前\n".repeat(10);
+        let second = "👩🏽‍💻\n".repeat(10);
+        let mut line = InputLine::default();
+        line.paste(&first);
+        line.paste(&second);
+        line.home();
+        line.right();
+        line.insert_char('é');
+        assert_eq!(line.expanded(), format!("{first}é{second}"));
+        assert!(line.ends_with("[pasted 10 lines #2]"));
+        assert!(line.undo());
+        assert_eq!(line.before_cursor(), "[");
+        assert_eq!(line.expanded(), format!("{first}{second}"));
+    }
+
+    #[test]
+    fn expanding_a_paste_keeps_insertion_before_the_next_placeholder() {
+        let first = format!("{}\u{0600}", "A\n".repeat(9));
+        let second = "B\n".repeat(10);
+        let mut line = InputLine::default();
+        line.paste(&first);
+        line.paste(&second);
+        line.home();
+        line.right();
+        line.insert_char('é');
+        assert_eq!(line.expanded(), format!("{first}é{second}"));
+        assert_eq!(line.before_cursor(), format!("{first}é"));
+        assert!(line.ends_with("[pasted 10 lines #2]"));
+        assert!(line.undo());
+        assert_eq!(&*line, "[pasted 10 lines #1][pasted 10 lines #2]");
+        assert_eq!(line.expanded(), format!("{first}{second}"));
+    }
+
+    #[test]
+    fn paste_collapse_thresholds_and_newline_normalization_are_unchanged() {
+        for (payload, collapsed) in [
+            ("é\r\n".repeat(PASTE_COLLAPSE_LINES), false),
+            ("é\r".repeat(PASTE_COLLAPSE_LINES + 1), true),
+            ("é".repeat(PASTE_COLLAPSE_CHARS), false),
+            ("é".repeat(PASTE_COLLAPSE_CHARS + 1), true),
+        ] {
+            let mut line = InputLine::default();
+            line.paste(&payload);
+            assert_eq!(line.starts_with("[pasted "), collapsed);
+            assert_eq!(
+                line.take(),
+                payload.replace("\r\n", "\n").replace('\r', "\n")
+            );
+        }
+    }
+
+    #[test]
     fn history_keeps_the_draft() {
         let h = vec!["first".to_string(), "second".to_string()];
         let mut i = InputLine::from("draft");
@@ -1580,6 +1770,37 @@ mod tests {
         let mut i = InputLine::from("hello 世界");
         i.delete_word_back();
         assert_eq!(&*i, "hello 世");
+        for (first, second) in [
+            ("\u{30000}\u{e0100}", "\u{31350}"),
+            ("\u{3105}", "\u{3106}"),
+            ("\u{31f0}", "\u{31f1}"),
+            ("\u{1980}", "\u{1981}"),
+            ("\u{19e0}", "\u{19e1}"),
+            ("\u{1a20}", "\u{1a21}"),
+            ("\u{3190}", "\u{3191}"),
+            ("\u{31c0}", "\u{31c1}"),
+            ("\u{aa80}", "\u{aa81}"),
+        ] {
+            let source = format!("{first}{second}");
+            let mut input = InputLine::from(source.as_str());
+            input.word_left();
+            assert_eq!(input.cursor_byte(), first.len(), "{source}");
+            input.word_left();
+            assert_eq!(input.cursor_byte(), 0, "{source}");
+            input.word_right();
+            assert_eq!(input.cursor_byte(), first.len(), "{source}");
+            input.end();
+            input.delete_word_back();
+            assert_eq!(&*input, first, "{source}");
+        }
+        let mut hangul = InputLine::from("ㄱㄴ");
+        hangul.word_left();
+        assert_eq!(hangul.cursor_byte(), 0);
+        hangul.word_right();
+        assert_eq!(hangul.cursor_byte(), "ㄱㄴ".len());
+        let mut punctuation = InputLine::from("hello 世界。");
+        punctuation.delete_word_back();
+        assert_eq!(&*punctuation, "hello 世");
     }
     #[test]
     fn command_intent_is_part_of_undo_redo_and_transcript_history_snapshots() {
@@ -1619,7 +1840,10 @@ mod tests {
             assert!(line.undo());
             if backing {
                 line.text = "[pasted]".into();
-                line.pastes = vec![("[pasted]".into(), "x".repeat(16 * 1024 * 1024 + 1))];
+                line.pastes = vec![PasteSegment {
+                    range: 0..line.text.len(),
+                    payload: "x".repeat(16 * 1024 * 1024 + 1),
+                }];
             } else {
                 line.text = "x".repeat(16 * 1024 * 1024 + 1);
             }
