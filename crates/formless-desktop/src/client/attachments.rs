@@ -10,7 +10,10 @@ use std::path::PathBuf;
 pub const MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
 
 pub fn clipboard_bytes(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, String), String> {
-    if matches!(mime, "image/png" | "image/jpeg") {
+    if matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
         return Ok((bytes.to_vec(), mime.into()));
     }
     let format = image::ImageFormat::from_mime_type(mime).ok_or_else(|| {
@@ -363,6 +366,17 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_clipboard_formats_preserve_every_encoded_byte() {
+        let frames = b"encoded animation frames and metadata must not be decoded or flattened";
+        for mime in ["image/gif", "image/webp"] {
+            assert_eq!(
+                clipboard_bytes(frames, mime).unwrap(),
+                (frames.to_vec(), mime.into())
+            );
+        }
+    }
 
     #[test]
     fn clipboard_rasters_convert_to_png_and_invalid_images_report_errors() {
