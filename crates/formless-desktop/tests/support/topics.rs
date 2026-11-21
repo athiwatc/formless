@@ -154,6 +154,11 @@ fn topic_controls_require_explicit_user_actions_and_keep_failed_changes_unsaved(
             window.find("topic-notice").visible(),
             "a failed save must show its error without another scroll"
         );
+        assert_eq!(
+            window.find("topic-notice").value().as_deref(),
+            Some("topic control request is not implemented yet"),
+            "the visible feedback must show the failure, not the pending notice"
+        );
         assert_eq!(shell.read(cx).sidebar().active_id(), Some("topic-chat"));
         assert!(
             shell.update(cx, |s, _| s.take_client_commands()).is_empty(),
