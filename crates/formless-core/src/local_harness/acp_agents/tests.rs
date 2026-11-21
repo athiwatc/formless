@@ -281,7 +281,7 @@ agent_tests! {
     kiro: "kiro-cli", ["acp"], [];
     junie: "junie", ["--acp=true"], [];
     qwen: "qwen", ["--acp"], ["--approval-mode", "plan"];
-    kimi: "kimi", ["acp"], ["--plan"];
+    kimi: "kimi", ["acp"], [];
     vibe: "vibe-acp", [], [];
     auggie: "auggie", ["--acp"], [];
     goose: "goose", ["acp"], [];

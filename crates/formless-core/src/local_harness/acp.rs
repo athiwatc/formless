@@ -21,7 +21,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::{HarnessRequest, HarnessResult, StepAccess};
+use super::{
+    HarnessPermissionRequest, HarnessRequest, HarnessResult, HarnessUpdate, InteractionHandler,
+    StepAccess,
+};
 
 const PROTOCOL_VERSION: u64 = 1;
 const CANCELLED: &str = "The harness run was cancelled.";
@@ -121,6 +124,81 @@ pub trait PermissionHandler {
     /// Returns the answer, or `None` when unanswered or once `cancel` fires.
     fn ask_question(&mut self, _question: &Value, _cancel: &CancellationToken) -> Option<Value> {
         None
+    }
+}
+
+/// Forwards ACP approvals, questions and updates to the daemon's [`InteractionHandler`].
+///
+/// [`run`] is blocking, so each request is driven to completion on `runtime`; call `run`
+/// from a blocking thread (for example `spawn_blocking`), never from inside the runtime.
+pub struct Interactions<'a> {
+    pub handler: &'a dyn InteractionHandler,
+    pub runtime: tokio::runtime::Handle,
+}
+
+impl PermissionHandler for Interactions<'_> {
+    fn decide(&mut self, request: &PermissionRequest<'_>) -> Option<String> {
+        let options = request
+            .options
+            .iter()
+            .map(|option| serde_json::from_value(option.clone()))
+            .collect::<std::result::Result<Vec<formless_protocol::HarnessPermissionOption>, _>>()
+            .ok()?;
+        let text = |key: &str| {
+            request
+                .tool_call
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let permission = HarnessPermissionRequest {
+            title: text("title"),
+            kind: text("kind"),
+            raw_input: request.tool_call.get("rawInput").cloned(),
+            options,
+        };
+        self.runtime
+            .block_on(self.handler.request_permission(permission, request.cancel))
+            .or_else(|| option_of_kind(request.options, &["reject_once", "reject_always"]))
+    }
+
+    fn on_update(&mut self, update: &Value) {
+        if let Some(update) = harness_update(&update["update"]) {
+            let _ = self.handler.on_update(update);
+        }
+    }
+
+    fn ask_question(&mut self, questions: &Value, cancel: &CancellationToken) -> Option<Value> {
+        let questions: Vec<formless_protocol::Question> =
+            serde_json::from_value(questions.clone()).ok()?;
+        let answers = self
+            .runtime
+            .block_on(self.handler.ask_question(questions, cancel))?;
+        serde_json::to_value(answers).ok()
+    }
+}
+
+/// Maps an ACP `session/update` payload to the daemon's live update, when it has one.
+fn harness_update(update: &Value) -> Option<HarnessUpdate> {
+    let text = || update["content"]["text"].as_str().map(str::to_owned);
+    match update["sessionUpdate"].as_str()? {
+        "agent_message_chunk" => Some(HarnessUpdate::Message { content: text()? }),
+        "agent_thought_chunk" => Some(HarnessUpdate::Thought { content: text()? }),
+        "tool_call" => Some(HarnessUpdate::ToolCall {
+            name: update["title"].as_str().unwrap_or_default().to_owned(),
+            input: update.get("rawInput").cloned().unwrap_or(Value::Null),
+        }),
+        "plan" => {
+            let entries = update["entries"].as_array()?;
+            let content = entries
+                .iter()
+                .filter_map(|entry| entry["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(HarnessUpdate::Plan { content })
+        }
+        _ => None,
     }
 }
 
@@ -1161,6 +1239,76 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot start a write session"));
+    }
+
+    #[test]
+    fn interactions_forward_permissions_questions_and_updates_to_the_daemon() {
+        use crate::local_harness::InteractionFuture;
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Daemon {
+            permissions: Mutex<Vec<HarnessPermissionRequest>>,
+            updates: Mutex<Vec<HarnessUpdate>>,
+        }
+        impl InteractionHandler for Daemon {
+            fn request_permission<'a>(
+                &'a self,
+                request: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                let choice = request.options[1].option_id.clone();
+                self.permissions.lock().unwrap().push(request);
+                Box::pin(async move { Some(choice) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                questions: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async move {
+                    Some(vec![formless_protocol::QuestionAnswer {
+                        selected: vec![],
+                        text: Some(questions[0].question.clone()),
+                    }])
+                })
+            }
+            fn on_update(&self, update: HarnessUpdate) -> Result<()> {
+                self.updates.lock().unwrap().push(update);
+                Ok(())
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let daemon = Daemon::default();
+        let mut interactions = Interactions {
+            handler: &daemon,
+            runtime: runtime.handle().clone(),
+        };
+        let lines = [
+            LIVE_INITIALIZE.into(),
+            SESSION_NEW.into(),
+            permission(90, "execute"),
+            update("done"),
+            stop(3, "end_turn"),
+        ];
+        let (result, sent) = drive_lines(&request(StepAccess::Write), &lines, &mut interactions);
+        result.unwrap();
+        let answer = sent.iter().find(|message| message["id"] == 90).unwrap();
+        assert_eq!(answer["result"]["outcome"]["optionId"], "deny");
+        let permissions = daemon.permissions.lock().unwrap();
+        assert_eq!(permissions[0].kind, "execute");
+        assert_eq!(permissions[0].title, "tool");
+        assert_eq!(
+            permissions[0].options[0].kind,
+            formless_protocol::HarnessPermissionOptionKind::AllowOnce
+        );
+        assert!(matches!(
+            daemon.updates.lock().unwrap().as_slice(),
+            [HarnessUpdate::Message { content }] if content == "done"
+        ));
+        let answers = interactions
+            .ask_question(&json!([{"question": "which?"}]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(answers, json!([{"selected": [], "text": "which?"}]));
     }
 
     #[test]

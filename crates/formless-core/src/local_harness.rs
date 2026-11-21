@@ -154,11 +154,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
     }
     if matches!(
         request.kind,
-        HarnessKind::Pi
-            | HarnessKind::OpenCode
-            | HarnessKind::Antigravity
-            | HarnessKind::Acp
-            | HarnessKind::Muse
+        HarnessKind::Pi | HarnessKind::OpenCode | HarnessKind::Acp | HarnessKind::Muse
     ) {
         bail!(
             "{:?} adapter not integrated yet; use Claude or Codex for now",
@@ -574,7 +570,6 @@ mod access_tests {
             HarnessKind::Codex,
             HarnessKind::Pi,
             HarnessKind::OpenCode,
-            HarnessKind::Antigravity,
             HarnessKind::Acp,
             HarnessKind::Muse,
         ] {
@@ -620,5 +615,22 @@ mod access_tests {
                     .contains("adapter not integrated yet"));
             }
         }
+        let antigravity = HarnessRequest {
+            kind: HarnessKind::Antigravity,
+            acp_agent: None,
+            model: None,
+            cwd: std::env::current_dir().unwrap(),
+            prompt: "prompt".into(),
+            access: StepAccess::ReadOnly,
+            mcp_command: PathBuf::from("formless"),
+            mcp_args: vec![],
+            mcp_env_vars: vec![],
+            executable: None,
+            environment: BTreeMap::new(),
+        };
+        assert!(command_spec(&antigravity)
+            .unwrap_err()
+            .to_string()
+            .contains("local_harness::antigravity::run"));
     }
 }

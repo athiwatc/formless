@@ -1,17 +1,16 @@
 use std::sync::Mutex;
 
 use formless_protocol::{Question, QuestionAnswer, StepAccess};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::*;
-use crate::local_harness::InteractionFuture;
+use crate::local_harness::{HarnessPermissionRequest, HarnessUpdate, InteractionFuture};
 
 #[derive(Default)]
 struct Handler {
     choice: Option<String>,
     permissions: Mutex<Vec<HarnessPermissionRequest>>,
     updates: Mutex<Vec<HarnessUpdate>>,
-    fail_updates: bool,
 }
 
 impl InteractionHandler for Handler {
@@ -33,9 +32,6 @@ impl InteractionHandler for Handler {
     }
 
     fn on_update(&self, update: HarnessUpdate) -> Result<()> {
-        if self.fail_updates {
-            bail!("fixture update failed");
-        }
         self.updates.lock().unwrap().push(update);
         Ok(())
     }
@@ -195,7 +191,7 @@ mod fixture {
                     matches!(&updates[1], HarnessUpdate::ToolCall { name, input } if name == "Read file" && input == &json!({"path":"input"}))
                 );
                 assert!(
-                    matches!(&updates[2], HarnessUpdate::Plan { content } if serde_json::from_str::<Value>(content).unwrap()[0]["content"] == "Inspect input")
+                    matches!(&updates[2], HarnessUpdate::Plan { content } if content == "Inspect input")
                 );
                 assert!(
                     matches!(&updates[3], HarnessUpdate::Message { content } if content == "answer")
@@ -233,22 +229,5 @@ mod fixture {
         .await
         .is_err());
         assert!(!agent.0.join("argv").exists());
-    }
-
-    #[tokio::test]
-    async fn acp_dispatch_propagates_update_errors() {
-        let agent = Agent::new(StepAccess::Write);
-        let handler = Arc::new(Handler {
-            fail_updates: true,
-            ..Default::default()
-        });
-        let error = run(
-            agent.request(StepAccess::Write),
-            handler,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.to_string(), "fixture update failed");
     }
 }

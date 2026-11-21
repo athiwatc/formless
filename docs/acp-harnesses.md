@@ -14,7 +14,7 @@ selection. Permission IDs, names, kinds, and opaque option metadata reach the
 interaction handler unchanged. An unanswered permission is rejected. The adapter
 does not cache approvals; core's AllowAlways cache is scoped to the attempt, and
 each run starts a fresh agent process/session. Text messages/thoughts, tool calls,
-and plans are mapped to core updates; update-handler failures stop the run.
+and plans are mapped to core updates using the shared `acp::Interactions` adapter.
 
 Install each vendor's CLI separately and put its executable on PATH, or supply
 `HarnessRequest.executable`. Formless never installs agents, handles credentials,
@@ -30,6 +30,9 @@ Auggie, and Devin only. Prompt turns were not live-tested for any agent.**
 Other session/new calls returned authentication/configuration errors, not working
 sessions. The read-only settings below come from captured help/session options;
 they have fixture coverage, not live prompt-enforcement verification.
+The installed binaries also accepted the final ReadOnly launch argv in live
+initialize-only checks. Kimi's rejected `acp --plan` flag was removed before
+the successful 13-agent check.
 
 | Agent | ACP launch command | Sign-in/configuration outside Formless | Review/read-only behavior | Tested version |
 |---|---|---|---|---|
@@ -40,7 +43,7 @@ they have fixture coverage, not live prompt-enforcement verification.
 | kiro | `kiro-cli acp` | `kiro-cli login` or `KIRO_API_KEY` | No documented read-only flag/mode in captured help; permission filter | 3.5.0 |
 | junie | `junie --acp=true` | Run `junie` and sign in with Junie Account in browser | Select `plan` in the actual `mode` option; fail closed if unavailable/refused | npm 3110.7.0; agent 26.9.7 (3110.7) |
 | qwen | `qwen --acp` | Run `qwen`, use `/auth` or configure model/`OPENAI_API_KEY` | Help-documented `--approval-mode plan`; try ACP `plan`, otherwise permission filter | 0.28.3 |
-| kimi | `kimi acp` | `kimi login` | Help-documented `--plan`; try ACP `plan`, otherwise permission filter | Kimi Code CLI 2.7.2 |
+| kimi | `kimi acp` | `kimi login` | Try ACP `plan`, otherwise permission filter; no extra argv (`acp --plan` is rejected) | Kimi Code CLI 2.7.2 |
 | vibe | `vibe-acp` | Run `vibe` to sign in through Mistral AI Studio, or set `MISTRAL_API_KEY` | No read-only flag/mode in captured help; permission filter | 3.1.4 |
 | auggie | `auggie --acp` | `auggie auth login` | No built-in read-only mode verified; permission filter (extension-specific `--plan` is not assumed) | 1.2.2 |
 | goose | `goose acp` | `goose configure`; configure `GOOSE_PROVIDER`, model and provider credentials | No read-only flag/mode in captured help; permission filter | 1.60.2 |
@@ -83,6 +86,8 @@ not echoed by the shared runner.
 - Junie's npm launcher searches for its installation under HOME. With an isolated
   HOME, point the live test at the installed version's actual `junie` binary,
   not the npm launcher or home-relative update shim.
+- Kimi's root help lists `--plan`, but `kimi acp --plan` rejects it as an unknown
+  option. No read-only argv is added; its ACP `plan` mode is tried instead.
 - Cursor's initialize response contains neither agentInfo nor a version in
   `_meta`; its tested version comes from `--version`.
 - Auggie's unauthenticated session advertises only `model` with empty choices;

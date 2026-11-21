@@ -114,7 +114,7 @@ agents! {
     },
     "kimi" => KIMI {
         name: "Kimi", program: "kimi", identity: Some("Kimi Code CLI"),
-        args: ["acp"], review_args: ["--plan"],
+        args: ["acp"], review_args: [],
         modes: &["plan"], fail_closed: false, write_modes: &[], auth_codes: &[-32000],
         sign_in: "Run `kimi login` to sign in with Kimi Code."
     },
