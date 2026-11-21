@@ -279,6 +279,7 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     .await
     .unwrap();
     assert_eq!(message.role, "user");
+    assert!(message.content.contains("Available harness kinds: claude, codex, pi; opencode, antigravity, acp and muse currently return adapter-not-integrated errors."));
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
     let session = topic.topic_session_id.clone().unwrap();
     let wire = f
