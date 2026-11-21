@@ -6,6 +6,26 @@ use std::{
     time::{Duration, Instant},
 };
 struct Fixture(PathBuf);
+impl Fixture {
+    fn new(label: &str) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "fl-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = Self(root);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fixture
+    }
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -69,38 +89,102 @@ fn invoke(root: &Path, args: &[&str]) -> Output {
     }
 }
 #[test]
-fn cli_plan_is_write_free_and_verify_list_restore_drill_read_known_session() {
-    let root = Fixture(std::env::temp_dir().join(format!(
-            "fl-backup-cli-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
-    std::fs::create_dir(&root.0).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+fn restore_preview_leaves_an_existing_locked_profile_untouched() {
+    use formless_core::profile_lock::ProfileLock;
+
+    let root = Fixture::new("backup-plan");
     let file = root.0.join("snapshot.bak");
-    let plan = invoke(
-        &root.0,
-        &["backup", "restore", file.to_str().unwrap(), "--dry-run"],
-    );
-    assert!(
-        plan.status.success(),
-        "{}",
-        String::from_utf8_lossy(&plan.stderr)
-    );
+    let args = ["backup", "restore", file.to_str().unwrap(), "--dry-run"];
+    let missing = invoke(&root.0, &args);
+    assert!(missing.status.success(), "{missing:?}");
     assert!(
         !root.0.join("data").exists() && !root.0.join("config").exists(),
         "dry-run must not create a profile"
     );
-    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert!(!file.exists(), "preview must not create the missing source");
+
+    let profile = root.0.file_name().unwrap().to_str().unwrap();
+    let paths = formless_core::Paths {
+        data_dir: root.0.join("data").join(profile),
+        config_dir: root.0.join("config").join(profile),
+        profile: profile.to_owned(),
+    };
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    let config = "# Private preview fixture\n";
+    std::fs::write(paths.config_file(), config).unwrap();
+    let db = paths.db_file();
+    let store = formless_core::Store::open(&db).unwrap();
+    store
+        .create_session(Some("Snapshot Session".into()))
+        .unwrap();
+    store.backup_into(&file).unwrap();
+    store
+        .create_session(Some("Current profile Session".into()))
+        .unwrap();
+    drop(store);
+    let source_bytes = std::fs::read(&file).unwrap();
+    let current_bytes = std::fs::read(&db).unwrap();
+    assert_ne!(source_bytes, current_bytes);
+
+    // The CLI subprocess must succeed without either the ordinary profile
+    // lease or the restore launcher lock. Even a dispatch regression could
+    // not replace this fixture's database while the guard is held.
+    let _guard = ProfileLock::maintenance(&paths, Duration::ZERO)
+        .unwrap()
+        .freeze()
+        .unwrap();
+    assert!(ProfileLock::hierarchy_shared(&paths).is_err());
+    assert!(ProfileLock::launcher(&paths, Duration::ZERO).is_err());
+    let preview = invoke(&root.0, &args);
+    assert!(preview.status.success(), "{preview:?}");
+    assert!(preview.stderr.is_empty(), "{preview:?}");
+    assert_eq!(missing.stdout, preview.stdout, "plan depends only on paths");
+    let plan: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
     assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["source"], serde_json::json!(file));
+    assert_eq!(plan["destination"], serde_json::json!(db));
     assert!(plan["steps"].to_string().contains("WAL/SHM"));
+    assert_eq!(std::fs::read(&file).unwrap(), source_bytes);
+    assert_eq!(std::fs::read(&db).unwrap(), current_bytes);
+    assert_eq!(
+        std::fs::read_to_string(paths.config_file()).unwrap(),
+        config
+    );
+    assert!(!paths.data_dir.join("backups").exists());
+}
+
+#[test]
+fn restore_preview_help_and_backup_hint_describe_the_plan_only() {
+    let root = Fixture::new("backup-help");
+    let help = invoke(&root.0, &["backup", "restore", "--help"]);
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        help.contains("Print the restore plan without verifying the backup"),
+        "{help}"
+    );
+    let alias = invoke(&root.0, &["restore", "--help"]);
+    assert!(alias.status.success(), "{alias:?}");
+    assert!(!String::from_utf8(alias.stdout)
+        .unwrap()
+        .contains("--dry-run"));
+
+    let backup = invoke(&root.0, &["backup"]);
+    assert!(backup.status.success(), "{backup:?}");
+    let text = String::from_utf8(backup.stdout).unwrap();
+    assert!(
+        text.lines().any(|line| line.starts_with("preview:")
+            && line.contains("formless backup restore FILE --dry-run (plan only)")),
+        "{text}"
+    );
+}
+
+#[test]
+fn cli_verify_list_restore_drill_read_known_session() {
+    let root = Fixture::new("backup-cli");
+    let file = root.0.join("snapshot.bak");
     let source = root.0.join("source.db");
     let store = formless_core::Store::open(&source).unwrap();
     let known = store
@@ -206,20 +290,7 @@ fn cli_plan_is_write_free_and_verify_list_restore_drill_read_known_session() {
 
 #[test]
 fn production_main_thread_runs_help_man_and_completions() {
-    let root = Fixture(std::env::temp_dir().join(format!(
-            "fl-cli-stack-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
-    std::fs::create_dir(&root.0).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let root = Fixture::new("cli-stack");
     for (args, needle) in [
         (&["--help"][..], "Commands:"),
         (&["backup", "--help"][..], "verify"),
