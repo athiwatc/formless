@@ -44,6 +44,29 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn pulumi_mentions_warn_for_credentials_in_the_pulumi_directory() {
+    for path in [
+        ".pulumi/credentials.json",
+        "project/.PULUMI/CREDENTIALS.JSON",
+    ] {
+        assert!(credential_path(path.as_ref()).is_some(), "{path}");
+    }
+    for path in ["project/credentials.json", ".pulumi/stacks/dev.json"] {
+        assert!(credential_path(path.as_ref()).is_none(), "{path}");
+    }
+}
+
+#[test]
+fn yarn_credentials_are_detected_for_attachment_warnings() {
+    for name in [".yarnrc", "project/.YARNRC.YML"] {
+        assert!(credential_path(name.as_ref()).is_some(), "{name}");
+    }
+    for name in ["project/.yarnrc.yml.example", "project/.yarn/notes.txt"] {
+        assert!(credential_path(name.as_ref()).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn java_keystores_are_credential_paths_by_suffix() {
     let project = std::env::temp_dir().join("formless-attachment-project");
     for name in ["release.jks", "debug.KEYSTORE"] {
@@ -330,7 +353,7 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             .await
         }
     };
-    for bad in denied {
+    for bad in denied.iter().copied().chain([".env:4"]) {
         let e = attach(bad).await.unwrap_err().to_string();
         assert!(e.contains("credential"), "{bad}: {e}");
     }
@@ -362,6 +385,32 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             "{name}"
         );
     }
+    assert!(attach("notes.txt").await.is_ok());
+    for citation in ["notes.txt:42", "notes.txt:42:8"] {
+        let attached = attach(citation).await.unwrap();
+        assert_eq!(attached["name"], "notes.txt");
+        assert_eq!(attached["reference"], false);
+    }
+    assert!(attach("missing.txt:12")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("missing.txt:12"));
+    #[cfg(unix)]
+    for name in ["notes.txt:42", "notes:final"] {
+        std::fs::write(root.join(name), "literal filename").unwrap();
+        assert_eq!(attach(name).await.unwrap()["name"], name);
+    }
+    let home_leaf = format!("fl-mention-{}.txt", uuid::Uuid::new_v4().simple());
+    let native_home = directories::BaseDirs::new().unwrap();
+    let home_file = native_home.home_dir().join(&home_leaf);
+    std::fs::write(&home_file, "home fixture").unwrap();
+    let mention = format!("~{}{home_leaf}", std::path::MAIN_SEPARATOR);
+    let home_result = attach(&mention).await;
+    std::fs::remove_file(home_file).unwrap();
+    let home_attachment = home_result.unwrap();
+    assert_eq!(home_attachment["name"], home_leaf);
+    assert_eq!(home_attachment["reference"], false);
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
