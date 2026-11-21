@@ -584,7 +584,7 @@ enum BackupAction {
     Restore {
         /// Path to the database backup to restore
         file: std::path::PathBuf,
-        /// Check and preview the restore without replacing the database
+        /// Print the restore plan without verifying the backup or changing the profile
         #[arg(long)]
         dry_run: bool,
     },
@@ -2300,9 +2300,8 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
     }
-    // Keep every ordinary command's family leased through its final write.
-    // Destructive commands resolve read-only and obtain an explicit freeze;
-    // `serve` already retains the same shared lease through its owner guard.
+    // A restore preview only needs paths. Return before claiming profile
+    // leases or dispatching the actual restore.
     if let Some(Cmd::Backup {
         action: Some(BackupAction::Restore {
             file,
@@ -2319,6 +2318,9 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         );
         return Ok(());
     }
+    // Keep every ordinary command's family leased through its final write.
+    // Destructive commands resolve read-only and obtain an explicit freeze;
+    // `serve` already retains the same shared lease through its owner guard.
     let destructive = matches!(
         cli.cmd,
         Some(
@@ -4049,7 +4051,7 @@ fn backup_cmd(paths: &Paths) -> Result<()> {
     println!("scope:     database only; copy artifacts/ and skills/ separately");
     println!("excluded:  config.toml, credential files and OS keyring entries");
     println!("paths:     recorded file paths are not rewritten for another profile or machine");
-    println!("restore:   formless backup restore FILE --dry-run");
+    println!("preview:   formless backup restore FILE --dry-run (plan only)");
     Ok(())
 }
 
