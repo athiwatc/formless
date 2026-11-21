@@ -267,6 +267,9 @@ pub fn is_env_template_file(path: &Path) -> bool {
 }
 
 fn builtin(path: &Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     let parts: Vec<_> = path
         .components()
         .filter_map(|part| {
@@ -419,6 +422,31 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn composer_auth_file_is_classified_before_ordinary_config_files() {
+        let root = std::env::temp_dir().join("formless-project");
+        let policy = PathPolicy::default();
+        for relative in [".composer/auth.json", ".config/composer/auth.json"] {
+            let path = root.join(relative);
+            let alias = root.join("alias.txt");
+            assert!(matches!(
+                policy.classify(&alias, &path).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        for relative in [
+            "auth.json",
+            ".composer/cache/auth.json",
+            ".config/composer/config.json",
+        ] {
+            let path = root.join(relative);
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary
+            );
+        }
+    }
+
     #[test]
     fn protects_terraform_config_during_tool_reads() {
         let root = std::env::temp_dir();

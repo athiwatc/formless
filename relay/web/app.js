@@ -511,6 +511,11 @@
     if (!m) return null;
     const { path, windows } = normalizeApprovalPath(m[2]);
     const seg = path.split("/").filter(Boolean);
+    const windowsPath = /^[a-z]:[\\/]|^\\\\/i.test(path);
+    const composer = (windowsPath ? path.split(/[\\/]/).filter(Boolean) : seg)
+      .slice(-3).map(part => (windowsPath ? part.split(":")[0] : part).toLowerCase());
+    if (composer.at(-1) === "auth.json" && (composer.at(-2) === ".composer" ||
+        (composer.at(-2) === "composer" && composer.at(-3) === ".config"))) return [true, "holds Composer credentials"];
     const secret = [[".ssh", "SSH keys"], [".aws", "cloud credentials"], [".gnupg", "encryption keys"], [".kube", "cluster credentials"], [".docker", "registry credentials"], ["Keychains", "the keychain"], [".password-store", "saved passwords"]];
     for (const [dir, what] of secret) if (seg.includes(windows ? dir.toLowerCase() : dir)) return [true, "holds " + what];
     for (let i = 0; i + 1 < seg.length; i++) if (seg[i] === ".config" && (seg[i + 1] === "gh" || seg[i + 1] === "gcloud")) return [true, "holds account credentials"];

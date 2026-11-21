@@ -17259,6 +17259,9 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
