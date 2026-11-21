@@ -24,8 +24,9 @@ import pathlib
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', '/workspace/.formless-browsers')
 PASSES = 0
 
 
@@ -371,7 +372,7 @@ def live_reasoning_cases(page, name):
 
 def run_engine(p, name, url, out):
     start=PASSES
-    browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(executable_path=p.webkit.executable_path,headless=True)
+    browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(executable_path=p.webkit.executable_path,headless=True)
     context=browser.new_context(viewport={'width':1280,'height':900},reduced_motion='reduce')
     context.add_init_script(INIT)
     context.route('**/app.js',expose_script)
@@ -576,8 +577,8 @@ def run_engine(p, name, url, out):
 
 def run():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('artifacts',nargs='?',default='/tmp/formless-816-browser')
-    parser.add_argument('--browser',choices=['all','chromium','webkit'],default='all',help='all is required for complete validation; a single engine is partial')
+    parser.add_argument('artifacts',nargs='?',default=artifact_dir('/tmp/formless-816-browser'))
+    parser.add_argument('--browser',choices=['all','chromium','webkit'],default=os.environ.get('FORMLESS_BROWSER_TEST_ENGINE','all'),help='all is required for complete validation; a single engine is partial')
     args=parser.parse_args()
     out=pathlib.Path(args.artifacts);out.mkdir(parents=True,exist_ok=True)
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(QuietHandler,directory=str(ROOT/'web')))

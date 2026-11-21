@@ -199,6 +199,11 @@ const SHELL: Lang = Lang {
     regex: false,
 };
 
+const POWERSHELL: Lang = Lang {
+    block_comment: Some(("<#", "#>")),
+    ..SHELL
+};
+
 const C_LIKE: Lang = Lang {
     line_comments: &["//"],
     block_comment: Some(("/*", "*/")),
@@ -313,6 +318,10 @@ const CONFIG: Lang = Lang {
     nested: false,
     raw_strings: false,
     regex: false,
+};
+const TOML: Lang = Lang {
+    multiline: &["\"\"\"", "'''"],
+    ..CONFIG
 };
 /// INI and properties: `;` comments too.
 const INI: Lang = Lang {
@@ -464,9 +473,11 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "js" | "javascript" | "jsx" | "mjs" | "cjs" | "ts" | "typescript" | "tsx" => &JS,
         "py" | "python" | "python3" => &PYTHON,
         "go" | "golang" => &GO,
-        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" | "ps" | "powershell"
-        | "dockerfile" | "docker" | "make" | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir"
-        | "ex" | "exs" | "perl" | "pl" => &SHELL,
+        "sh" | "bash" | "zsh" | "fish" | "shell" | "console" | "dockerfile" | "docker" | "make"
+        | "makefile" | "mk" | "ruby" | "rb" | "r" | "elixir" | "ex" | "exs" | "perl" | "pl" => {
+            &SHELL
+        }
+        "ps" | "powershell" => &POWERSHELL,
         "c" | "h" | "cpp" | "c++" | "cc" | "hpp" | "java" | "kotlin" | "kt" | "swift" | "cs"
         | "c#" | "csharp" | "f#" | "fsharp" | "scala" | "dart" | "zig" | "objc" => &C_LIKE,
         "php" => &PHP,
@@ -474,7 +485,8 @@ fn lang(name: &str) -> Option<&'static Lang> {
         "json" => &JSON,
         "jsonc" => &JSONC,
         "json5" => &JSON5,
-        "yaml" | "yml" | "toml" | "env" | "dotenv" => &CONFIG,
+        "yaml" | "yml" | "env" | "dotenv" => &CONFIG,
+        "toml" => &TOML,
         "ini" | "conf" | "cfg" | "properties" | "editorconfig" | "gitconfig" => &INI,
         "sql" | "sqlite" | "postgres" | "postgresql" => &SQL,
         "mysql" => &MYSQL,
@@ -500,7 +512,9 @@ enum Tok {
 pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
+    powershell: bool,
     python_comments: bool,
+    toml_strings: bool,
     mysql_comments: bool,
     php_comments: bool,
     json5_strings: bool,
@@ -592,6 +606,19 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
 
 // After a contextual `await`, an apparent closing slash can instead be the
 // second division operator. Check the flags and the next operand token.
+fn powershell_quote_end(chars: &[char], mut i: usize, quote: char) -> Option<usize> {
+    while let Some(&c) = chars.get(i) {
+        if (quote == '"' && c == '`') || (c == quote && chars.get(i + 1) == Some(&quote)) {
+            i += 2;
+        } else if c == quote {
+            return Some(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> bool {
     if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
         return false;
@@ -622,7 +649,9 @@ impl Highlighter {
         lang(&name).map(|lang| Self {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
+            powershell: matches!(name.as_str(), "ps" | "powershell"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            toml_strings: name == "toml",
             mysql_comments: name == "mysql",
             php_comments: name == "php",
             json5_strings: name == "json5",
@@ -651,6 +680,7 @@ impl Highlighter {
     /// carry to the next call.
     pub(crate) fn line(&mut self, line: &str) -> Vec<Span<'static>> {
         let l = self.lang;
+        let toml = self.toml_strings;
         let mysql = self.mysql_comments;
         let php = self.php_comments;
         let chars: Vec<char> = line.chars().collect();
@@ -674,12 +704,13 @@ impl Highlighter {
         };
         let mut i = 0;
         // Config keys: `  name:` / `name =` at line start.
-        if let Some(sep) = l.key_sep {
+        if let Some(sep) = l.key_sep.filter(|_| self.in_str.is_none()) {
             let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
             let end = (lead..chars.len()).find(|&j| chars[j] == sep || chars[j] == '=');
             if let Some(end) = end {
                 let key = &chars[lead..end];
                 let bare = !key.is_empty()
+                    && !l.multiline.iter().any(|delimiter| at(lead, delimiter))
                     && key
                         .iter()
                         .all(|c| c.is_alphanumeric() || "_-. \"'[]".contains(*c));
@@ -693,14 +724,27 @@ impl Highlighter {
         // Where the string closed by `close` ends, scanning from `from`:
         // just past the delimiter, or None when it runs past the line.
         let close_at = |from: usize, close: &str| -> Option<usize> {
+            let escapes =
+                !(l.raw_strings || toml && close.starts_with('\'') || mysql && close == "`");
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' && !(mysql && close == "`") {
+                if chars[j] == '\\' && escapes {
                     j += 2;
                     continue;
                 }
                 if at(j, close) {
-                    return Some(j + close.chars().count());
+                    let end = j + close.chars().count();
+                    // TOML allows up to two quotes before the closing delimiter.
+                    let trailing = if toml {
+                        chars[end..]
+                            .iter()
+                            .take(2)
+                            .take_while(|&&c| c == chars[j])
+                            .count()
+                    } else {
+                        0
+                    };
+                    return Some(end + trailing);
                 }
                 j += 1;
             }
@@ -708,11 +752,10 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
-                // Raw strings (`"#…` closers) have no escapes.
-                let stop = if l.raw_strings {
-                    (i..chars.len())
-                        .find(|&j| at(j, &close))
-                        .map(|j| j + close.chars().count())
+                let stop = if self.powershell && close.ends_with('@') {
+                    (i == 0 && at(0, &close)).then_some(2)
+                } else if self.powershell {
+                    powershell_quote_end(&chars, i, close.chars().next().unwrap())
                 } else {
                     close_at(i, &close)
                 };
@@ -790,7 +833,12 @@ impl Highlighter {
                 || if php {
                     chars.get(i + 1) != Some(&'[')
                 } else {
-                    self.python_comments || mysql || i == 0 || chars[i - 1].is_whitespace()
+                    self.python_comments
+                        || mysql
+                        || self.powershell
+                        || i == 0
+                        || chars[i - 1].is_whitespace()
+                        || toml && l.quotes.contains(&chars[i - 1])
                 };
             if hash_comment
                 && l.line_comments.iter().any(|p| {
@@ -813,6 +861,15 @@ impl Highlighter {
                 push(Tok::Comment, &chars[i..end]);
                 i = end;
                 continue;
+            }
+            if self.powershell && c == '@' {
+                if let Some(quote @ ('"' | '\'')) = chars.get(i + 1) {
+                    if chars[i + 2..].iter().all(|c| c.is_whitespace()) {
+                        self.in_str = Some(format!("{quote}@"));
+                        push(Tok::Str, &chars[i..]);
+                        break;
+                    }
+                }
             }
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
@@ -911,10 +968,24 @@ impl Highlighter {
                 i = stop.unwrap_or(chars.len());
                 continue;
             }
+            if self.powershell && l.quotes.contains(&c) {
+                let stop = powershell_quote_end(&chars, i + 1, c);
+                if stop.is_none() {
+                    self.in_str = Some(c.to_string());
+                }
+                let end = stop.unwrap_or(chars.len());
+                push(Tok::Str, &chars[i..end]);
+                i = end;
+                continue;
+            }
             if l.quotes.contains(&c) {
                 let mut j = i + 1;
                 while j < chars.len() && chars[j] != c {
-                    j += if chars[j] == '\\' { 2 } else { 1 };
+                    j += if chars[j] == '\\' && !(toml && c == '\'') {
+                        2
+                    } else {
+                        1
+                    };
                 }
                 let stop = (j + 1).min(chars.len());
                 push(Tok::Str, &chars[i..stop]);
@@ -1543,7 +1614,103 @@ mod tests {
             .all(|s| s.style.fg == Some(Color::Green))
     }
 
+    #[test]
+    fn toml_multiline_strings_keep_hashes_and_keys_until_the_closer() {
+        for (delimiter, middle, closing) in [
+            ("\"\"\"", r#"\""" keep # escaped quote"#, "\"\"\"\"\""),
+            ("'''", "keep # literal", "\\'''''"),
+        ] {
+            let mut h = Highlighter::new("TOML", true).unwrap();
+            h.line(&format!("text = {delimiter}"));
+            for source in [middle, "name = not a key", "# still content"] {
+                let spans = h.line(source);
+                assert_eq!(spans.len(), 1, "{spans:?}");
+                assert_eq!(spans[0].content, source);
+                assert_eq!(spans[0].style.fg, Some(Color::Green));
+            }
+            let spacing = if delimiter.starts_with('"') { "" } else { " " };
+            let spans = h.line(&format!("{closing}{spacing}# outside"));
+            assert_eq!(spans[0].content, closing);
+            assert_eq!(spans[0].style.fg, Some(Color::Green));
+            assert_eq!(spans.last().unwrap().content, "# outside");
+            assert_eq!(spans.last().unwrap().style.fg, Some(Color::DarkGray));
+            let next = h.line("name = \"formless\" # comment");
+            assert!(next
+                .iter()
+                .any(|s| s.content.trim_end() == "name" && s.style.fg == Some(Color::Blue)));
+            assert!(next
+                .iter()
+                .any(|s| s.content == "\"formless\"" && s.style.fg == Some(Color::Green)));
+            assert_eq!(next.last().unwrap().style.fg, Some(Color::DarkGray));
+
+            h.line("items = [");
+            let first = h.line(&format!("  {delimiter}a = b"));
+            assert!(first.iter().any(|s| {
+                s.content == format!("{delimiter}a = b") && s.style.fg == Some(Color::Green)
+            }));
+            assert!(all_str(&mut h, "# inside the array value"));
+            assert!(all_str(&mut h, delimiter));
+            h.line("]");
+            assert_eq!(h.line("# outside")[0].style.fg, Some(Color::DarkGray));
+        }
+    }
+
     /// Strings that run across lines stay strings until they close (#876).
+    #[test]
+    fn powershell_quotes_and_comments_do_not_colour_following_code() {
+        for lang in ["ps", "PowerShell"] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            let line = r#"Write-Host "say `"hello`""; if ($true) { echo hi }"#;
+            let spans = highlighter.line(line);
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r#""say `"hello`"""#
+                    && span.style.fg == Some(Color::Green)));
+            assert!(spans
+                .iter()
+                .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+
+            let spans = highlighter.line(r"echo 'it''s\'; if true");
+            assert!(spans
+                .iter()
+                .any(|span| span.content == r"'it''s\'" && span.style.fg == Some(Color::Green)));
+            let spans = highlighter.line("echo# tail");
+            assert!(spans
+                .last()
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC));
+
+            highlighter.line("<#");
+            let spans = highlighter.line("if ($true) { echo hi }");
+            assert_eq!(spans.len(), 1);
+            assert!(spans[0].style.add_modifier.contains(Modifier::ITALIC));
+            assert!(highlighter
+                .line("#> if true")
+                .iter()
+                .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+
+            for quote in ['\'', '"'] {
+                let opener = format!("@{quote}");
+                let closer = format!("{quote}@");
+                assert_eq!(highlighter.line(&opener)[0].style.fg, Some(Color::Green));
+                assert_eq!(
+                    highlighter.line(&format!("  {closer}"))[0].style.fg,
+                    Some(Color::Green)
+                );
+                assert_eq!(
+                    highlighter.line("<# still data")[0].style.fg,
+                    Some(Color::Green)
+                );
+                assert!(highlighter
+                    .line(&format!("{closer}; if true"))
+                    .iter()
+                    .any(|span| span.content == "if" && span.style.fg == Some(Color::Magenta)));
+            }
+        }
+    }
+
     #[test]
     fn multi_line_strings_carry_across_lines() {
         let mut h = Highlighter::new("python", true).unwrap();

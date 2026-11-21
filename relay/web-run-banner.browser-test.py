@@ -7,10 +7,12 @@ from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = Path(__file__).resolve().parent
 parser = argparse.ArgumentParser()
 parser.add_argument("--css", type=Path, help="Optional CSS negative control")
-parser.add_argument("--out", type=Path, default=Path("/tmp/formless-banner-1654"))
+parser.add_argument("--out", type=Path, default=artifact_dir("/tmp/formless-banner-1654"))
 args = parser.parse_args()
 args.out.mkdir(parents=True, exist_ok=True)
 
@@ -46,7 +48,7 @@ thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
     with sync_playwright() as p:
-        browser = p.chromium.launch(executable_path="/usr/bin/chromium", headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=["--no-sandbox"])
         for width in [240, 360, 900]:
             for font in [16, 32]:
                 for index, fixture in enumerate(fixtures):

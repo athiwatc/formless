@@ -11,8 +11,10 @@ import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '/tmp/formless-mermaid-1481')
+OUT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else artifact_dir('/tmp/formless-mermaid-1481')
 OUT.mkdir(parents=True, exist_ok=True)
 PASSES = 0
 
@@ -74,7 +76,7 @@ def run():
     url=f'http://127.0.0.1:{server.server_port}/'
     try:
         with sync_playwright() as p:
-            browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox'])
+            browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox'])
             for missing in [False,True]:
                 attempts=[]
                 def loader(route):

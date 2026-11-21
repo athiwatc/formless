@@ -22,6 +22,13 @@ CREATE TRIGGER immutable_optimiser_replay_binding BEFORE UPDATE ON optimiser_att
 CREATE INDEX idx_optimiser_replay_created ON optimiser_replay_snapshots(created_at);
 "#;
 const MAX_INPUT: usize = 256 * 1024;
+const MAX_SCAN_ROWS: usize = 8192;
+const MAX_EXTENSION_BYTES: usize = 32 * 1024 * 1024;
+const REPLAY_POOL_SQL: &str = "SELECT id,
+    CASE WHEN length(CAST(input AS BLOB))<=?2 THEN input ELSE NULL END,
+    substr(error,1,2048), substr(tag,1,128), status
+    FROM invocations
+    WHERE tool_id=?1 AND status IN ('success','failure') ORDER BY rowid DESC LIMIT ?3";
 const MAX_MANIFEST: usize = 8 * 1024 * 1024;
 const MAX_SNAPSHOTS: i64 = 64;
 const MAX_STORED_BYTES: i64 = 64 * 1024 * 1024;
@@ -73,27 +80,32 @@ impl Store {
         if !(2..=512).contains(&limit) {
             return Err(anyhow!("optimiser.replay_pool_limit must be 2..=512"));
         }
-        // Outcome is deliberately absent from ORDER BY and sample allocation.
-        // Reading one bounded recency window avoids the old all-failures plus
-        // equally-many-successes selection bias and unbounded allocations.
-        let mut statement = self.ps("SELECT id, CASE WHEN length(CAST(input AS BLOB))<=262144 THEN input ELSE NULL END, substr(error,1,2048), substr(tag,1,128), status FROM invocations WHERE tool_id=?1 AND status IN ('success','failure') ORDER BY rowid DESC LIMIT ?2")?;
-        let mut rows = statement.query(params![tool_id, (limit * 4).min(2048) as i64])?;
+        // Keep the ordinary recent window so duplicates there can still add
+        // their outcome evidence. If it is short of distinct inputs, keep
+        // scanning the same newest-first index within fixed row and byte caps.
+        let recent = limit * 4;
+        let mut statement = self.ps(REPLAY_POOL_SQL)?;
+        let mut rows = statement.query(params![tool_id, MAX_INPUT as i64, MAX_SCAN_ROWS as i64])?;
         let mut groups = BTreeMap::<String, Group>::new();
         let mut order = Vec::new();
         let mut source_count = 0;
         let mut excluded = 0;
         let mut bytes = 0;
-        while let Some(row) = rows.next()? {
+        let mut extension_bytes = 0;
+        while source_count < recent || groups.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let input: Option<String> = row.get(1)?;
+            if source_count >= recent {
+                extension_bytes += input.as_ref().map_or(0, String::len);
+                if extension_bytes > MAX_EXTENSION_BYTES {
+                    break;
+                }
+            }
             source_count += 1;
-            let source: String = row.get(0)?;
-            let Some(input) = row.get::<_, Option<String>>(1)? else {
+            let Some(input) = input else {
                 excluded += 1;
                 continue;
             };
-            if input.len() > MAX_INPUT {
-                excluded += 1;
-                continue;
-            }
             let mut parsed: Value = match serde_json::from_str(&input) {
                 Ok(v) => v,
                 Err(_) => {
@@ -104,13 +116,14 @@ impl Store {
             canonical(&mut parsed);
             let input = serde_json::to_string(&parsed)?;
             let digest = hash(input.as_bytes());
+            let success = row.get::<_, String>(4)? == "success";
             if let Some(group) = groups.get_mut(&digest) {
                 // One input group counts once even with conflicting recorded
                 // outcomes. Preserve ANY represented known success for the
                 // zero-regression guard; recency still supplies error/tag
                 // context and neither selection nor split depends on outcome.
-                group.item.recorded_success |= row.get::<_, String>(4)? == "success";
-                group.sources.push(source);
+                group.item.recorded_success |= success;
+                group.sources.push(row.get(0)?);
                 continue;
             }
             if groups.len() >= limit || bytes + input.len() > MAX_MANIFEST / 2 {
@@ -123,13 +136,13 @@ impl Store {
                 digest.clone(),
                 Group {
                     hash: digest,
-                    latest_success: row.get::<_, String>(4)? == "success",
-                    sources: vec![source],
+                    latest_success: success,
+                    sources: vec![row.get(0)?],
                     item: ReplayItem {
                         input,
                         error: row.get(2)?,
                         tag: row.get(3)?,
-                        recorded_success: row.get::<_, String>(4)? == "success",
+                        recorded_success: success,
                     },
                 },
             );

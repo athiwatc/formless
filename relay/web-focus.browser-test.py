@@ -15,8 +15,10 @@ import sys
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT = pathlib.Path(__file__).resolve().parent
-OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else '/tmp/formless-817-browser')
+OUT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else artifact_dir('/tmp/formless-817-browser')
 OUT.mkdir(parents=True, exist_ok=True)
 PASSES = 0
 
@@ -71,6 +73,12 @@ def expose_script(route):
     const reply817 = async (req) => {
       fixture817.calls.push(req.type);
       if(req.type==='get_artifact') {
+        if (fixture817.pagedArtifact) {
+          fixture817.pagedArtifact.offsets.push(req.offset);
+          const chunks = {0: ['Preview ', 8], 8: ['ไทย ', 12], 12: ['end', 15]};
+          const [text, end] = chunks[req.offset];
+          return {text, end, total_chars:15, bytes:21};
+        }
         const value={text:'Local artifact output',end:21,total_chars:21,bytes:21};
         if(fixture817.deferredArtifact) return new Promise(resolve=>fixture817.finishArtifact=()=>resolve(value));
         return value;
@@ -235,12 +243,37 @@ def click_away_checks(page):
     page.evaluate("""()=>{const d=__focus817;d.S.running.delete(d.S.current);d.S.streaming='';d.S.view='tools';d.renderChrome();d.renderHistory();document.querySelector('#focus-click-away').remove();document.querySelector('#toasts').replaceChildren();}""")
 
 
+def artifact_download_checks(page):
+    page.evaluate('''() => {
+      const fixture = __focus817.pagedArtifact = {offsets: [], connectedClicks: 0};
+      document.body.addEventListener('click', event => {
+        if (event.target.matches('a[download="artifact-00000000.txt"]') && event.target.isConnected)
+          fixture.connectedClicks++;
+      });
+    }''')
+    invoke(page, "__focus817.openArtifact('00000000-0000-0000-0000-000000000000')")
+    viewer = page.get_by_role('dialog', name='Full output')
+    with page.expect_download() as saved:
+        viewer.get_by_role('button', name='Download').click()
+    check(saved.value.suggested_filename == 'artifact-00000000.txt', 'artifact has its expected download filename')
+    check(saved.value.path().read_text(encoding='utf-8') == 'Preview ไทย end', 'artifact download contains all pages')
+    check(page.evaluate('__focus817.pagedArtifact.connectedClicks') == 1, 'artifact download clicks an attached link')
+    check(viewer.locator('pre').text_content() == 'Preview ', 'downloading leaves the artifact preview unchanged')
+    check(viewer.get_by_text('8 of 15 characters').is_visible(), 'downloading leaves the preview count unchanged')
+    viewer.get_by_role('button', name='Load more').click()
+    viewer.get_by_text('12 of 15 characters').wait_for(state='visible')
+    check(viewer.locator('pre').text_content() == 'Preview ไทย ', 'Load more resumes from the displayed preview')
+    check(page.evaluate('__focus817.pagedArtifact.offsets') == [0, 8, 12, 8], 'download and preview request their own offsets')
+    close_and_return(page,'.backdrop:has(.viewer)','#fixture-tools-open','downloaded artifact viewer')
+    page.evaluate('__focus817.pagedArtifact=null')
+
+
 def run():
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(QuietHandler, directory=str(ROOT / 'web')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'])
+            browser = p.chromium.launch(executable_path=chromium_executable(p), headless=True, args=['--no-sandbox'])
             context = browser.new_context(viewport={'width':1280,'height':900}, reduced_motion='reduce')
             context.route('**/app.js', expose_script)
             page = context.new_page()
@@ -300,6 +333,8 @@ def run():
             page.evaluate('__focus817.finishArtifact();__focus817.deferredArtifact=false')
             page.wait_for_selector('.viewer')
             close_and_return(page,'.backdrop:has(.viewer)','#fixture-tools-open','deferred viewer')
+
+            artifact_download_checks(page)
 
             # A picker closed while list_models is pending must stay closed when
             # the reply eventually arrives, without stealing the restored focus.
@@ -502,6 +537,35 @@ def run():
             check(page.locator('.popover').count()==0,'mobile nonfocusable outside click closes menu')
             check(page.evaluate('document.activeElement!==document.body && !document.activeElement.closest("#sidebar:not(.open)")'),'mobile outside click does not leave focus in closed drawer')
             check(page.locator('#sessions .menu').evaluate_all('(items)=>items.every(e=>getComputedStyle(e).visibility==="hidden")'),'closed mobile drawer menu descendants are hidden from Tab navigation')
+            # At large text size the toolbar wraps into its own scrollport.
+            # Drawer dismissal must bring an obscured return target back into view.
+            for height in (740, 200, 160):
+                page.set_viewport_size({'width':320,'height':height})
+                toolbar = page.locator('.topbar')
+                for trigger, panel, to_end in [('#notes-btn','#notes-panel:not(.hidden)',False),
+                                               ('#menu-btn','#sidebar.open',True)]:
+                    page.locator(trigger).click()
+                    page.locator(panel).wait_for()
+                    sliver = height == 160 and not to_end
+                    toolbar.evaluate('''(e,{toEnd,sliver,selector})=>{
+                        if (!sliver) { e.scrollTop=toEnd?e.scrollHeight:0; return; }
+                        const button=document.querySelector(selector).getBoundingClientRect();
+                        e.scrollTop += button.top-e.getBoundingClientRect().bottom+4;
+                    }''',{'toEnd':to_end,'sliver':sliver,'selector':trigger})
+                    check(toolbar.evaluate('''(e,{sliver,selector})=>{
+                        const bounds=e.getBoundingClientRect(), button=document.querySelector(selector).getBoundingClientRect();
+                        const overlap=Math.min(button.bottom,bounds.bottom)-Math.max(button.top,bounds.top);
+                        return sliver ? overlap>0 && overlap<8 : overlap<=0;
+                    }''',{'sliver':sliver,'selector':trigger}),'scrolled toolbar clips open drawer trigger '+trigger)
+                    page.keyboard.press('Escape')
+                    page.locator(panel).wait_for(state='hidden')
+                    page.wait_for_function('''selector=>{
+                        const target=document.querySelector(selector);
+                        const button=target.getBoundingClientRect(), bounds=target.closest('.topbar').getBoundingClientRect();
+                        const overlap=Math.min(button.bottom,bounds.bottom)-Math.max(button.top,bounds.top);
+                        return target===document.activeElement && overlap>=Math.min(button.height,bounds.height-2)-1;
+                    }''',arg=trigger)
+                    check(page.locator(trigger).evaluate('e=>e===document.activeElement'),'closing drawer reveals restored toolbar focus '+trigger)
             check(not errors,'no browser page errors: '+repr(errors))
             page.screenshot(path=str(OUT/'final-state.png'))
             context.close();browser.close()
