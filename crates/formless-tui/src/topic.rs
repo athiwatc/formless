@@ -1,9 +1,10 @@
 use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use formless_protocol::{
-    HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MessageInfo, SessionInfo,
-    StepAccess, TopicArtifact, TopicAttemptInfo, TopicAttemptStatus, TopicFeatureStatus, TopicInfo,
-    TopicProposalRequest, TopicStatus, TopicStepOutline, WorkspaceKind,
+    HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MessageInfo, Request,
+    SessionInfo, StepAccess, TopicArtifact, TopicAttemptInfo, TopicAttemptStatus,
+    TopicFeatureStatus, TopicInfo, TopicLimits, TopicProposalRequest, TopicRuleDecision,
+    TopicStatus, TopicStepOutline, WorkspaceKind,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::prelude::*;
@@ -34,7 +35,10 @@ pub enum ChatContext {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `(topic to refresh, request, note on success)`.
+pub type ControlRequest = (Option<String>, Request, String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmedAction {
     Approve,
     ApproveAndStart,
@@ -987,6 +991,99 @@ impl State {
             reason,
         });
         true
+    }
+
+    /// User-only topic controls. `None` means `args` is another `/topic`
+    /// command; `Some(Ok((topic, request, done)))` is ready to send.
+    pub fn control_command(&self, args: &str) -> Option<Result<ControlRequest, String>> {
+        let words: Vec<_> = args.split_whitespace().collect();
+        let known = |id: &str| {
+            self.topic(id)
+                .map(|topic| topic.id.clone())
+                .ok_or_else(|| format!("No topic named {id}; use /topics."))
+        };
+        let result = match words.as_slice() {
+            ["harnesses"] => Ok((None, Request::ListHarnesses, String::new())),
+            ["context", id, flag @ ("on" | "off")] => known(id).map(|topic_id| {
+                let allow = *flag == "on";
+                let done = if allow {
+                    "Harnesses in this topic may now read conversations outside it."
+                } else {
+                    "Harnesses in this topic now read only this topic branch."
+                };
+                (
+                    Some(topic_id.clone()),
+                    Request::SetTopicContextAccess { topic_id, allow },
+                    done.into(),
+                )
+            }),
+            ["context", ..] => Err("Usage: /topic context TOPIC on|off".into()),
+            ["limits", id, retries, attempts] => {
+                match (retries.parse::<u32>(), attempts.parse::<u32>()) {
+                    (Ok(retries), Ok(attempts)) => known(id).map(|topic_id| {
+                        (
+                            Some(topic_id.clone()),
+                            Request::SetTopicLimits {
+                                topic_id,
+                                limits: TopicLimits {
+                                    max_retries_per_step: retries,
+                                    max_attempts_per_topic: attempts,
+                                },
+                            },
+                            format!(
+                                "Limits set: {retries} retries per step, {attempts} attempts per topic."
+                            ),
+                        )
+                    }),
+                    _ => Err("Limits must be whole numbers.".into()),
+                }
+            }
+            ["limits", ..] => Err("Usage: /topic limits TOPIC RETRIES_PER_STEP ATTEMPTS_PER_TOPIC".into()),
+            [verb @ ("allow" | "deny"), id, pattern @ ..] if !pattern.is_empty() => {
+                let pattern = pattern.join(" ");
+                let (decision, label) = if *verb == "allow" {
+                    (TopicRuleDecision::AllowOnce, "allows")
+                } else {
+                    (TopicRuleDecision::Reject, "denies")
+                };
+                known(id).map(|topic_id| {
+                    (
+                        Some(topic_id.clone()),
+                        Request::AddTopicPermissionRule {
+                            topic_id,
+                            harness: None,
+                            acp_agent: None,
+                            kind: None,
+                            pattern: pattern.clone(),
+                            decision,
+                        },
+                        format!("Rule added: Formless {label} permission requests matching `{pattern}`."),
+                    )
+                })
+            }
+            ["allow" | "deny", ..] => Err(
+                "Usage: /topic allow|deny TOPIC PATTERN (* and ? match the request title or command)".into(),
+            ),
+            ["unrule", id, rule_id] => known(id).and_then(|topic_id| {
+                let exists = self.topic(&topic_id).is_some_and(|topic| {
+                    topic.permission_rules.iter().any(|rule| rule.rule_id == *rule_id)
+                });
+                if !exists {
+                    return Err(format!("This topic has no permission rule {rule_id}."));
+                }
+                Ok((
+                    Some(topic_id.clone()),
+                    Request::RemoveTopicPermissionRule {
+                        topic_id,
+                        rule_id: rule_id.to_string(),
+                    },
+                    "Permission rule removed.".into(),
+                ))
+            }),
+            ["unrule", ..] => Err("Usage: /topic unrule TOPIC RULE_ID".into()),
+            _ => return None,
+        };
+        Some(result)
     }
 
     pub fn open_topic_command(&mut self, args: &str) -> Result<(), String> {
@@ -2108,6 +2205,24 @@ fn attempt_label(attempt: &TopicAttemptInfo) -> String {
     )
 }
 
+pub fn harness_availability_line(harness: &formless_protocol::HarnessAvailability) -> String {
+    let name = harness_name(harness.kind, harness.acp_agent.as_deref());
+    let state = match (harness.installed, harness.signed_in) {
+        (false, _) => "not installed",
+        (true, Some(false)) => "signed out",
+        (true, Some(true)) => "ready",
+        (true, None) => "installed (sign-in unknown)",
+    };
+    let mut line = format!("{name}: {state}");
+    if let Some(version) = &harness.version {
+        line.push_str(&format!(" · {version}"));
+    }
+    if let Some(detail) = &harness.detail {
+        line.push_str(&format!(" · {detail}"));
+    }
+    line
+}
+
 fn model_suffix(model: Option<&str>) -> String {
     model.map(|model| format!(" · {model}")).unwrap_or_default()
 }
@@ -2125,6 +2240,7 @@ fn artifact_label(artifact: &TopicArtifact) -> String {
         TopicArtifact::Text { title, content } => {
             format!("{title}: {}", content.replace('\n', " "))
         }
+        TopicArtifact::Directory { path } => format!("folder copy {path}"),
     }
 }
 
@@ -2182,6 +2298,34 @@ fn topic_lines(topic: &TopicInfo, color: bool) -> Vec<Line<'static>> {
     ];
     if let Some(revision) = &topic.base_revision {
         lines.push(Line::from(format!("Base revision: {revision}")));
+    }
+    lines.push(Line::from(if topic.allow_external_context {
+        "Context: harnesses may read conversations outside this topic"
+    } else {
+        "Context: harnesses read this topic branch only (/topic context ID on widens it)"
+    }));
+    lines.push(Line::from(format!(
+        "Limits: {} retries per step · {} attempts per topic",
+        topic.limits.max_retries_per_step, topic.limits.max_attempts_per_topic
+    )));
+    if !topic.permission_rules.is_empty() {
+        lines.push(Line::from("Permission rules (yours only):"));
+        for rule in &topic.permission_rules {
+            let decision = match rule.decision {
+                TopicRuleDecision::AllowOnce => "allow",
+                TopicRuleDecision::Reject => "deny",
+            };
+            let harness = rule
+                .harness
+                .map(|harness| harness_name(harness, rule.acp_agent.as_deref()))
+                .unwrap_or_else(|| "any harness".into());
+            lines.push(Line::from(format!(
+                "  {} · {decision} · {harness} · {} · `{}`",
+                rule.rule_id,
+                rule.kind.as_deref().unwrap_or("any kind"),
+                rule.pattern
+            )));
+        }
     }
     lines.push(Line::from("Outline (advice; Formless decides the steps):"));
     lines.extend(outline_lines(&topic.outline, "  "));
@@ -2297,6 +2441,9 @@ mod tests {
             attempts: vec![],
             created_at: String::new(),
             updated_at: String::new(),
+            allow_external_context: false,
+            permission_rules: vec![],
+            limits: Default::default(),
         }
     }
 
@@ -2465,6 +2612,37 @@ mod tests {
             topic("t2", TopicStatus::PendingApproval),
         ];
         assert_eq!(state.update_topics(topics), Some("t2".into()));
+    }
+
+    #[test]
+    fn topic_details_show_user_controls() {
+        let mut info = topic("t1", TopicStatus::Running);
+        info.limits.max_retries_per_step = 0;
+        info.permission_rules
+            .push(formless_protocol::TopicPermissionRule {
+                rule_id: "r1".into(),
+                harness: Some(HarnessKind::Claude),
+                acp_agent: None,
+                kind: None,
+                pattern: "cargo *".into(),
+                decision: TopicRuleDecision::AllowOnce,
+            });
+        let text: String = topic_lines(&info, false)
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect();
+        assert!(text.contains("this topic branch only"), "{text}");
+        assert!(text.contains("0 retries per step · 20 attempts"), "{text}");
+        assert!(
+            text.contains("r1 · allow · Claude · any kind · `cargo *`"),
+            "{text}"
+        );
+        assert_eq!(
+            artifact_label(&TopicArtifact::Directory {
+                path: "/tmp/copy".into()
+            }),
+            "folder copy /tmp/copy"
+        );
     }
 
     #[test]

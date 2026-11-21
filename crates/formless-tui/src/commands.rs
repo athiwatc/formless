@@ -122,7 +122,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("topics", "", "browse Main Chat and topic conversations", Session),
     cmd(
         "topic",
-        "[ID|start|cancel|recover|retry TOPIC FEATURE|reject TOPIC REASON]",
+        "[ID|start|cancel|recover|retry TOPIC FEATURE|reject TOPIC REASON|context TOPIC on/off|limits TOPIC RETRIES ATTEMPTS|allow/deny TOPIC PATTERN|unrule TOPIC RULE|harnesses]",
         "propose, review, or manage a Topic Chat",
         Session,
     ),

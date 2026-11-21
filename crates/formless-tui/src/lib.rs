@@ -385,6 +385,10 @@ enum Pending {
     TopicPermission {
         permission_id: String,
     },
+    TopicControl {
+        topic_id: Option<String>,
+        done: String,
+    },
     ReconnectSession,
     CreateSession,
     ForkSession,
@@ -687,6 +691,8 @@ struct OpenQuestion {
     cursor: usize,
     /// Ticked options of a multi-select question.
     checked: Vec<bool>,
+    /// The Formless model may not answer this one.
+    user_only: bool,
 }
 
 impl OpenQuestion {
@@ -698,6 +704,7 @@ impl OpenQuestion {
             answers: Vec::new(),
             cursor: 0,
             checked: Vec::new(),
+            user_only: false,
         };
         q.reset_choice();
         q
@@ -3422,7 +3429,8 @@ impl App {
                         | Pending::TopicRecover { .. }
                         | Pending::TopicRetry { .. }
                         | Pending::TopicCancel { .. }
-                        | Pending::TopicPermission { .. } => {
+                        | Pending::TopicPermission { .. }
+                        | Pending::TopicControl { .. } => {
                             unreachable!("topic replies handled above")
                         }
                         Pending::HunkReview { reply, action } => {
@@ -6496,13 +6504,15 @@ impl App {
                 question,
                 options,
                 mut questions,
+                user_only,
                 ..
             } => {
                 // An older daemon sends only the single-question form.
                 if questions.is_empty() {
                     questions.push(Question::single(question, options));
                 }
-                let open = OpenQuestion::new(question_id, session_id, questions);
+                let mut open = OpenQuestion::new(question_id, session_id, questions);
+                open.user_only = user_only;
                 self.notes.push(open.prompt());
                 if self.is_current(&open.session_id) {
                     self.set_activity("awaiting your answer");
@@ -6533,7 +6543,23 @@ impl App {
                 }
                 self.run_usage.insert(session_id, usage);
             }
-            Event::UserQuestionClosed { question_id, .. } => {
+            Event::UserQuestionClosed {
+                question_id,
+                answered_by,
+            } => {
+                if answered_by.as_deref() == Some("model") {
+                    let asker = self
+                        .questions
+                        .iter()
+                        .find(|q| q.id == question_id)
+                        .and_then(|q| self.topic.harness_label_for_session(&q.session_id));
+                    self.notes.push(match asker {
+                        Some(asker) => format!(
+                            "Formless answered the question from {asker}; the answer is in the Topic Chat."
+                        ),
+                        None => "Formless answered an open question.".into(),
+                    });
+                }
                 self.questions.retain(|q| q.id != question_id);
             }
             Event::SessionClients {
@@ -12828,6 +12854,9 @@ fn draw_question_panel(
     }
     if let Some(context) = context {
         title.push_str(&format!(" · {context}"));
+    }
+    if open.user_only {
+        title.push_str(" · only you can answer");
     }
     if let Some(h) = &q.header {
         title.push_str(&format!(" · {h}"));

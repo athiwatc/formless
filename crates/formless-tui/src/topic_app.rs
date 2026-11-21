@@ -96,6 +96,13 @@ impl App {
                 let args = args.trim();
                 if args.is_empty() || args == "new" {
                     self.open_topic_proposal();
+                } else if let Some(control) = self.topic.control_command(args) {
+                    match control {
+                        Ok((topic_id, request, done)) => {
+                            self.request(Pending::TopicControl { topic_id, done }, request)
+                        }
+                        Err(error) => self.notes.push(error),
+                    }
                 } else if let Err(error) = self.topic.open_topic_command(args) {
                     self.notes.push(error);
                 }
@@ -531,6 +538,23 @@ impl App {
                     "Topic cancelled; running harness work was stopped.",
                 );
             }
+            Pending::TopicControl {
+                topic_id: Some(_),
+                done,
+            } => self.topic_updated(ok, result, &reason, &done),
+            Pending::TopicControl { topic_id: None, .. } => {
+                match parse!(Vec<formless_protocol::HarnessAvailability>, ok, result) {
+                    Some(harnesses) if harnesses.is_empty() => {
+                        self.notes.push("No harnesses reported.".into())
+                    }
+                    Some(harnesses) => {
+                        for harness in harnesses {
+                            self.notes.push(topic::harness_availability_line(&harness));
+                        }
+                    }
+                    None => self.notes.push(format!("Harness check failed: {reason}")),
+                }
+            }
             Pending::TopicPermission { permission_id } => {
                 if !ok {
                     self.notes.push(format!(
@@ -626,6 +650,7 @@ impl Pending {
                 | Pending::TopicRetry { .. }
                 | Pending::TopicCancel { .. }
                 | Pending::TopicPermission { .. }
+                | Pending::TopicControl { .. }
         )
     }
 }
@@ -705,6 +730,9 @@ mod tests {
             attempts: vec![],
             created_at: String::new(),
             updated_at: String::new(),
+            allow_external_context: false,
+            permission_rules: vec![],
+            limits: Default::default(),
         }
     }
 
@@ -759,6 +787,11 @@ mod tests {
                             | Request::RejectTopic { .. }
                             | Request::StartTopicWorkflow { .. }
                             | Request::RecoverTopic { .. }
+                            | Request::SetTopicContextAccess { .. }
+                            | Request::SetTopicLimits { .. }
+                            | Request::AddTopicPermissionRule { .. }
+                            | Request::RemoveTopicPermissionRule { .. }
+                            | Request::ListHarnesses
                             | Request::RetryTopicFeature { .. }
                             | Request::CancelTopic { .. }
                     )
@@ -1126,6 +1159,48 @@ mod tests {
     }
 
     #[test]
+    fn user_topic_controls_send_their_requests() {
+        let (mut app, wire) = connected(vec![topic("t1", TopicStatus::Approved)]);
+        app.topic_slash("topic", "context t1 on");
+        app.topic_slash("topic", "limits t1 1 5");
+        app.topic_slash("topic", "deny t1 rm -rf *");
+        app.topic_slash("topic", "unrule t1 nope");
+        assert!(app.notes.last().unwrap().contains("no permission rule"));
+        app.topic_slash("topic", "harnesses");
+        let requests = wire.topic_requests();
+        assert!(matches!(
+            &requests[0].request,
+            Request::SetTopicContextAccess { topic_id, allow: true } if topic_id == "t1"
+        ));
+        assert!(matches!(
+            &requests[1].request,
+            Request::SetTopicLimits { limits, .. }
+                if limits.max_retries_per_step == 1 && limits.max_attempts_per_topic == 5
+        ));
+        assert!(matches!(
+            &requests[2].request,
+            Request::AddTopicPermissionRule { pattern, decision: formless_protocol::TopicRuleDecision::Reject, harness: None, .. }
+                if pattern == "rm -rf *"
+        ));
+        assert!(matches!(&requests[3].request, Request::ListHarnesses));
+        assert_eq!(requests.len(), 4);
+        let mut updated = topic("t1", TopicStatus::Approved);
+        updated.allow_external_context = true;
+        wire.respond(
+            &mut app,
+            requests[0].id,
+            serde_json::to_value(updated).unwrap(),
+        );
+        assert!(app.topic.topic("t1").unwrap().allow_external_context);
+        wire.respond(
+            &mut app,
+            requests[3].id,
+            serde_json::json!([{"kind":"codex","acp_agent":null,"installed":true,"signed_in":false,"version":"1.2","detail":null}]),
+        );
+        assert_eq!(app.notes.last().unwrap(), "Codex: signed out · 1.2");
+    }
+
+    #[test]
     fn harness_questions_take_typed_answers() {
         let mut running = topic("t1", TopicStatus::Running);
         running
@@ -1141,6 +1216,7 @@ mod tests {
             question: "Which file?".into(),
             options: vec![],
             questions: vec![],
+            user_only: true,
         });
         app.input.set("src/main.rs");
         app.submit_chat(false);
