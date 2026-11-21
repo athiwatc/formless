@@ -19,12 +19,15 @@ The ACP client itself is shared in `local_harness::acp` (`AgentSpec`, `run`, `Pe
 | Unauthenticated `session/new` | Observed: JSON-RPC -32000 "Authentication required", returned before the MCP server starts | Captured live response |
 | Signed-in `session/new` starts the bridge with its env | Not observed (no signed-in account) | ACP v1 schema shapes only |
 | Prompt turn, approvals, plan mode, model selection | Not observed | ACP v1 schema shapes only |
+| Readiness probe (`antigravity::availability`) | Observed: `agy models` exits 1 with "Please sign in" when signed out; signed-in output not observed | Fake `agy` script |
 
 Fixture coverage does not show that the released `agy` starts the bridge. To check on a machine where `agy` is already signed in, run:
 
 ```sh
 FORMLESS_LIVE_AGY=1 cargo test -p formless-core live_agy_acp -- --ignored --nocapture
 ```
+
+`antigravity::availability` reports readiness for `ListHarnesses` without touching credentials: an ACP `initialize` (no `session/new`, so no bridge or prompt) gives install state and version, then `agy models` gives the sign-in state. A "sign in" error means signed out, success means signed in, and anything else (timeout, network error) leaves it unknown.
 
 Set `FORMLESS_AGY_BIN` if `agy` is not on PATH. The test opens a session whose bridge is a shell stub, and checks that it started with the run's capability variable.
 

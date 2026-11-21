@@ -1,8 +1,16 @@
-use std::ffi::OsString;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    io::Read,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 use super::acp::{self, AgentSpec, PermissionHandler};
-use super::{CommandSpec, HarnessRequest, HarnessResult, StepAccess};
+use super::{CommandSpec, HarnessKind, HarnessRequest, HarnessResult, StepAccess};
 use anyhow::{anyhow, bail, Context, Result};
+use formless_protocol::HarnessAvailability;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +46,91 @@ pub fn run(
 /// Opens an `agy acp` session with the Formless bridge attached, without prompting.
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
     acp::open_session(&SPEC, request)
+}
+
+/// Readiness for `ListHarnesses`. ACP `initialize` gives install state and version without
+/// a sign-in; `agy models` then needs the user's existing sign-in and asks for one without
+/// it. Nothing is written and no credentials are read.
+pub fn availability(
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> HarnessAvailability {
+    let probe = acp::probe(&SPEC, executable.clone(), environment);
+    let signed_in = probe
+        .compatible
+        .then(|| models_signed_in(executable, environment))
+        .flatten();
+    HarnessAvailability {
+        kind: HarnessKind::Antigravity,
+        acp_agent: None,
+        installed: probe.installed,
+        signed_in,
+        version: probe.version,
+        detail: probe
+            .detail
+            .or_else(|| (signed_in == Some(false)).then(|| SPEC.not_signed_in.to_owned())),
+    }
+}
+
+#[cfg(not(test))]
+const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const MODELS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Runs `agy models`; `None` when the answer is not conclusive (timeout, network error).
+fn models_signed_in(
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<bool> {
+    let mut child = Command::new(executable.unwrap_or_else(|| PathBuf::from(SPEC.program)))
+        .arg("models")
+        .current_dir(std::env::temp_dir())
+        .envs(environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut pipes: Vec<Box<dyn Read + Send>> = Vec::new();
+    pipes.extend(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    pipes.extend(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let readers: Vec<_> = pipes
+        .into_iter()
+        .map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                text
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + MODELS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let output: String = readers
+        .into_iter()
+        .filter_map(|reader| reader.join().ok())
+        .collect();
+    signed_in_from(status.success(), &output)
+}
+
+fn signed_in_from(success: bool, output: &str) -> Option<bool> {
+    if success {
+        Some(true)
+    } else if output.to_ascii_lowercase().contains("sign in") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// `agy acp` flags; review runs also get agy's terminal sandbox.
@@ -248,6 +341,54 @@ mod tests {
         HarnessRequest, StepAccess,
     };
     use super::parse_output;
+
+    #[test]
+    fn sign_in_comes_from_the_models_command() {
+        assert_eq!(super::signed_in_from(true, "gemini-3-pro"), Some(true));
+        assert_eq!(
+            super::signed_in_from(
+                false,
+                "Error: Please sign in to view available models. Launch the CLI without arguments to sign in."
+            ),
+            Some(false)
+        );
+        assert_eq!(super::signed_in_from(false, "network unreachable"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn availability_probes_an_installed_agy_without_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("formless-agy-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agy = dir.join("agy");
+        std::fs::write(
+            &agy,
+            r#"#!/bin/sh
+if [ "$1" = models ]; then
+  echo "Error: Please sign in to view available models. Launch the CLI without arguments to sign in." >&2
+  exit 1
+fi
+read line
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"}}}'
+sleep 5
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let availability = super::availability(Some(agy), &BTreeMap::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(availability.kind, HarnessKind::Antigravity);
+        assert!(availability.installed);
+        assert_eq!(availability.version.as_deref(), Some("1.5.14"));
+        assert_eq!(availability.signed_in, Some(false));
+        assert!(availability.detail.unwrap().contains("not signed in"));
+
+        let missing =
+            super::availability(Some(PathBuf::from("/nonexistent/agy")), &BTreeMap::new());
+        assert!(!missing.installed);
+        assert_eq!(missing.signed_in, None);
+    }
     use std::{
         collections::BTreeMap,
         ffi::OsString,
