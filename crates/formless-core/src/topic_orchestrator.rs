@@ -307,6 +307,11 @@ impl Daemon {
             if self.runs.locked().contains_key(&session) {
                 bail!("Topic Chat already has an active model run");
             }
+            let availability=local_harness::list_harnesses().await;
+            if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
+            if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
+            if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
+            let kickoff=format!("{kickoff}\nFresh local harness availability (ready means installed && signed_in != false; unknown auth is ready):\n{}\nNever launch an unready harness. Ask the user through topic_request_harness_substitute to sign in and retry, approve a substitute for one feature+step, or skip. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
@@ -442,7 +447,7 @@ impl Daemon {
         args: &Value,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        let step: Step = serde_json::from_value(args.clone())?;
+        let mut step: Step = serde_json::from_value(args.clone())?;
         local_harness::validate_acp_agent(Some(step.harness), step.acp_agent.as_deref())?;
         if step.title.trim().is_empty() || step.instructions.trim().is_empty() {
             bail!("step title and instructions must not be blank");
@@ -458,6 +463,30 @@ impl Daemon {
             .iter()
             .find(|feature| feature.id == step.feature_id)
             .context("feature does not belong to this topic")?;
+        let substitute_key = (
+            topic.id.clone(),
+            feature.id.clone(),
+            step.title.trim().to_owned(),
+        );
+        let approved = {
+            let approvals = self.topic_substitutes.locked();
+            approvals
+                .get(&substitute_key)
+                .filter(|approval| {
+                    approval.wanted.harness == step.harness
+                        && approval.wanted.acp_agent == step.acp_agent
+                })
+                .cloned()
+        };
+        if let Some(approval) = &approved {
+            step.harness = approval.substitute.harness;
+            step.acp_agent = approval.substitute.acp_agent.clone();
+        }
+        let availability =
+            local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;
+        if !availability.installed || availability.signed_in == Some(false) {
+            bail!("{:?} is not ready: {}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness,availability.detail.as_deref().unwrap_or("not signed in"));
+        }
         if step
             .inputs
             .iter()
@@ -493,6 +522,11 @@ impl Daemon {
         );
         let (attempt, lease) = {
             let _launch = self.topic_launch.locked();
+            if approved.is_some()
+                && self.topic_substitutes.locked().get(&substitute_key) != approved.as_ref()
+            {
+                bail!("substitute approval was already consumed; ask the user again");
+            }
             if step_cancel.is_cancelled() || self.shutdown.is_cancelled() {
                 bail!("step cancelled before preparation");
             }
@@ -530,6 +564,7 @@ impl Daemon {
                 )
             })?;
             let key = (topic.id.clone(), attempt.id.clone());
+            self.topic_substitutes.locked().remove(&substitute_key);
             self.topic_steps
                 .locked()
                 .insert(key.clone(), step_cancel.clone());
