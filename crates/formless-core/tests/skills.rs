@@ -388,13 +388,26 @@ async fn the_agent_loads_enabled_skills() {
         name: "report-writer".into(),
         args: None,
     };
-    assert!(daemon.handle(original).await.unwrap_err().to_string().contains("session not found"));
+    assert!(daemon
+        .handle(original)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("session not found"));
     assert_eq!(store.get_skill("report-writer").unwrap().unwrap().loads, 2);
     store.set_skill_enabled("report-writer", false).unwrap();
-    for (name, message) in [("report-writer", "disabled"), ("missing-skill", "no skill named")] {
-        let error = daemon.handle(formless_protocol::Request::LoadSkill {
-            session_id: session.clone(), name: name.into(), args: None,
-        }).await.unwrap_err();
+    for (name, message) in [
+        ("report-writer", "disabled"),
+        ("missing-skill", "no skill named"),
+    ] {
+        let error = daemon
+            .handle(formless_protocol::Request::LoadSkill {
+                session_id: session.clone(),
+                name: name.into(),
+                args: None,
+            })
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains(message));
     }
 }
@@ -522,7 +535,14 @@ async fn manual_loads_and_legacy_blank_run_ids_do_not_trigger_unhelpful_retireme
     let (_fixture, paths) = temp_paths("manual-retire");
     let store = Store::open(&paths.db_file()).unwrap();
     let name = "manual-skill";
-    install_text(&paths, &store, "---\nname: manual-skill\ndescription: d\n---\nbody\n", "auto", "auto").unwrap();
+    install_text(
+        &paths,
+        &store,
+        "---\nname: manual-skill\ndescription: d\n---\nbody\n",
+        "auto",
+        "auto",
+    )
+    .unwrap();
     store.set_skill_enabled(name, true).unwrap();
     let session = store.create_session(None).unwrap().id;
     let raw = rusqlite::Connection::open(paths.db_file()).unwrap();
@@ -532,15 +552,35 @@ async fn manual_loads_and_legacy_blank_run_ids_do_not_trigger_unhelpful_retireme
     ).unwrap();
     let daemon = std::sync::Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
     let load = || formless_protocol::Request::LoadSkill {
-        session_id: session.clone(), name: name.into(), args: None,
+        session_id: session.clone(),
+        name: name.into(),
+        args: None,
     };
     assert_eq!(daemon.handle(load()).await.unwrap()["loaded"], name);
     let skill = store.get_skill(name).unwrap().unwrap();
     assert_eq!((skill.loads, skill.runs, skill.runs_completed), (2, 0, 0));
     assert!(store.retire_auto_skills(None, 0.9, 1).unwrap().is_empty());
-    assert_eq!(raw.query_row("SELECT COUNT(*) FROM skill_loads WHERE run_id IS NULL", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-    assert_eq!(store.retire_auto_skills(Some("2999-01-01T00:00:00Z"), 0.0, 1).unwrap(), vec![name]);
-    assert!(daemon.handle(load()).await.unwrap_err().to_string().contains("is retired"));
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM skill_loads WHERE run_id IS NULL",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .retire_auto_skills(Some("2999-01-01T00:00:00Z"), 0.0, 1)
+            .unwrap(),
+        vec![name]
+    );
+    assert!(daemon
+        .handle(load())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("is retired"));
     assert_eq!(store.get_skill(name).unwrap().unwrap().loads, 2);
 }
 

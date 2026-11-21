@@ -4358,7 +4358,10 @@ impl App {
                             lines.push(if enabled {
                                 format!("/skill:{name} loads it into this Session")
                             } else {
-                                format!("/skills enable {name} {} it for loading", if retired { "restores" } else { "enables" })
+                                format!(
+                                    "/skills enable {name} {} it for loading",
+                                    if retired { "restores" } else { "enables" }
+                                )
                             });
                             self.pager = Some(Pager {
                                 title: format!("Skill {name}"),
@@ -21516,14 +21519,23 @@ mod tests {
             app.slash("skill:foo");
             assert!(app.notes.is_empty());
             let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
-            reply.send(ServerMessage::Response {
-                id: request.id,
-                ok,
-                result: ok.then(|| serde_json::json!({"loaded":"foo"})),
-                error: (!ok).then(|| "skill 'foo' is retired".into()),
-            }).unwrap();
+            reply
+                .send(ServerMessage::Response {
+                    id: request.id,
+                    ok,
+                    result: ok.then(|| serde_json::json!({"loaded":"foo"})),
+                    error: (!ok).then(|| "skill 'foo' is retired".into()),
+                })
+                .unwrap();
             app.drain_daemon();
-            assert_eq!(app.notes.last().map(String::as_str), Some(if ok { "loaded skill foo" } else { "daemon: skill 'foo' is retired" }));
+            assert_eq!(
+                app.notes.last().map(String::as_str),
+                Some(if ok {
+                    "loaded skill foo"
+                } else {
+                    "daemon: skill 'foo' is retired"
+                })
+            );
         }
     }
 

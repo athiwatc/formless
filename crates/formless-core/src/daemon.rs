@@ -2808,9 +2808,19 @@ impl Daemon {
                             .context(RequestFailure::not_found("session not found"))?;
                         let skill = Self::enabled_skill_in(st, &name)?;
                         if loaded["version"] != skill.version {
-                            return Err(RequestFailure::busy("the skill changed while it was loading; try again").into());
+                            return Err(RequestFailure::busy(
+                                "the skill changed while it was loading; try again",
+                            )
+                            .into());
                         }
-                        Self::record_skill_origins(st, &session_id, "", toolreg::LOAD_SKILL, &skill, "SKILL.md")?;
+                        Self::record_skill_origins(
+                            st,
+                            &session_id,
+                            "",
+                            toolreg::LOAD_SKILL,
+                            &skill,
+                            "SKILL.md",
+                        )?;
                         let origins = st.data_origins(&session_id, "")?;
                         let msg = st.append_message_meta(
                             &session_id,
@@ -10637,13 +10647,20 @@ impl Daemon {
     }
 
     fn enabled_skill_in(st: &Store, name: &str) -> Result<SkillInfo> {
-        let skill = st.get_skill(name)?
+        let skill = st
+            .get_skill(name)?
             .with_context(|| RequestFailure::not_found(format!("no skill named '{name}'")))?;
         if skill.retired {
-            return Err(RequestFailure::invalid(format!("skill '{name}' is retired; enable it to restore it")).into());
+            return Err(RequestFailure::invalid(format!(
+                "skill '{name}' is retired; enable it to restore it"
+            ))
+            .into());
         }
         if !skill.enabled {
-            return Err(RequestFailure::invalid(format!("no enabled skill named '{name}': the skill is disabled")).into());
+            return Err(RequestFailure::invalid(format!(
+                "no enabled skill named '{name}': the skill is disabled"
+            ))
+            .into());
         }
         Ok(skill)
     }
@@ -12517,9 +12534,14 @@ impl Daemon {
     }
 
     fn skill_load_payload(&self, name: &str) -> Result<Value> {
-        let (skill, dir) = self.with_reader(|st| st.read_transaction(|st| {
-            Ok((Self::enabled_skill_in(st, name)?, crate::skills::current_dir(st, name)?))
-        }))?;
+        let (skill, dir) = self.with_reader(|st| {
+            st.read_transaction(|st| {
+                Ok((
+                    Self::enabled_skill_in(st, name)?,
+                    crate::skills::current_dir(st, name)?,
+                ))
+            })
+        })?;
         let body =
             crate::skills::parse_skill_md(&std::fs::read_to_string(dir.join("SKILL.md"))?)?.body;
         let files: Vec<String> = crate::skills::files(&dir)?
@@ -14078,10 +14100,18 @@ impl Daemon {
     ) -> Result<()> {
         use crate::provenance::Origin;
         st.record_data_origin(session, run, &Origin::new(tool, "skill", &skill.source))?;
-        st.record_data_origin(session, run, &Origin::new(tool, "skill_author", &skill.author))?;
+        st.record_data_origin(
+            session,
+            run,
+            &Origin::new(tool, "skill_author", &skill.author),
+        )?;
         let dir = crate::skills::current_dir(st, &skill.name)?;
         if let Ok(file) = dir.join(path).canonicalize() {
-            st.record_data_origin(session, run, &Origin::new(tool, "file", &file.to_string_lossy()))?;
+            st.record_data_origin(
+                session,
+                run,
+                &Origin::new(tool, "file", &file.to_string_lossy()),
+            )?;
         }
         Ok(())
     }
