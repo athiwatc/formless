@@ -33,6 +33,239 @@ fn topic_main_identity_is_non_creating_and_persistent() {
 }
 
 #[test]
+fn topic_context_branch_scope_search_and_external_opt_in() {
+    let (store, source, _, _) = fixture();
+    let parent = nested_topic(&store, &source.id, None).unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    store.claim_topic_workflow(&parent.id).unwrap();
+    let ancestor = store
+        .begin_topic_attempt(
+            &parent.id,
+            &parent.features[0].id,
+            "Prior",
+            StepAccess::ReadOnly,
+            HarnessKind::Claude,
+            None,
+            None,
+            &[],
+            &"token".repeat(8),
+            Path::new("/topic/prior"),
+        )
+        .unwrap();
+    store
+        .report_topic_result(
+            &ancestor.id,
+            &"token".repeat(8),
+            TopicAttemptStatus::Succeeded,
+            "done",
+            &[],
+        )
+        .unwrap();
+    store
+        .finish_topic_feature(
+            parent.topic_session_id.as_ref().unwrap(),
+            &parent.features[0].id,
+            true,
+            "done",
+        )
+        .unwrap();
+    let parent_session = parent.topic_session_id.as_ref().unwrap();
+    let child = nested_topic(&store, parent_session, None).unwrap();
+    let child = store.approve_topic(&child.id).unwrap();
+    store.claim_topic_workflow(&child.id).unwrap();
+    let own = store
+        .begin_topic_attempt(
+            &child.id,
+            &child.features[0].id,
+            "Own",
+            StepAccess::ReadOnly,
+            HarnessKind::Claude,
+            None,
+            None,
+            &[],
+            &"child".repeat(8),
+            Path::new("/topic/own"),
+        )
+        .unwrap();
+    let sibling = nested_topic(&store, &source.id, Some(parent.id.clone())).unwrap();
+    let sibling = store.approve_topic(&sibling.id).unwrap();
+    let sibling_session = sibling.topic_session_id.unwrap();
+    let own_session = child.topic_session_id.as_ref().unwrap();
+    for session in [
+        own_session,
+        parent_session,
+        &own.conversation_session_id,
+        &ancestor.conversation_session_id,
+        &sibling_session,
+        &source.id,
+    ] {
+        store
+            .append_message(session, "user", "A NeEdLe to locate")
+            .unwrap();
+    }
+    for session in [
+        own_session,
+        parent_session,
+        &own.conversation_session_id,
+        &ancestor.conversation_session_id,
+    ] {
+        assert!(store.topic_read_conversation(&child.id, session).is_ok());
+    }
+    for session in [&source.id, &sibling_session] {
+        assert!(store.topic_read_conversation(&child.id, session).is_err());
+    }
+    let matches = store
+        .topic_search_conversations(&child.id, "needle")
+        .unwrap();
+    assert_eq!(matches.as_array().unwrap().len(), 4);
+    assert_eq!(
+        store.topic_search_conversations(&child.id, " ").unwrap(),
+        json!([])
+    );
+    assert!(store
+        .topic_search_conversations(&child.id, &"x".repeat(1001))
+        .is_err());
+    assert!(!child.allow_external_context);
+    store.set_topic_context_access(&child.id, true).unwrap();
+    assert!(store.topic_read_conversation(&child.id, &source.id).is_ok());
+    assert!(store
+        .topic_read_conversation(&child.id, &sibling_session)
+        .is_ok());
+    assert_eq!(
+        store
+            .topic_search_conversations(&child.id, "NEEDLE")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    store.soft_delete_session(&sibling_session).unwrap();
+    assert!(store
+        .topic_read_conversation(&child.id, &sibling_session)
+        .is_err());
+    for _ in 0..45 {
+        store.append_message(own_session, "user", "needle").unwrap();
+    }
+    assert_eq!(
+        store
+            .topic_search_conversations(&child.id, "needle")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        40
+    );
+}
+
+#[test]
+fn topic_needs_user_feature_does_not_block_active_sibling() {
+    let (store, _, message, mut request) = fixture();
+    request.features = vec![
+        TopicFeatureProposal {
+            source_message_id: message.id.clone(),
+            request: "X".into(),
+        },
+        TopicFeatureProposal {
+            source_message_id: message.id,
+            request: "Y".into(),
+        },
+    ];
+    let topic = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&topic.id).unwrap();
+    store.claim_topic_workflow(&topic.id).unwrap();
+    let token = "capability".repeat(8);
+    let attempts: Vec<_> = topic
+        .features
+        .iter()
+        .map(|feature| {
+            store
+                .begin_topic_attempt(
+                    &topic.id,
+                    &feature.id,
+                    "Step",
+                    StepAccess::Write,
+                    HarnessKind::Claude,
+                    None,
+                    None,
+                    &[],
+                    &token,
+                    Path::new("/topic/build"),
+                )
+                .unwrap()
+        })
+        .collect();
+    store
+        .report_topic_result(
+            &attempts[0].id,
+            &token,
+            TopicAttemptStatus::NeedsUser,
+            "Question",
+            &[],
+        )
+        .unwrap();
+    assert!(store
+        .authenticate_topic_attempt(&attempts[1].id, &token)
+        .is_ok());
+    assert!(store
+        .report_topic_result(
+            &attempts[1].id,
+            &token,
+            TopicAttemptStatus::Succeeded,
+            "Y done",
+            &[]
+        )
+        .is_ok());
+}
+
+#[test]
+fn topic_results_accept_sha1_and_sha256_revisions() {
+    for (revision, valid) in [
+        ("a".repeat(40), true),
+        ("b".repeat(64), true),
+        ("g".repeat(64), false),
+        ("a".repeat(39), false),
+        ("b".repeat(65), false),
+    ] {
+        let (store, _, _, request) = fixture();
+        let topic = store
+            .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+            .unwrap();
+        store.approve_topic(&topic.id).unwrap();
+        store.claim_topic_workflow(&topic.id).unwrap();
+        let token = "capability".repeat(8);
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Step",
+                StepAccess::Write,
+                HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                &token,
+                Path::new("/topic/build"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .report_topic_result(
+                    &attempt.id,
+                    &token,
+                    TopicAttemptStatus::Succeeded,
+                    "Done",
+                    &[TopicArtifact::GitRevision { revision }]
+                )
+                .is_ok(),
+            valid
+        );
+    }
+}
+
+#[test]
 fn topic_empty_features_fallback_approval_idempotence_and_rejection() {
     let (store, source, message, request) = fixture();
     let other = store
@@ -332,7 +565,7 @@ fn topic_source_can_be_deleted_or_purged_after_rejection() {
 }
 
 #[test]
-fn topic_source_deletion_cascades_active_attempts_and_repository_lock() {
+fn topic_session_deletion_cascades_active_attempts_and_repository_lock() {
     let (store, source, _, request) = fixture();
     let topic = store
         .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
@@ -354,6 +587,11 @@ fn topic_source_deletion_cascades_active_attempts_and_repository_lock() {
         )
         .unwrap();
     assert!(store.delete_session(&source.id).unwrap());
+    let surviving = store.get_topic(&topic.id).unwrap().unwrap();
+    assert!(store.get_topic_attempt(&attempt.id).unwrap().is_some());
+    assert!(store
+        .delete_session(surviving.topic_session_id.as_ref().unwrap())
+        .unwrap());
     assert!(store.get_topic(&topic.id).unwrap().is_none());
     assert!(store.get_topic_attempt(&attempt.id).unwrap().is_none());
     let locks: i64 = store
@@ -827,4 +1065,42 @@ fn topic_acp_selector_is_required_iff_acp_and_persisted() {
         )
         .unwrap();
     assert_eq!(attempt.acp_agent.as_deref(), Some("gemini"));
+}
+
+#[test]
+fn topic_approved_explicit_parent_survives_source_purge_but_pending_does_not() {
+    let (store, source, message, mut proposal) = fixture();
+    let owner = store.create_session(None).unwrap();
+    let parent = nested_topic(&store, &owner.id, None).unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    let artifact = store
+        .save_artifact(Some(&source.id), "/retained.txt", "", 0)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET meta=?2 WHERE id=?1",
+            params![
+                message.id,
+                json!({"attachments":[{"id":artifact}]}).to_string()
+            ],
+        )
+        .unwrap();
+    proposal.parent_topic_id = Some(parent.id.clone());
+    let topic = store
+        .propose_topic(&proposal, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let topic = store.approve_topic(&topic.id).unwrap();
+    let pending = nested_topic(&store, &source.id, Some(parent.id.clone())).unwrap();
+    store.delete_session(&source.id).unwrap();
+    let surviving = store.get_topic(&topic.id).unwrap().unwrap();
+    assert_eq!(surviving.parent_topic_id, Some(parent.id));
+    assert_eq!(surviving.source_session_id, source.id);
+    assert!(store.get_topic(&pending.id).unwrap().is_none());
+    let session = topic.topic_session_id.unwrap();
+    assert!(store.get_message(&session, &message.id).unwrap().is_some());
+    assert!(store
+        .topic_artifact_access(&artifact, &session, None, Some(&source.id))
+        .unwrap());
+    assert!(store.get_artifact(&artifact).unwrap().is_some());
 }

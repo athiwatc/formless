@@ -697,7 +697,7 @@ fn remove_resolved_prompt(prompts: &mut VecDeque<Prompt>, ev: &Event) {
             },
             Event::ApprovalClosed { approval_id },
         ) => id == approval_id,
-        (Prompt::Question { id, .. }, Event::UserQuestionClosed { question_id }) => {
+        (Prompt::Question { id, .. }, Event::UserQuestionClosed { question_id, .. }) => {
             id == question_id
         }
         _ => false,
