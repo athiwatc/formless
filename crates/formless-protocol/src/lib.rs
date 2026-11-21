@@ -726,6 +726,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             base,
             "sh" | "bash"
                 | "zsh"
+                | "nu"
                 | "fish"
                 | "dash"
                 | "ksh"
@@ -3929,6 +3930,9 @@ mod tests {
             "process:python3.11",
             "process:ruby3.2",
             "process:node20",
+            "process:nu",
+            "process:/usr/bin/nu",
+            "process:nu.exe",
             "process:git",
             "process:git:status|log",
             "process:find",
@@ -3938,6 +3942,8 @@ mod tests {
             assert!(broad_capability(spec).is_some(), "{spec}");
         }
         assert!(broad_capability("process:ls").is_none());
+        assert!(broad_capability("process:nuget").is_none());
+        assert!(broad_capability("process:null").is_none());
     }
 
     #[test]
