@@ -1927,6 +1927,7 @@ struct App {
     /// The chat's inner area in the last frame, and the OSC 8 links
     /// painted over it (SPEC §10.2).
     chat_area: Option<Rect>,
+    chat_markdown_links: Vec<links::Painted>,
     hyperlinks: bool,
     /// Path words already checked against the filesystem: their
     /// `file://` target when the file exists.
@@ -2067,7 +2068,7 @@ struct App {
     should_quit: bool,
     /// Rendered Markdown of settled messages, keyed by content and width.
     /// Rendered settled messages by (id, content length, width).
-    md_cache: std::cell::RefCell<HashMap<(String, usize, usize), Vec<Line<'static>>>>,
+    md_cache: std::cell::RefCell<HashMap<(String, usize, usize), markdown::Rendered>>,
     /// Clickable regions of the last frame (SPEC §10.5), and the last
     /// click for double-click detection.
     click_targets: std::cell::RefCell<Vec<(Rect, Click)>>,
@@ -2077,13 +2078,13 @@ struct App {
     selecting_draft: bool,
     last_click: Option<(Click, Instant)>,
     /// The streaming answer's settled prefix: (key, rendered lines).
-    stream_cache: std::cell::RefCell<Option<(StreamKey, Vec<Line<'static>>)>>,
+    stream_cache: std::cell::RefCell<Option<(StreamKey, markdown::Rendered)>>,
 }
 
 impl App {
     /// Markdown for a settled message, rendered once per message and width
     /// (assistant messages never change; reloads clear the cache).
-    fn markdown_cached(&self, m: &MessageInfo, width: usize) -> Vec<Line<'static>> {
+    fn markdown_cached(&self, m: &MessageInfo, width: usize) -> markdown::Rendered {
         let content = &m.content;
         let key = (m.id.clone(), content.len(), width);
         let mut cache = self.md_cache.borrow_mut();
@@ -2093,7 +2094,7 @@ impl App {
         if cache.len() > 1024 {
             cache.clear();
         }
-        let lines = markdown::render(content, self.color, "  ", width);
+        let lines = markdown::render_with_links(content, self.color, "  ", width);
         cache.insert(key, lines.clone());
         lines
     }
@@ -2101,7 +2102,7 @@ impl App {
     /// The live answer, rendered incrementally: everything up to its last
     /// block boundary is rendered once and reused while tokens arrive, so
     /// each frame only renders the unfinished tail block.
-    fn streaming_markdown(&self, width: usize) -> Vec<Line<'static>> {
+    fn streaming_markdown(&self, width: usize) -> markdown::Rendered {
         let text = &self.streaming;
         let split = stable_prefix_len(text);
         let (prefix, tail) = text.split_at(split);
@@ -2110,16 +2111,17 @@ impl App {
         let mut lines = match cache.as_ref() {
             Some((k, lines)) if *k == key => lines.clone(),
             _ => {
-                let lines = markdown::render(prefix, self.color, "  ", width);
+                let lines = markdown::render_with_links(prefix, self.color, "  ", width);
                 *cache = Some((key, lines.clone()));
                 lines
             }
         };
-        if !lines.is_empty() && !tail.is_empty() {
+        if !lines.lines.is_empty() && !tail.is_empty() {
             // The block gap a single render would put between them.
-            lines.push(Line::default());
+            lines.lines.push(Line::default());
         }
-        lines.extend(markdown::render(tail, self.color, "  ", width));
+        markdown::render_with_links(tail, self.color, "  ", width)
+            .append_to(&mut lines.lines, &mut lines.links);
         lines
     }
 
@@ -2258,6 +2260,7 @@ impl App {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
+            chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
@@ -16609,6 +16612,7 @@ fn tool_call_block(
 #[derive(Default)]
 struct ChatRender {
     lines: Vec<Line<'static>>,
+    markdown_links: Vec<markdown::Link>,
     focus_line: Option<usize>,
     search_line: Option<usize>,
     search_nearby: bool,
@@ -16620,6 +16624,7 @@ struct ChatRender {
 
 fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut lines: Vec<Line> = Vec::new();
+    let mut markdown_links = Vec::new();
     let mut focus_line = None;
     let mut search_line = None;
     let mut search_nearby = false;
@@ -16758,7 +16763,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 if is_placeholder(m) {
                     lines.push(Line::styled(format!("  {}", m.content), ui::dim(app.color)));
                 } else {
-                    lines.extend(app.markdown_cached(m, width));
+                    app.markdown_cached(m, width)
+                        .append_to(&mut lines, &mut markdown_links);
                 }
                 if let Some(note) = stored_stop_note(m) {
                     lines.push(Line::styled(format!("  {note}"), ui::dim(app.color)));
@@ -16936,7 +16942,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     }
     if !app.streaming.is_empty() || app.running() {
         open_group(&mut lines, &mut group, "assistant", None);
-        lines.extend(app.streaming_markdown(width));
+        app.streaming_markdown(width)
+            .append_to(&mut lines, &mut markdown_links);
         if app.streaming.is_empty() {
             lines.push(Line::styled(
                 format!("  {}", app.activity_text().unwrap_or_else(|| "…".into())),
@@ -17010,6 +17017,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     }
     ChatRender {
         lines,
+        markdown_links,
         focus_line,
         search_line,
         search_nearby,
@@ -17028,6 +17036,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus
     let width = area.width.saturating_sub(2);
     let ChatRender {
         mut lines,
+        markdown_links,
         focus_line,
         search_line,
         search_nearby,
@@ -17209,6 +17218,25 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) -> Option<keys::ChatFocus
             .right_aligned(),
         );
     }
+    app.chat_markdown_links = markdown_links
+        .into_iter()
+        .filter_map(|link| {
+            let row = line_rows[link.row];
+            let visible =
+                row >= scroll_top && row - scroll_top < usize::from(area.height.saturating_sub(2));
+            // Markdown is already wrapped. On an exceptionally narrow pane
+            // Ratatui can still rewrap its minimum-layout lines.
+            if !visible || lines[link.row].width() > usize::from(width) {
+                return None;
+            }
+            Some(links::Painted {
+                y: area.y + 1 + (row - scroll_top) as u16,
+                x0: area.x + 1 + link.columns.start as u16,
+                x1: area.x + link.columns.end as u16,
+                url: link.target.to_string(),
+            })
+        })
+        .collect();
     // Only the lines on screen go to the paragraph: wrapping a long
     // transcript every frame is what made it slow.
     let first = line_rows
@@ -20223,7 +20251,14 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                         .clone()
                 };
                 app.chat_area
-                    .map(|a| links::scan(frame.buffer, a, &mut resolve))
+                    .map(|a| {
+                        links::scan_with_explicit(
+                            frame.buffer,
+                            a,
+                            &app.chat_markdown_links,
+                            &mut resolve,
+                        )
+                    })
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -20511,6 +20546,7 @@ mod tests {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
+            chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
             pane_widths: (22, 26),
@@ -23749,11 +23785,11 @@ mod tests {
     fn incremental_streaming_render_matches_a_full_render() {
         let doc = "# Title\n\nSome **bold** text and `code`.\n\n- one\n- two\n\n\
                    1. first\n2. second\n\n```rust\nfn main() {\n\n    println!(\"hi\");\n}\n```\n\n\
-                   > quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nThe end.";
+                   > quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nThe [ending](https://example.com/end.).";
         let mut app = test_app();
         for cut in (0..=doc.len()).filter(|i| doc.is_char_boundary(*i)) {
             app.streaming = doc[..cut].to_string();
-            let full = markdown::render(&app.streaming, app.color, "  ", 60);
+            let full = markdown::render_with_links(&app.streaming, app.color, "  ", 60);
             assert_eq!(app.streaming_markdown(60), full, "cut at {cut}");
         }
     }
@@ -27226,6 +27262,63 @@ mod tests {
         // The chat area is recorded for the OSC 8 pass.
         render(&mut app, 80, 20);
         assert!(app.chat_area.is_some());
+    }
+
+    #[test]
+    fn chat_paints_exact_markdown_destinations_and_keeps_bare_url_trimming() {
+        let mut app = test_app();
+        let report = "https://example.com/report.";
+        let balanced = "https://example.com/thing_(x)!";
+        let bare = "https://example.com/bare";
+        app.messages = vec![msg(
+            "assistant",
+            &format!("See [report]({report}), [{balanced}]({balanced}) and {bare}."),
+        )];
+        let text_for = |buffer: &ratatui::buffer::Buffer, link: &links::Painted| -> String {
+            (link.x0..=link.x1)
+                .map(|x| buffer[(x, link.y)].symbol())
+                .collect()
+        };
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        let found = links::scan_with_explicit(
+            buffer,
+            app.chat_area.unwrap(),
+            &app.chat_markdown_links,
+            &mut |_| None,
+        );
+        for target in [report, balanced, bare] {
+            let matches: Vec<_> = found.iter().filter(|link| link.url == target).collect();
+            assert_eq!(matches.len(), 1, "{found:?}");
+            assert_eq!(text_for(buffer, matches[0]), target);
+        }
+        let link = found.iter().find(|link| link.url == report).unwrap();
+        assert_eq!(buffer[(link.x0 - 1, link.y)].symbol(), "(");
+        assert_eq!(buffer[(link.x1 + 1, link.y)].symbol(), ")");
+    }
+
+    #[test]
+    fn scrolled_markdown_destination_fragments_keep_the_full_target() {
+        let mut app = test_app();
+        let url = format!("https://example.com/{}.?", "abc".repeat(38));
+        app.messages = vec![msg("assistant", &format!("Before. [destination]({url})"))];
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(28, 9)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        let found = links::scan_with_explicit(
+            buffer,
+            app.chat_area.unwrap(),
+            &app.chat_markdown_links,
+            &mut |_| None,
+        );
+        assert!(found.len() >= 2, "{found:?}");
+        assert!(found.iter().all(|link| link.url == url), "{found:?}");
+        assert!(found
+            .iter()
+            .all(|link| (link.x0..=link.x1)
+                .all(|x| !matches!(buffer[(x, link.y)].symbol(), "(" | ")"))));
+        assert!(app.chat_line_count > app.chat_view_height);
     }
 
     #[test]
