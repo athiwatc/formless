@@ -201,14 +201,12 @@ pub(super) fn validate_runs_limit(cli: &Cli) -> Result<()> {
     if matches!(
         &cli.cmd,
         Some(Cmd::Runs {
-            action: Some(RunsAction::Running { .. }),
+            action: Some(_),
             limit: Some(_),
             ..
         })
     ) {
-        return Err(super::usage(
-            "--limit applies to the stored Run list, not the live Invocation snapshot",
-        ));
+        return Err(super::usage("--limit applies only to the Runs list"));
     }
     Ok(())
 }
@@ -666,10 +664,14 @@ mod tests {
             assert!(limit.is_none());
         }
         for limit in ["0", "20", "100"] {
-            let cli =
-                Cli::try_parse_from(["formless", "runs", "--limit", limit, "running"]).unwrap();
-            let error = validate_runs_limit(&cli).unwrap_err();
-            assert_eq!(super::super::exit_code(&error), 2);
+            for action in [&["running"][..], &["show", "id"], &["cancel", "id"]] {
+                let args = ["formless", "runs", "--limit", limit]
+                    .into_iter()
+                    .chain(action.iter().copied());
+                let cli = Cli::try_parse_from(args).unwrap();
+                let error = validate_runs_limit(&cli).unwrap_err();
+                assert_eq!(super::super::exit_code(&error), 2);
+            }
         }
         let cli = Cli::try_parse_from(["formless", "runs", "--limit", "7", "--json"]).unwrap();
         validate_runs_limit(&cli).unwrap();

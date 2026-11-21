@@ -46,18 +46,18 @@ test('both shipped diff viewers use the renderer without changing fenced highlig
   assert.match(source, /h\("pre", \{ class: "diff" \}, renderDiffLines\(f\.diff, "span"\)\)/);
 });
 test('run-file dialog uses metadata styling while preserving literal diff text', async () => {
-  const begin = source.indexOf('  async function showRunFiles(');
+  const extract = begin => source.slice(begin, source.indexOf('\n  }', begin) + 4);
   const diff = '--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new';
   let dialog;
   const c = vm.createContext({
-    document: { activeElement: {} }, S: { current: 'session' },
+    document: { activeElement: {} }, S: { current: 'session' }, sessionSeq: 0,
     act: async () => ({ run_id: 'run', files: [{ path: 'file', status: 'modified',
       revertible: false, diff }] }),
     h: (tag, props, ...children) => ({ tag, props, children: children.flat(Infinity).filter(x => x != null) }),
     openDialog: node => { dialog = node; }, closeDialog() {}, note() {},
   });
-  vm.runInContext(source.slice(start, source.indexOf('\n  }', start) + 4) + '\n' +
-    source.slice(begin, source.indexOf('\n  }', begin) + 4), c);
+  vm.runInContext([start, source.indexOf('  function currentRunTarget('),
+    source.indexOf('  function ensureRunTarget('), source.indexOf('  async function showRunFiles(')].map(extract).join('\n'), c);
   await c.showRunFiles();
   const all = [];
   const visit = n => { if (typeof n === 'object') { all.push(n); n.children?.forEach(visit); } };
