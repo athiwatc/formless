@@ -63,6 +63,7 @@ macro_rules! agents {
         fn session_requires_auth(id: &str) -> bool {
             match id {
                 $($id => $auth,)*
+                "grok" => true,
                 _ => false,
             }
         }

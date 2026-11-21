@@ -18,6 +18,17 @@ to shared `acp::run`.
 `StepAccess::ReadOnly` selects the read-only sandbox and plan mode; write steps
 use `StepAccess::Write`. Access is independent of the harness selection.
 
+Readiness uses the shared registry probe for `acp_agent: "grok"`: ACP
+`initialize` followed by `session/new` with no MCP servers or model turn.
+The version comes from `_meta.agentVersion` and must pass the same minimum
+version check as a normal launch. There is no version-argument field or separate
+`--version` invocation in this registry probe. A successful session proves sign-in;
+error `-32000` reports not signed in with the profile's authentication hint.
+Other failures leave sign-in unknown. The shared process launcher applies
+`SPEC.set_env` during probing too, forcing `GROK_DISABLE_AUTOUPDATER=1` even
+when the supplied environment says otherwise. Credentials remain in environment
+variables, never arguments, and no persistent harness configuration is changed.
+
 Launch write steps with:
 
 ```text

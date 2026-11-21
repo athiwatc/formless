@@ -7243,7 +7243,10 @@ availability with unknown auth. Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
-process group on success, failure or timeout.
+process group on success, failure or timeout. Grok's registry probe reads
+_meta.agentVersion (minimum 1.0.92), reports signed_in true on session creation
+and false on -32000, and forces GROK_DISABLE_AUTOUPDATER=1 through the shared
+launcher. It never places XAI_API_KEY in arguments or sends a model turn.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.
