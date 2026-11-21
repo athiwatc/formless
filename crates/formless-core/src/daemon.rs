@@ -18,6 +18,9 @@ use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
+#[path = "topic_orchestrator.rs"]
+mod topic_orchestrator;
+
 #[path = "topic_interactions.rs"]
 mod topic_interactions;
 
@@ -923,6 +926,8 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    topic_launch: StdMutex<()>,
+    topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1070,6 +1075,7 @@ impl Daemon {
             }
         }
         store.mark_orphan_runs_interrupted()?;
+        store.recover_topic_workflows()?;
         // Pending handles do not survive a restart; tell each Session's
         // agent instead of leaving a handle that later reads "unknown".
         for (handle, session_id, tool) in store.interrupt_pending_handles()? {
@@ -1167,6 +1173,8 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            topic_launch: StdMutex::new(()),
+            topic_steps: StdMutex::new(HashMap::new()),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1851,6 +1859,14 @@ impl Daemon {
         &self,
         proposal: &TopicProposalRequest,
     ) -> Result<TopicInfo> {
+        self.propose_topic_with_git(proposal, std::ffi::OsStr::new("git"))
+    }
+
+    fn propose_topic_with_git(
+        &self,
+        proposal: &TopicProposalRequest,
+        git: &std::ffi::OsStr,
+    ) -> Result<TopicInfo> {
         let mut normalized = proposal.clone();
         let (kind, base) = match &proposal.workspace {
             None => (WorkspaceKind::Scratch, None),
@@ -1862,32 +1878,43 @@ impl Daemon {
                 if !path.is_dir() {
                     bail!("workspace must be an existing directory");
                 }
-                let output = std::process::Command::new("git")
+                let output = std::process::Command::new(git)
                     .arg("-C")
                     .arg(&path)
                     .args(["rev-parse", "--is-inside-work-tree"])
-                    .output()
-                    .context("could not inspect workspace with git")?;
-                let git_marker = path
-                    .ancestors()
-                    .any(|ancestor| ancestor.join(".git").exists());
-                if !output.status.success() && git_marker {
-                    bail!(
-                        "could not inspect Git workspace: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                if output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() != "true"
-                {
-                    bail!("Git workspace must be a working tree, not a bare repository");
-                }
-                if output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() == "true"
-                {
-                    let (root, base) = topic_repo_snapshot(&path)?;
-                    normalized.workspace = Some(root);
-                    (WorkspaceKind::Git, Some(base))
+                    .output();
+                let output = match output {
+                    Ok(output) => Some(output),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).context("could not inspect workspace with git")
+                    }
+                };
+                if let Some(output) = output {
+                    let git_marker = path
+                        .ancestors()
+                        .any(|ancestor| ancestor.join(".git").exists());
+                    if !output.status.success() && git_marker {
+                        bail!(
+                            "could not inspect Git workspace: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        );
+                    }
+                    if output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() != "true"
+                    {
+                        bail!("Git workspace must be a working tree, not a bare repository");
+                    }
+                    if output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                    {
+                        let (root, base) = topic_repo_snapshot(&path)?;
+                        normalized.workspace = Some(root);
+                        (WorkspaceKind::Git, Some(base))
+                    } else {
+                        normalized.workspace = Some(path);
+                        (WorkspaceKind::Directory, None)
+                    }
                 } else {
                     normalized.workspace = Some(path);
                     (WorkspaceKind::Directory, None)
@@ -1899,13 +1926,6 @@ impl Daemon {
             topic_id: topic.id.clone(),
         });
         Ok(topic)
-    }
-
-    fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
-        let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        self.with_store(|st| st.fail_topic_workflow(&topic.id, "orchestrator not available yet"))?;
-        self.broadcast(Event::TopicChanged { topic_id: topic.id });
-        bail!("orchestrator not available yet; topic failed and workspace lock released; no child was launched")
     }
 
     /// Handle one request as a connected client's would be (in-process
@@ -2061,9 +2081,9 @@ impl Daemon {
                     .context(RequestFailure::not_found("topic attempt not found"))?;
                 Ok(serde_json::to_value(attempt)?)
             }
-            Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id),
+            Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id).await,
             Request::CancelTopic { topic_id } => {
-                let topic = self.with_store(|st| st.cancel_topic(&topic_id))?;
+                let topic = self.cancel_topic_work(&topic_id)?;
                 self.close_topic_interactions(&topic_id, None);
                 if let Some(session) = &topic.topic_session_id {
                     if let Some(run) = self.runs.locked().get(session) {
@@ -2091,6 +2111,30 @@ impl Daemon {
                 Ok(serde_json::to_value(topic)?)
             }
             Request::TopicMcp { request } => {
+                if let TopicMcpOperation::RequestPermission {
+                    title,
+                    kind,
+                    raw_input,
+                    options,
+                } = &request.operation
+                {
+                    let handler = self.topic_interaction_handler(
+                        &request.attempt_id,
+                        &request.capability_token,
+                    )?;
+                    let answer = handler
+                        .request_permission(
+                            crate::local_harness::HarnessPermissionRequest {
+                                title: title.clone(),
+                                kind: kind.clone(),
+                                raw_input: raw_input.clone(),
+                                options: options.clone(),
+                            },
+                            &self.shutdown,
+                        )
+                        .await;
+                    return Ok(serde_json::to_value(answer)?);
+                }
                 if let TopicMcpOperation::AskUser { questions } = &request.operation {
                     let questions = parse_questions(&json!({"questions": questions}))?;
                     let handler = self.topic_interaction_handler(
@@ -2107,7 +2151,7 @@ impl Daemon {
                         let attempt=st.authenticate_topic_attempt(&request.attempt_id,&request.capability_token)?;
                         let mut message=None;
                         let value=match request.operation {
-                            TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
+                            TopicMcpOperation::RequestPermission {..} | TopicMcpOperation::AskUser {..} => bail!("question dispatched through the interaction handler"),
                             TopicMcpOperation::ListConversations => serde_json::to_value(st.list_sessions()?)?,
                             TopicMcpOperation::ReadConversation {session_id} => {
                                 if st.session_deleted(&session_id)? {bail!("conversation is deleted");}
@@ -2254,7 +2298,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::DeleteSession { id } => {
-                self.stop_session_work(&id).await;
+                self.stop_session_work(&id).await?;
                 // Hidden now, gone after the undo window (SPEC §5.1).
                 let existed = self.with_store(|st| st.soft_delete_session(&id))?;
                 if existed {
@@ -2271,7 +2315,7 @@ impl Daemon {
                             .with_store(|st| st.session_deleted(&sid))
                             .unwrap_or(false)
                         {
-                            if let Err(error) = this.purge_session(&sid) {
+                            if let Err(error) = this.purge_session(&sid).await {
                                 this.broadcast(Event::Note{session_id:Some(sid.clone()),text:format!("Session cleanup incomplete; artifact records retained: {error:#}")});
                             }
                         }
@@ -5545,7 +5589,31 @@ impl Daemon {
     /// Stop everything still working on a Session before it is deleted:
     /// drop its queued messages, interrupt its Run (and wait for it to
     /// finish writing), and abandon its background invocations.
-    async fn stop_session_work(&self, session_id: &str) {
+    async fn stop_session_work(&self, session_id: &str) -> Result<Vec<String>> {
+        let family = self.with_reader(|st| st.topic_session_family(session_id))?;
+        let topics = self.with_reader(|st| st.list_topics())?;
+        for topic in topics.into_iter().filter(|topic| {
+            topic
+                .topic_session_id
+                .as_ref()
+                .is_some_and(|id| family.contains(id))
+        }) {
+            if matches!(
+                topic.status,
+                TopicStatus::Approved | TopicStatus::Running | TopicStatus::NeedsUser
+            ) {
+                self.cancel_topic_work(&topic.id)?;
+                self.close_topic_interactions(&topic.id, None);
+                self.broadcast(Event::TopicChanged { topic_id: topic.id });
+            }
+        }
+        for id in &family {
+            self.stop_one_session_work(id).await?;
+        }
+        Ok(family)
+    }
+
+    async fn stop_one_session_work(&self, session_id: &str) -> Result<()> {
         // Session-only approvals end with the Session (SPEC §10.3).
         self.session_grants
             .lock()
@@ -5570,11 +5638,12 @@ impl Daemon {
         }
         for _ in 0..100 {
             if !self.runs.locked().contains_key(session_id) {
-                return;
+                return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         tracing::warn!("run for deleted session {session_id} did not stop within 5s");
+        bail!("run for deleted session {session_id} did not stop; retry deletion")
     }
 
     /// Share the existing per-connection send receipt and detached execution
@@ -6166,6 +6235,7 @@ impl Daemon {
         run_id: String,
         admission: Arc<RunAdmission>,
     ) -> Result<()> {
+        self.with_store(|st| st.resume_topic_orchestrator(&session_id))?;
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<i64>();
@@ -6480,6 +6550,7 @@ impl Daemon {
                 None
             }
         };
+        self.topic_orchestrator_ended(&session_id, final_status);
         // Locks a panicking Run may have poisoned are still taken. Only this
         // Run's own entry goes: a newer Run of the Session keeps its
         // controls (#726).
@@ -8588,6 +8659,19 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            toolreg::TOPIC_RUN_STEP => match self.run_topic_step(session_id, &args, cancel).await {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
+            },
+            toolreg::TOPIC_COMPLETE_FEATURE | toolreg::TOPIC_FAIL_FEATURE => match self
+                .finish_topic_feature_tool(
+                    session_id,
+                    &args,
+                    tc.name == toolreg::TOPIC_COMPLETE_FEATURE,
+                ) {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic feature: {error:#}")),
+            },
             toolreg::CREATE_TOOL => match self
                 .create_agent_tool(session_id, run_id, &args, cfg, cancel_flag)
                 .await
@@ -10980,10 +11064,15 @@ impl Daemon {
     }
 
     /// Delete a Session for good, with its stored outputs (SPEC §15).
-    fn purge_session(&self, id: &str) -> Result<()> {
-        self.with_store(|st| crate::artifacts::remove_for_session(st, id))?;
+    async fn purge_session(&self, id: &str) -> Result<()> {
+        let family = self.stop_session_work(id).await?;
+        for session in &family {
+            self.with_store(|st| crate::artifacts::remove_for_session(st, session))?;
+        }
         self.with_store(|st| st.delete_session(id))?;
-        self.contexts.locked().remove(id);
+        for session in &family {
+            self.contexts.locked().remove(session);
+        }
         Ok(())
     }
 
@@ -16157,7 +16246,7 @@ impl Daemon {
             .with_store(|st| st.sessions_deleted_before(&cutoff))
             .unwrap_or_default()
         {
-            if let Err(error) = self.purge_session(&id) {
+            if let Err(error) = self.purge_session(&id).await {
                 self.broadcast(Event::Note {
                     session_id: Some(id.clone()),
                     text: format!(

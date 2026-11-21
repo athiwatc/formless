@@ -10,6 +10,117 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::DirBuilderExt;
 
 impl Store {
+    pub(crate) fn update_topic_message(&self, message: &MessageInfo) -> Result<()> {
+        self.note_rewrite();
+        self.conn.execute(
+            "UPDATE messages SET content=?3,meta=?4 WHERE session_id=?1 AND id=?2",
+            params![
+                message.session_id,
+                message.id,
+                message.content,
+                message.meta
+            ],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn topic_for_session(&self, session: &str) -> Result<Option<TopicInfo>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM topics WHERE topic_session_id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        id.map(|id| topic_info(self, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+    pub(crate) fn is_topic_orchestrator(&self, session: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1 AND status IN ('running','needs_user'))",[session],|row|row.get(0))?)
+    }
+    pub(crate) fn resume_topic_orchestrator(&self, session: &str) -> Result<()> {
+        self.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE topic_session_id=?1 AND status='needs_user'",params![session,now()])?;
+        Ok(())
+    }
+    pub(crate) fn finish_topic_orchestrator(
+        &self,
+        session: &str,
+        status: &str,
+    ) -> Result<Option<String>> {
+        self.transaction(|st|{
+            let Some(topic)=st.topic_for_session(session)? else{return Ok(None)};
+            if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){return Ok(None);}
+            if matches!(status,"paused"|"failed"|"error") {
+                st.fail_topic_workflow(&topic.id,&format!("orchestrator run ended with {status}"))?;
+            } else if topic.features.iter().any(|feature|matches!(feature.status,formless_protocol::TopicFeatureStatus::Pending|formless_protocol::TopicFeatureStatus::Running|formless_protocol::TopicFeatureStatus::NeedsUser)) {
+                st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
+                if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically.")?;}
+            }
+            Ok(Some(topic.id))
+        })
+    }
+    pub(crate) fn recover_topic_workflows(&self) -> Result<()> {
+        self.transaction(|st|{
+            let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            for id in topics {
+                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+                st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,detail='daemon restarted; inspect abandoned attempts before continuing',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+                st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![id,now()])?;
+                let topic=topic_row(st,&id)?.context("topic vanished")?;
+                if let Some(session)=topic.topic_session_id {st.append_message(&session,"system-note","Daemon restarted. Running harness attempts were abandoned; their outcomes are unknown. Inspect them, then send a message to continue explicitly.")?;}
+            }
+            Ok(())
+        })
+    }
+    pub(crate) fn finish_topic_feature(
+        &self,
+        session: &str,
+        feature: &str,
+        ready: bool,
+        detail: &str,
+    ) -> Result<TopicInfo> {
+        if detail.trim().is_empty() {
+            bail!("feature summary or failure reason must not be blank");
+        }
+        self.transaction(|st|{
+            let topic=st.topic_for_session(session)?.context("not a Topic Chat")?;
+            if !st.is_topic_orchestrator(session)?{bail!("topic is not running or waiting for input");}
+            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
+            if changed!=1{bail!("feature is missing, terminal, or has an active attempt");}
+            let open:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('pending','running','needs_user'))",[&topic.id],|row|row.get(0))?;
+            if !open {
+                st.conn.execute("UPDATE topics SET status=CASE WHEN EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('failed','cancelled')) THEN 'failed' ELSE 'complete' END,updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
+                st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[&topic.id])?;
+            }
+            topic_info(st,&topic.id)?.context("topic vanished")
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_topic_step(
+        &self,
+        id: &str,
+        status: TopicAttemptStatus,
+        summary: &str,
+        outputs: &[TopicArtifact],
+        harness_session: Option<&str>,
+    ) -> Result<TopicAttemptInfo> {
+        self.transaction(|st|{
+            let before=topic_attempt(st,id)?.context("attempt vanished")?;
+            let topic=topic_row(st,&before.topic_id)?.context("topic vanished")?;
+            if !matches!(topic.status.as_str(),"running"|"needs_user") || matches!(before.status,TopicAttemptStatus::Cancelled|TopicAttemptStatus::Abandoned){return Ok(before);}
+            let feature=topic_info(st,&before.topic_id)?.context("topic vanished")?.features.into_iter().find(|feature|feature.id==before.feature_id).context("feature vanished")?;
+            if feature.active_attempt_id.as_ref().is_some_and(|active|active!=id){bail!("attempt was superseded");}
+            let mut merged=before.outputs.clone();
+            for output in outputs {if !merged.contains(output){merged.push(output.clone());}}
+            let mut feature_outputs=feature.outputs;
+            for output in &merged {if !feature_outputs.contains(output){feature_outputs.push(output.clone());}}
+            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session,now()])?;
+            st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,outputs=?3,detail=NULL,updated_at=?4 WHERE id=?1",params![before.feature_id,if status==TopicAttemptStatus::NeedsUser{"needs_user"}else{"pending"},serde_json::to_string(&feature_outputs)?,now()])?;
+            if before.summary.as_deref()!=Some(summary) && !st.list_messages(&before.conversation_session_id)?.iter().any(|message|message.role=="assistant" && message.content==summary){st.append_message(&before.conversation_session_id,"assistant",summary)?;}
+            topic_attempt(st,id)?.context("attempt vanished")
+        })
+    }
     pub(crate) fn pause_topic_attempt(&self, id: &str, token: &str) -> Result<TopicAttemptInfo> {
         self.transaction(|st| {
             let attempt=st.authenticate_topic_attempt(id,token)?;
@@ -22,8 +133,11 @@ impl Store {
 
     pub(crate) fn resume_topic_attempt(&self, id: &str) -> Result<bool> {
         self.transaction(|st| {
-            let changed=st.conn.execute("UPDATE topic_attempts SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user' AND EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status='needs_user' AND t.status='running')",params![id,now()])?;
-            if changed>0 {st.conn.execute("UPDATE topic_features SET status='running',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;}
+            let changed=st.conn.execute("UPDATE topic_attempts SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user' AND EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status='needs_user' AND t.status IN ('running','needs_user'))",params![id,now()])?;
+            if changed>0 {
+                st.conn.execute("UPDATE topic_features SET status='running',updated_at=?2 WHERE active_attempt_id=?1",params![id,now()])?;
+                st.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE id=(SELECT topic_id FROM topic_attempts WHERE id=?1) AND status='needs_user' AND NOT EXISTS(SELECT 1 FROM topic_features f WHERE f.topic_id=topics.id AND f.active_attempt_id IS NOT NULL AND f.status='needs_user')",params![id,now()])?;
+            }
             Ok(changed>0)
         })
     }
@@ -528,11 +642,11 @@ impl Store {
         }
         self.transaction(|st| {
             let topic = topic_row(st, topic_id)?.context("topic not found")?;
-            if topic.status != "running" { bail!("topic must be running to launch an attempt"); }
+            if !matches!(topic.status.as_str(),"running"|"needs_user") { bail!("topic must be running to launch an attempt"); }
             let (status, count, active): (String, u32, Option<String>) = st.conn.query_row(
                 "SELECT status,attempt_count,active_attempt_id FROM topic_features WHERE topic_id=?1 AND id=?2",
                 params![topic_id,feature_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-            if status != "pending" || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
+            if !matches!(status.as_str(),"pending"|"needs_user") || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
             if count >= 12 { bail!("work item reached the 12-attempt limit"); }
             let id = uuid::Uuid::new_v4().to_string();
             let session = st.create_session(Some(format!("{}: {}", harness_label(harness), step_title.trim())))?;
@@ -570,7 +684,7 @@ impl Store {
             bail!("invalid topic attempt capability");
         }
         let attempt = topic_attempt(self, id)?.context("attempt not found")?;
-        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status='running')", [id], |r|r.get(0))?;
+        let active: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features f JOIN topics t ON t.id=f.topic_id WHERE f.active_attempt_id=?1 AND f.status IN ('running','needs_user') AND t.status IN ('running','needs_user'))", [id], |r|r.get(0))?;
         if !matches!(
             attempt.status,
             TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
@@ -610,7 +724,7 @@ impl Store {
                     *path=file;
                 }
                 if let TopicArtifact::GitRevision {revision} = artifact {
-                    if revision.len()!=40 || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40-character SHA");}
+                    if !matches!(revision.len(),40|64) || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40- or 64-character SHA");}
                 }
             }
             let timestamp=now();

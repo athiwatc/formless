@@ -7042,10 +7042,40 @@ resets only the selected feature to Pending and the topic to Approved; it does
 not start anything or move messages again. Start on a Running topic errors
 without changing it.
 
-Phase A does not launch an orchestrator: an approved StartTopicWorkflow claim
-immediately fails with `orchestrator not available yet`, records feature failure
-details and releases its lock. No harness process starts. Pi, OpenCode and
-Antigravity return `adapter not integrated yet`; their adapters are not wired.
+StartTopicWorkflow claims the topic and sends a kickoff to a normal Formless
+model Run in Topic Chat. Its tool snapshot includes topic_run_step,
+topic_complete_feature and topic_fail_feature only for Running/NeedsUser topics.
+The outline is advisory; the model chooses each independent step. A normal
+Run end with open work yields NeedsUser; a Run error fails the topic. User
+messages resume normal model Runs. No merge or push is performed. Start
+failures persist detail, fail features and release the workspace lock.
+
+Git steps use private worktrees under profile data: Write branches from the
+latest feature revision (or the base); ReadOnly detaches at the exact selected
+input revision. A successful Write must produce a clean new descendant HEAD.
+Each attempt has a private staging directory, including Git attempts.
+Directory/Scratch steps use private directories with copied read-only file
+inputs. File/text outputs are reported through scoped MCP. A failed step is
+returned to the model without automatically failing the feature; it can choose
+another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+actionable adapter-not-integrated step results.
+
+CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
+on Unix (the direct child on Windows). The last launch check is serialized
+with cancellation. On restart live attempts become Abandoned and Running
+topics become NeedsUser, with durable detail and no automatic restart.
+
+The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
+It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
+`FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
+must never be included in prompts, argv or transcripts. The bridge exposes
+AskUser and RequestPermission in addition to the scoped conversation/artifact
+operations. RequestPermission only raises a user request; it cannot decide one.
+An undecided or cancelled permission is denied. The bridge uses the existing
+five-minute IPC request deadline; cancellation closes pending requests.
 
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs

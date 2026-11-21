@@ -17,6 +17,7 @@ struct Handler {
     attempt_id: String,
     token: String,
     always: AlwaysPermissions,
+    open: StdMutex<Option<MessageInfo>>,
 }
 
 impl InteractionHandler for Handler {
@@ -96,27 +97,61 @@ impl InteractionHandler for Handler {
     }
 
     fn on_update(&self, update: HarnessUpdate) -> Result<()> {
-        let (kind, content, extra) = match update {
-            HarnessUpdate::Message { content } => ("message", content, Value::Null),
-            HarnessUpdate::Thought { content } => ("thought", content, Value::Null),
-            HarnessUpdate::Plan { content } => ("plan", content, Value::Null),
-            HarnessUpdate::ToolCall { name, input } => ("tool_call", name, input),
+        let mut open = self.open.locked();
+        let (kind, content, extra, delta) = match update {
+            HarnessUpdate::Message { content } => ("message", content, Value::Null, true),
+            HarnessUpdate::Thought { content } => ("thought", content, Value::Null, true),
+            HarnessUpdate::Plan { content } => ("plan", content, Value::Null, false),
+            HarnessUpdate::ToolCall { name, input } => ("tool_call", name, input, false),
         };
+        if delta && content.is_empty() {
+            return Ok(());
+        }
+        if !delta {
+            *open = None;
+        }
         let message = self.daemon.with_store(|st| {
             st.transaction(|st| {
                 let attempt = st.authenticate_topic_attempt(&self.attempt_id, &self.token)?;
-                st.append_message_meta(
-                    &attempt.conversation_session_id,
-                    "assistant",
-                    &content,
-                    Some(json!({"harness_update":kind,"input":extra}).to_string()),
-                )
+                let mut message = match open.as_ref().filter(|_| delta) {
+                    Some(message) => message.clone(),
+                    None => st.append_message_meta(
+                        &attempt.conversation_session_id,
+                        "assistant",
+                        "",
+                        None,
+                    )?,
+                };
+                let mut meta = message
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+                    .unwrap_or(json!({"harness_update":"message"}));
+                if kind == "thought" {
+                    let previous = meta["thought"].as_str().unwrap_or("");
+                    meta["thought"] = json!(format!("{previous}{content}"));
+                } else {
+                    message.content.push_str(&content);
+                }
+                if !delta {
+                    meta = json!({"harness_update":kind,"input":extra});
+                }
+                message.meta = Some(meta.to_string());
+                st.update_topic_message(&message)?;
+                Ok(message)
             })
         })?;
+        if delta {
+            *open = Some(message.clone());
+        }
         self.daemon.broadcast(Event::MessageAppended {
             session_id: message.session_id.clone(),
             message,
         });
+        Ok(())
+    }
+    fn finish(&self) -> Result<()> {
+        self.open.locked().take();
         Ok(())
     }
 }
@@ -167,6 +202,7 @@ impl Daemon {
             daemon: self.clone(),
             attempt_id: attempt_id.into(),
             token: capability_token.into(),
+            open: StdMutex::new(None),
             always: self
                 .harness_always
                 .locked()

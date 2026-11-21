@@ -28,6 +28,7 @@ mod cli_subagents;
 mod cli_tool_detail;
 mod cli_tool_diff;
 mod cli_tool_filters;
+mod cli_topic_mcp;
 
 mod cli_runs_list;
 mod cli_tool_lookup;
@@ -101,6 +102,11 @@ struct Cli {
 // Keep complete variants in this order so help, man and completions agree.
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(hide = true)]
+    TopicMcp {
+        #[arg(long)]
+        attempt: String,
+    },
     /// Every approval grant, and revoking them
     #[command(
         after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
@@ -2410,6 +2416,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             .unwrap_or_default(),
     );
     match cli.cmd {
+        Some(Cmd::TopicMcp { attempt }) => cli_topic_mcp::serve(&paths, &attempt),
         None | Some(Cmd::Tui { .. }) if cli.plain => formless_tui::plain::run(paths),
         None | Some(Cmd::Tui { .. }) => formless_tui::run_with(
             paths,
