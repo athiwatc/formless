@@ -791,6 +791,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 return Some("pip can execute code from package build backends")
             }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
+            "bundle" | "bundler" => return Some("Bundler can execute code in the Gemfile"),
+            _ if stem == "gem" => return Some("RubyGems can execute package build code"),
             "gradle" | "gradlew" | "mvn" | "mvnw" => {
                 return Some("Gradle and Maven can execute repository build code")
             }
@@ -3959,6 +3961,31 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn ruby_package_tools_require_broad_process_confirmation() {
+        for spec in [
+            "process:gem",
+            "process:gem3.2",
+            "process:/usr/bin/gem",
+            "process:gem.exe",
+            "process:gem:install",
+            "process:bundle",
+            "process:bundler",
+            "process:bundle.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in [
+            "process:gemini",
+            "process:bundles",
+            "process:bundle2",
+            "process:rake",
+            "process:ls",
+        ] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
