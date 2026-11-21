@@ -762,6 +762,8 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                     | "php"
                     | "lua"
                     | "julia"
+                    | "elixir"
+                    | "iex"
                     | "tclsh"
                     | "wish"
                     | "expect"
@@ -3981,6 +3983,23 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn elixir_and_iex_require_broad_process_confirmation() {
+        for spec in [
+            "process:elixir",
+            "process:elixir1.16",
+            "process:/usr/bin/elixir",
+            "process:elixir.exe",
+            "process:iex",
+            "process:iex.exe",
+        ] {
+            assert!(broad_capability(spec).is_some(), "{spec}");
+        }
+        for spec in ["process:elixirc", "process:ls"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
