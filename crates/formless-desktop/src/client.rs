@@ -60,6 +60,7 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 
 #[derive(Debug)]
 pub enum Update {
+    DeleteUndo(crate::run_actions::DeleteUndo),
     RunActionTarget {
         owner: crate::run_actions::Owner,
         operation: uuid::Uuid,
@@ -215,6 +216,7 @@ pub enum Update {
 }
 
 pub enum Command {
+    UndoDelete(uuid::Uuid),
     ReadRunAction {
         owner: crate::run_actions::Owner,
         operation: uuid::Uuid,
@@ -808,6 +810,7 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
         owner: crate::run_actions::Owner,
         operation: uuid::Uuid,
@@ -971,6 +974,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    delete_undo: Option<crate::run_actions::DeleteUndo>,
     compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     action_work: Option<Box<run_actions::Work>>,
     live_overlay: crate::live_overlay::Overlay,
@@ -1526,6 +1530,11 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::UndoDelete(operation) => {
+                if let Some(ticket) = self.delete_undo.take().filter(|t| t.operation == operation && t.available() && self.ready) {
+                    self.request(Request::RestoreSession { id: ticket.owner.session.clone() }, Pending::RestoreSession(ticket));
+                }
+            }
             Command::ReadRunAction { owner, operation } => {
                 if self.ready && self.action_owner().as_ref() == Some(&owner) {
                     let retired = self
@@ -1643,6 +1652,7 @@ impl Engine {
             return;
         }
         match command {
+            Command::UndoDelete(_) => unreachable!("handled by action dispatcher"),
             Command::ReadRunAction { .. }
             | Command::PrepareRunAction(_)
             | Command::ConfirmRunAction(_)
@@ -2542,6 +2552,16 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::RestoreSession(ticket) => {
+                let acknowledged = response_ok && result.as_ref().is_ok_and(|v| v["id"] == ticket.owner.session);
+                self.updates.push(Update::Notice(if acknowledged {
+                    "Session restored.".into()
+                } else {
+                    "Restore outcome unknown or rejected. Reload Sessions; nothing was replayed.".into()
+                }));
+                self.dirty_list = true;
+                self.dirty_session = true;
+            }
             Pending::RunTarget { owner, operation } => {
                 if self.action_owner().as_ref() == Some(&owner) {
                     let result =
@@ -2558,6 +2578,15 @@ impl Engine {
             Pending::RunForecast(w) => self.action_forecast(w, result),
             Pending::RunConsent(w) => self.action_consented(w, result),
             Pending::RunWrite(w) => {
+                if response_ok && w.dispatch.action.kind == crate::run_actions::Kind::Delete && result.as_ref().is_ok_and(|v| w.dispatch.acknowledged(v)) {
+                    if let Some(deadline) = result.as_ref().ok().and_then(|v| v["undo_secs"].as_u64()).and_then(|secs| w.sent_at?.checked_add(Duration::from_secs(secs))) {
+                        let ticket = crate::run_actions::DeleteUndo { owner: w.dispatch.action.owner.clone(), operation: uuid::Uuid::new_v4(), deadline };
+                        if ticket.available() {
+                            self.delete_undo = Some(ticket.clone());
+                            self.updates.push(Update::DeleteUndo(ticket));
+                        }
+                    }
+                }
                 w.dispatch.finish(result, response_ok);
                 self.dirty_session = true;
                 self.dirty_list = true;
@@ -3192,6 +3221,9 @@ async fn write_requests(
                 question_id: None,
             });
         }
+        if let Some(Pending::RestoreSession(ticket)) = engine.pending.get(&request.id) {
+            uncertain.insert(Action { id: ticket.operation, session_id: ticket.owner.session.clone(), question_id: None });
+        }
         let mut line = serde_json::to_vec(&request)?;
         if line.len() >= formless_protocol::MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -3401,6 +3433,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
+                        Some(Pending::RestoreSession(t)) if *ok && result.as_ref().is_some_and(|v| v["id"] == t.owner.session) => Some(Action { id: t.operation, session_id: t.owner.session.clone(), question_id: None }),
                         Some(Pending::RunWrite(w)) if !ok || result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v)) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),

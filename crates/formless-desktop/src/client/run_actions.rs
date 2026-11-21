@@ -3,6 +3,7 @@ use crate::run_actions::{Context, Dispatch, Owner, Target};
 
 #[derive(Debug)]
 pub(super) struct Work {
+    pub(super) sent_at: Option<std::time::Instant>,
     pub dispatch: Dispatch,
     revision: u64,
     quote: Option<formless_protocol::RunForecast>,
@@ -94,6 +95,7 @@ impl Engine {
         }
         let id = dispatch.action.owner.session.clone();
         let work = Box::new(Work {
+            sent_at: None,
             dispatch,
             revision: self.status_revision,
             quote: None,
@@ -249,6 +251,11 @@ impl Engine {
         );
     }
     pub(super) fn action_before_write(&mut self, id: u64) -> bool {
+        if matches!(self.pending.get(&id), Some(Pending::RestoreSession(t)) if !t.available()) {
+            self.pending.remove(&id);
+            self.updates.push(Update::Notice("The delete Undo window has expired. Nothing was sent.".into()));
+            return false;
+        }
         let valid = match self.pending.get(&id) {
             Some(Pending::RunWrite(w)) => self.action_current(w),
             _ => return true,
@@ -265,6 +272,7 @@ impl Engine {
             return false;
         }
         w.sent = true;
+        w.sent_at = Some(std::time::Instant::now());
         if w.dispatch.action.kind == crate::run_actions::Kind::Compact {
             self.compacting.lock().unwrap_or_else(|e| e.into_inner()).insert(w.dispatch.action.owner.session.clone());
         }
@@ -559,6 +567,30 @@ mod tests {
         e.receive(ServerMessage::Event(Event::Note { session_id: Some("s".into()), text: "compaction failed: test".into() })).unwrap();
         assert!(!e.compaction_pending("s"));
         assert!(e.action_target("s", &snapshot()).unwrap().allowed(Kind::Retry));
+    }
+    #[test]
+    fn delete_undo_uses_the_receipt_window_exact_session_and_never_replays() {
+        let (mut e, _, d) = setup(Kind::Delete);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        e.receive(ServerMessage::ok(request.id, json!({"deleted":true,"undo_secs":30}))).unwrap();
+        let ticket = e.delete_undo.clone().unwrap();
+        assert!(ticket.available());
+        assert!(ticket.deadline <= std::time::Instant::now() + Duration::from_secs(30));
+        e.active = Some("other".into());
+        e.command(Command::UndoDelete(ticket.operation));
+        assert!(matches!(reply(&mut e, json!({"id":"s"})), Request::RestoreSession { id } if id == "s"));
+        e.command(Command::UndoDelete(ticket.operation));
+        assert!(e.outgoing.is_empty());
+        let mut expired = ticket;
+        expired.deadline = std::time::Instant::now();
+        e.delete_undo = Some(expired.clone());
+        e.command(Command::UndoDelete(expired.operation));
+        assert!(e.outgoing.is_empty());
     }
     #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {

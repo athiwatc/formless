@@ -25,6 +25,7 @@ pub(super) struct Panel {
 }
 #[derive(Default)]
 pub(super) struct State {
+    pub delete_undo: Option<crate::run_actions::DeleteUndo>,
     pub panel: Option<Panel>,
     pub ledger: Arc<Ledger>,
     pub context: Option<(Owner, ContextUsage)>,
@@ -33,6 +34,14 @@ pub(super) struct State {
     observed: Status,
 }
 impl Shell {
+    pub(super) fn undo_deleted_session(&mut self, operation: uuid::Uuid, cx: &mut Context<Self>) {
+        if let Some(ticket) = self.run_actions.delete_undo.take().filter(|t| t.operation == operation && t.available()) {
+            if self.client_identity() == Some((ticket.owner.client, ticket.owner.connection)) && self.client_connected {
+                self.client_request(ClientCommand::UndoDelete(operation), cx);
+            }
+        }
+        cx.notify();
+    }
     pub(super) fn run_action_owner(&self) -> Option<Owner> {
         let client = self.client.as_ref()?;
         (self.client_connected

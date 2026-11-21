@@ -2323,6 +2323,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match update {
+            ClientUpdate::DeleteUndo(ticket) => {
+                if self.client_identity() == Some((ticket.owner.client, ticket.owner.connection)) && self.client_connected && ticket.available() {
+                    self.run_actions.delete_undo = Some(ticket);
+                }
+            }
             ClientUpdate::RunActionTarget {
                 owner,
                 operation,
@@ -2384,6 +2389,7 @@ impl Shell {
                 }
                 if !ready {
                     self.live_overlay = Default::default();
+                    self.run_actions.delete_undo = None;
                     self.client_steps = Default::default();
                     self.client_step_mode = None;
                     self.retire_stream_view(cx);
@@ -5894,6 +5900,10 @@ impl Shell {
                     .flex_wrap()
                     .gap_2()
                     .child(stop)
+                    .children(self.run_actions.delete_undo.as_ref().filter(|t| t.available() && self.client_connected).map(|t| {
+                        let operation = t.operation;
+                        Button::new("session-delete-undo").small().label("Undo session delete").outline().disabled(inert).on_click(cx.listener(move |this, _, _, cx| this.undo_deleted_session(operation, cx)))
+                    }))
                     .when(self.client.is_some() && self.fit(window) != Fit::Reflowed, |row| row.child(Button::new("run-actions-open").small().label("Run actions").outline().disabled(inert || self.run_action_owner().is_none() || self.run_actions.ledger.status().blocked()).on_click(cx.listener(|this, _, window, cx| this.open_run_action(crate::run_actions::Kind::Retry, window, cx)))))
                     .child(div().flex_1())
                     .children(model)

@@ -67,6 +67,17 @@ pub struct Owner {
     pub generation: u64,
     pub session: String,
 }
+#[derive(Clone, Debug)]
+pub struct DeleteUndo {
+    pub owner: Owner,
+    pub operation: uuid::Uuid,
+    pub deadline: std::time::Instant,
+}
+impl DeleteUndo {
+    pub fn available(&self) -> bool {
+        std::time::Instant::now() < self.deadline
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub compacting: bool,

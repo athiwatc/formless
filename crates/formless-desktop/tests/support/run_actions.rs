@@ -242,6 +242,38 @@ fn cancelled_stale_or_disconnected_action_reviews_cannot_commit(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn delete_undo_is_explicit_expires_and_is_cleared_on_disconnect(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        select(&shell, &sessions[0].id, window, cx);
+        let (owner, _) = open_action(&shell, Kind::Delete, window, cx);
+        window.render_frame(cx);
+        window.click("run-action-close", cx);
+        let ticket = formless_desktop::run_actions::DeleteUndo {
+            owner, operation: uuid::Uuid::new_v4(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        };
+        shell.update(cx, |s, cx| s.apply_client_update(Update::DeleteUndo(ticket.clone()), window, cx));
+        window.render_frame(cx);
+        window.click("session-delete-undo", cx);
+        assert!(shell.update(cx, |s, _| s.take_client_commands()).iter().any(|c| matches!(c, Wire::UndoDelete(op) if *op == ticket.operation)));
+        window.render_frame(cx);
+        assert!(window.try_find("session-delete-undo").is_none());
+        let mut expired = ticket.clone();
+        expired.deadline = std::time::Instant::now();
+        shell.update(cx, |s, cx| s.apply_client_update(Update::DeleteUndo(expired), window, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("session-delete-undo").is_none());
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::DeleteUndo(ticket), window, cx);
+            s.apply_client_update(Update::Connection { ready: false, notice: "Disconnected".into() }, window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("session-delete-undo").is_none());
+    });
+}
+#[gpui_kit::test]
 fn context_provider_and_compaction_notices_are_live_and_selection_guarded(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, handle, &shell);

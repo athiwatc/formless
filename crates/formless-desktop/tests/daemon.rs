@@ -138,6 +138,7 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                 Update::RunActionReady { .. } => "run action ready".into(),
                 Update::LiveContext { result, .. } => format!("context ok={}", result.is_ok()),
                 Update::RunActivity { .. } => "run activity".into(),
+                Update::DeleteUndo(_) => "delete undo available".into(),
                 Update::Transcript(batch) => format!(
                     "live reader generation {} / reload={}",
                     batch.owner.generation, batch.reload
