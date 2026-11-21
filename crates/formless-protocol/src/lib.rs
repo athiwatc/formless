@@ -791,6 +791,9 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 return Some("pip can execute code from package build backends")
             }
             "tar" => return Some("tar can run any program (--to-command) and write anywhere"),
+            "gradle" | "gradlew" | "mvn" | "mvnw" => {
+                return Some("Gradle and Maven can execute repository build code")
+            }
             "make" | "cmake" | "ninja" => {
                 return Some("a build tool runs whatever the build files say")
             }
@@ -3956,6 +3959,29 @@ mod tests {
         assert!(broad_capability("process:ls").is_none());
         assert!(broad_capability("process:nuget").is_none());
         assert!(broad_capability("process:null").is_none());
+    }
+
+    #[test]
+    fn gradle_maven_requires_broad_process_confirmation() {
+        for spec in [
+            "process:gradle",
+            "process:gradlew",
+            "process:/usr/bin/gradle",
+            "process:gradle.exe",
+            "process:mvn",
+            "process:mvnw",
+            "process:gradle:tasks",
+            "process:mvnw:validate",
+        ] {
+            assert_eq!(
+                broad_capability(spec),
+                Some("Gradle and Maven can execute repository build code"),
+                "{spec}"
+            );
+        }
+        for spec in ["process:mvnDebug", "process:gradle-profiler"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
     }
 
     #[test]
