@@ -255,6 +255,9 @@ impl Fixture {
                         Request::SearchSessions { .. } => timestamp_search_hits(),
                         Request::ListApprovals => timestamp_grants(),
                         Request::ListDenials => timestamp_denials(),
+                        Request::ForgetDenial { capability } => {
+                            json!({"forgotten": if capability.is_some() { 1 } else { 3 }})
+                        }
                         Request::ListRelayClients => timestamp_devices(),
                         Request::ListJobs => timestamp_jobs(),
                         Request::JobRuns { id, .. } => timestamp_job_runs(id),
@@ -1039,6 +1042,60 @@ fn timestamp_grants() -> Value {
         "expires_at":"2026-11-01T10:00:00+07:00",
         "last_used":"2026-10-31T23:15:00-03:30"
     }])
+}
+
+#[test]
+fn shipped_denials_reject_conflicting_mutations_and_honor_json() {
+    let fixture = Fixture::new();
+    let capability = "net:fixture.example";
+    let conflict = fixture.run(&["approvals", "denials", "--forget", capability, "--all"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+    let error = String::from_utf8(conflict.stderr).unwrap();
+    assert!(
+        error.contains("--forget") && error.contains("--all"),
+        "{error}"
+    );
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+
+    for (flags, expected_capability, count) in [
+        (vec!["--all"], None, 3),
+        (vec!["--forget", capability], Some(capability), 1),
+    ] {
+        let mut args = vec!["approvals", "denials"];
+        args.extend(flags);
+        let human = fixture.run(&args);
+        assert!(human.status.success(), "{:?}", human);
+        assert_eq!(
+            String::from_utf8(human.stdout).unwrap(),
+            format!("forgot {count} denial(s); the next use asks again\n"),
+        );
+        args.push("--json");
+        let machine = fixture.run(&args);
+        assert!(machine.status.success(), "{:?}", machine);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+            json!({"forgotten": count}),
+        );
+        let requests = fixture.requests.lock().unwrap();
+        let sent: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::ForgetDenial { capability } => Some(capability.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [expected_capability; 2]);
+        drop(requests);
+        fixture.requests.lock().unwrap().clear();
+    }
+
+    let list = fixture.run(&["approvals", "denials", "--json"]);
+    assert!(list.status.success(), "{:?}", list);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&list.stdout).unwrap(),
+        timestamp_denials()
+    );
 }
 
 fn timestamp_denials() -> Value {
