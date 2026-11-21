@@ -5,6 +5,8 @@ use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Com
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+pub mod opencode;
+
 pub use formless_protocol::{HarnessKind, HarnessRole};
 
 pub struct HarnessRequest {
@@ -120,6 +122,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         .unwrap_or_else(|| match request.kind {
             HarnessKind::Claude => PathBuf::from("claude"),
             HarnessKind::Codex => PathBuf::from("codex"),
+            HarnessKind::OpenCode => PathBuf::from("opencode"),
         });
     let mut args = Vec::<OsString>::new();
     match request.kind {
@@ -186,6 +189,7 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             }
             args.push(request.prompt.as_str().into());
         }
+        HarnessKind::OpenCode => return opencode::command_spec(request),
     }
 
     Ok(CommandSpec {
@@ -217,6 +221,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
     match kind {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
+        HarnessKind::OpenCode => opencode::parse_output(stdout),
     }
 }
 
