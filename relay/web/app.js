@@ -2304,7 +2304,8 @@
           code.startsWith(c.repeat(3), i);
         const delimiter = triple ? c.repeat(3) : c;
         const multiline = shell || triple || c === "`" || L.mysqlComments;
-        const ansiQuote = shell?.ansiQuotes && c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
+        const ansiQuote = shell && (shell.ansiQuotes || shellLiteralQuotes) &&
+          c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
         const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) &&
           !(toml && c === "'") && !(L.mysqlComments && c === "`") &&
           !(shell && lang !== "fish" && c === "'" && !ansiQuote);

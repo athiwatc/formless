@@ -1439,7 +1439,7 @@ impl Highlighter {
                 }
                 shell.track(&chars, i);
                 if l.quotes.contains(&c) && !ShellComments::escaped(&chars[..i]) {
-                    let ansi_quote = shell.ansi_quotes
+                    let ansi_quote = (shell.ansi_quotes || self.shell_literal_quotes)
                         && c == '\''
                         && i > 0
                         && chars[i - 1] == '$'
