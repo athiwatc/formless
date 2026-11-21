@@ -37,11 +37,16 @@ impl EditorCommand {
         )
     }
     pub(super) fn parse(value: &str) -> Result<Self> {
-        anyhow::ensure!(!value.contains('\0'), "editor command contains a NUL byte");
         #[cfg(not(windows))]
-        let words = shlex::split(value).context("unclosed quote or escape in editor command")?;
+        let words = {
+            anyhow::ensure!(!value.contains('\0'), "editor command contains a NUL byte");
+            shlex::split(value).context("unclosed quote or escape in editor command")?
+        };
         #[cfg(windows)]
         let words = split_windows(value)?;
+        Self::from_words(words)
+    }
+    fn from_words(words: Vec<String>) -> Result<Self> {
         let mut words = words.into_iter();
         let program = words
             .next()
@@ -103,8 +108,7 @@ impl EditorCommand {
                 "a non-waiting GUI editor cannot return an edited draft; remove its no-wait option"
             );
         }
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args);
+        let mut cmd = self.base_command();
         if roundtrip {
             match name.as_str() {
                 "code" | "code-insiders" | "codium" | "cursor" | "windsurf" | "subl"
@@ -150,12 +154,22 @@ impl EditorCommand {
         }
         Ok(cmd)
     }
+    fn base_command(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        cmd
+    }
+}
+
+/// Construct a literal Windows editor command using the TUI's argv parser.
+pub fn windows_editor_command(value: &str) -> Result<Command> {
+    Ok(EditorCommand::from_words(split_windows(value)?)?.base_command())
 }
 
 // Windows CRT-style quoting: preserve ordinary path backslashes, including
 // those before spaces inside double quotes. Kept testable on every platform.
-#[cfg(any(windows, test))]
 fn split_windows(value: &str) -> Result<Vec<String>> {
+    anyhow::ensure!(!value.contains('\0'), "editor command contains a NUL byte");
     let chars: Vec<char> = value.chars().collect();
     let mut i = 0;
     let mut words = Vec::new();
