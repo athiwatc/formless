@@ -1,0 +1,102 @@
+# Phase 0 spike for the native desktop client (epic #1753).
+#
+# Deliberately NOT a member of the repository workspace: it has its own
+# workspace root and lockfile so `cargo build/test --workspace` at the
+# repository root, the release workflows and the root Cargo.lock never see
+# GPUI. Build it from this directory.
+[package]
+name = "formless-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Optional native desktop client spike for Formless (GPUI Kit)"
+publish = false
+
+[workspace]
+
+# Accessibility converts bounded Markdown windows on demand. Profiling shows
+# parser/AST construction dominates this path in unoptimized builds. Keep the
+# identical GFM parser and semantics, but optimize this dependency in dev/test
+# builds as well; the desktop and other dependencies remain debuggable.
+[profile.dev.package.markdown]
+opt-level = 3
+
+[profile.test.package.markdown]
+opt-level = 3
+
+[features]
+default = ["gui"]
+# The GPUI Kit shell. Without it only the presentation model and fixture
+# build, which lets their tests run on hosts with no GUI toolchain.
+gui = ["dep:gpui-kit", "dep:block2", "dep:core-foundation", "dep:objc2", "dep:objc2-app-kit", "dep:raw-window-handle"]
+# The kit's headless window harness, for tests/shell.rs. A feature rather
+# than a dev-dependency: dev-dependencies cannot be optional, and one on the
+# kit would compile GPUI even for the model tests.
+test-support = ["gui", "gpui-kit/test-support"]
+# Private-profile daemon/provider integration tests; never linked into the
+# desktop binary or the normal model build.
+daemon-tests = ["dep:formless-core", "dep:axum", "dep:futures-util", "tokio/rt-multi-thread"]
+# Feasibility study, off by default and not wired into the shell: Thai word
+# boundaries from ICU's dictionary, for giving GPUI's line breaker somewhere
+# to break. See src/thai.rs and the findings document.
+thai-breaks = ["dep:icu_segmenter"]
+# Diagnostic, off by default, macOS only: lets the binary walk its own
+# window's NSAccessibility elements from inside the process and write them
+# out (`--dump-platform-a11y`). That is what the platform adapter exposes,
+# read without an assistive-technology permission. See the findings document.
+ax-dump = ["gui", "dep:objc", "dep:raw-window-handle"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "formless-desktop"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[test]]
+name = "shell"
+path = "tests/shell.rs"
+required-features = ["test-support"]
+
+# Offscreen render through GPUI's real renderer; it has its own `main`.
+[[test]]
+name = "render"
+path = "tests/render.rs"
+harness = false
+required-features = ["test-support"]
+
+[dependencies]
+formless-protocol = { path = "../formless-protocol" }
+formless-core = { path = "../formless-core", default-features = false, optional = true }
+axum = { version = "0.8", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+# Daemon replies carry their result as a JSON value (src/replies.rs). Both
+# are already in the lockfile through formless-protocol.
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+# Grapheme boundaries, so a restored selection never lands inside a
+# character the user sees as one. Already in the graph through the kit.
+unicode-segmentation = "1"
+# Markdown to plain text for what assistive technology is given. The same
+# crate and version the kit already parses markdown with (it is in the
+# lockfile through the kit); no GPUI crate.
+markdown = "=1.0.0"
+# The same crate and features the GPUI layer already builds (it is in the
+# lockfile through gpui-pre), so the GUI build compiles nothing new for it.
+icu_segmenter = { version = "2.4", default-features = false, features = ["compiled_data"], optional = true }
+# Exact pin: the kit pins its GPUI layer exactly (gpui-pre =0.3.12), so the
+# whole family moves together and only on purpose.
+gpui-kit = { version = "=0.9.1", optional = true }
+
+# All versions are already pinned by the GPUI layer. The GUI uses AppKit's
+# application-local Escape event monitor. The diagnostic walk also uses objc.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
+core-foundation = { version = "0.10.1", optional = true }
+objc = { version = "0.2.7", optional = true }
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["block2", "NSEvent", "NSResponder", "NSTextInputClient", "NSTextInputContext", "NSView", "NSWindow"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }

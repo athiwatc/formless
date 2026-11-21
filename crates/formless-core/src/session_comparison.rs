@@ -3,7 +3,7 @@ use super::*;
 use formless_protocol::{
     SessionBranchUsage, SessionComparison, SessionComparisonSide, SessionMessageDiff,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionComparisonFailure {
@@ -159,16 +159,19 @@ impl Store {
         cfg: &crate::Config,
     ) -> Result<SessionBranchUsage> {
         let all_owned = cut == 0 || session.fork_point_seq.is_some_and(|birth| cut <= birth);
-        let valid = |id: &Option<String>, seq: i64| -> bool {
-            (seq == 0 && id.is_none())
-                || messages
-                    .iter()
-                    .any(|m| Some(&m.id) == id.as_ref() && m.seq == seq)
+        let boundaries: HashSet<(&str, i64)> = if all_owned {
+            HashSet::new()
+        } else {
+            messages.iter().map(|m| (m.id.as_str(), m.seq)).collect()
+        };
+        let valid = |id: Option<&str>, seq: i64| -> bool {
+            id.map_or(seq == 0, |id| boundaries.contains(&(id, seq)))
         };
         // true=allocated, false=known pre-cut, None=not safely assignable.
         let mut runs = BTreeMap::new();
         let mut unknown = BTreeSet::new();
         let mut complete = true;
+        let mut runs_to_check = Vec::new();
         let mut query = self.ps("SELECT id,status,start_message_id,start_message_seq,end_message_id,end_message_seq FROM runs WHERE session_id=?1")?;
         let records = query.query_map(params![session.id], |r| {
             Ok((
@@ -182,24 +185,28 @@ impl Store {
         })?;
         for record in records {
             let (id, status, start_id, start, end_id, end) = record?;
-            let allocated =
-                if all_owned || start.is_some_and(|seq| seq > cut && valid(&start_id, seq)) {
-                    Some(true)
-                } else if end.is_some_and(|seq| seq <= cut && valid(&end_id, seq)) {
-                    Some(false)
-                } else {
-                    None
-                };
-            if allocated == Some(true)
-                && (status == "running" || !self.forecast_usage_complete(&id)?)
+            let allocated = if all_owned
+                || start.is_some_and(|seq| seq > cut && valid(start_id.as_deref(), seq))
             {
-                complete = false;
+                Some(true)
+            } else if end.is_some_and(|seq| seq <= cut && valid(end_id.as_deref(), seq)) {
+                Some(false)
+            } else {
+                None
+            };
+            if allocated == Some(true) {
+                if status == "running" {
+                    complete = false;
+                } else {
+                    runs_to_check.push(id.clone());
+                }
             }
             if allocated.is_none() {
                 unknown.insert(id.clone());
             }
             runs.insert(id, allocated);
         }
+        complete &= self.forecast_usage_complete_for_runs(&runs_to_check)?;
         let mut out = SessionBranchUsage {
             scope: if all_owned {
                 "recorded local work owned by this Session; copied transcripts carry no copied charges".into()

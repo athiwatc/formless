@@ -1,7 +1,9 @@
 //! Read-only Session presentation. Rows retain their original Session index so
 //! painting, selection, clicks and bulk actions all address the same identity.
+use crate::text;
 use formless_protocol::SessionInfo;
 use std::collections::{HashMap, HashSet};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, PartialEq)]
 pub struct SessionRow {
@@ -85,6 +87,34 @@ pub fn rows(sessions: &[SessionInfo], visible: &[usize], tree: bool) -> Vec<Sess
         }
     }
     out
+}
+
+/// Fit a label and its optional tree prefix into the name column.
+pub(crate) fn name_cell(name: &str, depth: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if depth > 0 && width <= 2 {
+        return crate::ui::pad("↳", width);
+    }
+
+    // Keep the branch sign and leave up to eight columns for the name.
+    let indent = depth.min(width.saturating_sub(10) / 2) * 2;
+    let branch = if depth == 0 { "" } else { "↳ " };
+    let budget = width - indent - text::width(branch);
+    // Match List rendering, which paints graphemes individually. Whole
+    // strings can report a narrower width when adjacent characters join.
+    let (shown, ellipsis) = if text::take_width(name, budget) == name {
+        (name, "")
+    } else {
+        (text::take_width(name, budget - 1), "…")
+    };
+    let columns = shown.graphemes(true).map(text::width).sum::<usize>() + text::width(ellipsis);
+    format!(
+        "{}{branch}{shown}{ellipsis}{}",
+        " ".repeat(indent),
+        " ".repeat(budget - columns)
+    )
 }
 
 pub fn resolve(sessions: &[SessionInfo], query: &str) -> Result<String, String> {
