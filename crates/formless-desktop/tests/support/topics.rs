@@ -512,6 +512,7 @@ fn failed_topic_can_recover_then_retry_without_another_move(cx: &mut TestAppCont
             .unwrap()
             .contains("does not move them again"));
         assert!(window.try_find("topic-approve").is_none());
+        assert!(window.try_find("topic-cancel").is_none());
         window.click("topic-recover", cx);
         let commands = shell.update(cx, |s, _| s.take_client_commands());
         let actions = commands

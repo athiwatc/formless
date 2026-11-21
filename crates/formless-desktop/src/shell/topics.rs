@@ -856,10 +856,7 @@ impl Shell {
             }
             if matches!(
                 topic.status,
-                TopicStatus::Approved
-                    | TopicStatus::Running
-                    | TopicStatus::NeedsUser
-                    | TopicStatus::Failed
+                TopicStatus::Approved | TopicStatus::Running | TopicStatus::NeedsUser
             ) {
                 let id = topic.id.clone();
                 panel = panel.child(
