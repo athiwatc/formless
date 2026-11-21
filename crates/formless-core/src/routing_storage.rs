@@ -7,7 +7,7 @@ use crate::{
     routing_recorder::Receipt,
     routing_task_observation::{Event, TaskOutcome, TaskRecord},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE routing_calls (
@@ -33,7 +33,52 @@ fn eligible(record: &Record) -> Option<(&Identity, bool)> {
         Outcome::Neutral(_) => None,
     }
 }
-#[derive(Default)]
+const ROUTING_TASK_BATCH: usize = 64;
+
+struct Repricing<'a> {
+    cfg: &'a crate::Config,
+    endpoints: HashMap<String, Option<String>>,
+}
+
+impl<'a> Repricing<'a> {
+    fn new(cfg: &'a crate::Config, provider: &str, endpoint: String) -> Self {
+        Self {
+            cfg,
+            endpoints: [(provider.to_owned(), Some(endpoint))].into(),
+        }
+    }
+
+    fn matches_endpoint(&mut self, identity: &Identity) -> bool {
+        let provider = &identity.provider;
+        if let Some(endpoint) = self.endpoints.get(provider) {
+            return endpoint.as_deref() == Some(identity.endpoint.as_str());
+        }
+        let endpoint = self
+            .cfg
+            .provider_cfg_ref(Some(provider))
+            .ok()
+            .map(|cfg| crate::tokens::provider_key(provider, cfg));
+        let matches = endpoint.as_deref() == Some(identity.endpoint.as_str());
+        self.endpoints.insert(provider.clone(), endpoint);
+        matches
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TaskCost {
+    calls: u64,
+    cost: Cost,
+}
+
+struct TaskCandidate {
+    id: String,
+    identity: Identity,
+    good: bool,
+    elapsed_ms: u64,
+    expected_calls: u64,
+}
+
+#[derive(Clone, Copy, Default)]
 struct Cost {
     usd: Option<f64>,
     tokens: Option<f64>,
@@ -45,7 +90,7 @@ impl Cost {
             tokens: Some(0.0),
         }
     }
-    fn add_call(&mut self, record: &Record, cfg: &crate::Config) {
+    fn add_call(&mut self, record: &Record, pricing: &mut Repricing<'_>) {
         if record.truncated {
             self.usd = None;
             self.tokens = None;
@@ -58,10 +103,16 @@ impl Cost {
                 if let Some(cost) = u.cost.filter(|c| c.is_finite() && *c >= 0.0) {
                     return Some(cost);
                 }
-                let pcfg = cfg.provider_cfg(Some(&attempt.identity.provider)).ok()?;
-                (crate::tokens::provider_key(&attempt.identity.provider, &pcfg)
-                    == attempt.identity.endpoint)
-                    .then(|| usage_usd(cfg, &attempt.identity.provider, &attempt.identity.model, u))
+                pricing
+                    .matches_endpoint(&attempt.identity)
+                    .then(|| {
+                        usage_usd(
+                            pricing.cfg,
+                            &attempt.identity.provider,
+                            &attempt.identity.model,
+                            u,
+                        )
+                    })
                     .flatten()
             });
             self.usd = self
@@ -182,15 +233,16 @@ impl Store {
         provider: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Stat>> {
-        let pcfg = cfg.provider_cfg(Some(provider))?;
+        let pcfg = cfg.provider_cfg_ref(Some(provider))?;
         let since =
             crate::routing_policy::window_start(now, pcfg.routing_window_days)?.timestamp_millis();
-        let endpoint = crate::tokens::provider_key(provider, &pcfg);
+        let endpoint = crate::tokens::provider_key(provider, pcfg);
         let mut query=self.ps("SELECT payload FROM routing_calls WHERE provider=?1 AND endpoint=?2 AND finished_at_ms>=?3 AND finished_at_ms<=?4 ORDER BY id")?;
         let mut rows = query.query(params![provider, endpoint, since, now.timestamp_millis()])?;
+        let mut pricing = Repricing::new(cfg, provider, endpoint);
         let mut stats = BTreeMap::new();
         while let Some(row) = rows.next()? {
-            let record: Record = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let record: Record = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
             let Some((identity, good)) = eligible(&record) else {
                 continue;
             };
@@ -199,7 +251,7 @@ impl Store {
                 continue;
             }
             let mut cost = Cost::zero();
-            cost.add_call(&record, cfg);
+            cost.add_call(&record, &mut pricing);
             accumulate(&mut stats, identity, good, record.elapsed_ms, cost);
         }
         Ok(stats.into_values().collect())
@@ -211,60 +263,107 @@ impl Store {
         provider: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Stat>> {
-        let pcfg = cfg.provider_cfg(Some(provider))?;
-        let since =
-            crate::routing_policy::window_start(now, pcfg.routing_window_days)?.timestamp_millis();
-        let endpoint = crate::tokens::provider_key(provider, &pcfg);
-        let mut query=self.ps("SELECT r.payload,t.outcome,run.rating,run.followup FROM routing_tasks r JOIN task_stats t ON t.id=r.id LEFT JOIN runs run ON run.id=t.run_id WHERE r.role=?1 AND r.provider=?2 AND r.endpoint=?3 AND r.final=1 AND r.finished_at_ms>=?4 AND r.finished_at_ms<=?5 ORDER BY r.id")?;
-        let mut rows = query.query(params![
-            role,
-            provider,
-            endpoint,
-            since,
-            now.timestamp_millis()
-        ])?;
-        let mut stats = BTreeMap::new();
+        self.read_transaction(|store| {
+            let pcfg = cfg.provider_cfg_ref(Some(provider))?;
+            let since =
+                crate::routing_policy::window_start(now, pcfg.routing_window_days)?.timestamp_millis();
+            let endpoint = crate::tokens::provider_key(provider, pcfg);
+            let mut query=store.ps("SELECT r.payload,t.outcome,run.rating,run.followup FROM routing_tasks r JOIN task_stats t ON t.id=r.id LEFT JOIN runs run ON run.id=t.run_id WHERE r.role=?1 AND r.provider=?2 AND r.endpoint=?3 AND r.final=1 AND r.finished_at_ms>=?4 AND r.finished_at_ms<=?5 ORDER BY r.id")?;
+            let mut rows = query.query(params![
+                role,
+                provider,
+                endpoint,
+                since,
+                now.timestamp_millis()
+            ])?;
+            let mut pricing = Repricing::new(cfg, provider, endpoint);
+            let mut stats = BTreeMap::new();
+            let mut tasks = Vec::with_capacity(ROUTING_TASK_BATCH);
+            while let Some(row) = rows.next()? {
+                let record: TaskRecord = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+                if record.mixed || !record.capture_complete {
+                    continue;
+                }
+                let (Some(identity), Some(elapsed_ms)) = (record.responsible, record.elapsed_ms) else {
+                    continue;
+                };
+                let mut good = match record.outcome {
+                    TaskOutcome::Completed => true,
+                    TaskOutcome::ContractFailure => false,
+                    TaskOutcome::Neutral(_) => continue,
+                };
+                let feedback: Option<String> = row.get(1)?;
+                let rating: Option<String> = row.get(2)?;
+                let followup: Option<String> = row.get(3)?;
+                if rating.as_deref() == Some("bad")
+                    || matches!(followup.as_deref(), Some("edited" | "corrected"))
+                    || matches!(
+                        feedback.as_deref(),
+                        Some("respawned" | "rated_bad" | "edited" | "corrected")
+                    )
+                {
+                    good = false;
+                }
+                tasks.push(TaskCandidate {
+                    id: record.id,
+                    identity,
+                    good,
+                    elapsed_ms,
+                    expected_calls: record.expected_calls,
+                });
+                if tasks.len() == ROUTING_TASK_BATCH {
+                    store.routing_task_batch(&mut tasks, &mut pricing, &mut stats)?;
+                }
+            }
+            if !tasks.is_empty() {
+                store.routing_task_batch(&mut tasks, &mut pricing, &mut stats)?;
+            }
+            Ok(stats.into_values().collect())
+        })
+    }
+
+    fn routing_task_batch(
+        &self,
+        tasks: &mut Vec<TaskCandidate>,
+        pricing: &mut Repricing<'_>,
+        stats: &mut BTreeMap<String, Stat>,
+    ) -> Result<()> {
+        let ids = serde_json::to_string(&tasks.iter().map(|task| &task.id).collect::<Vec<_>>())?;
+        let mut calls = self.ps("SELECT t.task_id,r.payload FROM routing_call_tasks t
+             JOIN routing_calls r ON r.id=t.call_id
+             WHERE t.task_id IN (SELECT value FROM json_each(?1))
+             ORDER BY t.task_id,t.call_id")?;
+        let mut rows = calls.query([ids])?;
+        let mut costs = BTreeMap::<String, TaskCost>::new();
         while let Some(row) = rows.next()? {
-            let record: TaskRecord = serde_json::from_str(&row.get::<_, String>(0)?)?;
-            if record.mixed || !record.capture_complete || record.elapsed_ms.is_none() {
-                continue;
-            }
-            let Some(identity) = &record.responsible else {
-                continue;
+            let task_id = row.get_ref(0)?.as_str()?;
+            let record: Record = serde_json::from_str(row.get_ref(1)?.as_str()?)?;
+            let aggregate = match costs.get_mut(task_id) {
+                Some(aggregate) => aggregate,
+                None => costs.entry(task_id.to_owned()).or_insert_with(|| TaskCost {
+                    calls: 0,
+                    cost: Cost::zero(),
+                }),
             };
-            let mut good = match record.outcome {
-                TaskOutcome::Completed => true,
-                TaskOutcome::ContractFailure => false,
-                TaskOutcome::Neutral(_) => continue,
-            };
-            let feedback: Option<String> = row.get(1)?;
-            let rating: Option<String> = row.get(2)?;
-            let followup: Option<String> = row.get(3)?;
-            if rating.as_deref() == Some("bad")
-                || matches!(followup.as_deref(), Some("edited" | "corrected"))
-                || matches!(
-                    feedback.as_deref(),
-                    Some("respawned" | "rated_bad" | "edited" | "corrected")
-                )
-            {
-                good = false;
-            }
-            let mut calls=self.ps("SELECT r.payload FROM routing_call_tasks t JOIN routing_calls r ON r.id=t.call_id WHERE t.task_id=?1 ORDER BY r.id")?;
-            let mut call_rows = calls.query(params![record.id])?;
-            let mut cost = Cost::zero();
-            let mut count = 0u64;
-            while let Some(call) = call_rows.next()? {
-                let call: Record = serde_json::from_str(&call.get::<_, String>(0)?)?;
-                count = count.saturating_add(1);
-                cost.add_call(&call, cfg);
-            }
-            // Missing/dropped receipts cannot be turned into a cheap task.
-            if count == 0 || count != record.expected_calls {
-                continue;
-            }
-            accumulate(&mut stats, identity, good, record.elapsed_ms, cost);
+            aggregate.calls = aggregate.calls.saturating_add(1);
+            aggregate.cost.add_call(&record, pricing);
         }
-        Ok(stats.into_values().collect())
+        // Accumulate in the original task order and only use complete
+        // evidence, even when one call contributes to several tasks.
+        for task in tasks.drain(..) {
+            if let Some(total) = costs.get(&task.id) {
+                if total.calls == task.expected_calls {
+                    accumulate(
+                        stats,
+                        &task.identity,
+                        task.good,
+                        Some(task.elapsed_ms),
+                        total.cost,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -521,6 +620,97 @@ mod tests {
         assert_eq!(stats[0].model, "agent");
         assert!((stats[0].usd.unwrap() - 0.4).abs() < 1e-12);
     }
+    #[test]
+    fn routing_task_batches_share_calls_and_preserve_counts_and_costs() {
+        use rusqlite::ffi;
+        use std::{
+            cell::Cell,
+            ffi::{c_int, c_uint, c_void, CStr},
+        };
+
+        unsafe extern "C" fn count_batches(
+            _: c_uint,
+            data: *mut c_void,
+            _: *mut c_void,
+            sql: *mut c_void,
+        ) -> c_int {
+            // SAFETY: SQLITE_TRACE_STMT supplies a NUL-terminated SQL string.
+            // The caller owns this Cell for the duration of the registered trace.
+            let sql = unsafe { CStr::from_ptr(sql.cast()) };
+            if sql.to_bytes().starts_with(b"SELECT t.task_id,r.payload") {
+                let count = unsafe { &*data.cast::<Cell<usize>>() };
+                count.set(count.get() + 1);
+            }
+            0
+        }
+
+        let count = Cell::new(0usize);
+        let st = Store::open_in_memory().unwrap();
+        let mut cfg = crate::Config::default();
+        cfg.provider.prices.insert(
+            "shared".into(),
+            crate::config::ModelPrice {
+                input: 250_000.0,
+                ..Default::default()
+            },
+        );
+        let now = chrono::Utc::now();
+        let n = 2 * ROUTING_TASK_BATCH + 5;
+        let mut shared = record(&cfg, "shared", None, now.timestamp_millis());
+        let usage = shared.attempts[0].usage.as_mut().unwrap();
+        usage.prompt_tokens = 1;
+        usage.cached_tokens = 0;
+        usage.cache_write_tokens = 0;
+        let mut receipts = Vec::new();
+        for i in 0..n {
+            let id = format!("task-{i:04}");
+            let mut own = record(&cfg, "agent", Some(0.125), now.timestamp_millis());
+            own.task_ids.push(id.clone());
+            let mut task = task_record(&own, &id);
+            task.expected_calls = if i == n - 1 { 3 } else { 2 };
+            legacy(&st, &id);
+            if i == 0 {
+                st.ex(
+                    "UPDATE task_stats SET outcome='rated_bad' WHERE id=?1",
+                    params![id],
+                )
+                .unwrap();
+            }
+            shared.task_ids.push(id);
+            receipts.extend([Receipt::Call(own), Receipt::Task(Event::Final(task))]);
+        }
+        receipts.push(Receipt::Call(shared));
+        st.record_routing(&receipts).unwrap();
+
+        // SAFETY: this handle remains open throughout the trace; SQLite calls
+        // the callback synchronously and we unregister before examining results.
+        let handle = unsafe { st.conn.handle() };
+        assert_eq!(
+            unsafe {
+                ffi::sqlite3_trace_v2(
+                    handle,
+                    ffi::SQLITE_TRACE_STMT as c_uint,
+                    Some(count_batches),
+                    (&count as *const Cell<usize>).cast_mut().cast(),
+                )
+            },
+            ffi::SQLITE_OK
+        );
+        let result = st.routing_task_stats(&cfg, "worker", "default", now);
+        unsafe { ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
+        let stats = result.unwrap();
+        assert_eq!(
+            count.get(),
+            3,
+            "one linked-call read per bounded task batch"
+        );
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].model, "agent");
+        assert_eq!(stats[0].samples, n as i64 - 1);
+        assert_eq!(stats[0].good, n as i64 - 2);
+        assert_eq!(stats[0].usd, Some((n - 1) as f64 * 0.375));
+    }
+
     #[test]
     fn transaction_failure_keeps_no_partial_receipts_and_raw_usage_roundtrips() {
         let st = Store::open_in_memory().unwrap();

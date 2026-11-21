@@ -418,9 +418,13 @@ impl Config {
     }
 
     pub fn provider_cfg(&self, name: Option<&str>) -> Result<ProviderCfg> {
+        self.provider_cfg_ref(name).cloned()
+    }
+
+    pub(crate) fn provider_cfg_ref(&self, name: Option<&str>) -> Result<&ProviderCfg> {
         match name.filter(|n| !n.is_empty() && *n != DEFAULT_PROVIDER) {
-            None => Ok(self.provider.clone()),
-            Some(n) => self.providers.get(n).cloned().with_context(|| {
+            None => Ok(&self.provider),
+            Some(n) => self.providers.get(n).with_context(|| {
                 format!(
                     "unknown provider '{n}' (configured: default{})",
                     self.providers
