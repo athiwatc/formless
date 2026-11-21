@@ -133,8 +133,17 @@ fn the_renderer_fills_everything_or_fails() {
 #[test]
 fn the_image_and_packages_carry_what_they_need() {
     let docker = std::fs::read_to_string(root().join("Dockerfile")).unwrap();
-    for from in docker.lines().filter(|l| l.starts_with("FROM ")) {
-        assert!(from.contains("@sha256:"), "unpinned base: {from}");
+    let mut stages = std::collections::BTreeSet::new();
+    for from in docker.lines().filter_map(|line| line.strip_prefix("FROM ")) {
+        let mut parts = from.split_whitespace();
+        let image = parts.next().unwrap();
+        assert!(
+            image.contains("@sha256:") || stages.contains(image),
+            "unpinned base: {from}"
+        );
+        if parts.next() == Some("AS") {
+            stages.insert(parts.next().unwrap());
+        }
     }
     assert!(docker.contains("libdbus-1-dev") && docker.contains("libdbus-1-3"));
     assert!(docker.contains("HEALTHCHECK"));
@@ -146,7 +155,9 @@ fn the_image_and_packages_carry_what_they_need() {
     let aur = std::fs::read_to_string(root().join("packaging/aur/PKGBUILD.in")).unwrap();
     assert!(aur.contains("'dbus'") && aur.contains("/usr/share/licenses/"));
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
-    assert!(release.contains("needs: [build, linux, linux-install-test, docker]"));
+    let publish = release.split_once("\n  publish:\n").unwrap().1;
+    let publish = publish.split_once("\n  docker-publish:\n").unwrap().0;
+    assert!(publish.contains("needs: [version-check, build, linux, linux-install-test, docker]"));
 }
 
 fn sh() -> &'static str {

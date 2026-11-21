@@ -19,6 +19,8 @@ jobs:
   # Before any build (#842): the tag must have matching binaries and notes.
   version-check:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    outputs:
+      prerelease: ${{ steps.tag-kind.outputs.prerelease }}
     timeout-minutes: 5
     runs-on: [self-hosted, Linux, X64]
     steps:
@@ -28,6 +30,15 @@ jobs:
       - name: Tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
+      - name: Tag is compatible with Docker version tags
+        id: tag-kind
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python3 scripts/push-release-image.py --check-version
+          case "$GITHUB_REF_NAME" in
+            *-*) echo 'prerelease=true' ;;
+            *) echo 'prerelease=false' ;;
+          esac >> "$GITHUB_OUTPUT"
       - name: Tag has release notes
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
@@ -194,12 +205,30 @@ jobs:
       - name: Packages
         if: matrix.packages
         shell: bash
+        env:
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
         run: |
-          cargo deb -p formless-bin --no-build --output target/debian/
+          deb_version=()
+          rpm_version=()
+          if [[ "$PRERELEASE" == true ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            suffix="${version#*-}"
+            package_version="${version%%-*}~${suffix//-/+}"
+            deb_version=(--deb-version "$package_version-1")
+            rpm_version=(--set-metadata "version=\"$package_version\"")
+          fi
+          cargo deb -p formless-bin --no-build --output target/debian/ "${deb_version[@]}"
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
-          cargo generate-rpm -p crates/formless --output target/generate-rpm
-          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
+          if [[ "$PRERELEASE" == true ]]; then
+            # Use the tag's characters in asset names so checksum sidecars
+            # match the downloaded names after GitHub's filename normalization.
+            cp target/debian/*.deb "dist/formless_${version}_amd64.deb"
+            cp target/generate-rpm/*.rpm "dist/formless-${version}.x86_64.rpm"
+          else
+            cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          fi
           # The recorded dependencies, for the log.
           dpkg -I dist/*.deb | sed -n '/Depends/p'
       - name: Checksum release files
@@ -318,7 +347,10 @@ jobs:
   docker:
     permissions:
       contents: read
-      packages: write
+    outputs:
+      artifact-id: ${{ steps.image-upload.outputs.artifact-id }}
+      image-id: ${{ steps.smoke.outputs.image-id }}
+      image: ${{ steps.image-identity.outputs.image }}
     env:
       RELEASE_IMAGE: formless:release-${{ github.run_id }}-${{ github.run_attempt }}
       RELEASE_CONTAINER: formless-release-${{ github.run_id }}-${{ github.run_attempt }}
@@ -343,13 +375,21 @@ jobs:
           context: .
           load: true
           tags: ${{ env.RELEASE_IMAGE }}
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke private container with positive RPC proof
+        id: smoke
         shell: bash
         run: |
-          docker run --rm --network none "$RELEASE_IMAGE" --version
-          docker run -d --network none --name "$RELEASE_CONTAINER" "$RELEASE_IMAGE"
+          image_id=$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_id")" = "$GITHUB_REF_NAME"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_id")" = "$GITHUB_SHA"
+          docker run --rm --network none "$image_id" --version
+          docker run -d --network none --name "$RELEASE_CONTAINER" "$image_id"
           python3 - <<'PY'
           import json, os, subprocess, time
           name = os.environ["RELEASE_CONTAINER"]
@@ -371,14 +411,26 @@ jobs:
           else:
               raise SystemExit("private container daemon never answered status within 30s: " + last)
           PY
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push the smoke-tested image
+          printf 'image-id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
+      - name: Archive the smoke-tested image
+        id: image-identity
         shell: bash
-        run: bash scripts/push-release-image.sh
+        env:
+          TESTED_IMAGE_ID: ${{ steps.smoke.outputs.image-id }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")" = "$TESTED_IMAGE_ID"
+          archive_dir=$(mktemp -d "$RUNNER_TEMP/formless-release-image.XXXXXX")
+          echo "RELEASE_IMAGE_ARCHIVE=$archive_dir" >> "$GITHUB_ENV"
+          docker image save --output "$archive_dir/image.tar" "$RELEASE_IMAGE"
+          printf 'image=%s\n' "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: image-upload
+        with:
+          name: docker-image-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_IMAGE_ARCHIVE }}/image.tar
+          if-no-files-found: error
+          retention-days: 7
       - name: Always remove owned smoke fixture
         if: always()
         shell: bash
@@ -389,12 +441,21 @@ jobs:
           if docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
             docker image rm "$RELEASE_IMAGE"
           fi
+          if [[ -n "${RELEASE_IMAGE_ARCHIVE:-}" ]]; then
+            rm -f -- "$RELEASE_IMAGE_ARCHIVE/image.tar"
+            rmdir -- "$RELEASE_IMAGE_ARCHIVE"
+          fi
   publish:
     permissions:
       contents: write
+    outputs:
+      release: ${{ steps.release.outcome }}
+      tap: ${{ steps.tap.outcome }}
+      winget: ${{ steps.winget.outcome }}
+      aur: ${{ steps.aur.outcome }}
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, linux, linux-install-test, docker]
+    if: startsWith(github.ref, 'refs/tags/v') && (needs.version-check.outputs.prerelease == 'true' || needs.version-check.outputs.prerelease == 'false')
+    needs: [version-check, build, linux, linux-install-test, docker]
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -403,8 +464,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
+          pattern: formless-*
           merge-multiple: true
       - name: Render Homebrew, AUR and winget files
+        if: needs.version-check.outputs.prerelease == 'false'
         run: scripts/render-packaging.sh "${GITHUB_REF_NAME#v}" assets packaging-out
       # Notes `formless update` shows: the CHANGELOG section, then GitHub's
       # generated list of changes (#842).
@@ -414,16 +477,19 @@ jobs:
         id: release
         with:
           body_path: release-notes.md
+          prerelease: ${{ needs.version-check.outputs.prerelease }}
+          make_latest: ${{ needs.version-check.outputs.prerelease == 'true' && 'false' || '' }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             assets/formless-*.tar.gz
             assets/formless-*.zip
             assets/*.deb
             assets/*.rpm
             assets/*.sha256
-            packaging-out/aur/PKGBUILD
-            packaging-out/homebrew/formless.rb
-            packaging-out/winget/*.yaml
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/aur/PKGBUILD' || '' }}
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/homebrew/formless.rb' || '' }}
+            ${{ needs.version-check.outputs.prerelease == 'false' && 'packaging-out/winget/*.yaml' || '' }}
       # Each channel runs only when its secret exists (packaging/README.md),
       # independently of the others; the summary says how each went.
       - name: Update the Homebrew tap
@@ -431,7 +497,7 @@ jobs:
         continue-on-error: true
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        if: env.TAP_TOKEN != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.TAP_TOKEN != ''
         run: |
           # Never persist the tap token in .git/config on a self-hosted runner.
           askpass=$(mktemp "$RUNNER_TEMP/formless-tap-askpass.XXXXXX")
@@ -462,7 +528,7 @@ jobs:
         continue-on-error: true
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-        if: env.WINGET_TOKEN != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.WINGET_TOKEN != ''
         uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         with:
           identifier: athiwatc.formless
@@ -473,7 +539,7 @@ jobs:
         continue-on-error: true
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_KEY }}
-        if: env.AUR_KEY != ''
+        if: needs.version-check.outputs.prerelease == 'false' && env.AUR_KEY != ''
         uses: KSXGitHub/github-actions-deploy-aur@a97f56a8425a7a7f3b8c58607f769c69b089cadb # v3.0.1
         with:
           pkgname: formless-bin
@@ -482,10 +548,91 @@ jobs:
           commit_email: 731394+athiwatc@users.noreply.github.com
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: formless ${{ github.ref_name }}
-      - name: Channel summary
-        if: always()
+  docker-publish:
+    # All version tags share this group. Check the newest stable tag only
+    # after admission, so a queued older run cannot roll back latest.
+    concurrency:
+      group: release-docker-publication
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.push.outputs.version }}
+      latest: ${{ steps.push.outputs.latest }}
+    timeout-minutes: 30
+    needs: [docker, publish]
+    if: needs.publish.outputs.release == 'success'
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      RELEASE_IMAGE: ${{ needs.docker.outputs.image }}
+      TESTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
+      IMAGE_ARTIFACT_ID: ${{ needs.docker.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Isolate publication files and credentials
         shell: bash
-        run: >-
-          bash scripts/release-channel-summary.sh
-          '${{ steps.release.outcome }}' '${{ steps.tap.outcome }}'
-          '${{ steps.winget.outcome }}' '${{ steps.aur.outcome }}'
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_IMAGE" =~ ^formless:release-[0-9]+-[0-9]+$ ]]
+          [[ "$TESTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          publish_dir=$(mktemp -d "$RUNNER_TEMP/formless-docker-publish.XXXXXX")
+          echo "DOCKER_PUBLISH_DIR=$publish_dir" >> "$GITHUB_ENV"
+          mkdir "$publish_dir/docker"
+          echo "DOCKER_CONFIG=$publish_dir/docker" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ env.IMAGE_ARTIFACT_ID }}
+          path: ${{ env.DOCKER_PUBLISH_DIR }}
+          merge-multiple: true
+      - name: Load the archived image
+        shell: bash
+        run: docker image load --input "$DOCKER_PUBLISH_DIR/image.tar"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.31.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the verified image
+        id: push
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: python3 scripts/push-release-image.py
+      - name: Always remove owned publish fixture
+        if: always() && env.DOCKER_PUBLISH_DIR != ''
+        shell: bash
+        run: |
+          if docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$RELEASE_IMAGE"
+          fi
+          # The login action uses this isolated config in its post step.
+          rm -f -- "$DOCKER_PUBLISH_DIR/image.tar"
+  channel-summary:
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    needs: [version-check, publish, docker-publish]
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Channel summary
+        shell: bash
+        env:
+          RELEASE: ${{ needs.publish.outputs.release }}
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
+          TAP: ${{ needs.publish.outputs.tap }}
+          WINGET: ${{ needs.publish.outputs.winget }}
+          AUR: ${{ needs.publish.outputs.aur }}
+          DOCKER: ${{ needs.docker-publish.result }}
+          DOCKER_VERSION: ${{ needs.docker-publish.outputs.version }}
+          DOCKER_LATEST: ${{ needs.docker-publish.outputs.latest }}
+        run: bash scripts/release-channel-summary.sh "$RELEASE" "$TAP" "$WINGET" "$AUR" "$DOCKER"

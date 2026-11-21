@@ -246,8 +246,12 @@ fn default_prefix_and_zdotdir_are_reported_without_creating_profiles() {
 }
 
 #[test]
-fn unsupported_arm_linux_names_prerequisites_before_any_download() {
+fn unsupported_linux_arch_names_prerequisites_before_any_download() {
     let fixture = Fixture::new();
+    executable(
+        &fixture.dir.join("mock-bin/uname"),
+        "#!/bin/sh\ncase \"$1\" in -s) printf 'Linux\\n';; -m) printf 'riscv64\\n';; *) exit 83;; esac\n",
+    );
     let output = fixture
         .command(None)
         .env_remove("FORMLESS_FROM_SOURCE")
@@ -256,7 +260,7 @@ fn unsupported_arm_linux_names_prerequisites_before_any_download() {
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
     for expected in [
-        "unsupported platform Linux/aarch64",
+        "unsupported platform Linux/riscv64",
         "FORMLESS_FROM_SOURCE=1",
         "Rust/cargo",
         "C compiler",
