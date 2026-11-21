@@ -4024,7 +4024,8 @@
       }
       for (const [key, entry] of historyRender.turns) {
         if (!active.has(key)) { entry.el.remove(); historyRender.turns.delete(key); continue; }
-        const answerHere = lastAnswer && entry.items.includes(rendered.get(lastAnswer.id)) && !isRunning();
+        const answerHere = lastAnswer && entry.items.includes(rendered.get(lastAnswer.id)) && !isRunning()
+          && !(S.topicsAvailable && currentTopicAttempt());
         if (answerHere) {
           const decorationKey = JSON.stringify([S.recap, S.rated, lastAnswer.id]);
           if (!entry.decorations) entry.decorations = h("div", { class: "turn-actions" });
@@ -4049,6 +4050,7 @@
     return { session: S.current, sequence: sessionSeq, run: S.liveRun?.id || null };
   }
   function ensureRunTarget(target) {
+    if (S.topicsAvailable && currentTopicAttempt()) return false;
     if (target.session && target.session === S.current
         && target.sequence === sessionSeq && target.run === (S.liveRun?.id || null)) return true;
     note("The Session or latest Run changed. Open the action again.", true);
@@ -4097,6 +4099,7 @@
   }
 
   async function resumeRun() {
+    if (S.topicsAvailable && currentTopicAttempt()) return;
     const sid = S.current;
     if (!sid) return;
     if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {

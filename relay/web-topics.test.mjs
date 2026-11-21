@@ -116,7 +116,7 @@ test('polling ignores disconnected replies, retains known status on error, and c
 });
 
 test('nested harness transcripts cannot dispatch native send, attachment, edit or fork actions', async () => {
-  const c = setup(['topicForSession', 'currentTopicAttempt', 'submit', 'attachFiles', 'beginEdit', 'forkSession', 'stop'], {
+  const c = setup(['topicForSession', 'currentTopicAttempt', 'submit', 'attachFiles', 'beginEdit', 'forkSession', 'stop', 'ensureRunTarget', 'retryRun', 'resumeRun'], {
     $: () => { throw new Error('Read-only action touched the composer'); },
     act: () => { throw new Error('Read-only action mutated a session'); } });
   c.S.current = 'build-transcript';
@@ -125,6 +125,9 @@ test('nested harness transcripts cannot dispatch native send, attachment, edit o
   c.beginEdit({ id: 'x', content: 'rewrite' });
   await c.forkSession(c.S.current);
   c.stop();
+  assert.equal(c.ensureRunTarget({ session: c.S.current }), false);
+  await c.retryRun('', { session: c.S.current });
+  await c.resumeRun();
 });
 
 test('attempt snapshot polling refreshes only the open transcript and rejects late navigation replies', async () => {
