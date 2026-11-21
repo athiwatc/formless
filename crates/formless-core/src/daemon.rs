@@ -17258,12 +17258,25 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
         ".npmrc",
@@ -17274,12 +17287,15 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         "credentials",
         "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
         || name.ends_with(".pem")
         || name.ends_with(".ppk")
         || name.ends_with(".key")
