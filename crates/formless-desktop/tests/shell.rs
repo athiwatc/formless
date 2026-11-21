@@ -44,6 +44,8 @@ mod run_inspection_tests;
 mod session_edit_tests;
 #[path = "support/session_fork.rs"]
 mod session_fork_tests;
+#[path = "support/slash.rs"]
+mod slash_tests;
 #[path = "support/usage.rs"]
 mod usage_tests;
 

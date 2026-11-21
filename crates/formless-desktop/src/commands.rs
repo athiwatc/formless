@@ -24,6 +24,9 @@ pub enum HistoryMove {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Command {
+    NewSession,
+    SessionUsage,
+    ToggleStepMode,
     MessageQueue,
     RunAction(crate::run_actions::Kind),
     /// The composer's primary action: Send, or Steer while a Run is going.
@@ -101,6 +104,9 @@ pub struct State {
     pub can_recover: bool,
     pub can_questions: bool,
     pub can_approvals: bool,
+    pub can_create_session: bool,
+    pub usage_reason: Option<&'static str>,
+    pub step_mode_reason: Option<&'static str>,
     pub can_search_profile: bool,
     pub can_edit_session: bool,
     pub can_browse_archived: bool,
@@ -189,6 +195,8 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         };
     }
     match command {
+        Command::NewSession => &[],
+        Command::SessionUsage | Command::ToggleStepMode => &[],
         Command::RunAction(_) | Command::MessageQueue => &[],
         Command::ToggleSessions => &[primary!("b")],
         Command::ToggleContext => &[primary!("alt-b")],
@@ -289,7 +297,12 @@ pub fn shortcut_text(key: &str) -> String {
 /// The commands the palette lists, in order. The palette itself is not
 /// one of them.
 pub fn palette(state: &State) -> Vec<Entry> {
-    let mut commands = vec![Command::Send];
+    let mut commands = vec![
+        Command::Send,
+        Command::NewSession,
+        Command::SessionUsage,
+        Command::ToggleStepMode,
+    ];
     commands.extend(crate::run_actions::Kind::ALL.map(Command::RunAction));
     if state.has_composer && state.composer.secondary.is_some() {
         commands.push(Command::SendSecondary);
@@ -359,6 +372,21 @@ pub fn entry(command: Command, state: &State) -> Entry {
         Option<bool>,
         Option<&'static str>,
     ) = match command {
+        Command::NewSession => (
+            "New session", "New session".into(), Group::Session,
+            "Start a new Session in this Profile", None,
+            if state.composing { Some(COMPOSING) } else { (!state.can_create_session).then_some("Wait for a ready Profile connection") },
+        ),
+        Command::SessionUsage => (
+            "Read usage", "Read recorded Session usage".into(), Group::Session,
+            "Read recorded tokens and cost for the open Session", None,
+            if state.composing { Some(COMPOSING) } else { state.usage_reason },
+        ),
+        Command::ToggleStepMode => (
+            "Step mode", "Toggle Step mode".into(), Group::Run,
+            "Change Step mode using the sampled daemon state", None,
+            if state.composing { Some(COMPOSING) } else { state.step_mode_reason },
+        ),
         Command::Send => {
             let label = send_mode_label(state.composer.primary);
             (
@@ -688,6 +716,9 @@ mod tests {
             can_recover: false,
             can_questions: false,
             can_approvals: false,
+            can_create_session: false,
+            usage_reason: Some("Choose a connected Session in Chat first"),
+            step_mode_reason: Some("Step mode is not available for this Session"),
             can_search_profile: false,
             can_edit_session: false,
             can_browse_archived: false,

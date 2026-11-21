@@ -457,12 +457,56 @@ fn composer_attachment_chips_render_after_staging_and_remove_by_artifact_id(
 }
 
 #[gpui_kit::test]
+fn external_drop_stages_paths_while_slash_menu_is_open(cx: &mut TestAppContext) {
+    let (handle, shell) = setup(cx);
+    step(cx, handle, |window, cx| {
+        window.input("/", cx);
+        window.render_frame(cx);
+        assert!(window.find("slash-popup").visible());
+        let position = window.find("composer-attach").bounds().center();
+        window.dispatch_event(
+            gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Entered {
+                position,
+                paths: gpui_kit::ExternalPaths(["/dropped.txt".into()].into_iter().collect()),
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui_kit::PlatformInput::MouseMove(gpui_kit::MouseMoveEvent {
+                position,
+                pressed_button: Some(gpui_kit::MouseButton::Left),
+                modifiers: Default::default(),
+            }),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(
+            gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Submit { position }),
+            cx,
+        );
+        let operation = queued(&shell, cx).pop().expect("drop stages an attachment");
+        assert!(
+            matches!(&operation.intake, Intake::Paths(paths) if paths == &[std::path::PathBuf::from("/dropped.txt")])
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "/");
+        complete(&shell, operation, vec![], window, cx);
+    });
+}
+
+#[gpui_kit::test]
 fn composer_attachment_empty_backspace_removes_last_without_changing_text(cx: &mut TestAppContext) {
     let (handle, shell) = setup(cx);
     step(cx, handle, |window, cx| {
         stage(&shell, window, cx);
-        window.input("x", cx);
+        window.input("/", cx);
+        window.render_frame(cx);
+        assert!(window.find("slash-popup").visible());
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("slash-row-1").selected(), Some(true));
         window.press("backspace", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("slash-popup").is_none());
         assert!(
             queued(&shell, cx).is_empty(),
             "ordinary text deletion must not detach"
@@ -615,10 +659,15 @@ fn composer_attachment_clipboard_paths_and_image_use_staging_not_text(cx: &mut T
         ))
         .into(),
     );
-    step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+    step(cx, handle, |window, cx| {
+        window.input("/", cx);
+        window.render_frame(cx);
+        assert!(window.find("slash-popup").visible());
+        window.press(&chord("v"), cx);
+    });
     cx.run_until_parked();
     step(cx, handle, |window, cx| {
-        assert!(shell.read(cx).draft(cx).is_empty());
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "/");
         let operation = queued(&shell, cx).pop().unwrap();
         assert!(matches!(&operation.intake, Intake::Paths(paths) if paths.len() == 2));
         complete(&shell, operation, vec![], window, cx);
@@ -635,6 +684,8 @@ fn composer_attachment_clipboard_paths_and_image_use_staging_not_text(cx: &mut T
             matches!(&operation.intake, Intake::ClipboardImage { number: 1, mime, bytes } if mime == "image/png" && bytes == &[1, 2, 3])
         );
         complete(&shell, operation, vec![], window, cx);
+        let input = shell.read(cx).composer().clone();
+        input.update(cx, |input, cx| input.set_value("", window, cx));
     });
     cx.write_to_clipboard(ClipboardItem::new_string("unchanged text paste".into()));
     step(cx, handle, |window, cx| window.press(&chord("v"), cx));

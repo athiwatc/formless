@@ -4,6 +4,7 @@ use super::*;
 use crate::questions::preview;
 use crate::session_edit::{Change, Field, Metadata, Outcome, MAX_INPUT};
 use crate::session_export::{self, Format};
+use crate::slash::Arguments;
 
 pub(super) enum SessionEditorStart {
     Details,
@@ -48,6 +49,7 @@ pub(super) struct Panel {
     id: String,
     metadata: Option<Metadata>,
     field: Field,
+    slash_prefill: Option<(crate::slash::Arguments, String)>,
     name: String,
     tags: String,
     instructions: Option<String>,
@@ -70,6 +72,11 @@ pub(super) struct Panel {
 }
 
 impl Shell {
+    pub(super) fn prefill_session_slash(&mut self, field: crate::slash::Arguments, text: String) {
+        if let Some(panel) = &mut self.session_editor {
+            panel.slash_prefill = Some((field, text));
+        }
+    }
     pub(super) fn retire_session_editor_attachment(
         &mut self,
         instance: uuid::Uuid,
@@ -228,6 +235,7 @@ impl Shell {
             id,
             metadata: None,
             field,
+            slash_prefill: None,
             name: String::new(),
             tags: String::new(),
             instructions: None,
@@ -545,6 +553,27 @@ impl Shell {
                 panel.name = metadata.name.clone();
                 panel.tags = metadata.tags.join("\n");
                 panel.instructions = metadata.instructions.text().map(str::to_string);
+                if let Some((field, text)) = panel.slash_prefill.take() {
+                    panel.field = match field {
+                        Arguments::Instructions => Field::Instructions,
+                        Arguments::Tags => Field::Tags,
+                        Arguments::Pin => Field::Pin,
+                        _ => Field::Name,
+                    };
+                    if !text.is_empty() {
+                        match field {
+                            Arguments::Name => panel.name = text,
+                            Arguments::Tags => {
+                                panel.tags = text.split_whitespace().collect::<Vec<_>>().join("\n")
+                            }
+                            Arguments::Instructions => {
+                                panel.instructions =
+                                    Some(if text == "clear" { String::new() } else { text })
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 panel.metadata = Some(metadata);
                 panel.retired = false;
                 panel.notice =
