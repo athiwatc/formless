@@ -1,10 +1,13 @@
 //! V2-only adapter for OpenCode's local CLI.
 //!
-//! Uses the V2 `opencode run --bare --standalone --format json` interface and
+//! Verified against OpenCode v2.3.2.
+//!
+//! Uses the V2 `opencode run --standalone --format json` interface and
 //! `OPENCODE_CONFIG_CONTENT` so per-run MCP and agent settings stay in the child
 //! process. V1 configuration and CLI flags are unsupported. This adapter starts
 //! new runs only; it does not resume, import files, or make provider calls itself.
-//! It requires a V2 CLI with those flags; no specific binary release is pinned.
+//! User/project OpenCode configuration is still read, never written; per-run
+//! settings come from `OPENCODE_CONFIG_CONTENT`. It requires a V2 CLI with those flags.
 //!
 //! The command and configuration follow the official [CLI], [MCP], [agent],
 //! [permission], and [configuration schema] documentation. JSON event fields
@@ -94,7 +97,6 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
     };
     let mut args = vec![
         "run".into(),
-        "--bare".into(),
         "--standalone".into(),
         "--format".into(),
         "json".into(),
@@ -339,10 +341,9 @@ mod tests {
             let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
             assert_eq!(spec.program, PathBuf::from("/opt/test/opencode"));
             assert_eq!(
-                &args[..7],
+                &args[..6],
                 [
                     "run",
-                    "--bare",
                     "--standalone",
                     "--format",
                     "json",
@@ -351,7 +352,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                &args[7..],
+                &args[6..],
                 [
                     "--model",
                     "provider/model#variant",
@@ -476,12 +477,28 @@ mod tests {
         request.model = None;
         let spec = command_spec(&request).unwrap();
         let args: Vec<_> = spec.args.iter().map(|arg| arg.to_string_lossy()).collect();
-        assert_eq!(&args[7..], ["--", "prompt"]);
+        assert_eq!(&args[6..], ["--", "prompt"]);
         request.executable = None;
         assert_eq!(
             command_spec(&request).unwrap().program,
             PathBuf::from("opencode")
         );
+    }
+
+    #[test]
+    fn parse_output_accepts_v2_3_2_tool_call_steps() {
+        let output = r#"{"type":"tool_use","timestamp":1795274606996,"sessionID":"ses-smoke","part":{"partID":"prt-tool","sessionID":"ses-smoke","messageID":"msg-tool","type":"tool","id":"call-1","tool":"execute","state":{"status":"completed","input":{"code":"return await tools.formless.topic_read()"},"output":"null","title":"execute","metadata":{"metadata":{"toolCalls":[{"tool":"formless.topic_read","status":"completed"}],"truncated":false},"content":[{"type":"text","text":"null"}],"providerCall":{"executed":false},"providerResult":{"executed":false},"rawInput":"{}"},"time":{"start":1795274606882,"end":1795274606996}}}}
+{"type":"step_finish","timestamp":1795274607002,"sessionID":"ses-smoke","part":{"id":"prt-finish","sessionID":"ses-smoke","messageID":"msg-tool","type":"step-finish","reason":"tool-calls","snapshot":"snapshot","cost":0,"tokens":{"input":700,"output":21,"reasoning":156,"cache":{"read":6656,"write":0}}}}
+{"type":"step_start","timestamp":1795274620374,"sessionID":"ses-smoke","part":{"id":"prt-start","sessionID":"ses-smoke","messageID":"msg-text","type":"step-start","snapshot":"snapshot"}}
+{"type":"text","timestamp":1795274622162,"sessionID":"ses-smoke","part":{"id":"prt-text","sessionID":"ses-smoke","messageID":"msg-text","type":"text","text":"I received your message literally.","time":{"start":1795274621867,"end":1795274622162}}}
+{"type":"step_finish","timestamp":1795274622171,"sessionID":"ses-smoke","part":{"id":"prt-stop","sessionID":"ses-smoke","messageID":"msg-text","type":"step-finish","reason":"stop","snapshot":"snapshot","cost":0,"tokens":{"input":713,"output":47,"reasoning":215,"cache":{"read":8192,"write":0}}}}
+"#;
+        let result = parse_output(output).unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("ses-smoke"));
+        assert_eq!(result.message, "I received your message literally.");
+        assert_eq!(result.events.len(), 5);
+        assert_eq!(result.events[0]["type"], "tool_use");
+        assert_eq!(result.events[1]["part"]["reason"], "tool-calls");
     }
 
     #[test]
@@ -559,7 +576,7 @@ mod tests {
         let executable = directory.0.join("fake-opencode");
         fs::write(
             &executable,
-            "#!/bin/sh\nset -eu\n[ \"$#\" -eq 9 ]\n[ \"$1\" = run ]\n[ \"$2\" = --bare ]\n[ \"$3\" = --standalone ]\n[ \"$4\" = --format ]\n[ \"$5\" = json ]\n[ \"$6\" = --agent ]\n[ \"$7\" = build ]\n[ \"$8\" = -- ]\n[ \"$9\" = --prompt-as-one-argument ]\n[ \"$(pwd)\" = \"$EXPECTED_CWD\" ]\n[ \"$FORMLESS_TOPIC_CAPABILITY\" = unit-test-secret ]\ncase \"$OPENCODE_CONFIG_CONTENT\" in *'{env:FORMLESS_TOPIC_CAPABILITY}'*) ;; *) exit 11 ;; esac\ncase \"$OPENCODE_CONFIG_CONTENT\" in *\"$FORMLESS_TOPIC_CAPABILITY\"*) exit 12 ;; esac\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"text\",\"text\":\"fake response\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n",
+            "#!/bin/sh\nset -eu\n[ \"$#\" -eq 8 ]\n[ \"$1\" = run ]\n[ \"$2\" = --standalone ]\n[ \"$3\" = --format ]\n[ \"$4\" = json ]\n[ \"$5\" = --agent ]\n[ \"$6\" = build ]\n[ \"$7\" = -- ]\n[ \"$8\" = --prompt-as-one-argument ]\n[ \"$(pwd)\" = \"$EXPECTED_CWD\" ]\n[ \"$FORMLESS_TOPIC_CAPABILITY\" = unit-test-secret ]\ncase \"$OPENCODE_CONFIG_CONTENT\" in *'{env:FORMLESS_TOPIC_CAPABILITY}'*) ;; *) exit 11 ;; esac\ncase \"$OPENCODE_CONFIG_CONTENT\" in *\"$FORMLESS_TOPIC_CAPABILITY\"*) exit 12 ;; esac\nprintf '%s\\n' '{\"type\":\"text\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"text\",\"text\":\"fake response\"}}'\nprintf '%s\\n' '{\"type\":\"step_finish\",\"sessionID\":\"fake-session\",\"part\":{\"type\":\"step-finish\",\"reason\":\"stop\"}}'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
