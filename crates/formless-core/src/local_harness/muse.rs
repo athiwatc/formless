@@ -28,6 +28,7 @@ use super::{
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 4 * 1024 * 1024;
+const MAX_ANSWER_CHARS: usize = 500;
 const TRUST_ONCE: &str = "trust_once";
 
 pub async fn run(
@@ -448,12 +449,7 @@ impl<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin> Msp<R, W> {
                             }}),
                         )
                         .await?;
-                        handler
-                            .ask_question(question.for_formless(), cancel)
-                            .await
-                            .and_then(|answers| question.answer(session, &answers))
-                            .map(|params| ("userInput/answer", params))
-                            .unwrap_or_else(|| ("userInput/cancel", question.cancel(session)))
+                        question.ask(session, handler, cancel).await
                     }
                     _ => bail!("Muse Code sent an unsupported server request"),
                 };
@@ -622,14 +618,46 @@ struct QuestionSelection {
 }
 
 impl Questions {
-    fn for_formless(&self) -> Vec<Question> {
+    async fn ask(
+        &self,
+        session: &str,
+        handler: &dyn InteractionHandler,
+        cancel: &CancellationToken,
+    ) -> (&'static str, Value) {
+        let mut feedback = None;
+        while !cancel.is_cancelled() {
+            let Some(answers) = handler
+                .ask_question(self.for_formless(feedback.as_deref()), cancel)
+                .await
+            else {
+                break;
+            };
+            match self.answer(session, &answers) {
+                Ok(params) => return ("userInput/answer", params),
+                Err(reason) => feedback = Some(reason),
+            }
+        }
+        ("userInput/cancel", self.cancel(session))
+    }
+
+    fn for_formless(&self, feedback: Option<&str>) -> Vec<Question> {
         self.questions
             .iter()
-            .map(|question| Question {
-                question: question.question.clone(),
-                header: Some(question.header.clone()),
-                options: question.options.clone(),
-                multi_select: question.selection.mode == "multiple",
+            .enumerate()
+            .map(|(index, question)| {
+                let mut prompt = format!(
+                    "{}\n\nMuse Code accepts up to {MAX_ANSWER_CHARS} characters of free text.",
+                    question.question
+                );
+                if let (0, Some(reason)) = (index, feedback) {
+                    prompt.push_str(&format!("\n\n{reason} Please try again."));
+                }
+                Question {
+                    question: prompt,
+                    header: Some(question.header.clone()),
+                    options: question.options.clone(),
+                    multi_select: question.selection.mode == "multiple",
+                }
             })
             .collect()
     }
@@ -657,16 +685,18 @@ impl Questions {
         json!({"commandId": Uuid::now_v7().to_string(), "sessionId": session, "userInputId": self.user_input_id})
     }
 
-    fn answer(&self, session: &str, replies: &[QuestionAnswer]) -> Option<Value> {
+    fn answer(&self, session: &str, replies: &[QuestionAnswer]) -> Result<Value, String> {
         if self.questions.len() != replies.len() {
-            return None;
+            return Err("Muse Code needs an answer to each question.".into());
         }
         let mut answers = Vec::new();
         for (question, reply) in self.questions.iter().zip(replies) {
             let chosen = &reply.selected;
             let text = reply.text.as_deref().filter(|text| !text.trim().is_empty());
-            if text.is_some_and(|text| text.chars().count() > 500) {
-                return None;
+            if text.is_some_and(|text| text.chars().count() > MAX_ANSWER_CHARS) {
+                return Err(format!(
+                    "A free-text answer exceeded {MAX_ANSWER_CHARS} characters."
+                ));
             }
             if let (true, Some(text)) = (chosen.is_empty(), text) {
                 answers.push(json!({"questionId": question.id, "freeText": text}));
@@ -678,7 +708,9 @@ impl Questions {
                     .iter()
                     .all(|label| question.options.iter().any(|option| option.label == *label))
             {
-                return None;
+                return Err(
+                    "Muse Code only accepts the listed options, without duplicates.".into(),
+                );
             }
             let mut answer = match question.selection.mode.as_str() {
                 "single" if chosen.len() == 1 => {
@@ -694,7 +726,21 @@ impl Questions {
                 {
                     json!({"questionId": question.id, "selectedLabels": chosen})
                 }
-                _ => return None,
+                "multiple" => {
+                    return Err(format!(
+                        "Muse Code expects {} to {} selections for a multiple-choice answer.",
+                        question.selection.min_selections.unwrap_or(1),
+                        question
+                            .selection
+                            .max_selections
+                            .unwrap_or(question.options.len())
+                    ))
+                }
+                _ => {
+                    return Err(
+                        "Choose one of the listed options or enter a free-text answer.".into(),
+                    )
+                }
             };
             if let Some(note) = text {
                 answer["note"] = json!(note);
@@ -703,7 +749,7 @@ impl Questions {
         }
         let mut params = self.cancel(session);
         params["answers"] = json!(answers);
-        Some(params)
+        Ok(params)
     }
 }
 
@@ -873,6 +919,7 @@ mod tests {
         stream: std::sync::Mutex<Vec<String>>,
         trust: Option<&'static str>,
         trust_path: std::sync::Mutex<Option<Value>>,
+        question_count: std::sync::atomic::AtomicUsize,
     }
 
     impl InteractionHandler for Hooks {
@@ -914,8 +961,22 @@ mod tests {
             questions: Vec<Question>,
             _cancel: &'a CancellationToken,
         ) -> InteractionFuture<'a, Option<Vec<QuestionAnswer>>> {
-            assert_eq!(questions[0].question, "Which format?");
+            let count = self
+                .question_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(questions[0].question.starts_with("Which format?"));
+            assert!(questions[0].question.contains("up to 500 characters"));
             assert_eq!(questions[0].header.as_deref(), Some("Format"));
+            if count == 0 {
+                return Box::pin(async {
+                    Some(vec![QuestionAnswer {
+                        selected: vec![],
+                        text: Some("x".repeat(MAX_ANSWER_CHARS + 1)),
+                    }])
+                });
+            }
+            assert_eq!(count, 1);
+            assert!(questions[0].question.contains("exceeded 500 characters"));
             Box::pin(async {
                 Some(vec![QuestionAnswer {
                     selected: vec!["CSV".into()],
@@ -1052,6 +1113,12 @@ mod tests {
         .unwrap();
         assert_eq!(result.unwrap(), "Fixture done");
         assert_eq!(*hooks.stream.lock().unwrap(), ["Fixture done"]);
+        assert_eq!(
+            hooks
+                .question_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1137,7 +1204,7 @@ mod tests {
                     text: None
                 }]
             )
-            .is_none());
+            .is_err());
         assert_eq!(
             question
                 .answer(
