@@ -847,17 +847,25 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
             ]
             .iter()
             .any(|ending| k.ends_with(ending));
-        let secret = [
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "CREDENTIAL",
-            "PRIVATE",
-            "AUTH",
-        ]
-        .iter()
-        .any(|w| k.contains(w))
+        let credential_part = k != "SSH_AUTH_SOCK"
+            && k.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|part| {
+                matches!(
+                    part,
+                    "TOKEN"
+                        | "TOKENS"
+                        | "SECRET"
+                        | "SECRETS"
+                        | "PASSWORD"
+                        | "PASSWORDS"
+                        | "PASSWD"
+                        | "CREDENTIAL"
+                        | "CREDENTIALS"
+                        | "PRIVATE"
+                        | "AUTH"
+                        | "AUTHORIZATION"
+                )
+            });
+        let secret = credential_part
             || credential_key
             || matches!(k.as_str(), "DATABASE_URL" | "REDIS_URL" | "MONGODB_URI")
             || k.ends_with("_PAT");
@@ -4674,7 +4682,10 @@ mod tests {
             "SIGNINGKEY",
             "HMACKEY",
             "PRIMARY_KEY_TOKEN",
-            "SSH_AUTH_SOCK",
+            "GITHUB_TOKEN",
+            "DB_PASSWORD",
+            "AUTHORIZATION",
+            "CREDENTIALS_FILE",
         ] {
             assert_eq!(
                 broad_capability(&format!("env:{name}")),
@@ -4695,6 +4706,12 @@ mod tests {
             "CANDIDATE_KEY",
             "SORT_KEY",
             "PARTITION_KEY",
+            "SSH_AUTH_SOCK",
+            "ssh_auth_sock",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "TOKENIZERS_PARALLELISM",
             "HOME",
         ] {
             assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");

@@ -94,6 +94,18 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
   assert.equal(c.hashParams().k, 'a+b=');
 });
 
+test('environment approvals distinguish credential words from ordinary name fragments', () => {
+  const c = setup(['broadWhy']);
+  for (const name of ['SSH_AUTH_SOCK', 'ssh_auth_sock', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
+      'GIT_AUTHOR_DATE', 'TOKENIZERS_PARALLELISM']) {
+    assert.equal(c.broadWhy('env:' + name), null, name);
+  }
+  for (const name of ['GITHUB_TOKEN', 'OPENAI_API_KEY', 'DB_PASSWORD', 'AUTHORIZATION',
+      'CREDENTIALS_FILE']) {
+    assert.equal(c.broadWhy('env:' + name), 'a secret from your environment', name);
+  }
+});
+
 test('Windows drive roots, home folders and credential paths use native separators', () => {
   const c = setup(['broadWhy', 'pathNote', 'normalizeApprovalPath']);
   for (const path of ['C:\\', 'c:/', 'D:\\Users', 'C:\\Users\\Ada', '\\\\?\\C:\\USERS\\Ada']) {
