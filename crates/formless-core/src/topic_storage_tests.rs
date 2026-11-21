@@ -33,6 +33,51 @@ fn topic_main_identity_is_non_creating_and_persistent() {
 }
 
 #[test]
+fn topic_results_accept_sha1_and_sha256_revisions() {
+    for (revision, valid) in [
+        ("a".repeat(40), true),
+        ("b".repeat(64), true),
+        ("g".repeat(64), false),
+        ("a".repeat(39), false),
+        ("b".repeat(65), false),
+    ] {
+        let (store, _, _, request) = fixture();
+        let topic = store
+            .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+            .unwrap();
+        store.approve_topic(&topic.id).unwrap();
+        store.claim_topic_workflow(&topic.id).unwrap();
+        let token = "capability".repeat(8);
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Step",
+                StepAccess::Write,
+                HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                &token,
+                Path::new("/topic/build"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .report_topic_result(
+                    &attempt.id,
+                    &token,
+                    TopicAttemptStatus::Succeeded,
+                    "Done",
+                    &[TopicArtifact::GitRevision { revision }]
+                )
+                .is_ok(),
+            valid
+        );
+    }
+}
+
+#[test]
 fn topic_empty_features_fallback_approval_idempotence_and_rejection() {
     let (store, source, message, request) = fixture();
     let other = store

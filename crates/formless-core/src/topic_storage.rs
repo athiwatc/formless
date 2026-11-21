@@ -610,7 +610,7 @@ impl Store {
                     *path=file;
                 }
                 if let TopicArtifact::GitRevision {revision} = artifact {
-                    if revision.len()!=40 || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40-character SHA");}
+                    if !matches!(revision.len(),40|64) || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40- or 64-character SHA");}
                 }
             }
             let timestamp=now();
