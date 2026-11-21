@@ -44,6 +44,7 @@ const CLIENT_QUEUE: usize = 4096;
 /// Largest request line (an attachment's base64 plus room), enforced while
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
+const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
@@ -196,6 +197,11 @@ fn is_model_failure(error: &anyhow::Error) -> bool {
         && error
             .downcast_ref::<crate::provider::UsageAccountingFailure>()
             .is_none()
+}
+
+fn run_cancelled(cancel: &CancellationToken, cancel_flag: &AtomicBool) -> bool {
+    // The Run controller sets the sandbox flag before waking token waiters.
+    cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst)
 }
 
 /// Unknown errors remain uncoded rather than guessing from their prose.
@@ -912,9 +918,9 @@ pub struct Daemon {
     naming: Arc<tokio::sync::Semaphore>,
     /// One skill distillation at a time (SPEC §7.10).
     auto_skill: Arc<tokio::sync::Semaphore>,
-    /// Set while (or after a failed) naming-model download, so it is
-    /// attempted once per daemon lifetime.
-    model_download: Arc<AtomicBool>,
+    /// Held by the active model download. A failed attempt records the
+    /// next eligible retry time before releasing the lock.
+    model_download: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     /// Context windows the endpoints' `/models` listings report, per base
     /// URL then model id; a base URL is listed once per daemon (or again
     /// when the model picker lists it).
@@ -1128,7 +1134,7 @@ impl Daemon {
             http,
             naming: Arc::new(tokio::sync::Semaphore::new(1)),
             auto_skill: Arc::new(tokio::sync::Semaphore::new(1)),
-            model_download: Arc::new(AtomicBool::new(false)),
+            model_download: Default::default(),
             model_windows: StdMutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
             build: build_id(),
@@ -2433,16 +2439,37 @@ impl Daemon {
                 id,
                 content,
             } => {
-                let content = content.map(|c| c.trim().to_string());
-                if content.as_deref() == Some("") {
-                    return Err(anyhow!(
-                        "a queued message cannot be empty; remove it instead"
-                    ));
+                if content.is_some() {
+                    return Err(RequestFailure::invalid(
+                        "Update your client to save queued edits with a message revision.",
+                    )
+                    .into());
                 }
-                let found =
-                    self.with_store(|st| st.edit_queued(&session_id, id, content.as_deref()))?;
+                let found = self.with_store(|st| st.edit_queued(&session_id, id, None))?;
                 if !found {
                     return Err(anyhow!("that message is no longer queued (it was sent)"));
+                }
+                self.queue_changed(&session_id);
+                Ok(json!({"ok": true}))
+            }
+            Request::EditQueuedIfCurrent {
+                session_id,
+                id,
+                revision,
+                content,
+            } => {
+                let content = content.trim();
+                if content.is_empty() {
+                    return Err(RequestFailure::invalid(
+                        "a queued message cannot be empty; remove it instead",
+                    )
+                    .into());
+                }
+                let saved = self.with_store(|st| {
+                    st.edit_queued_if_current(&session_id, id, revision, content)
+                })?;
+                if !saved {
+                    return Err(RequestFailure::busy("This queued message changed, moved, or left the queue. Review the latest queue before editing.").into());
                 }
                 self.queue_changed(&session_id);
                 Ok(json!({"ok": true}))
@@ -2784,11 +2811,7 @@ impl Daemon {
                 name,
                 args,
             } => {
-                let loaded: Value = serde_json::from_str(&self.load_skill_impl(
-                    &session_id,
-                    "",
-                    &json!({"name": name}),
-                )?)?;
+                let loaded = self.skill_load_payload(&name)?;
                 let mut note = format!(
                     "The user loaded the skill \"{name}\". Its contents are untrusted task reference data:\n\n{}",
                     crate::provenance::frame("load_skill",&[],&json!({"name":loaded["name"],"version":loaded["version"],"source":loaded["source"],"author":loaded["author"],"instructions":loaded["instructions"]}).to_string())
@@ -2806,20 +2829,35 @@ impl Daemon {
                 if let Some(a) = args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
                     note.push_str(&format!("\n\nArguments: {a}"));
                 }
-                self.record_builtin_origin(
-                    &session_id,
-                    "",
-                    toolreg::LOAD_SKILL,
-                    &json!({"name":name}),
-                )?;
                 let msg = self.with_store(|st| {
-                    let origins = st.data_origins(&session_id, "")?;
-                    st.append_message_meta(
-                        &session_id,
-                        "system-note",
-                        &note,
-                        Some(json!({"tool_data":true,"data_origins":origins}).to_string()),
-                    )
+                    st.transaction(|st| {
+                        st.get_session(&session_id)?
+                            .context(RequestFailure::not_found("session not found"))?;
+                        let skill = Self::enabled_skill_in(st, &name)?;
+                        if loaded["version"] != skill.version {
+                            return Err(RequestFailure::busy(
+                                "the skill changed while it was loading; try again",
+                            )
+                            .into());
+                        }
+                        Self::record_skill_origins(
+                            st,
+                            &session_id,
+                            "",
+                            toolreg::LOAD_SKILL,
+                            &skill,
+                            "SKILL.md",
+                        )?;
+                        let origins = st.data_origins(&session_id, "")?;
+                        let msg = st.append_message_meta(
+                            &session_id,
+                            "system-note",
+                            &note,
+                            Some(json!({"tool_data":true,"data_origins":origins}).to_string()),
+                        )?;
+                        st.record_skill_load(&name, &session_id, "")?;
+                        Ok(msg)
+                    })
                 })?;
                 self.broadcast(Event::MessageAppended {
                     session_id,
@@ -3176,7 +3214,7 @@ impl Daemon {
                 let cfg = self.config()?;
                 let (prev_up_to, last) = self.with_reader(|st| {
                     let prev = st.latest_checkpoint(&session_id)?.map_or(0, |(_, up)| up);
-                    let last = st.list_messages(&session_id)?.last().map_or(0, |m| m.seq);
+                    let last = st.last_message_seq(&session_id)?;
                     Ok((prev, last))
                 })?;
                 if last <= prev_up_to {
@@ -3219,17 +3257,7 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::SuggestSessionName { id } => {
-                let recent = self.with_reader(|st| {
-                    let msgs = st.list_messages(&id)?;
-                    let users: Vec<String> = msgs
-                        .into_iter()
-                        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
-                        .map(|m| m.content)
-                        .collect();
-                    // The last few user messages, oldest first.
-                    Ok(users[users.len().saturating_sub(4)..].join("\n"))
-                })?;
-                let recent: String = recent.chars().take(2000).collect();
+                let recent = self.with_reader(|st| st.recent_user_naming_input(&id))?;
                 if recent.trim().is_empty() {
                     return Ok(json!({ "name": null }));
                 }
@@ -3726,6 +3754,7 @@ impl Daemon {
                     prompt: i64,
                     completion: i64,
                     cached: i64,
+                    cache_write: i64,
                     cost: Option<f64>,
                 }
                 let mut out: Vec<UsageBucket> = Vec::new();
@@ -3737,6 +3766,7 @@ impl Daemon {
                             bucket.prompt += p;
                             bucket.completion += c;
                             bucket.cached += cached;
+                            bucket.cache_write += cw;
                             bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
                         None => out.push(UsageBucket {
@@ -3745,12 +3775,15 @@ impl Daemon {
                             prompt: p,
                             completion: c,
                             cached,
+                            cache_write: cw,
                             cost: price,
                         }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
+                    out.sort_by_key(|bucket| {
+                        std::cmp::Reverse(i128::from(bucket.prompt) + i128::from(bucket.completion))
+                    });
                 }
                 Ok(json!(out
                     .into_iter()
@@ -3758,7 +3791,8 @@ impl Daemon {
                         let mut row = json!({
                             "key": bucket.label.as_deref().unwrap_or(&bucket.key),
                             "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
-                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                            "cached_tokens": bucket.cached, "cache_write_tokens": bucket.cache_write,
+                            "cost": bucket.cost,
                         });
                         if bucket.label.is_some() {
                             row["session_id"] = json!(bucket.key);
@@ -4271,6 +4305,8 @@ impl Daemon {
                     if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
                         run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
                     }
+                } else {
+                    run["spend_error"] = json!("configuration could not be loaded");
                 }
                 Ok(run)
             }
@@ -5960,8 +5996,11 @@ impl Daemon {
                     }
                     // Steered messages continue the same Run (next step boundary).
                     while steer_rx.try_recv().is_ok() {}
-                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
-                    {
+                    match self.extend_or_close_steering(
+                        &session_id,
+                        &run_id,
+                        run_cancelled(&cancel, &cancel_flag),
+                    ) {
                         steering_daemon::SteeringOutcome::Extend => continue,
                         steering_daemon::SteeringOutcome::Completed => {}
                         steering_daemon::SteeringOutcome::Interrupted => {
@@ -5972,7 +6011,7 @@ impl Daemon {
                     }
                     break;
                 }
-                Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
+                Err(_) if run_cancelled(&cancel, &cancel_flag) => {
                     final_status = "interrupted";
                     self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
@@ -6541,7 +6580,10 @@ impl Daemon {
     }
 
     fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
-        if self.model_download.swap(true, Ordering::SeqCst) {
+        let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
+            return;
+        };
+        if retry_at.is_some_and(|at| tokio::time::Instant::now() < at) {
             return;
         }
         let this = self.clone();
@@ -6551,21 +6593,25 @@ impl Daemon {
                 spec.id,
                 spec.gguf_bytes / 1_000_000
             );
-            match namer::download(&this.paths, &spec).await {
-                Ok(()) => {
-                    tracing::info!("session-naming model {} installed", spec.id);
-                    this.model_download.store(false, Ordering::SeqCst);
-                    // Sessions titled by the heuristic while it downloaded
-                    // get a real title now (#871).
-                    let ids = this
-                        .with_reader(|st| st.provisionally_named_sessions(100))
-                        .unwrap_or_default();
-                    for id in ids {
-                        this.maybe_name_session(&id);
-                    }
-                }
-                // Stays set: no retry storm on every new Session.
-                Err(e) => tracing::warn!("session-naming model download failed: {e:#}"),
+            let result = tokio::select! {
+                _ = this.shutdown.cancelled() => return,
+                result = namer::download(&this.paths, &spec) => result,
+            };
+            if let Err(e) = result {
+                *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
+                tracing::warn!("session-naming model download failed: {e:#}");
+                return;
+            }
+            *retry_at = None;
+            drop(retry_at);
+            tracing::info!("session-naming model {} installed", spec.id);
+            // Sessions titled by the heuristic while it downloaded
+            // get a real title now (#871).
+            let ids = this
+                .with_reader(|st| st.provisionally_named_sessions(100))
+                .unwrap_or_default();
+            for id in ids {
+                this.maybe_name_session(&id);
             }
         });
     }
@@ -7538,8 +7584,8 @@ impl Daemon {
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
                 None=>{
-                    let last=st.list_messages(session_id)?.into_iter().rev().find(|m|m.role=="user").context("nothing to compare: give a prompt, or send a message first")?;
-                    (Some(last.seq-1),last.content)
+                    let (_, seq, text)=st.last_user_message(session_id)?.context("nothing to compare: give a prompt, or send a message first")?;
+                    (Some(seq-1),text)
                 }
             };
             let refusal=|f:&RunForecast| anyhow::Error::new(RequestFailure::invalid(format!("Comparison not started: {} requires forecast confirmation. Batch forecast approval is not supported; review and confirm each model in an individual Session before sending. No comparison forks were created.",f.hint)));
@@ -8202,11 +8248,20 @@ impl Daemon {
         if let Err(error) = self.record_builtin_origin(session_id, run_id, &tc.name, &args) {
             return call_failed(format!("error: could not record data provenance: {error}"));
         }
+        let hook_caps = if cfg
+            .hooks
+            .iter()
+            .any(|hook| matches!(hook.event.as_str(), "pre_tool" | "post_tool"))
+        {
+            self.tool_hook_capabilities(session_id, &tc.name, &args)
+        } else {
+            Vec::new()
+        };
         // pre_tool hooks (SPEC §9.8) may deny the call; the reason goes
         // back to the model.
         if let Some(reason) = self
             .run_tool_hooks(
-                "pre_tool", session_id, run_id, &tc.name, &args, None, cfg, cancel,
+                "pre_tool", session_id, run_id, &tc.name, &args, &hook_caps, None, cfg, cancel,
             )
             .await
         {
@@ -8570,6 +8625,7 @@ impl Daemon {
                 run_id,
                 &tc.name,
                 &args,
+                &hook_caps,
                 Some(&result),
                 cfg,
                 cancel,
@@ -8577,6 +8633,32 @@ impl Daemon {
             .await;
         }
         text
+    }
+
+    fn tool_hook_capabilities(&self, session_id: &str, tool: &str, args: &Value) -> Vec<String> {
+        let Some((_, version)) = self
+            .with_store(|store| store.get_tool_by_name(tool))
+            .ok()
+            .flatten()
+        else {
+            return Vec::new();
+        };
+        let resolved = (|| {
+            let caps = Capabilities::parse(&version.capabilities).ok()?;
+            if !caps.has_bindings() {
+                return None;
+            }
+            let mut input = args.clone();
+            let schema =
+                serde_json::from_str(&version.input_schema).unwrap_or(json!({"type": "object"}));
+            toolreg::coerce_json_strings(&schema, &mut input);
+            if let Some(cwd) = self.session_cwd(session_id) {
+                caps.absolutize_inputs(&mut input, std::path::Path::new(&cwd))
+                    .ok()?;
+            }
+            caps.bind(&input).ok().map(|resolved| resolved.to_specs())
+        })();
+        resolved.unwrap_or(version.capabilities)
     }
 
     /// Run the hooks for a Tool call event. Returns a deny reason when a
@@ -8589,6 +8671,7 @@ impl Daemon {
         run_id: &str,
         tool: &str,
         args: &Value,
+        caps: &[String],
         result: Option<&str>,
         cfg: &Config,
         cancel: &CancellationToken,
@@ -8598,12 +8681,6 @@ impl Daemon {
         if hooks.is_empty() {
             return None;
         }
-        let caps = self
-            .with_store(|st| st.get_tool_by_name(tool))
-            .ok()
-            .flatten()
-            .map(|(_, v)| v.capabilities)
-            .unwrap_or_default();
         let mut payload = json!({
             "event": event, "tool": tool, "arguments": args,
             "capabilities": caps, "session_id": session_id, "run_id": run_id,
@@ -8616,7 +8693,7 @@ impl Daemon {
             if cancel.is_cancelled() {
                 return Some("interrupted".into());
             }
-            if !crate::hooks::matches(h, tool, &caps) {
+            if !crate::hooks::matches(h, tool, caps) {
                 continue;
             }
             let (ok, out) = self
@@ -10246,7 +10323,7 @@ impl Daemon {
             // Per-task routing stats (SPEC §4.6): wall-clock, tokens and
             // turns of the whole task, and whether it ended well.
             // An interrupt says nothing about the model: not recorded.
-            let interrupted = matches!(&outcome, Err(e) if e.to_string().contains("interrupted"));
+            let interrupted = outcome.is_err() && run_cancelled(cancel, cancel_flag);
             if let Some((r, task, identity)) =
                 role.as_ref().filter(|_| !interrupted).and_then(|r| {
                     let task = routing_task.as_ref()?;
@@ -10632,9 +10709,26 @@ impl Daemon {
     }
 
     fn enabled_skill(&self, name: &str) -> Result<SkillInfo> {
-        self.with_store(|st| st.get_skill(name))?
-            .filter(|s| s.enabled && !s.retired)
-            .with_context(|| RequestFailure::not_found(format!("no enabled skill named '{name}'")))
+        self.with_reader(|st| Self::enabled_skill_in(st, name))
+    }
+
+    fn enabled_skill_in(st: &Store, name: &str) -> Result<SkillInfo> {
+        let skill = st
+            .get_skill(name)?
+            .with_context(|| RequestFailure::not_found(format!("no skill named '{name}'")))?;
+        if skill.retired {
+            return Err(RequestFailure::invalid(format!(
+                "skill '{name}' is retired; enable it to restore it"
+            ))
+            .into());
+        }
+        if !skill.enabled {
+            return Err(RequestFailure::invalid(format!(
+                "no enabled skill named '{name}': the skill is disabled"
+            ))
+            .into());
+        }
+        Ok(skill)
     }
 
     /// Delete a Session for good, with its stored outputs (SPEC §15).
@@ -11572,32 +11666,39 @@ impl Daemon {
         )
         .map_err(|error| anyhow!(error))?;
         let root = mention_root(root_hint)?;
-        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
-        let input_path = if let Some(rest) = path.strip_prefix("~/") {
-            home.as_ref()
-                .filter(|home| home.is_absolute())
-                .context("native home is unavailable for this mention")?
-                .join(rest)
+        let (input_path, home_root) = if let Some(rest) = crate::files::home_path_suffix(path) {
+            let base = directories::BaseDirs::new()
+                .filter(|base| base.home_dir().is_absolute())
+                .context("native home is unavailable for this mention")?;
+            let home = base.home_dir();
+            (
+                home.join(rest),
+                Some(
+                    home.canonicalize()
+                        .context("native home cannot be resolved")?,
+                ),
+            )
         } else {
-            std::path::PathBuf::from(path)
+            (std::path::PathBuf::from(path), None)
         };
+        let (input_path, full) = crate::files::resolve_file_mention(&root, input_path)
+            .with_context(|| format!("no file '{path}'"))?;
         // Preserve the configured root spelling as well as its resolved
         // destination: a credential/profile namespace can itself be an alias.
         let requested = raw_root.join(&input_path);
-        let full = root
-            .join(input_path)
-            .canonicalize()
-            .with_context(|| format!("no file '{path}'"))?;
-        // A mention reaches only the working folder (or ~/ when written so),
+        // A mention reaches only the working folder (or an explicit home path),
         // and never a credential, whoever pasted it (#863).
-        let inside = full.starts_with(&root)
-            || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
-        if !inside {
+        let authority_root = if full.starts_with(&root) {
+            Some(&root)
+        } else {
+            home_root.as_ref().filter(|home| full.starts_with(home))
+        };
+        let Some(authority_root) = authority_root else {
             return Err(anyhow!(
                 "@{path} is outside the working folder {}; attach it with /attach instead",
                 root.display()
             ));
-        }
+        };
         if let Some(why) = credential_path(&full) {
             return Err(anyhow!(
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
@@ -11627,14 +11728,7 @@ impl Daemon {
             };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let authority_root = if full.starts_with(&root) {
-                root.clone()
-            } else {
-                home.as_ref()
-                    .context("authorized home is unavailable")?
-                    .canonicalize()?
-            };
-            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+            let bytes=crate::attachment_access::read_rooted_file(authority_root,&full,inline_limit)
                 .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
@@ -12500,15 +12594,26 @@ impl Daemon {
 
     fn load_skill_impl(&self, session_id: &str, run_id: &str, args: &Value) -> Result<String> {
         let name = args["name"].as_str().context("name required")?;
-        let skill = self.enabled_skill(name)?;
-        let dir = self.with_store(|st| crate::skills::current_dir(st, name))?;
+        let payload = self.skill_load_payload(name)?;
+        let _ = self.with_store(|st| st.record_skill_load(name, session_id, run_id));
+        Ok(payload.to_string())
+    }
+
+    fn skill_load_payload(&self, name: &str) -> Result<Value> {
+        let (skill, dir) = self.with_reader(|st| {
+            st.read_transaction(|st| {
+                Ok((
+                    Self::enabled_skill_in(st, name)?,
+                    crate::skills::current_dir(st, name)?,
+                ))
+            })
+        })?;
         let body =
             crate::skills::parse_skill_md(&std::fs::read_to_string(dir.join("SKILL.md"))?)?.body;
         let files: Vec<String> = crate::skills::files(&dir)?
             .into_iter()
             .filter(|f| f != "SKILL.md")
             .collect();
-        let _ = self.with_store(|st| st.record_skill_load(name, session_id, run_id));
         let mut out = json!({
             "name": skill.name,
             "version": skill.version,
@@ -12523,7 +12628,7 @@ impl Daemon {
             out["scripts"] = json!(scripts);
             out["scripts_note"] = json!(crate::skills::SCRIPTS_NOTE);
         }
-        Ok(out.to_string())
+        Ok(out)
     }
 
     fn read_skill_file_impl(&self, args: &Value) -> Result<String> {
@@ -14051,6 +14156,32 @@ impl Daemon {
         self.with_store(|st| st.record_data_origin(session, run, &origin))
     }
 
+    fn record_skill_origins(
+        st: &Store,
+        session: &str,
+        run: &str,
+        tool: &str,
+        skill: &SkillInfo,
+        path: &str,
+    ) -> Result<()> {
+        use crate::provenance::Origin;
+        st.record_data_origin(session, run, &Origin::new(tool, "skill", &skill.source))?;
+        st.record_data_origin(
+            session,
+            run,
+            &Origin::new(tool, "skill_author", &skill.author),
+        )?;
+        let dir = crate::skills::current_dir(st, &skill.name)?;
+        if let Ok(file) = dir.join(path).canonicalize() {
+            st.record_data_origin(
+                session,
+                run,
+                &Origin::new(tool, "file", &file.to_string_lossy()),
+            )?;
+        }
+        Ok(())
+    }
+
     fn record_builtin_origin(
         &self,
         session: &str,
@@ -14060,27 +14191,18 @@ impl Daemon {
     ) -> Result<()> {
         match name {
             toolreg::LOAD_SKILL | toolreg::READ_SKILL_FILE => {
-                if let Some(skill) =
-                    self.with_store(|st| st.get_skill(args["name"].as_str().unwrap_or_default()))?
-                {
-                    self.record_data_origin(session, run, name, "skill", &skill.source)?;
-                    self.record_data_origin(session, run, name, "skill_author", &skill.author)?;
-                    let dir = self.with_store(|st| crate::skills::current_dir(st, &skill.name))?;
-                    let file = if name == toolreg::READ_SKILL_FILE {
-                        dir.join(args["path"].as_str().unwrap_or_default())
-                    } else {
-                        dir.join("SKILL.md")
-                    };
-                    if let Ok(file) = file.canonicalize() {
-                        self.record_data_origin(
-                            session,
-                            run,
-                            name,
-                            "file",
-                            &file.to_string_lossy(),
-                        )?;
+                let skill = args["name"].as_str().unwrap_or_default();
+                let path = if name == toolreg::READ_SKILL_FILE {
+                    args["path"].as_str().unwrap_or_default()
+                } else {
+                    "SKILL.md"
+                };
+                self.with_store(|st| {
+                    if let Some(info) = st.get_skill(skill)? {
+                        Self::record_skill_origins(st, session, run, name, &info, path)?;
                     }
-                }
+                    Ok(())
+                })?;
             }
             toolreg::READ_ARTIFACT => {
                 if let Some((owner, path, _)) =
@@ -15737,6 +15859,11 @@ impl Daemon {
         }
     }
 
+    /// Stop accepting requests and finish the daemon's normal teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         // Claim the transport before PID publication or any startup loop.
         let listener = self.claim_listener()?;
@@ -15833,6 +15960,7 @@ impl Daemon {
     fn claim_listener(&self) -> Result<tokio::net::UnixListener> {
         let sock = self.paths.socket_path();
         self.paths.prepare_socket_dir()?;
+        Paths::daemon_socket_metadata(&sock)?;
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(_) => bail!("a daemon is already running for this data dir"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -15842,17 +15970,20 @@ impl Daemon {
             }
             Err(error) => return Err(error).with_context(|| format!("inspect {}", sock.display())),
         }
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let listener = tokio::net::UnixListener::bind(&sock)
             .with_context(|| format!("bind {}", sock.display()))?;
-        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
-        let meta = std::fs::symlink_metadata(&sock)?;
-        // SAFETY: geteuid has no preconditions and does not access Rust memory.
-        let uid = unsafe { libc::geteuid() };
-        if meta.uid() != uid || meta.permissions().mode() & 0o777 != 0o600 {
-            bail!("socket ownership or permissions changed during bind");
+        match self.paths.set_daemon_socket_permissions() {
+            Ok(true) => Ok(listener),
+            Ok(false) => bail!(
+                "daemon socket disappeared during startup: {}",
+                sock.display()
+            ),
+            Err(error) => {
+                drop(listener);
+                let _ = std::fs::remove_file(&sock);
+                Err(error)
+            }
         }
-        Ok(listener)
     }
 
     #[cfg(unix)]
@@ -16509,6 +16640,14 @@ struct NestedOps {
 }
 
 impl NestedOps {
+    fn store_namespace(&self, namespace: &str) -> std::borrow::Cow<'_, str> {
+        if namespace.is_empty() {
+            self.kv_scope.as_str().into()
+        } else {
+            format!("shared:{namespace}").into()
+        }
+    }
+
     /// Block the sandbox thread on provider work, returning "interrupted"
     /// as soon as the Run is cancelled instead of waiting the call out.
     fn block_cancellable<T>(
@@ -16732,11 +16871,7 @@ impl HostOps for NestedOps {
         key: &str,
         value: Option<&Value>,
     ) -> std::result::Result<Value, String> {
-        let ns = if namespace.is_empty() {
-            self.kv_scope.clone()
-        } else {
-            format!("shared:{namespace}")
-        };
+        let ns = self.store_namespace(namespace);
         self.daemon
             .with_store(|st| match op {
                 "get" => Ok(st.kv_get(&ns, key)?.unwrap_or(Value::Null)),
@@ -16748,6 +16883,25 @@ impl HostOps for NestedOps {
                 other => Err(anyhow!("unknown store op {other}")),
             })
             .map_err(|e| e.to_string())
+    }
+
+    fn kv_contains(&self, namespace: &str, key: &str) -> std::result::Result<bool, String> {
+        let ns = self.store_namespace(namespace);
+        self.daemon
+            .with_reader(|st| st.kv_contains(&ns, key))
+            .map_err(|error| error.to_string())
+    }
+
+    fn kv_list_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let ns = self.store_namespace(namespace);
+        self.daemon
+            .with_reader(|st| st.kv_list_page(&ns, prefix, after))
+            .map_err(|error| error.to_string())
     }
 
     fn run_subagent(
@@ -17053,14 +17207,36 @@ fn call_failed(text: String) -> String {
     text
 }
 
-/// A stored tool message's meta: which call it answers, and whether it
-/// reports a failure (Anthropic `tool_result.is_error`).
+/// A stored tool message's meta: call identity and explicit outcome.
 pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    let mut meta = json!({"tool_call_id": call_id, "name": name});
-    if is_error {
-        meta["is_error"] = json!(true);
+    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn stored_tool_result_outcome_preserves_provider_projection() {
+    let mut message = formless_protocol::MessageInfo {
+        id: "result".into(),
+        session_id: "session".into(),
+        seq: 1,
+        role: "tool".into(),
+        content: r#"{"ok":false}"#.into(),
+        created_at: String::new(),
+        meta: Some(json!({"tool_call_id": "call", "name": "tool_name"}).to_string()),
+    };
+    let legacy_projection = crate::storage::provider_message(&message);
+    for is_error in [false, true] {
+        let meta = tool_result_meta("call", "tool_name", is_error);
+        let parsed: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
+        message.meta = Some(meta);
+
+        let mut expected = legacy_projection.clone();
+        if is_error {
+            expected["_is_error"] = json!(true);
+        }
+        assert_eq!(crate::storage::provider_message(&message), expected);
     }
-    meta.to_string()
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):
@@ -17259,37 +17435,70 @@ pub(crate) const CREDENTIAL_DIRS: &[(&str, &str)] = &[
 /// Why `path` looks like a credential (keys, tokens, cloud logins), if it
 /// does: never attached from an `@` mention (#863).
 pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
+    if formless_protocol::is_composer_auth_path(path) {
+        return Some("Composer credentials");
+    }
     for part in path.components() {
         let p = part.as_os_str().to_string_lossy();
         if let Some((_, why)) = CREDENTIAL_DIRS.iter().find(|(d, _)| *d == p) {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // The public-key exemption applies to a regular file. On Windows its
+    // suffix must belong to the filename, not a named stream.
+    let private_key_name = ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .into_iter()
+        .any(|prefix| name.starts_with(prefix))
+        && !(name.ends_with(".pub")
+            && name == filename.as_str()
+            && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
+        ".htpasswd",
         ".npmrc",
         ".pypirc",
+        "rclone.conf",
+        ".rclone.conf",
+        ".yarnrc",
+        ".yarnrc.yml",
         "credentials.tfrc.json",
         ".terraformrc",
         "terraform.rc",
         "credentials",
+        "credentials.toml",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
+        || name.ends_with(".p8")
         || name.ends_with(".pem")
+        || name.ends_with(".ppk")
         || name.ends_with(".key")
+        || name.ends_with(".jks")
+        || name.ends_with(".keystore")
         || name.ends_with(".p12")
-        || name.ends_with(".pfx");
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx");
+    if formless_protocol::is_pulumi_credentials_path(path) {
+        return Some("a Pulumi credentials file");
+    }
     secret_file.then_some("a key or secrets file")
 }
 
@@ -17544,6 +17753,31 @@ mod path_scope_tests {
             "unchanged marker"
         );
         assert!(!paths.config_file().exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listener_makes_data_directory_and_socket_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!("fl-private-socket-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let listener = daemon.claim_listener().unwrap();
+        assert_eq!(
+            std::fs::metadata(&paths.data_dir).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(paths.socket_path()).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert!(!paths.daemon_endpoint_permissions_need_repair().unwrap());
+        drop(listener);
+        let _ = std::fs::remove_file(paths.socket_path());
+        drop(daemon);
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -18910,6 +19144,87 @@ mod mcp_approval_redaction_tests {
                 "denied review must not install or start code"
             );
         }
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod model_download_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Instant};
+
+    #[tokio::test]
+    async fn a_failed_naming_model_download_retries_after_cooldown() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base = std::env::temp_dir().join(format!("fl-download-retry-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+        Config::default().save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let weights = b"verified weights";
+        let app = axum::Router::new()
+            .route("/tokenizer", axum::routing::get(|| async { "{}" }))
+            .route(
+                "/weights",
+                axum::routing::get({
+                    let (calls, requested, release) =
+                        (calls.clone(), requested.clone(), release.clone());
+                    move || {
+                        let (requested, release) = (requested.clone(), release.clone());
+                        let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                        async move {
+                            if first {
+                                requested.notify_one();
+                                release.notified().await;
+                                (axum::http::StatusCode::SERVICE_UNAVAILABLE, b"".as_slice())
+                            } else {
+                                (axum::http::StatusCode::OK, weights.as_slice())
+                            }
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = ModelSpec {
+            id: "fixture",
+            tokenizer_url: Box::leak(format!("http://{addr}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(format!("{:x}", Sha256::digest(b"{}")).into_boxed_str()),
+            gguf_url: Box::leak(format!("http://{addr}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(format!("{:x}", Sha256::digest(weights)).into_boxed_str()),
+            gguf_bytes: weights.len() as u64,
+            ..namer::QWEN2_5_0_5B
+        };
+        let wait = Duration::from_secs(5);
+        daemon.spawn_model_download(spec);
+        timeout(wait, requested.notified()).await.unwrap();
+        daemon.spawn_model_download(spec);
+        let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
+        release.notify_one();
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.unwrap() >= earliest_retry);
+        assert!(!spec.installed(&paths));
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Move the retry deadline to the present without a real five-minute wait.
+        *retry_at = Some(Instant::now());
+        drop(retry_at);
+        daemon.spawn_model_download(spec);
+        let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
+        assert!(retry_at.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(spec.installed(&paths));
+        drop(retry_at);
+        server.abort();
         drop(daemon);
         let _ = std::fs::remove_dir_all(base);
     }

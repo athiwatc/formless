@@ -22,14 +22,12 @@ serde_json.workspace = true
 # Already locked; parse editor argv without invoking an implicit shell.
 shlex = "2"
 sha2.workspace = true
+tokio.workspace = true
 unicode-width = "0.2"
 unicode-segmentation.workspace = true
 # Already locked transitively; native file URLs encode Windows prefixes and reserved characters.
 url = "2"
 uuid.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Asking the terminal for its background colour (OSC 11) at start (#883).
@@ -38,6 +36,3 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # Reuse the daemon's current-user/SYSTEM security descriptor for private drafts.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
-# Overlapped duplex daemon pipe on a worker-owned runtime (#1789). Already
-# locked (Tokio 1.54.0, Mio 1.2.4) and already a dev-dependency here.
-tokio.workspace = true

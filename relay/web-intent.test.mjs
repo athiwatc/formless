@@ -40,6 +40,33 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
+test('queued edits submit the revision opened by the editor', () => {
+  const notices = [];
+  let rendered, dialog, input;
+  const c = setup(['renderQueue', 'editQueuedMessage'], {
+    sessionSeq: 1,
+    tr: text => text, h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+    toast: notice => notices.push(notice), note: notice => notices.push(notice),
+    ask: options => { dialog = options; input = options.body.children[0]; },
+  });
+  c.$('queue').replaceChildren = (...tree) => { rendered = tree; };
+  const edit = () => rendered[1].children[0][0].children.find(node => node?.attrs?.title === 'Edit').attrs.onclick();
+  c.S.queued = [{ id: 7, revision: 12, content: 'original' }];
+  c.renderQueue();
+  edit();
+  input.value = 'my edit';
+  assert.deepEqual({ ...dialog.saveRequest() }, { type: 'edit_queued_if_current', session_id: 'A', id: 7, revision: 12, content: 'my edit' });
+  input.value = ' ';
+  assert.throws(() => dialog.saveRequest(), /nonempty/);
+  input.value = 'my edit';
+  c.S.queued = [{ id: 7, revision: 13, content: 'original' }];
+  assert.equal(dialog.saveRequest(), null);
+  assert.match(notices.pop(), /changed/);
+  c.S.queued = [{ id: 7, content: 'legacy' }];
+  c.renderQueue();
+  edit();
+  assert.match(notices.pop(), /Update the daemon/);
+});
 test('wrapped file mentions attach and highlight the same paths without matching email addresses', () => {
   const c = setup(['mentionMatches', 'mentionsIn', 'withMentions', 'mentionAtCaret'], {
     h: (tag, attrs, text) => ({ tag, attrs, text }),
@@ -191,6 +218,29 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
   assert.equal(c.$('input').value, 'B draft');
   assert.equal(vm.runInContext('attachmentDrafts.A', c), 'please read @file');
 });
+test('line citations queue files for review and report missing citations', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit', 'mentionMatches', 'mentionsIn'], {
+    isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    note: (message, failed) => notes.push({ message, failed }),
+    request: async (request) => {
+      calls.push(request);
+      if (request.path === 'src/main.rs:42:8') return { name: 'main.rs' };
+      throw new Error("no file '" + request.path + "'");
+    },
+  });
+  vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+  const draft = 'Compare @src/main.rs:42:8 with @missing.rs:4 and @someone';
+  c.$('input').value = draft;
+  await c.submit(false);
+  assert.deepEqual(calls.map((request) => request.path), ['src/main.rs:42:8', 'missing.rs:4', 'someone']);
+  assert.equal(c.S.chips.A[0].name, 'main.rs');
+  assert.equal(c.$('input').value, draft);
+  assert.deepEqual(notes.filter((entry) => entry.failed).map((entry) => entry.message), [
+    "cannot attach @missing.rs:4: no file 'missing.rs:4'",
+  ]);
+});
+
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
@@ -204,9 +254,9 @@ test('send completion clears only the original Session attachments', async () =>
 test('tool, search and audit ignore out-of-order resolutions', async () => {
   for (const name of ['selectTool', 'search', 'loadAudit']) {
     const replies = [deferred(), deferred()]; let call = 0; const renders = [];
-    const c = setup([name], { act: () => replies[call++].promise, request: () => replies[call++].promise,
+    const c = setup(name === 'loadAudit' ? ['ownsAudit', name] : [name], { act: () => replies[call++].promise, request: () => replies[call++].promise,
       renderView() {}, renderSearch: (...x) => renders.push(x) });
-    vm.runInContext('let toolSeq = 0, searchSeq = 0, auditSeq = 0;', c);
+    vm.runInContext('let toolSeq = 0, searchSeq = 0, auditRequest = null, auditOwner = null;', c);
     let a, b;
     if (name === 'loadAudit') { c.S.auditFilter = 'A'; a = c.loadAudit(false); c.S.auditFilter = 'B'; b = c.loadAudit(false); }
     else { a = c[name]('A'); b = c[name]('B'); }
@@ -1083,4 +1133,13 @@ test('Session selection pruning reads each loaded ID once for a large selection'
   c.renderSessions();
   assert.equal(c.S.marked.size,4000);
   assert.equal(reads,4000,'one loaded-ID index, independent of selected-ID count');
+});
+test('Pulumi credentials get an approval warning only under the Pulumi directory', () => {
+  const c = setup(['pathNote', 'normalizeApprovalPath']);
+  for (const path of ['/work/.PuLuMi/nested/Credentials.json', 'C:\\Users\\fixture\\.pulumi\\credentials.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [true, 'holds Pulumi credentials']);
+  }
+  for (const path of ['/work/credentials.json', '/work/.pulumi/stacks/dev.json']) {
+    assert.deepEqual(Array.from(c.pathNote('fs:read:' + path, '/work')), [false, 'inside the working folder']);
+  }
 });

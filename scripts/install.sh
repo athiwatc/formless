@@ -73,6 +73,24 @@ quote_path() {
   printf "'"
 }
 
+# Compare real directories from a colon-delimited discovery path. The suffix
+# converts an XDG data directory to the shell's vendor directory.
+completion_path_contains() (
+  search_dirs="$2"
+  suffix="$3"
+  while [ -n "$search_dirs" ]; do
+    search_dir="${search_dirs%%:*}"
+    if [ -n "$search_dir" ] && [ "$1" -ef "$search_dir$suffix" ]; then
+      exit 0
+    fi
+    case "$search_dirs" in
+      *:*) search_dirs="${search_dirs#*:}" ;;
+      *) break ;;
+    esac
+  done
+  exit 1
+)
+
 install_guidance() {
   installed_bin="$PREFIX/bin"
   case ":${PATH:-}:" in
@@ -105,6 +123,8 @@ install_guidance() {
       ;;
   esac
   guidance_shell="${SHELL:-sh}"
+  data_home="${XDG_DATA_HOME:-${HOME:-~}/.local/share}"
+  data_dirs="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
   case "${guidance_shell##*/}" in
     zsh)
       completion_dir="$PREFIX/share/zsh/site-functions"
@@ -121,8 +141,27 @@ install_guidance() {
       fi
       ;;
     bash)
-      if [ "$PREFIX" != "${HOME:-}/.local" ]; then
-        printf '\nBash completions are in %s/share; bash-completion discovers XDG_DATA_HOME/XDG_DATA_DIRS. Include this share directory there to load them.\n' "$PREFIX"
+      completion_dir="$PREFIX/share/bash-completion"
+      bash_user_match=false
+      if [ -n "${BASH_COMPLETION_USER_DIR:-}" ]; then
+        if completion_path_contains "$completion_dir" "$BASH_COMPLETION_USER_DIR" ''; then
+          bash_user_match=true
+        fi
+      elif [ "$completion_dir" -ef "$data_home/bash-completion" ]; then
+        bash_user_match=true
+      fi
+      if [ -f "$completion_dir/completions/formless" ] &&
+          ! "$bash_user_match" &&
+          ! completion_path_contains "$completion_dir" "$data_dirs" /bash-completion; then
+        printf '\nBash completions are in %s. If they are unavailable, add that directory to BASH_COMPLETION_USER_DIR or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "$PREFIX"
+      fi
+      ;;
+    fish)
+      completion_dir="$PREFIX/share/fish/vendor_completions.d"
+      if [ -f "$completion_dir/formless.fish" ] &&
+          ! [ "$completion_dir" -ef "$data_home/fish/vendor_completions.d" ] &&
+          ! completion_path_contains "$completion_dir" "$data_dirs" /fish/vendor_completions.d; then
+        printf '\nFish completions are in %s/formless.fish. If they are unavailable, link that file into %s/fish/completions or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "${XDG_CONFIG_HOME:-${HOME:-~}/.config}" "$PREFIX"
       fi
       ;;
   esac
@@ -195,6 +234,7 @@ case "${FORMLESS_TARGET:-$os/$arch}" in
   Darwin/arm64) target="aarch64-apple-darwin" ;;
   Darwin/x86_64) target="x86_64-apple-darwin" ;;
   Linux/x86_64) target="x86_64-unknown-linux-gnu" ;;
+  Linux/aarch64 | Linux/arm64) target="aarch64-unknown-linux-gnu" ;;
   */*) die "unsupported platform $os/$arch; build from source with FORMLESS_FROM_SOURCE=1 (requires Rust/cargo and a C compiler/linker; see README.md source-build requirements)" ;;
   *) target="$FORMLESS_TARGET" ;;
 esac

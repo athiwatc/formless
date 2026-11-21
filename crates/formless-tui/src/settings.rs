@@ -579,6 +579,29 @@ pub enum FormKind {
     McpCatalog,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct FormViewport {
+    pub top: usize,
+    pub page: usize,
+    pub max_top: usize,
+    pub inspecting: bool,
+}
+
+impl FormViewport {
+    pub fn page(&mut self, down: bool) {
+        if self.max_top == 0 {
+            return;
+        }
+        let step = self.page.saturating_sub(1).max(1);
+        self.top = if down {
+            self.top.saturating_add(step).min(self.max_top)
+        } else {
+            self.top.saturating_sub(step)
+        };
+        self.inspecting = true;
+    }
+}
+
 /// Add or edit a provider or Role.
 pub struct Form {
     pub kind: FormKind,
@@ -589,6 +612,7 @@ pub struct Form {
     pub fields: Vec<Field>,
     pub idx: usize,
     pub error: Option<String>,
+    pub(super) viewport: std::cell::Cell<FormViewport>,
 }
 
 fn field(label: &'static str, value: &str, masked: bool, hint: &'static str) -> Field {
@@ -684,6 +708,7 @@ impl Form {
             ],
             idx: if existing.is_some() { 1 } else { 0 },
             error: None,
+            viewport: Default::default(),
         }
     }
 
@@ -733,6 +758,7 @@ impl Form {
             ],
             idx: if name.is_some() { 1 } else { 0 },
             error: None,
+            viewport: Default::default(),
         }
     }
 
@@ -782,6 +808,7 @@ impl Form {
             fields,
             idx: 1,
             error: None,
+            viewport: Default::default(),
         }
     }
 

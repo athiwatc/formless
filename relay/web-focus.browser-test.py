@@ -73,6 +73,12 @@ def expose_script(route):
     const reply817 = async (req) => {
       fixture817.calls.push(req.type);
       if(req.type==='get_artifact') {
+        if (fixture817.pagedArtifact) {
+          fixture817.pagedArtifact.offsets.push(req.offset);
+          const chunks = {0: ['Preview ', 8], 8: ['ไทย ', 12], 12: ['end', 15]};
+          const [text, end] = chunks[req.offset];
+          return {text, end, total_chars:15, bytes:21};
+        }
         const value={text:'Local artifact output',end:21,total_chars:21,bytes:21};
         if(fixture817.deferredArtifact) return new Promise(resolve=>fixture817.finishArtifact=()=>resolve(value));
         return value;
@@ -237,6 +243,31 @@ def click_away_checks(page):
     page.evaluate("""()=>{const d=__focus817;d.S.running.delete(d.S.current);d.S.streaming='';d.S.view='tools';d.renderChrome();d.renderHistory();document.querySelector('#focus-click-away').remove();document.querySelector('#toasts').replaceChildren();}""")
 
 
+def artifact_download_checks(page):
+    page.evaluate('''() => {
+      const fixture = __focus817.pagedArtifact = {offsets: [], connectedClicks: 0};
+      document.body.addEventListener('click', event => {
+        if (event.target.matches('a[download="artifact-00000000.txt"]') && event.target.isConnected)
+          fixture.connectedClicks++;
+      });
+    }''')
+    invoke(page, "__focus817.openArtifact('00000000-0000-0000-0000-000000000000')")
+    viewer = page.get_by_role('dialog', name='Full output')
+    with page.expect_download() as saved:
+        viewer.get_by_role('button', name='Download').click()
+    check(saved.value.suggested_filename == 'artifact-00000000.txt', 'artifact has its expected download filename')
+    check(saved.value.path().read_text(encoding='utf-8') == 'Preview ไทย end', 'artifact download contains all pages')
+    check(page.evaluate('__focus817.pagedArtifact.connectedClicks') == 1, 'artifact download clicks an attached link')
+    check(viewer.locator('pre').text_content() == 'Preview ', 'downloading leaves the artifact preview unchanged')
+    check(viewer.get_by_text('8 of 15 characters').is_visible(), 'downloading leaves the preview count unchanged')
+    viewer.get_by_role('button', name='Load more').click()
+    viewer.get_by_text('12 of 15 characters').wait_for(state='visible')
+    check(viewer.locator('pre').text_content() == 'Preview ไทย ', 'Load more resumes from the displayed preview')
+    check(page.evaluate('__focus817.pagedArtifact.offsets') == [0, 8, 12, 8], 'download and preview request their own offsets')
+    close_and_return(page,'.backdrop:has(.viewer)','#fixture-tools-open','downloaded artifact viewer')
+    page.evaluate('__focus817.pagedArtifact=null')
+
+
 def run():
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(QuietHandler, directory=str(ROOT / 'web')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -302,6 +333,8 @@ def run():
             page.evaluate('__focus817.finishArtifact();__focus817.deferredArtifact=false')
             page.wait_for_selector('.viewer')
             close_and_return(page,'.backdrop:has(.viewer)','#fixture-tools-open','deferred viewer')
+
+            artifact_download_checks(page)
 
             # A picker closed while list_models is pending must stay closed when
             # the reply eventually arrives, without stealing the restored focus.

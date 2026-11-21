@@ -6,6 +6,8 @@ use formless_protocol::{
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -69,6 +71,10 @@ mod attachment_expiry;
 #[path = "recap_storage.rs"]
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
+
+#[path = "forecast_report_storage.rs"]
+mod forecast_report_storage;
+pub(crate) use forecast_report_storage::ForecastMetricInput;
 
 pub struct Store {
     conn: Connection,
@@ -223,9 +229,7 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
 
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
-    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id)
     FROM runs WHERE id=?1";
 const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
 const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
@@ -265,6 +269,90 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
         if start > 0 { "…" } else { "" },
         core,
         if end < chars.len() { "…" } else { "" }
+    )
+}
+
+/// For multi-term searches, fit as many distinct word-prefix matches as
+/// possible into 100 original characters, plus ellipses. Match from the
+/// start of alphanumeric words with the app's accent-insensitive folding.
+/// Combining marks stay with the preceding word. SQLite still decides which
+/// rows match, using its own tokenizer.
+fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
+    const BUDGET: usize = 100;
+    let max_term_bytes = terms.keys().map(String::len).max().unwrap_or(0);
+    let mut counts = vec![0; terms.len()];
+    let mut covered = 0;
+    let mut window: VecDeque<(usize, usize, Vec<usize>)> = VecDeque::new();
+    let mut folded = String::new();
+    let mut best = ((0, Reverse(0), Reverse(0)), 0, 0, 0);
+    let mut word_start = None;
+    let chars = content.char_indices().chain([(content.len(), '\0')]);
+    for (end_char, (end_byte, ch)) in chars.enumerate() {
+        if ch.is_alphanumeric() {
+            word_start.get_or_insert((end_char, end_byte));
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(ch) {
+            continue;
+        }
+        let Some((start_char, start_byte)) = word_start.take() else {
+            continue;
+        };
+        if end_char - start_char > BUDGET {
+            continue;
+        }
+        folded.clear();
+        let mut matched = Vec::new();
+        for key in crate::fuzzy::fold_chars(&content[start_byte..end_byte]) {
+            if folded.len() + key.len_utf8() > max_term_bytes {
+                break;
+            }
+            folded.push(key);
+            if let Some(&id) = terms.get(&folded) {
+                matched.push(id);
+                covered += usize::from(counts[id] == 0);
+                counts[id] += 1;
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        window.push_back((start_char, start_byte, matched));
+        // Remove out-of-budget words and any redundant leading matches to
+        // find the shortest span with this coverage ending at this word.
+        while window.front().is_some_and(|(start, _, ids)| {
+            end_char - start > BUDGET || ids.iter().all(|&id| counts[id] > 1)
+        }) {
+            let (_, _, ids) = window.pop_front().unwrap();
+            for id in ids {
+                counts[id] -= 1;
+                covered -= usize::from(counts[id] == 0);
+            }
+        }
+        if let Some(&(start, from, _)) = window.front() {
+            let width = end_char - start;
+            let score = (covered, Reverse(width), Reverse(start));
+            if score > best.0 {
+                best = (score, from, end_byte, width);
+            }
+        }
+    }
+    let (_, from, to, width) = best;
+    let mut start = from;
+    let mut after = BUDGET - width;
+    for (index, _) in content[..from].char_indices().rev().take(after.min(40)) {
+        start = index;
+        after -= 1;
+    }
+    let end = content[to..]
+        .char_indices()
+        .nth(after)
+        .map_or(content.len(), |(index, _)| to + index);
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        content[start..end].replace('\n', " "),
+        if end < content.len() { "…" } else { "" }
     )
 }
 
@@ -419,7 +507,7 @@ pub(crate) struct SkillSummary {
 /// Columns for [`Store::row_skill`]: the row plus usage metrics.
 const SKILL_COLS: &str = "s.*,
   (SELECT COUNT(*) FROM skill_loads l WHERE l.skill_id=s.id) AS loads,
-  (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l WHERE l.skill_id=s.id AND l.run_id IS NOT NULL) AS runs,
+  (SELECT COUNT(DISTINCT NULLIF(l.run_id,'')) FROM skill_loads l WHERE l.skill_id=s.id) AS runs,
   (SELECT COUNT(DISTINCT l.run_id) FROM skill_loads l JOIN runs r ON r.id=l.run_id
      WHERE l.skill_id=s.id AND r.status='completed' AND r.followup='') AS runs_completed";
 
@@ -544,6 +632,157 @@ impl ModelStat {
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
 
+// These indexes are rebuilt from existing rows and change no record layout.
+// Install them on writable opens without accepting a new schema stamp.
+const DERIVED_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
+    CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);
+    CREATE INDEX IF NOT EXISTS idx_inv_replay_recent ON invocations(tool_id)
+        WHERE status IN ('success','failure');
+";
+
+const LATEST_CHECKPOINT_SQL: &str = "SELECT id, summary, up_to_seq FROM checkpoints
+     WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1";
+
+fn usage_by_model_sql(bounded: bool) -> String {
+    let filter = if bounded {
+        "WHERE created_at >= ?1"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens)
+         FROM run_usage {filter} GROUP BY model"
+    )
+}
+
+fn grouped_usage_sql(by: &str, bounded: bool) -> String {
+    let key = match by {
+        "model" => "u.model",
+        "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
+        "purpose" => "u.source",
+        "session" => "u.session_id",
+        "role" => {
+            "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')"
+        }
+        _ => "substr(u.created_at, 1, 10)",
+    };
+    let (label, order) = if by == "session" {
+        (
+            "COALESCE((SELECT s.name FROM sessions s WHERE s.id=u.session_id), u.session_id)",
+            // Keep alphabetical labels on token-count ties. The ID
+            // makes buckets with an identical label stay contiguous.
+            "10, 1",
+        )
+    } else {
+        ("NULL", "1")
+    };
+    let filter = if bounded {
+        "WHERE u.created_at >= ?1"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
+           SUM(u.cached_tokens), SUM(u.cache_write_tokens),
+           CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
+         FROM run_usage u
+         {filter}
+         GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn checkpoint_and_usage_range_queries_use_their_indexes() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("fixture".into())).unwrap().id;
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE fixture(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM fixture WHERE n < 2000
+         )
+         INSERT INTO run_usage (session_id, run_id, model, prompt_tokens, completion_tokens,
+                                reasoning_tokens, cached_tokens, created_at, source, provider)
+         SELECT ?1, 'fixture', 'model', 1, 2, 0, 0,
+                printf('2026-01-%02dT00:00:00Z', n % 28 + 1), 'run', ''
+         FROM fixture",
+            params![session],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE fixture(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM fixture WHERE n < 200
+         )
+         INSERT INTO checkpoints (id, session_id, summary, up_to_seq, created_at)
+         SELECT printf('fixture-%d', n), ?1, 'old', n, '2026-01-01T00:00:00Z' FROM fixture",
+            params![session],
+        )
+        .unwrap();
+    let newest = store.save_checkpoint(&session, "newest", 200).unwrap();
+    let plan = |sql: &str, param: &str| {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan = stmt
+            .query_map([param], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        plan.join("\n")
+    };
+    let checkpoint_plan = plan(LATEST_CHECKPOINT_SQL, &session);
+    assert!(
+        checkpoint_plan.contains("USING INDEX idx_checkpoints_session"),
+        "{checkpoint_plan}"
+    );
+    assert!(
+        !checkpoint_plan.contains("TEMP B-TREE"),
+        "{checkpoint_plan}"
+    );
+    let latest = store.latest_checkpoint_record(&session).unwrap().unwrap();
+    assert_eq!(latest, (newest, "newest".into(), 200));
+
+    let since = "2026-01-28T00:00:00Z";
+    let check_range = |sql: &str| {
+        let usage_plan = plan(sql, since);
+        assert!(
+            usage_plan.contains("USING INDEX idx_run_usage_created (created_at>?)"),
+            "{usage_plan}"
+        );
+    };
+    check_range(&usage_by_model_sql(true));
+    for group in ["model", "provider", "purpose", "session", "role", "day"] {
+        check_range(&grouped_usage_sql(group, true));
+    }
+    assert_eq!(
+        store.usage_by_model(None).unwrap()["model"],
+        (2000, 4000, 0)
+    );
+    assert_eq!(
+        store.usage_by_model(Some(since)).unwrap()["model"],
+        (71, 142, 0)
+    );
+    assert_eq!(
+        store.usage_grouped(Some(since), "model").unwrap(),
+        [(
+            "model".into(),
+            "".into(),
+            "model".into(),
+            71,
+            142,
+            0,
+            0,
+            None,
+            false
+        )]
+    );
+}
+
 fn run_duration_ms(created: &str, updated: &str) -> i64 {
     match (
         chrono::DateTime::parse_from_rfc3339(created),
@@ -555,7 +794,11 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 67;
+pub const SCHEMA_VERSION: i64 = 70;
+
+fn unsupported_preview_schema(version: i64) -> bool {
+    matches!(version, 68 | 69)
+}
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -640,7 +883,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 67] = [
+const MIGRATIONS: [(i64, MigrationStep); 68] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -966,12 +1209,18 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
         add_column(c, "sessions", "plan_state TEXT")?;
         Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
+    // Versions 68 and 69 were unpublished preview schemas.
+    (70, |c| {
+        add_column(c, "queued_messages", "position INTEGER")?;
+        add_column(c, "queued_messages", "revision INTEGER NOT NULL DEFAULT 0")?;
+        Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
 /// Applies the same ordered migration prefix without opening/upgrading a backup.
 pub(crate) fn schema_at(version: i64) -> Result<Connection> {
-    if !(1..=SCHEMA_VERSION).contains(&version) {
+    if !(1..=SCHEMA_VERSION).contains(&version) || unsupported_preview_schema(version) {
         return Err(anyhow!("unsupported backup schema v{version}"));
     }
     let conn = Connection::open_in_memory()?;
@@ -989,6 +1238,9 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
 /// the last completed version.
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if unsupported_preview_schema(version) {
+        return Err(anyhow!("database schema v{version} is an unsupported preview schema (this build writes v{SCHEMA_VERSION})"));
+    }
     if version > SCHEMA_VERSION {
         return Err(anyhow!(
             "database schema v{version} is newer than this build (v{SCHEMA_VERSION}); upgrade formless"
@@ -1000,7 +1252,7 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     } else {
         None
     };
-    let result = (|| {
+    let result: Result<()> = (|| {
         for (target, step) in MIGRATIONS {
             if version < target {
                 let tx = conn.unchecked_transaction()?;
@@ -1022,7 +1274,9 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
             let _ = std::fs::remove_file(migration_receipt_path(file));
         }
     }
-    result
+    result?;
+    conn.execute_batch(DERIVED_INDEXES)
+        .context("create derived database indexes")
 }
 
 /// Whether `e` says the database file itself is damaged (corrupt, or not a
@@ -1860,6 +2114,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// Newest transcript sequence without decoding any message bodies.
+    pub(crate) fn last_message_seq(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The same newest user row as reversing a Session transcript, including
+    /// empty content. Compare and retry need its identity, sequence, and text.
+    pub(crate) fn last_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, seq, content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Suggest-name prompt: the latest four nonblank user rows, in transcript
+    /// order. Step through a single SQL snapshot rather than materializing
+    /// unrelated messages or retaining unbounded user text.
+    pub(crate) fn recent_user_naming_input(&self, session_id: &str) -> Result<String> {
+        const LIMIT: usize = 4;
+        const MAX_CHARS: usize = 2000;
+        let mut stmt = self.ps(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let mut recent = Vec::with_capacity(LIMIT);
+        while recent.len() < LIMIT {
+            let Some(row) = rows.next()? else { break };
+            let text = row.get_ref(0)?.as_str()?;
+            if !text.trim().is_empty() {
+                recent.push(text.chars().take(MAX_CHARS).collect::<String>());
+            }
+        }
+        recent.reverse();
+        Ok(recent.join("\n").chars().take(MAX_CHARS).collect())
+    }
+
     /// One Session-scoped message, using the same row/metadata conversion as
     /// transcript reads. Unrelated rows are deliberately not decoded here.
     pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
@@ -2089,33 +2392,30 @@ impl Store {
         if let Some(phrase) = phrase {
             args.push(phrase.into());
         }
-        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, String>(6)?,
-            ))
-        })?;
-        let needle = query
-            .split(|c: char| !c.is_alphanumeric())
-            .find(|w| !w.is_empty())
-            .unwrap_or(query)
-            .to_lowercase();
+        let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
+        let needle = search_words(query).next().unwrap_or(query).to_lowercase();
+        let mut terms = HashMap::new();
+        for word in search_words(query) {
+            let next = terms.len();
+            terms
+                .entry(crate::fuzzy::fold_chars(word).collect())
+                .or_insert(next);
+        }
         let mut hits = Vec::new();
-        for row in rows {
-            let (session_id, session_name, message_id, seq, role, content, created_at) = row?;
+        while let Some(row) = rows.next()? {
+            let content = row.get_ref(5)?.as_str()?;
             hits.push(SearchHit {
-                session_id,
-                session_name,
-                message_id,
-                seq,
-                role,
-                snippet: make_snippet(&content, &needle),
-                created_at,
+                session_id: row.get(0)?,
+                session_name: row.get(1)?,
+                message_id: row.get(2)?,
+                seq: row.get(3)?,
+                role: row.get(4)?,
+                snippet: if terms.len() > 1 {
+                    multi_term_snippet(content, &terms)
+                } else {
+                    make_snippet(content, &needle)
+                },
+                created_at: row.get(6)?,
             });
         }
         Ok(hits)
@@ -3221,10 +3521,10 @@ impl Store {
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(expected > 0
-            && expected == rows
-            && expected == known
-            && main >= self.run_steps(run_id)?)
+        Ok(
+            forecast_report_storage::covered_requests(expected, rows, known)
+                && main >= self.run_steps(run_id)?,
+        )
     }
 
     /// Check coverage for a branch's allocated Runs in one statement.
@@ -3314,13 +3614,23 @@ impl Store {
     }
 
     fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+        let Some(mut run) = self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
             "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-        }))).optional().map_err(Into::into)
+            "tool_calls":r.get::<_,i64>(9)?
+        }))).optional()? else {
+            return Ok(None);
+        };
+        let usage = self.run_usage(id)?;
+        // Preserve the signed SQLite totals already returned by GetRun.
+        run["prompt_tokens"] = serde_json::json!(usage.prompt_tokens as i64);
+        run["completion_tokens"] = serde_json::json!(usage.completion_tokens as i64);
+        run["cached_tokens"] = serde_json::json!(usage.cached_tokens);
+        run["cache_write_tokens"] = serde_json::json!(usage.cache_write_tokens);
+        run["reasoning_tokens"] = serde_json::json!(usage.reasoning_tokens);
+        Ok(Some(run))
     }
 
     pub fn run_metrics_for(
@@ -3572,25 +3882,16 @@ impl Store {
 
     /// Remove and return the Session's oldest queued message.
     pub fn pop_queued_message(&self, session_id: &str) -> Result<Option<String>> {
-        let next: Option<(i64, String)> = self
-            .conn
-            .query_row(
-                "SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id LIMIT 1",
-                params![session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
-        if let Some((id, _)) = &next {
-            self.conn
-                .execute("DELETE FROM queued_messages WHERE id=?1", params![id])?;
-        }
-        Ok(next.map(|(_, content)| content))
+        Ok(self.ps(
+            "DELETE FROM queued_messages WHERE id=(SELECT id FROM queued_messages WHERE session_id=?1
+               ORDER BY COALESCE(position,id),id LIMIT 1) RETURNING content",
+        )?.query_row([session_id], |row| row.get(0)).optional()?)
     }
 
     pub fn list_queued_messages(&self, session_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
+            .prepare("SELECT content FROM queued_messages WHERE session_id=?1 ORDER BY COALESCE(position,id),id")?;
         let rows = stmt
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
@@ -3600,12 +3901,13 @@ impl Store {
     /// The Session's queued messages with their ids, in send order.
     pub fn queued_items(&self, session_id: &str) -> Result<Vec<formless_protocol::QueuedMessage>> {
         let mut stmt =
-            self.ps("SELECT id, content FROM queued_messages WHERE session_id=?1 ORDER BY id")?;
+            self.ps("SELECT id, content, revision FROM queued_messages WHERE session_id=?1 ORDER BY COALESCE(position,id),id")?;
         let rows = stmt
             .query_map(params![session_id], |r| {
                 Ok(formless_protocol::QueuedMessage {
                     id: r.get(0)?,
                     content: r.get(1)?,
+                    revision: Some(r.get(2)?),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -3617,7 +3919,7 @@ impl Store {
     pub fn edit_queued(&self, session_id: &str, id: i64, content: Option<&str>) -> Result<bool> {
         let n = match content {
             Some(c) => self.ex(
-                "UPDATE queued_messages SET content=?3 WHERE id=?1 AND session_id=?2",
+                "UPDATE queued_messages SET content=?3, revision=revision+1 WHERE id=?1 AND session_id=?2",
                 params![id, session_id, c],
             )?,
             None => self.ex(
@@ -3628,27 +3930,44 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Move a queued message one place earlier (`up`) or later, by
-    /// swapping its text with its neighbour's. Returns the id that now
-    /// holds it, or None when it is not queued or already at that end.
+    /// A revision binds editable text and position. Reject a stale draft
+    /// atomically even when there was no event on the editing connection.
+    pub fn edit_queued_if_current(
+        &self,
+        session_id: &str,
+        id: i64,
+        revision: i64,
+        content: &str,
+    ) -> Result<bool> {
+        Ok(self.ex(
+            "UPDATE queued_messages SET content=?4, revision=revision+1 WHERE session_id=?1 AND id=?2 AND revision=?3",
+            params![session_id, id, revision, content],
+        )? > 0)
+    }
+
+    /// Move a queued message one place without changing its identity or text.
     pub fn move_queued(&self, session_id: &str, id: i64, up: bool) -> Result<Option<i64>> {
-        let items = self.queued_items(session_id)?;
-        let Some(i) = items.iter().position(|q| q.id == id) else {
-            return Ok(None);
-        };
-        let j = if up { i.checked_sub(1) } else { Some(i + 1) };
-        let Some(other) = j.and_then(|j| items.get(j)) else {
-            return Ok(None);
-        };
-        self.ex(
-            "UPDATE queued_messages SET content=?2 WHERE id=?1",
-            params![items[i].id, other.content],
-        )?;
-        self.ex(
-            "UPDATE queued_messages SET content=?2 WHERE id=?1",
-            params![other.id, items[i].content],
-        )?;
-        Ok(Some(other.id))
+        self.transaction(|st| {
+            let Some(position) = st.ps("SELECT COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND id=?2")?
+                .query_row(params![session_id, id], |row| row.get::<_, i64>(0)).optional()? else {
+                return Ok(None);
+            };
+            let neighbor = if up {
+                "SELECT id, COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND COALESCE(position,id)<?2 ORDER BY COALESCE(position,id) DESC,id DESC LIMIT 1"
+            } else {
+                "SELECT id, COALESCE(position,id) FROM queued_messages WHERE session_id=?1 AND COALESCE(position,id)>?2 ORDER BY COALESCE(position,id),id LIMIT 1"
+            };
+            let Some((other, other_position)) = st.ps(neighbor)?
+                .query_row(params![session_id, position], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).optional()? else {
+                return Ok(None);
+            };
+            st.ex(
+                "UPDATE queued_messages SET position=CASE id WHEN ?2 THEN ?4 ELSE ?5 END, revision=revision+1
+                 WHERE session_id=?1 AND id IN (?2,?3)",
+                params![session_id, id, other, other_position, position],
+            )?;
+            Ok(Some(id))
+        })
     }
 
     pub fn clear_queued_messages(&self, session_id: &str) -> Result<()> {
@@ -3822,11 +4141,12 @@ impl Store {
         &self,
         session_id: &str,
     ) -> Result<Option<(String, String, i64)>> {
-        Ok(self.conn.query_row(
-            "SELECT id, summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1",
-            params![session_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional()?)
+        Ok(self
+            .conn
+            .query_row(LATEST_CHECKPOINT_SQL, params![session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
     }
 
     // --- Tools (SPEC §7, §8) ---
@@ -5226,13 +5546,36 @@ impl Store {
         )? > 0)
     }
 
-    /// Keys under `prefix`, sorted (at most 1000).
+    pub fn kv_contains(&self, namespace: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_kv WHERE namespace=?1 AND key=?2)",
+            params![namespace, key],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Keys under the prefix, sorted (at most 1,000).
     pub fn kv_list(&self, namespace: &str, prefix: &str) -> Result<Vec<String>> {
-        let mut stmt = self.ps(
-            "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000",
-        )?;
+        self.kv_list_page(namespace, prefix, None)
+    }
+
+    pub(crate) fn kv_list_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let sql = if after.is_some() {
+            "SELECT key FROM tool_kv WHERE namespace=?1 AND key>?3 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000"
+        } else {
+            "SELECT key FROM tool_kv WHERE namespace=?1 AND substr(key,1,length(?2))=?2 ORDER BY key LIMIT 1000"
+        };
+        let mut stmt = self.ps(sql)?;
         let rows = stmt
-            .query_map(params![namespace, prefix], |r| r.get(0))?
+            .query_map(
+                rusqlite::params_from_iter([namespace, prefix].into_iter().chain(after)),
+                |r| r.get(0),
+            )?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -5681,7 +6024,7 @@ impl Store {
              VALUES(?1,?2,?3,?4,0,?5,?6,?7,?8,?8)
              ON CONFLICT(name) DO UPDATE SET description=excluded.description, current_version=excluded.current_version,
                enabled=0, source=excluded.source, author=excluded.author, has_scripts=excluded.has_scripts,
-               retired=0, updated_at=excluded.updated_at",
+               retired=0, retire_reason=NULL, updated_at=excluded.updated_at",
             params![uuid::Uuid::new_v4().to_string(), name, description, version, source, author, has_scripts, t],
         )?;
         self.ex(
@@ -5797,10 +6140,10 @@ impl Store {
         )? > 0)
     }
 
-    /// Record that a Session loaded a skill (usage metrics).
+    /// Record a skill load. An empty Run ID represents a manual load.
     pub fn record_skill_load(&self, name: &str, session_id: &str, run_id: &str) -> Result<()> {
         self.ex(
-            "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, ?3, ?4 FROM skills WHERE name=?1",
+            "INSERT INTO skill_loads(skill_id, session_id, run_id, created_at) SELECT id, ?2, NULLIF(?3,''), ?4 FROM skills WHERE name=?1",
             params![name, session_id, run_id, now()],
         )?;
         Ok(())
@@ -6437,12 +6780,9 @@ impl Store {
         &self,
         since: Option<&str>,
     ) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
-        let mut stmt = self.ps(
-            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
-             WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY model",
-        )?;
+        let mut stmt = self.ps(&usage_by_model_sql(since.is_some()))?;
         let rows = stmt
-            .query_map(params![since], |r| {
+            .query_map(rusqlite::params_from_iter(since), |r| {
                 Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -6470,35 +6810,9 @@ impl Store {
         by: &str,
         project: impl Fn(GroupedUsage, Option<String>) -> T,
     ) -> Result<Vec<T>> {
-        let key = match by {
-            "model" => "u.model",
-            "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
-            "purpose" => "u.source",
-            "session" => "u.session_id",
-            "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
-            _ => "substr(u.created_at, 1, 10)",
-        };
-        let (label, join, order) = if by == "session" {
-            (
-                "COALESCE(s.name, u.session_id)",
-                "LEFT JOIN sessions s ON s.id=u.session_id",
-                // Keep alphabetical labels on token-count ties. The ID
-                // makes buckets with an identical label stay contiguous.
-                "10, 1",
-            )
-        } else {
-            ("NULL", "", "1")
-        };
-        let mut stmt = self.ps(&format!(
-            "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
-               SUM(u.cached_tokens), SUM(u.cache_write_tokens),
-               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
-             FROM run_usage u {join}
-             WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
-        ))?;
+        let mut stmt = self.ps(&grouped_usage_sql(by, since.is_some()))?;
         let rows = stmt
-            .query_map(params![since], |r| {
+            .query_map(rusqlite::params_from_iter(since), |r| {
                 let usage = (
                     r.get(0)?,
                     r.get(1)?,
@@ -7770,14 +8084,15 @@ fn identifier_prefix_phrase(text: &str) -> Option<String> {
     terms.contains(' ').then(|| terms.replace(' ', " + "))
 }
 
+fn search_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+}
+
 /// An FTS5 query from free text: each word quoted as a prefix term, all
 /// required. None when the text has no word characters.
 pub fn fts_query(text: &str) -> Option<String> {
-    let terms: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{w}\"*"))
-        .collect();
+    let terms: Vec<String> = search_words(text).map(|w| format!("\"{w}\"*")).collect();
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
@@ -8317,6 +8632,107 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}
+
+#[cfg(test)]
+mod narrow_transcript_tests {
+    use super::*;
+
+    fn assert_projection_matches_full(store: &Store, session: &str) {
+        let full = store.list_messages(session).unwrap();
+        assert_eq!(
+            store.last_message_seq(session).unwrap(),
+            full.last().map_or(0, |row| row.seq)
+        );
+        let last_user = full.iter().rev().find(|row| row.role == "user");
+        assert_eq!(
+            store.last_user_message(session).unwrap(),
+            last_user.map(|row| (row.id.clone(), row.seq, row.content.clone()))
+        );
+        let users: Vec<_> = full
+            .iter()
+            .filter(|row| row.role == "user" && !row.content.trim().is_empty())
+            .map(|row| row.content.as_str())
+            .collect();
+        let legacy = users[users.len().saturating_sub(4)..]
+            .join("\n")
+            .chars()
+            .take(2000)
+            .collect::<String>();
+        assert_eq!(store.recent_user_naming_input(session).unwrap(), legacy);
+    }
+
+    #[test]
+    fn narrow_transcript_reads_keep_unicode_cap_and_empty_latest_user() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let other = store.create_session(None).unwrap().id;
+        store
+            .append_message(&other, "user", "not this Session")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+        store
+            .append_message(&session, "assistant", "no user yet")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+
+        let long_user = "ก中".repeat(1800);
+        let long_tool = "unrelated tool output".repeat(120_000);
+        for (role, content) in [
+            ("user", "excluded oldest"),
+            ("assistant", "assistant"),
+            ("user", "oldest kept"),
+            ("user", "\t\n"),
+            ("user", long_user.as_str()),
+            ("tool", long_tool.as_str()),
+            ("user", "third kept"),
+            ("user", "\u{2003}\u{00A0}"),
+            ("user", "fourth kept"),
+            ("user", ""),
+            ("system-note", "last sequence is not the newest user"),
+        ] {
+            store.append_message(&session, role, content).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        let recent = store.recent_user_naming_input(&session).unwrap();
+        assert_eq!(recent.chars().count(), 2000);
+        assert!(recent.starts_with("oldest kept\nก中"));
+        assert!(store
+            .last_user_message(&session)
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
+
+    #[test]
+    fn narrow_transcript_reads_match_equal_sequences_in_both_directions() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        for (id, role, content) in [
+            ("old", "user", "discarded"),
+            ("z", "user", "first kept"),
+            ("y", "user", "second kept"),
+            ("x", "assistant", "ignored"),
+            ("w", "user", "third kept"),
+            ("v", "user", "last kept"),
+            ("u", "user", "\u{2003}"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at) VALUES(?1,?2,1,?3,?4,'fixture')",
+                params![id, session, role, content],
+            ).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        assert_eq!(
+            store.last_user_message(&session).unwrap(),
+            Some(("u".into(), 1, "\u{2003}".into()))
+        );
+        assert_eq!(
+            store.recent_user_naming_input(&session).unwrap(),
+            "first kept\nsecond kept\nthird kept\nlast kept"
+        );
     }
 }
 

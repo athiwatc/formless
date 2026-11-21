@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 5
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Tag matches Cargo.toml
@@ -64,7 +64,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Create job-local Cargo and application directories
@@ -117,7 +117,7 @@ jobs:
           Copy-Item README.md,SPEC.md,LICENSE $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: formless-${{ matrix.target }}
           path: |
@@ -129,15 +129,27 @@ jobs:
         if: always()
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
-  # The Linux archive, .deb and .rpm (packaging/README.md), built on Debian
-  # bullseye so they run on glibc 2.31 and newer (Debian 11+, Ubuntu 20.04+,
-  # RHEL/Rocky 9+), not on whatever ubuntu-latest ships.
+  # Linux archives and x86_64 native packages use Debian bullseye for
+  # a glibc 2.31 floor (Debian 11+, Ubuntu 20.04+, RHEL/Rocky 9+).
   linux:
     timeout-minutes: 60
     needs: version-check
-    runs-on: [self-hosted, Linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: [self-hosted, Linux, X64]
+            target: x86_64-unknown-linux-gnu
+            artifact: formless-linux
+            packages: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: formless-linux-arm64
+            packages: false
+    runs-on: ${{ matrix.os }}
     container: rust:1-bullseye
     env:
+      FORMLESS_RELEASE_TARGET: ${{ matrix.target }}
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
@@ -147,7 +159,7 @@ jobs:
         run: |
           test ! -L "$GITHUB_WORKSPACE"
           echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Create job-local Cargo and application directories
@@ -175,18 +187,23 @@ jobs:
         run: bash scripts/ci-storage-budget.sh snapshot release-built
       - run: target/release/formless man > target/formless.1
       - name: Generate package shell completions
+        if: matrix.packages
         run: sh scripts/generate-package-completions.sh target/release/formless target/completions
       - name: Archive
         shell: bash
         run: |
-          name="formless-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$FORMLESS_RELEASE_TARGET"
+          name="formless-${GITHUB_REF_NAME}-${FORMLESS_RELEASE_TARGET}"
           mkdir -p dist "$name"
           cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
           tar -czf "dist/$name.tar.gz" "$name"
       - name: Install package-building tools with private intermediates
+        if: matrix.packages
         shell: bash
         run: bash scripts/ci-storage-budget.sh install-package-tools
       - name: Packages
+        if: matrix.packages
         shell: bash
         env:
           PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
@@ -212,18 +229,33 @@ jobs:
           else
             cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           fi
-          cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
-          dpkg -I ./*.deb | sed -n '/Depends/p'
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+          dpkg -I dist/*.deb | sed -n '/Depends/p'
+      - name: Checksum release files
+        shell: bash
+        working-directory: dist
+        run: for f in *; do sha256sum "$f" > "$f.sha256"; done
+      - name: Install and run the ARM64 archive
+        if: runner.arch == 'ARM64' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          fixtures="$(mktemp -d "$RUNNER_TEMP/formless-arm64.XXXXXX")"
+          trap 'rm -rf -- "$fixtures"' EXIT
+          mirror="$fixtures/releases/$GITHUB_REF_NAME"
+          mkdir -p "$mirror"
+          cp dist/*.tar.gz dist/*.tar.gz.sha256 "$mirror/"
+          PREFIX="$fixtures/install" FORMLESS_VERSION="$GITHUB_REF_NAME" \
+            FORMLESS_RELEASES_URL="file://$fixtures/releases" sh scripts/install.sh
+          "$fixtures/install/bin/formless" --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: formless-linux
+          name: ${{ matrix.artifact }}
           path: dist/*
+          if-no-files-found: error
       - name: Final storage (including failed phases)
         if: always()
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
-  # Install each package in a clean system and run it.
       - name: Restore runner ownership of generated files
         if: always()
         shell: bash
@@ -243,6 +275,7 @@ jobs:
             esac
           done
 
+  # Install each x86_64 native package in a clean system and run it.
   linux-install-test:
     timeout-minutes: 30
     needs: linux
@@ -327,7 +360,7 @@ jobs:
     needs: [version-check, build, linux, linux-install-test]
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Isolate Docker client configuration
@@ -391,7 +424,7 @@ jobs:
           echo "RELEASE_IMAGE_ARCHIVE=$archive_dir" >> "$GITHUB_ENV"
           docker image save --output "$archive_dir/image.tar" "$RELEASE_IMAGE"
           printf 'image=%s\n' "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: image-upload
         with:
           name: docker-image-${{ github.run_attempt }}
@@ -425,7 +458,7 @@ jobs:
     needs: [version-check, build, linux, linux-install-test, docker]
     runs-on: [self-hosted, Linux, X64]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -440,7 +473,7 @@ jobs:
       # generated list of changes (#842).
       - name: Release notes
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         id: release
         with:
           body_path: release-notes.md
@@ -507,7 +540,7 @@ jobs:
         env:
           AUR_KEY: ${{ secrets.AUR_SSH_KEY }}
         if: needs.version-check.outputs.prerelease == 'false' && env.AUR_KEY != ''
-        uses: KSXGitHub/github-actions-deploy-aur@a97f56a8425a7a7f3b8c58607f769c69b089cadb # v3.0.1
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
         with:
           pkgname: formless-bin
           pkgbuild: packaging-out/aur/PKGBUILD
@@ -536,7 +569,7 @@ jobs:
       TESTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
       IMAGE_ARTIFACT_ID: ${{ needs.docker.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -588,7 +621,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Channel summary

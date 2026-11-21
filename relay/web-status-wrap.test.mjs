@@ -51,12 +51,12 @@ test('the rule overrides the bar nowrap without touching neighbours', () => {
     '.statusbar .note.err { color: var(--err); }',
     '.statusbar .err { color: var(--err); font-weight: 650; }',
     '#status-context.clickable { cursor: pointer; }',
-    '#status-model.clickable { cursor: pointer; }',
+    '#status-model { min-width: 1.5rem; min-height: 1.5rem; max-width: min(100%, 28ch); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
     '.spacer { flex: 1; }',
     '.hidden, [hidden] { display: none !important; }',
     '  .statusbar { padding: 0.3125rem 0.75rem; }',
   ];
   for (const line of expected) assert.ok(css.includes(line + '\n'), line);
-  const hide = '  #status-model, #status-model + .sep, .statusbar .sep:nth-of-type(2) { display: none; }\n';
-  assert.equal(css.split(hide).length - 1, 2, 'both model-hiding breakpoints unchanged');
+  const hide = '  .statusbar .sep:nth-of-type(2) { display: none; }\n';
+  assert.equal(css.split(hide).length - 1, 2, 'only the separator is hidden at both breakpoints');
 });

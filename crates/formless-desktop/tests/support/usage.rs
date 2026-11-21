@@ -7,6 +7,44 @@ use serde_json::json;
 fn value() -> serde_json::Value {
     json!({"runs":2,"total":{"steps":3,"prompt_tokens":2000,"completion_tokens":100,"cached_tokens":200,"cache_write_tokens":300,"cost":null,"unpriced":["model ไทย 😀"]},"last_run":{"steps":1,"prompt_tokens":1000,"completion_tokens":50,"cached_tokens":100,"cost":0.00123456}})
 }
+
+#[gpui_kit::test]
+fn usage_connection_lost_notice_requires_a_previously_connected_client(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| shell.connect_recording_daemon(cx));
+        for (ready, notice, lost) in [
+            (false, "Connecting…", false),
+            (false, "Cannot connect", false),
+            (true, "Connected", false),
+            (false, "Disconnected", true),
+            (false, "Connecting…", true),
+            (true, "Connected", true),
+        ] {
+            shell.update(cx, |shell, cx| {
+                shell.apply_client_update(
+                    Update::Connection {
+                        ready,
+                        notice: notice.into(),
+                    },
+                    window,
+                    cx,
+                );
+                shell.open_panel(false, window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .find("session-usage-notice")
+                    .value()
+                    .unwrap()
+                    .contains("Connection lost"),
+                lost,
+                "{notice}"
+            );
+        }
+    });
+}
 fn activate(
     shell: &Entity<Shell>,
     session: &formless_protocol::SessionInfo,
