@@ -77,7 +77,6 @@ def check(page):
         ('MYSQL_PWD', 'session'),
         ('db_pwd', 'always'),
         ('PRIMARY_KEY_TOKEN', 'session'),
-        ('SSH_AUTH_SOCK', 'hour'),
         ('DATABASE_URL', 'session'),
         ('redis_url', 'hour'),
         ('MONGODB_URI', 'always'),
@@ -92,7 +91,7 @@ def check(page):
 
     for name in ('MONKEY', 'TURKEY', 'DONKEY', 'HOCKEY', 'JOCKEY', 'HOTKEY', 'PRIMARY_KEY',
                  'foreign_key', 'UNIQUE_KEY', 'CANDIDATE_KEY', 'SORT_KEY', 'PARTITION_KEY', 'HOME',
-                 'PUBLIC_URL', 'DATABASE_URL_SAMPLE'):
+                 'PUBLIC_URL', 'DATABASE_URL_SAMPLE', 'SSH_AUTH_SOCK', 'ssh_auth_sock'):
         queue(name)
         assert labels.count() == 0, name
         click('always')

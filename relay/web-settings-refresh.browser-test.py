@@ -45,6 +45,7 @@ HOOK = """
       S.auditPages = 2;
       S.audit = [head, tail];
       this.connect();
+      auditOwner = {ws: S.ws, channel: S.channel, filter: null};
       renderAll();
     },
     connect() {

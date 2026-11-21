@@ -42,6 +42,8 @@ HOOK = """
       S.local = true;
       S.daemonOnline = true;
       renderChrome();
+      // Mirror loadAll's connection-bootstrap snapshot without its other reads.
+      if (runningPanelExposed()) refreshRunning('exposure');
     },
     disconnect() {
       S.ws = null;
@@ -122,30 +124,34 @@ def exercise(page, url, app):
     page.evaluate("() => { __runningFixture.identify(); __runningFixture.syncSidebar(); __runningFixture.hide(false); }")
     assert page.evaluate("__runningFixture.count()") == 2
     page.evaluate("() => { __runningFixture.event('invocation_stalled'); __runningFixture.event('invocation_stalled'); }")
-    assert page.evaluate("__runningFixture.count()") == 2
-    reply(page, 2, {**ROW, "tool_name": "obsolete snapshot"})
+    # The first event starts a read for the new identity; the second coalesces.
     wait_requests(page, 3)
+    reply(page, 2, {**ROW, "tool_name": "obsolete snapshot"})
     expect(panel).to_be_hidden()
-    reply(page, 3, ROW)
+    # The newer read also needs one follow-up for the coalesced events.
+    reply(page, 3, {**ROW, "tool_name": "pre-event snapshot"})
+    wait_requests(page, 4)
+    expect(panel).to_be_hidden()
+    reply(page, 4, ROW)
     expect(panel).to_contain_text("silent")
 
     cancel = panel.get_by_role("button", name="Cancel", exact=True)
     cancel.focus()
     page.evaluate("window.__savedCancel = document.activeElement")
     resumed = {**ROW, "stalled": False}
-    tick(page, 4)
-    reply(page, 4, resumed)
+    tick(page, 5)
+    reply(page, 5, resumed)
     expect(panel).not_to_contain_text("silent")
     expect(cancel).to_be_focused()
     assert page.evaluate("window.__savedCancel === document.activeElement")
 
     cancel.press("Enter")
-    wait_requests(page, 5)
-    reply(page, 5, resumed)
+    wait_requests(page, 6)
+    reply(page, 6, resumed)
     abandon = panel.get_by_role("button", name="Abandon", exact=True)
     abandon.press("Space")
-    wait_requests(page, 6)
-    reply(page, 6, {**resumed, "abandoned": True})
+    wait_requests(page, 7)
+    reply(page, 7, {**resumed, "abandoned": True})
     expect(abandon).to_have_count(0)
     expect(panel.locator(".linklike")).to_be_focused()
     assert page.evaluate("__runningFixture.actions()") == [
@@ -153,51 +159,56 @@ def exercise(page, url, app):
         {"type": "abandon_invocation", "handle": ROW["handle"]},
     ]
 
-    tick(page, 7)
-    page.evaluate("__runningFixture.fail(7)")
+    tick(page, 8)
+    page.evaluate("__runningFixture.fail(8)")
     expect(panel).to_contain_text("abandoned")
     expect(panel.locator(".linklike")).to_be_focused()
     page.evaluate("__runningFixture.hide(true)")
-    tick(page, 7)
+    tick(page, 8)
     page.evaluate("__runningFixture.event('invocation_completed')")
-    tick(page, 7)
+    # Events refresh even while hidden; only periodic polling pauses.
+    wait_requests(page, 9)
+    tick(page, 9)
     page.evaluate("__runningFixture.hide(false)")
-    wait_requests(page, 8)
-    reply(page, 8)
+    wait_requests(page, 9)
+    reply(page, 9)
     expect(panel).to_be_hidden()
     expect(page.locator("#new-session")).to_be_focused()
 
     menu.click()
     expect(menu).to_have_attribute("aria-expanded", "false")
-    tick(page, 8)
+    tick(page, 9)
     page.set_viewport_size({"width": 1200, "height": 900})
-    wait_requests(page, 9)
-    page.evaluate("() => { __runningFixture.disconnect(); __runningFixture.connect(); }")
     wait_requests(page, 10)
-    reply(page, 10, {**resumed, "tool_name": "new connection"})
+    page.evaluate("() => { __runningFixture.disconnect(); __runningFixture.connect(); }")
+    wait_requests(page, 11)
+    reply(page, 11, {**resumed, "tool_name": "new connection"})
     expect(panel).to_contain_text("new connection")
-    reply(page, 9, {**ROW, "tool_name": "old connection"})
+    reply(page, 10, {**ROW, "tool_name": "old connection"})
     expect(panel).not_to_contain_text("old connection")
     expect(panel).to_contain_text("new connection")
 
     page.evaluate("__runningFixture.setView('settings')")
-    tick(page, 10)
+    tick(page, 11)
     page.evaluate("__runningFixture.setView('chat')")
-    wait_requests(page, 11)
-    reply(page, 11)
+    wait_requests(page, 12)
+    reply(page, 12)
     expect(panel).to_be_hidden()
 
-    # A pre-exposure response may be stale, even when its list is empty.
+    # Exposure reuses a pending read on the same connection.
     page.evaluate("() => { __runningFixture.hide(true); __runningFixture.event('invocation_pending'); }")
-    wait_requests(page, 12)
-    page.evaluate("__runningFixture.hide(false)")
-    reply(page, 12, {**ROW, "tool_name": "pre-exposure snapshot"})
     wait_requests(page, 13)
+    page.evaluate("__runningFixture.hide(false)")
+    assert page.evaluate("__runningFixture.count()") == 13
+    reply(page, 13, {**ROW, "tool_name": "pre-exposure snapshot"})
+    expect(panel).to_contain_text("pre-exposure snapshot")
+    tick(page, 14)
+    page.evaluate("__runningFixture.fail(14)")
+    expect(panel).to_contain_text("pre-exposure snapshot")
+    tick(page, 15)
+    reply(page, 15)
     expect(panel).to_be_hidden()
-    page.evaluate("__runningFixture.fail(13)")
-    tick(page, 14)
-    reply(page, 14)
-    tick(page, 14)
+    tick(page, 15)
 
 
 def main():
