@@ -6931,8 +6931,12 @@ shared object and already-open handles can retain additional bytes. Inventory
 charges the actual observed size without reading an oversized body; admission
 refuses excess use. Cleanup can reclaim an inactive verified retained alias as
 soon as it becomes oversized, without waiting seven days or touching its public
-name. Active Run/review leases still protect their owned objects. Unknown entries
-fail closed rather than counting as zero or supplying deletion authority.
+name. Active Run/review leases still protect their owned objects.
+Receipts publish after a private staging file has been flushed. Recovery can
+remove verified private staging files and legacy truncated receipts with
+absent objects. Other corrupt token entries remain charged to the store for
+manual recovery. Affected tokens cannot authorize review or deletion, and
+verified tokens can still expire. Unknown filenames fail closed.
 Already-deleted legacy files without a captured original object remain read-only.
 
 
