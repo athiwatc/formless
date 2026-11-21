@@ -933,6 +933,7 @@ pub struct Daemon {
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     topic_activity: tokio::sync::Notify,
+    topic_wait_seen: StdMutex<HashMap<String, std::collections::HashSet<String>>>,
     /// FIFO question gate shared by main and nested calls in each Session.
     question_gates: StdMutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Shown to each client as it connects (deprecation migrations).
@@ -1184,6 +1185,7 @@ impl Daemon {
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
             topic_activity: tokio::sync::Notify::new(),
+            topic_wait_seen: StdMutex::new(HashMap::new()),
             question_gates: StdMutex::new(HashMap::new()),
             file_index: StdMutex::new(HashMap::new()),
             web: tokio::sync::Mutex::new(None),
@@ -1835,6 +1837,16 @@ impl Daemon {
                 | Event::HarnessPermissionRequested { .. }
         ) {
             let _ = self.attention.send(());
+        }
+        if matches!(
+            &ev,
+            Event::TopicChanged { .. }
+                | Event::UserQuestion { .. }
+                | Event::UserQuestionClosed { .. }
+                | Event::HarnessPermissionRequested { .. }
+                | Event::HarnessPermissionClosed { .. }
+        ) {
+            self.topic_activity.notify_waiters();
         }
         send_all(&self.subs, ev);
     }
@@ -8773,6 +8785,10 @@ impl Daemon {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
             },
+            toolreg::TOPIC_WAIT => match self.wait_topic_steps(session_id, &args, cancel).await {
+                Ok(value) => value.to_string(),
+                Err(error) => call_failed(format!("error: topic_wait: {error:#}")),
+            },
             toolreg::TOPIC_ANSWER_QUESTION => {
                 match self.answer_topic_question_tool(session_id, &args) {
                     Ok(value) => value.to_string(),
@@ -11191,6 +11207,7 @@ impl Daemon {
         })?;
         for session in &family {
             self.contexts.locked().remove(session);
+            self.topic_wait_seen.locked().remove(session);
         }
         Ok(())
     }
