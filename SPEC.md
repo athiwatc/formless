@@ -6562,7 +6562,8 @@ under `crates/*/src` against README or SPEC, including test-only references.
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
 Private subprocess fixtures also use these test-only variables (no product
-configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
+configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
+`FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
