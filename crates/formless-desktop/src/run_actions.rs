@@ -261,6 +261,7 @@ pub enum Status {
     Reviewing(uuid::Uuid),
     Sent(uuid::Uuid),
     Applied(String),
+    Reconciled,
     Rejected(String),
     Unknown,
 }
@@ -274,7 +275,8 @@ impl Status {
         Self::Reviewing(_) => "Reviewing the exact action. No mutation has been written.".into(),
         Self::Sent(_) => "Submitted; awaiting acknowledgement. Never replayed.".into(),
         Self::Applied(s) => format!("Acknowledged: {s}"), Self::Rejected(s) => format!("Not applied: {s}"),
-            Self::Unknown => "Outcome UNKNOWN. The action may already have applied. Further run actions are blocked; inspect the Session in Formless TUI. Nothing was replayed.".into(),
+        Self::Reconciled => "Canonical Session state reloaded after an uncertain mutation. Some changes may have persisted. Nothing was replayed.".into(),
+            Self::Unknown => "Outcome UNKNOWN. The action may already have applied. Further run actions are blocked until canonical state confirms the outcome. Refresh the Session to check again. Nothing was replayed.".into(),
     }
     }
 }
@@ -337,13 +339,14 @@ impl Dispatch {
         *s = Status::Sent(self.action.operation);
         true
     }
-    pub fn finish(&self, result: Result<Value, String>, ok: bool) {
+    pub fn finish(&self, result: Result<Value, String>, definite_rejection: bool) {
         let mut s = self.ledger.0.lock().unwrap_or_else(|e| e.into_inner());
         if *s != Status::Sent(self.action.operation) {
             return;
         }
         *s = match result {
-            Ok(v) if ok && receipt(&self.action, &v) => Status::Applied(
+            Err(e) if definite_rejection => Status::Rejected(e.chars().take(500).collect()),
+            Ok(v) if receipt(&self.action, &v) => Status::Applied(
                 if self.action.kind == Kind::ProviderRetry && v["retrying"] == false {
                     "No provider request was available; nothing was retried.".into()
                 } else {
@@ -352,6 +355,17 @@ impl Dispatch {
             ),
             _ => Status::Unknown,
         };
+    }
+    pub fn unknown(&self) -> bool {
+        self.ledger.status() == Status::Unknown
+    }
+    pub fn reconcile(&self, unchanged_error: Option<&str>) {
+        let mut status = self.ledger.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *status == Status::Unknown {
+            *status = unchanged_error.map_or(Status::Reconciled, |e| {
+                Status::Rejected(e.chars().take(500).collect())
+            });
+        }
     }
     pub fn lost(&self) {
         let mut s = self.ledger.0.lock().unwrap_or_else(|e| e.into_inner());

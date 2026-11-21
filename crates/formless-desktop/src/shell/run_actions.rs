@@ -126,7 +126,7 @@ impl Shell {
         if self.run_actions.observed != status {
             if matches!(
                 status,
-                Status::Applied(_) | Status::Rejected(_) | Status::Unknown
+                Status::Applied(_) | Status::Reconciled | Status::Rejected(_) | Status::Unknown
             ) {
                 self.composer_notice = Some(status.notice().into());
             }

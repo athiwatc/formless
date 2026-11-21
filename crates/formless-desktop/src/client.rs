@@ -810,6 +810,7 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    RunReconcile(run_actions::Recovery),
     RestoreSession(crate::run_actions::DeleteUndo),
     RunTarget {
         owner: crate::run_actions::Owner,
@@ -974,6 +975,8 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
+    reconciled_actions: Vec<Action>,
     delete_undo: Option<crate::run_actions::DeleteUndo>,
     compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     action_work: Option<Box<run_actions::Work>>,
@@ -2104,6 +2107,7 @@ impl Engine {
             } => self.select(session_id, generation),
             Command::Page(page) => self.load_page(page),
             Command::Refresh => {
+                self.recover_run_actions();
                 self.stream_reload();
                 self.dirty_list = true;
                 self.dirty_session = true;
@@ -2385,6 +2389,7 @@ impl Engine {
     }
 
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
+        let definite_rejection = run_actions::definite_rejection(&message);
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
                 if matches!(&event, Event::CompactionNotice { .. })
@@ -2581,6 +2586,7 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::RunReconcile(recovery) => self.run_reconciled(recovery, result),
             Pending::RestoreSession(ticket) => {
                 let acknowledged = response_ok
                     && result
@@ -2633,12 +2639,24 @@ impl Engine {
                         }
                     }
                 }
-                w.dispatch.finish(result, response_ok);
+                if acknowledged || definite_rejection {
+                    self.run_recoveries
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&w.dispatch.action.operation);
+                } else if let Some(recovery) = self
+                    .run_recoveries
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&w.dispatch.action.operation)
+                {
+                    recovery.replied = true;
+                    recovery.error = result.as_ref().err().cloned();
+                }
+                w.dispatch.finish(result, definite_rejection);
+                self.recover_run_actions();
                 self.dirty_session = true;
                 self.dirty_list = true;
-                if !acknowledged {
-                    self.refresh();
-                }
             }
             Pending::LiveContext(owner) => self.context_received(owner, result),
             Pending::StreamSubscribe(owner) => self.stream_subscribed(owner, result),
@@ -2711,6 +2729,7 @@ impl Engine {
             Pending::Subscribe => {
                 result?;
                 self.ready = true;
+                self.recover_run_actions();
                 self.dirty_list = true;
                 self.dirty_session = true;
                 self.updates.push(Update::Connection {
@@ -3301,6 +3320,7 @@ fn deliver(tx: &SyncSender<Update>, engine: &mut Engine) -> Result<(), String> {
 
 #[derive(Default)]
 struct Retained {
+    run_recoveries: Arc<std::sync::Mutex<HashMap<uuid::Uuid, run_actions::Recovery>>>,
     compacting: Arc<std::sync::Mutex<HashSet<String>>>,
     instance: uuid::Uuid,
     stream_epoch: Arc<AtomicU64>,
@@ -3331,6 +3351,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         connection,
     } = state;
     let Retained {
+        run_recoveries,
         compacting,
         active,
         page,
@@ -3345,6 +3366,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let _fork_connection_guard =
         session_fork::ConnectionGuard::new(forks.clone(), connection.load(Ordering::Acquire));
     let mut engine = Engine {
+        run_recoveries: run_recoveries.clone(),
         compacting: compacting.clone(),
         instance: *instance,
         reader: reader::Reader::new(*future_attempts),
@@ -3487,13 +3509,14 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
                         Some(Pending::RestoreSession(t)) if *ok && result.as_ref().is_some_and(|v| v["id"] == t.owner.session) => Some(Action { id: t.operation, session_id: t.owner.session.clone(), question_id: None }),
-                        Some(Pending::RunWrite(w)) if *ok && result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v)) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
+                        Some(Pending::RunWrite(w)) if run_actions::definite_rejection(&message) || (*ok && result.as_ref().is_some_and(|v| w.dispatch.acknowledged(v))) => Some(Action { id: w.dispatch.action.operation, session_id: w.dispatch.action.owner.session.clone(), question_id: None }),
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
                         Some(Pending::ReviewedAction {action,work,..}) if *ok && result.as_ref().is_some_and(|value| work.acknowledges_reviewed_send(value)) => Some(action.clone()),
                         Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
                         _ => None }, _ => None };
                     engine.receive(message)?;
+                    for action in engine.reconciled_actions.drain(..) { uncertain.remove(&action); }
                     ready.store(engine.ready, Ordering::Release);
                     if let Some(id) = answered { uncertain.remove(&id); }
                 }

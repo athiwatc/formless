@@ -1,6 +1,28 @@
 use super::*;
 use crate::run_actions::{Context, Dispatch, Owner, Target};
 
+#[derive(Clone, Debug)]
+pub(super) struct Recovery {
+    pub dispatch: Dispatch,
+    pub replied: bool,
+    pub error: Option<String>,
+}
+pub(super) fn definite_rejection(message: &ServerMessage) -> bool {
+    use formless_protocol::codes;
+    matches!(
+        message.error_code(),
+        Some(
+            codes::BAD_REQUEST
+                | codes::INVALID
+                | codes::BUSY
+                | codes::BUDGET
+                | codes::NOT_FOUND
+                | codes::PROTOCOL_MISMATCH
+                | codes::UNSUPPORTED
+        )
+    )
+}
+
 #[derive(Debug)]
 pub(super) struct Work {
     pub(super) sent_at: Option<std::time::Instant>,
@@ -17,6 +39,65 @@ impl Drop for Work {
     }
 }
 impl Engine {
+    pub(super) fn recover_run_actions(&mut self) {
+        if !self.ready {
+            return;
+        }
+        let recoveries = self
+            .run_recoveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|r| r.dispatch.unknown())
+            .cloned()
+            .collect::<Vec<_>>();
+        for recovery in recoveries {
+            if !self.pending.values().any(|p| matches!(p, Pending::RunReconcile(r) if r.dispatch.action.operation == recovery.dispatch.action.operation)) {
+                self.request(Request::GetSession { id: recovery.dispatch.action.owner.session.clone() }, Pending::RunReconcile(recovery));
+            }
+        }
+    }
+    pub(super) fn run_reconciled(&mut self, recovery: Recovery, value: Result<Value, String>) {
+        let Ok(value) = value else {
+            return;
+        };
+        let action = &recovery.dispatch.action;
+        let Ok(target) = Target::decode(&action.owner.session, &value) else {
+            return;
+        };
+        let changed_run = target.run.is_some() && target.run != action.target.run;
+        let confirmed = recovery.replied
+            || match action.kind {
+                crate::run_actions::Kind::Cwd => {
+                    target.cwd != action.target.cwd
+                        && target.cwd.as_deref() == Some(action.text.trim())
+                }
+                crate::run_actions::Kind::Edit => {
+                    changed_run && target.user.as_ref().is_some_and(|u| u.1 == action.text)
+                }
+                crate::run_actions::Kind::Retry => changed_run,
+                _ => false,
+            };
+        if !confirmed {
+            return;
+        }
+        let unchanged_error = (action.kind == crate::run_actions::Kind::Cwd
+            && target == action.target)
+            .then_some(recovery.error.as_deref())
+            .flatten();
+        recovery.dispatch.reconcile(unchanged_error);
+        self.reconciled_actions.push(Action {
+            id: action.operation,
+            session_id: action.owner.session.clone(),
+            question_id: None,
+        });
+        self.run_recoveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&action.operation);
+        self.dirty_list = true;
+        self.dirty_session = true;
+    }
     pub(super) fn compaction_pending(&self, session: &str) -> bool {
         self.compacting
             .lock()
@@ -286,6 +367,17 @@ impl Engine {
         }
         w.sent = true;
         w.sent_at = Some(std::time::Instant::now());
+        self.run_recoveries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                w.dispatch.action.operation,
+                Recovery {
+                    dispatch: w.dispatch.clone(),
+                    replied: false,
+                    error: None,
+                },
+            );
         if w.dispatch.action.kind == crate::run_actions::Kind::Compact {
             self.compacting
                 .lock()
@@ -658,7 +750,81 @@ mod tests {
             .outgoing
             .iter()
             .any(|r| matches!(r.request, Request::SetSessionCwd { .. })));
-        assert!(ledger.reserve(d.action).is_err());
+        assert!(ledger.reserve(d.action.clone()).is_err());
+        let mut canonical = snapshot();
+        canonical["session"]["cwd"] = json!("/persisted");
+        reply(&mut e, canonical);
+        assert_eq!(ledger.status(), Status::Reconciled);
+        assert!(e.run_recoveries.lock().unwrap().is_empty());
+        let mut uncertain = HashSet::from([crate::client::Action {
+            id: d.action.operation,
+            session_id: "s".into(),
+            question_id: None,
+        }]);
+        for action in e.reconciled_actions.drain(..) {
+            uncertain.remove(&action);
+        }
+        assert!(!e.blocked_by_unknown(&Command::PrepareRunAction(d.clone()), &uncertain));
+        let mut next = d.action;
+        next.operation = uuid::Uuid::new_v4();
+        assert!(ledger.reserve(next).is_ok());
+    }
+    #[test]
+    fn prewrite_rejections_and_unchanged_cwd_fail_definitely() {
+        for code in [Some(formless_protocol::codes::INVALID), None] {
+            let (mut e, ledger, d) = setup(Kind::Cwd);
+            review(&mut e, d.clone(), false);
+            e.command(Command::ConfirmRunAction(d.action.operation));
+            e.command(Command::CommitRunAction(d.action.operation));
+            reply(&mut e, snapshot());
+            let request = e.outgoing.pop_front().unwrap();
+            assert!(e.action_before_write(request.id));
+            e.receive(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: code.map(|c| json!({"code":c})),
+                error: Some("no directory '/missing'".into()),
+            })
+            .unwrap();
+            if code.is_none() {
+                assert_eq!(ledger.status(), Status::Unknown);
+                reply(&mut e, snapshot());
+            }
+            assert!(matches!(ledger.status(), Status::Rejected(_)));
+            assert!(e.run_recoveries.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn canonical_recovery_requires_valid_state_and_never_replays_a_write() {
+        let (mut e, ledger, d) = setup(Kind::Cwd);
+        review(&mut e, d.clone(), false);
+        e.command(Command::ConfirmRunAction(d.action.operation));
+        e.command(Command::CommitRunAction(d.action.operation));
+        reply(&mut e, snapshot());
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(e.action_before_write(request.id));
+        let recoveries = e.run_recoveries.clone();
+        drop(e);
+        assert_eq!(ledger.status(), Status::Unknown);
+        let (mut e, _, _) = setup(Kind::Cwd);
+        e.run_recoveries = recoveries;
+        for value in [json!({}), snapshot()] {
+            e.recover_run_actions();
+            assert!(matches!(reply(&mut e, value), Request::GetSession { .. }));
+            assert_eq!(ledger.status(), Status::Unknown);
+            assert!(e.reconciled_actions.is_empty());
+            assert!(e.outgoing.is_empty());
+        }
+        e.recover_run_actions();
+        let request = e.outgoing.pop_front().unwrap();
+        e.receive(ServerMessage::err_code(
+            request.id,
+            formless_protocol::codes::NOT_FOUND,
+            "missing".into(),
+        ))
+        .unwrap();
+        assert_eq!(ledger.status(), Status::Unknown);
+        assert!(e.outgoing.is_empty());
     }
     #[test]
     fn context_reads_are_coalesced_and_old_selection_replies_are_discarded() {
