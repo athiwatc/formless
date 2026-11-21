@@ -60,7 +60,7 @@ fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
                 None,
                 None,
                 &[],
-                "capability",
+                &"c".repeat(64),
                 Path::new("/topic/repo"),
             )
             .unwrap();
