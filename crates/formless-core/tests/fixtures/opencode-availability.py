@@ -1,0 +1,25 @@
+#!/usr/bin/python3
+import os
+import sys
+import time
+
+assert sys.argv[1:] == ["--version"]
+assert os.environ["AVAILABILITY_ENV"] == "provided"
+mode = os.environ.get("AVAILABILITY_MODE", "normal")
+if mode == "hang":
+    with open(os.environ["AVAILABILITY_PID"], "w") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(30)
+elif mode == "empty":
+    pass
+elif mode == "error":
+    print("dummy-credential-not-for-logs", file=sys.stderr)
+    sys.exit(1)
+elif mode == "malformed":
+    print("opencode v2.3.2 dummy-credential-not-for-logs")
+elif mode == "oversized":
+    print("x" * 10000)
+elif mode == "old":
+    print("opencode v1.0.0")
+else:
+    print("opencode v2.3.2")

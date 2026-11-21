@@ -25,10 +25,19 @@
 //! directory containing work/), then run the ignored real_binary_acp_permissions_and_read_only
 //! test with --nocapture. It uses fresh HOME/XDG directories and the default free model.
 
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    io::Read,
+    path::PathBuf,
+    process::{Command, Stdio},
+    sync::{mpsc, Arc},
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
-use formless_protocol::{Question, QuestionAnswer, QuestionOption};
+use formless_protocol::{HarnessAvailability, Question, QuestionAnswer, QuestionOption};
+use formless_runtime::process_group::SupervisedProcess;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +60,83 @@ pub const SPEC: AgentSpec = AgentSpec {
     bridge_tool: acp::no_bridge_tools,
     vendor_request,
 };
+
+#[cfg(not(test))]
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Queries only the CLI version: credential discovery initializes providers and
+/// performs network requests, so readiness must not run it.
+pub fn availability(
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> HarnessAvailability {
+    let version = probe_version(executable, environment);
+    let (installed, version, error) = match version {
+        Ok(version) => {
+            let compatible =
+                acp::parse_version(&version).is_some_and(|v| v.0 == 2 && v >= (2, 3, 2));
+            (
+                true,
+                Some(version),
+                (!compatible).then_some("This adapter requires OpenCode V2 >= 2.3.2."),
+            )
+        }
+        Err(error) => (false, None, Some(error)),
+    };
+    let detail = "OpenCode can use its free default model without credentials. Credential status is unknown: auth list initializes providers and makes network requests.";
+    HarnessAvailability {
+        kind: super::HarnessKind::OpenCode,
+        acp_agent: None,
+        installed,
+        signed_in: None,
+        version,
+        detail: Some(match error {
+            Some(error) => format!("{error} {detail}"),
+            None => detail.to_owned(),
+        }),
+    }
+}
+
+fn probe_version(
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> std::result::Result<String, &'static str> {
+    let mut command = Command::new(executable.unwrap_or_else(|| SPEC.program.into()));
+    command
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .envs(environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut process = SupervisedProcess::spawn(command)
+        .map_err(|_| "OpenCode executable could not be started.")?;
+    let (_, stdout, _) = process.take_pipes();
+    let stdout = stdout.ok_or("OpenCode version output is unavailable.")?;
+    let (send, receive) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout.take(4097).read_to_end(&mut output).map(|_| output);
+        let _ = send.send(result);
+    });
+    let output = receive
+        .recv_timeout(AVAILABILITY_TIMEOUT)
+        .map_err(|_| "OpenCode version probe timed out or disconnected.")?
+        .map_err(|_| "OpenCode version output could not be read.")?;
+    drop(process);
+    if output.len() > 4096 {
+        return Err("OpenCode version output exceeded the limit.");
+    }
+    let version = std::str::from_utf8(&output)
+        .ok()
+        .and_then(|s| s.trim().strip_prefix("opencode v"))
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .filter(|s| acp::parse_version(s).is_some())
+        .ok_or("OpenCode did not report a recognizable CLI version.")?;
+    Ok(version.to_owned())
+}
 
 /// Runs the shared blocking ACP driver off the async core's executor.
 pub async fn run(

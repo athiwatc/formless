@@ -409,6 +409,67 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
+#[test]
+fn availability_checks_version_without_discovering_credentials_and_bounds_hanging_probes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fl-opencode-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let executable = dir.join("opencode");
+    std::fs::copy(fixture("opencode-availability.py"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut environment = BTreeMap::from([
+        ("AVAILABILITY_ENV".into(), "provided".into()),
+        ("PATH".into(), dir.clone().into_os_string()),
+        (
+            "ANTHROPIC_API_KEY".into(),
+            "dummy-credential-not-for-logs".into(),
+        ),
+    ]);
+    for (mode, installed, version) in [
+        ("normal", true, Some("2.3.2")),
+        ("old", true, Some("1.0.0")),
+        ("empty", false, None),
+        ("error", false, None),
+        ("malformed", false, None),
+        ("oversized", false, None),
+    ] {
+        environment.insert("AVAILABILITY_MODE".into(), mode.into());
+        let result = availability(Some(executable.clone()), &environment);
+        assert_eq!(result.kind, HarnessKind::OpenCode);
+        assert_eq!(result.acp_agent, None);
+        assert_eq!(result.installed, installed, "{mode}: {result:?}");
+        assert_eq!(result.version.as_deref(), version);
+        assert_eq!(result.signed_in, None);
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("free default model"));
+        assert!(!detail.contains("dummy-credential"));
+    }
+    environment.insert("AVAILABILITY_MODE".into(), "normal".into());
+    assert!(availability(None, &environment).installed);
+    environment.remove(&OsString::from("ANTHROPIC_API_KEY"));
+    assert_eq!(availability(None, &environment).signed_in, None);
+    assert!(!availability(Some(dir.join("missing")), &environment).installed);
+    let pid_file = dir.join("probe-pid");
+    environment.insert("AVAILABILITY_MODE".into(), "hang".into());
+    environment.insert("AVAILABILITY_PID".into(), pid_file.clone().into_os_string());
+    let started = std::time::Instant::now();
+    let result = availability(Some(executable), &environment);
+    assert!(!result.installed);
+    assert!(result.detail.unwrap().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let pid = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn aborting_run_cancels_the_blocking_task_without_cancelling_caller() {
     use std::os::unix::fs::PermissionsExt;
