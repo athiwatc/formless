@@ -2314,14 +2314,22 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 String::from_utf8_lossy(&out.stderr)
             );
             if json {
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
-                    grouped_usage()
-                );
+                let expected = serde_json::to_string_pretty(&grouped_usage()).unwrap() + "\n";
+                assert_eq!(out.stdout, expected.into_bytes());
             } else {
                 let text = String::from_utf8(out.stdout).unwrap();
+                assert_eq!(
+                    text.contains("DAY (UTC)"),
+                    group.is_none() || group == Some("day")
+                );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
-                assert!(text.contains('-') && text.contains("0.125"));
+                let cost = |key| {
+                    text.lines()
+                        .find(|line| line.starts_with(key))
+                        .and_then(|line| line.split_whitespace().last())
+                };
+                assert_eq!(cost("日本語"), Some("-"));
+                assert_eq!(cost("ไทย"), Some("$0.125000"));
                 assert!(
                     !text.contains('\x1b'),
                     "redirected usage must be plain: {text:?}"
