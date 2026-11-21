@@ -227,9 +227,7 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
 
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
-    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id)
     FROM runs WHERE id=?1";
 const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
 const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
@@ -3367,13 +3365,23 @@ impl Store {
     }
 
     fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+        let Some(mut run) = self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
             "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-        }))).optional().map_err(Into::into)
+            "tool_calls":r.get::<_,i64>(9)?
+        }))).optional()? else {
+            return Ok(None);
+        };
+        let usage = self.run_usage(id)?;
+        // Preserve the signed SQLite totals already returned by GetRun.
+        run["prompt_tokens"] = serde_json::json!(usage.prompt_tokens as i64);
+        run["completion_tokens"] = serde_json::json!(usage.completion_tokens as i64);
+        run["cached_tokens"] = serde_json::json!(usage.cached_tokens);
+        run["cache_write_tokens"] = serde_json::json!(usage.cache_write_tokens);
+        run["reasoning_tokens"] = serde_json::json!(usage.reasoning_tokens);
+        Ok(Some(run))
     }
 
     pub fn run_metrics_for(

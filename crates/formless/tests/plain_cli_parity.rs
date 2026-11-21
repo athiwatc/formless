@@ -2454,9 +2454,9 @@ fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete
                 }
                 if status == "paused" {
                     assert!(
-                        text.contains("Known USD subtotal: 0.25")
+                        text.contains("Known USD subtotal: $0.250000")
                             && text.contains("Total USD: -")
-                            && text.contains("Spend complete: false")
+                            && text.contains("Spend complete: no")
                     );
                 }
             }

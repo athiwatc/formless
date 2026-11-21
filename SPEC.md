@@ -6822,6 +6822,11 @@ human-detail layout change leaves fetching, metrics and security fields intact.
 The existing GetTool all-version payload remains until protocol selectors
 are addressed separately (#889).
 
+Run inspection includes recorded cache-read, cache-write and reasoning token
+counts. The human `runs show` report derives duration from the stored timestamps,
+shows estimated USD amounts with six decimal places, and formats spend flags
+and unpriced model names for reading.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
