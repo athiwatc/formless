@@ -24,6 +24,15 @@ fn run_report() -> Value {
     json!({"summary":{"runs":4,"completed":0.5,"interrupted":0.25,"paused":0.25,"edited":0.0,"corrected":0.0,"avg_steps":4.0,"avg_tool_calls":2.0,"avg_tokens":100.0,"avg_duration_ms":1200.0},"runs":rows,"future":{"preserved":true}})
 }
 
+type ToolRunReply = Result<Value, &'static str>;
+
+fn tool_run_response(id: u64, reply: ToolRunReply) -> Value {
+    match reply {
+        Ok(value) => json!({"kind":"response","id":id,"ok":true,"result":value}),
+        Err(error) => json!({"kind":"response","id":id,"ok":false,"error":error}),
+    }
+}
+
 struct Fixture {
     root: std::path::PathBuf,
     stop: Arc<AtomicBool>,
@@ -36,6 +45,7 @@ struct Fixture {
     gc_failure: Arc<AtomicBool>,
     session_rows: Arc<Mutex<Value>>,
     organization_failure: Arc<AtomicBool>,
+    tool_run_reply: Arc<Mutex<Option<ToolRunReply>>>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -97,6 +107,8 @@ impl Fixture {
         let invocation_reply = invocations.clone();
         let invocation_error = Arc::new(AtomicBool::new(false));
         let fail_invocations = invocation_error.clone();
+        let tool_run_reply = Arc::new(Mutex::new(None::<ToolRunReply>));
+        let tool_result = tool_run_reply.clone();
         let thread = std::thread::spawn(move || {
             let serve = |socket| {
                 let mut socket = FixtureStream::new(
@@ -108,6 +120,7 @@ impl Fixture {
                 .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut line = String::new();
+                let mut awaiting_tool_approval = None;
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     if fail_organization.load(Ordering::SeqCst)
@@ -159,7 +172,62 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    if let Request::RunTool { id, session_id, .. }
+                    | Request::DryRunTool { id, session_id, .. } = &envelope.request
+                    {
+                        assert_eq!(id, "full-tool-id");
+                        assert_eq!(session_id, "owned-tool-session");
+                        let fixture_reply = tool_result.lock().unwrap().clone();
+                        let reply = if let Some(fixture_reply) = fixture_reply {
+                            tool_run_response(envelope.id, fixture_reply)
+                        } else if matches!(&envelope.request, Request::RunTool { .. }) {
+                            assert!(awaiting_tool_approval.replace(envelope.id).is_none());
+                            json!({
+                                "kind": "event", "type": "approval_requested",
+                                "approval_id": "fixture-approval", "session_id": session_id,
+                                "tool_name": "FetchPage", "version": 1,
+                                "capabilities": ["fixture-capability"], "memory_mb": 16
+                            })
+                        } else {
+                            tool_run_response(
+                                envelope.id,
+                                Ok(json!({"ok":true,"result":"synthetic preview","effects":[]})),
+                            )
+                        };
+                        seen.lock().unwrap().push(envelope.request);
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
+                    if let Request::ApprovalDecision { approved, .. } = &envelope.request {
+                        let run = awaiting_tool_approval
+                            .take()
+                            .expect("private mock Tool Run");
+                        let result = if *approved {
+                            Ok(json!({"ok":true,"result":"synthetic result"}))
+                        } else {
+                            Err("fixture call denied")
+                        };
+                        let reply = tool_run_response(run, result);
+                        seen.lock().unwrap().push(envelope.request);
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::CreateSession { name } => {
+                            assert_eq!(name.as_deref(), Some("tools run FetchPage"));
+                            json!({"id":"owned-tool-session"})
+                        }
+                        Request::SetSessionArchived { id, archived } => {
+                            assert_eq!(id, "owned-tool-session");
+                            assert!(*archived);
+                            json!({})
+                        }
                         Request::SetSessionPinned { id, pinned } => {
                             organization_reply(id, Some(!pinned), false)
                         }
@@ -190,6 +258,20 @@ impl Fixture {
                             json!([])
                         }
                         Request::ListTools => tool_rows.clone(),
+                        Request::SetToolTags { id, tags } => {
+                            let mut tool = tool_rows
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|row| row["id"] == *id)
+                                .unwrap()
+                                .clone();
+                            tool["tags"] = json!(tags
+                                .iter()
+                                .map(|tag| tag.to_ascii_lowercase())
+                                .collect::<Vec<_>>());
+                            tool
+                        }
                         Request::ExportTool { id } => {
                             assert_eq!(id, "full-tool-id");
                             json!({"fixture":"unchanged bundle"})
@@ -255,6 +337,9 @@ impl Fixture {
                         Request::SearchSessions { .. } => timestamp_search_hits(),
                         Request::ListApprovals => timestamp_grants(),
                         Request::ListDenials => timestamp_denials(),
+                        Request::ForgetDenial { capability } => {
+                            json!({"forgotten": if capability.is_some() { 1 } else { 3 }})
+                        }
                         Request::ListRelayClients => timestamp_devices(),
                         Request::ListJobs => timestamp_jobs(),
                         Request::JobRuns { id, .. } => timestamp_job_runs(id),
@@ -389,6 +474,7 @@ impl Fixture {
             gc_failure,
             session_rows,
             organization_failure,
+            tool_run_reply,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -420,8 +506,18 @@ impl Fixture {
         Self::capture(command)
     }
 
-    fn capture(mut command: Command) -> std::process::Output {
+    fn capture(command: Command) -> std::process::Output {
+        Self::capture_with_input(command, None)
+    }
+
+    fn capture_with_input(mut command: Command, input: Option<&[u8]>) -> std::process::Output {
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child.stdin.take().unwrap().write_all(input).unwrap();
+        }
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let out = std::thread::spawn(move || {
@@ -465,6 +561,129 @@ fn module_detail() -> Value {
         {"version":1,"author":"user","created_at":"first","code":"// source 日本語\n"},
         {"version":2,"author":"agent","created_at":"last","code":"// source ไทย"}
     ],"used_by":["alpha","日本語 tool"],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_tool_run_json_preserves_replies_verdicts_and_cleanup() {
+    let fixture = Fixture::new();
+    let text = "{\n  \"argument\": \"ข้อความไทย\",\n  \"nested\": [\"น้ำ\", null, 3]\n}";
+    let input: Value = serde_json::from_str(text).unwrap();
+    let file = fixture.root.join("คำขอ.json");
+    std::fs::write(&file, text.as_bytes()).unwrap();
+    for (source, stdin) in [
+        (["--input", text], None),
+        (["--input-file", file.to_str().unwrap()], None),
+        (["--input-file", "-"], Some(text.as_bytes())),
+    ] {
+        let run = |dry_run: bool, json: bool, reply: ToolRunReply| {
+            *fixture.tool_run_reply.lock().unwrap() = Some(reply);
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["tools", "run", "FetchPage"];
+            args.extend(source);
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if json {
+                args.push("--json");
+            }
+            let output = Fixture::capture_with_input(fixture.command(&args), stdin);
+            let requests = fixture.requests.lock().unwrap();
+            let [Request::ListTools, Request::CreateSession { .. }, invocation, Request::SetSessionArchived {
+                id: archived_id,
+                archived: true,
+            }] = &requests[..]
+            else {
+                panic!("unexpected request sequence for {source:?}: {requests:?}");
+            };
+            let (id, actual, session_id) = match invocation {
+                Request::RunTool {
+                    id,
+                    input,
+                    session_id,
+                } if !dry_run => (id, input, session_id),
+                Request::DryRunTool {
+                    id,
+                    input,
+                    session_id,
+                } if dry_run => (id, input, session_id),
+                _ => panic!("unexpected Tool Run request for {source:?}: {invocation:?}"),
+            };
+            assert_eq!(id, "full-tool-id");
+            assert_eq!(actual, &input, "{source:?}");
+            assert_eq!(session_id, "owned-tool-session");
+            assert_eq!(archived_id, session_id);
+            output
+        };
+        let text_json = json!({"ok":true,"result":"  {\"text\": \"ไทย 🦀\"}\n","extra":{"n":0}});
+        for (dry_run, status, value) in [
+            (
+                false,
+                0,
+                json!({"ok":true,"result":"error is part of this successful text"}),
+            ),
+            (false, 0, text_json.clone()),
+            (
+                false,
+                1,
+                json!({"ok":false,"result":"unavailable","extra":null}),
+            ),
+            (false, 1, json!({"result":"\n error: legacy"})),
+            (false, 0, json!({"result":"ordinary legacy reply"})),
+            (
+                true,
+                0,
+                json!({"ok":true,"result":{"text":"ไทย","n":false},"effects":["write fixture"],"logs":["debug ไทย"],"extra":{"kept":true}}),
+            ),
+            (
+                true,
+                1,
+                json!({"ok":false,"error":"preview failed","effects":[],"logs":["fixture report"]}),
+            ),
+        ] {
+            let out = run(dry_run, true, Ok(value.clone()));
+            assert_eq!(out.status.code(), Some(status), "{:?}", out.stderr);
+            assert_eq!(
+                out.stdout,
+                format!("{}\n", serde_json::to_string_pretty(&value).unwrap()).into_bytes()
+            );
+            assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+        }
+        for dry_run in [false, true] {
+            for json in [false, true] {
+                let out = run(dry_run, json, Err("mock request refused"));
+                assert_eq!(out.status.code(), Some(1));
+                assert_eq!(out.stderr, b"mock request refused\n");
+                assert!(out.stdout.is_empty());
+            }
+        }
+        let human = run(false, false, Ok(text_json));
+        assert!(human.stderr.is_empty());
+        assert_eq!(human.stdout, "{\n  \"text\": \"ไทย 🦀\"\n}\n".as_bytes());
+        assert_eq!(human.status.code(), Some(0));
+        let dry_success = run(
+            true,
+            false,
+            Ok(json!({
+                "ok":true,"result":{"text":"ไทย"},"effects":[],"logs":["not printed in human mode"]
+            })),
+        );
+        assert_eq!(dry_success.status.code(), Some(0));
+        assert_eq!(dry_success.stdout, "{\n  \"text\": \"ไทย\"\n}\n".as_bytes());
+        assert_eq!(
+            dry_success.stderr,
+            b"dry run: nothing was changed.\nit would have had no side effects\n"
+        );
+        let human_dry = run(
+            true,
+            false,
+            Ok(
+                json!({"ok":false,"error":"preview failed","effects":["write fixture"],"logs":["invisible"]}),
+            ),
+        );
+        assert_eq!(human_dry.status.code(), Some(1));
+        assert!(human_dry.stdout.is_empty());
+        assert_eq!(human_dry.stderr, b"dry run: nothing was changed.\nit would have:\n  - write fixture\nerror: preview failed\n");
+    }
 }
 
 #[test]
@@ -1039,6 +1258,60 @@ fn timestamp_grants() -> Value {
         "expires_at":"2026-11-01T10:00:00+07:00",
         "last_used":"2026-10-31T23:15:00-03:30"
     }])
+}
+
+#[test]
+fn shipped_denials_reject_conflicting_mutations_and_honor_json() {
+    let fixture = Fixture::new();
+    let capability = "net:fixture.example";
+    let conflict = fixture.run(&["approvals", "denials", "--forget", capability, "--all"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+    let error = String::from_utf8(conflict.stderr).unwrap();
+    assert!(
+        error.contains("--forget") && error.contains("--all"),
+        "{error}"
+    );
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+
+    for (flags, expected_capability, count) in [
+        (vec!["--all"], None, 3),
+        (vec!["--forget", capability], Some(capability), 1),
+    ] {
+        let mut args = vec!["approvals", "denials"];
+        args.extend(flags);
+        let human = fixture.run(&args);
+        assert!(human.status.success(), "{:?}", human);
+        assert_eq!(
+            String::from_utf8(human.stdout).unwrap(),
+            format!("forgot {count} denial(s); the next use asks again\n"),
+        );
+        args.push("--json");
+        let machine = fixture.run(&args);
+        assert!(machine.status.success(), "{:?}", machine);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+            json!({"forgotten": count}),
+        );
+        let requests = fixture.requests.lock().unwrap();
+        let sent: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::ForgetDenial { capability } => Some(capability.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [expected_capability; 2]);
+        drop(requests);
+        fixture.requests.lock().unwrap().clear();
+    }
+
+    let list = fixture.run(&["approvals", "denials", "--json"]);
+    assert!(list.status.success(), "{:?}", list);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&list.stdout).unwrap(),
+        timestamp_denials()
+    );
 }
 
 fn timestamp_denials() -> Value {
@@ -2257,14 +2530,22 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 String::from_utf8_lossy(&out.stderr)
             );
             if json {
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
-                    grouped_usage()
-                );
+                let expected = serde_json::to_string_pretty(&grouped_usage()).unwrap() + "\n";
+                assert_eq!(out.stdout, expected.into_bytes());
             } else {
                 let text = String::from_utf8(out.stdout).unwrap();
+                assert_eq!(
+                    text.contains("DAY (UTC)"),
+                    group.is_none() || group == Some("day")
+                );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
-                assert!(text.contains('-') && text.contains("0.125"));
+                let cost = |key| {
+                    text.lines()
+                        .find(|line| line.starts_with(key))
+                        .and_then(|line| line.split_whitespace().last())
+                };
+                assert_eq!(cost("日本語"), Some("-"));
+                assert_eq!(cost("ไทย"), Some("$0.125000"));
                 assert!(
                     !text.contains('\x1b'),
                     "redirected usage must be plain: {text:?}"
@@ -2336,21 +2617,20 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
                 "Invocation ID: invocation-full-id",
                 "Elapsed: 1.234s",
                 "Silent: 0.000s",
-                "Elapsed: 86400.001s",
-                "Silent: 60.001s",
+                "Elapsed: 24h",
+                "Silent: 1m",
                 "Stalled: yes",
                 "Stalled: no",
                 "Abandoned: no",
                 "Abandoned: yes — no longer awaited; may still finish",
-                "Progress fraction: 0",
-                "Progress label: label only\\u{9}ไทย",
+                "Progress: 0%",
+                "Progress: label only\\u{9}ไทย",
                 "日本語\\u{1b}[31m",
                 "Session: session\\u{a}full",
             ] {
                 assert!(text.contains(expected), "missing {expected:?}: {text}");
             }
-            assert_eq!(text.matches("Progress fraction:").count(), 1);
-            assert_eq!(text.matches("Progress label:").count(), 1);
+            assert_eq!(text.matches("Progress:").count(), 2);
             assert!(!text.contains('\u{1b}'));
         }
         let requests = fixture.requests.lock().unwrap();
@@ -2397,6 +2677,45 @@ impl Drop for Fixture {
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn shipped_tool_tag_only_mutates_for_positional_tags_or_explicit_clear() {
+    let mut tool = detail_tool("full-tool-id", "FetchPage", 1);
+    tool["tags"] = json!(["web", "stored\u{202e}tag"]);
+    let fixture = Fixture::with_tools(json!([tool]));
+
+    let conflict = fixture.run(&["tools", "tag", "FetchPage", "web", "--clear"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(fixture.requests.lock().unwrap().is_empty());
+
+    let read = fixture.run(&["tools", "tag", "FetchPage"]);
+    assert!(read.status.success(), "{read:?}");
+    assert_eq!(read.stdout, b"FetchPage: web stored\\u{202e}tag\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools]
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let cleared = fixture.run(&["tools", "tag", "FetchPage", "--clear"]);
+    assert!(cleared.status.success(), "{cleared:?}");
+    assert_eq!(cleared.stdout, b"FetchPage: no tags\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags.is_empty()
+    ));
+
+    fixture.requests.lock().unwrap().clear();
+    let replaced = fixture.run(&["tools", "tag", "full-tool-id", "HTTP", "Docs"]);
+    assert!(replaced.status.success(), "{replaced:?}");
+    assert_eq!(replaced.stdout, b"FetchPage: http docs\n");
+    assert!(matches!(
+        &fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::SetToolTags { id, tags }]
+            if id == "full-tool-id" && tags == &["HTTP", "Docs"]
+    ));
 }
 
 #[test]
@@ -2866,4 +3185,138 @@ fn shipped_run_list_retains_report_json_summary_order_and_numeric_units() {
             since: None
         }
     )));
+}
+
+#[test]
+fn shipped_tool_run_input_sources_keep_dispatch_and_once_approval() {
+    let fixture = Fixture::new();
+    let file = fixture.root.join("input.json");
+    let text = "{\n  \"argument\": \"ไทย 日本語\"\n}";
+    let input: Value = serde_json::from_str(text).unwrap();
+    std::fs::write(&file, text).unwrap();
+    let file = file.to_str().unwrap();
+    for (args, stdin, expected, approved) in [
+        (vec!["--input", text, "--yes"], None, input.clone(), true),
+        (
+            vec!["--input-file", file, "--yes"],
+            None,
+            input.clone(),
+            true,
+        ),
+        (
+            vec!["--input-file", "-", "--yes"],
+            Some(text.as_bytes()),
+            input.clone(),
+            true,
+        ),
+        (vec!["--yes"], None, json!({}), true),
+        (vec!["--input-file", file], None, input.clone(), false),
+    ] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut command_args = ["tools", "run", "FetchPage"]
+                .into_iter()
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>();
+            if json {
+                command_args.push("--json");
+            }
+            let out = Fixture::capture_with_input(fixture.command(&command_args), stdin);
+            assert_eq!(out.status.code(), Some(i32::from(!approved)), "{out:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            if approved {
+                let expected_stdout = if json {
+                    format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(
+                            &json!({"ok":true,"result":"synthetic result"})
+                        )
+                        .unwrap()
+                    )
+                } else {
+                    "synthetic result\n".into()
+                };
+                assert_eq!(out.stdout, expected_stdout.as_bytes());
+                assert_eq!(stderr, "[approval] FetchPage wants fixture-capability -> sending approval for this call (--yes)\n");
+            } else {
+                assert!(out.stdout.is_empty());
+                assert_eq!(stderr, "[approval] FetchPage wants fixture-capability -> sending denial (pass --yes)\nfixture call denied\n");
+            }
+            use formless_protocol::ApprovalScope;
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [
+                    Request::ListTools,
+                    Request::CreateSession { .. },
+                    Request::RunTool { id, input, session_id },
+                    Request::ApprovalDecision { approval_id, approved: actual, scope: ApprovalScope::Once, remember_denial: false, .. },
+                    Request::SetSessionArchived { id: archived_id, archived: true }
+                ] if id == "full-tool-id" && *input == expected
+                    && session_id == "owned-tool-session"
+                    && archived_id == session_id && approval_id == "fixture-approval"
+                    && *actual == approved
+            ));
+        }
+    }
+    fixture.requests.lock().unwrap().clear();
+    let preview = fixture.run(&[
+        "tools",
+        "run",
+        "FetchPage",
+        "--input-file",
+        file,
+        "--dry-run",
+    ]);
+    assert!(preview.status.success(), "{preview:?}");
+    assert!(matches!(&fixture.requests.lock().unwrap()[..],
+        [Request::ListTools, Request::CreateSession{..}, Request::DryRunTool{input:actual,..}, Request::SetSessionArchived{..}]
+        if *actual == input));
+}
+
+#[test]
+fn shipped_tool_run_rejects_bad_input_without_opening_a_profile_or_contacting_daemon() {
+    let fixture = Fixture::new();
+    let input = fixture.root.join("invalid.json");
+    let missing = fixture.root.join("missing.json");
+    let absent = fixture.root.join("absent");
+    let connected = fixture.connections.load(Ordering::SeqCst);
+    let check = |file: &str, data: Option<&[u8]>, hint: &str| {
+        for (existing, json) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut args = vec!["tools", "run", "FetchPage", "--input-file", file];
+            if json {
+                args.push("--json");
+            }
+            let mut command = fixture.command(&args);
+            if !existing {
+                command
+                    .env("FORMLESS_DATA_DIR", absent.join("data"))
+                    .env("FORMLESS_CONFIG_DIR", absent.join("config"));
+            }
+            let result = Fixture::capture_with_input(command, data);
+            assert_eq!(result.status.code(), Some(2), "{result:?}");
+            assert!(result.stdout.is_empty());
+            let error = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                error.contains(if file == "-" { "stdin" } else { file }),
+                "{error}"
+            );
+            assert!(error.contains(hint), "{error}");
+        }
+    };
+    check(missing.to_str().unwrap(), None, "cannot read");
+    check(fixture.root.to_str().unwrap(), None, "regular file");
+    for (data, hint) in [
+        (&[0xff][..], "UTF-8"),
+        (&b"invalid fixture payload"[..], "JSON object"),
+        (&b"[]"[..], "JSON object"),
+    ] {
+        std::fs::write(&input, data).unwrap();
+        check(input.to_str().unwrap(), None, hint);
+        check("-", Some(data), hint);
+    }
+    std::fs::write(&input, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    check(input.to_str().unwrap(), None, "1 MiB");
+    assert!(!absent.exists());
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), connected);
 }

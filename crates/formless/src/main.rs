@@ -31,6 +31,7 @@ mod cli_tool_filters;
 
 mod cli_runs_list;
 mod cli_tool_lookup;
+mod cli_tool_run_input;
 mod cli_tool_success;
 mod cli_update;
 mod cli_usage;
@@ -212,6 +213,9 @@ enum Cmd {
         /// Where to write it (default: ./formless-export-<date>.json)
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
+        /// Replace an existing file at the explicit output path
+        #[arg(long, requires = "output")]
+        overwrite: bool,
     },
     /// Free disk space: old artifacts and snapshots, long MCP logs, old
     /// migration copies, database free space
@@ -801,12 +805,15 @@ enum ToolsAction {
         /// Tool name or ID
         name: String,
     },
-    /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
+    /// Read or replace a Tool's tags
     Tag {
         /// Tool name or id
         name: String,
-        /// Tags to assign to this Tool; omit all tags to clear them
+        /// Replacement tags; omission only reads
         tags: Vec<String>,
+        /// Explicitly remove all tags
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
     Show {
@@ -852,9 +859,12 @@ enum ToolsAction {
     Run {
         /// Tool name or id
         name: String,
-        /// The input, a JSON object
-        #[arg(long, default_value = "{}")]
-        input: String,
+        /// Inline JSON object (the default is {} when neither input flag is used)
+        #[arg(long, value_name = "JSON", conflicts_with = "input_file")]
+        input: Option<String>,
+        /// Read a UTF-8 JSON object from a regular FILE or '-' (stdin), at most 1 MiB
+        #[arg(long, value_name = "FILE|-")]
+        input_file: Option<std::path::PathBuf>,
         /// Approve this run's Capabilities once (nothing is remembered)
         #[arg(long)]
         yes: bool,
@@ -865,6 +875,9 @@ enum ToolsAction {
         /// non-GET requests aren't made; prints what it would have done
         #[arg(long)]
         dry_run: bool,
+        /// Print the complete Tool result from the daemon as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Write one Tool or the whole registry as an importable bundle
     Export {
@@ -1458,7 +1471,7 @@ enum ApprovalsAction {
         #[arg(long)]
         forget: Option<String>,
         /// Forget every stored permanent denial
-        #[arg(long)]
+        #[arg(long, conflicts_with = "forget")]
         all: bool,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -1509,10 +1522,14 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
         ApprovalsAction::Denials { forget, all, json } => {
             if forget.is_some() || all {
                 let r = request_once(paths, Request::ForgetDenial { capability: forget })?;
-                println!(
-                    "forgot {} denial(s); the next use asks again",
-                    r["forgotten"]
-                );
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&r)?);
+                } else {
+                    println!(
+                        "forgot {} denial(s); the next use asks again",
+                        r["forgotten"]
+                    );
+                }
                 return Ok(());
             }
             let list: Vec<formless_protocol::DenialInfo> =
@@ -2058,6 +2075,19 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     // daemon connection. sessions_cmd validates again for direct callers.
     validate_cli_export_format(&cli)?;
     validate_mcp_prompt_args(&cli)?;
+    // Reject invalid Tool input before resolving a profile or connecting.
+    let tool_run_input = match &cli.cmd {
+        Some(Cmd::Tools {
+            action: ToolsAction::Run {
+                input, input_file, ..
+            },
+        }) => Some(cli_tool_run_input::prepare(
+            input.as_deref(),
+            input_file.as_deref(),
+            std::io::stdin(),
+        )?),
+        _ => None,
+    };
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -2493,7 +2523,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             check,
             json,
         }) => update_cmd(check || matches!(action, Some(UpdateAction::Check)), json),
-        Some(Cmd::Tools { action }) => tools_cmd(paths, action),
+        Some(Cmd::Tools { action }) => tools_cmd(paths, action, tool_run_input),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
         Some(Cmd::Uninstall {
@@ -2538,20 +2568,26 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Some(BackupAction::Restore { file, .. }) => restore_cmd(&paths, &file),
             Some(BackupAction::Drill { file }) => run_restore_drill(&paths, file),
         },
-        Some(Cmd::ExportAll { sessions, output }) => {
+        Some(Cmd::ExportAll {
+            sessions,
+            output,
+            overwrite,
+        }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
             let bundle =
                 formless_tui::client::request_once(&paths, Request::ExportAll { sessions })?;
             let file = output.unwrap_or_else(|| {
                 std::path::PathBuf::from(format!(
                     "formless-export-{}.json",
-                    chrono::Local::now().format("%Y%m%d-%H%M")
+                    chrono::Local::now().format("%Y%m%d-%H%M%S")
                 ))
             });
-            formless_core::config::write_secret_file(
-                &file,
-                &serde_json::to_string_pretty(&bundle)?,
-            )?;
+            let contents = serde_json::to_string_pretty(&bundle)?;
+            if overwrite {
+                formless_core::config::write_secret_file(&file, &contents)?;
+            } else {
+                write_new_bundle(&file, &contents)?;
+            }
             let n = |k: &str| bundle[k].as_array().map_or(0, Vec::len);
             println!("exported:  {}", file.display());
             println!(
@@ -2718,23 +2754,10 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 None if session.is_none() => std::env::current_dir().ok(),
                 None => None,
             };
-            let restore = match (&session, pick_was_set || cwd.is_some()) {
-                (Some(id), true) => {
-                    formless_core::daemon::ensure_daemon(&paths)?;
-                    let list: Vec<SessionInfo> = serde_json::from_value(
-                        formless_tui::client::request_once(&paths, Request::ListSessions)?,
-                    )?;
-                    list.into_iter().find(|s| &s.id == id)
-                }
-                _ => None,
-            };
-            // `--effort` alone keeps the Session's model.
-            let pick = if pipeline_mode { None } else { pick }.map(|(model, effort)| {
-                (
-                    model.or_else(|| restore.as_ref().and_then(|s| s.model.clone())),
-                    effort,
-                )
-            });
+            // Capture the restoration record from the same Session lookup
+            // that supplies the canonical ID for the Run.
+            let mut restore = None;
+            let pick = if pipeline_mode { None } else { pick };
             let code = run_headless(
                 paths.clone(),
                 task,
@@ -2750,6 +2773,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 max_steps,
                 prepared.options,
                 pipeline.output_file,
+                &mut restore,
             );
             if let Some(s) = restore {
                 if pick_was_set {
@@ -3073,8 +3097,35 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
+                #[cfg(unix)]
+                use tokio::signal::unix::{signal, SignalKind};
+                #[cfg(unix)]
+                let mut terminate = signal(SignalKind::terminate())?;
+                #[cfg(unix)]
+                let mut interrupt = signal(SignalKind::interrupt())?;
+                #[cfg(windows)]
+                let mut interrupt = tokio::signal::windows::ctrl_c()?;
+                // Keep the listeners alive during teardown so a second
+                // Windows Ctrl+C is still handled while cleanup finishes.
+                let stop_signal = async {
+                    #[cfg(unix)]
+                    tokio::select! {
+                        _ = terminate.recv() => {}
+                        _ = interrupt.recv() => {}
+                    }
+                    #[cfg(windows)]
+                    interrupt.recv().await;
+                };
                 let d = Arc::new(Daemon::new(paths)?);
-                d.serve().await
+                let serve = d.clone().serve();
+                tokio::pin!(serve);
+                tokio::select! {
+                    result = &mut serve => result,
+                    _ = stop_signal => {
+                        d.request_shutdown();
+                        serve.await
+                    }
+                }
             })
         }
         DaemonAction::InstallService { dry_run } => {
@@ -4678,6 +4729,25 @@ fn check_last_run_session(paths: &Paths, id: String) -> Result<String, String> {
     }
 }
 
+fn prepare_existing_headless_session(
+    session: SessionInfo,
+    pick: &mut Option<ModelPick>,
+    override_cwd: bool,
+    restore: &mut Option<SessionInfo>,
+) -> String {
+    let id = session.id.clone();
+    if let Some((model, _)) = pick {
+        // An effort-only override keeps the existing Session model.
+        if model.is_none() {
+            *model = session.model.clone();
+        }
+    }
+    if pick.is_some() || override_cwd {
+        *restore = Some(session);
+    }
+    id
+}
+
 fn last_run_session(paths: &Paths) -> Result<String, String> {
     let id = read_last_run_session_id(paths)?;
     formless_core::daemon::ensure_daemon(paths).map_err(|e| format!("{e:#}"))?;
@@ -4690,7 +4760,7 @@ fn run_headless(
     task: String,
     files: Vec<(String, Vec<u8>)>,
     session: Option<String>,
-    pick: Option<ModelPick>,
+    mut pick: Option<ModelPick>,
     dir: Option<std::path::PathBuf>,
     yes: bool,
     answer: Option<String>,
@@ -4700,6 +4770,7 @@ fn run_headless(
     max_steps: Option<u32>,
     options: formless_protocol::RunOptions,
     output_file: Option<std::path::PathBuf>,
+    restore: &mut Option<SessionInfo>,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let json_out = output == RunOutput::JsonlEvents;
@@ -4748,7 +4819,7 @@ fn run_headless(
     let session_id = match session {
         // An id, an id prefix or a name, confirmed to exist (#893).
         Some(id) => match find_session(&paths, &id) {
-            Ok(s) => s.id,
+            Ok(s) => prepare_existing_headless_session(s, &mut pick, dir.is_some(), restore),
             Err(e) => {
                 eprintln!("{e}");
                 return Ok(2);
@@ -5444,6 +5515,30 @@ fn description_reviews_cmd(
         }
     }
     Ok(())
+}
+
+fn write_new_bundle(path: &std::path::Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("stage export in {}", parent.display()))?;
+    staged.write_all(contents.as_bytes())?;
+    staged.as_file().sync_all()?;
+    match staged.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists. Choose a new output path or pass --overwrite with --output.",
+                path.display()
+            );
+        }
+        Err(error) => {
+            Err(error.error).with_context(|| format!("publish export {}", path.display()))
+        }
+    }
 }
 
 fn print_bundle_description_preview(paths: &Paths, bundle: &Value) -> Result<()> {
@@ -8167,19 +8262,8 @@ fn set_tool_pinned(paths: &Paths, name: &str, pinned: bool) -> Result<()> {
     Ok(())
 }
 
-fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
+fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -> Result<()> {
     use formless_tui::client::request_once;
-    // Checked here, before a daemon (and a database) is started (#896).
-    if let ToolsAction::Run { input, .. } = &action {
-        if !matches!(
-            serde_json::from_str(input),
-            Ok(serde_json::Value::Object(_))
-        ) {
-            return Err(usage(
-                "--input must be a JSON object, like '{\"url\": \"https://…\"}'",
-            ));
-        }
-    }
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
         ToolsAction::Diff {
@@ -8301,24 +8385,19 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         }
         ToolsAction::Run {
             name,
-            input,
             yes,
             session,
             dry_run,
+            json,
+            ..
         } => {
-            let input: serde_json::Value = match serde_json::from_str(&input) {
-                Ok(v @ serde_json::Value::Object(_)) => v,
-                _ => {
-                    eprintln!("--input must be a JSON object, like '{{\"url\": \"https://…\"}}'");
-                    std::process::exit(2);
-                }
-            };
+            let input = prepared_input.context("Tool Run input was not prepared")?;
             let tool = find_tool(&paths, &name)?;
             if let Err(e) = formless_tui::client::require_secure_daemon(&paths) {
                 eprintln!("error: {e:#}");
                 std::process::exit(2);
             }
-            let code = tool_run(&paths, tool, input, yes, session, dry_run)?;
+            let code = tool_run(&paths, tool, input, yes, session, dry_run, json)?;
             std::process::exit(code);
         }
         ToolsAction::Undo => {
@@ -8330,17 +8409,23 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         ToolsAction::Enable { name } => set_tool_disabled(&paths, &name, false),
         ToolsAction::Pin { name } => set_tool_pinned(&paths, &name, true),
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
-        ToolsAction::Tag { name, tags } => {
+        ToolsAction::Tag { name, tags, clear } => {
             let tool = find_tool(&paths, &name)?;
-            let t: formless_protocol::ToolInfo = serde_json::from_value(request_once(
-                &paths,
-                Request::SetToolTags { id: tool.id, tags },
-            )?)?;
-            if t.tags.is_empty() {
-                println!("{}: no tags", t.name);
+            let tool = if clear || !tags.is_empty() {
+                serde_json::from_value(request_once(
+                    &paths,
+                    Request::SetToolTags { id: tool.id, tags },
+                )?)?
             } else {
-                println!("{}: {}", t.name, t.tags.join(" "));
-            }
+                tool
+            };
+            let name = comparison_terminal_text(&tool.name);
+            let tags = if tool.tags.is_empty() {
+                "no tags".into()
+            } else {
+                comparison_terminal_text(&tool.tags.join(" "))
+            };
+            println!("{name}: {tags}");
             Ok(())
         }
         ToolsAction::Retire { name, force } => set_tool_retired(&paths, &name, true, force),
@@ -8822,6 +8907,7 @@ fn tool_run(
     yes: bool,
     session: Option<String>,
     dry_run: bool,
+    json: bool,
 ) -> Result<i32> {
     let (client, rx) = formless_tui::client::DaemonClient::connect(paths)?;
     let wait = |id: u64| -> Result<serde_json::Value> {
@@ -8928,6 +9014,7 @@ fn tool_run(
         let _ = wait(id);
     }
     match result {
+        Ok(v) if json => write_tool_run_json(&v, dry_run, &mut std::io::stdout().lock()),
         Ok(v) if dry_run => {
             let effects: Vec<&str> = v["effects"]
                 .as_array()
@@ -9010,6 +9097,21 @@ fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
         Ok(())
     }
     section(&cli, "formless", 1, out)
+}
+
+fn write_tool_run_json(
+    reply: &serde_json::Value,
+    dry_run: bool,
+    out: &mut impl Write,
+) -> Result<i32> {
+    serde_json::to_writer_pretty(&mut *out, reply)?;
+    writeln!(out)?;
+    out.flush()?;
+    Ok(if dry_run {
+        i32::from(reply["ok"] != true)
+    } else {
+        tool_run_exit(reply, reply["result"].as_str().unwrap_or_default())
+    })
 }
 
 /// `tools run`'s exit code: from the daemon's `ok` (#901); an older daemon
@@ -9352,6 +9454,78 @@ mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
+    fn override_fixture(id: &str, name: &str) -> super::SessionInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "model": "stored-model",
+            "reasoning_effort": "low",
+            "cwd": "stored-directory",
+            "created_at": "",
+            "updated_at": "",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn headless_overrides_use_the_resolved_target_and_snapshot() {
+        use super::{find_session_in, prepare_existing_headless_session};
+
+        let sessions = [
+            override_fixture("abc-one", "Primary"),
+            override_fixture("abc-two", "Other"),
+            override_fixture("xyz-three", "Other"),
+        ];
+        for selector in ["abc-one", "abc-o", "pRiMaRy"] {
+            let resolved = find_session_in(&sessions, selector).unwrap();
+            let mut pick = Some((None, Some("high".into())));
+            let mut restore = None;
+            let id = prepare_existing_headless_session(resolved, &mut pick, true, &mut restore);
+            assert_eq!(id, "abc-one");
+            assert_eq!(
+                pick,
+                Some((Some("stored-model".into()), Some("high".into())))
+            );
+            let snapshot = restore.unwrap();
+            assert_eq!(snapshot.id, id);
+            assert_eq!(snapshot.model.as_deref(), Some("stored-model"));
+            assert_eq!(snapshot.reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(snapshot.cwd.as_deref(), Some("stored-directory"));
+        }
+        for selector in ["abc-", "Other", "missing", ""] {
+            assert!(find_session_in(&sessions, selector).is_err());
+        }
+    }
+
+    #[test]
+    fn headless_snapshot_is_needed_only_for_temporary_overrides() {
+        use super::prepare_existing_headless_session;
+
+        let mut pick = None;
+        for override_cwd in [false, true] {
+            let mut restore = None;
+            let id = prepare_existing_headless_session(
+                override_fixture("abc-one", "Primary"),
+                &mut pick,
+                override_cwd,
+                &mut restore,
+            );
+            assert_eq!(id, "abc-one");
+            assert!(pick.is_none());
+            assert_eq!(restore.is_some(), override_cwd);
+        }
+        let mut pick = Some((Some("explicit-model".into()), None));
+        let mut restore = None;
+        prepare_existing_headless_session(
+            override_fixture("abc-one", "Primary"),
+            &mut pick,
+            false,
+            &mut restore,
+        );
+        assert_eq!(pick, Some((Some("explicit-model".into()), None)));
+        assert_eq!(restore.unwrap().model.as_deref(), Some("stored-model"));
+    }
+
     #[test]
     fn tool_detail_calls_use_shared_success_rate_labels() {
         use super::tool_detail_calls_line;
@@ -10188,6 +10362,21 @@ mod tests {
         assert_eq!(super::tool_run_exit(&failed, "boom"), 1);
         let old = serde_json::json!({"result": "error: x"});
         assert_eq!(super::tool_run_exit(&old, "error: x"), 1);
+    }
+
+    #[test]
+    fn tool_run_json_propagates_output_errors() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let reply = serde_json::json!({"ok":true,"result":"success"});
+        assert!(super::write_tool_run_json(&reply, false, &mut BrokenPipe).is_err());
     }
 
     #[test]
