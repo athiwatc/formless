@@ -47,7 +47,7 @@
     </nav>
     <div class="spacer"></div>
     <span id="conn" class="pill" aria-live="polite">connecting…</span>
-    <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log">◔<span id="notes-badge" class="badge hidden"></span></button>
+    <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log, 0 unread" aria-expanded="false" aria-controls="notes-panel">◔<span id="notes-badge" class="badge hidden" aria-hidden="true"></span></button>
     <select id="theme" aria-label="Theme" title="Theme">
       <option value="auto">Auto</option>
       <option value="light">Light</option>
@@ -169,6 +169,7 @@
           </div>
         </div>
         <p class="muted">Everything a Tool has been allowed to do. Revoking makes its next call ask again.</p>
+        <div id="revocation-feedback"></div>
         <div class="table-wrap"><table class="table" id="approvals-table"></table></div>
       </section>
 
@@ -176,12 +177,14 @@
       <section id="view-settings" class="view hidden" aria-label="Settings">
         <div class="view-head"><h2>Settings</h2></div>
         <input id="settings-filter" class="settings-filter" type="search" placeholder="Filter settings: a key, a word from a description…" aria-label="Filter settings" autocomplete="off" spellcheck="false" autocapitalize="none" autocorrect="off" inputmode="search">
+        <div id="settings-filter-status" class="muted" role="status"></div>
+        <button id="settings-filter-clear" class="btn small ghost" type="button" hidden>Clear filter</button>
         <div id="settings"></div>
       </section>
     </main>
 
     <aside id="notes-panel" class="notes-panel hidden" aria-label="Activity log">
-      <div class="notes-head"><h3>Activity</h3><button class="icon-btn" id="notes-close" type="button" aria-label="Close">✕</button></div>
+      <div class="notes-head"><h3>Activity</h3><button class="icon-btn" id="notes-close" type="button" aria-label="Close Activity">✕</button></div>
       <ol id="notes" class="notes"></ol>
     </aside>
   </div>
@@ -222,8 +225,12 @@
   <form class="modal" id="ask-form" role="dialog" aria-modal="true" aria-labelledby="ask-title" aria-describedby="ask-text">
     <h2 id="ask-title"></h2>
     <p id="ask-text" class="muted"></p>
-    <div id="ask-body"></div>
-    <input id="ask-input" type="text" aria-labelledby="ask-title">
+    <fieldset id="ask-fields">
+      <div id="ask-body"></div>
+      <input id="ask-input" type="text" aria-labelledby="ask-title">
+    </fieldset>
+    <p id="ask-error" class="error hidden" role="alert"></p>
+    <span id="ask-saving" class="sr-only" role="status"></span>
     <div class="modal-actions">
       <span class="spacer"></span>
       <button class="btn ghost" id="ask-cancel" type="button">Cancel</button>

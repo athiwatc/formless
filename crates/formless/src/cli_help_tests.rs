@@ -286,6 +286,38 @@ fn every_documented_help_example_parses_without_dispatch() {
 }
 
 #[test]
+fn job_history_limit_parses_and_rejects_out_of_range_values() {
+    use super::{Cli, Cmd, JobsAction};
+    for (extra, expected) in [
+        (&[][..], 20),
+        (&["--limit", "1"], 1),
+        (&["--limit", "50", "--json"], 50),
+        (&["--limit", "500"], 500),
+    ] {
+        let cli = Cli::try_parse_from(
+            ["formless", "jobs", "history", "job"]
+                .into_iter()
+                .chain(extra.iter().copied()),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Jobs { action: JobsAction::History { limit, .. } }) if limit == expected
+        ));
+    }
+    for limit in ["0", "501", "not-a-number"] {
+        for extra in [&[][..], &["--json"]] {
+            let result = Cli::try_parse_from(
+                ["formless", "jobs", "history", "job", "--limit", limit]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            );
+            assert_eq!(result.err().map(|error| error.exit_code()), Some(2));
+        }
+    }
+}
+
+#[test]
 fn example_gate_rejects_removed_flags_and_preserves_shell_arguments() {
     assert!(!example_problems("Examples:\n  formless run fixture --removed-docs-flag").is_empty());
     assert!(!example_problems("Examples:\n  formless run \"unclosed").is_empty());

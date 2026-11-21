@@ -74,7 +74,8 @@ pub(super) fn unavailable(snapshot: &Snapshot, name: &str) -> Option<String> {
         .diagnostics
         .iter()
         .filter(|diagnostic| {
-            diagnostic.path.extension() == Some(std::ffi::OsStr::new("md"))
+            !diagnostic.warning
+                && diagnostic.path.extension() == Some(std::ffi::OsStr::new("md"))
                 && diagnostic
                     .path
                     .file_stem()
@@ -302,7 +303,6 @@ impl App {
     pub(super) fn expand_user_command(&mut self) -> bool {
         if self.input.is_literal()
             || self.search_mode
-            || self.renaming.is_some()
             || self.instructing.is_some()
             || self.import_mode.is_some()
             || self.bulk.is_some()
