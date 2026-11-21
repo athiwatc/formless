@@ -4,8 +4,10 @@
 //! aligned columns no longer fit, labelled records wrap every full field.
 //! Zero/one-column requests preserve whole graphemes as best effort.
 
-use formless_tui::{colorblind_rgb, tone_marker, SemanticTone};
-use std::cell::Cell;
+use formless_tui::{
+    colorblind_rgb_on_background, terminal_has_light_background, tone_marker, SemanticTone,
+};
+use std::{cell::Cell, sync::OnceLock};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -37,9 +39,9 @@ impl Tone {
             _ => None,
         }
     }
-    fn code(self, colorblind: bool) -> Option<String> {
+    fn code(self, colorblind: bool, light_background: bool) -> Option<String> {
         if let Some(tone) = self.semantic().filter(|_| colorblind) {
-            let (r, g, b) = colorblind_rgb(tone);
+            let (r, g, b) = colorblind_rgb_on_background(tone, light_background);
             return Some(format!("38;2;{r};{g};{b}"));
         }
         Some(
@@ -99,7 +101,13 @@ impl Table {
     /// insufficient. Pipes omit semantic markers, regardless of theme;
     /// both modes normalize cell whitespace and show input controls visibly.
     pub fn render(&self, terminal: bool, color: bool, width: Option<usize>) -> String {
-        self.render_theme(terminal, color, width, COLORBLIND.with(Cell::get))
+        let colorblind = COLORBLIND.with(Cell::get);
+        static LIGHT_BACKGROUND: OnceLock<bool> = OnceLock::new();
+        let light_background = terminal
+            && color
+            && colorblind
+            && *LIGHT_BACKGROUND.get_or_init(terminal_has_light_background);
+        self.render_theme(terminal, color, width, colorblind, light_background)
     }
 
     fn render_theme(
@@ -108,6 +116,7 @@ impl Table {
         color: bool,
         width: Option<usize>,
         colorblind: bool,
+        light_background: bool,
     ) -> String {
         // Normalize before measuring, labeling or clipping. Input cells never
         // contribute terminal escapes; only paint() below emits trusted styles.
@@ -151,7 +160,8 @@ impl Table {
                 widths[i] = w - 1;
             }
         }
-        let paint = |text: &str, tone: Tone| match (color, tone.code(colorblind)) {
+        let paint = |text: &str, tone: Tone| match (color, tone.code(colorblind, light_background))
+        {
             (true, Some(code)) if !text.is_empty() => format!("\x1b[{code}m{text}\x1b[0m"),
             _ => text.to_string(),
         };
@@ -439,7 +449,7 @@ mod tests {
         ]);
         for width in 0..=27 {
             for color in [false, true] {
-                let out = table.render_theme(true, color, Some(width), true);
+                let out = table.render_theme(true, color, Some(width), true, false);
                 let plain = regex::Regex::new(r"\x1b\[[0-9;]*m")
                     .unwrap()
                     .replace_all(&out, "")
@@ -571,14 +581,14 @@ mod tests {
     #[test]
     fn semantic_labels_survive_no_color_and_use_the_canonical_colorblind_palette() {
         let table = statuses();
-        let plain = table.render_theme(true, false, None, false);
+        let plain = table.render_theme(true, false, None, false, false);
         for marker in ["ok 100%", "warn 80%", "fail 20%", "fail needs attention"] {
             assert!(plain.contains(marker), "{plain}");
         }
         assert!(!plain.contains('\x1b'));
-        let accessible = table.render_theme(true, true, None, true);
+        let accessible = table.render_theme(true, true, None, true, false);
         for tone in [SemanticTone::Good, SemanticTone::Warn, SemanticTone::Bad] {
-            let (r, g, b) = colorblind_rgb(tone);
+            let (r, g, b) = colorblind_rgb_on_background(tone, false);
             assert!(accessible.contains(&format!("\x1b[38;2;{r};{g};{b}m")));
         }
         let stripped = regex::Regex::new(r"\x1b\[[0-9;]*m")
@@ -588,7 +598,7 @@ mod tests {
             stripped, plain,
             "colorblind and no-color contain identical status information/layout"
         );
-        let ordinary = table.render_theme(true, true, None, false);
+        let ordinary = table.render_theme(true, true, None, false, false);
         assert!(ordinary.contains("\x1b[32m100%"));
         assert!(!ordinary.contains("ok 100%"));
     }
@@ -597,7 +607,7 @@ mod tests {
     fn marker_widths_are_counted_before_unicode_alignment_and_clipping() {
         let table = statuses();
         for colorblind in [false, true] {
-            let out = table.render_theme(true, false, Some(34), colorblind);
+            let out = table.render_theme(true, false, Some(34), colorblind, false);
             assert!(out.lines().all(|line| line.width() <= 34), "{out}");
             for marker in ["ok ", "warn ", "fail "] {
                 assert!(out.contains(marker), "marker clipped: {out}");
@@ -607,7 +617,9 @@ mod tests {
         let mut empty = Table::new(&["STATE"]);
         empty.row(vec![t("", Tone::Good)]);
         assert!(
-            !empty.render_theme(true, false, None, false).contains("ok"),
+            !empty
+                .render_theme(true, false, None, false, false)
+                .contains("ok"),
             "missing values are not announced as success"
         );
     }
