@@ -322,6 +322,13 @@ fn topic_permission_globs_are_full_string_and_unicode_safe() {
         ("file", "prefix file", false),
         ("a*b*c", "a xx b yy c", true),
         ("a*b", "a xx c", false),
+        ("rm *", "rm *.txt", true),
+        ("rm *.*", "rm *.txt", true),
+        ("*", "* literal * and ?", true),
+        ("a*b", "a*literal b", true),
+        ("?x", "?x", true),
+        ("*?", "*", true),
+        ("a?", "a??", false),
     ] {
         assert_eq!(permission_glob(pattern, value), expected);
     }

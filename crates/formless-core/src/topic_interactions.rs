@@ -21,13 +21,13 @@ pub(super) fn permission_glob(pattern: &str, value: &str) -> bool {
     let value: Vec<_> = value.chars().collect();
     let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
     while v < value.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
-            p += 1;
-            v += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
+        if p < pattern.len() && pattern[p] == '*' {
             star = Some(p);
             p += 1;
             retry = v;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
         } else if let Some(previous) = star {
             retry += 1;
             v = retry;
