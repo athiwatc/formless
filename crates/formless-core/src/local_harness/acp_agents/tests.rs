@@ -195,13 +195,16 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
         json!({"sessionUpdate":"plan","entries":[{"content":"Step","priority":"high","status":"pending"}]}),
         json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}),
     ].map(|value| update(session_id, value));
-    let mut lines = vec![
-        fixture["initialize"].clone(),
-        session.clone(),
-        permission(session_id, "read"),
-    ];
+    let mut lines = vec![fixture["initialize"].clone(), session.clone()];
+    let prompt_id = if spec.write_modes.is_empty() {
+        3
+    } else {
+        lines.push(reply(3, json!({})));
+        4
+    };
+    lines.push(permission(session_id, "read"));
     lines.extend(updates.clone());
-    lines.push(reply(3, json!({"stopReason":"end_turn"})));
+    lines.push(reply(prompt_id, json!({"stopReason":"end_turn"})));
     let mut handler = Handler::default();
     let (result, sent) = drive_spec(spec, HarnessRole::Build, &lines, &mut handler);
     assert_eq!(result.unwrap().message, "done");
@@ -210,18 +213,20 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
         handler.updates,
         updates.map(|value| value["params"].clone())
     );
-    assert_eq!(sent[3]["result"]["outcome"]["optionId"], "yes");
+    let response = sent.iter().find(|value| value["id"] == 90).unwrap();
+    assert_eq!(response["result"]["outcome"]["optionId"], "yes");
+    if let Some(mode) = spec.write_modes.first() {
+        assert_eq!(sent[2]["params"]["configId"], "mode");
+        assert_eq!(sent[2]["params"]["value"], *mode);
+        assert_ne!(*mode, "bypass");
+    }
 
-    let (result, _) = drive_spec(
-        spec,
-        HarnessRole::Build,
-        &[
-            fixture["initialize"].clone(),
-            session.clone(),
-            reply(3, json!({"stopReason":"end_turn"})),
-        ],
-        &mut RejectAll,
-    );
+    let mut empty_turn = vec![fixture["initialize"].clone(), session.clone()];
+    if !spec.write_modes.is_empty() {
+        empty_turn.push(reply(3, json!({})));
+    }
+    empty_turn.push(reply(prompt_id, json!({"stopReason":"end_turn"})));
+    let (result, _) = drive_spec(spec, HarnessRole::Build, &empty_turn, &mut RejectAll);
     assert!(result
         .unwrap_err()
         .to_string()
@@ -241,7 +246,7 @@ fn assert_agent(id: &str, program: &str, args: &[&str], review_args: &[&str]) {
     } else {
         3
     };
-    lines.push(permission(session_id, "execute"));
+    lines.push(permission(session_id, "edit"));
     lines.push(update(
         session_id,
         json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"review"}}),
@@ -469,6 +474,7 @@ fn live_acp_agents_initialize_installed_binaries() {
             .recv_timeout(Duration::from_secs(20))
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         (spec.check_agent)(&response["result"]).unwrap_or_else(|error| panic!("{id}: {error}"));
+        println!("live initialize: {id} OK");
         checked += 1;
     }
     std::fs::remove_dir_all(root).unwrap();
