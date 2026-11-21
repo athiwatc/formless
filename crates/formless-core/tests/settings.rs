@@ -4,6 +4,30 @@ use formless_core::{Config, Paths};
 use formless_protocol::Request;
 use std::sync::Arc;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn saving_an_unmatched_routing_subset_returns_actionable_warnings() {
+    use serde_json::json;
+    let root = std::env::temp_dir().join(format!("fl-routing-settings-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut config = Config::default();
+    config.provider.routing_models = vec!["primary".into(), "budget".into()];
+    config.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let saved = daemon
+        .handle(Request::SetSetting {
+            key: "provider.routing_strong_models".into(),
+            value: json!(["typo"]),
+        })
+        .await
+        .unwrap();
+    let warnings = saved["routing_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings[0].as_str().unwrap().contains("typo"));
+    assert!(warnings[1].as_str().unwrap().contains("primary"));
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn map_updates_preserve_siblings_remove_entries_and_validate_atomically() {
     use serde_json::json;
