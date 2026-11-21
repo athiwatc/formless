@@ -116,6 +116,203 @@ fn permission(always: bool) -> HarnessPermissionRequest {
 }
 
 #[tokio::test]
+async fn topic_model_answer_requires_basis_posts_chat_and_preserves_first_answer() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single(
+                    "Use CSV?".into(),
+                    vec!["Yes".into(), "No".into()],
+                )],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    let mut args = json!({"question_id":question_id,"answers":[{"selected":["Yes"]}],"basis":" "});
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(session, &args)
+        .unwrap_err()
+        .to_string()
+        .contains("basis"));
+    args["basis"] = json!("User request: use CSV for the ledger");
+    assert_eq!(
+        f.daemon()
+            .answer_topic_question_tool(session, &args)
+            .unwrap()["answered"],
+        true
+    );
+    assert_eq!(waiting.await.unwrap().unwrap()[0].selected, vec!["Yes"]);
+    next_event(
+        &mut events,
+        |event| matches!(event,Event::UserQuestionClosed{answered_by:Some(by),..} if by=="model"),
+    )
+    .await;
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(session))
+        .unwrap();
+    let audit = messages
+        .iter()
+        .filter(|message| message.content.contains("Basis: User request: use CSV"))
+        .collect::<Vec<_>>();
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].content.contains(&f.attempt.id));
+    assert!(audit[0].content.contains("Use CSV?"));
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "No".into(),
+                answers: vec![]
+            })
+            .await
+            .unwrap()["answered"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn topic_model_answer_rejects_user_only_and_empty_answers() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Choose".into(), vec![])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(
+            session,
+            &json!({"question_id":question_id,"answers":[],"basis":"User said yes"})
+        )
+        .is_err());
+    for event in f.daemon().pending_attention.locked().iter_mut() {
+        if let Event::UserQuestion {
+            question_id: id,
+            user_only,
+            ..
+        } = event
+        {
+            if id == &question_id {
+                *user_only = true;
+            }
+        }
+    }
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(
+            session,
+            &json!({"question_id":question_id,"answers":[{"text":"yes"}],"basis":"User said yes"})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("user_only"));
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "yes".into(),
+                answers: vec![]
+            })
+            .await
+            .unwrap()["answered"],
+        true
+    );
+    assert_eq!(
+        waiting.await.unwrap().unwrap()[0].text.as_deref(),
+        Some("yes")
+    );
+    next_event(
+        &mut events,
+        |event| matches!(event,Event::UserQuestionClosed{answered_by:Some(by),..} if by=="user"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn topic_shutdown_closes_pending_permission_and_question() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .request_permission(permission(false), &CancellationToken::new())
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::HarnessPermissionRequested { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::HarnessPermissionClosed {
+                option_id: None,
+                ..
+            }
+        )
+    })
+    .await;
+    let f = TopicFixture::new(&env);
+    let mut events = f.events();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single("Proceed?".into(), vec![])],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await;
+    f.daemon().request_shutdown();
+    assert_eq!(waiting.await.unwrap(), None);
+    next_event(&mut events, |event| {
+        matches!(
+            event,
+            Event::UserQuestionClosed {
+                answered_by: None,
+                ..
+            }
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn topic_permission_fixture_sibling_needs_user_does_not_block_answer() {
     let env = crate::credential_env::EnvGuard::isolated();
     let fixture = Fixture::new(&env);

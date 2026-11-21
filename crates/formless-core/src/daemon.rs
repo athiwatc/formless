@@ -545,6 +545,7 @@ pub(crate) async fn counted<F: std::future::Future>(
 tokio::task_local! {
     /// The connection (id, label) a request came from, for attribution.
     static CLIENT: (u64, String);
+    static GENERATED_MESSAGE:String;
 }
 
 /// The client a request came from, outside requests none.
@@ -926,6 +927,7 @@ pub struct Daemon {
     harness_permissions: StdMutex<HashMap<String, topic_interactions::PendingPermission>>,
     harness_always: StdMutex<HashMap<String, topic_interactions::AlwaysPermissions>>,
     topic_questions: StdMutex<HashMap<String, (String, String)>>,
+    question_answered_by: StdMutex<HashMap<String, String>>,
     topic_launch: StdMutex<()>,
     topic_steps: StdMutex<HashMap<(String, String), CancellationToken>>,
     topic_activity: tokio::sync::Notify,
@@ -1174,6 +1176,7 @@ impl Daemon {
             harness_permissions: StdMutex::new(HashMap::new()),
             harness_always: StdMutex::new(HashMap::new()),
             topic_questions: StdMutex::new(HashMap::new()),
+            question_answered_by: StdMutex::new(HashMap::new()),
             topic_launch: StdMutex::new(()),
             topic_steps: StdMutex::new(HashMap::new()),
             topic_activity: tokio::sync::Notify::new(),
@@ -4101,9 +4104,17 @@ impl Daemon {
                 // First answer wins; the others find it gone.
                 let answered = {
                     let mut waiters = self.questions.locked();
-                    waiters
-                        .remove(&question_id)
-                        .is_some_and(|tx| tx.send((answer, answers)).is_ok())
+                    waiters.remove(&question_id).is_some_and(|tx| {
+                        self.question_answered_by
+                            .locked()
+                            .insert(question_id.clone(), "user".into());
+                        if tx.send((answer, answers)).is_ok() {
+                            true
+                        } else {
+                            self.question_answered_by.locked().remove(&question_id);
+                            false
+                        }
+                    })
                 };
                 self.remove_attention(&question_id);
                 Ok(json!({"answered": answered}))
@@ -5834,6 +5845,15 @@ impl Daemon {
         let control = self.runs.locked().get(&session_id).cloned();
         // A Run can start or finish after the client confirms. Classify under
         // the same admission lock as the ensuing append and Run admission.
+        if GENERATED_MESSAGE
+            .try_with(|marker| marker == "topic_kickoff")
+            .unwrap_or(false)
+            && (control.is_some() || self.session_is_publishing(&session_id))
+        {
+            bail!(
+                "Topic Chat became busy before kickoff; no generated message was queued or steered"
+            );
+        }
         if let Some(review) = &review {
             if let Some(expected_run) = &review.run_id {
                 if control.as_ref().map(|run| &run.run_id) != Some(expected_run) {
@@ -8739,6 +8759,12 @@ impl Daemon {
                 Ok(value) => value.to_string(),
                 Err(error) => call_failed(format!("error: topic_run_step: {error:#}")),
             },
+            toolreg::TOPIC_ANSWER_QUESTION => {
+                match self.answer_topic_question_tool(session_id, &args) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => call_failed(format!("error: topic_answer_question: {error:#}")),
+                }
+            }
             toolreg::TOPIC_COMPLETE_FEATURE | toolreg::TOPIC_FAIL_FEATURE => match self
                 .finish_topic_feature_tool(
                     session_id,
@@ -11145,7 +11171,10 @@ impl Daemon {
         for session in &family {
             self.with_store(|st| crate::artifacts::remove_for_session(st, session))?;
         }
-        self.with_store(|st| st.delete_session(id))?;
+        self.with_store(|st| {
+            crate::artifacts::remove_retained_for_topic_purge(st, &family)?;
+            st.delete_session(id)
+        })?;
         for session in &family {
             self.contexts.locked().remove(session);
         }
@@ -12377,7 +12406,8 @@ impl Daemon {
             meta[k] = v;
         }
         let meta = (meta != json!({})).then(|| meta.to_string());
-        st.append_message_meta(session_id, "user", content, meta)
+        let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+        st.append_message_generated(session_id, "user", content, meta, generated_by.as_deref())
     }
 
     /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
@@ -12883,7 +12913,7 @@ impl Daemon {
         });
         let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
         self.broadcast(Event::UserQuestionClosed {
-            answered_by: None,
+            answered_by: self.question_answered_by.locked().remove(&question_id),
             question_id,
         });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
@@ -17654,6 +17684,7 @@ pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> Str
 #[test]
 fn stored_tool_result_outcome_preserves_provider_projection() {
     let mut message = formless_protocol::MessageInfo {
+        generated_by: None,
         id: "result".into(),
         session_id: "session".into(),
         seq: 1,

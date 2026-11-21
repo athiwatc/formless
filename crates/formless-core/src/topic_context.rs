@@ -64,7 +64,15 @@ impl Store {
             let content: String = row.get(2)?;
             let folded = content.to_lowercase();
             if let Some(offset) = folded.find(&query) {
-                let start = folded[..offset].chars().count().saturating_sub(60);
+                let mut folded_bytes = 0;
+                let original_offset = content
+                    .chars()
+                    .position(|character| {
+                        folded_bytes += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+                        offset < folded_bytes
+                    })
+                    .unwrap_or_default();
+                let start = original_offset.saturating_sub(60);
                 let snippet = content.chars().skip(start).take(240).collect::<String>();
                 matches.push(json!({"session_id":row.get::<_,String>(0)?,"message_id":row.get::<_,String>(1)?,"snippet":snippet}));
                 if matches.len() == 40 {

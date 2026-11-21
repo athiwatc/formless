@@ -308,6 +308,7 @@ impl Store {
                 if message.role != "user" {
                     bail!("only user messages can be proposed as feature requests");
                 }
+                if message.generated_by.is_some(){bail!("generated messages cannot be proposed as feature requests");}
                 selected.push(message);
             }
             selected.sort_by_key(|message| message.seq);
@@ -461,6 +462,7 @@ impl Store {
             for (seq, (message_id, source_seq, snapshot)) in refs.iter().enumerate() {
                 let current = st.get_message(&topic.source_session_id, message_id)?
                     .ok_or_else(|| anyhow!("selected source message {message_id} no longer exists"))?;
+                if current.generated_by.is_some(){bail!("generated messages cannot be moved to topics");}
                 if current.role != "user" || hash_token(&current.content) != *snapshot {
                     bail!("selected source message {message_id} changed since proposal; create a new proposal to approve the edited request");
                 }

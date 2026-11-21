@@ -7,6 +7,7 @@ use crate::storage::Store;
 use formless_protocol::ToolInfo;
 
 pub const TOPIC_RUN_STEP: &str = "topic_run_step";
+pub const TOPIC_ANSWER_QUESTION: &str = "topic_answer_question";
 pub const TOPIC_LIST_CONVERSATIONS: &str = "topic_list_conversations";
 pub const TOPIC_READ_CONVERSATION: &str = "topic_read_conversation";
 pub const TOPIC_SEARCH_CONVERSATIONS: &str = "topic_search_conversations";
@@ -46,7 +47,7 @@ pub const UPDATE_PLAN: &str = "update_plan";
 /// Most steps a plan may have, and longest step text.
 pub const MAX_PLAN_ITEMS: usize = 20;
 pub const MAX_PLAN_TEXT: usize = 200;
-pub const RESERVED: [&str; 32] = [
+pub const RESERVED: [&str; 33] = [
     TOPIC_LIST_CONVERSATIONS,
     TOPIC_READ_CONVERSATION,
     TOPIC_SEARCH_CONVERSATIONS,
@@ -77,6 +78,7 @@ pub const RESERVED: [&str; 32] = [
     RUN_SCRIPT,
     UPDATE_PLAN,
     TOPIC_RUN_STEP,
+    TOPIC_ANSWER_QUESTION,
     TOPIC_COMPLETE_FEATURE,
     TOPIC_FAIL_FEATURE,
 ];
@@ -965,6 +967,7 @@ fn topic_context_definition(name: &str, field: Option<&str>) -> Value {
 }
 pub fn builtin_definitions() -> Vec<Value> {
     vec![
+        json!({"type":"function","function":{"name":TOPIC_ANSWER_QUESTION,"description":"Answer a pending harness question using a quote or reference to a user's message or decision as basis. User-only questions and permissions cannot be answered by the model.","parameters":{"type":"object","properties":{"question_id":{"type":"string"},"answers":{"type":"array","items":{"type":"object","properties":{"selected":{"type":"array","items":{"type":"string"}},"text":{"type":"string"}}}},"basis":{"type":"string","minLength":1}},"required":["question_id","answers","basis"],"additionalProperties":false}}}),
         topic_step_definition(),
         topic_context_definition(TOPIC_LIST_CONVERSATIONS,None),
         topic_context_definition(TOPIC_READ_CONVERSATION,Some("session_id")),
@@ -1259,6 +1262,7 @@ fn definitions(
                 definition["function"]["name"].as_str(),
                 Some(
                     TOPIC_RUN_STEP
+                        | TOPIC_ANSWER_QUESTION
                         | TOPIC_COMPLETE_FEATURE
                         | TOPIC_FAIL_FEATURE
                         | TOPIC_LIST_CONVERSATIONS

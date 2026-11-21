@@ -490,6 +490,7 @@ mod tests {
             let event = Event::MessageAppended {
                 session_id: "s".into(),
                 message: formless_protocol::MessageInfo {
+                    generated_by: None,
                     id: "m".into(),
                     session_id: "s".into(),
                     seq: 4,
