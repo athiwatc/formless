@@ -7,15 +7,43 @@ the **relay** (the browser UI, end-to-end encrypted) or with `docker exec`.
 
 ## Start it
 
+Choose a published `vX.Y.Z` tag from the [releases](https://github.com/athiwatc/formless/releases)
+and replace the placeholder below. For a rootful Linux Docker Engine with
+default user mapping, run these commands in Bash. They prompt for the key
+without echoing it or adding it to your shell history. The key file lives
+outside your project in a private directory.
+
+```bash
+image=ghcr.io/athiwatc/formless:vX.Y.Z
+secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/formless-docker"
+secret_file="$secret_dir/api_key"
+(
+  set -e
+  set +x
+  set -o noclobber
+  umask 077
+  install -d -m 0700 "$secret_dir"
+  IFS= read -r -s -p 'Provider API key: ' provider_key
+  printf '\n'
+  test -n "$provider_key"
+  printf '%s\n' "$provider_key" > "$secret_file"
+  unset provider_key
+  sudo chown 10001 "$secret_file"
+  sudo chmod 0400 "$secret_file"
+)
+```
+
+After the file is ready, create the volumes and start the daemon using the
+same shell variables.
+
 ```sh
 docker volume create formless-data
 docker volume create formless-config
-echo "sk-…" > api_key.txt   # your provider key
 docker run -d --name formless --restart unless-stopped \
   -v formless-data:/data -v formless-config:/config \
-  -v "$PWD/api_key.txt:/run/secrets/api_key:ro" \
+  --mount "type=bind,source=$secret_file,target=/run/secrets/api_key,readonly" \
   -e FORMLESS_API_KEY_FILE=/run/secrets/api_key \
-  ghcr.io/athiwatc/formless:latest
+  "$image"
 ```
 
 Then give it a provider. Write a `config.toml` (any setting from the
@@ -54,6 +82,8 @@ can't write its database), and `docker logs formless` says so.
 
 ## Image details
 
+- Releases publish `:vX.Y.Z` with a leading `v`, plus the moving
+  `:latest` tag. Pin a release tag or image digest on servers.
 - `linux/amd64` only for now; on Apple silicon or other arm64 servers it
   runs under emulation (slow) or build it yourself with
   `docker build -t formless .`. The release installer also offers a native
@@ -126,22 +156,76 @@ the previous tag or digest. If you restored the backup, mount the restored
 volumes instead of the migrated originals. Keep the post-upgrade volumes
 intact; the restored copy does not contain changes made since the backup.
 
+## Upgrading and rolling back
+
+Keep the previous image tag or digest. Wait for active Runs to finish
+before stopping the container. Runs still in flight may be interrupted.
+Enabled, approved jobs keep their schedule in the data volume, and missed
+firings of a due job coalesce into one execution after the daemon restarts.
+
+Set `image` to the next pinned release, then pull it before stopping the
+existing container.
+
+```sh
+image=ghcr.io/athiwatc/formless:vX.Y.Z
+docker pull "$image" && docker stop formless
+```
+
+Stop any other containers using the same volumes. While those containers
+are stopped, make and verify backups of both volumes. This preserves the
+database, configuration, and external files together. Then remove the
+stopped container.
+
+```sh
+docker rm formless
+```
+
+Run the same `docker run` command from [Start it](#start-it) with the new
+`image`, the same `formless-data` and `formless-config` volumes, and the
+existing secret mount. In a fresh shell, set `secret_file` to the existing
+host path of that mount. After the container is healthy, verify it with
+`docker exec formless formless --version` and
+`docker exec formless formless doctor`. With Compose, update the image
+reference in your configuration and run
+`docker compose pull && docker compose stop`. Verify the same volume
+backups while the containers are stopped, then run `docker compose up -d`.
+
+Replace the image to upgrade. `formless update` reports the available
+version and suggests commands for a host installation.
+
+To roll back, recreate the container using your previous image tag or
+digest. Check the release notes for data format compatibility before
+using volumes touched by the newer image. If compatibility is uncertain
+or a migration is incompatible, restore the pre-upgrade backups into
+separate volumes and use those with the previous image.
+
 ## The API key
 
-- `FORMLESS_API_KEY_FILE=/run/secrets/…`: a file holding the key (Docker
-  secrets, Kubernetes secrets). Preferred.
+- `FORMLESS_API_KEY_FILE=/run/secrets/…`: the preferred way to provide the
+  key. The file must be readable as container UID `10001`, including when
+  mounted read-only. A host file with mode `0600` owned by another user
+  will usually cause a permission error. With rootless Docker, user
+  namespaces, or Docker Desktop, verify the host-to-container UID mapping.
 - `FORMLESS_API_KEY=…`: the key itself, in the environment (visible to
   `docker inspect`).
 - Named providers: `FORMLESS_API_KEY_<NAME>_FILE` (preferred) or
   `FORMLESS_API_KEY_<NAME>` (e.g. `FORMLESS_API_KEY_LOCAL_FILE`).
 
-A file that is set but can't be used (missing, empty, not text) is named
+When an orchestrator manages the key, mount its secret file under
+`/run/secrets` and point `FORMLESS_API_KEY_FILE` at it. Swarm services can
+use Docker secrets. Compose services can use `secrets:`. A file-backed
+Compose secret still needs source permissions that let container UID
+`10001` read it. [Swarm secrets](https://docs.docker.com/engine/swarm/secrets/) ·
+[Compose secrets](https://docs.docker.com/compose/how-tos/use-secrets/)
+
+A file that can't be used (including a permission error) is named
 in the daemon log and in `formless doctor`, which also says where the key
 comes from (env, file, fallback file or keychain) without showing it. A
 leading BOM and surrounding whitespace are ignored.
 
-There is no keychain in the container; the key is never written to the
-volumes.
+A key supplied through the read-only mount stays in that file. Protect
+`/config` backups, which can contain the relay pairing secret and key files
+created by Formless setup.
 
 ## Using it from a browser
 
@@ -163,7 +247,7 @@ second daemon for another profile with the same volumes:
 
 ```sh
 docker run -d --name formless-work -v formless-data:/data -v formless-config:/config \
-  ghcr.io/athiwatc/formless --profile work daemon serve --stay
+  "$image" --profile work daemon serve --stay
 ```
 
 ## Approvals
