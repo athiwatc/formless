@@ -28,6 +28,8 @@ fn fields_size(questions: &[Question]) -> usize {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Open {
+    #[serde(default)]
+    pub user_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<Permission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +90,7 @@ impl Open {
                 return Err("Permission options are ambiguous. No permission granted.");
             }
             let open = Self {
+                user_only: true,
                 id: permission_id.clone(),
                 session_id: session_id.clone(),
                 topic_id: Some(topic_id.clone()),
@@ -118,6 +121,7 @@ impl Open {
             return Ok(open);
         }
         let Event::UserQuestion {
+            user_only,
             question_id,
             session_id,
             topic_id,
@@ -152,6 +156,7 @@ impl Open {
             questions.clone()
         };
         let open = Self {
+            user_only: *user_only,
             permission: None,
             topic_id: topic_id.clone(),
             attempt_id: attempt_id.clone(),
@@ -320,14 +325,25 @@ impl Directory {
     pub fn event(&mut self, event: &Event) {
         self.changed();
         match event {
-            Event::UserQuestionClosed { question_id, .. } => self.close(question_id),
+            Event::UserQuestionClosed {
+                question_id,
+                answered_by,
+            } => {
+                self.close(question_id);
+                if answered_by.as_deref() == Some("model") {
+                    self.notice = Some(
+                        "Question answered by Formless; its answer is recorded in Topic Chat."
+                            .into(),
+                    );
+                }
+            }
             Event::HarnessPermissionClosed {
                 permission_id, by, ..
             } => {
                 self.close(permission_id);
                 if let Some(rule) = by.as_deref().and_then(|by| by.strip_prefix("rule:")) {
                     self.notice = Some(format!(
-                        "Permission decided by your saved topic rule {rule}."
+                        "Last permission decision: your saved topic rule {rule}."
                     ));
                 }
             }
@@ -400,6 +416,7 @@ impl Directory {
         let mut replacement = Self {
             revision: self.revision,
             closed: self.closed.clone(),
+            notice: self.notice.clone(),
             ..Self::default()
         };
         if permissions_only {
@@ -551,8 +568,41 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("saved topic rule tests-in-this-topic"));
+        assert!(directory.permission_snapshot(&[], directory.revision()));
+        assert!(directory
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("saved topic rule"));
         directory.event(&crate::fixture::harness_permission("codex-chat"));
         assert!(directory.get("native-permission").is_none());
+    }
+
+    #[test]
+    fn user_only_questions_keep_their_authority_and_model_closure_stays_closed() {
+        let mut event = crate::fixture::user_question("topic-chat");
+        if let Event::UserQuestion { user_only, .. } = &mut event {
+            *user_only = true;
+        }
+        let open = Open::from_event(&event).unwrap();
+        assert!(open.user_only);
+        if let Event::UserQuestion { user_only, .. } = &mut event {
+            *user_only = false;
+        }
+        let mut directory = Directory::default();
+        directory.event(&event);
+        directory.event(&Event::UserQuestionClosed {
+            question_id: open.id.clone(),
+            answered_by: Some("model".into()),
+        });
+        assert!(directory.get(&open.id).is_none());
+        assert!(directory
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("answered by Formless"));
+        directory.event(&event);
+        assert!(directory.get(&open.id).is_none());
     }
 
     #[test]

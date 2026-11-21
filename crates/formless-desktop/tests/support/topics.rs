@@ -33,6 +33,204 @@ fn workspace(cx: &mut TestAppContext, handle: WindowHandle<Root>, shell: &Entity
     });
 }
 
+fn reveal_topic_control(window: &mut Window, cx: &mut App, id: &'static str) {
+    window.scroll(
+        "topic-workbench",
+        ScrollDelta::Pixels(point(px(0.), px(10000.))),
+        cx,
+    );
+    for _ in 0..24 {
+        window.render_frame(cx);
+        if window.try_find(id).is_some_and(|element| element.visible()) {
+            return;
+        }
+        window.scroll(
+            "topic-workbench",
+            ScrollDelta::Pixels(point(px(0.), px(-100.))),
+            cx,
+        );
+    }
+    panic!("control {id} was not reachable");
+}
+
+#[gpui_kit::test]
+fn topic_controls_require_explicit_user_actions_and_keep_failed_changes_unsaved(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        shell.update(cx, |s, _| s.take_client_commands());
+        window.render_frame(cx);
+        window.click("topic-controls-toggle", cx);
+        window.render_frame(cx);
+        assert!(
+            shell.update(cx, |s, _| s.take_client_commands()).is_empty(),
+            "opening controls sends no mutation"
+        );
+        window.click("topic-context-toggle", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(op),
+                    action: Action::SetContext { allow, .. },
+                    ..
+                } => Some((*op, *allow)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(operation, allow)] = actions.as_slice() else {
+            panic!("one explicit context decision")
+        };
+        let operation = *operation;
+        assert!(*allow);
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(operation),
+                    result: Err("topic control request is not implemented yet".into()),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-context-scope")
+            .value()
+            .unwrap()
+            .contains("limited to this topic"));
+        let inputs = shell.read(cx).topic_policy_inputs().unwrap();
+        inputs[0].update(cx, |input, cx| input.set_value("*cargo test*", window, cx));
+        reveal_topic_control(window, cx, "topic-rule-allow");
+        window.click("topic-rule-allow", cx);
+        window.render_frame(cx);
+        assert!(
+            shell.update(cx, |s, _| s.take_client_commands()).is_empty(),
+            "choosing a draft decision never saves a rule"
+        );
+        reveal_topic_control(window, cx, "topic-rule-add");
+        window.click("topic-rule-add", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(op),
+                    action:
+                        Action::AddRule {
+                            pattern,
+                            decision: formless_protocol::TopicRuleDecision::AllowOnce,
+                            ..
+                        },
+                    ..
+                } if pattern == "*cargo test*" => Some(*op),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [operation] = actions.as_slice() else {
+            panic!("one explicit rule save")
+        };
+        let operation = *operation;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(operation),
+                    result: Err("topic control request is not implemented yet".into()),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(inputs[0].read(cx).value().as_ref(), "*cargo test*");
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("topic-chat"));
+        assert!(
+            shell.update(cx, |s, _| s.take_client_commands()).is_empty(),
+            "failure does not replay or start work"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn policy_receipt_keeps_the_current_read_only_attempt_and_shows_unknown_sign_in_honestly(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("topic-attempt-build-x", cx);
+        shell.update(cx, |s, _| s.take_client_commands());
+        window.render_frame(cx);
+        window.click("topic-controls-toggle", cx);
+        window.render_frame(cx);
+        window.click("topic-context-toggle", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let operation = commands
+            .iter()
+            .find_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(op),
+                    action: Action::SetContext { .. },
+                    ..
+                } => Some(*op),
+                _ => None,
+            })
+            .unwrap();
+        let (_, mut topic) = fixture::topic_workspace();
+        topic.allow_external_context = true;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(operation),
+                    result: Ok(Reply::Policy(Box::new(topic))),
+                },
+                window,
+                cx,
+            );
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Harnesses(vec![
+                        formless_protocol::HarnessAvailability {
+                            kind: formless_protocol::HarnessKind::Codex,
+                            acp_agent: None,
+                            installed: true,
+                            signed_in: None,
+                            version: None,
+                            detail: None,
+                        },
+                    ])),
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("claude-chat"));
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-context-scope")
+            .value()
+            .unwrap()
+            .contains("allowed"));
+        reveal_topic_control(window, cx, "topic-harness-ready-0");
+        assert!(window
+            .find("topic-harness-ready-0")
+            .value()
+            .unwrap()
+            .contains("sign-in status unknown"));
+        assert!(shell.update(cx, |s, _| s.take_client_commands()).is_empty());
+    });
+}
+
 fn proposal_source(window: &mut Window, cx: &mut App, shell: &Entity<Shell>) {
     window.render_frame(cx);
     window.click("topic-main-chat", cx);

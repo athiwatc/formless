@@ -3,6 +3,7 @@ use crate::topics::{self, Action, Reply};
 use formless_protocol::{HarnessKind, TopicFeatureStatus, TopicStatus};
 mod outline;
 mod parent;
+mod policy;
 
 pub(super) struct Ui {
     pub state: topics::State,
@@ -19,6 +20,7 @@ pub(super) struct Ui {
     tree_scroll: ScrollHandle,
     pending_open: Option<String>,
     show_outline_details: bool,
+    policy: Option<policy::Editor>,
 }
 
 impl Ui {
@@ -31,11 +33,13 @@ impl Ui {
         self.show_outline_details = false;
         self.parent = None;
         self.choosing_parent = false;
+        self.policy = None;
     }
     pub fn retain_candidates(&mut self, available: &HashSet<&str>) {
         self.selected.retain(|id| available.contains(id.as_str()));
     }
     pub fn session_changed(&mut self, session: Option<&str>) {
+        self.policy = None;
         self.proposing = false;
         self.selected.clear();
         self.state.candidates.clear();
@@ -74,11 +78,102 @@ impl Ui {
             tree_scroll: ScrollHandle::new(),
             pending_open: None,
             show_outline_details: false,
+            policy: None,
         }
     }
 }
 
 impl Shell {
+    fn toggle_topic_policy(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .topic_ui
+            .policy
+            .as_ref()
+            .is_some_and(|editor| editor.topic == id)
+        {
+            self.topic_ui.policy = None;
+        } else if let Some(topic) = self
+            .topic_ui
+            .state
+            .topics
+            .iter()
+            .find(|topic| topic.id == id)
+        {
+            self.topic_ui.policy = Some(policy::Editor::new(
+                topic.id.clone(),
+                topic.limits.max_retries_per_step,
+                topic.limits.max_attempts_per_topic,
+                window,
+                cx,
+            ));
+        }
+        cx.notify();
+    }
+    fn save_topic_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &self.topic_ui.policy else {
+            return;
+        };
+        if editor.composing(window, cx) {
+            self.topic_ui.state.notice =
+                Some("Finish composing the controls first; nothing was saved.".into());
+            cx.notify();
+            return;
+        }
+        let result = topics::RuleDraft {
+            harness: editor.harness,
+            acp_agent: editor.acp_agent.read(cx).value().to_string(),
+            kind: editor.kind.read(cx).value().to_string(),
+            pattern: editor.pattern.read(cx).value().to_string(),
+            allow: editor.allow,
+        }
+        .action(editor.topic.clone());
+        match result {
+            Ok(action) => self.topic_action(action, cx),
+            Err(error) => {
+                self.topic_ui.state.notice = Some(error);
+                cx.notify();
+            }
+        }
+    }
+    fn save_topic_limits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = &self.topic_ui.policy else {
+            return;
+        };
+        if editor.composing(window, cx) {
+            self.topic_ui.state.notice =
+                Some("Finish composing the controls first; nothing was saved.".into());
+            cx.notify();
+            return;
+        }
+        match topics::limits(
+            &editor.retries.read(cx).value(),
+            &editor.attempts.read(cx).value(),
+        ) {
+            Ok(limits) => self.topic_action(
+                Action::SetLimits {
+                    topic: editor.topic.clone(),
+                    limits,
+                },
+                cx,
+            ),
+            Err(error) => {
+                self.topic_ui.state.notice = Some(error);
+                cx.notify();
+            }
+        }
+    }
+    #[cfg(feature = "test-support")]
+    pub fn topic_policy_inputs(&self) -> Option<[Entity<InputState>; 5]> {
+        self.topic_ui.policy.as_ref().map(|editor| {
+            [
+                editor.pattern.clone(),
+                editor.kind.clone(),
+                editor.acp_agent.clone(),
+                editor.retries.clone(),
+                editor.attempts.clone(),
+            ]
+        })
+    }
     #[cfg(feature = "test-support")]
     pub fn topic_inputs(&self) -> [Entity<InputState>; 2] {
         [self.topic_ui.name.clone(), self.topic_ui.workspace.clone()]
@@ -120,7 +215,8 @@ impl Shell {
         let Some(client) = &self.client else {
             return;
         };
-        let operation = (!matches!(action, Action::Main | Action::List)).then(uuid::Uuid::new_v4);
+        let operation = (!matches!(action, Action::Main | Action::List | Action::Harnesses))
+            .then(uuid::Uuid::new_v4);
         let command = ClientCommand::Topic {
             connection: client.connection(),
             operation,
@@ -609,7 +705,10 @@ impl Shell {
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.begin_topic(window, cx)),
                             ),
-                    ),
+                    )
+                    .when_some(current_topic.filter(|_| !ui.proposing), |row, topic| {
+                        row.child(policy::toggle(ui, topic, busy, cx))
+                    }),
             );
         if ui.proposing {
             panel = panel.child(readable("topic-proposal-help", "Choose saved requests, a topic name and an optional starting outline. Nothing moves or starts until you approve.").text_sm())
@@ -662,6 +761,15 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.propose_topic(cx))),
             );
         } else if let Some(topic) = current_topic {
+            if ui
+                .policy
+                .as_ref()
+                .is_some_and(|editor| editor.topic == topic.id)
+            {
+                panel = panel
+                    .child(policy::editor(ui, topic, busy, cx))
+                    .child(policy::availability(ui, busy, cx));
+            }
             let mut breadcrumbs = h_flex()
                 .id("topic-breadcrumbs")
                 .test_support()

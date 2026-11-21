@@ -70,6 +70,31 @@ impl Shell {
             );
         }
         if question.topic_id.is_some() || question.attempt_id.is_some() {
+            if let Some(topic) = question.topic_id.as_deref().and_then(|id| {
+                self.topic_ui
+                    .state
+                    .topics
+                    .iter()
+                    .find(|topic| topic.id == id)
+            }) {
+                let path = self
+                    .topic_ui
+                    .state
+                    .breadcrumbs(&topic.id)
+                    .iter()
+                    .map(|topic| topic.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                return format!(
+                    "{path} · Session {}{}",
+                    question.session_id,
+                    question
+                        .attempt_id
+                        .as_ref()
+                        .map(|id| format!(" · Attempt {id}"))
+                        .unwrap_or_default()
+                );
+            }
             return format!(
                 "Topic {} · Attempt {} · Session {}",
                 question.topic_id.as_deref().unwrap_or("not provided"),
@@ -610,13 +635,14 @@ impl Shell {
                         .when(clipped,|row|row.child(readable(SharedString::from(format!("question-option-label-{index}")),if permission.is_some() { label } else { model::preview(&label,400) }).text_sm()))
                         .children(form.question.option_description(form.field,index).map(|description|readable(SharedString::from(format!("question-option-description-{index}")),model::literal(&description)).text_sm()))
                 }))
+                .when(permission.is_none() && form.question.user_only, |body|body.child(readable("question-user-only", "Only you can answer this question. Formless cannot approve a substitute or change a cap for you.").text_sm()))
                 .when(permission.is_none(),|body|body.child(div().id("question-input-anchor").test_support().pt_1().anchor_scroll(Some(form.input_anchor.clone()))
                     .child(Textarea::new(&form.input).aria_label("Your answer").disabled(waiting).w_full().on_paste({let shell=cx.entity();move|item,_,cx|{
                         if item.text().is_some_and(|text|text.len()>MAX_TEXT_BYTES) {shell.update(cx,|this,cx|{if let Some(panel)=&mut this.question_panel{panel.notice=Some("Paste not added: answer text is limited to 64 KiB.".into());cx.notify();}});true}else{false}
                     }}))))
                 .when(permission.is_none(),|body|body.child(readable("question-empty-help","Blank fields are returned as unanswered. Enter inserts a line; Submit is an explicit button." ).text_sm()));
         } else {
-            body=body.child(readable("questions-scope","Questions and harness permissions across this Profile. Harness permissions require your explicit choice; security Tool approvals are reviewed separately in Approvals."))
+            body=body.child(readable("questions-scope","Questions and harness permissions across this Profile. Unmatched permissions require your explicit choice; saved topic rules may decide matches. Security Tool approvals are reviewed separately in Approvals."))
                 .when(self.client_questions.open.is_empty(),|body|body.child(readable("questions-empty","No pending questions loaded. Open a Session to restore existing questions; newly arriving questions appear here without changing focus.")))
                 .children(self.client_questions.open.iter().map(|question|{
                     let id=question.id.clone();

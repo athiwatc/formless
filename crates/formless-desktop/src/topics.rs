@@ -7,6 +7,27 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Harnesses,
+    SetContext {
+        topic: String,
+        allow: bool,
+    },
+    AddRule {
+        topic: String,
+        harness: Option<formless_protocol::HarnessKind>,
+        acp_agent: Option<String>,
+        kind: Option<String>,
+        pattern: String,
+        decision: formless_protocol::TopicRuleDecision,
+    },
+    RemoveRule {
+        topic: String,
+        rule: String,
+    },
+    SetLimits {
+        topic: String,
+        limits: formless_protocol::TopicLimits,
+    },
     Main,
     List,
     Propose(TopicProposalRequest),
@@ -14,7 +35,10 @@ pub enum Action {
     MoveAndStart(String),
     Reject(String),
     Start(String),
-    Retry { topic: String, feature: String },
+    Retry {
+        topic: String,
+        feature: String,
+    },
     Recover(String),
     Cancel(String),
 }
@@ -22,6 +46,34 @@ pub enum Action {
 impl Action {
     pub fn request(&self) -> Request {
         match self {
+            Self::Harnesses => Request::ListHarnesses,
+            Self::SetContext { topic, allow } => Request::SetTopicContextAccess {
+                topic_id: topic.clone(),
+                allow: *allow,
+            },
+            Self::AddRule {
+                topic,
+                harness,
+                acp_agent,
+                kind,
+                pattern,
+                decision,
+            } => Request::AddTopicPermissionRule {
+                topic_id: topic.clone(),
+                harness: *harness,
+                acp_agent: acp_agent.clone(),
+                kind: kind.clone(),
+                pattern: pattern.clone(),
+                decision: *decision,
+            },
+            Self::RemoveRule { topic, rule } => Request::RemoveTopicPermissionRule {
+                topic_id: topic.clone(),
+                rule_id: rule.clone(),
+            },
+            Self::SetLimits { topic, limits } => Request::SetTopicLimits {
+                topic_id: topic.clone(),
+                limits: limits.clone(),
+            },
             Self::Main => Request::GetMainChat,
             Self::List => Request::ListTopics,
             Self::Propose(proposal) => Request::ProposeTopic {
@@ -60,6 +112,13 @@ impl Action {
 
     pub fn decode(&self, value: serde_json::Value) -> Result<Reply, String> {
         match self {
+            Self::Harnesses => serde_json::from_value(value).map(Reply::Harnesses),
+            Self::SetContext { .. }
+            | Self::AddRule { .. }
+            | Self::RemoveRule { .. }
+            | Self::SetLimits { .. } => {
+                serde_json::from_value(value).map(|t| Reply::Policy(Box::new(t)))
+            }
             Self::Main => serde_json::from_value(value).map(Reply::Main),
             Self::List => serde_json::from_value(value).map(Reply::Inventory),
             _ => serde_json::from_value(value).map(|t| Reply::Topic(Box::new(t))),
@@ -70,9 +129,92 @@ impl Action {
 
 #[derive(Debug)]
 pub enum Reply {
+    Harnesses(Vec<formless_protocol::HarnessAvailability>),
+    Policy(Box<TopicInfo>),
     Main(SessionInfo),
     Inventory(Vec<TopicInfo>),
     Topic(Box<TopicInfo>),
+}
+
+#[derive(Default)]
+pub struct RuleDraft {
+    pub harness: Option<HarnessKind>,
+    pub acp_agent: String,
+    pub kind: String,
+    pub pattern: String,
+    pub allow: bool,
+}
+impl RuleDraft {
+    pub fn action(self, topic: String) -> Result<Action, String> {
+        if self.pattern.trim().is_empty() {
+            return Err("Enter a non-empty permission request pattern.".into());
+        }
+        let agent = self.acp_agent.trim().to_owned();
+        let kind = self.kind.trim().to_owned();
+        Ok(Action::AddRule {
+            topic,
+            harness: self.harness,
+            acp_agent: (self.harness == Some(HarnessKind::Acp) && !agent.is_empty())
+                .then_some(agent),
+            kind: (!kind.is_empty()).then_some(kind),
+            pattern: self.pattern,
+            decision: if self.allow {
+                formless_protocol::TopicRuleDecision::AllowOnce
+            } else {
+                formless_protocol::TopicRuleDecision::Reject
+            },
+        })
+    }
+}
+pub fn limits(retries: &str, attempts: &str) -> Result<formless_protocol::TopicLimits, String> {
+    Ok(formless_protocol::TopicLimits {
+        max_retries_per_step: retries
+            .trim()
+            .parse()
+            .map_err(|_| "Retries must be a whole number from 0 through 4294967295.")?,
+        max_attempts_per_topic: attempts
+            .trim()
+            .parse()
+            .map_err(|_| "Attempts must be a whole number from 0 through 4294967295.")?,
+    })
+}
+pub fn rule_summary(rule: &formless_protocol::TopicPermissionRule) -> String {
+    format!(
+        "{} · {} · {} · Pattern: {} · Rule {}",
+        match rule.decision {
+            formless_protocol::TopicRuleDecision::AllowOnce => "Allow matching requests",
+            formless_protocol::TopicRuleDecision::Reject => "Reject matching requests",
+        },
+        rule.harness
+            .map(|h| chosen_harness(Some(h), rule.acp_agent.as_deref()))
+            .unwrap_or("Any harness".into()),
+        rule.kind.as_deref().unwrap_or("any request type"),
+        rule.pattern,
+        rule.rule_id
+    )
+}
+pub fn harness_availability(info: &formless_protocol::HarnessAvailability) -> String {
+    let status = if !info.installed {
+        "not installed"
+    } else {
+        match info.signed_in {
+            Some(true) => "ready",
+            Some(false) => "installed; sign in required",
+            None => "installed; sign-in status unknown",
+        }
+    };
+    format!(
+        "{} · {status}{}{}",
+        chosen_harness(Some(info.kind), info.acp_agent.as_deref()),
+        info.version
+            .as_ref()
+            .map(|v| format!(" · version {v}"))
+            .unwrap_or_default(),
+        info.detail
+            .as_ref()
+            .map(|d| format!(" · {d}"))
+            .unwrap_or_default()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +317,7 @@ pub fn preset(preset: Preset) -> Vec<TopicStepOutline> {
 
 pub fn artifact(artifact: &TopicArtifact) -> String {
     match artifact {
+        TopicArtifact::Directory { path } => format!("Directory: {path}"),
         TopicArtifact::GitRevision { revision } => {
             format!("Git revision: {revision} · no automatic merge")
         }
@@ -220,6 +363,7 @@ pub fn feature_status(status: TopicFeatureStatus) -> &'static str {
 
 #[derive(Default)]
 pub struct State {
+    pub harnesses: Vec<formless_protocol::HarnessAvailability>,
     pub supported: bool,
     pub inventory_loaded: bool,
     pub main: Option<SessionInfo>,
@@ -317,6 +461,7 @@ impl State {
     }
     pub fn apply(&mut self, reply: Reply) {
         match reply {
+            Reply::Harnesses(harnesses) => self.harnesses = harnesses,
             Reply::Main(main) => self.main = Some(main),
             Reply::Inventory(topics) => {
                 self.topics = topics;
@@ -324,6 +469,9 @@ impl State {
             }
             Reply::Topic(topic) => {
                 self.selected = (topic.status != TopicStatus::Rejected).then(|| topic.id.clone());
+                self.apply(Reply::Policy(topic));
+            }
+            Reply::Policy(topic) => {
                 if let Some(old) = self.topics.iter_mut().find(|t| t.id == topic.id) {
                     *old = *topic;
                 } else {
@@ -369,6 +517,60 @@ impl State {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn user_rule_drafts_preserve_exact_patterns_and_never_grant_by_default() {
+        assert!(RuleDraft::default().action("topic".into()).is_err());
+        let action = RuleDraft {
+            harness: Some(HarnessKind::Codex),
+            acp_agent: "stale hidden agent".into(),
+            kind: " execute ".into(),
+            pattern: " *cargo test* ".into(),
+            ..Default::default()
+        }
+        .action("topic".into())
+        .unwrap();
+        assert!(
+            matches!(action.request(), Request::AddTopicPermissionRule { harness: Some(HarnessKind::Codex), acp_agent: None, kind: Some(kind), pattern, decision: formless_protocol::TopicRuleDecision::Reject, .. } if kind == "execute" && pattern == " *cargo test* ")
+        );
+    }
+    #[test]
+    fn explicit_caps_accept_zero_and_reject_negative_or_overflow_without_a_request() {
+        assert_eq!(
+            limits("0", "0").unwrap(),
+            formless_protocol::TopicLimits {
+                max_retries_per_step: 0,
+                max_attempts_per_topic: 0
+            }
+        );
+        assert!(limits("-1", "20").is_err());
+        assert!(limits("3", "4294967296").is_err());
+        assert!(limits("", "20").is_err());
+    }
+    #[test]
+    fn policy_and_readiness_receipts_do_not_change_the_selected_topic_or_start_work() {
+        let (_, mut topic) = crate::fixture::topic_workspace();
+        let mut state = State::default();
+        state.selected = Some("another-topic".into());
+        topic.allow_external_context = true;
+        let reply = Action::SetContext {
+            topic: topic.id.clone(),
+            allow: true,
+        }
+        .decode(serde_json::to_value(&topic).unwrap())
+        .unwrap();
+        assert!(matches!(reply, Reply::Policy(_)));
+        state.apply(reply);
+        assert_eq!(state.selected.as_deref(), Some("another-topic"));
+        assert!(state.topics[0].allow_external_context);
+        state.apply(Action::Harnesses.decode(json!([{ "kind": "codex", "acp_agent": null, "installed": true, "signed_in": null, "version": null, "detail": null }])).unwrap());
+        assert!(harness_availability(&state.harnesses[0]).contains("sign-in status unknown"));
+        assert_eq!(
+            artifact(&TopicArtifact::Directory {
+                path: "/tmp/owned-copy".into()
+            }),
+            "Directory: /tmp/owned-copy"
+        );
+    }
     #[test]
     fn orchestrator_is_working_before_it_launches_a_harness() {
         let (_, mut topic) = crate::fixture::topic_workspace();
