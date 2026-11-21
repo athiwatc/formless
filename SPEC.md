@@ -7184,7 +7184,7 @@ and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
 a model or harness automatically. SetTopicLimits itself changes limits only.
 
 ListHarnesses refreshes all seven kinds concurrently. Every probe is capped at
-10s overall (ProbeContext defaults to 5s); a timeout reports unknown auth with
+10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses

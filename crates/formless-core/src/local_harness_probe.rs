@@ -21,7 +21,7 @@ impl Default for ProbeContext {
         Self {
             executable: PathBuf::new(),
             environment: BTreeMap::new(),
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
         }
     }
 }
@@ -317,8 +317,12 @@ async fn probe_environment(
     }
 }
 pub async fn harness_availability(kind: HarnessKind, agent: Option<&str>) -> HarnessAvailability {
-    let mut value =
-        probe_environment(kind, &std::env::vars_os().collect(), Duration::from_secs(5)).await;
+    let mut value = probe_environment(
+        kind,
+        &std::env::vars_os().collect(),
+        Duration::from_secs(10),
+    )
+    .await;
     value.acp_agent = agent.map(str::to_owned);
     value
 }
@@ -342,7 +346,7 @@ async fn list_environment(
     .await
 }
 pub async fn list_harnesses() -> Vec<HarnessAvailability> {
-    list_environment(std::env::vars_os().collect(), Duration::from_secs(5)).await
+    list_environment(std::env::vars_os().collect(), Duration::from_secs(10)).await
 }
 
 async fn acp_response(

@@ -132,6 +132,7 @@ async fn muse_pi_overrides_and_missing_or_relative_executables() {
 
 #[tokio::test]
 async fn official_probe_timeout_is_unknown_and_bounded() {
+    assert_eq!(ProbeContext::default().timeout, Duration::from_secs(10));
     let (_root, mut ctx) = fixture();
     ctx.environment.insert("PROBE_MODE".into(), "hang".into());
     ctx.timeout = Duration::from_millis(100);
