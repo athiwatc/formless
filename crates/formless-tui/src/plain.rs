@@ -46,7 +46,7 @@ fn docs_lines(input: &str) -> Vec<String> {
     lines
 }
 
-fn display_text(text: &str) -> String {
+pub(super) fn display_text(text: &str) -> String {
     text.chars().flat_map(|c| {
         if c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
             c.escape_default().collect::<Vec<_>>()
@@ -82,6 +82,10 @@ pub struct LiveFeedback {
 }
 impl LiveFeedback {
     pub fn event(&mut self, ev: &Event) -> Option<String> {
+        self.event_with_suffix(ev, None)
+    }
+
+    fn event_with_suffix(&mut self, ev: &Event, suffix: Option<&str>) -> Option<String> {
         match ev {
             Event::ToolCallFinished {
                 run_id,
@@ -131,7 +135,9 @@ impl LiveFeedback {
                 Some(format!(
                     "Tool progress: {}{}: {}{}.",
                     display_text(tool_name),
-                    invocation_label(Some(id)),
+                    suffix
+                        .map(std::borrow::Cow::Borrowed)
+                        .unwrap_or_else(|| { std::borrow::Cow::Owned(invocation_label(Some(id))) }),
                     percent.map_or_else(|| "working".into(), |p| format!("{p}%")),
                     if label.is_empty() {
                         String::new()
@@ -144,6 +150,130 @@ impl LiveFeedback {
                 items, plan_state, ..
             } => Some(plan_text(items, plan_state.as_ref())),
             Event::RunRecap { recap, .. } => Some(recap_text(recap)),
+            _ => None,
+        }
+    }
+}
+
+/// The plain client needs an audible distinction only for calls that
+/// overlap. Preserve the distinction until both lifecycles are announced.
+#[derive(Default)]
+struct PlainFeedback {
+    live: LiveFeedback,
+    calls: HashMap<String, PlainCall>,
+    next: usize,
+}
+
+struct PlainCall {
+    run: Option<String>,
+    name: String,
+    number: usize,
+    numbered: bool,
+    pending: bool,
+}
+
+impl PlainFeedback {
+    fn notice(&mut self, ev: &Event, streaming: &mut bool) -> Option<String> {
+        let label = self
+            .call_number(ev)
+            .map_or_else(String::new, |n| format!(" #{n}"));
+        let live = self.live.event_with_suffix(ev, Some(&label));
+        if matches!(ev, Event::ToolProgress { .. }) {
+            live.map(|text| {
+                if std::mem::take(streaming) {
+                    format!("\n{text}")
+                } else {
+                    text
+                }
+            })
+        } else {
+            format_event(ev, streaming, &label)
+        }
+    }
+
+    fn discover(
+        &mut self,
+        id: &str,
+        name: &str,
+        run: Option<&str>,
+        pending: bool,
+    ) -> Option<usize> {
+        if let Some(call) = self.calls.get_mut(id) {
+            call.pending |= pending;
+            return call.numbered.then_some(call.number);
+        }
+        if self.calls.len() >= 1024 {
+            return None;
+        }
+        self.next = self.next.saturating_add(1);
+        let mut numbered = false;
+        for call in self.calls.values_mut().filter(|call| call.name == name) {
+            call.numbered = true;
+            numbered = true;
+        }
+        self.calls.insert(
+            id.to_owned(),
+            PlainCall {
+                run: run.map(str::to_owned),
+                name: name.to_owned(),
+                number: self.next,
+                numbered,
+                pending,
+            },
+        );
+        numbered.then_some(self.next)
+    }
+
+    fn call_number(&mut self, ev: &Event) -> Option<usize> {
+        match ev {
+            Event::ToolCallStarted {
+                invocation_id: Some(id),
+                tool_name,
+                run_id,
+                depth: 0,
+                ..
+            }
+            | Event::ToolProgress {
+                invocation_id: Some(id),
+                tool_name,
+                run_id,
+                depth: 0,
+                ..
+            } => self.discover(id, tool_name, Some(run_id), false),
+            Event::InvocationPending {
+                invocation_id: Some(id),
+                tool_name,
+                run_id,
+                ..
+            } => self.discover(id, tool_name, Some(run_id), true),
+            Event::InvocationStalled {
+                invocation_id: Some(id),
+                tool_name,
+                ..
+            } => self.discover(id, tool_name, None, true),
+            Event::ToolCallFinished {
+                invocation_id: Some(id),
+                ..
+            } => {
+                let call = self.calls.get(id)?;
+                let label = call.numbered.then_some(call.number);
+                if !call.pending {
+                    self.calls.remove(id);
+                }
+                label
+            }
+            Event::InvocationCompleted {
+                invocation_id: Some(id),
+                ..
+            } => self
+                .calls
+                .remove(id)
+                .and_then(|call| call.numbered.then_some(call.number)),
+            Event::RunFinished { run_id, .. } | Event::RunPaused { run_id, .. } => {
+                self.calls
+                    .retain(|_, call| call.pending || call.run.as_deref() != Some(run_id));
+                None
+            }
             _ => None,
         }
     }
@@ -623,7 +753,7 @@ fn gap_result(kind: GapRefresh, result: &serde_json::Value) -> String {
 
 /// The printed form of an event, if it has one. `streaming` says whether
 /// the answer is mid-stream (deltas are printed as they come).
-pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
+pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -> Option<String> {
     let end_stream = |streaming: &mut bool| {
         if std::mem::take(streaming) {
             "\n"
@@ -647,11 +777,11 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             return None;
         }
         Event::ToolCallStarted {
-            tool_name, depth, invocation_id, ..
-        } if *depth == 0 => format!("{}Tool started: {tool_name}{}.", end_stream(streaming), invocation_label(invocation_id.as_deref())),
-        Event::ToolCallFinished { tool_name, invocation_id, ok, .. } => format!(
+            tool_name, depth, ..
+        } if *depth == 0 => format!("{}Tool started: {tool_name}{}.", end_stream(streaming), call_label),
+        Event::ToolCallFinished { tool_name, ok, .. } => format!(
             "Tool {}: {tool_name}{}.",
-            if *ok { "finished" } else { "failed" }, invocation_label(invocation_id.as_deref())
+            if *ok { "finished" } else { "failed" }, call_label
         ),
         // A paused Run was already reported by RunPaused.
         Event::RunFinished { status, .. } if status == "paused" => return None,
@@ -749,21 +879,20 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
         ),
         Event::InvocationStalled {
             tool_name,
-            invocation_id,
             last_fraction,
             last_label,
             silent_secs,
             ..
         } => format!(
             "{}Note: Tool {tool_name}{} has shown no advancing progress or activity for {silent_secs} s; it keeps running.{}",
-            end_stream(streaming), invocation_label(invocation_id.as_deref()), progress_diagnostic(*last_fraction, last_label.as_deref())
+            end_stream(streaming), call_label, progress_diagnostic(*last_fraction, last_label.as_deref())
         ),
-        Event::InvocationCompleted { tool_name, invocation_id, ok, .. } => format!(
+        Event::InvocationCompleted { tool_name, ok, .. } => format!(
             "{}Background Tool {tool_name}{} {}.",
-            end_stream(streaming), invocation_label(invocation_id.as_deref()),
+            end_stream(streaming), call_label,
             if *ok { "finished" } else { "failed" }
         ),
-        Event::InvocationPending { tool_name, invocation_id, handle, .. } => format!("{}Tool {tool_name}{} continues in the background ({}).", end_stream(streaming), invocation_label(invocation_id.as_deref()), display_text(handle)),
+        Event::InvocationPending { tool_name, handle, .. } => format!("{}Tool {tool_name}{} continues in the background ({}).", end_stream(streaming), call_label, display_text(handle)),
         // Stateful progress is printed by LiveFeedback. Reasoning, activity,
         // usage, settings and subscription chatter stay out of line mode.
         // A new event lands here by default: decide whether it belongs.
@@ -874,7 +1003,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut reply_acks = ReplyAcks::default();
     let mut streaming = false;
     let mut running = false;
-    let mut feedback = LiveFeedback::default();
+    let mut feedback = PlainFeedback::default();
     let mut template_diagnostics = VecDeque::new();
     let mut run_state = RunState::default();
     let mut snapshots = HashMap::new();
@@ -958,18 +1087,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 Event::SessionUpdated { session: updated } => session = updated.clone(),
                 _ => {}
             }
-            let live = feedback.event(&ev);
-            let text = if matches!(ev, Event::ToolProgress { .. }) {
-                live.map(|t| {
-                    if std::mem::take(&mut streaming) {
-                        format!("\n{t}")
-                    } else {
-                        t
-                    }
-                })
-            } else {
-                format_event(&ev, &mut streaming)
-            };
+            let text = feedback.notice(&ev, &mut streaming);
             if let Some(text) = text {
                 if matches!(ev, Event::MessageDelta { .. }) || text == "\n" {
                     print!("{text}");
@@ -1184,7 +1302,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 )?)?;
                 session = s;
                 run_state = RunState::default();
-                feedback = LiveFeedback::default();
+                feedback = PlainFeedback::default();
                 client.send(Request::Subscribe {
                     sessions: Some(vec![session.id.clone()]),
                     deltas: true,
@@ -1220,7 +1338,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     Some(s) => {
                         session = s.clone();
                         run_state = RunState::default();
-                        feedback = LiveFeedback::default();
+                        feedback = PlainFeedback::default();
                         client.send(Request::Subscribe {
                             sessions: Some(vec![session.id.clone()]),
                             deltas: true,
@@ -1313,6 +1431,94 @@ mod tests {
             ok: true,
         });
         assert!(!feedback.progress.keys().any(|(_, id)| id == "two"));
+    }
+
+    #[test]
+    fn plain_tool_labels_appear_only_for_overlapping_calls_and_stay_stable() {
+        let start = |id: &str| Event::ToolCallStarted {
+            invocation_id: Some(id.into()),
+            session_id: "s".into(),
+            run_id: "r".into(),
+            tool_name: "same".into(),
+            version: 1,
+            arguments: "{}".into(),
+            depth: 0,
+        };
+        let finish = |id: &str| Event::ToolCallFinished {
+            invocation_id: Some(id.into()),
+            session_id: "s".into(),
+            run_id: "r".into(),
+            tool_name: "same".into(),
+            ok: true,
+            elapsed_ms: 1,
+        };
+        let first = "a00a00a0-1000-4000-8000-000000000001";
+        let second = "a00a00a0-1000-4000-8000-000000000002";
+        let mut streaming = false;
+        let mut sequential = PlainFeedback::default();
+        for id in [first, second] {
+            assert_eq!(
+                sequential.notice(&start(id), &mut streaming).as_deref(),
+                Some("Tool started: same.")
+            );
+            assert_eq!(
+                sequential.notice(&finish(id), &mut streaming).as_deref(),
+                Some("Tool finished: same.")
+            );
+        }
+
+        let mut parallel = PlainFeedback::default();
+        assert_eq!(
+            parallel.notice(&start(first), &mut streaming).as_deref(),
+            Some("Tool started: same.")
+        );
+        assert_eq!(
+            parallel.notice(&start(second), &mut streaming).as_deref(),
+            Some("Tool started: same #2.")
+        );
+        let status = parallel
+            .notice(&progress(Some(first), 0.5), &mut streaming)
+            .unwrap();
+        assert!(
+            status.starts_with("Tool progress: same #1: 50%"),
+            "{status}"
+        );
+        assert!(!status.contains(first));
+        let pending = Event::InvocationPending {
+            invocation_id: Some(first.into()),
+            session_id: "s".into(),
+            run_id: "r".into(),
+            tool_name: "same".into(),
+            handle: "cancel-handle".into(),
+        };
+        assert_eq!(
+            parallel.notice(&pending, &mut streaming).as_deref(),
+            Some("Tool same #1 continues in the background (cancel-handle).")
+        );
+        assert_eq!(
+            parallel.notice(&finish(second), &mut streaming).as_deref(),
+            Some("Tool finished: same #2.")
+        );
+        parallel.notice(
+            &Event::RunFinished {
+                session_id: "s".into(),
+                run_id: "r".into(),
+                status: "completed".into(),
+            },
+            &mut streaming,
+        );
+        let completed = Event::InvocationCompleted {
+            invocation_id: Some(first.into()),
+            session_id: "s".into(),
+            tool_name: "same".into(),
+            handle: "cancel-handle".into(),
+            ok: true,
+        };
+        assert_eq!(
+            parallel.notice(&completed, &mut streaming).as_deref(),
+            Some("Background Tool same #1 finished.")
+        );
+        assert!(parallel.calls.is_empty());
     }
 
     #[test]
@@ -1518,7 +1724,7 @@ mod tests {
             },
             delta("Hello world"),
         ] {
-            if let Some(t) = format_event(&ev, &mut streaming) {
+            if let Some(t) = format_event(&ev, &mut streaming, "") {
                 out.push_str(&t);
             }
         }
@@ -1536,10 +1742,13 @@ mod tests {
             delta: d.into(),
         };
         assert_eq!(
-            format_event(&delta("Hel"), &mut streaming).unwrap(),
+            format_event(&delta("Hel"), &mut streaming, "").unwrap(),
             "Formless: Hel"
         );
-        assert_eq!(format_event(&delta("lo"), &mut streaming).unwrap(), "lo");
+        assert_eq!(
+            format_event(&delta("lo"), &mut streaming, "").unwrap(),
+            "lo"
+        );
         let started = Event::ToolCallStarted {
             invocation_id: None,
             session_id: "s".into(),
@@ -1551,7 +1760,7 @@ mod tests {
         };
         // A tool after streamed text starts on its own line.
         assert_eq!(
-            format_event(&started, &mut streaming).unwrap(),
+            format_event(&started, &mut streaming, "").unwrap(),
             "\nTool started: fetch."
         );
         let approval = Event::ApprovalRequested {
@@ -1569,7 +1778,7 @@ mod tests {
             tool_id: None,
             batch: None,
         };
-        let text = format_event(&approval, &mut streaming).unwrap();
+        let text = format_event(&approval, &mut streaming, "").unwrap();
         assert!(
             text.contains("net:example.com (can reach example.com over the network)"),
             "{text}"
@@ -1585,7 +1794,7 @@ mod tests {
             *capabilities = vec!["fs:read-sensitive:/private/project/token.json".into()];
             *detail = Some("Pinned reader v2 requests credential access".into());
         }
-        let text = format_event(&sensitive, &mut streaming).unwrap();
+        let text = format_event(&sensitive, &mut streaming, "").unwrap();
         assert!(text.contains("Pinned reader v2 requests credential access"));
         assert!(text.contains("fs:read-sensitive:/private/project/token.json"));
         assert!(text.contains("exact approved path identity only, not descendants"));

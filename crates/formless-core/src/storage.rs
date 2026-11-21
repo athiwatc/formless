@@ -20,6 +20,10 @@ mod pin_batch_tests;
 #[path = "run_id_lookup_tests.rs"]
 mod run_id_lookup_tests;
 
+#[path = "short_ids.rs"]
+mod short_ids;
+use short_ids::insert_short_id;
+
 /// A usage bucket's key, provider, model, prompt, completion, cache read and
 /// write tokens, reported cost, and whether the cost is explicitly unknown.
 pub type GroupedUsage = (
@@ -33,6 +37,9 @@ pub type GroupedUsage = (
     Option<f64>,
     bool,
 );
+
+#[path = "storage_forecast.rs"]
+mod forecast_storage;
 
 #[path = "forecast_snapshot.rs"]
 mod forecast_snapshot;
@@ -56,9 +63,16 @@ pub use runfile_storage::{
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
 
+#[path = "attachment_expiry.rs"]
+mod attachment_expiry;
+
 #[path = "recap_storage.rs"]
 mod recap_storage;
 pub(crate) use recap_storage::RecapRunFacts;
+
+#[path = "forecast_report_storage.rs"]
+mod forecast_report_storage;
+pub(crate) use forecast_report_storage::ForecastMetricInput;
 
 pub struct Store {
     conn: Connection,
@@ -213,9 +227,7 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
 
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
-    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id)
     FROM runs WHERE id=?1";
 const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
 const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
@@ -506,15 +518,6 @@ CREATE INDEX IF NOT EXISTS idx_builtin_calls ON builtin_calls(name, created_at);
 CREATE INDEX IF NOT EXISTS idx_builtin_calls_run ON builtin_calls(run_id);
 ";
 
-/// Applied memory-kind proposals move into the memory store (author
-/// `optimiser`, linked for rollback).
-const SCHEMA_V18: &str = "
-INSERT OR IGNORE INTO memories(id,text,dedup_key,scope,author,enabled,created_at,updated_at,proposal_id)
-  SELECT 'm' || lower(hex(randomblob(4))), trim(content), lower(trim(content)), 'global', 'optimiser', 1,
-         COALESCE(applied_at, created_at), COALESCE(applied_at, created_at), id
-  FROM prompt_proposals WHERE kind='memory' AND status='applied';
-";
-
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelStat {
     pub model: String,
@@ -542,6 +545,16 @@ impl ModelStat {
 /// schema v39) and triggers on `messages`/`runs` keep them true, so the
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
+
+fn run_duration_ms(created: &str, updated: &str) -> i64 {
+    match (
+        chrono::DateTime::parse_from_rfc3339(created),
+        chrono::DateTime::parse_from_rfc3339(updated),
+    ) {
+        (Ok(start), Ok(end)) => (end - start).num_milliseconds().max(0),
+        _ => 0,
+    }
+}
 
 /// Schema version this build writes (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: i64 = 67;
@@ -670,7 +683,7 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
     (17, |c| Ok(c.execute_batch(SCHEMA_V17)?)),
     (18, |c| {
         add_column(c, "memories", "proposal_id TEXT")?;
-        Ok(c.execute_batch(SCHEMA_V18)?)
+        short_ids::migrate_applied_memories(c, uuid::Uuid::new_v4)
     }),
     // Run-level metrics (SPEC §8.7).
     (19, |c| {
@@ -1849,6 +1862,55 @@ impl Store {
         Ok(rows)
     }
 
+    /// Newest transcript sequence without decoding any message bodies.
+    pub(crate) fn last_message_seq(&self, session_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The same newest user row as reversing a Session transcript, including
+    /// empty content. Compare and retry need its identity, sequence, and text.
+    pub(crate) fn last_user_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, seq, content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Suggest-name prompt: the latest four nonblank user rows, in transcript
+    /// order. Step through a single SQL snapshot rather than materializing
+    /// unrelated messages or retaining unbounded user text.
+    pub(crate) fn recent_user_naming_input(&self, session_id: &str) -> Result<String> {
+        const LIMIT: usize = 4;
+        const MAX_CHARS: usize = 2000;
+        let mut stmt = self.ps(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user'
+             ORDER BY seq DESC, rowid DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        let mut recent = Vec::with_capacity(LIMIT);
+        while recent.len() < LIMIT {
+            let Some(row) = rows.next()? else { break };
+            let text = row.get_ref(0)?.as_str()?;
+            if !text.trim().is_empty() {
+                recent.push(text.chars().take(MAX_CHARS).collect::<String>());
+            }
+        }
+        recent.reverse();
+        Ok(recent.join("\n").chars().take(MAX_CHARS).collect())
+    }
+
     /// One Session-scoped message, using the same row/metadata conversion as
     /// transcript reads. Unrelated rows are deliberately not decoded here.
     pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
@@ -2501,11 +2563,14 @@ impl Store {
         approved: bool,
         author: &str,
     ) -> Result<formless_protocol::JobInfo> {
-        let id = format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)",
-            params![id, prompt, session_id, cron, next_run, approved, author, now()],
-        )?;
+        let created = now();
+        let id = insert_short_id('j', "job", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO jobs(id,prompt,session_id,cron,next_run,enabled,approved,author,created_at) VALUES(?1,?2,?3,?4,?5,?6,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, prompt, session_id, cron, next_run, approved, author, created],
+            )
+        })?;
         self.get_job(&id)?.context("job vanished")
     }
 
@@ -2871,12 +2936,14 @@ impl Store {
         tool: &str,
         reason: &str,
     ) -> Result<String> {
-        let id = format!("h{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        self.ex(
-            "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, op, target, before.to_string(), after.to_string(), tool, reason, now()],
-        )?;
-        Ok(id)
+        let (before, after, created) = (before.to_string(), after.to_string(), now());
+        insert_short_id('h', "harness change", uuid::Uuid::new_v4, |id| {
+            self.ex(
+                "INSERT INTO harness_changes(id,op,target,before,after,tool,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id, op, target, before, after, tool, reason, created],
+            )
+        })
     }
 
     /// Harness changes, newest first.
@@ -3177,8 +3244,7 @@ impl Store {
         &self,
         limit: usize,
     ) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
-        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
-        if !exists {
+        if !self.has_forecast_history()? {
             return Ok(Vec::new());
         }
         let mut stmt =
@@ -3206,10 +3272,10 @@ impl Store {
             params![run_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(expected > 0
-            && expected == rows
-            && expected == known
-            && main >= self.run_steps(run_id)?)
+        Ok(
+            forecast_report_storage::covered_requests(expected, rows, known)
+                && main >= self.run_steps(run_id)?,
+        )
     }
 
     /// Check coverage for a branch's allocated Runs in one statement.
@@ -3251,43 +3317,6 @@ impl Store {
         let rows = stmt.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-    pub fn forecast_usage(
-        &self,
-        run_id: &str,
-        cfg: &crate::Config,
-    ) -> Result<(Option<f64>, u64, u64)> {
-        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source,cost_unknown FROM run_usage WHERE run_id=?1")?;
-        let rows = stmt.query_map(params![run_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<f64>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, bool>(8)?,
-            ))
-        })?;
-        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
-        let mut any = false;
-        for row in rows {
-            let (p, m, input, output, cache, write, reported, source, unknown) = row?;
-            any = true;
-            // Only the main Session request drives its compaction threshold;
-            // nested llm/sub-agent/summarizer contexts have separate windows.
-            if source == "run" {
-                peak = peak.max(input.max(0) as u64);
-            }
-            cached += cache.max(0) as u64;
-            cost = cost
-                .zip(cfg.cost_of_known(&p, &m, input, output, cache, write, reported, unknown))
-                .map(|(a, b)| a + b);
-        }
-        Ok((cost.filter(|_| any), peak, cached))
-    }
-
     pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
         Ok(self
             .ps("SELECT COUNT(*) FROM runs WHERE session_id=?1")?
@@ -3336,13 +3365,23 @@ impl Store {
     }
 
     fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
-        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+        let Some(mut run) = self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
             "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
             "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
             "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
             "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-        }))).optional().map_err(Into::into)
+            "tool_calls":r.get::<_,i64>(9)?
+        }))).optional()? else {
+            return Ok(None);
+        };
+        let usage = self.run_usage(id)?;
+        // Preserve the signed SQLite totals already returned by GetRun.
+        run["prompt_tokens"] = serde_json::json!(usage.prompt_tokens as i64);
+        run["completion_tokens"] = serde_json::json!(usage.completion_tokens as i64);
+        run["cached_tokens"] = serde_json::json!(usage.cached_tokens);
+        run["cache_write_tokens"] = serde_json::json!(usage.cache_write_tokens);
+        run["reasoning_tokens"] = serde_json::json!(usage.reasoning_tokens);
+        Ok(Some(run))
     }
 
     pub fn run_metrics_for(
@@ -3386,13 +3425,7 @@ impl Store {
         let rows = stmt
             .query_map(params![limit as i64, session_id, since, run_id], |r| {
                 let (created, updated): (String, String) = (r.get(8)?, r.get(9)?);
-                let duration_ms = match (
-                    chrono::DateTime::parse_from_rfc3339(&created),
-                    chrono::DateTime::parse_from_rfc3339(&updated),
-                ) {
-                    (Ok(a), Ok(b)) => (b - a).num_milliseconds().max(0),
-                    _ => 0,
-                };
+                let duration_ms = run_duration_ms(&created, &updated);
                 let status: String = r.get(2)?;
                 let followup: String = r.get(3)?;
                 let rating: String = r.get(10)?;
@@ -5980,32 +6013,32 @@ impl Store {
         }
         let key = crate::memory::dedup_key(text);
         let t = now();
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
-                params![scope, key],
-                |r| r.get(0),
-            )
-            .ok();
-        let (id, created) = match existing {
-            Some(id) => {
-                self.ex(
+        self.transaction(|st| {
+            let existing: Option<String> = st
+                .conn
+                .query_row(
+                    "SELECT id FROM memories WHERE scope=?1 AND dedup_key=?2",
+                    params![scope, key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                st.ex(
                     "UPDATE memories SET enabled=1, updated_at=?2 WHERE id=?1",
                     params![id, t],
                 )?;
-                (id, false)
+                return Ok((st.get_memory(&id)?.context("memory vanished")?, false));
             }
-            None => {
-                let id = format!("m{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                self.ex(
-                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-                    params![id, crate::memory::clean(text), key, scope, author, session_id, t],
-                )?;
-                (id, true)
-            }
-        };
-        Ok((self.get_memory(&id)?.context("memory vanished")?, created))
+            let text = crate::memory::clean(text);
+            let id = insert_short_id('m', "memory", uuid::Uuid::new_v4, |id| {
+                st.ex(
+                    "INSERT INTO memories(id,text,dedup_key,scope,author,session_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![id, text, key, scope, author, session_id, t],
+                )
+            })?;
+            Ok((st.get_memory(&id)?.context("memory vanished")?, true))
+        })
     }
 
     pub fn get_memory(&self, id: &str) -> Result<Option<formless_protocol::MemoryInfo>> {
@@ -6623,44 +6656,6 @@ impl Store {
     /// Mark the attachments with these artifact ids as expired in the
     /// messages that carry them, so every client and the model's history
     /// say so instead of pointing at a removed file (#858).
-    pub fn mark_attachments_expired(&self, ids: &[String]) -> Result<usize> {
-        let mut changed = 0;
-        for id in ids {
-            let rows: Vec<(String, String)> = {
-                let mut stmt =
-                    self.ps("SELECT id, meta FROM messages WHERE role='user' AND meta LIKE ?1")?;
-                let rows = stmt
-                    .query_map(params![format!("%{id}%")], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?;
-                rows
-            };
-            for (msg_id, meta) in rows {
-                let Ok(mut v) = serde_json::from_str::<Value>(&meta) else {
-                    continue;
-                };
-                let mut hit = false;
-                for a in v["attachments"].as_array_mut().into_iter().flatten() {
-                    if a["id"].as_str() == Some(id.as_str()) && a["expired"] != true {
-                        a["expired"] = json!(true);
-                        hit = true;
-                    }
-                }
-                if hit {
-                    self.ex(
-                        "UPDATE messages SET meta=?1 WHERE id=?2",
-                        params![v.to_string(), msg_id],
-                    )?;
-                    changed += 1;
-                }
-            }
-        }
-        if changed > 0 {
-            self.rewrites
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(changed)
-    }
-
     pub fn delete_session_artifact_rows(&self, session_id: &str) -> Result<()> {
         self.ex(
             "DELETE FROM artifacts WHERE session_id=?1",
@@ -8383,6 +8378,107 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}
+
+#[cfg(test)]
+mod narrow_transcript_tests {
+    use super::*;
+
+    fn assert_projection_matches_full(store: &Store, session: &str) {
+        let full = store.list_messages(session).unwrap();
+        assert_eq!(
+            store.last_message_seq(session).unwrap(),
+            full.last().map_or(0, |row| row.seq)
+        );
+        let last_user = full.iter().rev().find(|row| row.role == "user");
+        assert_eq!(
+            store.last_user_message(session).unwrap(),
+            last_user.map(|row| (row.id.clone(), row.seq, row.content.clone()))
+        );
+        let users: Vec<_> = full
+            .iter()
+            .filter(|row| row.role == "user" && !row.content.trim().is_empty())
+            .map(|row| row.content.as_str())
+            .collect();
+        let legacy = users[users.len().saturating_sub(4)..]
+            .join("\n")
+            .chars()
+            .take(2000)
+            .collect::<String>();
+        assert_eq!(store.recent_user_naming_input(session).unwrap(), legacy);
+    }
+
+    #[test]
+    fn narrow_transcript_reads_keep_unicode_cap_and_empty_latest_user() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let other = store.create_session(None).unwrap().id;
+        store
+            .append_message(&other, "user", "not this Session")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+        store
+            .append_message(&session, "assistant", "no user yet")
+            .unwrap();
+        assert_projection_matches_full(&store, &session);
+
+        let long_user = "ก中".repeat(1800);
+        let long_tool = "unrelated tool output".repeat(120_000);
+        for (role, content) in [
+            ("user", "excluded oldest"),
+            ("assistant", "assistant"),
+            ("user", "oldest kept"),
+            ("user", "\t\n"),
+            ("user", long_user.as_str()),
+            ("tool", long_tool.as_str()),
+            ("user", "third kept"),
+            ("user", "\u{2003}\u{00A0}"),
+            ("user", "fourth kept"),
+            ("user", ""),
+            ("system-note", "last sequence is not the newest user"),
+        ] {
+            store.append_message(&session, role, content).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        let recent = store.recent_user_naming_input(&session).unwrap();
+        assert_eq!(recent.chars().count(), 2000);
+        assert!(recent.starts_with("oldest kept\nก中"));
+        assert!(store
+            .last_user_message(&session)
+            .unwrap()
+            .unwrap()
+            .2
+            .is_empty());
+    }
+
+    #[test]
+    fn narrow_transcript_reads_match_equal_sequences_in_both_directions() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        for (id, role, content) in [
+            ("old", "user", "discarded"),
+            ("z", "user", "first kept"),
+            ("y", "user", "second kept"),
+            ("x", "assistant", "ignored"),
+            ("w", "user", "third kept"),
+            ("v", "user", "last kept"),
+            ("u", "user", "\u{2003}"),
+        ] {
+            store.conn.execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at) VALUES(?1,?2,1,?3,?4,'fixture')",
+                params![id, session, role, content],
+            ).unwrap();
+        }
+        assert_projection_matches_full(&store, &session);
+        assert_eq!(
+            store.last_user_message(&session).unwrap(),
+            Some(("u".into(), 1, "\u{2003}".into()))
+        );
+        assert_eq!(
+            store.recent_user_naming_input(&session).unwrap(),
+            "first kept\nsecond kept\nthird kept\nlast kept"
+        );
     }
 }
 

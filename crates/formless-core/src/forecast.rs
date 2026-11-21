@@ -222,13 +222,10 @@ pub(crate) fn estimate_store_with_window(
             copy.edit_message(session, edit, &input.draft)?
                 .context("user message not found")?;
         } else if input.retry {
-            let user = copy
-                .list_messages(session)?
-                .into_iter()
-                .rev()
-                .find(|m| m.role == "user")
+            let (id, _, content) = copy
+                .last_user_message(session)?
                 .context("nothing to retry")?;
-            copy.edit_message(session, &user.id, &user.content)?
+            copy.edit_message(session, &id, &content)?
                 .context("user message not found")?;
         } else {
             let (id, status) = copy
@@ -512,76 +509,28 @@ pub(crate) fn estimate_store_with_window(
         tools_hash: hash(&defs),
         prompt_tokens,
     };
-    let recorded = st.recorded_forecasts()?;
-    let runs = st.run_metrics(2000)?;
+    let share_cwd = basis.cwd_hash != hash(&Option::<String>::None);
+    let comparables = st.forecast_comparables(&basis, name, share_cwd, cfg)?;
     let mut steps = Vec::new();
     let mut tokens = Vec::new();
     let mut costs = Vec::new();
     let mut durations = Vec::new();
     let mut caches = Vec::new();
     let mut crossings = 0;
-    let mut comparables = Vec::new();
     let threshold = window as f64 * cfg.compaction.fraction();
-    // Bound quote size and preview work while retaining the exact sample ids.
-    // recorded_forecasts is newest-first; N always names this selected sample.
-    for (id, old) in &recorded {
-        let b = &old.basis;
-        let same_location = b.session_id.is_some() && b.session_id == basis.session_id
-            || (basis.cwd_hash != hash(&Option::<String>::None) && b.cwd_hash == basis.cwd_hash);
-        let scale = prompt_tokens as f64 / b.prompt_tokens.max(1) as f64;
-        if b.provider_key != basis.provider_key
-            || b.model != model
-            || b.role != role
-            || b.reasoning_effort != basis.reasoning_effort
-            || b.tools_hash != basis.tools_hash
-            || !same_location
-            || !(0.5..=2.0).contains(&scale)
-        {
-            continue;
-        }
-        let Some(run) = runs
-            .iter()
-            .find(|r| &r.run_id == id && r.status == "completed")
-        else {
-            continue;
-        };
-        let served = st.forecast_models(id)?;
-        if served.is_empty()
-            || served
-                .iter()
-                .any(|(provider, model)| provider != name || model != &basis.model)
-        {
-            continue;
-        }
-        let (cost, peak, cached) = st.forecast_usage(id, cfg)?;
-        if peak == 0 || !st.forecast_usage_complete(id)? {
-            continue;
-        }
-        comparables.push(ForecastComparable {
-            run_id: id.clone(),
-            prompt_tokens: b.prompt_tokens,
-            steps: run.steps,
-            tokens: run.prompt_tokens + run.completion_tokens,
-            duration_ms: run.duration_ms,
-            cost_usd: cost,
-            cached_fraction: (run.prompt_tokens > 0)
-                .then_some(cached as f64 / run.prompt_tokens.max(1) as f64),
-            peak_prompt_tokens: peak,
-        });
+    for run in &comparables {
+        let scale = prompt_tokens as f64 / run.prompt_tokens.max(1) as f64;
         steps.push(run.steps as f64);
-        tokens.push((run.prompt_tokens + run.completion_tokens) as f64 * scale);
+        tokens.push(run.tokens as f64 * scale);
         durations.push(run.duration_ms as f64);
-        if let Some(c) = cost {
-            costs.push(c * scale);
+        if let Some(cost) = run.cost_usd {
+            costs.push(cost * scale);
         }
-        if peak as f64 * scale > threshold {
+        if run.peak_prompt_tokens as f64 * scale > threshold {
             crossings += 1;
         }
-        if run.prompt_tokens > 0 {
-            caches.push(cached as f64 / run.prompt_tokens as f64);
-        }
-        if comparables.len() == 50 {
-            break;
+        if let Some(cached) = run.cached_fraction {
+            caches.push(cached);
         }
     }
     let n = steps.len();
@@ -675,20 +624,8 @@ pub(crate) fn estimate_store_with_window(
         confirmation_id: None,
         hint: String::new(),
     };
-    let history_revision: Vec<_> = runs
-        .iter()
-        .map(|r| {
-            (
-                &r.run_id,
-                &r.status,
-                if r.status == "completed" {
-                    Some((r.steps, r.prompt_tokens, r.completion_tokens, r.duration_ms))
-                } else {
-                    None
-                },
-            )
-        })
-        .collect();
+    // Comparables and the measured values used by this quote are part of f.
+    // Updates in other Runs do not invalidate an otherwise identical quote.
     f.fingerprint = hash(&(
         context_hash,
         &input.draft,
@@ -698,8 +635,6 @@ pub(crate) fn estimate_store_with_window(
             .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),
         &logical,
         &cfg,
-        &recorded,
-        &history_revision,
         ratio,
         &f,
     ));
@@ -732,24 +667,106 @@ pub fn resume_note(status: &str) -> String {
     format!("The previous run was {status} before it finished. Continue the user's task from where it stopped; do not repeat work already done above.")
 }
 
+fn forecast_count(value: f64) -> String {
+    let rounded = format!("{value:.0}");
+    let digits = rounded.strip_prefix('-').unwrap_or(&rounded);
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return rounded;
+    }
+    let mut grouped = String::new();
+    if rounded.starts_with('-') {
+        grouped.push('-');
+    }
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn forecast_duration(ms: f64) -> String {
+    let millis = ms.round() as u64;
+    if millis > 0 && millis < 1_000 {
+        let fractional = format!("{millis:03}");
+        return format!("0.{}s", fractional.trim_end_matches('0'));
+    }
+    let seconds = millis / 1_000;
+    let mut text = String::new();
+    for (n, unit) in [
+        (seconds / 3600, "h"),
+        (seconds / 60 % 60, "m"),
+        (seconds % 60, "s"),
+    ] {
+        if n > 0 {
+            text.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if text.is_empty() {
+        "0s".into()
+    } else {
+        text
+    }
+}
+
+fn forecast_cost(value: f64) -> String {
+    if value != 0.0 && value.abs() < 0.00005 {
+        format!("${value:.2e}")
+    } else if value != 0.0 && value.abs() < 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.2}")
+    }
+}
+
 pub fn describe(f: &RunForecast) -> String {
-    let show = |r: &Option<ForecastRange>, unit: &str| {
-        r.as_ref()
-            .map(|r| format!("p50 {:.2} / p90 {:.2} {unit}", r.p50, r.p90))
-            .unwrap_or_else(|| "unknown (no comparable history or price)".into())
+    let show = |range: &Option<ForecastRange>, format: fn(f64) -> String| {
+        range.as_ref().map_or_else(
+            || "unknown (no comparable history or price)".into(),
+            |range| format!("p50 {} / p90 {}", format(range.p50), format(range.p90)),
+        )
     };
-    format!("{}\nSteps: {}\nTokens: {}\nCost: {}\nDuration: {}\nCached fraction: {}\nCompaction probability: {}\n{}",f.hint,show(&f.steps,"steps"),show(&f.tokens,"tokens"),show(&f.cost_usd,"USD"),show(&f.duration_ms,"ms"),show(&f.cached_fraction,""),f.compaction_probability.map_or("unknown".into(),|p|format!("{:.0}%",100.0*p)),f.warnings.join("\n"))
+    let percent = |p| format!("{:.0}%", 100.0 * p);
+    let mut lines = vec![
+        f.hint.clone(),
+        format!("Steps: {}", show(&f.steps, forecast_count)),
+        format!("Tokens: {}", show(&f.tokens, forecast_count)),
+        format!("Cost: {}", show(&f.cost_usd, forecast_cost)),
+        format!("Duration: {}", show(&f.duration_ms, forecast_duration)),
+        format!("Cached fraction: {}", show(&f.cached_fraction, percent)),
+        format!(
+            "Compaction probability: {}",
+            f.compaction_probability
+                .map_or_else(|| "unknown".into(), percent)
+        ),
+    ];
+    lines.extend(f.warnings.iter().cloned());
+    lines.join("\n")
 }
 
 pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
-    let runs = st.run_metrics(2000)?;
+    // The forecast window and its observations come from one read snapshot.
+    st.read_transaction(|st| {
+        let forecasts = st.recorded_forecasts_limited(200)?;
+        let ids: Vec<_> = forecasts.iter().map(|(id, _)| id.as_str()).collect();
+        let facts = st.forecast_metric_inputs(&ids, cfg)?;
+        Ok(render_metrics(forecasts, facts))
+    })
+}
+
+fn render_metrics(
+    forecasts: Vec<(String, RunForecast)>,
+    mut facts: std::collections::HashMap<String, crate::storage::ForecastMetricInput>,
+) -> Value {
     let mut rows = Vec::new();
-    for (id, f) in st.recorded_forecasts_limited(200)? {
-        let Some(run) = runs.iter().find(|r| r.run_id == id) else {
+    for (id, f) in forecasts {
+        let Some(run) = facts.remove(&id) else {
             continue;
         };
-        let (cost, main_peak, _) = st.forecast_usage(&id, cfg)?;
-        let served = st.forecast_models(&id)?;
+        let cost = run.cost;
+        let main_peak = run.main_peak;
+        let served = run.served;
         let quoted_provider = f
             .basis
             .provider_key
@@ -764,7 +781,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             .into_iter()
             .map(|(provider, model)| json!({"provider":provider,"model":model}))
             .collect();
-        let complete = st.forecast_usage_complete(&id)?;
+        let complete = run.complete;
         let actual = (run.prompt_tokens + run.completion_tokens) as f64;
         let finished = run.status == "completed" && complete;
         let error = f
@@ -789,12 +806,67 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
         let comparisons = json!({"steps":comparison(&f.steps,Some(run.steps as f64)),"tokens":comparison(&f.tokens,complete.then_some(actual)),"cost_usd":comparison(&f.cost_usd,cost.filter(|_|complete)),"duration_ms":comparison(&f.duration_ms,Some(run.duration_ms as f64))});
         rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"peak_main_prompt_tokens":main_peak,"served_main":served_main,"basis_match":basis_match,"duration_ms":run.duration_ms},"comparison":comparisons,"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished && basis_match && main_peak>0}));
     }
-    Ok(json!(rows))
+    json!(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forecast_description_formats_history_and_unknowns_without_blank_lines() {
+        let mut f: RunForecast = serde_json::from_value(json!({
+            "fingerprint": "fixture",
+            "basis": {
+                "provider_key": "fixture", "model": "fixture", "role": "fixture",
+                "session_id": null, "cwd_hash": "fixture", "tools_hash": "fixture",
+                "prompt_tokens": 0
+            },
+            "comparable_runs": 0, "steps": null, "tokens": null,
+            "cost_usd": null, "duration_ms": null, "context_tokens": 0,
+            "context_source": "fixture", "will_compact": false,
+            "compaction_probability": null, "cached_fraction": null,
+            "unpriced": true, "warnings": [], "confirmation_required": false,
+            "hint": "Synthetic forecast"
+        }))
+        .unwrap();
+        assert_eq!(
+            describe(&f),
+            "Synthetic forecast\nSteps: unknown (no comparable history or price)\nTokens: unknown (no comparable history or price)\nCost: unknown (no comparable history or price)\nDuration: unknown (no comparable history or price)\nCached fraction: unknown (no comparable history or price)\nCompaction probability: unknown"
+        );
+
+        let range = |p50, p90| Some(ForecastRange { p50, p90 });
+        f.comparable_runs = 3;
+        f.steps = range(12.0, 31.0);
+        f.tokens = range(48_213.0, 90_551.0);
+        f.cost_usd = range(0.0002, 0.004);
+        f.duration_ms = range(84_211.0, 240_000.0);
+        f.cached_fraction = range(0.42, 0.8);
+        f.compaction_probability = Some(0.1);
+        f.warnings = vec![
+            "First fixture warning".into(),
+            "Second fixture warning".into(),
+        ];
+        let original = serde_json::to_value(&f).unwrap();
+        assert_eq!(
+            describe(&f),
+            "Synthetic forecast\nSteps: p50 12 / p90 31\nTokens: p50 48,213 / p90 90,551\nCost: p50 $0.0002 / p90 $0.0040\nDuration: p50 1m24s / p90 4m\nCached fraction: p50 42% / p90 80%\nCompaction probability: 10%\nFirst fixture warning\nSecond fixture warning"
+        );
+        assert_eq!(serde_json::to_value(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn forecast_human_rounding_preserves_subsecond_and_small_cost_information() {
+        assert_eq!(forecast_count(999.6), "1,000");
+        assert_eq!(forecast_duration(400.0), "0.4s");
+        assert_eq!(forecast_duration(999.49), "0.999s");
+        assert_eq!(forecast_duration(999.5), "1s");
+        assert_eq!(forecast_duration(3_600_000.0), "1h");
+        assert_eq!(forecast_cost(0.0), "$0.00");
+        assert_eq!(forecast_cost(0.000001), "$1.00e-6");
+        assert_eq!(forecast_cost(0.0001), "$0.0001");
+        assert_eq!(forecast_cost(0.3456), "$0.35");
+    }
+
     fn config() -> Config {
         let mut c = Config::default();
         c.provider.model = "model".into();
@@ -870,6 +942,117 @@ mod tests {
         st.set_run_status(&legacy, "completed").unwrap();
         assert_eq!(estimate_store(&st, &c, &input).unwrap().comparable_runs, 0);
     }
+    #[test]
+    fn a_full_history_keeps_the_same_ordered_samples_and_quote_ranges() {
+        let st = Store::open_in_memory().unwrap();
+        let mut cfg = config();
+        let session = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(session.clone()),
+            draft: "draft with a bounded quote".into(),
+            ..Default::default()
+        };
+        let quote = estimate_store(&st, &cfg, &input).unwrap();
+        let mut unrelated = quote.clone();
+        unrelated.basis.role = "other role".into();
+        for _ in 0..1948 {
+            let id = st.create_run(&session).unwrap();
+            st.record_forecast(&id, &unrelated).unwrap();
+            st.set_run_status(&id, "completed").unwrap();
+        }
+        assert_eq!(estimate_store(&st, &cfg, &input).unwrap(), quote);
+        let first = completed(&st, &cfg, &quote, 1, "completed");
+        let second = completed(&st, &cfg, &quote, 2, "completed");
+        let few = estimate_store(&st, &cfg, &input).unwrap();
+        let (_, few_statements) = st.count_forecast_statements(|| {
+            st.forecast_comparables(&few.basis, "default", false, &cfg)
+                .unwrap()
+        });
+        assert_eq!(
+            few.comparables
+                .iter()
+                .map(|c| c.run_id.as_str())
+                .collect::<Vec<_>>(),
+            [second.as_str(), first.as_str()]
+        );
+        assert_eq!(few.steps, Some(ForecastRange { p50: 1.0, p90: 2.0 }));
+        assert_ne!(quote.fingerprint, few.fingerprint);
+        let mut expected = Vec::new();
+        for _ in 0..50 {
+            expected.push(completed(&st, &cfg, &quote, 1, "completed"));
+        }
+        expected.reverse();
+        assert_eq!(st.recorded_forecasts().unwrap().len(), 2000);
+        let full = estimate_store(&st, &cfg, &input).unwrap();
+        let (selected, full_statements) = st.count_forecast_statements(|| {
+            st.forecast_comparables(&full.basis, "default", false, &cfg)
+                .unwrap()
+        });
+        assert_eq!(selected, full.comparables);
+        assert_eq!(few_statements, full_statements);
+        assert!(full_statements <= 5, "{full_statements} SQL statements");
+        assert_eq!(
+            full.comparables
+                .iter()
+                .map(|c| &c.run_id)
+                .collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        let legacy = st
+            .run_metrics(2000)
+            .unwrap()
+            .into_iter()
+            .map(|run| (run.run_id.clone(), run))
+            .collect::<std::collections::HashMap<_, _>>();
+        for sample in &full.comparables {
+            let metrics = &legacy[&sample.run_id];
+            let (cost, peak, cache) = st.forecast_usage(&sample.run_id, &cfg).unwrap();
+            assert_eq!(sample.steps, metrics.steps);
+            assert_eq!(
+                sample.tokens,
+                metrics.prompt_tokens + metrics.completion_tokens
+            );
+            assert_eq!(sample.duration_ms, metrics.duration_ms);
+            assert_eq!(sample.cost_usd, cost);
+            assert_eq!(sample.peak_prompt_tokens, peak);
+            assert_eq!(
+                sample.cached_fraction,
+                Some(cache as f64 / metrics.prompt_tokens as f64)
+            );
+        }
+        assert_eq!(full.steps, Some(ForecastRange { p50: 1.0, p90: 1.0 }));
+        assert_eq!(
+            full.tokens,
+            Some(ForecastRange {
+                p50: 120.0,
+                p90: 120.0
+            })
+        );
+        assert_eq!(
+            full.warnings.as_slice(),
+            &few.warnings[..full.warnings.len()]
+        );
+        assert!(few
+            .warnings
+            .last()
+            .unwrap()
+            .starts_with("Small empirical sample (N=2)"));
+        assert!(full.hint.contains("50 comparable Runs"));
+        let id = st.create_run(&session).unwrap();
+        st.record_forecast(&id, &unrelated).unwrap();
+        assert_eq!(estimate_store(&st, &cfg, &input).unwrap(), full);
+
+        cfg.provider.prices.clear();
+        let unpriced = estimate_store(&st, &cfg, &input).unwrap();
+        assert!(unpriced
+            .comparables
+            .iter()
+            .all(|sample| sample.cost_usd.is_none()));
+        assert!(unpriced.cost_usd.is_none());
+        assert!(unpriced.hint.ends_with(" · unpriced"));
+        assert_ne!(unpriced.fingerprint, full.fingerprint);
+    }
+
     #[test]
     fn comparable_quantiles_unknown_prices_outcomes_and_metrics_are_truthful() {
         let st = Store::open_in_memory().unwrap();

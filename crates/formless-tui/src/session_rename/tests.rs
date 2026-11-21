@@ -226,7 +226,7 @@ fn switching_views_and_sessions_discards_only_the_rename_editor() {
 }
 
 #[test]
-fn a_late_search_that_changes_the_view_cancels_rename() {
+fn an_older_search_reply_preserves_the_active_rename_draft() {
     let (mut app, tx, sent) = recorded_app();
     app.slash("search");
     app.input.set("synthetic query");
@@ -238,9 +238,14 @@ fn a_late_search_that_changes_the_view_cancels_rename() {
     );
     app.input.set("new draft");
     app.start_rename("other", "fixture");
+    app.paste(" suffix");
+    let draft_name = name(&app);
+    assert!(draft_name.contains("suffix"));
     reply(&mut app, &tx, search.id, json!([]));
-    assert_eq!(app.view, View::Search);
-    assert!(app.renaming.is_none());
+    assert_eq!(app.view, View::Chat);
+    assert_eq!(name(&app), draft_name);
+    assert_eq!(app.renaming.as_ref().unwrap().target, "other");
+    assert!(app.search_context.is_none());
     app.key(key(KeyCode::Esc));
     assert_eq!(app.view, View::Chat);
     assert!(app.renaming.is_none());

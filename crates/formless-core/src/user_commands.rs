@@ -26,6 +26,7 @@ pub enum Source {
 pub struct CommandInfo {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub source: Source,
     pub max_position: u8,
     pub uses_arguments: bool,
@@ -36,6 +37,7 @@ pub struct CommandInfo {
 pub struct UserCommand {
     pub name: String,
     pub description: String,
+    pub argument_hint: Option<String>,
     pub source: Source,
     pub max_position: u8,
     pub uses_arguments: bool,
@@ -48,6 +50,7 @@ pub struct Diagnostic {
     #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub message: String,
+    pub warning: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ShadowedCommand {
@@ -87,6 +90,7 @@ impl Snapshot {
                 .map(|command| CommandInfo {
                     name: command.name.clone(),
                     description: command.description.clone(),
+                    argument_hint: command.argument_hint.clone(),
                     source: command.source,
                     max_position: command.max_position,
                     uses_arguments: command.uses_arguments,
@@ -98,6 +102,9 @@ impl Snapshot {
         }
     }
     fn diagnostic(&mut self, path: &Path, message: &str) {
+        self.record_diagnostic(path, message, false);
+    }
+    fn record_diagnostic(&mut self, path: &Path, message: &str, warning: bool) {
         if self.diagnostics.len() >= MAX_DIAGNOSTICS {
             return;
         }
@@ -112,6 +119,7 @@ impl Snapshot {
             key,
             path: path.into(),
             message: message.into(),
+            warning,
         });
     }
 }
@@ -170,8 +178,18 @@ fn argument_metadata(mut body: &str) -> (u8, bool) {
     }
     (max_position, uses_arguments)
 }
-fn usage(name: &str, max_position: u8, uses_arguments: bool) -> String {
+fn usage(
+    name: &str,
+    argument_hint: Option<&str>,
+    max_position: u8,
+    uses_arguments: bool,
+) -> String {
     let mut hint = format!("/{name}");
+    if let Some(custom) = argument_hint {
+        hint.push(' ');
+        hint.push_str(custom);
+        return hint;
+    }
     for position in 1..=max_position {
         hint.push_str(&format!(" <arg{position}>"));
     }
@@ -182,12 +200,22 @@ fn usage(name: &str, max_position: u8, uses_arguments: bool) -> String {
 }
 impl CommandInfo {
     pub fn usage(&self) -> String {
-        usage(&self.name, self.max_position, self.uses_arguments)
+        usage(
+            &self.name,
+            self.argument_hint.as_deref(),
+            self.max_position,
+            self.uses_arguments,
+        )
     }
 }
 impl UserCommand {
     pub fn usage(&self) -> String {
-        usage(&self.name, self.max_position, self.uses_arguments)
+        usage(
+            &self.name,
+            self.argument_hint.as_deref(),
+            self.max_position,
+            self.uses_arguments,
+        )
     }
     /// Literal single pass. Positions 1..9 split on Unicode whitespace; all
     /// arguments preserve their original spelling/whitespace in $ARGUMENTS.
@@ -237,13 +265,22 @@ fn valid_name(name: &str) -> bool {
         })
 }
 
-fn parse(text: &str) -> Result<(String, String), &'static str> {
+struct ParsedTemplate<'a> {
+    description: String,
+    argument_hint: Option<String>,
+    body: &'a str,
+    ignored_keys: Vec<&'a str>,
+}
+
+fn parse(text: &str) -> Result<ParsedTemplate<'_>, &'static str> {
     if text.contains('\0') {
         return Err("Template contains a NUL byte");
     }
     let text = text.trim_start_matches('\u{feff}');
     let mut body = text;
     let mut description = "User command".to_string();
+    let mut argument_hint = None;
+    let mut ignored_keys = Vec::new();
     if text.lines().next() == Some("---") {
         let mut consumed = text.find('\n').map_or(text.len(), |index| index + 1);
         let mut header = Vec::new();
@@ -261,7 +298,7 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
             return Err("Command frontmatter is not closed with ---");
         }
         body = &text[consumed..];
-        let mut found = false;
+        let mut keys = HashSet::new();
         let mut index = 0;
         while index < header.len() {
             let line = header[index];
@@ -269,23 +306,25 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
-            let key = line.trim_start();
-            let key_indent = line.len() - key.len();
-            let Some(value) = key.strip_prefix("description:") else {
-                return Err("Only description frontmatter is supported");
+            let trimmed = line.trim_start();
+            let key_indent = line.len() - trimmed.len();
+            let Some((key, value)) = trimmed.split_once(':') else {
+                return Err("Command frontmatter needs a key and string value");
             };
-            if found {
-                return Err("Duplicate frontmatter description");
+            if !valid_name(key) {
+                return Err("Invalid command frontmatter key");
             }
-            found = true;
+            if !keys.insert(key) {
+                return Err("Duplicate command frontmatter key");
+            }
             let value = crate::frontmatter::scalar_without_comment(value.trim());
-            description = if matches!(value, ">" | "|" | ">-" | "|-") {
+            let decoded = if matches!(value, ">" | "|" | ">-" | "|-") && key != "argument-hint" {
                 let mut parts = Vec::new();
                 while index < header.len() {
                     let line = header[index];
                     let content = line.trim_start();
                     // A sibling key/comment ends the block, even when the
-                    // description key itself has leading whitespace.
+                    // key itself has leading whitespace.
                     if !content.is_empty() && line.len() - content.len() <= key_indent {
                         break;
                     }
@@ -294,24 +333,40 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
                 }
                 parts.join(" ")
             } else if value.starts_with('"') {
-                serde_json::from_str::<String>(value).map_err(|_| "Invalid quoted description")?
+                serde_json::from_str::<String>(value)
+                    .map_err(|_| "Invalid quoted frontmatter string")?
             } else if let Some(value) = value.strip_prefix('\'') {
                 let Some(value) = value.strip_suffix('\'') else {
-                    return Err("Invalid quoted description");
+                    return Err("Invalid quoted frontmatter string");
                 };
                 let decoded = value.replace("''", "\0");
                 if decoded.contains('\'') {
-                    return Err("Invalid quoted description");
+                    return Err("Invalid quoted frontmatter string");
                 }
                 decoded.replace('\0', "'")
             } else {
                 if value.starts_with(['[', '{', '&', '*', '!', '>', '|']) {
-                    return Err("Description must be a plain or quoted string");
+                    return Err("Frontmatter values must be strings");
+                }
+                if key != "description"
+                    && (value.is_empty()
+                        || matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "true" | "false" | "null" | "~"
+                        )
+                        || value.parse::<f64>().is_ok())
+                {
+                    return Err("Frontmatter values must be strings");
                 }
                 value.into()
             };
+            match key {
+                "description" => description = decoded,
+                "argument-hint" => argument_hint = Some(decoded),
+                _ => ignored_keys.push(key),
+            }
         }
-        if !found || description.trim().is_empty() {
+        if !keys.contains("description") || description.trim().is_empty() {
             return Err("Frontmatter needs a non-empty description");
         }
     }
@@ -325,7 +380,24 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
     if description.trim().is_empty() {
         return Err("Command description has no displayable text");
     }
-    Ok((description, body.into()))
+    let argument_hint = argument_hint
+        .map(|hint| {
+            if hint.len() > 512 {
+                return Err("Command argument hint exceeds 512 bytes");
+            }
+            let hint = crate::descriptions::screen(&hint).text;
+            if hint.is_empty() {
+                return Err("Command argument hint needs displayable text");
+            }
+            Ok(hint)
+        })
+        .transpose()?;
+    Ok(ParsedTemplate {
+        description,
+        argument_hint,
+        body,
+        ignored_keys,
+    })
 }
 
 /// Read a fresh bounded snapshot for palette/help/list/dispatch. Config and the
@@ -420,22 +492,35 @@ pub fn load(config_dir: &Path, project_cwd: Option<&Path>, builtin_names: &[Stri
             let parsed = std::str::from_utf8(&bytes)
                 .map_err(|_| "Command template is not UTF-8")
                 .and_then(parse);
-            let (description, body) = match parsed {
+            let ParsedTemplate {
+                description,
+                argument_hint,
+                body,
+                ignored_keys,
+            } = match parsed {
                 Ok(parsed) => parsed,
                 Err(message) => {
                     snapshot.diagnostic(&path, message);
                     continue;
                 }
             };
-            let (max_position, uses_arguments) = argument_metadata(&body);
+            for key in ignored_keys {
+                snapshot.record_diagnostic(
+                    &path,
+                    &format!("Ignored frontmatter key `{key}`"),
+                    true,
+                );
+            }
+            let (max_position, uses_arguments) = argument_metadata(body);
             let command = UserCommand {
                 name: name_text.into(),
                 description,
+                argument_hint,
                 source,
                 max_position,
                 uses_arguments,
                 path: path.clone(),
-                body,
+                body: body.to_owned(),
             };
             if builtins.contains(command.name.as_str()) {
                 snapshot.shadowed.push(ShadowedCommand {
@@ -928,6 +1013,7 @@ mod tests {
         UserCommand {
             name: "test".into(),
             description: "test".into(),
+            argument_hint: None,
             source: Source::Global,
             max_position,
             uses_arguments,
@@ -1188,7 +1274,10 @@ mod tests {
             ),
             ("Plain body", "User command", "Plain body"),
         ] {
-            assert_eq!(parse(text).unwrap(), (description.into(), body.into()));
+            let parsed = parse(text).unwrap();
+            assert_eq!(parsed.description, description);
+            assert_eq!(parsed.body, body);
+            assert!(parsed.argument_hint.is_none());
         }
         for text in [
             "---\nmissing closure",
@@ -1198,6 +1287,12 @@ mod tests {
             "---\ndescription: a\ndescription: b\n---\nBody",
             "---\ndescription:\n---\nBody",
             "---\ndescription: 'a'b'\n---\nBody",
+            "---\ndescription: a\nargument-hint: [bad]\n---\nBody",
+            "---\ndescription: a\nargument-hint: |\n  multiline\n---\nBody",
+            "---\ndescription: a\nargument-hint: a\nargument-hint: b\n---\nBody",
+            "---\ndescription: a\nallowed-tools: [bad]\n---\nBody",
+            "---\ndescription: a\nother: true\n---\nBody",
+            "---\ndescription: a\nother: first\nother: second\n---\nBody",
             "",
         ] {
             assert!(parse(text).is_err(), "{text:?}");
@@ -1228,7 +1323,7 @@ mod tests {
             ),
         ] {
             let source = format!("---\n{header}\n---\nReview $1\n$ARGUMENTS_PATH\n");
-            assert_eq!(parse(&source).unwrap().0, expected, "{header}");
+            assert_eq!(parse(&source).unwrap().description, expected, "{header}");
             let fixture = Fixture::new();
             fixture.global("review.md", &source);
             let snapshot = fixture.load(&[]);
@@ -1251,8 +1346,6 @@ mod tests {
             "  other: unsupported",
             "  description: first\n  description: second",
             "  description: >\n    first\n  description: second",
-            "  description: >\n    first\n  other: unsupported",
-            "\tdescription: |\n\t\tfirst\n\tother: unsupported",
             "  description: >\n  not deeper",
             "  description: # empty",
             "  description: \"unfinished",
@@ -1265,6 +1358,39 @@ mod tests {
             assert!(snapshot.find("review").is_none(), "{header}");
             assert_eq!(snapshot.diagnostics.len(), 1, "{header}");
         }
+    }
+
+    #[test]
+    fn custom_argument_hint_and_ignored_frontmatter_do_not_affect_expansion() {
+        let fixture = Fixture::new();
+        fixture.global(
+            "review.md",
+            "---\n  description: >\n    Review a change\n  argument-hint: '[change and notes]'\n  allowed-tools: Shell(example)\n  model: example\n---\nReview $1 and $ARGUMENTS",
+        );
+        let snapshot = fixture.load(&[]);
+        let command = snapshot.find("review").unwrap();
+        assert_eq!(command.description, "Review a change");
+        assert_eq!(command.usage(), "/review [change and notes]");
+        assert_eq!(command.max_position, 1);
+        assert_eq!(
+            command.expand("123 with notes").unwrap(),
+            "Review 123 and 123 with notes"
+        );
+        assert_eq!(snapshot.diagnostics.len(), 2);
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.warning));
+        assert_eq!(
+            snapshot.diagnostics[0].message,
+            "Ignored frontmatter key `allowed-tools`"
+        );
+        let projection = serde_json::to_value(snapshot.projection()).unwrap();
+        assert_eq!(
+            projection["commands"][0]["argument_hint"],
+            "[change and notes]"
+        );
+        assert!(!projection.to_string().contains("Shell(example)"));
     }
 
     #[test]
@@ -1303,9 +1429,9 @@ mod tests {
             ("\t# note\r\ndescription: Simple\t# comment", "Simple"),
         ] {
             let source = format!("---\n{header}\n---\n# Body stays literal\n$ARGUMENTS_PATH\n");
-            let (description, body) = parse(&source).unwrap_or_else(|e| panic!("{header}: {e}"));
-            assert_eq!(description, expected, "{header}");
-            assert_eq!(body, "# Body stays literal\n$ARGUMENTS_PATH\n");
+            let parsed = parse(&source).unwrap_or_else(|e| panic!("{header}: {e}"));
+            assert_eq!(parsed.description, expected, "{header}");
+            assert_eq!(parsed.body, "# Body stays literal\n$ARGUMENTS_PATH\n");
             let fixture = Fixture::new();
             fixture.global("review.md", &source);
             let snapshot = fixture.load(&[]);
