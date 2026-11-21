@@ -20985,6 +20985,7 @@ mod tests {
     #[test]
     fn steering_messages_are_marked_with_their_step() {
         let msg = |meta: Option<&str>| MessageInfo {
+            generated_by: None,
             id: "m".into(),
             session_id: "s1".into(),
             seq: 1,
@@ -22589,6 +22590,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let msg =
             |id: &str, role: &str, content: &str, meta: Option<serde_json::Value>| MessageInfo {
+                generated_by: None,
                 id: id.into(),
                 session_id: "s".into(),
                 seq: 0,
@@ -23404,6 +23406,7 @@ mod tests {
     fn edit_slash_prefills_last_user_message() {
         let mut app = test_app();
         let mk = |id: &str, role: &str, content: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s1".into(),
             seq: 1,
@@ -23775,6 +23778,7 @@ mod tests {
     fn msg(role: &str, content: &str) -> MessageInfo {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         MessageInfo {
+            generated_by: None,
             id: format!(
                 "m{}",
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -24659,6 +24663,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, c)| MessageInfo {
+                generated_by: None,
                 id: format!("m{i}"),
                 session_id: "s1".into(),
                 seq: i as i64,
@@ -26042,6 +26047,7 @@ mod tests {
                 .to_rfc3339()
         };
         let msg = |id: &str, role: &str, when: String| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 0,
@@ -26070,6 +26076,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         let msg = |i: usize, role: &str, content: String| MessageInfo {
+            generated_by: None,
             id: format!("m{i}"),
             session_id: "s".into(),
             seq: i as i64,
@@ -26540,6 +26547,7 @@ mod tests {
         let mut app = test_app();
         app.messages = (0..8)
             .map(|i| MessageInfo {
+                generated_by: None,
                 id: format!("m{i}"),
                 session_id: "s".into(),
                 seq: i,
@@ -26676,6 +26684,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = test_app();
         let msg = |i: i64| MessageInfo {
+            generated_by: None,
             id: format!("m{i}"),
             session_id: "s".into(),
             seq: i,
@@ -26707,6 +26716,7 @@ mod tests {
         let mut app = test_app();
         app.messages = (0..4)
             .map(|i| MessageInfo {
+                generated_by: None,
                 id: format!("m{i}"),
                 session_id: "s".into(),
                 seq: i,
@@ -26751,6 +26761,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
         let msg = |id: &str, role: &str, content: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 0,
@@ -26801,6 +26812,7 @@ mod tests {
         let mut app = test_app();
         app.current = Some("s".into());
         let msg = |id: &str, seq: i64, role: &str, content: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq,
@@ -26899,6 +26911,7 @@ mod tests {
     fn table_command_uses_parsed_order_and_the_last_nonblank_answer() {
         let mut app = test_app();
         let message = |id: &str, role: &str, content: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 1,
@@ -27287,6 +27300,7 @@ mod tests {
             "word ".repeat(40)
         );
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "a".into(),
             session_id: "s".into(),
             seq: 1,
@@ -27312,6 +27326,7 @@ mod tests {
     fn open_links_from_the_last_answer() {
         let mut app = test_app();
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "a".into(),
             session_id: "s".into(),
             seq: 1,
@@ -27458,6 +27473,7 @@ mod tests {
     fn parsed_code_blocks_preserve_pager_ordinals_and_latest_answer() {
         let mut app = test_app();
         let message = |id: &str, role: &str, content: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 1,
@@ -27499,6 +27515,7 @@ mod tests {
     fn code_blocks_open_unwrapped_in_the_pager() {
         let mut app = test_app();
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "a".into(),
             session_id: "s".into(),
             seq: 1,
@@ -27521,6 +27538,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1,2 @@\n-old\n+new\n+more";
         let msg = |id: &str, role: &str, content: String, meta: serde_json::Value| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 0,
@@ -27569,6 +27587,7 @@ mod tests {
             .save_with_format(&png, image::ImageFormat::Png)
             .unwrap();
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "u".into(),
             session_id: "s".into(),
             seq: 1,
@@ -28035,6 +28054,7 @@ mod tests {
         // A tool call in the chat toggles on click.
         app.view = View::Chat;
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "a".into(),
             session_id: "s".into(),
             seq: 1,
@@ -28080,6 +28100,7 @@ mod tests {
         let mut app = test_app();
         app.current = Some("s".into());
         let msg = |id: &str, role: &str, at: &str| MessageInfo {
+            generated_by: None,
             id: id.into(),
             session_id: "s".into(),
             seq: 0,
@@ -28141,6 +28162,7 @@ mod tests {
         let content = format!("```py\nx = 1\n```\n\n```mermaid\n{src}\n```");
         assert_eq!(fenced_blocks(&content)[1].0, "mermaid");
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "a".into(),
             session_id: "s".into(),
             seq: 1,
@@ -29626,6 +29648,7 @@ mod tests {
         // Messages from the web, or from another attached TUI, say so;
         // this TUI's own (even from an earlier run) don't.
         let msg = |seq, conn, label: &str| MessageInfo {
+            generated_by: None,
             id: format!("m{seq}"),
             session_id: "s1".into(),
             seq,
@@ -30356,6 +30379,7 @@ mod tests {
         assert_eq!(app.view, View::Chat);
         assert_eq!(app.current.as_deref(), Some("s1"));
         app.messages = vec![MessageInfo {
+            generated_by: None,
             id: "m1".into(),
             session_id: "s1".into(),
             seq: 1,
@@ -33774,6 +33798,7 @@ mod tests {
         let call = ("call".into(), "edit_file".into(), "{}".into());
         let diff = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
         let result = MessageInfo {
+            generated_by: None,
             id: "result".into(),
             session_id: "session".into(),
             seq: 1,
@@ -33828,6 +33853,7 @@ mod tests {
         app.color = true;
         app.expanded_calls.insert("call".into());
         let assistant = MessageInfo {
+            generated_by: None,
             id: "assistant".into(),
             session_id: "session".into(),
             seq: 1,

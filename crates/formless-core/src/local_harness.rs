@@ -10,6 +10,13 @@ use serde_json::{json, Value};
 
 pub use formless_protocol::{HarnessKind, StepAccess};
 
+#[path = "local_harness_probe.rs"]
+mod readiness;
+pub use readiness::{
+    acp_probe, blocking_probe, claude_probe, codex_probe, harness_availability, list_harnesses,
+    ProbeContext,
+};
+
 pub struct HarnessPermissionRequest {
     pub title: String,
     pub kind: String,

@@ -329,6 +329,7 @@ mod tests {
 
     fn message(seq: i64, role: &str, content: &str) -> MessageInfo {
         MessageInfo {
+            generated_by: None,
             id: format!("m{seq}"),
             session_id: "s1".into(),
             seq,

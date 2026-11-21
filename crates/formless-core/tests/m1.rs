@@ -186,6 +186,7 @@ fn provider_message_echoes_reasoning_only_on_tool_call_turns() {
         "reasoning_content": "because reasons"
     });
     let m = formless_protocol::MessageInfo {
+        generated_by: None,
         id: "m1".into(),
         session_id: "s1".into(),
         seq: 1,

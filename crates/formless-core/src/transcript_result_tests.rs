@@ -3,6 +3,7 @@ use serde_json::json;
 
 fn msg(role: &str, content: &str, meta: Value) -> MessageInfo {
     MessageInfo {
+        generated_by: None,
         id: "fixture".into(),
         session_id: "fixture".into(),
         seq: 1,
