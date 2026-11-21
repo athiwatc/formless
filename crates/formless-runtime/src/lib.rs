@@ -4,7 +4,11 @@
 
 pub mod caps;
 mod clipboard_diagnostics;
+mod desktop_notification;
 mod dns;
+pub use desktop_notification::desktop_notify;
+#[cfg(any(target_os = "macos", test))]
+pub use desktop_notification::macos_notification_script;
 mod process_executable;
 pub mod process_group;
 mod processes;
@@ -1517,7 +1521,7 @@ impl State {
                         Ok(Value::Null)
                     }
                     HostMode::Live => {
-                        notify(
+                        desktop_notify(
                             a["title"].as_str().unwrap_or_default(),
                             a["body"].as_str().unwrap_or_default(),
                         )?;
@@ -3112,42 +3116,6 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     {
         let _ = text;
         Err("clipboard unsupported on this platform".into())
-    }
-}
-
-/// AppleScript source for a notification. Notification text stays on one
-/// source line and cannot end its quoted literal.
-#[cfg(any(target_os = "macos", test))]
-pub fn macos_notification_script(title: &str, body: &str) -> String {
-    let escape = |text: &str| {
-        let single_line: String = text
-            .replace("\r\n", "\n")
-            .chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .collect();
-        single_line.replace('\\', "\\\\").replace('"', "\\\"")
-    };
-    format!(
-        "display notification \"{}\" with title \"{}\"",
-        escape(body),
-        escape(title)
-    )
-}
-
-fn notify(title: &str, body: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let script = macos_notification_script(title, body);
-        run_capture("osascript", &["-e", &script], None).map(|_| ())
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        run_capture("notify-send", &[title, body], None).map(|_| ())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (title, body);
-        Err("notifications unsupported on this platform".into())
     }
 }
 
