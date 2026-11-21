@@ -548,6 +548,157 @@ impl ModelStat {
 /// list is one scan instead of three correlated subqueries per Session.
 const SESSION_SUMMARY: &str = "s.*";
 
+// These indexes are rebuilt from existing rows and change no record layout.
+// Install them on writable opens without accepting a new schema stamp.
+const DERIVED_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id, up_to_seq);
+    CREATE INDEX IF NOT EXISTS idx_run_usage_created ON run_usage(created_at);
+    CREATE INDEX IF NOT EXISTS idx_inv_replay_recent ON invocations(tool_id)
+        WHERE status IN ('success','failure');
+";
+
+const LATEST_CHECKPOINT_SQL: &str = "SELECT id, summary, up_to_seq FROM checkpoints
+     WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1";
+
+fn usage_by_model_sql(bounded: bool) -> String {
+    let filter = if bounded {
+        "WHERE created_at >= ?1"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens)
+         FROM run_usage {filter} GROUP BY model"
+    )
+}
+
+fn grouped_usage_sql(by: &str, bounded: bool) -> String {
+    let key = match by {
+        "model" => "u.model",
+        "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
+        "purpose" => "u.source",
+        "session" => "u.session_id",
+        "role" => {
+            "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')"
+        }
+        _ => "substr(u.created_at, 1, 10)",
+    };
+    let (label, order) = if by == "session" {
+        (
+            "COALESCE((SELECT s.name FROM sessions s WHERE s.id=u.session_id), u.session_id)",
+            // Keep alphabetical labels on token-count ties. The ID
+            // makes buckets with an identical label stay contiguous.
+            "10, 1",
+        )
+    } else {
+        ("NULL", "1")
+    };
+    let filter = if bounded {
+        "WHERE u.created_at >= ?1"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
+           SUM(u.cached_tokens), SUM(u.cache_write_tokens),
+           CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
+         FROM run_usage u
+         {filter}
+         GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn checkpoint_and_usage_range_queries_use_their_indexes() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("fixture".into())).unwrap().id;
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE fixture(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM fixture WHERE n < 2000
+         )
+         INSERT INTO run_usage (session_id, run_id, model, prompt_tokens, completion_tokens,
+                                reasoning_tokens, cached_tokens, created_at, source, provider)
+         SELECT ?1, 'fixture', 'model', 1, 2, 0, 0,
+                printf('2026-01-%02dT00:00:00Z', n % 28 + 1), 'run', ''
+         FROM fixture",
+            params![session],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "WITH RECURSIVE fixture(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM fixture WHERE n < 200
+         )
+         INSERT INTO checkpoints (id, session_id, summary, up_to_seq, created_at)
+         SELECT printf('fixture-%d', n), ?1, 'old', n, '2026-01-01T00:00:00Z' FROM fixture",
+            params![session],
+        )
+        .unwrap();
+    let newest = store.save_checkpoint(&session, "newest", 200).unwrap();
+    let plan = |sql: &str, param: &str| {
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let plan = stmt
+            .query_map([param], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        plan.join("\n")
+    };
+    let checkpoint_plan = plan(LATEST_CHECKPOINT_SQL, &session);
+    assert!(
+        checkpoint_plan.contains("USING INDEX idx_checkpoints_session"),
+        "{checkpoint_plan}"
+    );
+    assert!(
+        !checkpoint_plan.contains("TEMP B-TREE"),
+        "{checkpoint_plan}"
+    );
+    let latest = store.latest_checkpoint_record(&session).unwrap().unwrap();
+    assert_eq!(latest, (newest, "newest".into(), 200));
+
+    let since = "2026-01-28T00:00:00Z";
+    let check_range = |sql: &str| {
+        let usage_plan = plan(sql, since);
+        assert!(
+            usage_plan.contains("USING INDEX idx_run_usage_created (created_at>?)"),
+            "{usage_plan}"
+        );
+    };
+    check_range(&usage_by_model_sql(true));
+    for group in ["model", "provider", "purpose", "session", "role", "day"] {
+        check_range(&grouped_usage_sql(group, true));
+    }
+    assert_eq!(
+        store.usage_by_model(None).unwrap()["model"],
+        (2000, 4000, 0)
+    );
+    assert_eq!(
+        store.usage_by_model(Some(since)).unwrap()["model"],
+        (71, 142, 0)
+    );
+    assert_eq!(
+        store.usage_grouped(Some(since), "model").unwrap(),
+        [(
+            "model".into(),
+            "".into(),
+            "model".into(),
+            71,
+            142,
+            0,
+            0,
+            None,
+            false
+        )]
+    );
+}
+
 fn run_duration_ms(created: &str, updated: &str) -> i64 {
     match (
         chrono::DateTime::parse_from_rfc3339(created),
@@ -1004,7 +1155,7 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
     } else {
         None
     };
-    let result = (|| {
+    let result: Result<()> = (|| {
         for (target, step) in MIGRATIONS {
             if version < target {
                 let tx = conn.unchecked_transaction()?;
@@ -1026,7 +1177,9 @@ fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
             let _ = std::fs::remove_file(migration_receipt_path(file));
         }
     }
-    result
+    result?;
+    conn.execute_batch(DERIVED_INDEXES)
+        .context("create derived database indexes")
 }
 
 /// Whether `e` says the database file itself is damaged (corrupt, or not a
@@ -3875,11 +4028,12 @@ impl Store {
         &self,
         session_id: &str,
     ) -> Result<Option<(String, String, i64)>> {
-        Ok(self.conn.query_row(
-            "SELECT id, summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1",
-            params![session_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).optional()?)
+        Ok(self
+            .conn
+            .query_row(LATEST_CHECKPOINT_SQL, params![session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
     }
 
     // --- Tools (SPEC §7, §8) ---
@@ -6490,12 +6644,9 @@ impl Store {
         &self,
         since: Option<&str>,
     ) -> Result<std::collections::HashMap<String, (i64, i64, i64)>> {
-        let mut stmt = self.ps(
-            "SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens) FROM run_usage
-             WHERE ?1 IS NULL OR created_at >= ?1 GROUP BY model",
-        )?;
+        let mut stmt = self.ps(&usage_by_model_sql(since.is_some()))?;
         let rows = stmt
-            .query_map(params![since], |r| {
+            .query_map(rusqlite::params_from_iter(since), |r| {
                 Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -6523,35 +6674,9 @@ impl Store {
         by: &str,
         project: impl Fn(GroupedUsage, Option<String>) -> T,
     ) -> Result<Vec<T>> {
-        let key = match by {
-            "model" => "u.model",
-            "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
-            "purpose" => "u.source",
-            "session" => "u.session_id",
-            "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
-            _ => "substr(u.created_at, 1, 10)",
-        };
-        let (label, join, order) = if by == "session" {
-            (
-                "COALESCE(s.name, u.session_id)",
-                "LEFT JOIN sessions s ON s.id=u.session_id",
-                // Keep alphabetical labels on token-count ties. The ID
-                // makes buckets with an identical label stay contiguous.
-                "10, 1",
-            )
-        } else {
-            ("NULL", "", "1")
-        };
-        let mut stmt = self.ps(&format!(
-            "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
-               SUM(u.cached_tokens), SUM(u.cache_write_tokens),
-               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
-             FROM run_usage u {join}
-             WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
-        ))?;
+        let mut stmt = self.ps(&grouped_usage_sql(by, since.is_some()))?;
         let rows = stmt
-            .query_map(params![since], |r| {
+            .query_map(rusqlite::params_from_iter(since), |r| {
                 let usage = (
                     r.get(0)?,
                     r.get(1)?,
