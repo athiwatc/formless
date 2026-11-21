@@ -3749,7 +3749,7 @@ fn redact(text: &str) -> String {
             (r"(?i)((?:api[_-]?key|token|secret|password|authorization)\x22?\s*[:=]\s*\x22?)[^\s\x22',]+", "${1}[redacted]"),
             (r"#(k|local)=[^\s&\x22']+", "#${1}=[redacted]"),
             (r"(://)[^/\s:@]+:[^/\s@]+@", "${1}[redacted]@"),
-            (r"\b(sk|pk|rk|ghp|gho|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
+            (r"\b(sk|pk|rk|ghp|gho|ghr|xox[abp])[-_][A-Za-z0-9_\-]{8,}", "${1}-[redacted]"),
             (r"[A-Za-z0-9+/_\-]{40,}={0,2}", "[redacted]"),
         ]
         .into_iter()
@@ -10433,6 +10433,15 @@ mod tests {
             [("v0.2.0".into(), "Final release".into(), "final".into())]
         );
         assert!(newer_releases(&final_release, "0.2.0+build.5").is_empty());
+    }
+
+    #[test]
+    fn bug_reports_redact_github_app_refresh_tokens() {
+        let token = format!("ghr_{}", "0123456789abcdefghijklmnop");
+        assert_eq!(
+            redact(&format!("github: {token}, ghr_short")),
+            "github: ghr-[redacted], ghr_short"
+        );
     }
 
     #[test]

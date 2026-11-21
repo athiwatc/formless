@@ -20,6 +20,7 @@ const PREFIXES: &[(&str, &str)] = &[
     ("gho_", "GitHub token"),
     ("ghu_", "GitHub token"),
     ("ghs_", "GitHub token"),
+    ("ghr_", "GitHub token"),
     ("github_pat_", "GitHub token"),
     ("npm_", "npm token"),
     ("glpat-", "GitLab token"),
@@ -337,6 +338,14 @@ mod tests {
         }
         // Already redacted stays as it is.
         assert_eq!(redact("token=[REDACTED]").1, None);
+    }
+
+    #[test]
+    fn github_app_refresh_tokens_are_scanned_and_redacted() {
+        let token = format!("ghr_{}", "0123456789abcdefghijklmnop");
+        assert_eq!(scan(&token), Some("GitHub token"));
+        assert_eq!(redact(&token), (MARK.into(), Some("GitHub token")));
+        assert_eq!(redact("ghr_short"), ("ghr_short".into(), None));
     }
 
     #[test]
