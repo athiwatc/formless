@@ -655,6 +655,19 @@ pub struct ModuleInfo {
     pub updated_at: String,
 }
 
+/// Split a process grant into its executable and optional first-argument scope.
+pub fn split_process_grant(grant: &str) -> (&str, Option<&str>) {
+    match grant.rsplit_once(':') {
+        // `C:\…` is a Windows path, not a command with sub-commands.
+        Some((cmd, scope))
+            if cmd.len() > 1 && !scope.is_empty() && !scope.contains(['/', '\\']) =>
+        {
+            (cmd, Some(scope))
+        }
+        _ => (grant, None),
+    }
+}
+
 fn windows_drive_path(path: &str) -> bool {
     matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
@@ -700,21 +713,26 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
     // and write files. Argument scoping (`process:git:status`) narrows the
     // others, not these.
     if let Some(cmd) = spec.strip_prefix("process:") {
-        let name = cmd.split(':').next().unwrap_or(cmd);
+        let (name, _) = split_process_grant(cmd);
         let base = name
             .rsplit(['/', '\\'])
             .next()
             .unwrap_or(name)
-            .trim_end_matches(".exe")
             .to_ascii_lowercase();
+        let base = base.trim_end_matches(".exe");
         // Versioned names (`python3.11`, `ruby3.2`, `node20`) count too.
         let stem = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
         if matches!(
-            base.as_str(),
+            base,
             "sh" | "bash"
                 | "zsh"
                 | "fish"
                 | "dash"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "mksh"
+                | "ash"
                 | "cmd"
                 | "powershell"
                 | "pwsh"
@@ -723,32 +741,40 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 | "xargs"
                 | "sudo"
                 | "doas"
-        ) || matches!(
-            stem,
-            "python"
-                | "node"
-                | "deno"
-                | "bun"
-                | "perl"
-                | "ruby"
-                | "elixir"
-                | "iex"
-                | "php"
-                | "lua"
-                | "tclsh"
-                | "julia"
-                | "dart"
-        ) {
+                | "pkexec"
+                | "su"
+                | "runuser"
+        ) || base == "nodejs"
+            || matches!(
+                stem,
+                "python"
+                    | "pythonw"
+                    | "py"
+                    | "pyw"
+                    | "node"
+                    | "deno"
+                    | "dart"
+                    | "bun"
+                    | "perl"
+                    | "ruby"
+                    | "php"
+                    | "lua"
+                    | "julia"
+                    | "elixir"
+                    | "iex"
+                    | "tclsh"
+            )
+        {
             return Some("an interpreter or shell: it can run any program, like bare process");
         }
         if matches!(
-            base.as_str(),
+            base,
             "curl" | "wget" | "ssh" | "scp" | "rsync" | "nc" | "ncat"
         ) {
             return Some("it can reach any host and write files, like net plus fs:write");
         }
         // Run other programs through options or files they read (#1099).
-        match base.as_str() {
+        match base {
             _ if stem == "dotnet" => {
                 return Some("dotnet can build and execute repository code")
             }
@@ -4046,6 +4072,62 @@ mod tests {
         ] {
             assert_eq!(broad_capability(spec), None, "{spec}");
         }
+    }
+
+    #[test]
+    fn shell_launcher_and_interpreter_aliases_require_extra_confirmation() {
+        let reason = broad_capability("process:bash").unwrap();
+        for spec in [
+            "process:pkexec",
+            "process:/usr/bin/pkexec",
+            "process:su",
+            "process:su.exe",
+            "process:runuser",
+            "process:ksh",
+            "process:/usr/bin/ksh",
+            "process:csh",
+            "process:tcsh",
+            "process:mksh",
+            "process:ash",
+            "process:nodejs",
+            "process:pythonw",
+            "process:pythonw.exe",
+            "process:py",
+            "process:py.exe",
+            "process:pyw",
+            "process:pyw.exe",
+            "process:py3",
+            r"process:C:\Python311\pythonw.exe",
+        ] {
+            assert_eq!(broad_capability(spec), Some(reason), "{spec}");
+        }
+        for spec in ["process:ls", "process:pytest", "process:nodejs-helper"] {
+            assert_eq!(broad_capability(spec), None, "{spec}");
+        }
+    }
+
+    #[test]
+    fn windows_process_path_keeps_drive_prefix_and_optional_scope() {
+        for (spec, equivalent) in [
+            (r"process:C:\Windows\System32\CMD.EXE", "process:cmd"),
+            (
+                r"process:C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "process:powershell",
+            ),
+            (r"process:C:\Python311\python.exe", "process:python"),
+            ("process:C:/Python311/python.exe", "process:python"),
+            (r"process:C:\Windows\System32\curl.exe", "process:curl"),
+            (r"process:C:\Program Files\Git\cmd\git.exe", "process:git"),
+            (
+                r"process:C:\Program Files\Git\cmd\git.exe:status|log",
+                "process:git:status|log",
+            ),
+        ] {
+            let reason = broad_capability(equivalent).unwrap();
+            assert_eq!(broad_capability(spec), Some(reason), "{spec}");
+        }
+        assert_eq!(broad_capability(r"process:C:\tools\pytest.exe"), None);
+        assert_eq!(broad_capability(r"process:C:\tools\ls.exe"), None);
     }
 
     #[test]
