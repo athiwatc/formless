@@ -78,16 +78,18 @@ impl Shell {
         let Some(client) = &self.client else {
             return;
         };
-        let operation = uuid::Uuid::new_v4();
+        let operation = (!matches!(action, Action::Main | Action::List)).then(uuid::Uuid::new_v4);
         let command = ClientCommand::Topic {
             connection: client.connection(),
-            operation: Some(operation),
+            operation,
             action,
         };
         match client.send(command) {
             Ok(()) => {
-                self.topic_ui.state.pending = Some(operation);
-                self.topic_ui.state.notice = Some("Waiting for Formless…".into());
+                if let Some(operation) = operation {
+                    self.topic_ui.state.pending = Some(operation);
+                    self.topic_ui.state.notice = Some("Waiting for Formless…".into());
+                }
             }
             Err(error) => self.topic_ui.state.notice = Some(error.to_string()),
         }
@@ -170,7 +172,12 @@ impl Shell {
         }
     }
 
-    fn open_topic_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn open_topic_session(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.sidebar.rows().iter().any(|session| session.id == id) {
             self.topic_ui.state.notice = Some("This conversation is unavailable or archived. Restore archived conversations from Sessions first.".into());
             cx.notify();
@@ -190,7 +197,11 @@ impl Shell {
             .find(|t| t.id == id)
             // Pending proposals have no topic transcript yet. Review them in
             // their source chat, including when opened from another page.
-            .map(|t| t.topic_session_id.clone().unwrap_or_else(|| t.source_session_id.clone()));
+            .map(|t| {
+                t.topic_session_id
+                    .clone()
+                    .unwrap_or_else(|| t.source_session_id.clone())
+            });
         if let Some(session) = session {
             if !self.open_topic_session(&session, window, cx) {
                 return;
@@ -215,7 +226,9 @@ impl Shell {
             .find(|s| Some(s.id.as_str()) == self.sidebar.active_id())
             .and_then(|s| s.cwd.clone())
             .unwrap_or_default();
-        self.topic_ui.repo.update(cx, |input, cx| input.set_value(cwd, window, cx));
+        self.topic_ui
+            .repo
+            .update(cx, |input, cx| input.set_value(cwd, window, cx));
         cx.notify();
     }
 
