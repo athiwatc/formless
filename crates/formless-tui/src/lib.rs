@@ -1656,6 +1656,23 @@ fn truncate_chars(s: &str, max: usize) -> String {
     text::truncate(&flat, max)
 }
 
+fn memory_activity_note(memory: &formless_protocol::MemoryInfo) -> String {
+    let source = match memory.session_id.as_deref() {
+        Some(session) => format!(
+            "from session {}",
+            plain::display_text(&truncate_chars(session, 8))
+        ),
+        None => plain::display_text(&memory.author),
+    };
+    format!(
+        "memory {} [{}{}] {} · {source}",
+        plain::display_text(&memory.id),
+        plain::display_text(&memory.scope),
+        if memory.enabled { "" } else { ", off" },
+        plain::display_text(&memory.text),
+    )
+}
+
 /// Borrow this Session's user payloads; collecting the iterator copies only
 /// references. Rendering selects a single entry without collecting at all.
 fn input_history<'a>(
@@ -4443,16 +4460,7 @@ impl App {
                                 );
                             }
                             for m in list {
-                                self.notes.push(format!(
-                                    "memory {} [{}{}] {} · {}",
-                                    m.id,
-                                    m.scope,
-                                    if m.enabled { "" } else { ", off" },
-                                    m.text,
-                                    m.session_id
-                                        .map(|s| format!("from session {}", truncate_chars(&s, 8)))
-                                        .unwrap_or(m.author)
-                                ));
+                                self.notes.push(memory_activity_note(&m));
                             }
                         }
                         Pending::ListSkills => {
@@ -20159,6 +20167,19 @@ mod credential_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_activity_note_escapes_controls_in_stored_fields() {
+        let memory = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "scope":"project:test\u{202e}", "text":"note\r\n\u{1b}\u{9b}",
+            "author":"agent\u{9b}", "session_id":null, "enabled":false, "created_at":"", "updated_at":"",
+        })).unwrap();
+        let note = memory_activity_note(&memory);
+        assert_eq!(
+            note,
+            "memory fixture [project:test\\u{202e}, off] note\\r\\n\\u{1b}\\u{9b} · agent\\u{9b}"
+        );
+    }
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
