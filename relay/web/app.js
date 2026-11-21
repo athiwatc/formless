@@ -96,6 +96,7 @@
     topics: [],
     mainChat: null,
     topicsAvailable: false,
+    topicsUnsupported: false,
     topicFocus: null,
     current: null,
     messages: [],
@@ -1746,7 +1747,7 @@
   }
   function topicStatusLabel(status) {
     return ({ pending_approval: "Needs approval", approved: "Ready to start", running: "In progress",
-      complete: "Ready for you", pending: "Pending", building: "Building", reviewing: "In review",
+      complete: "Ready for you", pending: "Pending", building: "Building", awaiting_review: "Awaiting review", reviewing: "In review",
       ready: "Ready for you", needs_user: "Needs your input", failed: "Failed", rejected: "Not moved",
       passed: "Passed", findings: "Changes requested", abandoned: "Interrupted" })[status] || status || "Pending";
   }
@@ -1867,6 +1868,7 @@
   async function refreshTopics(initial = false) {
     const channel = S.channel;
     if (!channel || !S.daemonOnline) return;
+    initial = initial || !S.mainChat;
     if (topicRefresh?.channel === channel) return topicRefresh.promise;
     const refresh = { channel };
     refresh.promise = (async () => {
@@ -1877,11 +1879,15 @@
         S.mainChat = main;
         S.topics = topics;
         S.topicsAvailable = true;
+        S.topicsUnsupported = false;
         S.topicsError = false;
         if (!S.sessions.some(session => session.id === main.id)) S.sessions.unshift(main);
-      } catch (_) {
+      } catch (error) {
         if (S.channel !== channel) return;
-        if (initial) { S.topicsAvailable = false; S.mainChat = null; S.topics = []; }
+        if (initial && error.daemonResponse && ["bad_request", "unsupported"].includes(error.code)) {
+          S.topicsUnsupported = true;
+          S.topicsAvailable = false; S.mainChat = null; S.topics = [];
+        }
         else S.topicsError = true;
       }
       if (S.channel === channel) { renderSessions(); renderComposer(); }
@@ -9618,7 +9624,7 @@
   // Topic execution is independent of the open chat. Poll the small topic
   // index even while Main Chat is open; never subscribe to every transcript.
   setInterval(() => {
-    if (S.topicsAvailable && S.daemonOnline && !document.hidden && S.view === "chat" && !S.topicBusy) refreshTopicView();
+    if (!S.topicsUnsupported && S.daemonOnline && !document.hidden && S.view === "chat" && !S.topicBusy) refreshTopicView();
   }, 4000);
 
   // A new `formless web` link pasted into an open tab only changes the

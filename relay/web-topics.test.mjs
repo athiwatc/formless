@@ -111,8 +111,26 @@ test('polling ignores disconnected replies, retains known status on error, and c
   assert.equal(c.S.topicsError, true);
   assert.equal(c.S.topics.length, 1);
   await c.refreshTopics(true);
+  assert.equal(c.S.topicsAvailable, true, 'transient startup failure keeps known topics');
+  c.request = async () => { throw Object.assign(new Error('unknown request'), { daemonResponse: true, code: 'bad_request' }); };
+  await c.refreshTopics(true);
   assert.equal(c.S.topicsAvailable, false, 'older daemons retain the existing Sessions UI');
+  assert.equal(c.S.topicsUnsupported, true);
   assert.equal(c.S.mainChat, null);
+});
+
+test('transient first topic load is retried without reconnecting', async () => {
+  const calls = [];
+  const c = setup(['refreshTopics'], { request: async () => { throw new Error('request timed out'); } });
+  vm.runInContext('let topicRefresh = null;', c);
+  c.S.mainChat = null; c.S.topics = []; c.S.topicsAvailable = false;
+  await c.refreshTopics(true);
+  assert.equal(c.S.topicsUnsupported, undefined);
+  c.request = async req => { calls.push(req.type); return req.type === 'get_main_chat' ? { id: 'main' } : [topic()]; };
+  await c.refreshTopics();
+  assert.deepEqual(calls, ['get_main_chat', 'list_topics']);
+  assert.equal(c.S.topicsAvailable, true);
+  assert.equal(c.S.topicsUnsupported, false);
 });
 
 test('nested harness transcripts cannot dispatch native send, attachment, edit or fork actions', async () => {
