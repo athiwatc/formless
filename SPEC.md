@@ -1004,9 +1004,12 @@ original message, and each proposed feature is visible in the shared topic
 inventory. When the user has not specified a parent, a proposal from a Topic
 Chat defaults under that topic; a proposal from Main defaults directly under
 Main. Attempt sessions and nested agents do not get suggestion tools.
-The Topic Chat assistant brings harness questions and permission requests to
-the user without answering on their behalf. Approval, rejection, and
-cancellation are user actions, not assistant tools.
+Topic Chat suggestions see the current topic, its ancestors and descendants,
+unless the user enables external context. Main sees the whole tree. The
+Topic Chat assistant may answer a harness question only with a basis in a user
+request or decision, and never answers user-only questions or permissions.
+Approval, rejection, cancellation, permission rules, limits and external
+context access are user actions, not assistant tools.
 Suggesting or declining never moves a message or starts a
 harness; only an explicit approval in the client can authorize that. A chat
 reply, including “yes”, is not consent. Repeating a pending suggestion for
@@ -7065,10 +7068,40 @@ resets only the selected feature to Pending and the topic to Approved; it does
 not start anything or move messages again. Start on a Running topic errors
 without changing it.
 
-Phase A does not launch an orchestrator: an approved StartTopicWorkflow claim
-immediately fails with `orchestrator not available yet`, records feature failure
-details and releases its lock. No harness process starts. Pi, OpenCode and
-Antigravity return `adapter not integrated yet`; their adapters are not wired.
+StartTopicWorkflow claims the topic and sends a kickoff to a normal Formless
+model Run in Topic Chat. Its tool snapshot includes topic_run_step,
+topic_complete_feature and topic_fail_feature only for Running/NeedsUser topics.
+The outline is advisory; the model chooses each independent step. A normal
+Run end with open work yields NeedsUser; a Run error fails the topic. User
+messages resume normal model Runs. No merge or push is performed. Start
+failures persist detail, fail features and release the workspace lock.
+
+Git steps use private worktrees under profile data: Write branches from the
+latest feature revision (or the base); ReadOnly detaches at the exact selected
+input revision. A successful Write must produce a clean new descendant HEAD.
+Each attempt has a private staging directory, including Git attempts.
+Directory/Scratch steps use private directories with copied read-only file
+inputs. File/text outputs are reported through scoped MCP. A failed step is
+returned to the model without automatically failing the feature; it can choose
+another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+actionable adapter-not-integrated step results.
+
+CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
+on Unix (the direct child on Windows). The last launch check is serialized
+with cancellation. On restart live attempts become Abandoned and Running
+topics become NeedsUser, with durable detail and no automatic restart.
+
+The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
+It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
+`FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
+must never be included in prompts, argv or transcripts. The bridge exposes
+AskUser and RequestPermission in addition to the scoped conversation/artifact
+operations. RequestPermission only raises a user request; it cannot decide one.
+An undecided or cancelled permission is denied. The bridge uses the existing
+five-minute IPC request deadline; cancellation closes pending requests.
 
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
@@ -7083,6 +7116,15 @@ Topic Chat defaults to that topic as parent; other sources create roots.
 ListTopics includes all levels and their parent IDs. Cyclic parent chains are
 rejected. Permanent deletion/purge removes descendant topics and their canonical
 conversations; cancellation affects only the selected topic, not its children.
+Purging a source removes pending/rejected proposals, not approved topics.
+Source-owned attachments referenced by surviving moved topic messages are retained.
+
+Harness and topic-model conversation tools default to the topic branch: the
+topic and all ancestor Topic Chats and their attempt transcripts, not Main
+Chat, siblings or unrelated sessions. The user-only SetTopicContextAccess
+sets persisted allow_external_context (default false); opting in permits all
+non-deleted conversations. List/read/search share this scope. Search is a
+case-insensitive substring match returning at most 40 bounded snippets.
 
 The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
 in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
@@ -7105,3 +7147,53 @@ requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
 memory, scoped to the current attempt and the exact kind/title/input, never
 persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
 permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.
+
+topic_run_step launches asynchronously and returns {attempt_id,
+conversation_session_id}. Independent features can run concurrently; a feature
+still permits only one active step. topic_wait {attempt_ids?, timeout_secs?}
+waits for a finished attempt, a question or an informational permission notice.
+timeout_secs defaults to 600 and must be in 1..=600. An empty selection or no
+active work returns a snapshot immediately. Attempt IDs are scoped to this
+topic; completion and user-only informational notices are consumed once per
+Topic Chat daemon lifetime. Ordinary harness questions remain pending until
+answered. Cancellation and daemon shutdown unblock waits. There is no child
+model run. Normal model-run completion with open work marks NeedsUser and
+appends a durable "send a message to continue" note; harnesses may continue,
+but no model follow-up is started automatically. Run interruption/error
+cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.

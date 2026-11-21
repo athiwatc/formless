@@ -685,7 +685,7 @@ async fn question_answer_then_interrupt_and_interrupt_then_answer_preserve_ackno
         assert!(!messages
             .iter()
             .any(|m| m.content.contains("LOSING_ANSWER_966")));
-        assert_eq!(client.events.iter().filter(|event|matches!(event,Event::UserQuestionClosed {question_id:id} if id==&question_id)).count(),1);
+        assert_eq!(client.events.iter().filter(|event|matches!(event,Event::UserQuestionClosed {question_id:id, .. } if id==&question_id)).count(),1);
         let state = client
             .rpc(Request::GetSession {
                 id: fixture.session.clone(),

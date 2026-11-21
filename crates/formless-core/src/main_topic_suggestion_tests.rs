@@ -534,3 +534,111 @@ async fn topic_chat_suggests_story_under_current_project() {
         );
     }
 }
+
+#[tokio::test]
+async fn topic_suggestion_context_is_scoped_until_user_enables_external_access() {
+    use formless_protocol::{TopicProposalRequest, WorkspaceKind};
+    use std::collections::BTreeSet;
+
+    fn propose(
+        st: &Store,
+        source_session_id: &str,
+        name: &str,
+        parent_topic_id: Option<String>,
+    ) -> Result<TopicInfo> {
+        let message = st.append_message(source_session_id, "user", name)?;
+        st.propose_topic(
+            &TopicProposalRequest {
+                source_session_id: source_session_id.into(),
+                message_ids: vec![message.id],
+                features: vec![],
+                name: name.into(),
+                parent_topic_id,
+                workspace: None,
+                outline: vec![],
+            },
+            WorkspaceKind::Scratch,
+            None,
+        )
+    }
+
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let (main, story, scoped, all, scoped_proposals, outside) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?.id;
+            let project = propose(st, &main, "Project", None)?;
+            let project = st.approve_topic(&project.id)?;
+            let project_chat = project.topic_session_id.as_deref().unwrap();
+            let story = propose(st, project_chat, "Story", None)?;
+            let story = st.approve_topic(&story.id)?;
+            let story_chat = story.topic_session_id.as_deref().unwrap();
+            let child = propose(st, story_chat, "Child", None)?;
+            let child = st.approve_topic(&child.id)?;
+            let grandchild = propose(
+                st,
+                child.topic_session_id.as_deref().unwrap(),
+                "Grandchild",
+                None,
+            )?;
+            let inside = propose(st, story_chat, "Inside", None)?;
+            let sibling = propose(st, project_chat, "Sibling", None)?;
+            let other = propose(st, &main, "Unrelated", None)?;
+            let other = st.approve_topic(&other.id)?;
+            let outside = propose(st, story_chat, "Outside", Some(other.id.clone()))?;
+            let scoped_proposals = BTreeSet::from([child.id.clone(), inside.id.clone()]);
+            let scoped = BTreeSet::from([
+                project.id,
+                story.id.clone(),
+                child.id,
+                grandchild.id,
+                inside.id.clone(),
+            ]);
+            let mut all = scoped.clone();
+            all.extend([sibling.id, other.id, outside.id.clone()]);
+            Ok((main, story, scoped, all, scoped_proposals, outside.id))
+        })
+        .unwrap();
+    let story_chat = story.topic_session_id.as_deref().unwrap();
+    let ids = |context: &Value, collection: &str| {
+        context[collection]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let read = |session: &str| {
+        let session = session.to_owned();
+        let daemon = daemon.clone();
+        async move {
+            let (context, failed) =
+                dispatch(&daemon, &session, 0, READ_TOPIC_CONTEXT, json!({})).await;
+            assert!(!failed, "{context}");
+            serde_json::from_str::<Value>(&context).unwrap()
+        }
+    };
+    assert_eq!(ids(&read(&main).await, "topics"), all);
+    let context = read(story_chat).await;
+    assert_eq!(context["current_topic_id"], story.id);
+    assert_eq!(ids(&context, "topics"), scoped);
+    assert_eq!(ids(&context, "proposals"), scoped_proposals);
+    for allow in [true, false] {
+        daemon
+            .handle(Request::SetTopicContextAccess {
+                topic_id: story.id.clone(),
+                allow,
+            })
+            .await
+            .unwrap();
+        let context = read(story_chat).await;
+        if allow {
+            assert_eq!(ids(&context, "topics"), all);
+            let mut expected = scoped_proposals.clone();
+            expected.insert(outside.clone());
+            assert_eq!(ids(&context, "proposals"), expected);
+        } else {
+            assert_eq!(ids(&context, "topics"), scoped);
+            assert_eq!(ids(&context, "proposals"), scoped_proposals);
+        }
+    }
+}

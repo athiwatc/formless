@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -18,7 +18,7 @@ pub(crate) const PROPOSE_TOPIC: &str = "propose_topic";
 const POLICY: &str = r#"Topic suggestions:
 Answer everyday chat, questions and brainstorming normally. For an explicit request to do work that belongs in a topic (such as changes in a named repo or a new accounting flow), use read_topic_context to get the persisted source user message IDs, topic tree and local working directory, then propose_topic rather than starting the proposed work. In a Topic Chat, continue the current topic's work normally; propose a child or another topic only for distinct work. Choose the closest existing topic that is neither pending approval nor rejected as parent when the request clearly belongs there. Otherwise omit the parent: from a Topic Chat this defaults to the current topic, and from Main the proposal sits directly under Main.
 One user message can request multiple independent work items: put each in its own feature request linked to the same original message ID. Do not create synthetic messages. Include a workspace only when the user names one or a known repo applies; otherwise omit it to use scratch space. The working directory is a hint, not a workspace choice by itself. Use an outline only from the user's stated or standing preferences; otherwise leave it empty. Keep workflow steps within the leaf topic instead of treating steps as child topics. Any supported harness can take any step, including using the same harness for multiple steps. The outline is advisory; the Formless model orchestrating the Topic Chat makes the final decisions.
-In a Topic Chat, bring harness questions and permission requests to the user. Do not answer on the user's behalf or grant or deny harness permissions yourself. Approving, rejecting, and cancelling topics are user actions, never assistant tool actions. Do not automatically re-propose cancelled or declined work. A proposal is pending only: the user must explicitly approve in the client's consent UI. A yes in chat is not approval to move messages, start work, run a harness, or use other tools to do the proposed work."#;
+In a Topic Chat, answer a harness question only when it is not user-only and you can cite a specific user request or decision as the basis. Bring all other harness questions and permission requests to the user; never grant or deny harness permissions yourself. Approval, rejection, cancellation, permission rules, topic limits and external context access are user decisions, never assistant tool actions. Do not automatically re-propose cancelled or declined work. A proposal is pending only: the user must explicitly approve in the client's consent UI. A yes in chat is not approval to move messages, start work, run a harness, or use other tools to do the proposed work."#;
 
 pub(crate) enum SuggestionSource {
     Main,
@@ -161,8 +161,19 @@ impl Store {
             .get_session(session_id)?
             .context("source chat not found")?;
         let topics = self.list_topics()?;
+        let scope = source
+            .topic_id()
+            .map(|id| suggestion_tree_scope(&topics, id))
+            .transpose()?
+            .flatten();
+        let visible = |topic: &&TopicInfo| {
+            scope
+                .as_ref()
+                .is_none_or(|ids| ids.contains(topic.id.as_str()))
+        };
         let tree: Vec<_> = topics
             .iter()
+            .filter(visible)
             .map(|topic| {
                 json!({"id": topic.id, "name": topic.name, "parent_topic_id": topic.parent_topic_id,
                     "status": topic.status})
@@ -170,6 +181,7 @@ impl Store {
             .collect();
         let proposals: Vec<_> = topics
             .iter()
+            .filter(visible)
             .filter(|topic| topic.source_session_id == session_id)
             .take(8)
             .map(|topic| {
@@ -237,6 +249,46 @@ impl Store {
         );
         Ok(None)
     }
+}
+
+fn suggestion_tree_scope<'a>(
+    topics: &'a [TopicInfo],
+    current_id: &str,
+) -> Result<Option<HashSet<&'a str>>> {
+    let by_id: HashMap<_, _> = topics
+        .iter()
+        .map(|topic| (topic.id.as_str(), topic))
+        .collect();
+    let current = by_id.get(current_id).context("source topic not found")?;
+    if current.allow_external_context {
+        return Ok(None);
+    }
+
+    let mut children = HashMap::<&str, Vec<&str>>::new();
+    for topic in topics {
+        if let Some(parent) = topic.parent_topic_id.as_deref() {
+            children.entry(parent).or_default().push(&topic.id);
+        }
+    }
+    let mut visible = HashSet::new();
+    let mut pending = vec![current.id.as_str()];
+    while let Some(id) = pending.pop() {
+        if visible.insert(id) {
+            if let Some(children) = children.get(id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+    }
+    let mut parent = current.parent_topic_id.as_deref();
+    while let Some(id) = parent {
+        if !visible.insert(id) {
+            break;
+        }
+        parent = by_id
+            .get(id)
+            .and_then(|topic| topic.parent_topic_id.as_deref());
+    }
+    Ok(Some(visible))
 }
 
 impl SuggestionSource {
