@@ -48,6 +48,12 @@ impl Inventory {
         let mut ids = HashSet::new();
         let mut prompts = Vec::with_capacity(rows.len());
         for raw in rows {
+            if raw["type"] == "harness_permission_requested" {
+                let event = serde_json::from_value(raw.clone())
+                    .map_err(|_| "Harness permission could not be read; review Questions.")?;
+                crate::questions::Open::from_event(&event)?;
+                continue; // Exact harness choices are reviewed separately in Questions.
+            }
             let prompt = Prompt::from_raw(raw)?;
             if !ids.insert(prompt.id.clone()) {
                 return Err("Duplicate approval identities; reload or use Formless TUI.");
@@ -538,6 +544,19 @@ mod tests {
         assert_eq!(serde_json::from_str::<Value>(&p.display()).unwrap(), v[0]);
         v[0]["approval_id"] = json!("id\u{202e}spoof");
         assert!(Prompt::from_list(&v).is_err());
+    }
+    #[test]
+    fn harness_permissions_do_not_hide_security_approvals_or_become_security_authority() {
+        let mut value = fixture_inventory();
+        value
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(crate::fixture::harness_permission("codex-chat")).unwrap());
+        let inventory = Inventory::from_list(&value).unwrap();
+        assert_eq!(inventory.prompts().len(), 1);
+        assert_eq!(inventory.prompts()[0].id(), "approval-fixture");
+        value[1]["options"][1]["option_id"] = value[1]["options"][0]["option_id"].clone();
+        assert!(Inventory::from_list(&value).is_err());
     }
     #[test]
     fn receipt_requires_resolved_and_audit_boolean() {

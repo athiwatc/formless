@@ -9,6 +9,102 @@ fn engine() -> Engine {
         ..Default::default()
     }
 }
+
+#[test]
+fn harness_permission_answers_are_bound_to_exact_prompt_and_send_once_without_chat_or_workflow_fallback(
+) {
+    for option in [None, Some("allow-once-id"), Some("allow-attempt-id")] {
+        let mut e = engine();
+        let event = crate::fixture::harness_permission("codex-chat");
+        let open = questions::Open::from_event(&event).unwrap();
+        e.receive(ServerMessage::Event(event)).unwrap();
+        let answers = vec![formless_protocol::QuestionAnswer {
+            selected: option.map(|id| vec![id.into()]).unwrap_or_default(),
+            text: None,
+        }];
+        for _ in 0..2 {
+            e.command(Command::AnswerQuestion {
+                connection: 2,
+                operation: uuid::Uuid::new_v4(),
+                question: Box::new(open.clone()),
+                answers: answers.clone(),
+            });
+        }
+        let [request] = e.outgoing.make_contiguous() else {
+            panic!("one explicit decision")
+        };
+        assert!(
+            matches!(&request.request, Request::HarnessPermissionDecision { permission_id, option_id } if permission_id == "native-permission" && option_id.as_deref() == option)
+        );
+        let request_id = request.id;
+        e.receive(ServerMessage::ok(
+            request_id,
+            serde_json::json!({"answered":true}),
+        ))
+        .unwrap();
+        assert!(e.questions.get("native-permission").is_none());
+    }
+}
+
+#[test]
+fn closed_or_changed_harness_permission_never_reaches_the_wire() {
+    let mut e = engine();
+    let event = crate::fixture::harness_permission("codex-chat");
+    let open = questions::Open::from_event(&event).unwrap();
+    e.receive(ServerMessage::Event(event)).unwrap();
+    e.receive(ServerMessage::Event(Event::HarnessPermissionClosed {
+        permission_id: open.id.clone(),
+        option_id: None,
+        by: None,
+    }))
+    .unwrap();
+    e.command(Command::AnswerQuestion {
+        connection: 2,
+        operation: uuid::Uuid::new_v4(),
+        question: Box::new(open),
+        answers: vec![formless_protocol::QuestionAnswer {
+            selected: vec!["allow-once-id".into()],
+            text: None,
+        }],
+    });
+    assert!(e.outgoing.is_empty());
+}
+
+#[test]
+fn reconnect_inventory_restores_permissions_without_hiding_security_approvals_or_granting_anything()
+{
+    let mut e = engine();
+    e.refresh();
+    let pending = e
+        .outgoing
+        .iter()
+        .find(|request| matches!(request.request, Request::PendingApprovals))
+        .unwrap()
+        .id;
+    let mut value = crate::approvals::fixture_inventory();
+    value
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::to_value(crate::fixture::harness_permission("codex-chat")).unwrap());
+    e.receive(ServerMessage::ok(pending, value.clone()))
+        .unwrap();
+    assert!(e.questions.get("native-permission").is_some());
+    assert!(e.outgoing.iter().all(|request| !matches!(
+        request.request,
+        Request::HarnessPermissionDecision { .. }
+            | Request::StartTopicWorkflow { .. }
+            | Request::AnswerQuestion { .. }
+    )));
+    let operation = uuid::Uuid::new_v4();
+    e.command(Command::ReadApprovals {
+        connection: 2,
+        operation,
+    });
+    let read = e.outgoing.back().unwrap();
+    assert!(matches!(read.request, Request::PendingApprovals));
+    e.receive(ServerMessage::ok(read.id, value)).unwrap();
+    assert!(e.updates.iter().any(|update| matches!(update, Update::ApprovalInventory { result:Ok(inventory), .. } if inventory.prompts().len() == 1 && inventory.prompts()[0].id() == "approval-fixture")));
+}
 fn command(action: TopicAction, operation: uuid::Uuid) -> Command {
     Command::Topic {
         connection: 2,
@@ -121,6 +217,43 @@ fn failed_approval_and_unsupported_daemons_never_start_a_workflow() {
         .updates
         .iter()
         .any(|u| matches!(u, Update::Topics { result: Err(_), .. })));
+}
+
+#[test]
+fn resetting_an_item_and_cancelling_never_approve_or_start_a_workflow() {
+    for action in [
+        TopicAction::Retry {
+            topic: "topic-formless".into(),
+            feature: "feature-y".into(),
+        },
+        TopicAction::Cancel("topic-formless".into()),
+    ] {
+        let mut e = engine();
+        let operation = uuid::Uuid::new_v4();
+        e.command(command(action.clone(), operation));
+        e.command(command(action.clone(), operation));
+        assert_eq!(e.outgoing.len(), 1);
+        let request = e.outgoing.pop_front().unwrap();
+        assert!(matches!(
+            request.request,
+            Request::RetryTopicFeature { .. } | Request::CancelTopic { .. }
+        ));
+        let (_, mut topic) = crate::fixture::topic_workspace();
+        topic.status = if matches!(action, TopicAction::Cancel(_)) {
+            formless_protocol::TopicStatus::Cancelled
+        } else {
+            formless_protocol::TopicStatus::Approved
+        };
+        e.receive(ServerMessage::ok(
+            request.id,
+            serde_json::to_value(topic).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            e.outgoing.is_empty(),
+            "neither reset nor cancel implies consent to start"
+        );
+    }
 }
 
 #[test]

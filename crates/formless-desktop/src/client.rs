@@ -962,6 +962,9 @@ enum Pending {
     Consent(Box<Preparation>),
     Create,
     Answer(Action),
+    HarnessPermissionSnapshot {
+        revision: u64,
+    },
     EditSession {
         operation: uuid::Uuid,
         session_id: String,
@@ -1570,6 +1573,18 @@ impl Engine {
         {
             self.topics_polled = Some(std::time::Instant::now());
             self.topic_command(None, crate::topics::Action::List);
+            if !self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::HarnessPermissionSnapshot { .. }))
+            {
+                self.request(
+                    Request::PendingApprovals,
+                    Pending::HarnessPermissionSnapshot {
+                        revision: self.questions.revision(),
+                    },
+                );
+            }
         }
         self.emit_live_overlay();
         if self.dirty_list
@@ -2204,11 +2219,7 @@ impl Engine {
                     });
                 } else {
                     self.request(
-                        Request::AnswerQuestion {
-                            question_id: question.id.clone(),
-                            answer: formless_protocol::QuestionAnswer::summary_of(&answers),
-                            answers,
-                        },
+                        question.request(answers),
                         Pending::Answer(Action {
                             id: operation,
                             session_id: question.session_id,
@@ -2699,7 +2710,10 @@ impl Engine {
                 }
                 if matches!(
                     event,
-                    Event::UserQuestion { .. } | Event::UserQuestionClosed { .. }
+                    Event::UserQuestion { .. }
+                        | Event::UserQuestionClosed { .. }
+                        | Event::HarnessPermissionRequested { .. }
+                        | Event::HarnessPermissionClosed { .. }
                 ) {
                     self.questions.event(&event);
                     self.emit_questions();
@@ -2871,7 +2885,7 @@ impl Engine {
                 }
                 self.topics_available = result["features"]
                     .as_array()
-                    .is_some_and(|features| features.iter().any(|f| f == "topic_orchestration_v1"));
+                    .is_some_and(|features| features.iter().any(|f| f == "topic_orchestration_v2"));
                 self.updates
                     .push(Update::TopicSupport(self.topics_available));
                 self.session_model_cas_available =
@@ -3425,6 +3439,12 @@ impl Engine {
                     session_id,
                     result,
                 });
+            }
+            Pending::HarnessPermissionSnapshot { revision } => {
+                if let Ok(Value::Array(events)) = result {
+                    self.questions.permission_snapshot(&events, revision);
+                    self.emit_questions();
+                }
             }
             Pending::Answer(action) => {
                 let question_id = action.question_id.expect("question action has identity");

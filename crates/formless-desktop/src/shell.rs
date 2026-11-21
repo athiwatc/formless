@@ -4443,7 +4443,12 @@ impl Shell {
             Button::new(id)
                 .small()
                 .outline()
-                .label(entry.label)
+                .label(if command == Command::Questions {
+                    "Questions"
+                } else {
+                    entry.label
+                })
+                .accessibility_label(entry.label)
                 .tooltip(tooltip(&entry))
                 .track_focus(focus)
                 .selected(entry.checked == Some(true))
@@ -4938,7 +4943,7 @@ impl Shell {
             .when(self.client_attention && self.client.as_ref().is_some_and(Client::is_ready),|region|region.child(Button::new("approval-review-open").track_focus(&self.approval_open_focus).label("Review security approval").on_click(Self::on_command(Command::Approvals,cx))))
             .when(self.step_prompt().is_some(), |region|region.child(Button::new("step-review-open").track_focus(&self.step_open_focus).label("Review Step").on_click(cx.listener(|this,_,window,cx|this.open_step_review(window,cx)))))
             .when(self.client.is_some() && self.client_attention, |region| region.child(
-                readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions or Approvals for one complete supported Tool call; other decisions require Formless TUI.").text_sm().px_2().py_1()
+                readable("daemon-pending-attention", "This Profile has pending decisions. Questions handles questions and harness permissions; Approvals handles security Tool calls. Other decisions require Formless TUI.").text_sm().px_2().py_1()
             ))
             .when(self.client.is_some() && !self.client_snapshot_ready, |region| region.child(
                 v_flex().p_4().gap_2().when(self.sidebar.active_id().is_none(), |view| view.child(
@@ -6628,7 +6633,7 @@ impl Shell {
             .when(self.client.is_some() && self.client_attention, |status| {
                 status.child(readable(
                     "status-pending-attention",
-                    "Profile decisions · Questions / Formless TUI approvals",
+                    "Profile decisions · Questions / permissions · Approvals / Formless TUI",
                 ))
             });
         if reflowed {

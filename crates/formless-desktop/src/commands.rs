@@ -495,8 +495,8 @@ pub fn entry(command: Command, state: &State) -> Entry {
             if state.composing { Some(COMPOSING) } else { (!state.can_approvals).then_some("Wait for a ready Profile connection") },
         ),
         Command::Questions => (
-            "Questions",
-            "Review Profile questions".into(),
+            "Questions / permissions",
+            "Review Profile questions and harness permissions".into(),
             Group::Run,
             "Answer pending questions for their original Sessions",
             None,

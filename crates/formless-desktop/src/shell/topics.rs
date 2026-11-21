@@ -1,6 +1,8 @@
 use super::*;
 use crate::topics::{self, Action, Reply};
 use formless_protocol::{HarnessKind, TopicFeatureStatus, TopicStatus};
+mod outline;
+mod parent;
 
 pub(super) struct Ui {
     pub state: topics::State,
@@ -8,14 +10,15 @@ pub(super) struct Ui {
     source: Option<String>,
     selected: HashSet<String>,
     name: Entity<InputState>,
-    repo: Entity<InputState>,
-    builder_model: Entity<InputState>,
-    reviewer_model: Entity<InputState>,
-    builder: HarnessKind,
-    reviewer: HarnessKind,
+    workspace: Entity<InputState>,
+    outline: Vec<outline::Step>,
+    parent: Option<String>,
+    choosing_parent: bool,
+    parent_scroll: ScrollHandle,
     scroll: ScrollHandle,
     tree_scroll: ScrollHandle,
     pending_open: Option<String>,
+    show_outline_details: bool,
 }
 
 impl Ui {
@@ -25,6 +28,9 @@ impl Ui {
         self.source = None;
         self.selected.clear();
         self.pending_open = None;
+        self.show_outline_details = false;
+        self.parent = None;
+        self.choosing_parent = false;
     }
     pub fn retain_candidates(&mut self, available: &HashSet<&str>) {
         self.selected.retain(|id| available.contains(id.as_str()));
@@ -36,15 +42,20 @@ impl Ui {
         self.state.candidate_session = None;
         self.state.selected = self
             .state
-            .topics
-            .iter()
-            .find(|t| {
-                t.topic_session_id.as_deref() == session && session.is_some()
-                    || t.attempts
-                        .iter()
-                        .any(|a| Some(a.conversation_session_id.as_str()) == session)
-            })
-            .map(|t| t.id.clone());
+            .pending_for(session)
+            .map(|topic| topic.id.clone())
+            .or_else(|| {
+                self.state
+                    .topics
+                    .iter()
+                    .find(|t| {
+                        t.topic_session_id.as_deref() == session && session.is_some()
+                            || t.attempts
+                                .iter()
+                                .any(|a| Some(a.conversation_session_id.as_str()) == session)
+                    })
+                    .map(|t| t.id.clone())
+            });
     }
     pub fn new(window: &mut Window, cx: &mut Context<Shell>) -> Self {
         Self {
@@ -53,30 +64,54 @@ impl Ui {
             source: None,
             selected: HashSet::new(),
             name: cx.new(|cx| InputState::new(window, cx).placeholder("Topic name, e.g. Formless")),
-            repo: cx.new(|cx| InputState::new(window, cx).placeholder("Absolute repository path")),
-            builder_model: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Build model (optional, e.g. opus)")
-            }),
-            reviewer_model: cx
-                .new(|cx| InputState::new(window, cx).placeholder("Review model (optional)")),
-            builder: HarnessKind::Claude,
-            reviewer: HarnessKind::Codex,
+            workspace: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Workspace folder (optional)")),
+            outline: Vec::new(),
+            parent: None,
+            choosing_parent: false,
+            parent_scroll: ScrollHandle::new(),
             scroll: ScrollHandle::new(),
             tree_scroll: ScrollHandle::new(),
             pending_open: None,
+            show_outline_details: false,
         }
     }
 }
 
 impl Shell {
     #[cfg(feature = "test-support")]
-    pub fn topic_inputs(&self) -> [Entity<InputState>; 4] {
-        [
-            self.topic_ui.name.clone(),
-            self.topic_ui.repo.clone(),
-            self.topic_ui.builder_model.clone(),
-            self.topic_ui.reviewer_model.clone(),
-        ]
+    pub fn topic_inputs(&self) -> [Entity<InputState>; 2] {
+        [self.topic_ui.name.clone(), self.topic_ui.workspace.clone()]
+    }
+    #[cfg(feature = "test-support")]
+    pub fn topic_step_inputs(&self) -> Vec<(uuid::Uuid, [Entity<InputState>; 3])> {
+        self.topic_ui
+            .outline
+            .iter()
+            .map(|step| {
+                (
+                    step.id,
+                    [
+                        step.title.clone(),
+                        step.instructions.clone(),
+                        step.model.clone(),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    fn set_topic_outline(
+        &mut self,
+        preset: topics::Preset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.topic_ui.outline = topics::preset(preset)
+            .into_iter()
+            .map(|step| outline::Step::new(step, window, cx))
+            .collect();
+        cx.notify();
     }
     fn topic_action(&mut self, action: Action, cx: &mut Context<Self>) {
         if !self.client_connected || self.topic_ui.state.pending.is_some() {
@@ -126,6 +161,24 @@ impl Shell {
         }
         match result {
             Ok(reply) => {
+                let newly_pending = if let Reply::Inventory(topics) = &reply {
+                    topics
+                        .iter()
+                        .find(|topic| {
+                            topic.status == TopicStatus::PendingApproval
+                                && Some(topic.source_session_id.as_str())
+                                    == self.sidebar.active_id()
+                                && !self
+                                    .topic_ui
+                                    .state
+                                    .topics
+                                    .iter()
+                                    .any(|old| old.id == topic.id)
+                        })
+                        .map(|topic| topic.id.clone())
+                } else {
+                    None
+                };
                 let main = match &reply {
                     Reply::Main(s) => Some(s.clone()),
                     _ => None,
@@ -138,10 +191,12 @@ impl Shell {
                 };
                 if operation.is_some() {
                     self.topic_ui.proposing = false;
-                    self.topic_ui.state.notice =
-                        Some("Updated from Formless. Nothing is merged automatically.".into());
+                    self.topic_ui.state.notice = Some("Updated from Formless.".into());
                 }
                 self.topic_ui.state.apply(reply);
+                if let Some(id) = newly_pending {
+                    self.topic_ui.state.selected = Some(id);
+                }
                 if approved.is_some() {
                     self.topic_ui.proposing = false;
                 }
@@ -230,6 +285,8 @@ impl Shell {
         self.topic_ui.source = self.sidebar.active_id().map(str::to_string);
         self.topic_ui.selected.clear();
         self.topic_ui.state.notice = None;
+        self.topic_ui.parent = None;
+        self.topic_ui.choosing_parent = false;
         let cwd = self
             .client_sessions
             .iter()
@@ -237,7 +294,7 @@ impl Shell {
             .and_then(|s| s.cwd.clone())
             .unwrap_or_default();
         self.topic_ui
-            .repo
+            .workspace
             .update(cx, |input, cx| input.set_value(cwd, window, cx));
         cx.notify();
     }
@@ -251,7 +308,7 @@ impl Shell {
             return;
         }
         let name = ui.name.read(cx).value().to_string().trim().to_string();
-        let repo = ui.repo.read(cx).value().to_string().trim().to_string();
+        let workspace = ui.workspace.read(cx).value().to_string().trim().to_string();
         let message_ids = ui
             .state
             .candidates
@@ -259,26 +316,54 @@ impl Shell {
             .filter(|m| ui.selected.contains(&m.id))
             .map(|m| m.id.clone())
             .collect::<Vec<_>>();
-        if name.is_empty() || repo.is_empty() || message_ids.is_empty() {
+        if name.is_empty() || message_ids.is_empty() {
             self.topic_ui.state.notice =
-                Some("Choose at least one request, a topic name and a repository path.".into());
+                Some("Choose at least one saved request and a topic name.".into());
             cx.notify();
             return;
         }
-        let optional = |input: &Entity<InputState>| {
-            let value = input.read(cx).value().to_string().trim().to_string();
-            (!value.is_empty()).then_some(value)
-        };
+        if ui.parent.as_ref().is_some_and(|id| {
+            !ui.state.topics.iter().any(|topic| {
+                &topic.id == id
+                    && !matches!(
+                        topic.status,
+                        TopicStatus::PendingApproval | TopicStatus::Rejected
+                    )
+            })
+        }) {
+            self.topic_ui.state.notice =
+                Some("Choose an available parent topic or use the source context.".into());
+            cx.notify();
+            return;
+        }
+        let outline = ui
+            .outline
+            .iter()
+            .map(|step| step.value(cx))
+            .collect::<Vec<_>>();
+        if outline.iter().any(|step| step.title.is_empty()) {
+            self.topic_ui.state.notice =
+                Some("Give each suggested step a title, or remove it.".into());
+            cx.notify();
+            return;
+        }
+        if outline
+            .iter()
+            .any(|step| step.harness == Some(HarnessKind::Acp) && step.acp_agent.is_none())
+        {
+            self.topic_ui.state.notice =
+                Some("Choose the configured ACP agent for each ACP step.".into());
+            cx.notify();
+            return;
+        }
         let proposal = formless_protocol::TopicProposalRequest {
             source_session_id: ui.source.clone().unwrap(),
+            parent_topic_id: ui.parent.clone(),
             message_ids,
             features: vec![],
             name,
-            repo: repo.into(),
-            builder: ui.builder,
-            reviewer: ui.reviewer,
-            builder_model: optional(&ui.builder_model),
-            reviewer_model: optional(&ui.reviewer_model),
+            workspace: (!workspace.is_empty()).then(|| workspace.into()),
+            outline,
         };
         self.topic_action(Action::Propose(proposal), cx);
     }
@@ -293,7 +378,7 @@ impl Shell {
         if self.topic_ui.state.supported && !self.topic_ui.state.inventory_loaded {
             Some("Waiting for topic conversations to load")
         } else if self.harness_read_only() {
-            Some("Harness conversation is read only; Formless manages the handoff")
+            Some("Harness transcript is read only. Use Questions / permissions for harness requests, or Topic Chat to steer Formless.")
         } else {
             None
         }
@@ -363,10 +448,10 @@ impl Shell {
                 .text_color(cx.theme().muted_foreground),
             );
         }
-        for topic in &state.topics {
-            if topic.status == TopicStatus::Rejected {
-                continue;
-            }
+        let displayed = state
+            .displayed(self.sidebar.active_id())
+            .map(|topic| topic.id.as_str());
+        for (depth, topic) in state.tree() {
             let id = topic.id.clone();
             let ready = topic
                 .features
@@ -377,16 +462,18 @@ impl Shell {
                 v_flex()
                     .gap_1()
                     .min_w_0()
+                    .pl(px((depth.min(6) * 12) as f32))
                     .child(
                         Button::new(SharedString::from(format!("topic-{}", topic.id)))
                             .ghost()
                             .label(topic.name.clone())
                             .accessibility_label(format!(
-                                "{}, {}",
+                                "Level {}, {}, {}",
+                                depth + 1,
                                 topic.name,
                                 topics::status(topic)
                             ))
-                            .selected(state.selected.as_deref() == Some(topic.id.as_str()))
+                            .selected(displayed == Some(topic.id.as_str()))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_topic(&id, window, cx)
                             })),
@@ -409,30 +496,37 @@ impl Shell {
                 let session = attempt.conversation_session_id.clone();
                 let topic_id = topic.id.clone();
                 let label = format!(
-                    "{} · {} {} · {:?}",
-                    topics::harness(attempt.harness),
-                    topics::role(attempt.role),
-                    attempt.round,
-                    attempt.status
+                    "{} · {} · {}",
+                    attempt.step_title,
+                    topics::chosen_harness(Some(attempt.harness), attempt.acp_agent.as_deref()),
+                    topics::attempt_status(attempt.status)
                 );
                 let available = self.sidebar.rows().iter().any(|s| s.id == session);
                 tree = tree.child(
-                    div().pl_4().min_w_0().child(
-                        Button::new(SharedString::from(format!("topic-attempt-{}", attempt.id)))
+                    div()
+                        .pl(px(16. + (depth.min(6) * 12) as f32))
+                        .min_w_0()
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "topic-attempt-{}",
+                                attempt.id
+                            )))
                             .small()
                             .ghost()
                             .label(label)
                             .disabled(!available)
                             .selected(self.sidebar.active_id() == Some(session.as_str()))
                             .tooltip("Read the harness conversation. Formless owns the handoff.")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_topic_session(&session, window, cx);
-                                this.topic_ui.state.selected = Some(topic_id.clone());
-                                this.topic_ui.proposing = false;
-                                this.prefs.close_overlays();
-                                this.settle(window, cx);
-                            })),
-                    ),
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_topic_session(&session, window, cx);
+                                    this.topic_ui.state.selected = Some(topic_id.clone());
+                                    this.topic_ui.proposing = false;
+                                    this.prefs.close_overlays();
+                                    this.settle(window, cx);
+                                },
+                            )),
+                        ),
                 );
             }
         }
@@ -447,6 +541,9 @@ impl Shell {
         let ui = &self.topic_ui;
         let busy = ui.state.pending.is_some() || !self.client_connected;
         let read_only = self.harness_read_only();
+        let current_topic = ui.state.displayed(self.sidebar.active_id());
+        let awaiting_consent =
+            current_topic.is_some_and(|topic| topic.status == TopicStatus::PendingApproval);
         let title = if ui
             .state
             .main
@@ -471,7 +568,16 @@ impl Shell {
             .px_3()
             .py_2()
             .gap_2()
-            .max_h(window.viewport_size().height * if ui.proposing { 0.65 } else { 0.38 })
+            .max_h(
+                window.viewport_size().height
+                    * if ui.proposing {
+                        0.65
+                    } else if awaiting_consent {
+                        0.55
+                    } else {
+                        0.38
+                    },
+            )
             .overflow_y_scroll()
             .track_scroll(&ui.scroll)
             .child(
@@ -506,56 +612,12 @@ impl Shell {
                     ),
             );
         if ui.proposing {
-            panel = panel.child(readable("topic-proposal-help", "Choose the requests to move and your build/review workflow. Nothing moves or starts until you approve the review.").text_sm())
+            panel = panel.child(readable("topic-proposal-help", "Choose saved requests, a topic name and an optional starting outline. Nothing moves or starts until you approve.").text_sm())
                 .child(Input::new(&ui.name).small().aria_label("Topic name"))
-                .child(Input::new(&ui.repo).small().aria_label("Repository path"));
-            for build in [true, false] {
-                let chosen = if build { ui.builder } else { ui.reviewer };
-                let mut row = h_flex().min_w_0().flex_wrap().gap_2().items_center().child(
-                    readable(
-                        if build {
-                            "topic-build-label"
-                        } else {
-                            "topic-review-label"
-                        },
-                        if build { "Build with" } else { "Review with" },
-                    )
-                    .text_xs(),
-                );
-                for kind in [HarnessKind::Claude, HarnessKind::Codex] {
-                    row = row.child(
-                        Button::new(SharedString::from(format!(
-                            "topic-harness-{build}-{kind:?}"
-                        )))
-                        .small()
-                        .outline()
-                        .label(topics::harness(kind))
-                        .selected(kind == chosen)
-                        .disabled(busy)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if build {
-                                this.topic_ui.builder = kind;
-                            } else {
-                                this.topic_ui.reviewer = kind;
-                            }
-                            cx.notify();
-                        })),
-                    );
-                }
-                panel = panel.child(row).child(
-                    Input::new(if build {
-                        &ui.builder_model
-                    } else {
-                        &ui.reviewer_model
-                    })
-                    .small()
-                    .aria_label(if build {
-                        "Build model"
-                    } else {
-                        "Review model"
-                    }),
-                );
-            }
+                .child(parent::editor(ui, busy, cx))
+                .child(Input::new(&ui.workspace).small().aria_label("Workspace folder (optional)"))
+                .child(readable("topic-workspace-help", "Leave the workspace blank to use a topic scratch folder.").text_xs())
+                .child(outline::editor(ui, busy, cx));
             if ui.state.candidates.is_empty() {
                 panel = panel.child(
                     readable(
@@ -599,11 +661,41 @@ impl Shell {
                     .disabled(busy || ui.selected.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| this.propose_topic(cx))),
             );
-        } else if let Some(topic) = ui
-            .state
-            .selected()
-            .or_else(|| ui.state.pending_for(self.sidebar.active_id()))
-        {
+        } else if let Some(topic) = current_topic {
+            let mut breadcrumbs = h_flex()
+                .id("topic-breadcrumbs")
+                .test_support()
+                .gap_1()
+                .flex_wrap();
+            if let Some(main) = &ui.state.main {
+                let id = main.id.clone();
+                breadcrumbs = breadcrumbs.child(
+                    Button::new("topic-breadcrumb-main")
+                        .small()
+                        .ghost()
+                        .label("Main Chat")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.topic_ui.state.selected = None;
+                            this.topic_ui.proposing = false;
+                            this.open_topic_session(&id, window, cx);
+                        })),
+                );
+            }
+            for ancestor in ui.state.breadcrumbs(&topic.id) {
+                let id = ancestor.id.clone();
+                breadcrumbs =
+                    breadcrumbs.child(Label::new("/").text_xs()).child(
+                        Button::new(SharedString::from(format!("topic-breadcrumb-{id}")))
+                            .small()
+                            .ghost()
+                            .label(ancestor.name.clone())
+                            .selected(ancestor.id == topic.id)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_topic(&id, window, cx)
+                            })),
+                    );
+            }
+            panel = panel.child(breadcrumbs);
             panel = panel
                 .child(
                     readable(
@@ -612,32 +704,120 @@ impl Shell {
                     )
                     .font_semibold(),
                 )
-                .child(readable("topic-detail-repo", topic.repo.display().to_string()).text_xs())
+                .child(readable("topic-detail-workspace", topic.workspace.as_ref().map(|path| format!("Workspace: {}", path.display())).unwrap_or_else(|| "Workspace: topic scratch folder".into())).text_xs())
                 .child(
                     readable(
                         "topic-workflow",
+                        "The Formless model decides the next steps. This outline is guidance, not a fixed pipeline.",
+                    )
+                    .text_sm(),
+                );
+            for (index, step) in topic.outline.iter().enumerate() {
+                panel = panel.child(
+                    readable(
+                        SharedString::from(format!("topic-outline-{index}")),
                         format!(
-                            "{}{} builds → {}{} reviews · Formless manages handoffs",
-                            topics::harness(topic.builder),
-                            topic
-                                .builder_model
+                            "{}. {} · {}{} · {}",
+                            index + 1,
+                            step.title,
+                            topics::chosen_harness(step.harness, step.acp_agent.as_deref()),
+                            step.model
                                 .as_ref()
-                                .map(|m| format!(" / {m}"))
+                                .map(|model| format!(" / {model}"))
                                 .unwrap_or_default(),
-                            topics::harness(topic.reviewer),
-                            topic
-                                .reviewer_model
-                                .as_ref()
-                                .map(|m| format!(" / {m}"))
-                                .unwrap_or_default()
+                            topics::access(step.access),
                         ),
                     )
                     .text_sm(),
                 );
+                if ui.show_outline_details {
+                    panel = panel.child(
+                        readable(
+                            SharedString::from(format!("topic-outline-instructions-{index}")),
+                            step.instructions.clone(),
+                        )
+                        .text_xs(),
+                    );
+                }
+            }
+            if !topic.outline.is_empty() {
+                panel = panel.child(
+                    Button::new("topic-outline-details")
+                        .small()
+                        .ghost()
+                        .label(if ui.show_outline_details {
+                            "Hide step details"
+                        } else {
+                            "Show step details"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.topic_ui.show_outline_details =
+                                !this.topic_ui.show_outline_details;
+                            cx.notify();
+                        })),
+                );
+            }
+            if !read_only && matches!(topic.status, TopicStatus::NeedsUser | TopicStatus::Running) {
+                panel = panel.child(
+                    readable(
+                        "topic-steering-help",
+                        "Reply in Topic Chat to answer Formless or steer the workflow.",
+                    )
+                    .text_xs(),
+                );
+            }
+            if let Some((_, attempt)) = ui
+                .state
+                .attempt_for(self.sidebar.active_id().unwrap_or_default())
+            {
+                panel = panel.child(
+                    readable(
+                        "topic-active-step",
+                        format!(
+                            "{} · {}{} · {} · {}",
+                            attempt.step_title,
+                            topics::chosen_harness(
+                                Some(attempt.harness),
+                                attempt.acp_agent.as_deref()
+                            ),
+                            attempt
+                                .model
+                                .as_ref()
+                                .map(|model| format!(" / {model}"))
+                                .unwrap_or_default(),
+                            topics::access(attempt.access),
+                            topics::attempt_status(attempt.status)
+                        ),
+                    )
+                    .text_sm(),
+                );
+                if let Some(summary) = &attempt.summary {
+                    panel =
+                        panel.child(readable("topic-attempt-summary", summary.clone()).text_sm());
+                }
+                for (index, artifact) in attempt.inputs.iter().enumerate() {
+                    panel = panel.child(
+                        readable(
+                            SharedString::from(format!("topic-attempt-input-{index}")),
+                            format!("Input · {}", topics::artifact(artifact)),
+                        )
+                        .text_xs(),
+                    );
+                }
+                for (index, artifact) in attempt.outputs.iter().enumerate() {
+                    panel = panel.child(
+                        readable(
+                            SharedString::from(format!("topic-attempt-output-{index}")),
+                            format!("Output · {}", topics::artifact(artifact)),
+                        )
+                        .text_xs(),
+                    );
+                }
+            }
             let id = topic.id.clone();
             if topic.status == TopicStatus::PendingApproval {
                 let reject_id = id.clone();
-                panel = panel.child(readable("topic-consent", format!("Move these requests into {} and start this workflow? Formless will hand each feature from builder to reviewer. Nothing auto-merges.", topic.name)).text_sm())
+                panel = panel.child(readable("topic-consent", format!("Move these requests into {} and start this workflow? The Formless model will use this outline as guidance and decide the next steps.", topic.name)).text_sm())
                     .child(h_flex().flex_wrap().gap_2()
                         .child(Button::new("topic-approve").small().primary().label("Move and start").disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| this.topic_action(Action::MoveAndStart(id.clone()), cx))))
@@ -654,9 +834,7 @@ impl Shell {
                             this.topic_action(Action::Start(id.clone()), cx)
                         })),
                 );
-            } else if topic.status == TopicStatus::Failed
-                || (topic.status == TopicStatus::Running && !topics::has_active_attempt(topic))
-            {
+            } else if topic.status == TopicStatus::Failed {
                 panel = panel.child(
                     readable(
                         "topic-recovery-help",
@@ -673,6 +851,25 @@ impl Shell {
                         .disabled(busy)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.topic_action(Action::Recover(id.clone()), cx)
+                        })),
+                );
+            }
+            if matches!(
+                topic.status,
+                TopicStatus::Approved
+                    | TopicStatus::Running
+                    | TopicStatus::NeedsUser
+                    | TopicStatus::Failed
+            ) {
+                let id = topic.id.clone();
+                panel = panel.child(
+                    Button::new("topic-cancel")
+                        .small()
+                        .outline()
+                        .label("Cancel workflow")
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.topic_action(Action::Cancel(id.clone()), cx)
                         })),
                 );
             }
@@ -697,27 +894,33 @@ impl Shell {
                 if let Some(detail) = &feature.detail {
                     feature_row = feature_row.child(Label::new(detail.clone()).text_xs());
                 }
-                if let Some(revision) = &feature.ready_revision {
+                for (index, artifact) in feature.outputs.iter().enumerate() {
                     feature_row = feature_row.child(
-                        Label::new(format!("Reviewed revision: {revision} · not merged")).text_xs(),
+                        readable(
+                            SharedString::from(format!("topic-output-{}-{index}", feature.id)),
+                            topics::artifact(artifact),
+                        )
+                        .text_xs(),
                     );
                 }
                 if matches!(
                     feature.status,
-                    TopicFeatureStatus::Failed | TopicFeatureStatus::NeedsUser
+                    TopicFeatureStatus::Failed
+                        | TopicFeatureStatus::NeedsUser
+                        | TopicFeatureStatus::Cancelled
                 ) {
-                    let topic = topic.id.clone();
+                    let topic_id = topic.id.clone();
                     let feature = feature.id.clone();
                     feature_row = feature_row.child(
                         Button::new(SharedString::from(format!("topic-retry-{feature}")))
                             .small()
                             .outline()
-                            .label("Retry feature")
-                            .disabled(busy)
+                            .label("Reset item for retry")
+                            .disabled(busy || topic.status == TopicStatus::Running)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.topic_action(
                                     Action::Retry {
-                                        topic: topic.clone(),
+                                        topic: topic_id.clone(),
                                         feature: feature.clone(),
                                     },
                                     cx,

@@ -41,6 +41,44 @@ struct Form {
 }
 
 impl Shell {
+    fn question_origin(&self, question: &Open) -> String {
+        if let Some((topic, attempt)) = self.topic_ui.state.attempt_for(&question.session_id) {
+            let path = self
+                .topic_ui
+                .state
+                .breadcrumbs(&topic.id)
+                .iter()
+                .map(|topic| topic.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            return format!(
+                "{path} / {} · {}",
+                attempt.step_title,
+                crate::topics::chosen_harness(Some(attempt.harness), attempt.acp_agent.as_deref())
+            );
+        }
+        if let Some(permission) = &question.permission {
+            return format!(
+                "{} · Topic {} · Attempt {} · Session {}",
+                crate::topics::chosen_harness(
+                    Some(permission.harness),
+                    permission.acp_agent.as_deref()
+                ),
+                permission.topic_id,
+                permission.attempt_id,
+                question.session_id
+            );
+        }
+        if question.topic_id.is_some() || question.attempt_id.is_some() {
+            return format!(
+                "Topic {} · Attempt {} · Session {}",
+                question.topic_id.as_deref().unwrap_or("not provided"),
+                question.attempt_id.as_deref().unwrap_or("not provided"),
+                question.session_id
+            );
+        }
+        format!("Session: {}", model::preview(&question.session_id, 160))
+    }
     #[cfg(feature = "test-support")]
     pub fn retire_recording_question_connection(&self) -> u64 {
         let client = self.client.as_ref().unwrap();
@@ -398,7 +436,11 @@ impl Shell {
                 self.client_questions
                     .open
                     .retain(|question| question.id != id);
-                "Daemon accepted the answers. A copy is kept in this window.".into()
+                if form.question.permission.is_some() {
+                    "Daemon accepted the permission decision. It was not saved as a persistent grant.".into()
+                } else {
+                    "Daemon accepted the answers. A copy is kept in this window.".into()
+                }
             }
             Outcome::Closed => {
                 self.client_questions
@@ -548,36 +590,39 @@ impl Shell {
             .gap_2();
         if let Some(form) = &panel.form {
             let question = &form.question.questions[form.field];
+            let permission = form.question.permission.as_ref();
             let current = self.question_current(form);
             let waiting = form.waiting.is_some();
-            body=body.child(readable("question-session",format!("Session: {}",model::preview(&form.question.session_id,160))))
-                .child(readable("question-position",format!("Question {} of {} · {}",form.field+1,form.question.questions.len(),if question.multi_select {"Choose any options and/or write your answer"} else {"Choose one option and/or write your answer"})))
+            body=body.child(readable("question-session",model::literal(&self.question_origin(&form.question))))
+                .child(readable("question-position",if permission.is_some() { "Harness permission · Only you can grant permission. Nothing is allowed until you choose an allow option. Unanswered, cancelled or ended requests are denied. ‘Always’ applies only to this attempt and is never saved.".into() } else { format!("Question {} of {} · {}",form.field+1,form.question.questions.len(),if question.multi_select {"Choose any options and/or write your answer"} else {"Choose one option and/or write your answer"}) }))
                 .children(question.header.as_ref().map(|header|readable("question-header",model::preview(header,100)).text_sm()))
-                .child(readable("question-prompt",model::preview(&question.question,1500)))
+                .child(readable("question-prompt",if permission.is_some() { model::literal(&question.question) } else { model::preview(&question.question,1500) }))
+                .children(permission.map(|permission| readable("harness-permission-details", model::literal(&format!("Kind: {}\n{}", permission.kind, permission.raw_input.as_ref().map(|raw|serde_json::to_string_pretty(raw).unwrap_or_default()).unwrap_or_default()))).text_sm()))
                 .when(!current,|body|body.child(readable("question-stale","This question is closed, disconnected or has an unknown previous answer. Submission is disabled; your answers remain copyable.")))
                 .children(question.options.iter().enumerate().map(|(index,option)|{
-                    let short:String=option.label.chars().take(16).collect();
-                    let clipped=short.len()!=option.label.len();
+                    let label=model::literal(form.question.option_label(form.field,index));
+                    let short:String=label.chars().take(16).collect();
+                    let clipped=short.len()!=label.len();
                     v_flex().id(("question-option-row",index)).test_support().track_focus(&form.rows[index].0).gap_1()
-                        .child(div().id(("question-option-focus",index)).test_support().anchor_scroll(Some(form.rows[index].1.clone())).pt_1().child(Checkbox::new(("question-option",index)).w_full().label(format!("{short}{}",if clipped {"…"}else{""})).accessibility_label(option.label.clone())
+                        .child(div().id(("question-option-focus",index)).test_support().anchor_scroll(Some(form.rows[index].1.clone())).pt_1().child(Checkbox::new(("question-option",index)).w_full().label(format!("{short}{}",if clipped {"…"}else{""})).accessibility_label(label.clone())
                             .checked(form.answers[form.field].selected.contains(&option.label)).disabled(waiting || !current)
                             .on_click(cx.listener(move|this,_,_,cx|{if let Some(form)=this.question_panel.as_mut().and_then(|panel|panel.form.as_mut()){form.question.toggle(&mut form.answers,form.field,index);cx.notify();}}))))
-                        .when(clipped,|row|row.child(readable(SharedString::from(format!("question-option-label-{index}")),model::preview(&option.label,400)).text_sm()))
-                        .children(option.description.as_ref().map(|description|readable(SharedString::from(format!("question-option-description-{index}")),model::preview(description,400)).text_sm()))
+                        .when(clipped,|row|row.child(readable(SharedString::from(format!("question-option-label-{index}")),if permission.is_some() { label } else { model::preview(&label,400) }).text_sm()))
+                        .children(form.question.option_description(form.field,index).map(|description|readable(SharedString::from(format!("question-option-description-{index}")),model::literal(&description)).text_sm()))
                 }))
-                .child(div().id("question-input-anchor").test_support().pt_1().anchor_scroll(Some(form.input_anchor.clone()))
+                .when(permission.is_none(),|body|body.child(div().id("question-input-anchor").test_support().pt_1().anchor_scroll(Some(form.input_anchor.clone()))
                     .child(Textarea::new(&form.input).aria_label("Your answer").disabled(waiting).w_full().on_paste({let shell=cx.entity();move|item,_,cx|{
                         if item.text().is_some_and(|text|text.len()>MAX_TEXT_BYTES) {shell.update(cx,|this,cx|{if let Some(panel)=&mut this.question_panel{panel.notice=Some("Paste not added: answer text is limited to 64 KiB.".into());cx.notify();}});true}else{false}
-                    }})))
-                .child(readable("question-empty-help","Blank fields are returned as unanswered. Enter inserts a line; Submit is an explicit button." ).text_sm());
+                    }}))))
+                .when(permission.is_none(),|body|body.child(readable("question-empty-help","Blank fields are returned as unanswered. Enter inserts a line; Submit is an explicit button." ).text_sm()));
         } else {
-            body=body.child(readable("questions-scope","Questions belong to the Sessions shown below, across this Profile. Approvals still require the TUI."))
+            body=body.child(readable("questions-scope","Questions and harness permissions across this Profile. Harness permissions require your explicit choice; security Tool approvals are reviewed separately in Approvals."))
                 .when(self.client_questions.open.is_empty(),|body|body.child(readable("questions-empty","No pending questions loaded. Open a Session to restore existing questions; newly arriving questions appear here without changing focus.")))
                 .children(self.client_questions.open.iter().map(|question|{
                     let id=question.id.clone();
                     let (_,focus,anchor)=panel.directory.iter().find(|(current,_,_)|current==&id).expect("question directory focus is synchronized");
                     div().id(SharedString::from(format!("question-entry-{id}"))).test_support().pt_1().anchor_scroll(Some(anchor.clone()))
-                        .child(Button::new(SharedString::from(format!("open-question-{id}"))).w_full().track_focus(focus).label(format!("Session {} · {}",model::preview(&question.session_id,100),model::preview(&question.questions[0].question,200))).on_click(cx.listener(move|this,_,window,cx|this.open_question(&id,window,cx))))
+                        .child(Button::new(SharedString::from(format!("open-question-{id}"))).w_full().track_focus(focus).label(format!("{} · {}{}",model::literal(&self.question_origin(question)),if question.permission.is_some() {"Permission: "} else {""},model::preview(&question.questions[0].question,200))).on_click(cx.listener(move|this,_,window,cx|this.open_question(&id,window,cx))))
                 }));
             if !self.question_draft_ids.is_empty() {
                 body=body.child(readable("questions-saved-help",format!("{} saved answer(s) in this window. Retention is limited to 16 questions and 4 MiB; closing the app clears them.",self.question_draft_ids.len())))
@@ -629,8 +674,10 @@ impl Shell {
                                         .and_then(|panel| panel.form.as_ref())
                                     {
                                         let mut answers = form.answers.clone();
-                                        answers[form.field].text =
-                                            Some(form.input.read(cx).value().to_string());
+                                        if form.question.permission.is_none() {
+                                            answers[form.field].text =
+                                                Some(form.input.read(cx).value().to_string());
+                                        }
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             serde_json::to_string_pretty(&Saved {
                                                 question: form.question.clone(),
@@ -703,15 +750,45 @@ impl Shell {
             body = body.child(actions);
             footer = footer.child(
                 Button::new("question-submit")
-                    .label("Submit")
-                    .accessibility_label("Submit answers")
+                    .label(if form.question.permission.is_some() {
+                        "Apply selected option"
+                    } else {
+                        "Submit"
+                    })
+                    .accessibility_label(if form.question.permission.is_some() {
+                        "Apply selected harness permission option"
+                    } else {
+                        "Submit answers"
+                    })
                     .tooltip("Submit all answers to this question")
                     .primary()
-                    .disabled(form.waiting.is_some() || !self.question_current(form))
+                    .disabled(
+                        form.waiting.is_some()
+                            || !self.question_current(form)
+                            || (form.question.permission.is_some()
+                                && form.answers[0].selected.is_empty()),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.submit_question(window, cx))),
             );
+            if form.question.permission.is_some() {
+                footer = footer.child(
+                    Button::new("harness-permission-deny")
+                        .label("Deny request")
+                        .disabled(form.waiting.is_some() || !self.question_current(form))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(form) = this
+                                .question_panel
+                                .as_mut()
+                                .and_then(|panel| panel.form.as_mut())
+                            {
+                                form.answers = vec![QuestionAnswer::default()];
+                            }
+                            this.submit_question(window, cx);
+                        })),
+                );
+            }
         }
-        let dialog=v_flex().id("questions-dialog").test_support().role(Role::Dialog).aria_label("Profile questions").aria_description("Modal. Tab reaches controls. Arrow, Page, Home and End keys scroll outside text fields. Escape closes after composition; unsent answers are kept for this window.")
+        let dialog=v_flex().id("questions-dialog").test_support().role(Role::Dialog).aria_label("Profile questions and harness permissions").aria_description("Modal. Tab reaches controls. Arrow, Page, Home and End keys scroll outside text fields. Escape closes after composition; unsent answers are kept for this window.")
             .map(modal_dialog).key_context(QUESTIONS_CONTEXT).on_action(cx.listener(|this,_:&CloseQuestions,window,cx|this.close_questions(window,cx)))
             .on_action(cx.listener(|this,_:&ScrollViewerUp,_,cx|this.scroll_questions(1.,false,cx)))
             .on_action(cx.listener(|this,_:&ScrollViewerDown,_,cx|this.scroll_questions(-1.,false,cx)))
@@ -721,7 +798,7 @@ impl Shell {
             .on_action(cx.listener(|this,_:&ScrollViewerEnd,_,cx|{if let Some(panel)=&this.question_panel{panel.scroll.scroll_to_bottom();cx.notify();}}))
             .w(self.scaled(680.).min(viewport.width-margin*2.)).max_h(viewport.height-margin*2.).p_3().gap_2()
             .bg(cx.theme().popover).text_color(cx.theme().popover_foreground).border_1().border_color(cx.theme().border).rounded_lg().shadow_lg().occlude()
-            .child(readable("questions-heading","Profile questions").text_lg().flex_shrink_0()).child(body).child(footer).focus_trap("questions-dialog",&panel.focus);
+            .child(readable("questions-heading","Questions").text_lg().flex_shrink_0()).child(body).child(footer).focus_trap("questions-dialog",&panel.focus);
         div()
             .absolute()
             .top_0()

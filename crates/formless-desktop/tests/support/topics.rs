@@ -1,6 +1,7 @@
 use super::*;
 use formless_desktop::client::{Command as WireCommand, Update};
 use formless_desktop::topics::{Action, Reply};
+use gpui_kit::SharedString;
 
 fn workspace(cx: &mut TestAppContext, handle: WindowHandle<Root>, shell: &Entity<Shell>) {
     let (sessions, topic) = fixture::topic_workspace();
@@ -29,6 +30,313 @@ fn workspace(cx: &mut TestAppContext, handle: WindowHandle<Root>, shell: &Entity
             }
             s.take_client_commands();
         });
+    });
+}
+
+fn proposal_source(window: &mut Window, cx: &mut App, shell: &Entity<Shell>) {
+    window.render_frame(cx);
+    window.click("topic-main-chat", cx);
+    let generation = shell.read(cx).client_generation();
+    shell.update(cx, |s, cx| {
+        s.apply_client_update(Update::Snapshot {
+            generation,
+            snapshot: replies::session_snapshot("main", &serde_json::json!({
+                "session":{"id":"main"}, "running":false,
+                "messages":[{"id":"request","session_id":"main","seq":1,"role":"user","content":"Organize my monthly work","created_at":"now"}]
+            })).unwrap(),
+        }, window, cx);
+        s.apply_client_update(Update::TopicCandidates {
+            generation, session_id: "main".into(), messages: vec![formless_desktop::topics::Candidate { id: "request".into(), seq: 1, preview: "Organize my monthly work".into() }],
+        }, window, cx);
+        s.take_client_commands();
+    });
+    window.render_frame(cx);
+    window.click("topic-move-open", cx);
+    let inputs = shell.read(cx).topic_inputs();
+    inputs[0].update(cx, |s, cx| s.set_value("Monthly work", window, cx));
+    inputs[1].update(cx, |s, cx| s.set_value("", window, cx));
+    window.render_frame(cx);
+}
+
+#[gpui_kit::test]
+fn main_chat_can_propose_a_child_under_an_existing_topic(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        proposal_source(window, cx, &shell);
+        window.click("topic-parent-open", cx);
+        window.render_frame(cx);
+        window.click("topic-parent-topic-formless", cx);
+        window.render_frame(cx);
+        window.click("topic-message-request", cx);
+        window.click("topic-propose", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let proposals = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic {
+                    action: Action::Propose(proposal),
+                    ..
+                } => Some(proposal),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [proposal] = proposals.as_slice() else {
+            panic!("one proposal")
+        };
+        assert_eq!(proposal.source_session_id, "main");
+        assert_eq!(proposal.parent_topic_id.as_deref(), Some("topic-formless"));
+        assert!(
+            proposal.outline.is_empty(),
+            "the Formless model can plan without a preset"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn nested_topics_use_canonical_parent_navigation_and_pending_children_do_not_hide_the_parent_after_rejection(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let (mut sessions, mut project) = fixture::topic_workspace();
+        project.name = "Project A".into();
+        project.attempts.clear();
+        let (_, mut story) = fixture::topic_workspace();
+        story.id = "story".into();
+        story.name = "Story B".into();
+        story.parent_topic_id = Some(project.id.clone());
+        story.source_session_id = "topic-chat".into();
+        story.topic_session_id = Some("story-chat".into());
+        for attempt in &mut story.attempts {
+            attempt.topic_id = story.id.clone();
+        }
+        let mut story_session = sessions[1].clone();
+        story_session.id = "story-chat".into();
+        story_session.name = "Story B".into();
+        sessions.push(story_session);
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::Sessions(sessions), window, cx);
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![story.clone(), project.clone()])),
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        window.click("topic-story", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("story-chat"));
+        assert!(window.find("topic-breadcrumb-topic-formless").visible());
+        assert!(window.find("topic-breadcrumb-story").visible());
+        window.click("topic-breadcrumb-topic-formless", cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("topic-chat"));
+        let mut pending = story.clone();
+        pending.id = "new-story".into();
+        pending.name = "New story".into();
+        pending.status = formless_protocol::TopicStatus::PendingApproval;
+        pending.topic_session_id = None;
+        pending.attempts.clear();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![story, project, pending.clone()])),
+                },
+                window,
+                cx,
+            );
+            s.take_client_commands();
+        });
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some("topic-chat"));
+        assert!(window
+            .find("topic-detail-name")
+            .value()
+            .unwrap()
+            .contains("New story"));
+        window.click("topic-reject", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let operation = commands
+            .iter()
+            .find_map(|command| match command {
+                WireCommand::Topic {
+                    operation: Some(operation),
+                    action: Action::Reject(id),
+                    ..
+                } if id == "new-story" => Some(*operation),
+                _ => None,
+            })
+            .expect("rejects the child, not its parent");
+        pending.status = formless_protocol::TopicStatus::Rejected;
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: Some(operation),
+                    result: Ok(Reply::Topic(Box::new(pending))),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-detail-name")
+            .value()
+            .unwrap()
+            .contains("Project A"));
+        assert!(window.try_find("topic-approve").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn outline_presets_allow_same_harness_reverse_handoffs_and_other_harnesses(
+    cx: &mut TestAppContext,
+) {
+    use formless_protocol::{HarnessKind::*, StepAccess};
+    for (first, second) in [
+        (Claude, Claude),
+        (Codex, Codex),
+        (Codex, Claude),
+        (Pi, Antigravity),
+        (OpenCode, Pi),
+    ] {
+        let (handle, shell) = open(cx, WIDE, 0, 0);
+        workspace(cx, handle, &shell);
+        step(cx, handle, |window, cx| {
+            proposal_source(window, cx, &shell);
+            window.click("topic-outline-accounting", cx);
+            let accounting = shell.read(cx).topic_step_inputs();
+            assert_eq!(
+                accounting
+                    .iter()
+                    .map(|(_, inputs)| inputs[0].read(cx).value().to_string())
+                    .collect::<Vec<_>>(),
+                ["Scan receipts", "Do accounting", "Create reports"]
+            );
+            window.render_frame(cx);
+            window.click("topic-outline-code", cx);
+            let outline = shell.read(cx).topic_step_inputs();
+            assert_eq!(outline.len(), 2);
+            for ((id, inputs), harness) in outline.iter().zip([first, second]) {
+                window.render_frame(cx);
+                window.click(SharedString::from(format!("topic-step-edit-{id}")), cx);
+                window.render_frame(cx);
+                window.click(
+                    SharedString::from(format!("topic-step-harness-{id}-Some({harness:?})")),
+                    cx,
+                );
+                inputs[2].update(cx, |s, cx| s.set_value("chosen-model", window, cx));
+                window.render_frame(cx);
+                window.click(SharedString::from(format!("topic-step-edit-{id}")), cx);
+            }
+            window.render_frame(cx);
+            window.click("topic-message-request", cx);
+            window.click("topic-propose", cx);
+            let commands = shell.update(cx, |s, _| s.take_client_commands());
+            let proposals = commands
+                .iter()
+                .filter_map(|command| match command {
+                    WireCommand::Topic {
+                        action: Action::Propose(proposal),
+                        ..
+                    } => Some(proposal),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [proposal] = proposals.as_slice() else {
+                panic!("one proposal, not an approval or start")
+            };
+            assert!(proposal.workspace.is_none(), "a repository is not required");
+            assert_eq!(proposal.outline[0].harness, Some(first));
+            assert_eq!(proposal.outline[1].harness, Some(second));
+            assert_eq!(proposal.outline[0].access, StepAccess::Write);
+            assert_eq!(proposal.outline[1].access, StepAccess::ReadOnly);
+            assert!(proposal
+                .outline
+                .iter()
+                .all(|step| step.model.as_deref() == Some("chosen-model")));
+            assert_eq!(proposal.message_ids, ["request"]);
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn orchestrating_without_attempts_is_normal_and_cancel_is_a_separate_action(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let (_, mut topic) = fixture::topic_workspace();
+        topic.status = formless_protocol::TopicStatus::Running;
+        topic.attempts.clear();
+        for feature in &mut topic.features {
+            feature.status = formless_protocol::TopicFeatureStatus::Pending;
+        }
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(Reply::Inventory(vec![topic])),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        shell.update(cx, |s, _| s.take_client_commands());
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-detail-name")
+            .value()
+            .unwrap()
+            .contains("Working"));
+        assert!(window.try_find("topic-recover").is_none());
+        window.click("topic-cancel", cx);
+        let commands = shell.update(cx, |s, _| s.take_client_commands());
+        let actions = commands
+            .iter()
+            .filter_map(|command| match command {
+                WireCommand::Topic { action, .. } => Some(action),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(actions.as_slice(), [Action::Cancel(id)] if id == "topic-formless"));
+    });
+}
+
+#[gpui_kit::test]
+fn topic_chat_can_answer_the_formless_model_while_attempt_chats_remain_read_only(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |s, cx| {
+            s.apply_client_update(Update::Snapshot { generation, snapshot: replies::session_snapshot("topic-chat", &serde_json::json!({ "session":{"id":"topic-chat"}, "running":false, "messages":[] })).unwrap() }, window, cx);
+            s.composer().update(cx, |input, cx| input.set_value("Use the cash accounting method", window, cx));
+        });
+        window.render_frame(cx);
+        assert_ne!(window.find("composer-primary").disabled(), Some(true));
+        assert_ne!(window.find("composer-attach").disabled(), Some(true));
+        assert!(window
+            .find("topic-workflow")
+            .value()
+            .unwrap()
+            .contains("not a fixed pipeline"));
     });
 }
 
@@ -164,14 +472,12 @@ fn topic_accept_and_cancel_emit_distinct_single_intents(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-fn claimed_but_unstarted_topic_can_recover_then_retry_without_another_move(
-    cx: &mut TestAppContext,
-) {
+fn failed_topic_can_recover_then_retry_without_another_move(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     workspace(cx, handle, &shell);
     step(cx, handle, |window, cx| {
         let (_, mut topic) = fixture::topic_workspace();
-        topic.status = formless_protocol::TopicStatus::Running;
+        topic.status = formless_protocol::TopicStatus::Failed;
         // Recovery preserves history. A later failed launch must still be
         // recoverable when those older attempts are terminal.
         for attempt in &mut topic.attempts {
@@ -199,7 +505,7 @@ fn claimed_but_unstarted_topic_can_recover_then_retry_without_another_move(
             .find("topic-detail-name")
             .value()
             .unwrap()
-            .contains("No active harness attempt"));
+            .contains("Needs attention"));
         assert!(window
             .find("topic-recovery-help")
             .value()

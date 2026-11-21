@@ -99,17 +99,20 @@ pub fn topic_workspace() -> (Vec<SessionInfo>, formless_protocol::TopicInfo) {
         session.pinned = false;
     }
     let topic = serde_json::from_value(serde_json::json!({
-        "id":"topic-formless", "name":"Formless", "repo":"/work/formless",
+        "id":"topic-formless", "name":"Formless", "parent_topic_id":null, "workspace":"/work/formless", "workspace_kind":"git",
         "base_revision":"abc123", "source_session_id":"main", "topic_session_id":"topic-chat",
-        "status":"running", "builder":"claude", "builder_model":"opus", "reviewer":"codex", "reviewer_model":null,
+        "status":"needs_user", "outline":[
+            {"title":"Implement", "instructions":"Implement the selected work item", "harness":"claude", "model":"opus", "access":"write"},
+            {"title":"Review", "instructions":"Check the outputs independently", "harness":"codex", "model":null, "access":"read_only"}
+        ],
         "created_at":"2026-11-21T00:00:00Z", "updated_at":"2026-11-21T00:00:00Z",
         "features":[
-            {"id":"feature-x","source_message_id":"message-x","source_seq":1,"request":"Add feature X", "status":"ready", "active_attempt_id":null,"ready_revision":"abc123","review_round":1,"detail":null},
-            {"id":"feature-y","source_message_id":"message-y","source_seq":2,"request":"Add feature Y", "status":"needs_user", "active_attempt_id":null,"ready_revision":null,"review_round":1,"detail":"Builder and reviewer disagree on the public API. Choose a direction."}
+            {"id":"feature-x","source_message_id":"message-x","source_seq":1,"request":"Add feature X", "status":"ready", "active_attempt_id":null,"outputs":[{"kind":"git_revision","revision":"abc123"}],"attempt_count":2,"detail":null},
+            {"id":"feature-y","source_message_id":"message-y","source_seq":2,"request":"Add feature Y", "status":"needs_user", "active_attempt_id":null,"outputs":[],"attempt_count":0,"detail":"Choose a direction for the public API."}
         ],
         "attempts":[
-            {"id":"build-x","topic_id":"topic-formless","feature_id":"feature-x","round":1,"harness":"claude","role":"build","status":"passed","revision":"abc123","conversation_session_id":"claude-chat","harness_session_id":"external-claude","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"},
-            {"id":"review-x","topic_id":"topic-formless","feature_id":"feature-x","round":1,"harness":"codex","role":"review","status":"passed","revision":"abc123","conversation_session_id":"codex-chat","harness_session_id":"external-codex","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"}
+            {"id":"build-x","topic_id":"topic-formless","feature_id":"feature-x","step_title":"Implement", "access":"write", "model":"opus", "inputs":[], "outputs":[{"kind":"git_revision","revision":"abc123"}], "summary":"Implementation complete", "harness":"claude","status":"succeeded","conversation_session_id":"claude-chat","harness_session_id":"external-claude","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"},
+            {"id":"review-x","topic_id":"topic-formless","feature_id":"feature-x","step_title":"Review", "access":"read_only", "model":null, "inputs":[{"kind":"git_revision","revision":"abc123"}], "outputs":[{"kind":"text","title":"Review findings","content":"Checks passed"}], "summary":"Checked the supplied revision", "harness":"codex","status":"succeeded","conversation_session_id":"codex-chat","harness_session_id":"external-codex","detail":null,"created_at":"2026-11-21T00:00:00Z","updated_at":"2026-11-21T00:00:00Z"}
         ]
     })).expect("topic fixture follows the shared wire contract");
     (sessions, topic)
@@ -246,6 +249,40 @@ pub fn run_forecast(
 }
 
 /// Synthetic structured question for native component/render diagnostics.
+pub fn harness_permission(session: &str) -> formless_protocol::Event {
+    use formless_protocol::{
+        Event, HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind as Kind,
+    };
+    Event::HarnessPermissionRequested {
+        permission_id: "native-permission".into(),
+        session_id: session.into(),
+        topic_id: "topic-formless".into(),
+        attempt_id: "review-x".into(),
+        harness: HarnessKind::Codex,
+        acp_agent: None,
+        title: "Create the accounting report?".into(),
+        kind: "write".into(),
+        raw_input: Some(serde_json::json!({"path":"reports/summary.csv"})),
+        options: vec![
+            HarnessPermissionOption {
+                option_id: "allow-once-id".into(),
+                name: "Allow this file write".into(),
+                kind: Kind::AllowOnce,
+            },
+            HarnessPermissionOption {
+                option_id: "allow-attempt-id".into(),
+                name: "Allow report writes".into(),
+                kind: Kind::AllowAlways,
+            },
+            HarnessPermissionOption {
+                option_id: "reject-once-id".into(),
+                name: "Reject this file write".into(),
+                kind: Kind::RejectOnce,
+            },
+        ],
+    }
+}
+
 pub fn user_question(session: &str) -> formless_protocol::Event {
     use formless_protocol::{Question, QuestionOption};
     formless_protocol::Event::UserQuestion {
