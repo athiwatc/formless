@@ -354,7 +354,7 @@ async fn main_topic_chat_suggests_two_features_and_rejection_leaves_the_original
                     .into_iter()
                     .filter(|msg| msg.role == "user")
                     .map(|msg| (msg.id, msg.seq, msg.content))
-                    .last(),
+                    .next_back(),
                 Some(original)
             );
             assert_eq!(

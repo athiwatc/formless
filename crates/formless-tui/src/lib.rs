@@ -5918,7 +5918,7 @@ impl App {
         match ev {
             // This client keeps legacy Subscribe. Correlated answer frames
             // belong only to explicit future-attempt consumers.
-            Event::TranscriptAttempt { .. } => {}
+            Event::TranscriptAttempt { .. } | Event::TopicChanged { .. } => {}
             Event::MessageAppended {
                 session_id,
                 message,

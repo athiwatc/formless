@@ -360,6 +360,43 @@ fn request_kind(req: &Request) -> String {
         .unwrap_or_else(|| "request".into())
 }
 
+fn topic_repo_snapshot(path: &std::path::Path) -> Result<(std::path::PathBuf, String)> {
+    if !path.is_absolute() {
+        bail!("topic repository path must be absolute");
+    }
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("topic repository does not exist: {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("topic repository must be a directory");
+    }
+    let git = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(args)
+            .output()
+            .context("could not start git while inspecting the topic repository")?;
+        if !output.status.success() {
+            bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    let root = std::path::PathBuf::from(git(&["rev-parse", "--show-toplevel"])?).canonicalize()?;
+    let revision = git(&["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if !matches!(revision.len(), 40 | 64) || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("git did not return a full commit SHA for the topic base");
+    }
+    if !git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+        bail!("topic repository must have a clean worktree before proposal");
+    }
+    Ok((root, revision.to_ascii_lowercase()))
+}
+
 /// Handle one request, turning a panic into an error reply (and a log
 /// line) instead of a dead connection (SPEC §9.3).
 async fn handle_safely(this: &Arc<Daemon>, req: Request) -> Result<Value> {
@@ -1794,6 +1831,36 @@ impl Daemon {
         result
     }
 
+    pub(crate) fn propose_topic_request(
+        &self,
+        proposal: &TopicProposalRequest,
+        from_main_assistant: bool,
+    ) -> Result<TopicInfo> {
+        let (repo, base_revision) = topic_repo_snapshot(&proposal.repo)?;
+        let mut normalized = proposal.clone();
+        normalized.repo = repo;
+        let (topic, created) = self.with_store(|st| {
+            if from_main_assistant {
+                if let Some(existing) = st.existing_topic_suggestion(&normalized)? {
+                    return Ok((existing, false));
+                }
+            }
+            Ok((st.propose_topic(&normalized, &base_revision)?, true))
+        })?;
+        if created {
+            self.broadcast(Event::TopicChanged {
+                topic_id: topic.id.clone(),
+            });
+        }
+        Ok(topic)
+    }
+
+    fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
+        let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
+        self.broadcast(Event::TopicChanged { topic_id: topic.id });
+        bail!("topic workflow was claimed, but harness execution is not implemented in this build; no child was launched. RecoverTopic releases the claim before retrying with a runner-enabled build")
+    }
+
     /// Handle one request as a connected client's would be (in-process
     /// callers and tests; `Subscribe` needs a connection).
     /// Keep the large protocol dispatch state on the heap. Callers (including
@@ -1809,24 +1876,6 @@ impl Daemon {
     async fn handle_inner(self: &Arc<Self>, req: Request) -> Result<serde_json::Value> {
         self.flush_routing()?;
         match req {
-            Request::GetMainChat => Ok(json!(self.with_store(Store::main_chat)?)),
-            Request::ProposeTopic { proposal } => Ok(json!(self.propose_topic_request(&proposal)?)),
-            Request::ListTopics => Ok(json!(self.with_reader(Store::list_topics)?)),
-            Request::GetTopic { topic_id } => Ok(json!(self
-                .with_reader(|st| st.get_topic(&topic_id))?
-                .context(RequestFailure::not_found("topic not found"))?)),
-            Request::RejectTopic { rejection } => Ok(json!(
-                self.with_store(|st| st.reject_topic(&rejection.topic_id))?
-            )),
-            Request::ApproveTopic { .. }
-            | Request::StartTopicWorkflow { .. }
-            | Request::ListTopicAttempts { .. }
-            | Request::GetTopicAttempt { .. }
-            | Request::RecoverTopic { .. }
-            | Request::RetryTopicFeature { .. }
-            | Request::TopicMcp { .. } => {
-                Err(RequestFailure::invalid("topic workflow is not available").into())
-            }
             Request::Ping => Ok(json!({
                 "pong": true,
                 "protocol": PROTOCOL_VERSION,
@@ -1917,6 +1966,75 @@ impl Daemon {
             }
             Request::DismissMissingModel { provider, model } => {
                 self.dismiss_missing_model(&provider, &model)
+            }
+            Request::GetMainChat => {
+                Ok(serde_json::to_value(self.with_store(|st| st.main_chat())?)?)
+            }
+            Request::ProposeTopic { proposal } => Ok(serde_json::to_value(
+                self.propose_topic_request(&proposal, false)?,
+            )?),
+            Request::ApproveTopic { approval } => {
+                let topic = self.with_store(|st| st.approve_topic(&approval.topic_id))?;
+                self.broadcast(Event::MessagesEdited {
+                    session_id: topic.source_session_id.clone(),
+                });
+                if let Some(session_id) = &topic.topic_session_id {
+                    if let Some(session) = self.with_reader(|st| st.get_session(session_id))? {
+                        self.broadcast(Event::SessionUpdated { session });
+                    }
+                }
+                self.broadcast(Event::TopicChanged {
+                    topic_id: topic.id.clone(),
+                });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::RejectTopic { rejection } => {
+                let topic =
+                    self.with_store(|st| st.reject_topic(&rejection.topic_id, &rejection.reason))?;
+                self.broadcast(Event::TopicChanged {
+                    topic_id: topic.id.clone(),
+                });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::ListTopics => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_topics())?,
+            )?),
+            Request::GetTopic { topic_id } => {
+                let topic = self
+                    .with_reader(|st| st.get_topic(&topic_id))?
+                    .context(RequestFailure::not_found("topic not found"))?;
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::ListTopicAttempts { topic_id } => Ok(serde_json::to_value(
+                self.with_reader(|st| st.list_topic_attempts(&topic_id))?,
+            )?),
+            Request::GetTopicAttempt { attempt_id } => {
+                let attempt = self
+                    .with_reader(|st| st.get_topic_attempt(&attempt_id))?
+                    .context(RequestFailure::not_found("topic attempt not found"))?;
+                Ok(serde_json::to_value(attempt)?)
+            }
+            Request::StartTopicWorkflow { topic_id } => self.start_topic_workflow(topic_id),
+            Request::RecoverTopic { recovery } => {
+                let topic = self.with_store(|st| st.recover_topic(&recovery.topic_id))?;
+                self.broadcast(Event::TopicChanged {
+                    topic_id: topic.id.clone(),
+                });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::RetryTopicFeature { retry } => {
+                let topic = self
+                    .with_store(|st| st.retry_topic_feature(&retry.topic_id, &retry.feature_id))?;
+                self.broadcast(Event::TopicChanged {
+                    topic_id: topic.id.clone(),
+                });
+                Ok(serde_json::to_value(topic)?)
+            }
+            Request::TopicMcp { request } => {
+                self.with_reader(|st| {
+                    st.authenticate_topic_attempt(&request.attempt_id, &request.capability_token)
+                })?;
+                bail!("topic MCP operations are not implemented in this build; no conversation or workflow state was changed")
             }
             Request::ListSessions => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_sessions())?,

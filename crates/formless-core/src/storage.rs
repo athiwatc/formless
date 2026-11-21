@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
-    MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
-    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
+    HarnessKind, MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
+    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo, TopicAttemptInfo, TopicFeatureInfo,
+    TopicInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -64,6 +65,13 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+
+#[path = "topic_storage.rs"]
+mod topic_storage;
+
+#[cfg(test)]
+#[path = "topic_storage_tests.rs"]
+mod topic_storage_tests;
 
 #[path = "attachment_expiry.rs"]
 mod attachment_expiry;
@@ -794,7 +802,64 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 70;
+pub const SCHEMA_VERSION: i64 = 71;
+
+const SCHEMA_V71: &str = "
+CREATE TABLE profile_metadata (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE topics (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL,
+  base_revision TEXT NOT NULL, source_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE, status TEXT NOT NULL,
+  builder_kind TEXT NOT NULL, builder_model TEXT, reviewer_kind TEXT NOT NULL,
+  reviewer_model TEXT, redirect_message_id TEXT, rejection_reason TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX idx_topics_status_updated ON topics(status, updated_at DESC);
+CREATE TABLE topic_repo_locks (
+  repo TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  acquired_at TEXT NOT NULL);
+CREATE TABLE topic_source_messages (
+  topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  source_session_id TEXT NOT NULL, message_id TEXT NOT NULL,
+  source_seq INTEGER NOT NULL, source_content TEXT NOT NULL, source_content_hash TEXT NOT NULL, moved_at TEXT,
+  PRIMARY KEY(topic_id, message_id));
+CREATE TABLE topic_features (
+  id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  source_message_id TEXT NOT NULL, source_seq INTEGER NOT NULL, request TEXT NOT NULL,
+  status TEXT NOT NULL, active_attempt_id TEXT, ready_revision TEXT,
+  review_round INTEGER NOT NULL DEFAULT 0, detail TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX idx_topic_features_status ON topic_features(topic_id, status, source_seq);
+CREATE TABLE topic_attempts (
+  id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+  feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
+  round INTEGER NOT NULL, role TEXT NOT NULL, harness_kind TEXT NOT NULL,
+  status TEXT NOT NULL, conversation_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  capability_hash TEXT NOT NULL, worktree_path TEXT, base_revision TEXT,
+  revision TEXT, test_report TEXT, harness_session_id TEXT, child_pid INTEGER,
+  detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE INDEX idx_topic_attempts_feature ON topic_attempts(feature_id, created_at);
+CREATE UNIQUE INDEX idx_topic_active_review_attempt_revision
+  ON topic_attempts(feature_id, revision)
+  WHERE role='review' AND status='reviewing' AND revision IS NOT NULL;
+CREATE TABLE topic_reviews (
+  id TEXT PRIMARY KEY, feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL REFERENCES topic_attempts(id) ON DELETE CASCADE, revision TEXT NOT NULL,
+  outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+  UNIQUE(feature_id, revision));
+CREATE INDEX idx_topic_reviews_attempt ON topic_reviews(attempt_id);
+";
+
+fn migrate_v71(c: &Connection) -> Result<()> {
+    add_column(c, "sessions", "parent_session_id TEXT")?;
+    add_column(c, "sessions", "session_kind TEXT NOT NULL DEFAULT 'chat'")?;
+    add_column(c, "sessions", "topic_id TEXT")?;
+    add_column(c, "sessions", "topic_attempt_id TEXT")?;
+    add_column(c, "sessions", "harness_kind TEXT")?;
+    c.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, session_kind);")?;
+    c.execute_batch(SCHEMA_V71)?;
+    Ok(())
+}
 
 fn unsupported_preview_schema(version: i64) -> bool {
     matches!(version, 68 | 69)
@@ -883,7 +948,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 68] = [
+const MIGRATIONS: [(i64, MigrationStep); 69] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1215,6 +1280,7 @@ const MIGRATIONS: [(i64, MigrationStep); 68] = [
         add_column(c, "queued_messages", "revision INTEGER NOT NULL DEFAULT 0")?;
         Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
     }),
+    (71, migrate_v71),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
