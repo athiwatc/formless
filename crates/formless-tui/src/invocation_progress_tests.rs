@@ -111,8 +111,8 @@ fn invocation_progress_stall_activity_pending_and_reconnect_keep_exact_identity(
         Some("b"),
         serde_json::json!({"handle":"h-b","silent_secs":30,"last_fraction":0.5,"last_label":"stuck\u{001b}[2J"}),
     );
-    let text = plain::format_event(&event, &mut false).unwrap();
-    assert!(text.contains("[b]"));
+    let text = plain::format_event(&event, &mut false, "").unwrap();
+    assert!(!text.contains("[b]"));
     assert!(text.contains("50%"));
     assert!(text.contains("stuck"));
     assert!(!text.contains('\u{1b}'));

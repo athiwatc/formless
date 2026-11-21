@@ -108,3 +108,85 @@ async fn actual_idle_watcher_scans_stalls_when_cached_idle_close_is_disabled() {
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn live_tool_progress_flushes_without_another_host_call() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_BASE_URL");
+    env.remove("FORMLESS_MODEL");
+    let root = std::env::temp_dir().join(format!("fl-progress-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    let session_id = "private-progress-session".to_owned();
+    let run_id = "private-progress-run".to_owned();
+    let ops = NestedOps {
+        _pipeline: None,
+        routing_task: None,
+        _taint_scope: daemon.taint_scope(&session_id, &run_id),
+        read_identity: None,
+        read_input: Value::Null,
+        daemon: daemon.clone(),
+        tool_name: "progress-fixture".into(),
+        kv_scope: "test:progress".into(),
+        session_id,
+        run_id,
+        parent_inv: None,
+        progress: Arc::new(Default::default()),
+        activity: None,
+        depth: 1,
+        agent_depth: 0,
+        agent_ok: false,
+        script: None,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+        cancel: CancellationToken::new(),
+        cfg,
+        handle: tokio::runtime::Handle::current(),
+        emitted: StdMutex::new(None),
+        artifact_dir: root.join("artifacts"),
+    };
+    let (tx, mut rx) = mpsc::channel(8);
+    daemon.subs.locked().push(Subscriber {
+        conn: 1,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+
+    // Seed the leading state without a wire event, then exercise the real
+    // HostOps scheduling and the daemon's subscriber path.
+    let leading = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    assert!(ops
+        .progress
+        .report(Some(0.1), "starting", leading)
+        .emit
+        .is_some());
+    ops.progress(Some(0.9), "writing");
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let event = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match event {
+        ServerMessage::Event(Event::ToolProgress {
+            invocation_id,
+            fraction,
+            label,
+            ..
+        }) => {
+            assert_eq!(invocation_id.as_deref(), Some(ops.progress.id.as_str()));
+            assert_eq!(fraction, Some(0.9));
+            assert_eq!(label, "writing");
+        }
+        other => panic!("expected the trailing ToolProgress, got {other:?}"),
+    }
+    drop(ops);
+    drop(daemon);
+    let _ = std::fs::remove_dir_all(root);
+}

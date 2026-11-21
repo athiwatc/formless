@@ -1,7 +1,7 @@
 //! Starting the daemon at login (SPEC §9.1): a launchd agent on macOS, a
 //! systemd user unit on Linux, a logon task on Windows. The service runs
-//! `formless daemon serve --stay`, which never stops for being idle, so
-//! scheduled jobs fire on time.
+//! `formless daemon serve --stay` to prevent idle exit while the user manager
+//! is running.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -235,7 +235,76 @@ pub fn dry_run(plan: &Plan) -> String {
     for command in &plan.enable {
         output.push_str(&format!("\n$ {}", command.join(" ")));
     }
+    if let Some(guidance) = systemd_lingering_guidance(plan) {
+        output.push_str("\n# ");
+        output.push_str(guidance);
+    }
     output
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum Lingering {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_lingering(root: &Path, username: &std::ffi::OsStr) -> Lingering {
+    let name = Path::new(username);
+    let mut components = name.components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Lingering::Unknown;
+    }
+    match std::fs::symlink_metadata(root.join(name)) {
+        Ok(metadata) if metadata.is_file() => Lingering::Enabled,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Lingering::Disabled,
+        _ => Lingering::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn login_name() -> Option<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut found = std::ptr::null_mut();
+    // The reentrant call stores the username in this call's scratch buffer.
+    unsafe {
+        let status = libc::getpwuid_r(
+            libc::getuid(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        );
+        if status != 0 || found.is_null() || (*found).pw_name.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*found).pw_name).to_bytes();
+        Some(std::ffi::OsString::from_vec(name.to_vec()))
+    }
+}
+
+/// Report the Linux user's linger marker using only local reads.
+pub fn systemd_lingering_guidance(plan: &Plan) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    if plan.manager == "systemd" {
+        let status = login_name().map_or(Lingering::Unknown, |name| {
+            systemd_lingering(Path::new("/var/lib/systemd/linger"), &name)
+        });
+        return Some(match status {
+            Lingering::Enabled => "Systemd user lingering is enabled, allowing startup before login and operation after logout.",
+            Lingering::Disabled => "Systemd user lingering is disabled. To keep scheduled jobs running after logout or before login, run `loginctl enable-linger \"$(id -u)\"` separately.",
+            Lingering::Unknown => "Could not confirm systemd user lingering. To keep scheduled jobs running after logout or before login, check `loginctl show-user \"$(id -u)\" -p Linger` and enable lingering if needed.",
+        });
+    }
+    let _ = plan;
+    None
 }
 
 fn run_command(c: &[String]) -> Result<(bool, String)> {
@@ -496,6 +565,29 @@ pub fn installed(paths: &Paths) -> Option<(&'static str, PathBuf)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_linger_marker_distinguishes_missing_and_enabled_users() {
+        let root = std::env::temp_dir().join(format!("formless-linger-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let user = std::ffi::OsStr::new("fixture-user");
+        assert_eq!(
+            super::systemd_lingering(&root, user),
+            super::Lingering::Disabled
+        );
+        std::fs::write(root.join(user), b"").unwrap();
+        assert_eq!(
+            super::systemd_lingering(&root, user),
+            super::Lingering::Enabled
+        );
+        assert_eq!(
+            super::systemd_lingering(&root, std::ffi::OsStr::new("../fixture-user")),
+            super::Lingering::Unknown
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     use super::*;
 
     fn fixture(data: &str, config: &str, profile: &str) -> Paths {

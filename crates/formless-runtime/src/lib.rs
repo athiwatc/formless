@@ -6,6 +6,7 @@ pub mod caps;
 mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
+pub mod process_group;
 mod processes;
 mod read_size;
 use read_size::ReadSize;
@@ -333,8 +334,57 @@ struct Stream {
     resp: reqwest::blocking::Response,
     timeouts: FetchTimeouts,
     enc: Enc,
-    /// Bytes read but not yet handed out (an incomplete UTF-8 sequence).
-    carry: Vec<u8>,
+    scratch: Vec<u8>,
+    /// Incomplete UTF-8 bytes at the beginning of scratch.
+    buffered: usize,
+    terminal_error: Option<String>,
+}
+
+impl Stream {
+    fn read_chunk(&mut self, size: usize) -> Result<(Value, bool), String> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        self.scratch.resize(size, 0);
+        let mut used = self.buffered;
+        loop {
+            let eof = match self.resp.read(&mut self.scratch[used..]) {
+                Ok(0) => true,
+                Ok(count) => {
+                    used += count;
+                    false
+                }
+                Err(error) => {
+                    let error = fetch_error(&error, self.timeouts, "reading response body");
+                    self.terminal_error = Some(error.clone());
+                    if used == 0 {
+                        return Err(error);
+                    }
+                    // Deliver the incomplete text using the same lossy policy
+                    // as EOF. The next read still reports the terminal error.
+                    self.buffered = 0;
+                    return Ok((encode(&self.scratch[..used], self.enc), false));
+                }
+            };
+            let mut cut = used;
+            if self.enc == Enc::Text && !eof {
+                let possible = utf8_cut(&self.scratch[..used]);
+                if std::str::from_utf8(&self.scratch[possible..used])
+                    .is_err_and(|error| error.error_len().is_none())
+                {
+                    cut = possible;
+                }
+            }
+            if cut != 0 || eof {
+                let data = encode(&self.scratch[..cut], self.enc);
+                self.scratch.copy_within(cut..used, 0);
+                self.buffered = used - cut;
+                return Ok((data, eof));
+            }
+            // Read again only when none of the bytes can yet be delivered.
+            // A valid UTF-8 carry is at most three bytes and size is at least four.
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1240,13 +1290,8 @@ const PROCESS_BASE_ENV: &[&str] = &[
 /// A `process:` grant's command and, for `process:git:status|log`, the
 /// first arguments it allows (None = any).
 pub fn process_grant(grant: &str) -> (&str, Option<Vec<&str>>) {
-    match grant.rsplit_once(':') {
-        // `C:\…` is a Windows path, not a command with sub-commands.
-        Some((cmd, subs)) if cmd.len() > 1 && !subs.is_empty() && !subs.contains(['/', '\\']) => {
-            (cmd, Some(subs.split('|').collect()))
-        }
-        _ => (grant, None),
-    }
+    let (cmd, scope) = formless_protocol::split_process_grant(grant);
+    (cmd, scope.map(|scope| scope.split('|').collect()))
 }
 
 fn process_allowed(allowed: &[String], cmd: &str, first_arg: Option<&str>) -> bool {
@@ -1632,11 +1677,11 @@ impl State {
             "fs_read" => {
                 let enc = enc_of(&a["encoding"])?;
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
-                        return Ok(encode(&bytes, enc));
-                    }
+                match self.overlay_read(&p, |bytes| {
+                    check_read_size(ReadSize::Exact(bytes.len() as u64))?;
+                    Ok(encode(bytes, enc))
+                }) {
+                    Some(Some(encoded)) => return encoded,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {}
                 }
@@ -1659,7 +1704,7 @@ impl State {
                     // Capability must still be declared; the write lands in
                     // the overlay (readable this run, never on disk) (§8.4).
                     let mut full = if append {
-                        match self.overlay_get(&p) {
+                        match self.overlay_read(&p, <[u8]>::to_vec) {
                             Some(prev) => prev.unwrap_or_default(),
                             None if p.exists() => read_capped(&p)?,
                             None => Vec::new(),
@@ -1699,16 +1744,16 @@ impl State {
             }
             "fs_exists" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                Ok(json!(match self.overlay_get(&p) {
+                Ok(json!(match self.overlay_read(&p, |_| ()) {
                     Some(v) => v.is_some(),
                     None => p.exists(),
                 }))
             }
             "fs_stat" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
-                match self.overlay_get(&p) {
-                    Some(Some(b)) => {
-                        return Ok(json!({"type": "file", "size": b.len(), "modified_ms": null}))
+                match self.overlay_read(&p, <[u8]>::len) {
+                    Some(Some(size)) => {
+                        return Ok(json!({"type": "file", "size": size, "modified_ms": null}))
                     }
                     Some(None) => return Ok(Value::Null),
                     None => {}
@@ -1792,7 +1837,7 @@ impl State {
                 }
 
                 if self.mode.is_overlay() {
-                    let bytes = match self.overlay_get(&from) {
+                    let bytes = match self.overlay_read(&from, <[u8]>::to_vec) {
                         Some(Some(b)) => b,
                         Some(None) => return Err(format!("not found: {}", from.display())),
                         None if from.is_dir() => {
@@ -1823,12 +1868,13 @@ impl State {
                 let offset = a["offset"].as_u64().unwrap_or(0);
                 let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
                 self.guard_read(a["path"].as_str().unwrap_or_default(), &p, "file chunk")?;
-                let (buf, total) = match self.overlay_get(&p) {
-                    Some(Some(bytes)) => {
-                        let start = (offset as usize).min(bytes.len());
-                        let end = (start + size).min(bytes.len());
-                        (bytes[start..end].to_vec(), bytes.len() as u64)
-                    }
+                let overlay_chunk = self.overlay_read(&p, |bytes| {
+                    let start = offset.min(bytes.len() as u64) as usize;
+                    let end = (start + size).min(bytes.len());
+                    (bytes[start..end].to_vec(), bytes.len() as u64)
+                });
+                let (buf, total) = match overlay_chunk {
+                    Some(Some(chunk)) => chunk,
                     Some(None) => return Err(format!("not found: {}", p.display())),
                     None => {
                         let mut f =
@@ -1856,18 +1902,20 @@ impl State {
         }
     }
 
-    /// Overlay entry for `p`: `Some(None)` if it or an ancestor was removed.
-    fn overlay_get(&self, p: &Path) -> Option<Option<Vec<u8>>> {
+    /// Inspect an exact overlay entry while holding the lock. A removed entry
+    /// or ancestor returns `Some(None)`. The callback only reads the borrowed
+    /// bytes and must perform no filesystem access or reacquire the overlay.
+    fn overlay_read<T>(&self, path: &Path, inspect: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
         if !self.mode.is_overlay() {
             return None;
         }
-        let g = self.overlay.lock().ok()?;
-        if let Some(v) = g.get(&p.to_string_lossy().to_string()) {
-            return Some(v.clone());
+        let overlay = self.overlay.lock().ok()?;
+        if let Some(entry) = overlay.get(path.to_string_lossy().as_ref()) {
+            return Some(entry.as_deref().map(inspect));
         }
-        p.ancestors()
+        path.ancestors()
             .skip(1)
-            .any(|a| matches!(g.get(&a.to_string_lossy().to_string()), Some(None)))
+            .any(|ancestor| matches!(overlay.get(ancestor.to_string_lossy().as_ref()), Some(None)))
             .then_some(None)
     }
 
@@ -1881,7 +1929,7 @@ impl State {
         let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
         let details = a["details"].as_bool().unwrap_or(false);
         let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
-        if self.overlay_get(&p) != Some(None) {
+        if self.overlay_read(&p, |_| ()) != Some(None) {
             if let Some(rd) =
                 listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
             {
@@ -2214,7 +2262,9 @@ impl State {
                 resp,
                 timeouts,
                 enc,
-                carry: Vec::new(),
+                scratch: Vec::new(),
+                buffered: 0,
+                terminal_error: None,
             },
         );
         meta["id"] = json!(id);
@@ -2230,40 +2280,16 @@ impl State {
             // Smoke stub (id 0) or an already-closed stream: empty body.
             return Ok(json!({"data": "", "eof": true}));
         };
-        let (mut s, read) = self.cancellable(move || {
-            let mut buf = std::mem::take(&mut s.carry);
-            let mut eof = false;
-            while buf.len() < size {
-                let mut chunk = vec![0u8; size - buf.len()];
-                let n = match s.resp.read(&mut chunk) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let error = fetch_error(&e, s.timeouts, "reading response body");
-                        return Ok((s, Err(error)));
-                    }
-                };
-                if n == 0 {
-                    eof = true;
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Ok((s, Ok((buf, eof))))
+        let (s, read) = self.cancellable(move || {
+            let read = s.read_chunk(size);
+            Ok((s, read))
         })?;
-        let (mut buf, eof) = match read {
-            Ok(r) => r,
-            Err(e) => {
-                self.streams.locked().insert(id, s);
-                return Err(e);
-            }
-        };
-        if s.enc == Enc::Text && !eof {
-            let cut = utf8_cut(&buf).max(1);
-            s.carry = buf.split_off(cut);
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err("interrupted".into());
         }
-        let out = json!({"data": encode(&buf, s.enc), "eof": eof && s.carry.is_empty()});
         self.streams.locked().insert(id, s);
-        Ok(out)
+        let (data, eof) = read?;
+        Ok(json!({"data": data, "eof": eof}))
     }
 
     fn process_start(&self, a: &Value) -> Result<Option<processes::Process>, String> {
@@ -2848,51 +2874,133 @@ fn run_capture_impl(
     stdin_text: Option<&str>,
     detailed: bool,
 ) -> Result<String, String> {
-    use std::io::Write;
-    // All stdin-bearing callers are clipboard writes. Protect their errors
-    // on every platform, including the legacy non-detailed helper path.
-    let protected_diagnostics = detailed || stdin_text.is_some();
-    let mut child = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if protected_diagnostics {
-                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
-            } else {
-                format!("{cmd}: {e}")
-            }
-        })?;
-    if let Some(text) = stdin_text {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-    }
-    let out = child.wait_with_output().map_err(|e| {
-        if protected_diagnostics {
-            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
-        } else {
-            e.to_string()
-        }
-    })?;
-    if !out.status.success() {
-        if protected_diagnostics {
-            return Err(clipboard_diagnostics::failure(
-                cmd,
-                &format!("exited unsuccessfully ({})", out.status),
-                &String::from_utf8_lossy(&out.stderr),
-                stdin_text,
-            ));
-        }
-        return Err(format!(
-            "{cmd} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    run_capture_until(
+        cmd,
+        args,
+        stdin_text,
+        detailed,
+        std::time::Duration::from_secs(2),
+    )
 }
+
+fn run_capture_until(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // and avoid retaining pipes from the background clipboard owner.
+    let protected_diagnostics = detailed || stdin_text.is_some();
+    let write = stdin_text.is_some();
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if write {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let program = cmd.to_owned();
+    let input = stdin_text.map(|text| text.as_bytes().to_vec());
+    std::thread::Builder::new()
+        .name("formless-system-helper".into())
+        .spawn(move || {
+            let failure = |kind: &str, detail: &str| {
+                if protected_diagnostics {
+                    clipboard_diagnostics::failure(&program, kind, detail, write.then_some(""))
+                } else {
+                    format!("{program}: {kind}: {detail}")
+                }
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| failure("could not start helper runtime", &error.to_string()))?;
+            runtime.block_on(async {
+                let mut child = tokio::process::Command::from(command)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| failure("could not spawn", &error.to_string()))?;
+                let stdin = child.stdin.take();
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+                let send = async {
+                    match (stdin, input) {
+                        (Some(mut pipe), Some(input)) => pipe.write_all(&input).await,
+                        _ => Ok(()),
+                    }
+                };
+                async fn read(
+                    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+                ) -> std::io::Result<Vec<u8>> {
+                    let mut bytes = Vec::new();
+                    if let Some(mut pipe) = pipe {
+                        pipe.read_to_end(&mut bytes).await?;
+                    }
+                    Ok(bytes)
+                }
+                let result = tokio::time::timeout(timeout, async {
+                    let (sent, stdout, stderr) = tokio::join!(send, read(stdout), read(stderr));
+                    let status = child.wait().await?;
+                    Ok::<_, std::io::Error>((status, sent, stdout?, stderr?))
+                })
+                .await;
+                let (status, sent, stdout, stderr) = match result {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(error)) => return Err(failure("could not wait", &error.to_string())),
+                    Err(_) => {
+                        #[cfg(unix)]
+                        if let Some(pid) = child.id() {
+                            // The leader is still owned until wait succeeds.
+                            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                        }
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            child.kill(),
+                        )
+                        .await;
+                        return Err(format!("{program}: timed out"));
+                    }
+                };
+                if !status.success() {
+                    let detail = String::from_utf8_lossy(&stderr);
+                    return if protected_diagnostics {
+                        Err(failure(
+                            &format!("exited unsuccessfully ({status})"),
+                            &detail,
+                        ))
+                    } else {
+                        Err(format!("{program} failed: {}", detail.trim()))
+                    };
+                }
+                sent.map_err(|error| failure("could not write stdin", &error.to_string()))?;
+                Ok(String::from_utf8_lossy(&stdout).into_owned())
+            })
+        })
+        .map_err(|error| format!("{cmd}: could not start helper worker: {error}"))?
+        .join()
+        .map_err(|_| format!("{cmd}: helper worker failed"))?
+}
+
+#[cfg(windows)]
+const POWERSHELL_CLIPBOARD_WRITE: &str =
+    "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
+     Set-Clipboard -Value ([Console]::In.ReadToEnd()) -ErrorAction Stop";
 
 fn clipboard_read() -> Result<String, String> {
     #[cfg(target_os = "macos")]
@@ -2927,7 +3035,12 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     {
         run_capture(
             "powershell",
-            &["-NoProfile", "-Command", "Set-Clipboard -Value $input"],
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                POWERSHELL_CLIPBOARD_WRITE,
+            ],
             Some(text),
         )
         .map(|_| ())
@@ -3316,6 +3429,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     // including on early error paths, as required by rquickjs::Persistent.
     #[derive(Clone)]
     struct Rejection {
+        sequence: u64,
         message: String,
         reason: rquickjs::Persistent<rquickjs::Value<'static>>,
     }
@@ -3331,24 +3445,47 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let unhandled: Rejections = Default::default();
     let _clear_rejections = ClearRejections(unhandled.clone());
     let rejected = unhandled.clone();
+    let next_sequence = std::cell::Cell::new(0);
     runtime.set_host_promise_rejection_tracker(Some(Box::new(
         move |ctx, promise, reason, handled| {
             let promise = rquickjs::Persistent::save(&ctx, promise);
             if handled {
                 rejected.borrow_mut().remove(&promise);
             } else {
+                let sequence = {
+                    let mut rejected = rejected.borrow_mut();
+                    let entry = rejected.entry(promise.clone());
+                    // Re-observing a still-tracked Promise retains its place.
+                    // If handled and later reinserted, it gets a new sequence.
+                    let sequence = match &entry {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.get().sequence,
+                        std::collections::hash_map::Entry::Vacant(_) => {
+                            let sequence = next_sequence.get();
+                            next_sequence.set(sequence + 1);
+                            sequence
+                        }
+                    };
+                    entry.insert_entry(Rejection {
+                        sequence,
+                        message: String::new(),
+                        reason: rquickjs::Persistent::save(&ctx, reason.clone()),
+                    });
+                    sequence
+                };
+                // Reading an Error message can call JS. The observation is
+                // already ordered, and any handling during the read is final.
                 let message = reason
                     .as_exception()
                     .and_then(|e| e.message())
                     .or_else(|| reason.as_string().and_then(|s| s.to_string().ok()))
                     .unwrap_or_else(|| format!("{reason:?}"));
-                rejected.borrow_mut().insert(
-                    promise,
-                    Rejection {
-                        message,
-                        reason: rquickjs::Persistent::save(&ctx, reason),
-                    },
-                );
+                if let Some(entry) = rejected
+                    .borrow_mut()
+                    .get_mut(&promise)
+                    .filter(|entry| entry.sequence == sequence)
+                {
+                    entry.message = message;
+                }
             }
         },
     )));
@@ -3461,8 +3598,14 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
              tools.call returns a Promise, await every call"
         )));
     }
-    let rejection = unhandled.borrow().values().next().cloned();
-    if let Some(rejection) = rejection {
+    let rejection = {
+        let unhandled = unhandled.borrow();
+        unhandled
+            .values()
+            .min_by_key(|rejection| rejection.sequence)
+            .map(|first| (first.clone(), unhandled.len() - 1))
+    };
+    if let Some((rejection, extras)) = rejection {
         let mut message = format!("unhandled Promise rejection: {}", rejection.message);
         let nested = ctx.with(|ctx| {
             let reason = rejection.reason.clone().restore(&ctx).ok()?;
@@ -3476,6 +3619,19 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             nested_error(&ctx, reason)
         });
         let mut error = err(&message);
+        if extras > 0 && error.kind != ExecErrorKind::Cancelled {
+            if !error.message.ends_with('\n') {
+                error.message.push('\n');
+            }
+            let noun = if extras == 1 {
+                "rejection"
+            } else {
+                "rejections"
+            };
+            error
+                .message
+                .push_str(&format!("and {extras} more unhandled {noun}"));
+        }
         error.nested = nested;
         return Err(error);
     }
@@ -3979,6 +4135,10 @@ mod tests {
         assert_eq!(
             process_grant("C:\\tools\\x.exe"),
             ("C:\\tools\\x.exe", None)
+        );
+        assert_eq!(
+            process_grant("C:/Program Files/git.exe:status|log"),
+            ("C:/Program Files/git.exe", Some(vec!["status", "log"]))
         );
         let allowed = vec!["git:status|log".to_string()];
         assert!(process_allowed(&allowed, "git", Some("log")));
@@ -4734,6 +4894,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "aa").unwrap();
         std::fs::write(root.join("b.txt"), "bbb").unwrap();
         std::fs::create_dir(root.join("目录")).unwrap();
+        std::fs::write(root.join("目录/disk.txt"), "hidden on disk").unwrap();
         let request = |code: &str, mode| {
             let mut req = live(code);
             req.mode = mode;
@@ -4774,6 +4935,38 @@ mod tests {
                 out,
                 json!({"before":[],"after":["made"],"details":[{"name":"made","type":"file","size":3}]})
             );
+            let content = "fixture ไทย 日本語\n".repeat(9000);
+            let mut stream = request(
+                r#"function run(i) {
+                    const dir = i.root + '/目录';
+                    fs.remove(dir, {recursive:true});
+                    const hidden = dir + '/disk.txt';
+                    const path = dir + '/overlay.txt';
+                    fs.write(path, i.content);
+                    const chunks = [];
+                    fs.readChunks(path, 65536, chunk => chunks.push(chunk));
+                    return {
+                        content: chunks.join(''), chunks: chunks.length,
+                        exists: fs.exists(path), stat: fs.stat(path),
+                        hidden: fs.exists(hidden), hiddenStat: fs.stat(hidden),
+                        diskFallback: fs.read(i.root + '/b.txt'),
+                    };
+                }"#,
+                mode,
+            );
+            stream.input["content"] = json!(content);
+            let result = execute(&stream, Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(result["content"], content);
+            assert!(result["chunks"].as_u64().unwrap() > 1);
+            assert_eq!(result["exists"], true);
+            assert_eq!(
+                result["stat"],
+                json!({"type":"file","size":content.len(),"modified_ms":null})
+            );
+            assert_eq!(result["hidden"], false);
+            assert_eq!(result["hiddenStat"], Value::Null);
+            assert_eq!(result["diskFallback"], "bbb");
+            assert!(!root.join("目录/overlay.txt").exists());
         }
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "aa");
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb");
@@ -4901,6 +5094,124 @@ mod tests {
             assert!(e.message.contains("unhandled Promise rejection:"), "{}", e.message);
             assert!(e.message.contains(message), "{}", e.message);
         }
+    }
+
+    #[test]
+    fn unhandled_rejections_follow_observation_order_and_count_only_extras() {
+        for (handle_first, expected, extra_count) in
+            [(false, "first observed", 2), (true, "second observed", 1)]
+        {
+            let mut req = live(
+                "function first() { return new Error('first observed'); }
+                 function second() { return new Error('second observed'); }
+                 function run(input) {
+                   const pending = Promise.reject(first());
+                   Promise.reject(second());
+                   Promise.reject(new Error('third observed'));
+                   if (input.handle_first) pending.catch(() => {});
+                   return 1;
+                 }",
+            );
+            req.input = json!({"handle_first": handle_first});
+            let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .starts_with(&format!("unhandled Promise rejection: {expected}\n")),
+                "{}",
+                error.message
+            );
+            let frame = if handle_first { "second" } else { "first" };
+            assert!(error
+                .message
+                .contains(&format!("{frame} (formless-tool.js:")));
+            for other in ["first observed", "second observed", "third observed"] {
+                if other != expected {
+                    assert!(!error.message.contains(other), "{}", error.message);
+                }
+            }
+            assert_eq!(
+                error.message.lines().last().unwrap(),
+                format!(
+                    "and {extra_count} more unhandled rejection{}",
+                    if extra_count == 1 { "" } else { "s" }
+                )
+            );
+            assert!(error.nested.is_none());
+        }
+    }
+
+    #[test]
+    fn rejection_order_is_recorded_before_reading_the_message() {
+        let req = live(
+            "function run() {
+               const first = new Error();
+               Object.defineProperty(first, 'message', { get() {
+                 Promise.reject('observed while reading');
+                 return 'observed first';
+               } });
+               Promise.reject(first);
+               return 1;
+             }",
+        );
+        let error = execute(&req, Arc::new(NoHostOps)).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("unhandled Promise rejection: observed first\n"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("observed while reading"));
+    }
+
+    #[test]
+    fn selected_rejection_keeps_its_nested_detail_and_pending_calls_take_precedence() {
+        let nested = live(
+            "async function run() {
+               try { await tools.call('bad', {}); }
+               catch (error) {
+                 Promise.reject(error);
+                 Promise.reject(new Error('other rejection'));
+               }
+               return 1;
+             }",
+        );
+        let error = execute(&nested, Arc::new(SlowOps)).unwrap_err();
+        let detail = error.nested.as_ref().unwrap();
+        assert_eq!((&*detail.tool, &*detail.detail), ("bad", "bad tool"));
+        assert!(error
+            .message
+            .starts_with("unhandled Promise rejection: bad tool\n"));
+        assert!(error.message.contains("run (formless-tool.js:2:"));
+        assert!(error.message.ends_with("and 1 more unhandled rejection"));
+        assert!(!error.message.contains("other rejection"));
+
+        let pending = live(
+            "function run() {
+               Promise.reject(new Error('first'));
+               Promise.reject(new Error('second'));
+               tools.call('t', {});
+               return 1;
+             }",
+        );
+        let error = execute(&pending, Arc::new(SlowOps)).unwrap_err();
+        assert!(
+            error.message.contains("await every call"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains("unhandled Promise rejection"));
+        assert!(error.nested.is_none());
+
+        let single = live("function run() { Promise.reject('single'); return 1; }");
+        let error = execute(&single, Arc::new(NoHostOps)).unwrap_err();
+        assert_eq!(error.message, "unhandled Promise rejection: single");
+
+        let early = live("Promise.reject('early floating'); throw new Error('early stop');");
+        let error = execute(&early, Arc::new(NoHostOps)).unwrap_err();
+        assert!(!error.message.contains("unhandled Promise rejection"));
     }
 
     #[test]
