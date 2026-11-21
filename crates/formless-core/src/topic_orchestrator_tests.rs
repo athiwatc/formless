@@ -302,7 +302,7 @@ impl Daemon {
             if !self
                 .topic_steps
                 .locked()
-                .contains_key(&(saved.topic_id.clone(), saved.feature_id.clone()))
+                .contains_key(&(saved.topic_id.clone(), saved.id.clone()))
             {
                 return Ok(serde_json::to_value(saved)?);
             }
@@ -879,6 +879,88 @@ async fn topic_reported_result_cannot_complete_feature_before_exit_and_validatio
         f.daemon().request_shutdown();
         ipc.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn topic_wait_returns_old_attempt_while_newer_attempt_of_same_feature_runs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "release");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let first = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let first = first["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{first}.ready")).exists()).await;
+    std::fs::write(f.root.join(format!("{first}.go")), "").unwrap();
+    wait_until(|| f.daemon().topic_steps.locked().is_empty()).await;
+    let second = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Codex,
+                StepAccess::ReadOnly,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let second = second["attempt_id"].as_str().unwrap();
+    wait_until(|| f.root.join(format!("{second}.ready")).exists()).await;
+    assert!(f
+        .daemon()
+        .topic_steps
+        .locked()
+        .contains_key(&(topic.id.clone(), second.into())));
+    let done = f
+        .daemon()
+        .wait_topic_steps(
+            &session,
+            &json!({"attempt_ids":[first],"timeout_secs":1}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done["event"], "completed");
+    assert_eq!(done["attempt_id"], first);
+    assert_eq!(done["status"], "succeeded");
+    assert_eq!(
+        state(&f, &topic.id)
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == second)
+            .unwrap()
+            .status,
+        TopicAttemptStatus::Running
+    );
+    std::fs::write(f.root.join(format!("{second}.go")), "").unwrap();
+    assert_eq!(
+        f.daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[second]}), &cancel)
+            .await
+            .unwrap()["attempt_id"],
+        second
+    );
 }
 fn repository(f: &Fixture) -> PathBuf {
     let repo = f.root.join("repo");
