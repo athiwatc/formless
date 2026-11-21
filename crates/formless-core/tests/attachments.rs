@@ -385,6 +385,16 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             "{name}"
         );
     }
+    let home_leaf = format!("fl-mention-{}.txt", uuid::Uuid::new_v4().simple());
+    let native_home = directories::BaseDirs::new().unwrap();
+    let home_file = native_home.home_dir().join(&home_leaf);
+    std::fs::write(&home_file, "home fixture").unwrap();
+    let mention = format!("~{}{home_leaf}", std::path::MAIN_SEPARATOR);
+    let home_result = attach(&mention).await;
+    std::fs::remove_file(home_file).unwrap();
+    let home_attachment = home_result.unwrap();
+    assert_eq!(home_attachment["name"], home_leaf);
+    assert_eq!(home_attachment["reference"], false);
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }

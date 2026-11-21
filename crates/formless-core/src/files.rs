@@ -253,9 +253,37 @@ pub use file_mentions::{
     MentionInsertion,
 };
 
+/// The suffix of a path that explicitly names the native home directory.
+pub fn home_path_suffix(path: &str) -> Option<&str> {
+    if path == "~" {
+        return Some("");
+    }
+    #[cfg(windows)]
+    if let Some(suffix) = path.strip_prefix("~\\") {
+        return Some(suffix);
+    }
+    path.strip_prefix("~/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_path_prefixes_follow_native_path_separators() {
+        assert_eq!(home_path_suffix("~"), Some(""));
+        assert_eq!(
+            home_path_suffix("~/Documents/notes.txt"),
+            Some("Documents/notes.txt")
+        );
+        assert_eq!(home_path_suffix("~other/file"), None);
+        let windows_path = r"~\Documents\notes.txt";
+        assert_eq!(mentions(&format!("@{windows_path}")), [windows_path]);
+        assert_eq!(
+            home_path_suffix(windows_path),
+            cfg!(windows).then_some(r"Documents\notes.txt")
+        );
+    }
 
     fn tree() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("fl-files-{}", uuid::Uuid::new_v4().simple()));
