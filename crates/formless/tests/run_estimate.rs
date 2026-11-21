@@ -72,6 +72,46 @@ fn output(mut command: Command) -> std::process::Output {
     }
     child.wait_with_output().unwrap()
 }
+
+#[test]
+fn estimate_continuation_explains_missing_empty_and_deleted_last_sessions() {
+    let fixture = Fixture(std::env::temp_dir().join(format!("fl-estimate-continue-{}", unique())));
+    let paths = formless_core::Paths::from_dirs(fixture.0.join("d"), fixture.0.join("c")).unwrap();
+    let check = |flags: &[&str], message: &str| {
+        let mut invocation = command(&paths);
+        invocation
+            .args(["run", "--estimate"])
+            .args(flags)
+            .arg("fixture task");
+        let result = output(invocation);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(message),
+            "{result:?}"
+        );
+        assert!(!formless_core::daemon::daemon_reachable(&paths));
+    };
+    let missing = "no earlier `formless run` Session to continue; run once without --continue";
+    check(&["--continue"], missing);
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::write(paths.last_run_session_file(), " \n").unwrap();
+    check(&["--session", "last"], missing);
+
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let session = store.create_session(None).unwrap();
+    store.delete_session(&session.id).unwrap();
+    drop(store);
+    std::fs::write(paths.last_run_session_file(), &session.id).unwrap();
+    check(
+        &["--continue"],
+        &format!(
+            "the last `formless run` Session ({}) no longer exists; run once without --continue",
+            session.id
+        ),
+    );
+}
+
 #[test]
 fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
     let root = Fixture(std::env::temp_dir().join(format!("fl-estimate-cli-{}", unique())));
