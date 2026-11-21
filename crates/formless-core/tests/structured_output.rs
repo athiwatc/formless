@@ -504,7 +504,15 @@ async fn paid_invalid_json_schema_refusal_and_cutoff_keep_one_physical_charge() 
                         line: 1,
                         column: 1,
                     },
-                    "schema" => StructuredOutputError::SchemaViolation,
+                    "schema" => {
+                        let error = error.downcast_ref::<StructuredOutputError>().unwrap();
+                        assert!(matches!(
+                            error,
+                            StructuredOutputError::SchemaViolation { summary: Some(_) }
+                        ));
+                        assert!(error.to_string().contains("type at $/[property]"));
+                        error.clone()
+                    }
                     "refusal" => StructuredOutputError::RefusedResponse,
                     _ => StructuredOutputError::IncompleteResponse(if stream {
                         IncompleteReason::Truncated
