@@ -7083,6 +7083,11 @@ operations. RequestPermission only raises a user request; it cannot decide one.
 An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
 
+The Pi adapter's availability probe accepts `FORMLESS_TOPIC_PI_EXE` as an
+executable override before searching PATH for `pi`. It only runs `--version`;
+sign-in remains unknown because Pi has no read-only, any-provider CLI auth
+probe. It does not write Pi configuration or isolate the user's agent directory.
+
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
 directory is the real boundary. Pi ReadOnly is tool-restricted (`--tools`

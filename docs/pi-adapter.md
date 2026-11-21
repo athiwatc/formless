@@ -25,6 +25,38 @@ Pi 1.6.0 RPC does not expose its internal `expandPromptTemplates:false` option: 
 
 For `StepAccess::ReadOnly`, Pi's built-in tool allowlist is limited to `read`, `grep`, `find`, and `ls`, plus the per-attempt MCP server. `StepAccess::Write` uses normal tool selection. These access levels replace the former Review and Build roles, respectively. This is a tool allowlist, not an OS sandbox: Pi and its extension still run with the host process's permissions, and the MCP capability token remains the server-side authority boundary.
 
+## Availability
+
+Core can call `local_harness::pi::availability(executable.as_deref()).await` and
+return its `formless_protocol::HarnessAvailability`. An explicit executable takes
+precedence over `FORMLESS_TOPIC_PI_EXE`, then `pi` on PATH. A configured override
+that cannot be found does not fall back to another Pi. `installed` reflects
+executable lookup, independently of whether the version probe succeeds. The
+probe runs only `--version`, with null stdin/stderr, a three-second timeout and
+at most 129 bytes of stdout; only a version number is retained. Failures produce
+static diagnostics, not subprocess output or configuration values.
+
+`signed_in` is deliberately `None`, with an explanatory detail. Pi 1.6.0 has an
+official `auth check --provider <provider> --json --no-refresh` command, using
+read-only auth storage and an in-memory model store, but it requires a specific
+provider or model. This adapter's global availability API has neither. There is
+no equivalent CLI operation to enumerate all configured providers read-only.
+`--list-models --offline` still initializes a full runtime: a live probe with an
+empty smoke-only agent directory created `auth.json` and `models-store.json`.
+It is therefore unsuitable for a probe that must change nothing. Reading
+`auth.json` alone would miss environment credentials, custom provider config,
+secret-manager commands and ambient cloud authentication; absence of that file
+does not mean signed out. The probe does not read credentials, refresh OAuth,
+run credential commands, or change the user's agent directory/configuration.
+
+The merged core currently defines `HarnessAvailability` and `ListHarnesses` but
+still rejects `ListHarnesses` as unimplemented; calling this adapter probe from
+that endpoint remains core-owned.
+
+References: [configuration](https://docs.pi.dev/latest/configuration),
+[providers](https://docs.pi.dev/latest/providers), and
+[CLI authentication commands](https://docs.pi.dev/latest/cli#authentication-commands).
+
 ## Questions, updates and shutdown
 
 `extension_ui_request` dialogs map to `InteractionHandler::ask_question`:

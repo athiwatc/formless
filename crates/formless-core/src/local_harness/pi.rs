@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use formless_protocol::{Question, QuestionAnswer};
+use formless_protocol::{HarnessAvailability, HarnessKind, Question, QuestionAnswer};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -29,6 +29,141 @@ const BRIDGE_CUSTOM_TYPE: &str = "formless-pi-bridge";
 const BRIDGE_MESSAGE: &str = "formless-pi-mcp-registered";
 const EXTENSION_NAME: &str = "formless-pi-extension.ts";
 const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
+const SIGN_IN_UNKNOWN: &str = "Sign-in unknown: Pi's read-only auth check requires a provider or model; there is no read-only CLI check for any provider. --list-models initializes writable state; auth.json alone omits environment, custom and ambient credentials.";
+
+pub async fn availability(executable: Option<&Path>) -> HarnessAvailability {
+    let override_executable = std::env::var_os("FORMLESS_TOPIC_PI_EXE");
+    let search_path = std::env::var_os("PATH");
+    availability_with_path(
+        executable,
+        override_executable.as_deref(),
+        search_path.as_deref(),
+    )
+    .await
+}
+
+async fn availability_with_path(
+    executable: Option<&Path>,
+    override_executable: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+) -> HarnessAvailability {
+    let program = executable
+        .or_else(|| override_executable.map(Path::new))
+        .unwrap_or_else(|| Path::new("pi"));
+    let resolved = find_pi_executable(program, search_path);
+    let mut availability = HarnessAvailability {
+        kind: HarnessKind::Pi,
+        acp_agent: None,
+        installed: resolved.is_some(),
+        signed_in: None,
+        version: None,
+        detail: Some(SIGN_IN_UNKNOWN.into()),
+    };
+    let version = match resolved {
+        Some(program) => probe_version(&program).await,
+        None => Err("Pi executable was not found or is not executable"),
+    };
+    match version {
+        Ok(version) => availability.version = Some(version),
+        Err(detail) => availability.detail = Some(format!("{detail}. {SIGN_IN_UNKNOWN}")),
+    }
+    availability
+}
+
+fn find_pi_executable(program: &Path, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    fn candidate(path: &Path) -> Option<PathBuf> {
+        if !path.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            if unsafe {
+                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
+            } != 0
+            {
+                return None;
+            }
+        }
+        fs::canonicalize(path).ok()
+    }
+
+    if program.as_os_str().is_empty() {
+        return None;
+    }
+    if program.is_absolute() || program.components().count() > 1 {
+        return candidate(program);
+    }
+    for directory in std::env::split_paths(search_path?) {
+        let path = directory.join(program);
+        #[cfg(windows)]
+        if path.extension().is_none() {
+            if let Some(path) = candidate(&path.with_extension("exe")) {
+                return Some(path);
+            }
+        }
+        if let Some(path) = candidate(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn probe_version(executable: &Path) -> std::result::Result<String, &'static str> {
+    let mut child = tokio::process::Command::new(executable)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "Pi version probe could not start")?;
+    let stdout = child.stdout.take().expect("piped Pi version stdout");
+    let result = timeout(Duration::from_secs(3), async {
+        let mut bytes = Vec::new();
+        stdout
+            .take(129)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "Pi version output could not be read")?;
+        if bytes.len() > 128 {
+            return Err("Pi version output exceeded its limit");
+        }
+        if !child
+            .wait()
+            .await
+            .map_err(|_| "Pi version probe could not be reaped")?
+            .success()
+        {
+            return Err("Pi version probe exited unsuccessfully");
+        }
+        let version = std::str::from_utf8(&bytes)
+            .ok()
+            .map(str::trim)
+            .filter(|value| {
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+            })
+            .filter(|value| {
+                let core = value.split(['-', '+']).next().unwrap_or_default();
+                let components: Vec<_> = core.split('.').collect();
+                components.len() == 3
+                    && components.iter().all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .ok_or("Pi version output was not a version number")?;
+        Ok(version.to_owned())
+    })
+    .await
+    .unwrap_or(Err("Pi version probe timed out"));
+    if result.is_err() {
+        let _ = child.kill().await;
+    }
+    result
+}
 
 const WRITE_GUIDANCE: &str =
     "Access: Write. Implement the requested changes in the working directory.";
@@ -1016,6 +1151,101 @@ mod rpc_tests {
         request.executable = Some(executable);
         request.prompt = "@alice literal RPC prompt".into();
         (dir, extension, request)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_availability_reports_version_without_probing_credentials() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let (dir, _, request) = fake_pi(
+            r#"[ "$#" -eq 1 ] && [ "$1" = --version ] || exit 99
+printf '1.6.0\r\n'
+printf 'private diagnostic' >&2"#,
+        );
+        let result = availability(request.executable.as_deref()).await;
+        assert_eq!(result.kind, HarnessKind::Pi);
+        assert_eq!(result.acp_agent, None);
+        assert!(result.installed);
+        assert_eq!(result.version.as_deref(), Some("1.6.0"));
+        assert_eq!(result.signed_in, None);
+        assert_eq!(result.detail.as_deref(), Some(SIGN_IN_UNKNOWN));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_availability_obeys_explicit_override_and_path_lookup() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let (dir, _, request) = fake_pi("printf '1.6.0\\n'");
+        let program = dir.join("pi");
+        fs::rename(request.executable.unwrap(), &program).unwrap();
+        let path = dir.as_os_str();
+        let missing = dir.join("missing");
+        for (explicit, configured, search) in [
+            (Some(program.as_path()), Some(missing.as_os_str()), None),
+            (None, Some(program.as_os_str()), None),
+            (None, None, Some(path)),
+        ] {
+            let result = availability_with_path(explicit, configured, search).await;
+            assert!(result.installed);
+            assert_eq!(result.version.as_deref(), Some("1.6.0"));
+        }
+        for (explicit, configured, search) in [
+            (None, Some(missing.as_os_str()), Some(path)),
+            (Some(missing.as_path()), None, Some(path)),
+            (Some(dir.as_path()), None, Some(path)),
+            (Some(Path::new("")), None, Some(path)),
+            (None, None, None),
+        ] {
+            let result = availability_with_path(explicit, configured, search).await;
+            assert!(!result.installed);
+            assert_eq!(result.version, None);
+            assert_eq!(result.signed_in, None);
+            assert!(result.detail.unwrap().contains("not found"));
+        }
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            !availability_with_path(None, None, Some(path))
+                .await
+                .installed
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_availability_keeps_installed_on_invalid_or_failed_version_probe() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        for (body, detail) in [
+            ("exit 0", "not a version number"),
+            ("printf 'private diagnostic'", "not a version number"),
+            ("printf '1.6.0\\n'; exit 7", "exited unsuccessfully"),
+            ("printf '%0130d' 1", "exceeded its limit"),
+            ("exec 1>&-; exec sleep 20", "timed out"),
+        ] {
+            let (dir, _, request) = fake_pi(body);
+            let start = Instant::now();
+            let result = availability(request.executable.as_deref()).await;
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(result.installed);
+            assert_eq!(result.version, None);
+            assert_eq!(result.signed_in, None);
+            let message = result.detail.unwrap();
+            assert!(message.contains(detail), "{message}");
+            assert!(!message.contains("private diagnostic"));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FORMLESS_TOPIC_PI_EXE pointing at a real Pi installation"]
+    async fn live_pi_availability() {
+        let result = availability(None).await;
+        println!("live Pi availability: {result:?}");
+        assert!(result.installed);
+        assert!(result.version.is_some());
+        assert_eq!(result.signed_in, None);
     }
 
     #[cfg(unix)]
