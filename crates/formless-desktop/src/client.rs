@@ -5879,10 +5879,7 @@ mod tests {
                 }
             )));
             if stay_on_page {
-                let follow_up = engine
-                    .outgoing
-                    .pop_front()
-                    .expect("dirty page must reload");
+                let follow_up = engine.outgoing.pop_front().expect("dirty page must reload");
                 assert!(matches!(follow_up.request, Request::ListJobs));
                 respond(&mut engine, follow_up.id, json!([]));
                 assert!(matches!(
