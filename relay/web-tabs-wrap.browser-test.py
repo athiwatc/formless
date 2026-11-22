@@ -38,20 +38,40 @@ hook=r'''
   act=async()=>null;request=async()=>null;
   window.__fixture={setup(){ $('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='chat';renderChrome(); }};
 '''
+def resize_and_settle(page, width, font):
+    height = 1000
+    page.set_viewport_size({"width": width, "height": height})
+    page.evaluate('size => document.documentElement.style.fontSize = size + "px"', font)
+    # The app commits its visual viewport variables on the next animation
+    # frame. Measure after that resize, not the previous viewport's width.
+    page.wait_for_function("""
+        ([width, height, font]) => {
+            const root = document.documentElement;
+            const viewport = window.visualViewport;
+            return innerWidth === width && innerHeight === height
+                && root.hasAttribute("data-visual-viewport")
+                && Math.abs(parseFloat(root.style.getPropertyValue("--app-viewport-width"))
+                    - (viewport?.width ?? width)) < .01
+                && Math.abs(parseFloat(root.style.getPropertyValue("--app-viewport-height"))
+                    - (viewport?.height ?? height)) < .01
+                && parseFloat(getComputedStyle(root).fontSize) === font;
+        }
+    """, arg=[width, height, font])
+
+
 def check(page):
     page.set_default_timeout(5000)
     page.evaluate('__fixture.setup()')
     for width,font in [(320,16),(480,16),(320,32),(1200,16)]:
-        page.set_viewport_size({'width':width,'height':1000})
-        page.evaluate('size=>document.documentElement.style.fontSize=size+"px"',font)
+        resize_and_settle(page, width, font)
         geometry=page.locator('#tabs').evaluate('''e=>{
           const r=e.getBoundingClientRect();return {client:e.clientWidth,scroll:e.scrollWidth,top:r.top,bottom:r.bottom,left:r.left,right:r.right,
             buttons:[...e.querySelectorAll('button')].map(b=>{const r=b.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right};})};
         }''')
         assert geometry['scroll']<=geometry['client']+1,(width,font,'no hidden horizontal tabs',geometry)
         assert all(b['left']>=geometry['left']-1 and b['right']<=geometry['right']+1 and b['top']>=geometry['top']-1 and b['bottom']<=geometry['bottom']+1 for b in geometry['buttons']),(width,font,geometry)
-        if width==1200: assert len({round(b['top']) for b in geometry['buttons']})==1,'fitting desktop stays one row'
-    page.set_viewport_size({'width':320,'height':1000})
+        if width==1200: assert len({round(b['top']) for b in geometry['buttons']})==1,('fitting desktop stays one row',width,font,geometry)
+    resize_and_settle(page, 320, 16)
     buttons=page.locator('#tabs button')
     for index in range(buttons.count()):
         button=buttons.nth(index);button.focus();page.keyboard.press('Enter')
