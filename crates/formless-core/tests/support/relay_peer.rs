@@ -140,9 +140,21 @@ impl RoomPeer {
         Ok(())
     }
     async fn pump(&mut self) {
-        let message = tokio::time::timeout(std::time::Duration::from_secs(10), self.ws.next())
+        self.pump_with_timeout(std::time::Duration::from_secs(10), "normal frame")
+            .await;
+    }
+
+    async fn pump_with_timeout(&mut self, wait: std::time::Duration, phase: &str) {
+        let message = tokio::time::timeout(wait, self.ws.next())
             .await
-            .expect("private relay peer frame within10s")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "private relay peer timed out during {phase}: wait={wait:?}, UP receipts={}, DOWN fragments={}, outstanding DOWN grants={}",
+                    self.up.len(),
+                    self.down_fragments,
+                    self.permits.len()
+                )
+            })
             .expect("private relay peer open")
             .unwrap();
         let Message::Text(text) = message else { return };
@@ -230,6 +242,28 @@ impl RoomPeer {
             }
         }
     }
+    /// A full-size response needs time to read the DB, serialize and seal
+    /// before requesting the first DOWN grant. Keep the normal per-frame
+    /// deadline as soon as DOWN starts; this does not extend wire deadlines.
+    #[allow(dead_code)]
+    pub async fn next_full_size_reply(&mut self) -> Option<Result<Message, std::io::Error>> {
+        assert!(self.permits.is_empty() && self.down_fragments == 0);
+        let initial_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(Ok(Message::Text(frame.to_string())));
+            }
+            if self.permits.is_empty() && self.down_fragments == 0 {
+                let wait = initial_deadline.saturating_duration_since(tokio::time::Instant::now());
+                self.pump_with_timeout(wait, "waiting for first DOWN grant request")
+                    .await;
+            } else {
+                self.pump_with_timeout(std::time::Duration::from_secs(10), "DOWN transfer")
+                    .await;
+            }
+        }
+    }
+
     pub async fn next(&mut self) -> Option<Result<Message, std::io::Error>> {
         loop {
             if let Some(frame) = self.pending.pop_front() {

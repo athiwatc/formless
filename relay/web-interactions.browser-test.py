@@ -93,7 +93,7 @@ HOOK = r"""
       h("button", {type:"button",onclick:showRunFiles}, "Files"));
     $("composer").prepend(controls);
   };
-  F.reviseQueued = () => { S.queued = [{...S.queued[0], revision:13}]; };
+  F.reviseQueued = () => onEvent({type:"queue_changed", session_id:S.current, queued:[{...S.queued[0], revision:13}]});
   F.legacyQueued = () => { delete S.queued[0].revision; renderQueue(); };
   F.askFixtureQuestion = () => onEvent({type:"user_question",session_id:"first",question_id:"question-a",question:"Fixture question"});
   F.advanceRun = () => onEvent({type:"run_started",session_id:S.current,run_id:"run-b"});
@@ -493,6 +493,7 @@ def action_dialogs(page):
 
     edit.click()
     page.evaluate("__interaction.reviseQueued()")
+    expect(field).to_be_focused()
     field.fill("stale queue revision")
     modal.get_by_role("button", name="Save").click()
     expect(modal).to_be_hidden()
