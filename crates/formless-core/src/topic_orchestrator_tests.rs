@@ -3547,10 +3547,18 @@ async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and
             let decoy = f.root.join("override-decoy");
             std::fs::write(
                 &decoy,
-                "#!/bin/sh\\nprintf 'decoy' > \\\"$TOPIC_FIXTURE_DECOY_MARKER\\\"\\nexit 97\\n",
+                "#!/bin/sh\nprintf 'decoy' > \"$TOPIC_FIXTURE_DECOY_MARKER\"\nexit 97\n",
             )
             .unwrap();
             std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = f.root.join("decoy-marker");
+            let output = std::process::Command::new(&decoy)
+                .env("TOPIC_FIXTURE_DECOY_MARKER", &marker)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(97));
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "decoy");
+            std::fs::remove_file(marker).unwrap();
             let override_link = f.root.join("gemini-override");
             std::os::unix::fs::symlink(&executable, &override_link).unwrap();
             env.set("TOPIC_FIXTURE_OVERRIDE_LINK", &override_link);
