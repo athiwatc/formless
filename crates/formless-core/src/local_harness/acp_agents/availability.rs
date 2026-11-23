@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    ffi::{OsStr, OsString},
-    fs,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeMap, ffi::OsString, fs, path::PathBuf, time::Duration};
 
 use formless_protocol::{HarnessAvailability, HarnessKind};
 
@@ -51,12 +45,12 @@ fn with_timeout(
         }
     };
     let program = match executable {
-        Some(path) if path.is_absolute() => is_executable(&path).then_some(path),
+        Some(path) if path.is_absolute() => acp::is_executable(&path).then_some(path),
         Some(_) => {
             result.detail = Some("ACP executable override must be an absolute path.".into());
             return result;
         }
-        None => find_executable(spec.program, environment),
+        None => acp::find_executable(spec.program, environment),
     };
     let Some(program) = program else {
         result.detail = Some(format!(
@@ -115,52 +109,6 @@ fn with_timeout(
         Err(error) => result.detail = Some(format!("ACP readiness is unknown: {error:#}")),
     }
     result
-}
-
-fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn find_executable(program: &str, environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
-    let path = environment
-        .get(OsStr::new("PATH"))
-        .cloned()
-        .or_else(|| std::env::var_os("PATH"))?;
-    #[cfg(windows)]
-    let suffixes = environment
-        .get(OsStr::new("PATHEXT"))
-        .cloned()
-        .or_else(|| std::env::var_os("PATHEXT"))
-        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-    #[cfg(windows)]
-    let suffixes: Vec<_> = std::iter::once(String::new())
-        .chain(suffixes.to_string_lossy().split(';').map(str::to_owned))
-        .collect();
-    #[cfg(not(windows))]
-    let suffixes = [String::new()];
-    for directory in std::env::split_paths(&path) {
-        for suffix in &suffixes {
-            let candidate = directory.join(format!("{program}{suffix}"));
-            if is_executable(&candidate) {
-                return std::path::absolute(candidate).ok();
-            }
-        }
-    }
-    None
 }
 
 struct ProbeDir(PathBuf);
