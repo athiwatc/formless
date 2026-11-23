@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import os
+import subprocess
 import sys
 import time
 
@@ -21,6 +22,18 @@ elif mode == "error":
 elif mode == "nonzero":
     print("opencode v2.3.2")
     sys.exit(1)
+elif mode == "orphan":
+    helper = subprocess.Popen(
+        ["sleep", "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    with open(os.environ["AVAILABILITY_HELPER_PID"], "w") as marker:
+        marker.write(str(helper.pid))
+    print("opencode v2.3.2", flush=True)
+    sys.stdout.close()
+    sys.exit(0)
 elif mode == "malformed":
     print("opencode v2.3.2 dummy-credential-not-for-logs")
 elif mode == "oversized":

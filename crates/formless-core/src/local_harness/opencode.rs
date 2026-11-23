@@ -222,8 +222,14 @@ pub async fn run(
     let request = prepare(request)?;
     let runtime = tokio::runtime::Handle::current();
     let cancel = cancel.child_token();
+    if cancel.is_cancelled() {
+        bail!("OpenCode run cancelled before launch");
+    }
     let _cancel_on_drop = cancel.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            bail!("OpenCode run cancelled before launch");
+        }
         let mut permissions = AttemptScoped(acp::Interactions {
             handler: interactions.as_ref(),
             runtime,

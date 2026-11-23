@@ -1,8 +1,9 @@
 use super::*;
+use crate::daemon::topic_orchestrator::resolve_topic_opencode_executable;
 use crate::local_harness::{
     HarnessPermissionRequest, HarnessRequest, HarnessUpdate, InteractionFuture, InteractionHandler,
 };
-use formless_protocol::{Question, QuestionAnswer, TopicAttemptInfo, TopicAttemptStatus};
+use formless_protocol::{Question, QuestionAnswer, TopicAttemptInfo};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -48,29 +49,38 @@ impl InteractionHandler for TopicInteractions {
     }
 }
 
-fn attempt() -> TopicAttemptInfo {
-    TopicAttemptInfo {
-        id: "dispatch-attempt".into(),
-        topic_id: "dispatch-topic".into(),
-        feature_id: "dispatch-feature".into(),
-        step_title: "dispatch step".into(),
-        access: StepAccess::Write,
-        model: None,
-        inputs: vec![],
-        outputs: vec![],
-        summary: None,
-        harness: HarnessKind::OpenCode,
-        acp_agent: None,
-        status: TopicAttemptStatus::Running,
-        conversation_session_id: "dispatch-session".into(),
-        harness_session_id: None,
-        detail: None,
-        created_at: "now".into(),
-        updated_at: "now".into(),
-    }
+fn attempt(f: &Fixture) -> (TopicAttemptInfo, String) {
+    let topic = super::topic(f, None, true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let token = "topic-capability-test-value-with-sufficient-length".to_owned();
+    let attempt = f
+        .daemon()
+        .with_store(|st| {
+            st.begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "dispatch step",
+                StepAccess::Write,
+                HarnessKind::OpenCode,
+                None,
+                None,
+                &[],
+                &token,
+                topic.workspace.as_deref().unwrap(),
+            )
+        })
+        .unwrap();
+    (attempt, token)
 }
 
-fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
+fn request(
+    f: &Fixture,
+    attempt: &TopicAttemptInfo,
+    token: &str,
+    cancel_probe: Option<PathBuf>,
+) -> HarnessRequest {
     use std::os::unix::fs::PermissionsExt;
 
     let cwd = f.root.join("opencode-topic-cwd");
@@ -88,7 +98,6 @@ fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let token = "topic-capability-test-value";
     let mcp_env_vars = vec![
         "FORMLESS_TOPIC_CAPABILITY".into(),
         "FORMLESS_DATA_DIR".into(),
@@ -99,7 +108,7 @@ fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
         ("FORMLESS_TOPIC_CAPABILITY".into(), OsString::from(token)),
         (
             "FORMLESS_TOPIC_ATTEMPT_ID".into(),
-            OsString::from("dispatch-attempt"),
+            OsString::from(attempt.id.clone()),
         ),
         ("FORMLESS_DATA_DIR".into(), data.clone().into_os_string()),
         (
@@ -125,6 +134,10 @@ fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
             "TOPIC_PROMPT_MARKER".into(),
             OsString::from("topic-dispatch-prompt-marker"),
         ),
+        (
+            "OPENCODE_START_MARKER".into(),
+            f.root.join("opencode-started").into_os_string(),
+        ),
     ]);
     if let Some(path) = cancel_probe {
         environment.insert("CANCEL_PROBE".into(), path.into_os_string());
@@ -142,7 +155,7 @@ fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
             "topic-test".into(),
             "topic-mcp".into(),
             "--attempt".into(),
-            "dispatch-attempt".into(),
+            attempt.id.clone(),
         ],
         mcp_env_vars,
         executable: Some(executable),
@@ -154,23 +167,18 @@ fn request(f: &Fixture, cancel_probe: Option<PathBuf>) -> HarnessRequest {
 async fn topic_dispatch_routes_opencode_request_and_typed_interactions() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
-    let request = request(&f, None);
+    let (attempt, token) = attempt(&f);
+    let request = request(&f, &attempt, &token, None);
     let handler = Arc::new(TopicInteractions::default());
     let cancel = CancellationToken::new();
-    let attempt = attempt();
     let result = f
         .daemon()
-        .launch_topic_adapter(
-            &attempt,
-            "topic-capability-test-value",
-            &request,
-            handler.clone(),
-            &cancel,
-        )
+        .launch_topic_adapter(&attempt, &token, &request, handler.clone(), &cancel)
         .await
         .unwrap();
 
     assert_eq!(result.message, "done");
+    assert!(f.root.join("opencode-started").is_file());
     assert_eq!(handler.permissions.lock().unwrap().len(), 1);
     assert_eq!(handler.permissions.lock().unwrap()[0].title, "execute");
     assert_eq!(handler.questions.lock().unwrap().len(), 1);
@@ -190,7 +198,7 @@ async fn topic_dispatch_routes_opencode_request_and_typed_interactions() {
     assert_eq!(
         bridge["env"],
         serde_json::json!([
-            {"name":"FORMLESS_TOPIC_CAPABILITY","value":"topic-capability-test-value"},
+            {"name":"FORMLESS_TOPIC_CAPABILITY","value":request.environment[std::ffi::OsStr::new("FORMLESS_TOPIC_CAPABILITY")].to_string_lossy()},
             {"name":"FORMLESS_DATA_DIR","value":request.environment[std::ffi::OsStr::new("FORMLESS_DATA_DIR")].to_string_lossy()},
             {"name":"FORMLESS_CONFIG_DIR","value":request.environment[std::ffi::OsStr::new("FORMLESS_CONFIG_DIR")].to_string_lossy()},
             {"name":"FORMLESS_TOPIC_OUTPUTS_DIR","value":request.environment[std::ffi::OsStr::new("FORMLESS_TOPIC_OUTPUTS_DIR")].to_string_lossy()}
@@ -203,21 +211,15 @@ async fn topic_dispatch_forwards_cancellation_to_opencode_acp() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let probe = f.root.join("opencode-cancel-probe");
-    let request = request(&f, Some(probe.clone()));
+    let (attempt, token) = attempt(&f);
+    let request = request(&f, &attempt, &token, Some(probe.clone()));
     let handler = Arc::new(TopicInteractions::default());
     let cancel = CancellationToken::new();
     let daemon = f.daemon().clone();
-    let attempt = attempt();
     let child_cancel = cancel.clone();
     let task = tokio::spawn(async move {
         daemon
-            .launch_topic_adapter(
-                &attempt,
-                "topic-capability-test-value",
-                &request,
-                handler,
-                &child_cancel,
-            )
+            .launch_topic_adapter(&attempt, &token, &request, handler, &child_cancel)
             .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -236,4 +238,95 @@ async fn topic_dispatch_forwards_cancellation_to_opencode_acp() {
             .is_err()
     );
     assert_eq!(std::fs::read_to_string(probe).unwrap(), "cancelled");
+}
+
+#[tokio::test]
+async fn cancelled_opencode_topic_does_not_spawn() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let (attempt, token) = attempt(&f);
+    let request = request(&f, &attempt, &token, None);
+    let handler = Arc::new(TopicInteractions::default());
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = f
+        .daemon()
+        .launch_topic_adapter(&attempt, &token, &request, handler, &cancel)
+        .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled before launch"));
+    assert!(!f.root.join("opencode-started").exists());
+}
+
+#[tokio::test]
+async fn cancelled_topic_attempt_does_not_spawn_opencode() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let (attempt, token) = attempt(&f);
+    let request = request(&f, &attempt, &token, None);
+    f.daemon().cancel_topic_work(&attempt.topic_id).unwrap();
+    let handler = Arc::new(TopicInteractions::default());
+    let cancel = CancellationToken::new();
+    let result = f
+        .daemon()
+        .launch_topic_adapter(&attempt, &token, &request, handler, &cancel)
+        .await;
+    assert!(result.is_err());
+    assert!(!f.root.join("opencode-started").exists());
+}
+
+struct RelativePathDirectory(PathBuf);
+
+impl Drop for RelativePathDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn topic_opencode_executable_uses_absolute_path_and_preserves_override() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let relative = PathBuf::from(format!(".opencode-relative-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&relative).unwrap();
+    let _relative = RelativePathDirectory(relative.clone());
+    let relative_executable = relative.join("opencode");
+    std::fs::write(&relative_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&relative_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let absolute_dir = f.root.join("opencode-absolute-bin");
+    std::fs::create_dir(&absolute_dir).unwrap();
+    let absolute_executable = absolute_dir.join("opencode");
+    std::fs::write(&absolute_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&absolute_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut environment = BTreeMap::from([(
+        "PATH".into(),
+        std::env::join_paths([relative.as_os_str(), absolute_dir.as_os_str()]).unwrap(),
+    )]);
+    assert_eq!(
+        resolve_topic_opencode_executable(&environment).unwrap(),
+        absolute_executable
+    );
+    environment.insert("PATH".into(), relative.into_os_string());
+    assert!(resolve_topic_opencode_executable(&environment).is_err());
+
+    let override_path = f.root.join("missing-explicit-opencode");
+    environment.insert(
+        "FORMLESS_TOPIC_OPENCODE_EXE".into(),
+        override_path.clone().into_os_string(),
+    );
+    assert_eq!(
+        resolve_topic_opencode_executable(&environment).unwrap(),
+        override_path
+    );
+    environment.insert(
+        "FORMLESS_TOPIC_OPENCODE_EXE".into(),
+        PathBuf::from("relative/opencode").into_os_string(),
+    );
+    assert!(resolve_topic_opencode_executable(&environment).is_err());
 }

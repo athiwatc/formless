@@ -453,8 +453,9 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
         }
         if mode == "normal" {
             let cwd = PathBuf::from(std::fs::read_to_string(dir.join("probe-cwd")).unwrap());
-            assert_ne!(cwd, std::env::temp_dir());
-            assert!(cwd.starts_with(std::env::temp_dir()));
+            let temp_dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            assert_ne!(cwd, temp_dir);
+            assert!(cwd.starts_with(temp_dir));
             assert!(!cwd.exists());
         }
     }
@@ -467,7 +468,7 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
     environment.insert("AVAILABILITY_MODE".into(), "hang".into());
     environment.insert("AVAILABILITY_PID".into(), pid_file.clone().into_os_string());
     let started = std::time::Instant::now();
-    let result = availability(Some(executable), &environment);
+    let result = availability(Some(executable.clone()), &environment);
     assert!(result.installed);
     assert!(result.detail.unwrap().contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(3));
@@ -480,6 +481,52 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn availability_kills_outliving_helper_after_stdout_closes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("fl-opencode-orphan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let executable = dir.join("opencode");
+    std::fs::copy(fixture("opencode-availability.py"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let helper_pid = dir.join("helper-pid");
+    let environment = BTreeMap::from([
+        ("AVAILABILITY_ENV".into(), "provided".into()),
+        ("AVAILABILITY_MODE".into(), "orphan".into()),
+        (
+            "AVAILABILITY_HELPER_PID".into(),
+            helper_pid.clone().into_os_string(),
+        ),
+    ]);
+
+    let started = std::time::Instant::now();
+    let result = availability(Some(executable), &environment);
+    assert!(result.installed);
+    assert_eq!(result.version.as_deref(), Some("2.3.2"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let pid = std::fs::read_to_string(helper_pid)
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let alive = || {
+        (unsafe { libc::kill(pid, 0) }) == 0
+            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_or(true, |stat| !stat.contains(") Z "))
+    };
+    while alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "helper survived the probe"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -523,6 +570,34 @@ async fn aborting_run_cancels_the_blocking_task_without_cancelling_caller() {
     assert_eq!(std::fs::read_to_string(&probe).unwrap(), "cancelled");
     assert!(!caller_cancel.is_cancelled());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_cancelled_run_does_not_start_opencode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("fl-opencode-pre-cancel-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let executable = dir.join("opencode");
+    std::fs::copy(fixture("opencode-acp.py"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let marker = dir.join("started");
+    let mut request = request(StepAccess::Write);
+    request.cwd = dir.clone();
+    request.executable = Some(executable);
+    request.environment.insert(
+        "OPENCODE_START_MARKER".into(),
+        marker.clone().into_os_string(),
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    assert!(run(&request, Arc::new(CoreHandler::default()), &cancel)
+        .await
+        .is_err());
+    assert!(!marker.exists());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[cfg(unix)]

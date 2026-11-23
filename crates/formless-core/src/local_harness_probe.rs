@@ -116,6 +116,14 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
     }
     None
 }
+
+pub(crate) fn resolve_executable(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    lookup(kind, environment)
+}
+
 fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
     HarnessAvailability {
         kind,

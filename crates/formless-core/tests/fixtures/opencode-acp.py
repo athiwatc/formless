@@ -4,6 +4,10 @@ import os
 import signal
 import sys
 
+if "OPENCODE_START_MARKER" in os.environ:
+    with open(os.environ["OPENCODE_START_MARKER"], "w") as marker:
+        marker.write("started")
+
 
 def read():
     return json.loads(sys.stdin.readline())

@@ -921,10 +921,19 @@ impl Daemon {
                 let saved = self
                     .with_reader(|st| st.get_topic_attempt(attempt_id))?
                     .context("attempt vanished")?;
-                if cancelled || saved.status != TopicAttemptStatus::Succeeded {
+                if cancelled
+                    || !matches!(
+                        saved.status,
+                        TopicAttemptStatus::Succeeded | TopicAttemptStatus::NeedsUser
+                    )
+                    || saved
+                        .summary
+                        .as_deref()
+                        .is_none_or(|summary| summary.trim().is_empty())
+                {
                     return Err(error);
                 }
-                tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after successful topic report; daemon validation still required");
+                tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after a validated topic report; daemon validation still required");
                 Ok(HarnessResult {
                     session_id: saved.harness_session_id,
                     message: saved.summary.unwrap_or_default(),
@@ -1130,7 +1139,10 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
-                HarnessKind::OpenCode => executable("FORMLESS_TOPIC_OPENCODE_EXE")?,
+                HarnessKind::OpenCode => {
+                    let environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+                    Some(resolve_topic_opencode_executable(&environment)?)
+                }
                 HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
                 _ => None,
             },
@@ -1249,7 +1261,16 @@ impl Daemon {
                     .await
             }
             HarnessKind::Pi => bail!("Pi adapter not integrated yet; choose Claude or Codex"),
-            HarnessKind::OpenCode => local_harness::run(request, handler, cancel).await,
+            HarnessKind::OpenCode => {
+                {
+                    let _launch = self.topic_launch.locked();
+                    self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+                    if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                        bail!("step cancelled before launch");
+                    }
+                }
+                local_harness::run(request, handler, cancel).await
+            }
             HarnessKind::Antigravity => {
                 self.run_topic_acp(
                     attempt,
@@ -1381,4 +1402,19 @@ fn executable(name: &str) -> Result<Option<PathBuf>> {
             Ok(path)
         })
         .transpose()
+}
+
+pub(crate) fn resolve_topic_opencode_executable(
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<PathBuf> {
+    if let Some(value) = environment.get(std::ffi::OsStr::new("FORMLESS_TOPIC_OPENCODE_EXE")) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            bail!("FORMLESS_TOPIC_OPENCODE_EXE must be an absolute executable path");
+        }
+        return Ok(path);
+    }
+    local_harness::resolve_executable(HarnessKind::OpenCode, environment).context(
+        "OpenCode executable was not found on an absolute PATH entry; configure FORMLESS_TOPIC_OPENCODE_EXE",
+    )
 }
