@@ -45,6 +45,8 @@ HOOK = """
       S.auditPages = 2;
       S.audit = [head, tail];
       this.connect();
+      // These two fixture pages are already loaded on the current transport.
+      // Reconnect below deliberately leaves them owned by the prior channel.
       auditOwner = {ws: S.ws, channel: S.channel, filter: null};
       renderAll();
     },
@@ -107,7 +109,7 @@ def exercise(page, url, app):
 
     page.evaluate("() => { const f = __settingsRefreshFixture; f.reset(); f.setView('settings'); }")
     result = after_requests(page)
-    assert result["calls"] == BACKGROUND + LISTS
+    assert result["calls"] == BACKGROUND + LISTS, result["calls"]
     assert result["auditPages"] == 2 and result["audit"] == ["audit-head", "audit-tail"]
 
     # A local mutation's continuation and its broadcast may overlap.

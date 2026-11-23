@@ -92,6 +92,149 @@ async fn next_event(
     .expect("expected event")
 }
 
+#[test]
+fn topic_directory_reports_are_private_and_reject_files_and_escaping_links() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let outputs = f
+        .fixture
+        .paths
+        .data_dir
+        .join("topic-attempts")
+        .join(&f.attempt.id)
+        .join("outputs");
+    let outside = f.fixture.root.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outputs.join("file"), "not a directory").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, outputs.join("escape")).unwrap();
+    for path in [outside.to_string_lossy().into_owned(), "file".into()] {
+        assert!(f
+            .daemon()
+            .with_store(|st| st.report_topic_result(
+                &f.attempt.id,
+                &f.token,
+                TopicAttemptStatus::Succeeded,
+                "invalid",
+                &[TopicArtifact::Directory { path }]
+            ))
+            .is_err());
+    }
+    #[cfg(unix)]
+    assert!(f
+        .daemon()
+        .with_store(|st| st.report_topic_result(
+            &f.attempt.id,
+            &f.token,
+            TopicAttemptStatus::Succeeded,
+            "invalid",
+            &[TopicArtifact::Directory {
+                path: "escape".into()
+            }]
+        ))
+        .is_err());
+    std::fs::create_dir(outputs.join("empty")).unwrap();
+    let result = f
+        .daemon()
+        .with_store(|st| {
+            st.report_topic_result(
+                &f.attempt.id,
+                &f.token,
+                TopicAttemptStatus::Succeeded,
+                "valid",
+                &[TopicArtifact::Directory {
+                    path: "empty".into(),
+                }],
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        result.outputs,
+        vec![TopicArtifact::Directory {
+            path: outputs
+                .join("empty")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }]
+    );
+}
+
+#[tokio::test]
+async fn topic_terminal_report_survives_a_fixture_adapter_late_update_error() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let handler = f.handler();
+    let output = TopicArtifact::Text {
+        title: "Result".into(),
+        content: "finished".into(),
+    };
+    let execution: Result<(crate::local_harness::HarnessResult, Vec<TopicArtifact>)> = async {
+        f.daemon()
+            .handle(Request::TopicMcp {
+                request: TopicMcpRequest {
+                    attempt_id: f.attempt.id.clone(),
+                    capability_token: f.token.clone(),
+                    operation: TopicMcpOperation::ReportResult {
+                        status: TopicAttemptStatus::Succeeded,
+                        summary: "reported success".into(),
+                        outputs: vec![output.clone()],
+                    },
+                },
+            })
+            .await?;
+        handler.on_update(HarnessUpdate::Message {
+            content: "late streamed update".into(),
+        })?;
+        Ok((
+            crate::local_harness::HarnessResult {
+                session_id: None,
+                message: "late success".into(),
+                events: vec![],
+            },
+            vec![],
+        ))
+    }
+    .await;
+    assert!(execution
+        .as_ref()
+        .unwrap_err()
+        .to_string()
+        .contains("no longer active"));
+    let result = f
+        .daemon()
+        .accept_topic_harness_result(
+            &f.attempt.id,
+            handler.finish().and(execution).map(|(result, _)| result),
+            false,
+        )
+        .unwrap();
+    f.daemon()
+        .finish_topic_attempt_execution(&f.topic.id, &f.attempt.id, Ok((result, vec![])), false)
+        .unwrap();
+    let saved = f.state();
+    assert_eq!(saved.attempts[0].status, TopicAttemptStatus::Succeeded);
+    assert_eq!(
+        saved.attempts[0].summary.as_deref(),
+        Some("reported success")
+    );
+    assert_eq!(saved.attempts[0].outputs, vec![output.clone()]);
+    assert!(saved.features[0].active_attempt_id.is_none());
+    assert_eq!(saved.features[0].outputs, vec![output]);
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    f.daemon()
+        .finish_topic_feature_tool(
+            session,
+            &json!({"feature_id":f.attempt.feature_id,"summary":"Completed successfully"}),
+            true,
+        )
+        .unwrap();
+    let saved = f.state();
+    assert_eq!(saved.features[0].status, TopicFeatureStatus::Ready);
+    assert_eq!(saved.status, TopicStatus::Complete);
+}
+
 fn permission(always: bool) -> HarnessPermissionRequest {
     HarnessPermissionRequest {
         title: "Read invoices".into(),

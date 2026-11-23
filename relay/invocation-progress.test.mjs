@@ -28,7 +28,7 @@ function setup(actualRefresh = false) {
     reconcileChildren: (parent, nodes) => parent.replaceChildren(...nodes),
     request: async () => [], document: doc, focusVisible: button => box.contains(button), uiFormat: String, Date});
   installEventRenderFixture(c, fn);
-  vm.runInContext('let runningRefresh = null;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','recordedDuration','runningRow','renderRunning','onEvent'].map(fn).join('\n'),c);
+  vm.runInContext('let runningRefresh = null, runningExposed = false, runningExposureEpoch = 0, runningExposurePending = false;\n' + ['runningTool','reconcileInvocationProgress','progressDiagnostic','sameRunningConnection','refreshRunning','recordedDuration','runningRow','renderRunning','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};
 }
