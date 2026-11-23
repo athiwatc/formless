@@ -16863,7 +16863,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         let first_line = lines.len();
         match m.role.as_str() {
             "user" => {
-                user_lines.push(lines.len());
+                if m.generated_by.is_none() {
+                    user_lines.push(lines.len());
+                }
                 open_group(
                     &mut lines,
                     &mut group,
@@ -26265,7 +26267,7 @@ mod tests {
             created_at: String::new(),
             meta: None,
         };
-        app.messages = (0..6)
+        let mut messages: Vec<_> = (0..6)
             .map(|i| {
                 if i % 2 == 0 {
                     msg(i, "user", format!("question {}", i / 2 + 1))
@@ -26274,6 +26276,10 @@ mod tests {
                 }
             })
             .collect();
+        let mut kickoff = msg(6, "user", "Generated kickoff".into());
+        kickoff.generated_by = Some("topic_kickoff".into());
+        messages.insert(1, kickoff);
+        app.messages = messages;
         render(&mut app, 80, 20);
         assert_eq!(app.user_rows.len(), 3);
         // From the live bottom, { goes to the last question, then earlier.
@@ -26284,6 +26290,7 @@ mod tests {
         let screen = render(&mut app, 80, 20);
         assert!(screen.contains("message 2/3"), "{screen}");
         assert!(screen.contains("question 2"));
+        assert!(screen.contains("Generated kickoff"), "{screen}");
         // Ctrl+↓ forward; Home to the top; past the last, follow again.
         app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(app.chat_scroll_top, Some(app.user_rows[2]));
