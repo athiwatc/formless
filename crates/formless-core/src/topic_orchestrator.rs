@@ -1131,6 +1131,7 @@ impl Daemon {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
                 HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
+                HarnessKind::Acp => executable("FORMLESS_TOPIC_ACP_EXE")?,
                 _ => None,
             },
             environment: BTreeMap::from([
@@ -1262,7 +1263,17 @@ impl Daemon {
                 )
                 .await
             }
-            HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
+            HarnessKind::Acp => {
+                self.run_topic_acp(
+                    attempt,
+                    token,
+                    local_harness::acp_agents::run_request,
+                    request,
+                    handler,
+                    cancel,
+                )
+                .await
+            }
             HarnessKind::Muse => bail!("Muse adapter not integrated yet; choose Claude or Codex"),
         }
     }
