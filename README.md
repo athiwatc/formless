@@ -67,6 +67,7 @@ usual way; Formless does not ship or log in to them for you.
 Current topic-step adapters are Claude Code and Codex via their official
 non-interactive CLIs, and Muse Code via its `muse serve` protocol. Pi, OpenCode,
 Antigravity, Grok Build, and additional ACP profiles are still in progress.
+This list describes implemented integrations, not authenticated end-to-end validation.
 
 Any integrated harness can take any step, including the same harness on
 both sides of a hand-off. A harness's own permission modes are not an OS
