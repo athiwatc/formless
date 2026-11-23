@@ -385,6 +385,7 @@ enum Pending {
     TopicPermission {
         permission_id: String,
     },
+    HarnessPermissions,
     TopicControl {
         topic_id: Option<String>,
         done: String,
@@ -2616,6 +2617,9 @@ impl App {
         });
         self.pending.insert(subscribe, Pending::Subscribed);
         self.pending_since.insert(subscribe, Instant::now());
+        let permissions = client.send(Request::PendingApprovals);
+        self.pending.insert(permissions, Pending::HarnessPermissions);
+        self.pending_since.insert(permissions, Instant::now());
         let id = client.send(Request::GetSession {
             id: session_id.clone(),
         });
@@ -3740,6 +3744,15 @@ impl App {
                                 viewport: Default::default(),
                                 styled: Vec::new(),
                             });
+                        }
+                        Pending::HarnessPermissions => {
+                            let events: Vec<Event> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            for event in events {
+                                if matches!(event, Event::HarnessPermissionRequested { .. }) {
+                                    self.topic_permission_event(event);
+                                }
+                            }
                         }
                         Pending::RevokeAll => {
                             let family = self.grants_family.take();
@@ -5869,6 +5882,9 @@ impl App {
                 client: Some("TUI".into()),
             },
         );
+        if self.offline.is_none() {
+            self.request(Pending::HarnessPermissions, Request::PendingApprovals);
+        }
         self.request(
             Pending::ContextFill,
             Request::ContextUsage {
@@ -27150,6 +27166,93 @@ mod tests {
         assert_eq!(pager.title, "Workflow kickoff instructions");
         assert_eq!(pager.lines, [""]);
         assert!(app.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn pending_harness_permissions_restore_from_daemon_wire_snapshot() {
+        let event = Event::HarnessPermissionRequested {
+            permission_id: "c0ac0268-db77-4a49-b669-bac028f35207".into(),
+            session_id: "52593398-66c0-4f10-9cd0-bdc5ebac9f28".into(),
+            topic_id: "f6156346-5a5b-4861-8c72-fc170c69a920".into(),
+            attempt_id: "f543861a-b7bd-4945-94af-bfc5ab256318".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Fixture simulated write".into(),
+            kind: "write".into(),
+            raw_input: Some(serde_json::json!({
+                "operation": "simulated_write",
+                "path": "fixture.txt"
+            })),
+            options: vec![
+                HarnessPermissionOption {
+                    option_id: "allow".into(),
+                    name: "Allow once".into(),
+                    kind: HarnessPermissionOptionKind::AllowOnce,
+                },
+                HarnessPermissionOption {
+                    option_id: "deny".into(),
+                    name: "Deny".into(),
+                    kind: HarnessPermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+        let (client, outbound) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("52593398-66c0-4f10-9cd0-bdc5ebac9f28".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+
+        let send_wire = |message: ServerMessage| {
+            let encoded = serde_json::to_string(&message).unwrap();
+            let decoded = serde_json::from_str::<ServerMessage>(&encoded).unwrap();
+            incoming_tx.send(decoded).unwrap();
+        };
+        let pending_request_id = |lines: Vec<String>| {
+            lines
+                .into_iter()
+                .map(|line| {
+                    serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap()
+                })
+                .find_map(|envelope| {
+                    matches!(envelope.request, Request::PendingApprovals)
+                        .then_some(envelope.id)
+                })
+                .expect("PendingApprovals request")
+        };
+
+        app.switch_session("52593398-66c0-4f10-9cd0-bdc5ebac9f28".into());
+        let initial_query = pending_request_id(outbound.try_iter().collect());
+        send_wire(ServerMessage::Event(event.clone()));
+        app.drain_daemon();
+        assert!(app.topic.has_permission(), "live event reaches permission queue");
+
+        send_wire(ServerMessage::Response {
+            id: initial_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(app.topic.has_permission(), "snapshot response keeps prompt visible");
+
+        app.clear_attention();
+        assert!(!app.topic.has_permission());
+        app.offline = Some((Instant::now(), Instant::now()));
+        app.begin_reconnect_snapshot();
+        let reconnect_query = pending_request_id(outbound.try_iter().collect());
+        send_wire(ServerMessage::Response {
+            id: reconnect_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+
+        assert!(app.topic.has_permission(), "pending prompt restored after reconnect");
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("Fixture simulated write"), "{screen}");
+        assert!(screen.contains("1. Allow once"), "{screen}");
     }
 
     #[test]
