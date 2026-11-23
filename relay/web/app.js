@@ -4204,7 +4204,7 @@
           open("assistant", m.created_at).push(messageBody(m, (n) => n.append(
             h("p", null, h("strong", null, kickoff ? "Workflow requested." : "Background instructions added."),
               kickoff ? " Your requests and outline were sent to Formless to coordinate this topic." : " Formless added instructions for this conversation."),
-            h("details", { class: "chip generated-details" }, h("summary", null, kickoff ? "Orchestration details" : "Message details"), h("pre", null, m.content))
+            h("details", { class: "generated-details" }, h("summary", null, kickoff ? "Orchestration details" : "Message details"), h("pre", null, m.content))
           )));
         } else if (m.role === "tool") {
           open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || "", m.meta))));

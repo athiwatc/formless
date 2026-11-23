@@ -429,7 +429,7 @@ test('generated user-role messages render as Formless and cannot be moved or edi
   assert.equal(all(transcript).filter(n => n.attrs.class === 'who assistant').length, 1);
   assert.match(plainText(all(transcript).find(n => n.attrs.class === 'who assistant')), /^Formless/);
   assert.match(plainText(transcript), /Internal instructions.*Retry instructions/);
-  const disclosures = all(transcript).filter(n => n.tag === 'details' && n.attrs.class === 'chip generated-details');
+  const disclosures = all(transcript).filter(n => n.tag === 'details' && n.attrs.class === 'generated-details');
   assert.equal(disclosures.length, 2);
   assert.ok(disclosures.every(n => !n.attrs.open), 'raw generated instructions are collapsed by default');
   assert.equal(plainText(disclosures[0].children.find(n => n.tag === 'pre')), kickoff.content);
