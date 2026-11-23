@@ -3,7 +3,6 @@
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -12,7 +11,6 @@ from urllib.parse import unquote, urlsplit
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DOC_PATTERNS = ("packaging/*.md", "relay/*.md")
 GUIDES = ("docs/usage.md", "docs/cli.md", "docs/architecture.md")
 
 
