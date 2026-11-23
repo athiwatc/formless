@@ -14,15 +14,24 @@ ROOT = Path(__file__).resolve().parents[1]
 GUIDES = ("docs/usage.md", "docs/cli.md", "docs/architecture.md")
 
 
-def local_markdown_links(source):
-    for raw in re.findall(r"\]\(([^)]+)\)", source.read_text(encoding="utf-8")):
-        target = raw.strip().split(None, 1)[0].strip("<>")
+def relative_file_links(source):
+    text = source.read_text(encoding="utf-8")
+    text = re.sub(r"(?ms)^```.*?^```[ \t]*$", "", text)
+    text = re.sub(r"(?ms)^~~~.*?^~~~[ \t]*$", "", text)
+    text = re.sub(r"`+[^`\n]*`+", "", text)
+    raw_links = re.findall(r"\]\(([^)\n]+)\)", text)
+    raw_links.extend(re.findall(r"(?im)^\s*\[[^\]]+\]:\s*(<[^>]+>|\S+)", text))
+    raw_links.extend(re.findall(r"(?i)(?:href|src)\s*=\s*[\"']([^\"']+)[\"']", text))
+    for raw in raw_links:
+        target = raw.strip()
+        if target.startswith("<") and ">" in target:
+            target = target[1:target.index(">")]
+        else:
+            target = target.split(None, 1)[0]
         parsed = urlsplit(target)
-        if parsed.scheme or parsed.netloc or not parsed.path:
+        if parsed.scheme or parsed.netloc or not parsed.path or parsed.path.startswith("/"):
             continue
-        path = unquote(parsed.path)
-        if path.lower().endswith(".md"):
-            yield Path(path)
+        yield Path(unquote(parsed.path))
 
 
 class ReleaseDocArchive(unittest.TestCase):
@@ -64,14 +73,14 @@ cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
                 timeout=30,
             )
 
-    def test_readme_and_bundled_markdown_links_resolve_offline(self):
+    def test_readme_and_bundled_markdown_relative_file_links_resolve_offline(self):
         with tempfile.TemporaryDirectory(prefix="release archive ") as directory:
             package = Path(directory) / "formless-test"
             self.stage_reference_docs(package)
             for guide in GUIDES:
                 self.assertTrue((package / guide).is_file(), guide)
             for source in package.rglob("*.md"):
-                for target in local_markdown_links(source):
+                for target in relative_file_links(source):
                     resolved = (source.parent / target).resolve()
                     self.assertTrue(resolved.is_file(), f"{source.relative_to(package)} -> {target}")
 

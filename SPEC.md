@@ -2130,7 +2130,7 @@ pattern (§4.4).
   unique-local,
   multicast, unspecified, reserved (`240/4`), benchmarking, documentation,
   Teredo and discard addresses. The registry-entry test table
-  [`special_purpose_registry_addresses_are_not_public`](crates/formless-runtime/src/lib.rs)
+  [`special_purpose_registry_addresses_are_not_public`](https://github.com/athiwatc/formless/blob/main/crates/formless-runtime/src/lib.rs)
   covers the blocked special-purpose families,
   including IPv6 `fec0::/10`, `2001:2::/48` and `3fff::/20`.
   IPv6 forms that carry an IPv4 address

@@ -428,7 +428,7 @@ formless/
 
 ## Development
 
-The [CI workflow](../.github/workflows/ci.yml) runs on self-hosted macOS ARM64 and Linux x64
+The [CI workflow](https://github.com/athiwatc/formless/blob/main/.github/workflows/ci.yml) runs on self-hosted macOS ARM64 and Linux x64
 runners for pushes to `main`, same-repository pull requests targeting `main`, and
 manual dispatches. It checks Rust formatting and Clippy, runs workspace tests
 (including doc tests), relay/web Node tests, relay wire conformance and offline
