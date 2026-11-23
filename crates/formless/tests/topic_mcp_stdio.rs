@@ -82,7 +82,7 @@ while True:
             tools=mcp_call(bridge,2,'tools/list',{})
             assert 'ask_user' in [tool['name'] for tool in tools['tools']],tools
             pathlib.Path(os.environ['FORMLESS_TOPIC_QUESTION_STARTED']).write_text('waiting')
-            result=mcp_call(bridge,3,'tools/call',{'name':'ask_user','arguments':{'questions':[{'question':'Which fresh deployment cove should the preview use?','header':'Cove','multi_select':False,'options':[{'label':'copper'},{'label':'violet'}]}]}})
+            result=mcp_call(bridge,3,'tools/call',{'name':'ask_user','arguments':{'questions':[{'question':'Which fresh deployment cove should the preview use?','multi_select':False,'options':[{'label':'copper'},{'label':'violet'}]}]}})
             assert result['isError']==False,result
             answers=json.loads(result['content'][0]['text'])
             selected=answers[0]['selected']
@@ -214,8 +214,11 @@ async fn topic_mcp_real_stdio_negotiates_and_resolves_named_profile() {
         .unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
+async fn run_named_gemini_topic_question_case(
+    source_request: &str,
+    model_choice: &str,
+    model_answer_is_supported: bool,
+) {
     let env = credential_env::EnvGuard::isolated();
     env.remove("FORMLESS_SECURE");
     let root = tempfile::tempdir().unwrap();
@@ -240,12 +243,9 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
     let store = Store::open(&paths.db_file()).unwrap();
     let source = store.create_session(None).unwrap();
     let message = store
-        .append_message(
-            &source.id,
-            "user",
-            "Create a release preview with an unspecified deployment choice.",
-        )
+        .append_message(&source.id, "user", source_request)
         .unwrap();
+    let source_message_id = message.id.clone();
     let topic = store
         .propose_topic(
             &TopicProposalRequest {
@@ -253,10 +253,10 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
                 source_session_id: source.id,
                 message_ids: vec![message.id.clone()],
                 features: vec![TopicFeatureProposal {
-                    source_message_id: message.id,
+                    source_message_id: message.id.clone(),
                     request: "Create the requested release preview.".into(),
                 }],
-                name: "Fresh deployment choice fixture".into(),
+                name: "Deployment choice fixture".into(),
                 workspace: None,
                 outline: vec![],
             },
@@ -312,8 +312,8 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
             "topic_run_step",
             serde_json::json!({
                 "feature_id":feature_id,
-                "title":"Ask for a fresh deployment choice",
-                "instructions":"Use the scoped Formless MCP ask_user tool for a fresh choice, then complete the step with the exact selected reply.",
+                "title":"Ask for the deployment cove",
+                "instructions":"Use the scoped Formless MCP ask_user tool, then complete the step with the exact selected reply.",
                 "harness":"acp",
                 "acp_agent":"gemini",
                 "access":"write"
@@ -333,7 +333,7 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
         ),
     )
     .await
-    .expect("topic did not surface the fresh ask_user question");
+    .expect("topic did not surface the named-profile ask_user question");
     let question: serde_json::Value = serde_json::from_str(&question_text).unwrap();
     assert_eq!(question["event"], "question", "{question}");
     assert_eq!(question["user_only"], false, "{question}");
@@ -341,6 +341,7 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
         question["questions"][0]["question"],
         "Which fresh deployment cove should the preview use?"
     );
+    assert!(question["questions"][0]["header"].is_null(), "{question}");
     assert_eq!(question["questions"][0]["options"][1]["label"], "violet");
     let question_id = question["question_id"].as_str().unwrap().to_owned();
     assert_eq!(question["attempt_id"], attempt_id);
@@ -350,7 +351,7 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
     );
     assert!(
         !reply.exists(),
-        "the step must remain pending before the user answers"
+        "the step must remain pending before an answer"
     );
 
     let pending = Store::open(&paths.db_file())
@@ -359,67 +360,86 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
         .unwrap()
         .unwrap();
     assert_eq!(pending.status, TopicAttemptStatus::NeedsUser);
-    let (empty_basis, accepted) = daemon
+    let basis = if model_answer_is_supported {
+        "The approved request explicitly selects violet."
+    } else {
+        "The model guessed copper without an explicit choice."
+    };
+    let (model_answer, accepted) = daemon
         .call_tool_direct_outcome(
             &topic_session,
             "topic_answer_question",
             serde_json::json!({
                 "question_id":question_id,
-                "answers":[{"selected":["copper"]}],
-                "basis":""
+                "answers":[{"selected":[model_choice]}],
+                "basis":basis,
+                "evidence":{"message_id":source_message_id,"quote":source_request}
             }),
         )
         .await;
-    assert!(
-        !accepted,
-        "empty-basis model answer was accepted: {empty_basis}"
-    );
-    assert!(empty_basis.contains("basis"), "{empty_basis}");
-    assert_eq!(
-        Store::open(&paths.db_file())
-            .unwrap()
-            .get_topic_attempt(&attempt_id)
-            .unwrap()
-            .unwrap()
-            .status,
-        TopicAttemptStatus::NeedsUser
-    );
-    assert!(
-        !reply.exists(),
-        "an empty-basis answer must not resolve the pending MCP call"
-    );
+    if model_answer_is_supported {
+        assert!(
+            accepted,
+            "grounded model answer was rejected: {model_answer}"
+        );
+        let answer: serde_json::Value = serde_json::from_str(&model_answer).unwrap();
+        assert_eq!(answer["answered"], true, "{answer}");
+    } else {
+        assert!(
+            !accepted,
+            "unsupported model answer was accepted: {model_answer}"
+        );
+        assert!(
+            model_answer
+                .contains("approved request is not one unambiguous choice for this question"),
+            "{model_answer}"
+        );
+        assert_eq!(
+            Store::open(&paths.db_file())
+                .unwrap()
+                .get_topic_attempt(&attempt_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TopicAttemptStatus::NeedsUser
+        );
+        assert!(
+            !reply.exists(),
+            "unsupported model evidence must not resolve the pending MCP call"
+        );
 
-    let request = RequestEnvelope {
-        id: 17,
-        protocol: PROTOCOL_VERSION,
-        request: Request::AnswerQuestion {
-            question_id,
-            answer: "violet".into(),
-            answers: vec![QuestionAnswer {
-                selected: vec!["violet".into()],
-                text: None,
-            }],
-        },
-    };
-    writer
-        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
-        .await
-        .unwrap();
-    let response_ok = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let line = lines.next_line().await.unwrap().unwrap();
-            if let Ok(ServerMessage::Response { id, ok, .. }) =
-                serde_json::from_str::<ServerMessage>(&line)
-            {
-                if id == 17 {
-                    break ok;
+        let request = RequestEnvelope {
+            id: 17,
+            protocol: PROTOCOL_VERSION,
+            request: Request::AnswerQuestion {
+                question_id,
+                answer: "violet".into(),
+                answers: vec![QuestionAnswer {
+                    selected: vec!["violet".into()],
+                    text: None,
+                }],
+            },
+        };
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let response_ok = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                if let Ok(ServerMessage::Response { id, ok, .. }) =
+                    serde_json::from_str::<ServerMessage>(&line)
+                {
+                    if id == 17 {
+                        break ok;
+                    }
                 }
             }
-        }
-    })
-    .await
-    .expect("daemon did not accept the user's question answer");
-    assert!(response_ok);
+        })
+        .await
+        .expect("daemon did not accept the user's question answer");
+        assert!(response_ok);
+    }
 
     let completed_text = tokio::time::timeout(
         Duration::from_secs(30),
@@ -430,7 +450,7 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
         ),
     )
     .await
-    .expect("Gemini topic step did not complete after the user's answer");
+    .expect("Gemini topic step did not complete after its answer");
     let completed: serde_json::Value = serde_json::from_str(&completed_text).unwrap();
     assert_eq!(completed["event"], "completed", "{completed}");
     assert_eq!(completed["status"], "succeeded", "{completed}");
@@ -453,4 +473,20 @@ async fn named_gemini_topic_ask_user_waits_for_and_delivers_user_choice() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn named_gemini_topic_question_uses_grounding_and_human_fallback() {
+    run_named_gemini_topic_question_case(
+        "Which fresh deployment cove should the preview use: violet",
+        "violet",
+        true,
+    )
+    .await;
+    run_named_gemini_topic_question_case(
+        "Create a release preview with an unspecified deployment choice.",
+        "copper",
+        false,
+    )
+    .await;
 }
