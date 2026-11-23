@@ -417,9 +417,12 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
     let executable = dir.join("opencode");
     std::fs::copy(fixture("opencode-availability.py"), &executable).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut path =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    path.insert(0, dir.clone());
     let mut environment = BTreeMap::from([
         ("AVAILABILITY_ENV".into(), "provided".into()),
-        ("PATH".into(), dir.clone().into_os_string()),
+        ("PATH".into(), std::env::join_paths(path).unwrap()),
         (
             "AVAILABILITY_CWD_FILE".into(),
             dir.join("probe-cwd").into_os_string(),
@@ -534,6 +537,7 @@ fn availability_kills_outliving_helper_after_stdout_closes() {
 #[tokio::test]
 async fn aborting_run_cancels_the_blocking_task_without_cancelling_caller() {
     use std::os::unix::fs::PermissionsExt;
+    let _env = crate::credential_env::EnvGuard::isolated();
     let dir = std::env::temp_dir().join(format!("fl-opencode-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let executable = dir.join("opencode");
@@ -604,6 +608,7 @@ async fn pre_cancelled_run_does_not_start_opencode() {
 #[tokio::test]
 async fn public_dispatch_runs_executable_override_with_core_interactions() {
     use std::os::unix::fs::PermissionsExt;
+    let _env = crate::credential_env::EnvGuard::isolated();
     let dir = std::env::temp_dir().join(format!("fl-opencode-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let executable = dir.join("opencode");

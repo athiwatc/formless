@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 import json
 import os
 import signal
@@ -22,7 +22,7 @@ def reply(request, result):
 
 
 assert sys.argv[1:] == ["acp"]
-assert os.environ["PWD"] == os.getcwd()
+assert os.path.samefile(os.environ["PWD"], os.getcwd())
 assert "PROBE_ENV" not in os.environ
 config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
 assert config["default_agent"] == "build"
@@ -38,7 +38,7 @@ assert request["params"]["clientCapabilities"]["elicitation"] == {"form": {}}
 reply(request, {"protocolVersion": 1, "agentInfo": {"name": "OpenCode", "version": "2.3.2"}})
 request = read()
 assert request["method"] == "session/new"
-assert request["params"]["cwd"] == os.getcwd()
+assert os.path.samefile(request["params"]["cwd"], os.getcwd())
 assert request["params"]["mcpServers"][0]["name"] == "formless"
 server = request["params"]["mcpServers"][0]
 if "MCP_CAPTURE_FILE" in os.environ:
