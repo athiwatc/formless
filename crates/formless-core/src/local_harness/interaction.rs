@@ -4,8 +4,8 @@ use anyhow::{bail, Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    acp, acp_agents, antigravity, validate_acp_agent, HarnessKind, HarnessRequest, HarnessResult,
-    InteractionHandler,
+    acp, acp_agents, antigravity, opencode, validate_acp_agent, HarnessKind, HarnessRequest,
+    HarnessResult, InteractionHandler,
 };
 
 /// Runs an interactive ACP harness in a fresh, attempt-scoped session.
@@ -15,11 +15,17 @@ pub async fn run(
     cancel: CancellationToken,
 ) -> Result<HarnessResult> {
     validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
-    if !matches!(request.kind, HarnessKind::Acp | HarnessKind::Antigravity) {
+    if !matches!(
+        request.kind,
+        HarnessKind::Acp | HarnessKind::Antigravity | HarnessKind::OpenCode
+    ) {
         bail!("{:?} interactive adapter not integrated yet", request.kind);
     }
     if cancel.is_cancelled() {
         bail!("harness cancelled before launch");
+    }
+    if request.kind == HarnessKind::OpenCode {
+        return opencode::run(&request, handler, &cancel).await;
     }
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {

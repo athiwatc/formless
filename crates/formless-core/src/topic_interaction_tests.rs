@@ -235,6 +235,89 @@ async fn topic_terminal_report_survives_a_fixture_adapter_late_update_error() {
     assert_eq!(saved.status, TopicStatus::Complete);
 }
 
+#[tokio::test]
+async fn topic_needs_user_report_survives_acp_error_without_assistant_text() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    let handler = f.handler();
+    let output = TopicArtifact::Text {
+        title: "Decision basis".into(),
+        content: "User needs to confirm the account owner".into(),
+    };
+    f.daemon()
+        .handle(Request::TopicMcp {
+            request: TopicMcpRequest {
+                attempt_id: f.attempt.id.clone(),
+                capability_token: f.token.clone(),
+                operation: TopicMcpOperation::ReportResult {
+                    status: TopicAttemptStatus::NeedsUser,
+                    summary: "Waiting for the account owner".into(),
+                    outputs: vec![output.clone()],
+                },
+            },
+        })
+        .await
+        .unwrap();
+
+    let cancelled_error: anyhow::Result<crate::local_harness::HarnessResult> =
+        Err(anyhow::anyhow!("ACP cancelled after the report"));
+    assert!(f
+        .daemon()
+        .accept_topic_harness_result(&f.attempt.id, handler.finish().and(cancelled_error), true,)
+        .is_err());
+
+    let acp_error: anyhow::Result<crate::local_harness::HarnessResult> =
+        Err(anyhow::anyhow!("ACP ended without assistant text"));
+    let result = f
+        .daemon()
+        .accept_topic_harness_result(&f.attempt.id, handler.finish().and(acp_error), false)
+        .unwrap();
+    assert_eq!(result.message, "Waiting for the account owner");
+    f.daemon()
+        .finish_topic_attempt_execution(&f.topic.id, &f.attempt.id, Ok((result, vec![])), false)
+        .unwrap();
+
+    let saved = f.state();
+    assert_eq!(saved.attempts[0].status, TopicAttemptStatus::NeedsUser);
+    assert_eq!(
+        saved.attempts[0].summary.as_deref(),
+        Some("Waiting for the account owner")
+    );
+    assert_eq!(saved.attempts[0].outputs, vec![output.clone()]);
+    assert_eq!(saved.features[0].outputs, vec![output]);
+
+    let waiting = TopicFixture::new(&env);
+    waiting
+        .daemon()
+        .with_store(|st| st.pause_topic_attempt(&waiting.attempt.id, &waiting.token))
+        .unwrap();
+    let no_report_error: anyhow::Result<crate::local_harness::HarnessResult> =
+        Err(anyhow::anyhow!("ACP failed while a question was pending"));
+    assert!(waiting
+        .daemon()
+        .accept_topic_harness_result(&waiting.attempt.id, no_report_error, false)
+        .is_err());
+}
+
+#[tokio::test]
+async fn succeeded_topic_report_with_empty_summary_still_recovers() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(&f.attempt.id, TopicAttemptStatus::Succeeded, "", &[], None)
+        })
+        .unwrap();
+
+    let acp_error: anyhow::Result<crate::local_harness::HarnessResult> =
+        Err(anyhow::anyhow!("ACP ended without assistant text"));
+    let recovered = f
+        .daemon()
+        .accept_topic_harness_result(&f.attempt.id, acp_error, false)
+        .unwrap();
+    assert_eq!(recovered.message, "");
+}
+
 fn permission(always: bool) -> HarnessPermissionRequest {
     HarnessPermissionRequest {
         title: "Read invoices".into(),
