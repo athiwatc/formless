@@ -98,7 +98,7 @@ One daemon owns all state; every client is a thin view of it, so closing one nev
 | Terminal UI | `formless` — the current Session and Run interface; topic navigation is not integrated yet |
 | Desktop app | native GPUI app in [`crates/formless-desktop`](crates/formless-desktop) |
 | Browser | `formless relay enable` — end-to-end encrypted, works on phones ([relay](relay/README.md)) |
-| CLI | `formless run "…"`, `formless chat` — scriptable, with JSON output |
+| CLI | `formless run "…"` — scriptable, with JSON output; `formless chat` opens an interactive line-mode chat |
 
 Keys and commands: [docs/keys.md](docs/keys.md). Every CLI command: [docs/cli.md](docs/cli.md).
 
