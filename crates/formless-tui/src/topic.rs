@@ -454,6 +454,7 @@ impl ProposalForm {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Esc => return Action::Close,
+                    KeyCode::Char('b') if ctrl => self.step = ProposalStep::Messages,
                     KeyCode::Char('n') if ctrl => self.add_step(),
                     KeyCode::Char('d') if ctrl => self.remove_step(),
                     KeyCode::Tab | KeyCode::Down => {
@@ -515,6 +516,10 @@ impl ProposalForm {
             }
             ProposalStep::Review => match key.code {
                 KeyCode::Esc => Action::Close,
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.step = ProposalStep::Messages;
+                    Action::None
+                }
                 KeyCode::Backspace => {
                     self.step = ProposalStep::Fields;
                     Action::None
@@ -2006,9 +2011,9 @@ impl State {
                 match proposal.step {
                     ProposalStep::Messages => "Space select · Enter fields · Esc cancel",
                     ProposalStep::Fields => {
-                        "Tab move · ←/→ choose · Ctrl+N add step · Ctrl+D remove step · Enter next · Esc cancel"
+                        "Ctrl+B requests · Tab move · ←/→ choose · Ctrl+N add step · Ctrl+D remove step · Enter next · Esc cancel"
                     }
-                    ProposalStep::Review => "Enter propose only · Backspace edit · Esc cancel",
+                    ProposalStep::Review => "Ctrl+B requests · Enter propose only · Backspace edit · Esc cancel",
                     ProposalStep::Sending => {
                         "Submitting proposal · no messages moved and no workflow started"
                     }
@@ -2683,6 +2688,35 @@ mod tests {
         assert_eq!(request.workspace, Some(PathBuf::from("/repo")));
         assert!(request.outline.is_empty(), "Formless plans by default");
         assert_eq!(request.parent_topic_id, None);
+    }
+
+    #[test]
+    fn proposal_form_can_return_to_requests_without_losing_fields_or_selection() {
+        let source = session("main");
+        let messages = [message("u1", 1, "user", "First request")];
+        let mut form = ProposalForm::new(&source, &messages, "/repo", "Work", vec![], None);
+        form.name.set("Keep this name");
+        form.workspace.set("/keep/workspace");
+        form.step = ProposalStep::Fields;
+        form.field_index = 2;
+        form.key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(form.step, ProposalStep::Messages);
+        assert_eq!(form.name.expanded(), "Keep this name");
+        assert_eq!(form.workspace.expanded(), "/keep/workspace");
+        assert_eq!(form.selected, HashSet::from(["u1".into()]));
+        assert_eq!(form.field_index, 2);
+
+        form.step = ProposalStep::Review;
+        form.key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(form.step, ProposalStep::Messages);
+        assert_eq!(form.name.expanded(), "Keep this name");
+        assert_eq!(form.selected, HashSet::from(["u1".into()]));
     }
 
     #[test]
