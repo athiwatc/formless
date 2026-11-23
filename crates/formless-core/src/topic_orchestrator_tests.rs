@@ -281,6 +281,11 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     .unwrap();
     assert_eq!(message.role, "user");
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
+    assert!(message.content.contains(concat!(
+        "Available harness kinds: claude, codex, antigravity, acp; ",
+        "pi, opencode and muse currently return adapter-not-integrated errors. ",
+        "ACP requires acp_agent."
+    )));
     assert!(message
         .content
         .contains("Inputs are exact artifact references from any finalized output in this topic."));
