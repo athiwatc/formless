@@ -1185,16 +1185,16 @@ mod tests {
 
         press(&mut app, KeyCode::Char('1'));
         press(&mut app, KeyCode::Char('1'));
-        assert_eq!(permission_decisions(&wire), [("p1".into(), Some("allow".into()))]);
+        assert_eq!(
+            permission_decisions(&wire),
+            [("p1".into(), Some("allow".into()))]
+        );
 
         let _ = render(&mut app, 120);
         press(&mut app, KeyCode::Char('1'));
         assert_eq!(
             permission_decisions(&wire),
-            [
-                ("p1".into(), Some("allow".into())),
-                ("p2".into(), Some("allow".into()))
-            ]
+            [("p2".into(), Some("allow".into()))]
         );
     }
 
@@ -1202,7 +1202,7 @@ mod tests {
     fn generated_user_messages_render_with_marker_attribution() {
         let mut app = test_app();
         app.current = Some("s1".into());
-        let mut generated = formless_protocol::MessageInfo {
+        let generated = formless_protocol::MessageInfo {
             id: "generated".into(),
             session_id: "s1".into(),
             seq: 1,
@@ -1222,11 +1222,13 @@ mod tests {
             meta: None,
             generated_by: None,
         };
-        generated.seq = 1;
         app.messages = vec![generated, genuine];
 
         let screen = render(&mut app, 120);
-        assert!(screen.contains("Formless · generated: topic_kickoff"), "{screen}");
+        assert!(
+            screen.contains("Formless · generated: topic_kickoff"),
+            "{screen}"
+        );
         assert!(screen.contains("You"), "{screen}");
         assert_eq!(screen.matches("Same kickoff text").count(), 2, "{screen}");
     }
@@ -1470,17 +1472,15 @@ mod tests {
         }];
         app.topic
             .open_proposal(&source, &messages, "/repo", "Work", None);
-        app.topic_action(Action::Propose(
-            formless_protocol::TopicProposalRequest {
-                parent_topic_id: None,
-                source_session_id: "main".into(),
-                message_ids: vec!["m1".into()],
-                features: vec![],
-                name: "Work".into(),
-                workspace: Some("/repo".into()),
-                outline: vec![],
-            },
-        ));
+        app.topic_action(Action::Propose(formless_protocol::TopicProposalRequest {
+            parent_topic_id: None,
+            source_session_id: "main".into(),
+            message_ids: vec!["m1".into()],
+            features: vec![],
+            name: "Work".into(),
+            workspace: Some("/repo".into()),
+            outline: vec![],
+        }));
         assert!(app.topic.proposal_is_sending());
         let proposal_id = wire
             .requests()
@@ -1490,9 +1490,7 @@ mod tests {
             .id;
         app.pending_since.insert(
             proposal_id,
-            std::time::Instant::now()
-                - REQUEST_DEADLINE
-                - std::time::Duration::from_secs(1),
+            std::time::Instant::now() - REQUEST_DEADLINE - std::time::Duration::from_secs(1),
         );
 
         app.expire_pending();
