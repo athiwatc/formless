@@ -1955,6 +1955,11 @@ impl Shell {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn sampled_steerable_run_id(&self) -> Option<&str> {
+        self.client_steerable_run_id.as_deref()
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn send_review_open(&self) -> bool {
         self.forecast
             .as_ref()

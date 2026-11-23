@@ -104,6 +104,19 @@ impl Fixture {
             }))
             .unwrap()
     }
+    fn sent_run(
+        &self,
+        cx: &mut TestAppContext,
+        h: WindowHandle<Root>,
+        s: &Entity<Shell>,
+        sending: tokio::task::JoinHandle<Value>,
+    ) -> String {
+        until(cx, h, s, "Send acknowledged", |_| sending.is_finished());
+        self.runtime.block_on(sending).unwrap()["run_id"]
+            .as_str()
+            .expect("direct Send starts one Run")
+            .to_owned()
+    }
     fn pending(&self) -> Value {
         self.runtime
             .block_on(self.daemon.handle(Request::PendingApprovals))
@@ -216,7 +229,7 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
     let mut first_id = None;
     for (index, allow) in [true, false].into_iter().enumerate() {
         assert!(!f.marker.exists());
-        let sending = f.send(&f.session);
+        let run_id = f.sent_run(cx, handle, &shell, f.send(&f.session));
         // A fake model must not emit a whole Tool exchange while this fixture
         // blocks the desktop's bounded update consumer. Observe the new Run
         // and a live desktop subscriber before releasing its Tool response.
@@ -226,7 +239,7 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
             &shell,
             "new Run observed before Tool response",
             |s| {
-                sending.is_finished()
+                s.sampled_steerable_run_id() == Some(run_id.as_str())
                     && f.calls.load(Ordering::SeqCst) == index * 2 + 1
                     && s.step_mode_enable_target()
                         .is_some_and(|a| a.session_id == f.session)
@@ -236,7 +249,6 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
                     && f.daemon.subscriber_count() > 0
             },
         );
-        f.runtime.block_on(sending).unwrap();
         f.tool_response.add_permits(1);
         f.wait(cx, handle, &shell, "one real approval", || {
             f.pending().as_array().is_some_and(|a| a.len() == 1)
@@ -426,9 +438,11 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
     });
     let first = f.send(&f.session);
     let second = f.send(&other);
+    let selected_run = f.sent_run(cx, h, &s, first);
+    let other_run = f.sent_run(cx, h, &s, second);
+    assert_ne!(selected_run, other_run);
     until(cx, h, &s, "both Runs started before Tool responses", |s| {
-        first.is_finished()
-            && second.is_finished()
+        s.sampled_steerable_run_id() == Some(selected_run.as_str())
             && f.calls.load(Ordering::SeqCst) == 2
             && s.step_mode_enable_target()
                 .is_some_and(|a| a.session_id == f.session)
@@ -437,8 +451,6 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
                 .is_some_and(|r| r.run_state == formless_desktop::model::RunState::Running)
             && f.daemon.subscriber_count() > 0
     });
-    f.runtime.block_on(first).unwrap();
-    f.runtime.block_on(second).unwrap();
     f.tool_response.add_permits(2);
     f.wait(cx, h, &s, "two simultaneous approvals", || {
         f.pending().as_array().unwrap().len() == 2
