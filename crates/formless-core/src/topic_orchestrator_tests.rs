@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "topic_opencode_dispatch_tests.rs"]
+mod opencode_dispatch;
+
 fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
     std::fs::write(&path,r#"#!/usr/bin/env python3

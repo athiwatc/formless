@@ -24,6 +24,10 @@ config = json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])
 assert config["default_agent"] == "build"
 assert "mcp" not in config
 assert "cap-secret" not in json.dumps(config)
+assert "FORMLESS_TOPIC_CAPABILITY" not in json.dumps(config)
+if "TOPIC_PROMPT_MARKER" in os.environ:
+    for name in ("FORMLESS_TOPIC_CAPABILITY", "FORMLESS_DATA_DIR", "FORMLESS_CONFIG_DIR", "FORMLESS_TOPIC_OUTPUTS_DIR"):
+        assert name not in os.environ
 request = read()
 assert request["method"] == "initialize"
 assert request["params"]["clientCapabilities"]["elicitation"] == {"form": {}}
@@ -32,7 +36,12 @@ request = read()
 assert request["method"] == "session/new"
 assert request["params"]["cwd"] == os.getcwd()
 assert request["params"]["mcpServers"][0]["name"] == "formless"
-assert request["params"]["mcpServers"][0]["env"] == [{"name": "PROBE_ENV", "value": "cap-secret"}]
+server = request["params"]["mcpServers"][0]
+if "MCP_CAPTURE_FILE" in os.environ:
+    with open(os.environ["MCP_CAPTURE_FILE"], "w") as capture:
+        json.dump(server, capture)
+else:
+    assert server["env"] == [{"name": "PROBE_ENV", "value": "cap-secret"}]
 reply(request, {"sessionId": "fake-session", "configOptions": [{
     "id": "mode", "category": "mode", "type": "select", "currentValue": "user-default",
     "options": [{"value": "build", "name": "Build"}],
@@ -43,6 +52,8 @@ assert request["params"]["value"] == "build"
 reply(request, {})
 prompt = read()
 assert prompt["method"] == "session/prompt"
+if "TOPIC_PROMPT_MARKER" in os.environ:
+    assert os.environ["TOPIC_PROMPT_MARKER"] in json.dumps(prompt["params"])
 if "CANCEL_PROBE" in os.environ:
     signal.alarm(10)
     with open(os.environ["CANCEL_PROBE"], "w") as probe:
