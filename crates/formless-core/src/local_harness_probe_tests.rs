@@ -261,12 +261,16 @@ async fn official_probe_timeout_is_unknown_and_bounded() {
 
 #[tokio::test]
 async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() {
-    let (_root, mut ctx) = fixture();
+    let (root, mut ctx) = fixture();
     let value = dispatch(HarnessKind::Acp, &ctx, Some("grok")).await;
     assert_eq!(value.acp_agent.as_deref(), Some("grok"));
     assert!(value.installed);
     assert!(value.signed_in.is_none());
     ctx.environment.clear();
+    let empty_path = root.0.join("missing-bin");
+    std::fs::create_dir(&empty_path).unwrap();
+    ctx.environment
+        .insert("PATH".into(), empty_path.into_os_string());
     let missing = probe_environment(
         HarnessKind::Acp,
         Some("grok"),
