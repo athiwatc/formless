@@ -7077,6 +7077,14 @@ operations. RequestPermission only raises a user request; it cannot decide one.
 An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
 
+OpenCode readiness uses `FORMLESS_TOPIC_OPENCODE_EXE`, or resolves `opencode`
+from PATH when unset. Its probe runs only `--version`; credential status stays
+unknown because OpenCode credential-list commands can write state and access
+the network. OpenCode can still use its free default model without credentials.
+Developer-only live-test controls are `FORMLESS_AGY_BIN`,
+`FORMLESS_LIVE_AGY`, `FORMLESS_OPENCODE_BIN` and
+`FORMLESS_OPENCODE_SMOKE_DIR`; they do not configure runtime harness behavior.
+
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
 directory is the real boundary. Pi ReadOnly is tool-restricted (`--tools`
@@ -7234,8 +7242,12 @@ No operation changes the source checkout or moves the user's branch.
 
 Directory Write and ReadOnly steps recursively copy the source into their
 private workspace; a selected Directory input becomes the starting copy.
-Copies skip .git, reject special files and symlinks escaping the source
-tree, and rewrite internal links to stay within the copy. File data copying
+Copies skip .git and reject special files, absolute symlink targets and
+targets escaping the source tree. Containment follows symlinks in the longest
+existing target prefix before resolving the remaining nonexistent components;
+existing prefixes reached again through .. are resolved as well.
+Unresolvable existing links are rejected. Relative internal links are
+preserved as-is, including dangling links. File data copying
 runs off the async executor and checks cancellation. The attempt area must
 be outside the source tree to avoid recursive/self-copying. Scratch steps
 get an empty private workspace. Directory Write automatically reports a
@@ -7248,5 +7260,14 @@ Harness-reported directories must be inside that attempt's private outputs.
 Concurrent workflows and Write steps may share a source workspace because
 the old exclusive source-workspace lock is no longer acquired. Per-attempt
 leases/cancel tokens remain live through validation and are released on stop.
+Harness-process and adapter errors after a successful report are logged and
+ignored at the adapter boundary. Daemon validation always runs afterward:
+dirty worktrees, HEAD/reported-revision mismatches, changed file hashes and
+invalid Directory outputs fail the attempt and discard its provisional outputs.
+Only validated outputs are published to the feature. Cancelled and Abandoned
+attempts are never overwritten. CLI exit still releases the
+active-attempt gate before explicit feature completion is allowed. A feature's
+successful terminal state is Ready, reached through topic_complete_feature,
+not automatically through report_result.
 Combining outputs is explicit work in a later isolated step, never an
 automatic merge or push into the source workspace.

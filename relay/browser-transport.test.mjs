@@ -7,6 +7,32 @@ import * as transport from "./web/transport.mjs";
 const source=readFileSync(new URL('./web/app.js',import.meta.url),'utf8');
 const fn=name=>{const start=source.search(new RegExp('  (?:async )?function '+name+'\\('));assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);};
 const generation='a'.repeat(32);
+test('authenticated browser requests reach the daemon send path within the plaintext boundary',async()=>{
+  for(const size of [0,transport.LIMITS.plaintext,transport.LIMITS.plaintext+1]){
+    const received=[],closes=[];
+    const key=await webcrypto.subtle.generateKey({name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+    const ws={readyState:1,close:code=>closes.push(code)};
+    const S={ws,channel:{key,sent:0},local:false,relayReady:true,relayModule:transport,relayMemory:new transport.MemoryBudget(512*1024*1024),pending:new Map(),sendChain:Promise.resolve(),nextId:1};
+    S.relayLink={ws,endpoint:{async start(frame){
+      const value=JSON.parse(frame);
+      const plaintext=await webcrypto.subtle.decrypt({name:'AES-GCM',iv:Buffer.from(value.iv,'base64'),additionalData:new TextEncoder().encode('formless-relay/2 b2d '+value.seq)},key,Buffer.from(value.ct,'base64'));
+      const request=JSON.parse(new TextDecoder().decode(plaintext));
+      received.push(request);
+      S.pending.get(request.id).resolve('pong');S.pending.delete(request.id);
+    }}};
+    const c=vm.createContext({S,PROTOCOL:1,FRAME_VERSION:2,crypto:webcrypto,Uint8Array,btoa,enc:s=>new TextEncoder().encode(s),aad:(direction,seq)=>new TextEncoder().encode('formless-relay/2 '+direction+' '+seq),setTimeout(){return 1;},clearTimeout(){}});
+    vm.runInContext(['request','encrypt','bytesToB64'].map(fn).join('\n'),c);
+    const request={type:'ping'};
+    if(size){request.padding='';request.padding='x'.repeat(size-JSON.stringify({id:1,protocol:1,request}).length);}
+    const result=c.request(request);
+    if(size>transport.LIMITS.plaintext) await assert.rejects(result,/relay frame too large/);
+    else assert.equal(await result,'pong');
+    await S.sendChain;
+    assert.equal(received.length,size>transport.LIMITS.plaintext?0:1);
+    assert.equal(S.channel.sent,size>transport.LIMITS.plaintext?0:1);
+    assert.deepEqual(closes,[]);assert.equal(S.relayMemory.used,0);
+  }
+});
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return{promise,resolve};};
 async function until(predicate){const end=Date.now()+2000;while(!predicate()){assert.ok(Date.now()<end,'bounded browser fixture');await new Promise(r=>setTimeout(r,2));}}
 async function browser(keyGate=null,decryptGate=null){
