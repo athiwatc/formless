@@ -22425,10 +22425,10 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str(&line).unwrap())
             .collect();
-        assert_eq!(retried.len(), 2);
+        assert_eq!(retried.len(), 3);
         assert!(retried.iter().all(|request| matches!(
             request.request,
-            Request::Subscribe { .. } | Request::GetSession { .. }
+            Request::Subscribe { .. } | Request::PendingApprovals | Request::GetSession { .. }
         )));
         let (next, _) = app.reconnect_request.clone().unwrap();
         assert_ne!(next, id);
@@ -34113,7 +34113,7 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str(&line).unwrap())
             .collect();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         for request in requests {
             match request.request {
                 Request::Subscribe {
@@ -34125,6 +34125,7 @@ mod tests {
                     session_id: Some(id),
                     ..
                 } => assert_eq!(id, "source"),
+                Request::PendingApprovals => {}
                 other => panic!("switching must not commit, send or generate: {other:?}"),
             }
         }
