@@ -1946,6 +1946,7 @@ struct App {
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
     questions: Vec<OpenQuestion>,
+    questions_awaiting_close: HashMap<String, String>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
     /// The current Session's Runs, for the footer under each answer.
@@ -2300,6 +2301,7 @@ impl App {
             conn: None,
             others: Vec::new(),
             questions: Vec::new(),
+            questions_awaiting_close: HashMap::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
             session_runs: Vec::new(),
@@ -2596,6 +2598,7 @@ impl App {
         self.approvals.clear();
         self.promotions.clear();
         self.questions.clear();
+        self.questions_awaiting_close.clear();
         self.approval_summaries.clear();
         self.approval_batches.clear();
         self.approval_scopes.clear();
@@ -6592,17 +6595,17 @@ impl App {
                 question_id,
                 answered_by,
             } => {
-                let closed_session = self
+                let open_session = self
                     .questions
                     .iter()
                     .find(|question| question.id == question_id)
                     .map(|question| question.session_id.clone());
+                let closed_session =
+                    open_session.or_else(|| self.questions_awaiting_close.remove(&question_id));
                 if answered_by.as_deref() == Some("model") {
-                    let asker = self
-                        .questions
-                        .iter()
-                        .find(|q| q.id == question_id)
-                        .and_then(|q| self.topic.harness_label_for_session(&q.session_id));
+                    let asker = closed_session
+                        .as_deref()
+                        .and_then(|session| self.topic.harness_label_for_session(session));
                     self.notes.push(match asker {
                         Some(asker) => format!(
                             "Formless answered the question from {asker}; the answer is in the Topic Chat."
@@ -6610,11 +6613,16 @@ impl App {
                         None => "Formless answered an open question.".into(),
                     });
                 }
+                self.questions_awaiting_close.remove(&question_id);
                 self.questions.retain(|q| q.id != question_id);
                 let current_session_has_question = self.current.as_deref().is_some_and(|session| {
                     self.questions
                         .iter()
                         .any(|question| question.session_id == session)
+                        || self
+                            .questions_awaiting_close
+                            .values()
+                            .any(|closed_session| closed_session == session)
                 });
                 if closed_session
                     .as_deref()
@@ -7570,6 +7578,8 @@ impl App {
             return;
         }
         let open = self.questions.remove(i);
+        self.questions_awaiting_close
+            .insert(open.id.clone(), open.session_id.clone());
         self.fire(Request::AnswerQuestion {
             question_id: open.id,
             answer: QuestionAnswer::summary_of(&open.answers),
@@ -20879,6 +20889,7 @@ mod tests {
             conn: None,
             others: Vec::new(),
             questions: Vec::new(),
+            questions_awaiting_close: HashMap::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
             session_runs: Vec::new(),
@@ -22830,16 +22841,24 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_answer_footer_tracks_open_questions_in_current_session() {
+    fn awaiting_answer_footer_tracks_submitted_questions_until_their_close() {
         let question = |question_id: &str, session_id: &str| Event::UserQuestion {
             user_only: false,
             topic_id: None,
             attempt_id: None,
             question_id: question_id.into(),
             session_id: session_id.into(),
-            question: format!("Question {question_id}?"),
+            question: String::new(),
             options: Vec::new(),
-            questions: Vec::new(),
+            questions: vec![Question {
+                question: format!("Question {question_id}?"),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Done".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
         };
         let close = |question_id: &str| Event::UserQuestionClosed {
             question_id: question_id.into(),
@@ -22847,12 +22866,37 @@ mod tests {
         };
         let mut app = test_app();
         app.current = Some("s1".into());
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
         app.on_event(question("q1", "s1"));
-        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
-
         app.on_event(question("q2", "s1"));
         app.on_event(question("other-session", "s2"));
+
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.current_question().is_none(),
+            "submitted prompts are not active"
+        );
+        assert!(app
+            .questions
+            .iter()
+            .any(|question| question.id == "other-session"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+
+        let answered_ids = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .filter_map(|envelope| match envelope.request {
+                Request::AnswerQuestion { question_id, .. } => Some(question_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered_ids, ["q1", "q2"]);
+
         app.on_event(close("unknown"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
         app.on_event(close("q1"));
         assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
 
@@ -22864,6 +22908,15 @@ mod tests {
             .questions
             .iter()
             .any(|question| question.id == "other-session"));
+
+        app.on_event(question("q3", "s1"));
+        app.key(key(KeyCode::Enter));
+        app.set_activity("working");
+        app.on_event(close("q3"));
+        assert!(app
+            .activity_text()
+            .as_deref()
+            .is_some_and(|activity| activity.contains("working")));
     }
 
     #[test]
