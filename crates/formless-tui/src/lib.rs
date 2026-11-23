@@ -3045,6 +3045,10 @@ impl App {
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
+            if matches!(kind, Pending::TopicPropose) {
+                self.topic_proposal_timed_out();
+                continue;
+            }
             if matches!(kind, Pending::SuggestName { .. }) {
                 self.cancel_rename();
             }

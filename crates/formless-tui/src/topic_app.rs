@@ -194,6 +194,15 @@ impl App {
         self.topic_action(action);
     }
 
+    pub(crate) fn topic_proposal_timed_out(&mut self) {
+        self.topic.close_overlay();
+        self.refresh_topics();
+        self.notes.push(
+            "Topic proposal timed out; its outcome is unknown. Check /topics before trying again. No proposal was resent."
+                .into(),
+        );
+    }
+
     fn topic_action(&mut self, action: Action) {
         match action {
             Action::None | Action::Close => {}
@@ -1440,6 +1449,67 @@ mod tests {
         assert!(wire.requests()[before..]
             .iter()
             .any(|request| matches!(request.request, Request::GetMainChat)));
+    }
+
+    #[test]
+    fn timed_out_topic_proposal_closes_and_refreshes_without_replay() {
+        let (mut app, wire) = connected(vec![]);
+        let source: SessionInfo = serde_json::from_value(serde_json::json!({
+            "id":"main", "name":"Main Chat", "created_at":"", "updated_at":"", "cwd":"/repo"
+        }))
+        .unwrap();
+        let messages = [formless_protocol::MessageInfo {
+            id: "m1".into(),
+            session_id: "main".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "Build a feature".into(),
+            created_at: String::new(),
+            meta: None,
+            generated_by: None,
+        }];
+        app.topic
+            .open_proposal(&source, &messages, "/repo", "Work", None);
+        app.topic_action(Action::Propose(
+            formless_protocol::TopicProposalRequest {
+                parent_topic_id: None,
+                source_session_id: "main".into(),
+                message_ids: vec!["m1".into()],
+                features: vec![],
+                name: "Work".into(),
+                workspace: Some("/repo".into()),
+                outline: vec![],
+            },
+        ));
+        assert!(app.topic.proposal_is_sending());
+        let proposal_id = wire
+            .requests()
+            .into_iter()
+            .find(|request| matches!(request.request, Request::ProposeTopic { .. }))
+            .unwrap()
+            .id;
+        app.pending_since.insert(
+            proposal_id,
+            std::time::Instant::now()
+                - REQUEST_DEADLINE
+                - std::time::Duration::from_secs(1),
+        );
+
+        app.expire_pending();
+
+        assert!(!app.topic.overlay_open());
+        assert!(app.notes.last().unwrap().contains("outcome is unknown"));
+        let requests = wire.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request.request, Request::ProposeTopic { .. }))
+                .count(),
+            1
+        );
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request.request, Request::ListTopics)));
     }
 
     fn render(app: &mut App, width: u16) -> String {
