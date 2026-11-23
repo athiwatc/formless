@@ -1845,7 +1845,7 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         fs::write(&release, "continue").unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !finished.exists() {
+            while fs::read_to_string(&finished).ok().as_deref() != Some("cancelled") {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
