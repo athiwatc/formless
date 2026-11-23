@@ -1054,6 +1054,12 @@ async fn topic_fixture_scoped_mcp_results_conversations_files_and_cancellation()
         .join("topic-attempts")
         .join(&attempt.id)
         .join("outputs/report.txt");
+    #[cfg(unix)]
+    let output = {
+        let alias = f.root.join("outputs-alias");
+        std::os::unix::fs::symlink(output.parent().unwrap(), &alias).unwrap();
+        alias.join(output.file_name().unwrap())
+    };
     std::fs::write(&output, b"report").unwrap();
     let hash = format!("{:x}", Sha256::digest(b"report"));
     for (path, sha256) in [
@@ -1091,7 +1097,13 @@ async fn topic_fixture_scoped_mcp_results_conversations_files_and_cancellation()
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(report.outputs, outputs);
+    let mut expected_outputs = outputs.clone();
+    for artifact in &mut expected_outputs {
+        if let TopicArtifact::File { path, .. } = artifact {
+            *path = path.canonicalize().unwrap();
+        }
+    }
+    assert_eq!(report.outputs, expected_outputs);
     assert_eq!(report.summary.as_deref(), Some("Done"));
     assert!(f
         .daemon()

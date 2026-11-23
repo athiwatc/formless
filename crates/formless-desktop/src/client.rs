@@ -932,7 +932,10 @@ enum Pending {
         questions_revision: u64,
         status_revision: u64,
     },
-    Page(Destination),
+    Page {
+        destination: Destination,
+        refresh_after: bool,
+    },
     Action(Action),
     Forecast(Box<Preparation>),
     Consent(Box<Preparation>),
@@ -1560,7 +1563,7 @@ impl Engine {
             || self
                 .pending
                 .values()
-                .any(|p| matches!(p, Pending::Page(d) if *d == destination))
+                .any(|p| matches!(p, Pending::Page { destination: d, .. } if *d == destination))
         {
             return;
         }
@@ -1577,7 +1580,27 @@ impl Engine {
                 _ => return,
             },
         };
-        self.request(request, Pending::Page(destination));
+        self.request(
+            request,
+            Pending::Page {
+                destination,
+                refresh_after: false,
+            },
+        );
+    }
+
+    fn invalidate_page(&mut self, destination: Destination) {
+        if let Some(refresh_after) = self.pending.values_mut().find_map(|pending| match pending {
+            Pending::Page {
+                destination: pending_destination,
+                refresh_after,
+            } if *pending_destination == destination => Some(refresh_after),
+            _ => None,
+        }) {
+            *refresh_after = true;
+        } else {
+            self.load_page(destination);
+        }
     }
 
     fn command(&mut self, command: Command) {
@@ -2475,7 +2498,7 @@ impl Engine {
                             | (Destination::Jobs, Event::JobsChanged)
                     );
                     if refresh {
-                        self.load_page(destination);
+                        self.invalidate_page(destination);
                     }
                 }
                 if let Event::CompactionNotice { session_id, .. } = &event {
@@ -3162,13 +3185,26 @@ impl Engine {
                     }
                 }
                 if self.page == Some(destination) {
-                    self.load_page(destination);
+                    self.invalidate_page(destination);
                 }
             }
-            Pending::Page(destination) => self.updates.push(Update::Page {
+            Pending::Page {
                 destination,
-                result,
-            }),
+                refresh_after,
+            } => {
+                if refresh_after {
+                    // The reply may reflect the state before the invalidation;
+                    // do not publish it even while the follow-up is in flight.
+                    if self.page == Some(destination) {
+                        self.load_page(destination);
+                    }
+                } else {
+                    self.updates.push(Update::Page {
+                        destination,
+                        result,
+                    });
+                }
+            }
             Pending::Action(action) => {
                 self.dirty_session = true;
                 self.dirty_list = true;
@@ -5818,6 +5854,91 @@ mod tests {
         engine
             .receive(ServerMessage::Event(Event::JobsChanged))
             .unwrap();
+        assert!(engine.outgoing.is_empty());
+    }
+
+    #[test]
+    fn resource_invalidation_during_read_coalesces_into_one_follow_up() {
+        for stay_on_page in [true, false] {
+            let mut engine = ready();
+            engine.load_page(Destination::Jobs);
+            let first = engine.outgoing.pop_front().unwrap();
+            assert!(matches!(first.request, Request::ListJobs));
+            for _ in 0..2 {
+                engine
+                    .receive(ServerMessage::Event(Event::JobsChanged))
+                    .unwrap();
+            }
+            assert!(engine.outgoing.is_empty());
+            if !stay_on_page {
+                engine.load_page(Destination::Skills);
+                let navigation = engine.outgoing.pop_front().unwrap();
+                assert!(matches!(navigation.request, Request::ListSkills));
+            }
+            respond(&mut engine, first.id, json!([{"name": "stale"}]));
+            assert!(!engine.updates.iter().any(|update| matches!(
+                update,
+                Update::Page {
+                    destination: Destination::Jobs,
+                    ..
+                }
+            )));
+            if stay_on_page {
+                let follow_up = engine.outgoing.pop_front().expect("dirty page must reload");
+                assert!(matches!(follow_up.request, Request::ListJobs));
+                respond(&mut engine, follow_up.id, json!([]));
+                assert!(matches!(
+                    engine.updates.last(),
+                    Some(Update::Page {
+                        destination: Destination::Jobs,
+                        result: Ok(_),
+                    })
+                ));
+            } else {
+                assert_eq!(engine.page, Some(Destination::Skills));
+            }
+            assert!(engine.outgoing.is_empty());
+        }
+    }
+
+    #[test]
+    fn management_receipt_during_read_waits_for_one_fresh_snapshot() {
+        let mut engine = ready();
+        engine.load_page(Destination::Skills);
+        let first = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(first.request, Request::ListSkills));
+        engine.command(Command::Manage {
+            destination: Destination::Skills,
+            request: Request::RemoveSkill { name: "foo".into() },
+            label: "remove skill foo".into(),
+        });
+        let action = engine.outgoing.pop_front().unwrap();
+        respond(&mut engine, action.id, json!({}));
+        assert!(matches!(
+            engine.updates.last(),
+            Some(Update::ManagementNotice {
+                destination: Destination::Skills,
+                ..
+            })
+        ));
+        assert!(engine.outgoing.is_empty());
+        engine
+            .receive(ServerMessage::err(first.id, "old read failed".into()))
+            .unwrap();
+        assert!(matches!(
+            engine.updates.last(),
+            Some(Update::ManagementNotice { .. })
+        ));
+        let follow_up = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(follow_up.request, Request::ListSkills));
+        respond(&mut engine, follow_up.id, json!([]));
+        assert!(matches!(
+            engine.updates.last(),
+            Some(Update::Page {
+                destination: Destination::Skills,
+                result: Ok(_),
+            })
+        ));
         assert!(engine.outgoing.is_empty());
     }
 

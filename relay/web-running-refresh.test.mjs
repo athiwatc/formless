@@ -104,3 +104,43 @@ test('drawer layout and completion hooks use the same refresh logic', () => {
   assert.match(section, /cancel_invocation[\s\S]+then\(\(\) => refreshRunning\(\)\)/);
   assert.match(section, /abandon_invocation[\s\S]+then\(\(\) => refreshRunning\(\)\)/);
 });
+
+test('same transport waits for an obsolete subscription read and retries once', async () => {
+  const { S, context, requests, paints, reply } = harness();
+  S.conn = 'old';
+  context.refreshRunning();
+  S.conn = 'new';
+  context.refreshRunning();
+  context.refreshRunning();
+  assert.equal(requests.length, 1, 'a client ID change did not reopen the transport');
+  await reply([{ handle: 'obsolete' }]);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(paints, []);
+  const fresh = [{ handle: 'fresh' }];
+  await reply(fresh);
+  assert.deepEqual(paints, [fresh]);
+  assert.equal(requests.length, 2);
+});
+
+test('exposure fences an earlier read and retries until an empty snapshot succeeds', async () => {
+  const { S, document, context, requests, paints, flush, reply, fail } = harness();
+  document.hidden = true;
+  context.refreshRunning();
+  context.tick();
+  assert.equal(requests.length, 1);
+  document.hidden = false;
+  document.change();
+  await reply([{ handle: 'pre-exposure' }]);  // Also fence before the layout microtask runs.
+  flush();
+  assert.equal(requests.length, 2);
+  assert.deepEqual(paints, []);
+  await fail();
+  assert.deepEqual(S.invocations, []);
+  context.tick();
+  context.tick();
+  assert.equal(requests.length, 3, 'one retry even with no cached rows');
+  await reply([]);
+  context.tick();
+  assert.equal(requests.length, 3, 'no timer reads after an empty success');
+  assert.deepEqual(paints, [[]]);
+});
