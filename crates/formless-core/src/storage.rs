@@ -2317,7 +2317,8 @@ impl Store {
     pub(crate) fn recent_topic_messages(&self, session_id: &str) -> Result<Vec<Value>> {
         let mut stmt = self.ps(
             "SELECT id, seq, CASE WHEN length(CAST(content AS BLOB)) <= 4096 THEN content END
-             FROM messages WHERE session_id=?1 AND role='user' ORDER BY seq DESC LIMIT 8",
+             FROM messages WHERE session_id=?1 AND role='user' AND generated_by IS NULL
+             ORDER BY seq DESC LIMIT 8",
         )?;
         let mut rows = stmt
             .query_map(params![session_id], |row| {

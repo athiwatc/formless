@@ -489,6 +489,57 @@ async fn topic_suggestions_reject_overlapping_pending_sources() {
 }
 
 #[tokio::test]
+async fn topic_context_excludes_generated_user_messages() {
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let (main, generated) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?;
+            let generated = st.append_message_generated(
+                &main.id,
+                "user",
+                "Generated workflow kickoff",
+                None,
+                Some("topic_kickoff"),
+            )?;
+            Ok((main, generated))
+        })
+        .unwrap();
+
+    let (empty, failed) = dispatch(&daemon, &main.id, 0, READ_TOPIC_CONTEXT, json!({})).await;
+    assert!(!failed, "{empty}");
+    assert!(serde_json::from_str::<Value>(&empty).unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let normal = daemon
+        .with_store(|st| st.append_message(&main.id, "user", "A real request"))
+        .unwrap();
+    let (context, failed) =
+        dispatch(&daemon, &main.id, 0, READ_TOPIC_CONTEXT, json!({})).await;
+    assert!(!failed, "{context}");
+    let context: Value = serde_json::from_str(&context).unwrap();
+    let messages = context["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["id"], normal.id);
+    assert_ne!(messages[0]["id"], generated.id);
+
+    let (result, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        json!({
+            "name": "Invalid generated proposal",
+            "message_ids": [generated.id],
+            "features": [{"source_message_id": generated.id, "request": "Do not propose this"}],
+        }),
+    )
+    .await;
+    assert!(failed && result.contains("generated messages cannot be proposed"), "{result}");
+}
+
+#[tokio::test]
 async fn main_topic_suggests_accounting_outline_without_workspace() {
     let (_fixture, daemon) = Fixture::new(&Config::default());
     let request = "Set up accounting: scan receipts, do accounting, then create reports.";
