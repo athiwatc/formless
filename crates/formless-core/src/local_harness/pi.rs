@@ -101,10 +101,21 @@ async fn availability_with_path(
     override_executable: Option<&OsStr>,
     search_path: Option<&OsStr>,
 ) -> HarnessAvailability {
-    let program = executable
-        .or_else(|| override_executable.map(Path::new))
-        .unwrap_or_else(|| Path::new("pi"));
-    let resolved = find_pi_executable(program, search_path);
+    let explicit = executable.or_else(|| override_executable.map(Path::new));
+    let (resolved, missing_detail) = match explicit {
+        Some(program) if !program.is_absolute() => (
+            None,
+            "Pi executable override must be an absolute path; relative overrides are not allowed",
+        ),
+        Some(program) => (
+            candidate_for_platform(program, cfg!(windows), cfg!(unix)),
+            "Pi executable override was not found or is not executable",
+        ),
+        None => (
+            find_pi_executable(Path::new("pi"), search_path),
+            "Pi executable was not found in absolute PATH directories",
+        ),
+    };
     let mut availability = HarnessAvailability {
         kind: HarnessKind::Pi,
         acp_agent: None,
@@ -115,7 +126,7 @@ async fn availability_with_path(
     };
     let version = match resolved {
         Some(program) => probe_version(&program).await,
-        None => Err("Pi executable was not found or is not executable"),
+        None => Err(missing_detail),
     };
     match version {
         Ok(version) => availability.version = Some(version),
@@ -166,31 +177,21 @@ fn find_pi_executable_for_platform(
     windows: bool,
     require_executable: bool,
 ) -> Option<PathBuf> {
-    find_pi_executable_for_platform_in_cwd(program, search_path, windows, require_executable, None)
-}
-
-fn find_pi_executable_for_platform_in_cwd(
-    program: &Path,
-    search_path: Option<&OsStr>,
-    windows: bool,
-    require_executable: bool,
-    execution_cwd: Option<&Path>,
-) -> Option<PathBuf> {
     if program.as_os_str().is_empty() {
         return None;
     }
-    if program.is_absolute() || program.components().count() > 1 {
-        let program = resolve_candidate_path(program, execution_cwd);
-        return candidate_for_platform(&program, windows, require_executable);
+    if program.is_absolute() {
+        return candidate_for_platform(program, windows, require_executable);
+    }
+    if program.components().count() > 1 {
+        return None;
     }
     let search_path = search_path?;
-    let directories: Vec<_> = if search_path.is_empty() {
-        vec![PathBuf::new()]
-    } else {
-        std::env::split_paths(search_path).collect()
-    };
-    for directory in directories {
-        let path = resolve_candidate_path(&directory.join(program), execution_cwd);
+    for directory in std::env::split_paths(search_path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let path = directory.join(program);
         if let Some(path) = candidate_for_platform(&path, windows, require_executable) {
             return Some(path);
         }
@@ -198,43 +199,41 @@ fn find_pi_executable_for_platform_in_cwd(
     None
 }
 
-fn resolve_candidate_path(path: &Path, execution_cwd: Option<&Path>) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else if let Some(execution_cwd) = execution_cwd {
-        execution_cwd.join(path)
-    } else {
-        path.to_owned()
-    }
-}
-
 fn resolve_request_executable(
     executable: Option<&Path>,
     request_override: Option<&OsStr>,
     process_override: Option<&OsStr>,
     search_path: Option<&OsStr>,
-    request_path_overridden: bool,
-    execution_cwd: &Path,
     windows: bool,
     require_executable: bool,
 ) -> Result<PathBuf> {
-    let program = executable
-        .or_else(|| request_override.map(Path::new))
-        .or_else(|| process_override.map(Path::new))
-        .unwrap_or_else(|| Path::new("pi"));
-    if let Some(resolved) = find_pi_executable_for_platform_in_cwd(
-        program,
-        search_path,
-        windows,
-        require_executable,
-        Some(execution_cwd),
-    ) {
-        return Ok(resolved);
+    if let Some(program) = executable {
+        if !program.is_absolute() {
+            bail!("Pi executable override must be an absolute path; relative overrides are not allowed");
+        }
+        return candidate_for_platform(program, windows, require_executable).with_context(|| {
+            format!(
+                "Pi executable override `{}` was not found or is not executable",
+                program.display()
+            )
+        });
     }
-    if request_path_overridden && !program.is_absolute() && program.components().count() == 1 {
-        bail!("Pi executable was not found in the request PATH");
+
+    if let Some(value) = request_override.or(process_override) {
+        let program = Path::new(value);
+        if !program.is_absolute() {
+            bail!("FORMLESS_TOPIC_PI_EXE must be an absolute path; relative overrides are not allowed");
+        }
+        return candidate_for_platform(program, windows, require_executable).with_context(|| {
+            format!(
+                "Pi executable override `{}` was not found or is not executable",
+                program.display()
+            )
+        });
     }
-    Ok(program.to_owned())
+
+    find_pi_executable_for_platform(Path::new("pi"), search_path, windows, require_executable)
+        .context("Pi executable was not found in absolute PATH directories")
 }
 
 async fn probe_version(executable: &Path) -> std::result::Result<String, &'static str> {
@@ -423,11 +422,6 @@ pub fn command_spec_with_extension(
         .map(OsString::as_os_str);
     let process_path = std::env::var_os("PATH");
     let process_override = std::env::var_os("FORMLESS_TOPIC_PI_EXE");
-    let execution_cwd = if request.cwd.is_absolute() {
-        request.cwd.clone()
-    } else {
-        std::env::current_dir()?.join(&request.cwd)
-    };
     let program = resolve_request_executable(
         request.executable.as_deref(),
         request
@@ -436,8 +430,6 @@ pub fn command_spec_with_extension(
             .map(OsString::as_os_str),
         process_override.as_deref(),
         request_path.or(process_path.as_deref()),
-        request_path.is_some(),
-        &execution_cwd,
         cfg!(windows),
         cfg!(unix),
     )?;
@@ -1525,7 +1517,12 @@ printf '1.6.0\n'"#,
             assert!(!result.installed);
             assert_eq!(result.version, None);
             assert_eq!(result.signed_in, None);
-            assert!(result.detail.unwrap().contains("not found"));
+            let detail = result.detail.unwrap();
+            if explicit.is_some_and(|path| !path.is_absolute()) {
+                assert!(detail.contains("must be an absolute path"));
+            } else {
+                assert!(detail.contains("not found"));
+            }
         }
         fs::set_permissions(&program, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
@@ -2232,7 +2229,7 @@ mod tests {
             mcp_command: std::env::temp_dir().join("formless mcp"),
             mcp_args: vec!["serve".into(), "--literal $value".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
-            executable: Some(PathBuf::from("pi-test")),
+            executable: Some(std::env::current_exe().unwrap()),
             environment: BTreeMap::from([(
                 OsString::from("FORMLESS_TOPIC_CAPABILITY"),
                 OsString::from("secret-token"),
@@ -2268,8 +2265,6 @@ mod tests {
                 None,
                 Some(dir.as_os_str()),
                 true,
-                &dir,
-                true,
                 false,
             )
             .unwrap(),
@@ -2301,8 +2296,6 @@ mod tests {
                 Some(request_override.as_os_str()),
                 Some(exe.as_os_str()),
                 Some(dir.as_os_str()),
-                true,
-                &dir,
                 true,
                 false,
             )
@@ -2652,7 +2645,7 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(spec.program, PathBuf::from("pi-test"));
+        assert_eq!(spec.program, request.executable.clone().unwrap());
         assert_eq!(spec.cwd, request.cwd);
         assert_eq!(
             args[0..8],
@@ -2716,13 +2709,11 @@ mod tests {
     }
 
     #[test]
-    fn command_spec_omits_optional_model_and_uses_default_executable() {
+    fn command_spec_omits_optional_model() {
         let (dir, extension) = staged_extension();
         let mut request = request(StepAccess::Write);
         request.model = None;
-        request.executable = None;
         let spec = command_spec_with_extension(&request, &extension).unwrap();
-        assert_eq!(spec.program, PathBuf::from("pi"));
         assert!(!spec.args.iter().any(|arg| arg == "--model"));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2758,34 +2749,49 @@ mod tests {
         fs::remove_dir_all(bin_dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn availability_rejects_relative_executable_override() {
+        let override_executable = OsString::from("relative-bin/pi");
+        let availability =
+            super::availability_with_path(None, Some(&override_executable), None).await;
+        assert!(!availability.installed);
+        assert!(availability
+            .detail
+            .unwrap()
+            .contains("must be an absolute path"));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn command_spec_resolves_relative_path_entries_from_attempt_cwd() {
+    fn command_spec_and_availability_skip_relative_and_empty_path_entries() {
         use std::os::unix::fs::PermissionsExt;
 
         let (attempt_dir, extension) = staged_extension();
-        let daemon_dir = temp_dir();
-        let daemon_bin = daemon_dir.join("bin");
-        let absolute_bin = temp_dir();
-        fs::create_dir_all(&daemon_bin).unwrap();
-        let daemon_pi = daemon_bin.join("pi");
-        let absolute_pi = absolute_bin.join("pi");
-        for path in [&daemon_pi, &absolute_pi] {
+        let relative_bin = attempt_dir.join("relative-bin");
+        let trusted_bin = temp_dir();
+        fs::create_dir(&relative_bin).unwrap();
+        let workspace_pi = attempt_dir.join("pi");
+        let relative_pi = relative_bin.join("pi");
+        let trusted_pi = trusted_bin.join("pi");
+        for path in [&workspace_pi, &relative_pi, &trusted_pi] {
             fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        let search_path =
-            std::env::join_paths([OsString::from("bin"), absolute_bin.as_os_str().into()]).unwrap();
+        let search_path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-bin"),
+            trusted_bin.as_os_str().to_owned(),
+        ])
+        .unwrap();
         assert_eq!(
-            super::find_pi_executable_for_platform_in_cwd(
+            super::find_pi_executable_for_platform(
                 Path::new("pi"),
                 Some(&search_path),
                 false,
                 true,
-                Some(&daemon_dir),
             ),
-            Some(daemon_pi)
+            Some(trusted_pi.clone())
         );
 
         let mut request = request(StepAccess::Write);
@@ -2795,23 +2801,22 @@ mod tests {
             .environment
             .insert(OsString::from("PATH"), search_path);
         let spec = command_spec_with_extension(&request, &extension).unwrap();
-        assert_eq!(spec.program, absolute_pi);
+        assert_eq!(spec.program, trusted_pi);
         fs::remove_dir_all(attempt_dir).unwrap();
-        fs::remove_dir_all(daemon_dir).unwrap();
-        fs::remove_dir_all(absolute_bin).unwrap();
+        fs::remove_dir_all(trusted_bin).unwrap();
     }
 
     #[cfg(unix)]
     #[test]
-    fn command_spec_resolves_empty_and_relative_path_from_attempt_cwd() {
+    fn command_spec_fails_without_absolute_path_candidate_and_rejects_relative_override() {
         use std::os::unix::fs::PermissionsExt;
 
         let (attempt_dir, extension) = staged_extension();
-        let current_pi = attempt_dir.join("pi");
         let relative_bin = attempt_dir.join("relative-bin");
         let relative_pi = relative_bin.join("pi");
         fs::create_dir(&relative_bin).unwrap();
-        for path in [&current_pi, &relative_pi] {
+        let workspace_pi = attempt_dir.join("pi");
+        for path in [&workspace_pi, &relative_pi] {
             fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -2819,22 +2824,20 @@ mod tests {
         let mut request = request(StepAccess::Write);
         request.cwd = attempt_dir.clone();
         request.executable = None;
-        request
-            .environment
-            .insert(OsString::from("PATH"), OsString::new());
-        let spec = command_spec_with_extension(&request, &extension).unwrap();
-        assert_eq!(spec.program, current_pi);
+        request.environment.insert(
+            OsString::from("PATH"),
+            std::env::join_paths([OsString::new(), OsString::from("relative-bin")]).unwrap(),
+        );
+        let error = command_spec_with_extension(&request, &extension)
+            .err()
+            .expect("relative-only PATH must not resolve a workspace executable");
+        assert!(error.to_string().contains("absolute PATH directories"));
 
         request.executable = Some(PathBuf::from("relative-bin/pi"));
-        let spec = command_spec_with_extension(&request, &extension).unwrap();
-        assert_eq!(spec.program, relative_pi);
-
-        request.executable = None;
-        request
-            .environment
-            .insert(OsString::from("PATH"), OsString::from("relative-bin"));
-        let spec = command_spec_with_extension(&request, &extension).unwrap();
-        assert_eq!(spec.program, relative_pi);
+        let error = command_spec_with_extension(&request, &extension)
+            .err()
+            .expect("relative executable override must be rejected");
+        assert!(error.to_string().contains("must be an absolute path"));
         fs::remove_dir_all(attempt_dir).unwrap();
     }
 
