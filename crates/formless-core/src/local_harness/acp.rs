@@ -239,6 +239,7 @@ where
 {
     let (sender, mut asks) = tokio::sync::mpsc::unbounded_channel();
     let run_cancel = cancel.child_token();
+    let _cancel_on_drop = run_cancel.clone().drop_guard();
     let blocking_cancel = run_cancel.clone();
     let runtime = tokio::runtime::Handle::current();
     let mut job = tokio::task::spawn_blocking(move || {
@@ -1729,6 +1730,132 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.message, "done");
+    }
+
+    #[tokio::test]
+    async fn aborting_guarded_run_cancels_blocking_adapter_before_spawn() {
+        use crate::local_harness::InteractionFuture;
+        use std::{fs, path::PathBuf, thread};
+
+        struct NoInteractions;
+        impl InteractionHandler for NoInteractions {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                Box::pin(async { None })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async { None })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn wait_then_spawn(
+            request: &HarnessRequest,
+            _: &mut dyn PermissionHandler,
+            cancel: &CancellationToken,
+            spawn: &mut ProcessSpawner,
+        ) -> Result<HarnessResult> {
+            let path = |name: &str| -> Result<PathBuf> {
+                Ok(PathBuf::from(
+                    request
+                        .environment
+                        .get(&OsString::from(name))
+                        .context("missing abort-test path")?,
+                ))
+            };
+            let started = path("ACP_ABORT_STARTED")?;
+            let release = path("ACP_ABORT_RELEASE")?;
+            let finished = path("ACP_ABORT_FINISHED")?;
+            let spawn_called = path("ACP_ABORT_SPAWN_CALLED")?;
+            let spawn_marker = path("ACP_ABORT_SPAWN_MARKER")?;
+            fs::write(started, "ready")?;
+            while !release.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if cancel.is_cancelled() {
+                fs::write(finished, "cancelled")?;
+                bail!("cancelled before spawn");
+            }
+            fs::write(finished, "not-cancelled")?;
+            let mut command = Command::new("touch");
+            command.arg(spawn_marker);
+            let _process = spawn(command, cancel)?;
+            fs::write(spawn_called, "spawned")?;
+            bail!("adapter reached spawn after wrapper was dropped")
+        }
+
+        let dir = std::env::temp_dir().join(format!("formless-acp-abort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let started = dir.join("started");
+        let release = dir.join("release");
+        let finished = dir.join("finished");
+        let spawn_called = dir.join("spawn-called");
+        let spawn_marker = dir.join("spawn-marker");
+        let mut request = request(StepAccess::Write);
+        request.environment.extend([
+            ("ACP_ABORT_STARTED".into(), started.clone().into_os_string()),
+            ("ACP_ABORT_RELEASE".into(), release.clone().into_os_string()),
+            (
+                "ACP_ABORT_FINISHED".into(),
+                finished.clone().into_os_string(),
+            ),
+            (
+                "ACP_ABORT_SPAWN_CALLED".into(),
+                spawn_called.clone().into_os_string(),
+            ),
+            (
+                "ACP_ABORT_SPAWN_MARKER".into(),
+                spawn_marker.clone().into_os_string(),
+            ),
+        ]);
+        let caller_cancel = CancellationToken::new();
+        let cancel = caller_cancel.clone();
+        let handler = NoInteractions;
+        let spawn_called_for_closure = spawn_called.clone();
+        let task = tokio::spawn(async move {
+            run_interactive_with_spawn(
+                wait_then_spawn,
+                request,
+                &handler,
+                &cancel,
+                move |command, _| {
+                    fs::write(&spawn_called_for_closure, "spawned")?;
+                    SupervisedProcess::spawn(command).map_err(|error| anyhow!(error))
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocking adapter did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        fs::write(&release, "continue").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !finished.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocking adapter did not observe cancellation");
+        assert_eq!(fs::read_to_string(finished).unwrap(), "cancelled");
+        assert!(!spawn_called.exists());
+        assert!(!spawn_marker.exists());
+        assert!(!caller_cancel.is_cancelled());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

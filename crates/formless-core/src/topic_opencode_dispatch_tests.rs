@@ -285,8 +285,8 @@ fn cancellation_while_queued_on_launch_lock_prevents_actual_spawn() {
     let daemon = f.daemon().clone();
     let cancel = CancellationToken::new();
     let marker = f.root.join("queued-spawn-marker");
-    let mut command = std::process::Command::new("sh");
-    command.arg("-c").arg(format!("touch {}", marker.display()));
+    let mut command = std::process::Command::new("touch");
+    command.arg(&marker);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let spawn_daemon = daemon.clone();
     let lock_probe = daemon.clone();
