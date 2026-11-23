@@ -700,7 +700,10 @@ fn rpc_execution_error(
 struct BoundedLineReader<R> {
     reader: R,
     buffered: Vec<u8>,
+    scan_cursor: usize,
     eof: bool,
+    #[cfg(test)]
+    scanned_bytes: usize,
 }
 
 impl<R: AsyncRead + Unpin> BoundedLineReader<R> {
@@ -708,24 +711,45 @@ impl<R: AsyncRead + Unpin> BoundedLineReader<R> {
         Self {
             reader,
             buffered: Vec::new(),
+            scan_cursor: 0,
             eof: false,
+            #[cfg(test)]
+            scanned_bytes: 0,
         }
     }
 
     async fn next_line(&mut self, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
         let mut chunk = [0; 8192];
         loop {
-            if let Some(newline) = self.buffered.iter().position(|byte| *byte == b'\n') {
-                if newline > max_bytes {
-                    return Err(record_limit_error(max_bytes));
+            if self.scan_cursor < self.buffered.len() {
+                let unscanned = &self.buffered[self.scan_cursor..];
+                if let Some(offset) = unscanned.iter().position(|byte| *byte == b'\n') {
+                    #[cfg(test)]
+                    {
+                        self.scanned_bytes += offset + 1;
+                    }
+                    let newline = self.scan_cursor + offset;
+                    if newline > max_bytes {
+                        return Err(record_limit_error(max_bytes));
+                    }
+                    let consumed = newline + 1;
+                    let line = self.buffered.drain(..consumed).collect();
+                    self.scan_cursor = 0;
+                    return Ok(Some(line));
                 }
-                return Ok(Some(self.buffered.drain(..=newline).collect()));
+                #[cfg(test)]
+                {
+                    self.scanned_bytes += unscanned.len();
+                }
+                self.scan_cursor = self.buffered.len();
             }
             if self.buffered.len() > max_bytes {
                 return Err(record_limit_error(max_bytes));
             }
             if self.eof {
-                return Ok((!self.buffered.is_empty()).then(|| std::mem::take(&mut self.buffered)));
+                let line = (!self.buffered.is_empty()).then(|| std::mem::take(&mut self.buffered));
+                self.scan_cursor = 0;
+                return Ok(line);
             }
             let remaining = max_bytes
                 .saturating_add(1)
@@ -2483,6 +2507,25 @@ mod tests {
         let mut reader = BoundedLineReader::new(reader);
         let error = reader.next_line(8).await.unwrap_err();
         assert!(error.to_string().contains("8-byte limit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_rpc_line_reader_scans_each_record_byte_once() {
+        use tokio::io::AsyncWriteExt;
+
+        let record_bytes = 256 * 1024;
+        let (mut writer, reader) = tokio::io::duplex(record_bytes + 1);
+        let mut record = vec![b'x'; record_bytes];
+        record.push(b'\n');
+        writer.write_all(&record).await.unwrap();
+        drop(writer);
+
+        let mut reader = BoundedLineReader::new(reader);
+        assert_eq!(
+            reader.next_line(record_bytes).await.unwrap(),
+            Some(record.clone())
+        );
+        assert_eq!(reader.scanned_bytes, record_bytes + 1);
     }
 
     #[test]
