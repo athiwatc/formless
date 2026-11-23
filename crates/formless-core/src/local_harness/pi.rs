@@ -32,6 +32,7 @@ const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
 const REDACTED_CAPABILITY: &str = "[REDACTED]";
 const MAX_RPC_RECORD_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const PROMPT_REJECTION_ERROR_LIMIT: usize = 512;
 const SIGN_IN_UNKNOWN: &str = "Sign-in unknown: Pi's read-only auth check requires a provider or model; there is no read-only CLI check for any provider. --list-models initializes writable state; auth.json alone omits environment, custom and ambient credentials.";
 
 fn redact_text(text: &str, capability: Option<&str>) -> String {
@@ -39,6 +40,26 @@ fn redact_text(text: &str, capability: Option<&str>) -> String {
         .filter(|capability| !capability.is_empty())
         .map(|capability| text.replace(capability, REDACTED_CAPABILITY))
         .unwrap_or_else(|| text.to_owned())
+}
+
+fn prompt_rejection_diagnostic(event: &Value, capability: Option<&str>) -> String {
+    let Some(error) = event["error"]
+        .as_str()
+        .filter(|error| !error.trim().is_empty())
+    else {
+        return "Pi RPC prompt was rejected".to_owned();
+    };
+    let error = redact_text(error, capability);
+    let end = (0..=PROMPT_REJECTION_ERROR_LIMIT)
+        .rev()
+        .find(|index| error.is_char_boundary(*index))
+        .unwrap_or(0);
+    let error = if end < error.len() {
+        format!("{}…", &error[..end])
+    } else {
+        error
+    };
+    format!("Pi RPC prompt was rejected: {error}")
 }
 
 fn redact_value(value: &mut Value, capability: Option<&str>) {
@@ -838,7 +859,7 @@ async fn rpc_session(
                         Some("abort-1") if cancelling => bail!("Pi run cancelled"),
                         Some("prompt-1") => {
                             if event["command"] != "prompt" || event["success"] != true {
-                                bail!("Pi RPC prompt was rejected");
+                                bail!("{}", prompt_rejection_diagnostic(&event, capability));
                             }
                             let disposition = event["data"]["disposition"].as_str().unwrap_or("missing");
                             if disposition != "started" {
@@ -1598,7 +1619,8 @@ while IFS= read -r remaining; do :; done
     async fn fake_rpc_redacts_capability_from_events_questions_and_diagnostics() {
         let _guard = FAKE_PROCESS_LOCK.lock().await;
         let (dir, extension, mut request) = fake_pi("");
-        let secret = request.environment[&OsString::from(crate::local_harness::TOPIC_CAPABILITY_ENV)]
+        let secret = request.environment
+            [&OsString::from(crate::local_harness::TOPIC_CAPABILITY_ENV)]
             .to_string_lossy()
             .into_owned();
         let nonsecret_path = "/private/nonsecret-path";
@@ -1659,7 +1681,9 @@ while IFS= read -r remaining; do :; done
         drop(updates);
         fs::remove_dir_all(dir).unwrap();
 
-        let (dir, extension, request) = fake_pi(&format!("printf '%s\\n' 'stderr {secret} {nonsecret_path}' >&2\nexit 1"));
+        let (dir, extension, request) = fake_pi(&format!(
+            "printf '%s\\n' 'stderr {secret} {nonsecret_path}' >&2\nexit 1"
+        ));
         let error = run(
             &request,
             &extension,
@@ -1915,6 +1939,64 @@ wait
             if expected == "before successful settle" {
                 assert!(error.contains("early failure"));
             }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_prompt_rejection_reports_bounded_redacted_error_or_fallback() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        for (error_text, expected) in [
+            (
+                Some(format!(
+                    "provider rejected secret-token {}",
+                    "x".repeat(2_000)
+                )),
+                "provider rejected [REDACTED]",
+            ),
+            (None, "Pi RPC prompt was rejected"),
+        ] {
+            let state_response = json!({
+                "type":"response",
+                "id":"state-1",
+                "command":"get_state",
+                "success":true,
+                "data":{"sessionId":"rpc-session"}
+            });
+            let mut prompt_response = json!({
+                "type":"response",
+                "id":"prompt-1",
+                "command":"prompt",
+                "success":false
+            });
+            if let Some(error_text) = error_text {
+                prompt_response["error"] = json!(error_text);
+            }
+            let body = format!(
+                "IFS= read -r state\nprintf '%s\\n' '{state_response}'\nIFS= read -r prompt\nprintf '%s\\n' '{prompt_response}'"
+            );
+            let (dir, extension, request) = fake_pi(&body);
+            let error = timeout(
+                Duration::from_secs(10),
+                run(
+                    &request,
+                    &extension,
+                    &RecordingHandler::new(true, false),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("secret-token"), "{error}");
+            assert!(
+                error.len() < PROMPT_REJECTION_ERROR_LIMIT + 160,
+                "{} bytes",
+                error.len()
+            );
             fs::remove_dir_all(dir).unwrap();
         }
     }
