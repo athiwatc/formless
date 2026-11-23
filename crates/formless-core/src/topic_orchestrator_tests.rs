@@ -3355,6 +3355,48 @@ fn grok_fixture_process_stopped(pid: i32) -> bool {
     }
 }
 
+fn grok_fixture_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+struct GrokFixtureProcessGuard {
+    cancel: CancellationToken,
+    agent_pid_path: PathBuf,
+    child_pid_path: PathBuf,
+    armed: bool,
+}
+
+impl GrokFixtureProcessGuard {
+    fn terminate(&self) {
+        self.cancel.cancel();
+        if let Some(pid) = grok_fixture_pid(&self.agent_pid_path) {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        for path in [&self.agent_pid_path, &self.child_pid_path] {
+            if let Some(pid) = grok_fixture_pid(path) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrokFixtureProcessGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.terminate();
+        }
+    }
+}
+
 #[tokio::test]
 async fn topic_orchestrator_fixture_grok_acp_step_routes_permissions_questions_and_completion() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -3493,14 +3535,20 @@ async fn topic_orchestrator_fixture_grok_acp_cancellation_cleans_up_process_grou
     args["acp_agent"] = json!("grok");
     let daemon = f.daemon().clone();
     let cancel = CancellationToken::new();
+    let agent_pid_path = f.root.join("grok-pid");
+    let child_pid_path = f.root.join("grok-child-pid");
+    let mut cleanup = GrokFixtureProcessGuard {
+        cancel: cancel.clone(),
+        agent_pid_path: agent_pid_path.clone(),
+        child_pid_path: child_pid_path.clone(),
+        armed: true,
+    };
     let run_cancel = cancel.clone();
-    let task = tokio::spawn(async move {
+    let mut task = tokio::spawn(async move {
         daemon
             .run_topic_step_until_done(&session, &args, &run_cancel)
             .await
     });
-    let agent_pid_path = f.root.join("grok-pid");
-    let child_pid_path = f.root.join("grok-child-pid");
     wait_until(|| agent_pid_path.exists() && child_pid_path.exists()).await;
     f.daemon()
         .handle(Request::CancelTopic {
@@ -3508,11 +3556,41 @@ async fn topic_orchestrator_fixture_grok_acp_cancellation_cleans_up_process_grou
         })
         .await
         .unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let result = match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            cleanup.terminate();
+            let agent_pid = grok_fixture_pid(&agent_pid_path).expect("ACP agent pid was captured");
+            let child_pid = grok_fixture_pid(&child_pid_path).expect("ACP child pid was captured");
+            let processes_stopped = tokio::time::timeout(Duration::from_secs(3), async {
+                while !grok_fixture_process_stopped(agent_pid)
+                    || !grok_fixture_process_stopped(child_pid)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let mut task_stopped = tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_ok();
+            if !task_stopped {
+                task.abort();
+                task_stopped = tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_ok();
+            }
+            if processes_stopped {
+                cleanup.disarm();
+            }
+            assert!(
+                processes_stopped,
+                "watchdog left the Grok ACP process group alive"
+            );
+            assert!(task_stopped, "watchdog could not stop the Grok ACP task");
+            panic!("Grok ACP cancellation exceeded its watchdog after cleanup");
+        }
+    };
     assert_eq!(result["status"], "cancelled", "{result}");
     assert_eq!(result["harness"], "acp");
     assert_eq!(result["acp_agent"], "grok");
@@ -3527,4 +3605,5 @@ async fn topic_orchestrator_fixture_grok_acp_cancellation_cleans_up_process_grou
         .unwrap();
         assert!(grok_fixture_process_stopped(pid));
     }
+    cleanup.disarm();
 }
