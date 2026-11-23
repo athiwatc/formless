@@ -1390,6 +1390,7 @@ mod tests {
         let workspace_bin = workspace.join(&relative_bin);
         let global_bin = workspace.join("global");
         let marker = workspace.join("selected");
+        let marker_complete = workspace.join("selected.complete");
         for directory in [&daemon_bin, &workspace_bin, &global_bin] {
             std::fs::create_dir_all(directory).unwrap();
         }
@@ -1402,7 +1403,9 @@ mod tests {
             let executable = directory.join("gemini");
             std::fs::write(
                 &executable,
-                format!("#!/bin/sh\nprintf '%s' '{selected}' > \"$ACP_LAUNCH_MARKER\"\n"),
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{selected}' > \"$ACP_LAUNCH_MARKER\"\n: > \"$ACP_LAUNCH_MARKER_COMPLETE\"\n"
+                ),
             )
             .unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1420,6 +1423,10 @@ mod tests {
             "ACP_LAUNCH_MARKER".into(),
             marker.as_os_str().to_os_string(),
         );
+        request.environment.insert(
+            "ACP_LAUNCH_MARKER_COMPLETE".into(),
+            marker_complete.as_os_str().to_os_string(),
+        );
         assert_eq!(
             agent_program("gemini", &request, &BTreeMap::new(), false),
             PathBuf::from("gemini")
@@ -1428,10 +1435,13 @@ mod tests {
         let spec = crate::local_harness::acp_agents::spec("gemini").unwrap();
         let agent = AgentProcess::spawn(spec, &request).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < deadline {
+        while !marker_complete.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(marker.exists(), "workspace PATH executable did not launch");
+        assert!(
+            marker_complete.exists(),
+            "workspace PATH executable did not finish writing its marker"
+        );
         let selected = std::fs::read_to_string(&marker).unwrap();
         drop(agent);
         assert_eq!(selected, "workspace");
