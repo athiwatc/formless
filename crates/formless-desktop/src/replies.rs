@@ -104,9 +104,12 @@ impl UnfinishedRun {
     }
 }
 
-/// The block kind a message role is shown as. Matches the TUI's mapping.
-pub fn block_kind(role: &str) -> BlockKind {
-    match role {
+/// Display daemon-generated user turns as notes, not as the user's words.
+pub fn block_kind(message: &MessageInfo) -> BlockKind {
+    if message.role == "user" && message.generated_by.is_some() {
+        return BlockKind::Note;
+    }
+    match message.role.as_str() {
         "user" => BlockKind::User,
         "tool" => BlockKind::ToolSummary,
         "system-note" => BlockKind::Note,
@@ -227,11 +230,11 @@ pub(crate) fn message_sequence(asked: &str, message: &MessageInfo) -> Result<u64
 
 fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlock>, DecodeError> {
     let id = message_sequence(asked, &message)?;
-    let kind = block_kind(&message.role);
+    let kind = block_kind(&message);
     if kind == BlockKind::Assistant && message.content.trim().is_empty() {
         return Ok(None);
     }
-    let attachments = if kind == BlockKind::User {
+    let attachments = if message.role == "user" {
         crate::transcript_attachments::decode(message.meta.as_deref())
     } else {
         Vec::new()

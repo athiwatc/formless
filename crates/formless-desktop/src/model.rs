@@ -781,7 +781,7 @@ pub enum BlockKind {
     Assistant,
     ToolSummary,
     RunRecap,
-    /// A note the daemon adds to a transcript (role `system-note`).
+    /// A daemon-added note, including generated user-role workflow kickoffs.
     Note,
 }
 
