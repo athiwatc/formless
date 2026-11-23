@@ -95,7 +95,7 @@ One daemon owns all state; every client is a thin view of it, so closing one nev
 
 | Client | Start it |
 |---|---|
-| Terminal UI | `formless` — `/main` opens Main Chat, `/topics` browses topics, `/topic` proposes or manages one |
+| Terminal UI | `formless` — the current Session and Run interface; topic navigation is not integrated yet |
 | Desktop app | native GPUI app in [`crates/formless-desktop`](crates/formless-desktop) |
 | Browser | `formless relay enable` — end-to-end encrypted, works on phones ([relay](relay/README.md)) |
 | CLI | `formless run "…"`, `formless chat` — scriptable, with JSON output |
