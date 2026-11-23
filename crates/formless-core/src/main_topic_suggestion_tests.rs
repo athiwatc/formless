@@ -430,6 +430,65 @@ async fn topic_suggestion_dedup_rejects_edited_source_messages() {
 }
 
 #[tokio::test]
+async fn topic_suggestions_reject_overlapping_pending_sources() {
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let (main, first, second) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?;
+            let first = st.append_message(&main.id, "user", "Add feature A")?;
+            let second = st.append_message(&main.id, "user", "Add feature B")?;
+            Ok((main, first, second))
+        })
+        .unwrap();
+    let (created, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        json!({
+            "name": "Feature A",
+            "message_ids": [first.id],
+            "features": [{"source_message_id": first.id, "request": first.content}],
+        }),
+    )
+    .await;
+    assert!(!failed, "{created}");
+    let topic: TopicInfo = serde_json::from_str(&created).unwrap();
+
+    let (result, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        json!({
+            "name": "Features A and B",
+            "message_ids": [first.id, second.id],
+            "features": [
+                {"source_message_id": first.id, "request": first.content},
+                {"source_message_id": second.id, "request": second.content},
+            ],
+        }),
+    )
+    .await;
+    assert!(failed && result.contains("overlap a pending topic proposal"), "{result}");
+    daemon
+        .with_store(|st| {
+            assert_eq!(st.list_topics()?.len(), 1);
+            let approved = st.approve_topic(&topic.id)?;
+            assert_eq!(approved.status, TopicStatus::Approved);
+            assert_eq!(approved.features.len(), 1);
+            assert_eq!(approved.features[0].source_message_id, first.id);
+            assert!(st.get_message(&main.id, &first.id)?.is_none());
+            assert_eq!(
+                st.get_message(&main.id, &second.id)?.unwrap().content,
+                second.content
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
 async fn main_topic_suggests_accounting_outline_without_workspace() {
     let (_fixture, daemon) = Fixture::new(&Config::default());
     let request = "Set up accounting: scan receipts, do accounting, then create reports.";

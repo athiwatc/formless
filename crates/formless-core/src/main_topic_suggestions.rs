@@ -226,26 +226,37 @@ impl Store {
             "every selected source message must have a feature request"
         );
         let mut covered = BTreeSet::new();
-        for topic in self.list_topics()?.into_iter().filter(|topic| {
-            topic.source_session_id == *source
-                && proposal_workspace(topic) == proposal.workspace.as_deref()
-                && topic.parent_topic_id.as_deref() == parent
-        }) {
+        for topic in self
+            .list_topics()?
+            .into_iter()
+            .filter(|topic| topic.source_session_id == *source)
+        {
             let sources = source_ids(&topic);
-            if topic.status == TopicStatus::PendingApproval && sources == selected {
-                ensure!(
-                    self.topic_source_content_unchanged(&topic.id, source, &selected)?,
-                    "a source message changed since the pending proposal; reject it and send a new request before proposing again"
-                );
-                for step in &proposal.outline {
-                    crate::local_harness::validate_acp_agent(
-                        step.harness,
-                        step.acp_agent.as_deref(),
-                    )?;
+            let same_key = proposal_workspace(&topic) == proposal.workspace.as_deref()
+                && topic.parent_topic_id.as_deref() == parent;
+            if topic.status == TopicStatus::PendingApproval
+                && !sources.is_disjoint(&selected)
+            {
+                if same_key && sources == selected {
+                    ensure!(
+                        self.topic_source_content_unchanged(&topic.id, source, &selected)?,
+                        "a source message changed since the pending proposal; reject it and send a new request before proposing again"
+                    );
+                    for step in &proposal.outline {
+                        crate::local_harness::validate_acp_agent(
+                            step.harness,
+                            step.acp_agent.as_deref(),
+                        )?;
+                    }
+                    return Ok(Some(topic));
                 }
-                return Ok(Some(topic));
+                bail!(
+                    "these messages overlap a pending topic proposal; select a new explicit work request"
+                );
             }
-            covered.extend(sources.intersection(&selected).copied().map(str::to_owned));
+            if same_key {
+                covered.extend(sources.intersection(&selected).copied().map(str::to_owned));
+            }
         }
         ensure!(
             covered.len() < selected.len(),
