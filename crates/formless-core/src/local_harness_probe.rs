@@ -194,6 +194,22 @@ pub async fn claude_probe(ctx: &ProbeContext) -> HarnessAvailability {
 pub async fn codex_probe(ctx: &ProbeContext) -> HarnessAvailability {
     official_probe(HarnessKind::Codex, ctx).await
 }
+async fn fallback_probe(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
+    let mut value = availability(kind, Some(&ctx.executable));
+    if !value.installed {
+        return value;
+    }
+    let probe = async {
+        let cwd = ProbeDirectory::new()?;
+        Ok::<_, anyhow::Error>(version(&output(ctx, &["--version"], &cwd.0).await?))
+    };
+    match tokio::time::timeout(ctx.timeout.min(Duration::from_secs(10)), probe).await {
+        Ok(Ok(Some(version))) => value.version = Some(version),
+        Ok(Ok(None)) | Ok(Err(_)) => value.detail = Some("version probe failed".into()),
+        Err(_) => return timed_out(value),
+    }
+    value
+}
 async fn official_probe(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
     let base = availability(kind, Some(&ctx.executable));
     if !base.installed {
@@ -268,22 +284,33 @@ pub async fn blocking_probe(
     }
 }
 
-async fn dispatch(kind: HarnessKind, ctx: &ProbeContext) -> HarnessAvailability {
+async fn dispatch(
+    kind: HarnessKind,
+    ctx: &ProbeContext,
+    agent: Option<&str>,
+) -> HarnessAvailability {
     match kind {
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
-        HarnessKind::Pi => availability(kind, Some(&ctx.executable)),
-        HarnessKind::OpenCode => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Antigravity => availability(kind, Some(&ctx.executable)),
-        HarnessKind::Acp => availability(kind, Some(&ctx.executable)),
+        HarnessKind::Pi => fallback_probe(kind, ctx).await,
+        HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
+        HarnessKind::Antigravity => fallback_probe(kind, ctx).await,
+        HarnessKind::Acp => {
+            let mut value = availability(kind, Some(&ctx.executable));
+            value.acp_agent = agent.map(str::to_owned);
+            value
+        }
         HarnessKind::Muse => super::muse::probe(ctx).await,
     }
 }
 async fn probe_environment(
     kind: HarnessKind,
+    agent: Option<&str>,
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
 ) -> HarnessAvailability {
+    let mut base = availability(kind, None);
+    base.acp_agent = agent.map(str::to_owned);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let lookup_environment = environment.clone();
     let executable = match tokio::time::timeout_at(
@@ -294,37 +321,39 @@ async fn probe_environment(
     {
         Ok(Ok(path)) => path,
         Ok(Err(_)) => None,
-        Err(_) => return timed_out(availability(kind, None)),
+        Err(_) => return timed_out(base),
     };
     let Some(executable) = executable else {
-        let mut value = availability(kind, None);
-        value.detail = Some(format!(
-            "CLI executable not found; install {} or configure FORMLESS_TOPIC_{}_EXE",
-            kind_name(kind),
-            kind_name(kind).to_ascii_uppercase()
-        ));
-        return value;
+        base.detail = Some(if kind == HarnessKind::Acp {
+            "ACP agent executable is not configured".into()
+        } else {
+            format!(
+                "CLI executable not found; install {} or configure FORMLESS_TOPIC_{}_EXE",
+                kind_name(kind),
+                kind_name(kind).to_ascii_uppercase()
+            )
+        });
+        return base;
     };
-    let base = availability(kind, Some(&executable));
+    base.installed = executable_file(&executable);
     let ctx = ProbeContext {
         executable,
         environment: environment.clone(),
         timeout,
     };
-    match tokio::time::timeout_at(deadline, dispatch(kind, &ctx)).await {
+    match tokio::time::timeout_at(deadline, dispatch(kind, &ctx, agent)).await {
         Ok(value) => value,
         Err(_) => timed_out(base),
     }
 }
 pub async fn harness_availability(kind: HarnessKind, agent: Option<&str>) -> HarnessAvailability {
-    let mut value = probe_environment(
+    probe_environment(
         kind,
+        agent,
         &std::env::vars_os().collect(),
         Duration::from_secs(10),
     )
-    .await;
-    value.acp_agent = agent.map(str::to_owned);
-    value
+    .await
 }
 async fn list_environment(
     environment: BTreeMap<OsString, OsString>,
@@ -337,11 +366,10 @@ async fn list_environment(
             HarnessKind::Pi,
             HarnessKind::OpenCode,
             HarnessKind::Antigravity,
-            HarnessKind::Acp,
             HarnessKind::Muse,
         ]
         .into_iter()
-        .map(|kind| probe_environment(kind, &environment, timeout)),
+        .map(|kind| probe_environment(kind, None, &environment, timeout)),
     )
     .await
 }

@@ -25,7 +25,7 @@ concurrency:
   group: docs-${{ github.sha }}
   cancel-in-progress: false
 
-# Only reviewed main content runs on a persistent runner; no PR checkout.
+# Only reviewed main content runs this online link check; no PR checkout.
 jobs:
   links:
     # Exact private issue links require issue metadata as well as file reads.
@@ -33,7 +33,7 @@ jobs:
       contents: read
       issues: read
     if: github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: macos-15
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
