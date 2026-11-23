@@ -3749,7 +3749,7 @@ impl App {
                             let events: Vec<Event> =
                                 serde_json::from_value(result).unwrap_or_default();
                             for event in events {
-                                if matches!(event, Event::HarnessPermissionRequested { .. }) {
+                                if matches!(&event, Event::HarnessPermissionRequested { .. }) {
                                     self.topic_permission_event(event);
                                 }
                             }
