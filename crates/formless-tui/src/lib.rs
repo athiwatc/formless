@@ -385,7 +385,9 @@ enum Pending {
     TopicPermission {
         permission_id: String,
     },
-    HarnessPermissions { closed: HashSet<String> },
+    HarnessPermissions {
+        closed: HashSet<String>,
+    },
     TopicControl {
         topic_id: Option<String>,
         done: String,
@@ -27297,8 +27299,7 @@ mod tests {
                     serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap()
                 })
                 .find_map(|envelope| {
-                    matches!(envelope.request, Request::PendingApprovals)
-                        .then_some(envelope.id)
+                    matches!(envelope.request, Request::PendingApprovals).then_some(envelope.id)
                 })
                 .expect("PendingApprovals request")
         };
@@ -27307,9 +27308,7 @@ mod tests {
         let initial_lines = outbound.try_iter().collect::<Vec<_>>();
         let initial_requests = initial_lines
             .iter()
-            .map(|line| {
-                serde_json::from_str::<formless_protocol::RequestEnvelope>(line).unwrap()
-            })
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(line).unwrap())
             .collect::<Vec<_>>();
         let subscribe_at = initial_requests
             .iter()
@@ -27329,7 +27328,10 @@ mod tests {
             error: None,
         });
         app.drain_daemon();
-        assert!(app.topic.has_permission(), "snapshot response keeps prompt visible");
+        assert!(
+            app.topic.has_permission(),
+            "snapshot response keeps prompt visible"
+        );
 
         app.clear_attention();
         assert!(!app.topic.has_permission());
@@ -27339,12 +27341,15 @@ mod tests {
         send_wire(ServerMessage::Response {
             id: reconnect_query,
             ok: true,
-            result: Some(serde_json::to_value(vec![event]).unwrap()),
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
             error: None,
         });
         app.drain_daemon();
 
-        assert!(app.topic.has_permission(), "pending prompt restored after reconnect");
+        assert!(
+            app.topic.has_permission(),
+            "pending prompt restored after reconnect"
+        );
         let screen = render(&mut app, 100, 40);
         assert!(screen.contains("Fixture simulated write"), "{screen}");
         assert!(screen.contains("1. Allow once"), "{screen}");
