@@ -7083,9 +7083,9 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Muse Code uses its interactive session protocol and requires
-one-run workspace trust from the user. Pi and ACP currently return actionable
-adapter-not-integrated step results.
+another harness. OpenCode and Antigravity use their ACP adapters. Muse Code uses
+its interactive session protocol and requires one-run workspace trust from the
+user. Pi and ACP currently return actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7106,9 +7106,9 @@ An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
 
 OpenCode readiness uses `FORMLESS_TOPIC_OPENCODE_EXE`, or resolves `opencode`
-from PATH when unset. Its probe runs only `--version`; credential status stays
-unknown because OpenCode credential-list commands can write state and access
-the network. OpenCode can still use its free default model without credentials.
+from PATH when unset. Its private-cwd probe runs only `--version`; sign-in stays
+unknown because credential-list commands can write state and access the network.
+OpenCode can still use its free default model without credentials.
 Developer-only live-test controls are `FORMLESS_AGY_BIN`,
 `FORMLESS_LIVE_AGY`, `FORMLESS_OPENCODE_BIN` and
 `FORMLESS_OPENCODE_SMOKE_DIR`; they do not configure runtime harness behavior.
@@ -7232,9 +7232,7 @@ or copy raw auth output into detail or logs.
 Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
 or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
 its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
-`FORMLESS_TOPIC_MUSE_EXE`. OpenCode and Antigravity use their ACP adapters.
-Muse Code checks its version before using usage --json and only confirms sign-in when it
-receives a Meta account allowance. Pi uses a private-cwd version probe. ACP
+`FORMLESS_TOPIC_MUSE_EXE`. Pi uses a private-cwd version-only fallback. ACP
 reports lookup-only availability and preserves its configured agent. Adapter owners
 can replace these fallbacks with async probes or the bounded spawn_blocking
 probe hook. The reusable ACP
