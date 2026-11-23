@@ -6681,7 +6681,7 @@ Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
-`FORMLESS_FIXTURE_INSTALL_TARGET`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`, `FORMLESS_FIXTURE_TOKEN`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -6696,6 +6696,8 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
+`FORMLESS_TOPIC_OPENCODE_EXE` is used only by the fixture for the unavailable
+OpenCode adapter; the shipped binary does not read it.
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
