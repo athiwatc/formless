@@ -227,17 +227,26 @@ impl Store {
         );
         let mut covered = BTreeSet::new();
         for topic in self
-            .list_topics()?
+            .topic_suggestion_candidates(source)?
             .into_iter()
-            .filter(|topic| topic.source_session_id == *source)
         {
-            let sources = source_ids(&topic);
-            let same_key = proposal_workspace(&topic) == proposal.workspace.as_deref()
+            let candidate_workspace = if topic.workspace_kind == "scratch" {
+                None
+            } else {
+                topic.workspace.as_deref()
+            };
+            let same_key = candidate_workspace == proposal.workspace.as_deref()
                 && topic.parent_topic_id.as_deref() == parent;
-            if topic.status == TopicStatus::PendingApproval
-                && !sources.is_disjoint(&selected)
-            {
-                if same_key && sources == selected {
+            let overlaps = topic
+                .source_message_ids
+                .iter()
+                .any(|id| selected.contains(id.as_str()));
+            if topic.status == "pending_approval" && overlaps {
+                let same_sources = topic.source_message_ids.len() == selected.len()
+                    && selected
+                        .iter()
+                        .all(|id| topic.source_message_ids.contains(*id));
+                if same_key && same_sources {
                     ensure!(
                         self.topic_source_content_unchanged(&topic.id, source, &selected)?,
                         "a source message changed since the pending proposal; reject it and send a new request before proposing again"
@@ -248,14 +257,23 @@ impl Store {
                             step.acp_agent.as_deref(),
                         )?;
                     }
-                    return Ok(Some(topic));
+                    return Ok(Some(
+                        self.get_topic(&topic.id)?
+                            .context("pending topic proposal disappeared")?,
+                    ));
                 }
                 bail!(
                     "these messages overlap a pending topic proposal; select a new explicit work request"
                 );
             }
             if same_key {
-                covered.extend(sources.intersection(&selected).copied().map(str::to_owned));
+                covered.extend(
+                    topic
+                        .source_message_ids
+                        .iter()
+                        .filter(|id| selected.contains(id.as_str()))
+                        .cloned(),
+                );
             }
         }
         ensure!(
