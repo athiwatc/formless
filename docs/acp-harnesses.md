@@ -6,8 +6,12 @@
 inputs validate `HarnessKind::Acp` selectors against this registry.
 `local_harness::run(request, interaction_handler, cancel)` dispatches ACP and
 Antigravity sessions through the core interaction handler; Antigravity retains
-its own spec. Core's topic launcher still rejects ACP steps; this adapter alone
-does not make `StartTopicWorkflow` execute them.
+its own spec. Core topic steps dispatch registered ACP profiles when
+`HarnessKind::Acp` is paired with a valid `acp_agent`. The named Gemini topic
+fixture covers launch, permission forwarding, completion, and cancellation
+using a scripted ACP process. Installed-CLI checks cover initialize/readiness
+only; no authenticated model turns or native Windows `.cmd` execution have been
+verified.
 
 `HarnessRequest.access` (`StepAccess::ReadOnly` or `Write`) controls mode/argv
 selection. Permission IDs, names, and kinds reach the interaction handler unchanged;
