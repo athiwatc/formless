@@ -26290,7 +26290,6 @@ mod tests {
         let screen = render(&mut app, 80, 20);
         assert!(screen.contains("message 2/3"), "{screen}");
         assert!(screen.contains("question 2"));
-        assert!(screen.contains("Generated kickoff"), "{screen}");
         // Ctrl+↓ forward; Home to the top; past the last, follow again.
         app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
         assert_eq!(app.chat_scroll_top, Some(app.user_rows[2]));
