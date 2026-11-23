@@ -1552,6 +1552,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn database_bucket_paths_use_display_spelling_on_non_utf8_roots() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let paths = Paths {
+            data_dir: PathBuf::from(std::ffi::OsString::from_vec(b"raw-\xff".to_vec())),
+            config_dir: PathBuf::from("config"),
+            profile: "default".into(),
+        };
+        let display_root = Path::new("raw-�");
+        assert_ne!(paths.db_file(), display_root.join("formless.db"));
+        assert_eq!(
+            db_paths(&paths),
+            ["formless.db", "formless.db-wal", "formless.db-shm"]
+                .map(|name| display_root.join(name))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn usage_keeps_database_display_paths_distinct_on_non_utf8_roots() {
         use std::os::unix::ffi::OsStringExt;
 
@@ -1559,6 +1578,14 @@ mod tests {
         let root = fixture
             .0
             .join(std::ffi::OsString::from_vec(b"raw-\xff".to_vec()));
+        match std::fs::create_dir(&root) {
+            Ok(()) => {}
+            // APFS rejects invalid UTF-8 names. The separate database path
+            // test exercises the lossy spelling without creating this directory.
+            #[cfg(target_vendor = "apple")]
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+            Err(error) => panic!("could not create invalid-byte test directory: {error}"),
+        }
         let replacement = fixture.0.join("raw-�");
         synthetic_file(&root, "formless.db", 4);
         synthetic_file(&root, "formless.db.v9-test.bak", 3);

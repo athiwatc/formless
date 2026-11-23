@@ -29,6 +29,8 @@ enum TopicDecisionKind {
 pub(super) struct HarnessChoice {
     pub harness: HarnessKind,
     pub acp_agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ApprovedSubstitute {
