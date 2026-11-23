@@ -11804,7 +11804,10 @@ impl App {
     /// Chat focus (SPEC §10.2): `[`/`]` on an empty input move it; Enter
     /// toggles a call or opens kickoff instructions, and Esc leaves focus.
     fn call_focus_key(&mut self, key: &KeyEvent) -> bool {
-        if !self.input.is_empty() || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        if self.current_question().is_some()
+            || !self.input.is_empty()
+            || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        {
             return false;
         }
         let ids = self.focus_items();
@@ -16963,14 +16966,15 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         fg(app.color, Color::Yellow),
                     ));
                 }
-                let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
+                let focused = app.current_question().is_none()
+                    && app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
                 if focused {
                     focus_line = Some(lines.len());
                 }
                 let workflow_kickoff = m.generated_by.as_deref() == Some("topic_kickoff");
                 if workflow_kickoff {
                     lines.push(mention_line("Workflow kickoff for this topic.", app.color));
-                    if !focused {
+                    if !focused && app.current_question().is_none() {
                         lines.push(Line::styled(
                             "  [ ] select · Enter view raw instructions",
                             ui::dim(app.color),
@@ -25350,6 +25354,63 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.questions.is_empty(), "all answered and sent");
         assert!(app.notes.iter().any(|n| n == "answered: just auth"));
+    }
+
+    #[test]
+    fn active_question_owns_enter_and_hides_kickoff_focus_hint() {
+        let mut app = test_app();
+        let mut kickoff = msg("user", "raw workflow instructions");
+        kickoff.id = "kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        app.messages = vec![kickoff];
+        app.call_focus = Some("msg:kickoff".into());
+        app.on_event(Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Which approach?".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Continue".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+
+        let chat = chat_lines(&app, 120, 24);
+        let chat_text = chat
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chat_text.contains("Workflow kickoff for this topic."));
+        assert!(!chat_text.contains("Enter view raw instructions"));
+        assert!(!app.call_focus_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Which approach?"), "{screen}");
+        assert!(!screen.contains("Enter view raw instructions"), "{screen}");
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pager.is_none());
+        assert!(app.questions.is_empty());
+        assert!(requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .any(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. })));
     }
 
     #[test]
