@@ -7168,6 +7168,10 @@ are inserted atomically with generated_by="topic_kickoff". Transcript reads,
 events and forks preserve the marker. Both proposal and approval reject source
 messages with any generated_by value; generated instructions are not new user
 requests and cannot be moved as topic requests.
+Attempt instruction messages are inserted with
+generated_by="topic_attempt_instructions" without changing the exact prompt
+sent to the harness. This marker applies only to new messages; historical null
+values remain unknown and are not backfilled.
 
 Pending harness permissions and user-only questions also send a best-effort
 desktop notification through spawn_blocking. Notifications include the topic

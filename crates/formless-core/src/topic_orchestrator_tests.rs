@@ -16,6 +16,8 @@ if '--version' in sys.argv:print('fixture 1.0');sys.exit()
 if sys.argv[1:]==['auth','status']:print(json.dumps({} if os.environ.get('TOPIC_FIXTURE_AUTH_UNKNOWN') else {'loggedIn':True}));sys.exit()
 if sys.argv[1:]==['login','status']:print('Logged in');sys.exit()
 mode=os.environ.get('TOPIC_FIXTURE_MODE','git')
+if os.environ.get('TOPIC_FIXTURE_PROMPT_PATH'):
+    pathlib.Path(os.environ['TOPIC_FIXTURE_PROMPT_PATH']).write_text(sys.argv[-1])
 if mode=='hold':
     pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
     subprocess.Popen(['sleep','120'])
@@ -327,6 +329,112 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
         .to_string()
         .contains("generated"));
     server.abort();
+}
+
+#[tokio::test]
+async fn topic_attempt_instructions_are_marked_and_replayed_without_prompt_changes() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "capture_prompt");
+    let f = Fixture::new(&env);
+    let prompt_path = f.root.join("harness-prompt");
+    env.set("TOPIC_FIXTURE_PROMPT_PATH", &prompt_path);
+    script(&f, &env);
+    let topic = topic(&f, None, true);
+    let session = topic.topic_session_id.clone().unwrap();
+    let source_messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.session))
+        .unwrap();
+    assert!(source_messages
+        .iter()
+        .all(|message| message.generated_by.is_none()));
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+
+    let (tx, mut rx) = mpsc::channel(256);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 99,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    let cancel = CancellationToken::new();
+    let launched = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    let attempt_id = launched["attempt_id"].as_str().unwrap().to_owned();
+    let broadcast = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(ServerMessage::Event(Event::MessageAppended { message, .. })) =
+                rx.recv().await
+            {
+                if message.role == "user" && message.content.starts_with("Topic: ") {
+                    break message;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    finish_attempt(&f, &session, &attempt_id).await;
+
+    let attempt = f
+        .daemon()
+        .with_reader(|st| st.get_topic_attempt(&attempt_id))
+        .unwrap()
+        .unwrap();
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&attempt.conversation_session_id))
+        .unwrap();
+    let instruction = messages
+        .iter()
+        .find(|message| message.role == "user")
+        .unwrap();
+    let harness_prompt = std::fs::read_to_string(prompt_path).unwrap();
+    assert_eq!(broadcast.id, instruction.id);
+    assert_eq!(
+        broadcast.generated_by.as_deref(),
+        Some("topic_attempt_instructions")
+    );
+    assert_eq!(
+        instruction.generated_by.as_deref(),
+        Some("topic_attempt_instructions")
+    );
+    assert_eq!(instruction.content, harness_prompt);
+    assert!(harness_prompt.contains("Perform exactly this step; never merge or push"));
+
+    let replay = f
+        .daemon()
+        .handle(Request::GetSession {
+            id: attempt.conversation_session_id,
+        })
+        .await
+        .unwrap();
+    let replayed_instruction = replay["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["id"] == instruction.id)
+        .unwrap();
+    assert_eq!(
+        replayed_instruction["generated_by"],
+        "topic_attempt_instructions"
+    );
+    assert_eq!(replayed_instruction["content"], harness_prompt);
 }
 async fn model(
     f: &Fixture,
