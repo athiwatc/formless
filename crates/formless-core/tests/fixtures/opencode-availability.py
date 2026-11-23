@@ -6,6 +6,9 @@ import time
 assert sys.argv[1:] == ["--version"]
 assert os.environ["AVAILABILITY_ENV"] == "provided"
 mode = os.environ.get("AVAILABILITY_MODE", "normal")
+if "AVAILABILITY_CWD_FILE" in os.environ:
+    with open(os.environ["AVAILABILITY_CWD_FILE"], "w") as marker:
+        marker.write(os.getcwd())
 if mode == "hang":
     with open(os.environ["AVAILABILITY_PID"], "w") as marker:
         marker.write(str(os.getpid()))
@@ -14,6 +17,9 @@ elif mode == "empty":
     pass
 elif mode == "error":
     print("dummy-credential-not-for-logs", file=sys.stderr)
+    sys.exit(1)
+elif mode == "nonzero":
+    print("opencode v2.3.2")
     sys.exit(1)
 elif mode == "malformed":
     print("opencode v2.3.2 dummy-credential-not-for-logs")

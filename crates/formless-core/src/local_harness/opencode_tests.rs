@@ -421,6 +421,10 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
         ("AVAILABILITY_ENV".into(), "provided".into()),
         ("PATH".into(), dir.clone().into_os_string()),
         (
+            "AVAILABILITY_CWD_FILE".into(),
+            dir.join("probe-cwd").into_os_string(),
+        ),
+        (
             "ANTHROPIC_API_KEY".into(),
             "dummy-credential-not-for-logs".into(),
         ),
@@ -428,10 +432,11 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
     for (mode, installed, version) in [
         ("normal", true, Some("2.3.2")),
         ("old", true, Some("1.0.0")),
-        ("empty", false, None),
-        ("error", false, None),
-        ("malformed", false, None),
-        ("oversized", false, None),
+        ("empty", true, None),
+        ("error", true, None),
+        ("nonzero", true, None),
+        ("malformed", true, None),
+        ("oversized", true, None),
     ] {
         environment.insert("AVAILABILITY_MODE".into(), mode.into());
         let result = availability(Some(executable.clone()), &environment);
@@ -443,6 +448,15 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
         let detail = result.detail.unwrap();
         assert!(detail.contains("free default model"));
         assert!(!detail.contains("dummy-credential"));
+        if mode == "nonzero" {
+            assert!(detail.contains("exited unsuccessfully"));
+        }
+        if mode == "normal" {
+            let cwd = PathBuf::from(std::fs::read_to_string(dir.join("probe-cwd")).unwrap());
+            assert_ne!(cwd, std::env::temp_dir());
+            assert!(cwd.starts_with(std::env::temp_dir()));
+            assert!(!cwd.exists());
+        }
     }
     environment.insert("AVAILABILITY_MODE".into(), "normal".into());
     assert!(availability(None, &environment).installed);
@@ -454,7 +468,7 @@ fn availability_checks_version_without_discovering_credentials_and_bounds_hangin
     environment.insert("AVAILABILITY_PID".into(), pid_file.clone().into_os_string());
     let started = std::time::Instant::now();
     let result = availability(Some(executable), &environment);
-    assert!(!result.installed);
+    assert!(result.installed);
     assert!(result.detail.unwrap().contains("timed out"));
     assert!(started.elapsed() < Duration::from_secs(3));
     let pid = std::fs::read_to_string(pid_file)

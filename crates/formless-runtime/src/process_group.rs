@@ -138,6 +138,10 @@ impl SupervisedProcess {
             self.child.stderr.take(),
         )
     }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
 }
 
 impl Drop for SupervisedProcess {

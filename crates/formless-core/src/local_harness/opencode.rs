@@ -83,7 +83,7 @@ pub fn availability(
                 (!compatible).then_some("This adapter requires OpenCode V2 >= 2.3.2."),
             )
         }
-        Err(error) => (false, None, Some(error)),
+        Err(error) => (error.installed, None, Some(error.detail)),
     };
     let detail = "OpenCode can use its free default model without credentials. Credential status is unknown: auth list initializes providers and makes network requests.";
     HarnessAvailability {
@@ -99,22 +99,61 @@ pub fn availability(
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProbeError {
+    installed: bool,
+    detail: &'static str,
+}
+
+struct ProbeDirectory(PathBuf);
+
+impl ProbeDirectory {
+    fn create() -> std::io::Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("formless-opencode-probe-{}", uuid::Uuid::new_v4()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ProbeDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn probe_version(
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
-) -> std::result::Result<String, &'static str> {
+) -> std::result::Result<String, ProbeError> {
+    let directory = ProbeDirectory::create().map_err(|_| ProbeError {
+        installed: false,
+        detail: "OpenCode version probe could not create a private working directory.",
+    })?;
     let mut command = Command::new(executable.unwrap_or_else(|| SPEC.program.into()));
     command
         .arg("--version")
-        .current_dir(std::env::temp_dir())
+        .current_dir(&directory.0)
         .envs(environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut process = SupervisedProcess::spawn(command)
-        .map_err(|_| "OpenCode executable could not be started.")?;
+    let deadline = std::time::Instant::now() + AVAILABILITY_TIMEOUT;
+    let mut process = SupervisedProcess::spawn(command).map_err(|_| ProbeError {
+        installed: false,
+        detail: "OpenCode executable could not be started.",
+    })?;
     let (_, stdout, _) = process.take_pipes();
-    let stdout = stdout.ok_or("OpenCode version output is unavailable.")?;
+    let stdout = stdout.ok_or(ProbeError {
+        installed: true,
+        detail: "OpenCode version output is unavailable.",
+    })?;
     let (send, receive) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut output = Vec::new();
@@ -122,19 +161,53 @@ fn probe_version(
         let _ = send.send(result);
     });
     let output = receive
-        .recv_timeout(AVAILABILITY_TIMEOUT)
-        .map_err(|_| "OpenCode version probe timed out or disconnected.")?
-        .map_err(|_| "OpenCode version output could not be read.")?;
-    drop(process);
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| ProbeError {
+            installed: true,
+            detail: "OpenCode version probe timed out or disconnected.",
+        })?
+        .map_err(|_| ProbeError {
+            installed: true,
+            detail: "OpenCode version output could not be read.",
+        })?;
     if output.len() > 4096 {
-        return Err("OpenCode version output exceeded the limit.");
+        return Err(ProbeError {
+            installed: true,
+            detail: "OpenCode version output exceeded the limit.",
+        });
+    }
+    let status = loop {
+        if let Some(status) = process.try_wait().map_err(|_| ProbeError {
+            installed: true,
+            detail: "OpenCode version process status could not be read.",
+        })? {
+            break status;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ProbeError {
+                installed: true,
+                detail: "OpenCode version probe timed out or disconnected.",
+            });
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    };
+    drop(process);
+    if !status.success() {
+        return Err(ProbeError {
+            installed: true,
+            detail: "OpenCode version command exited unsuccessfully.",
+        });
     }
     let version = std::str::from_utf8(&output)
         .ok()
         .and_then(|s| s.trim().strip_prefix("opencode v"))
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
         .filter(|s| acp::parse_version(s).is_some())
-        .ok_or("OpenCode did not report a recognizable CLI version.")?;
+        .ok_or(ProbeError {
+            installed: true,
+            detail: "OpenCode did not report a recognizable CLI version.",
+        })?;
     Ok(version.to_owned())
 }
 
