@@ -27491,6 +27491,110 @@ mod tests {
     }
 
     #[test]
+    fn reconnecting_permission_waits_for_snapshot_before_accepting_decisions() {
+        let event = Event::HarnessPermissionRequested {
+            permission_id: "permission-reconnect".into(),
+            session_id: "session-reconnect".into(),
+            topic_id: "topic-reconnect".into(),
+            attempt_id: "attempt-reconnect".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Fixture permission".into(),
+            kind: "write".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        };
+        let (client, outbound) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("session-reconnect".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.offline = Some((Instant::now(), Instant::now()));
+        let send_wire = |message: ServerMessage| {
+            let encoded = serde_json::to_string(&message).unwrap();
+            incoming_tx
+                .send(serde_json::from_str::<ServerMessage>(&encoded).unwrap())
+                .unwrap();
+        };
+
+        app.begin_reconnect_snapshot();
+        let requests = outbound
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .collect::<Vec<_>>();
+        let pending_id = requests
+            .iter()
+            .find_map(|envelope| {
+                matches!(&envelope.request, Request::PendingApprovals).then_some(envelope.id)
+            })
+            .expect("PendingApprovals request");
+        let session_id = requests
+            .iter()
+            .find_map(|envelope| {
+                matches!(
+                    &envelope.request,
+                    Request::GetSession { id } if id == "session-reconnect"
+                )
+                .then_some(envelope.id)
+            })
+            .expect("reconnect GetSession request");
+
+        send_wire(ServerMessage::Response {
+            id: pending_id,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(app.offline.is_some());
+        assert!(app.topic.has_permission());
+        assert!(render(&mut app, 100, 40).contains("1. Allow once"));
+
+        app.key(key(KeyCode::Esc));
+        assert!(app.topic.has_permission(), "offline denial stays pending");
+        app.key(key(KeyCode::Char('1')));
+        assert!(app.topic.has_permission(), "offline decision stays pending");
+        assert!(!outbound.try_iter().any(|line| {
+            let envelope =
+                serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap();
+            matches!(envelope.request, Request::HarnessPermissionDecision { .. })
+        }));
+
+        send_wire(ServerMessage::Response {
+            id: session_id,
+            ok: true,
+            result: Some(reconnect_snapshot(false, vec![event.clone()])),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(
+            app.offline.is_none(),
+            "the authoritative snapshot completed"
+        );
+        assert!(app.topic.has_permission());
+        render(&mut app, 100, 40);
+
+        app.key(key(KeyCode::Char('1')));
+        assert!(!app.topic.has_permission());
+        assert!(outbound.try_iter().any(|line| {
+            let envelope =
+                serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap();
+            matches!(
+                envelope.request,
+                Request::HarnessPermissionDecision {
+                    permission_id,
+                    option_id: Some(option_id),
+                } if permission_id == "permission-reconnect" && option_id == "allow"
+            )
+        }));
+    }
+
+    #[test]
     fn matching_genuine_user_text_stays_raw_and_editable_and_forkable() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let raw = workflow_kickoff_content();

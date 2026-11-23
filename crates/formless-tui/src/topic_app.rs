@@ -190,6 +190,18 @@ impl App {
 
     /// Harness permission prompts sit above every other overlay.
     pub(crate) fn topic_permission_key(&mut self, key: KeyEvent) {
+        if self.offline.is_some()
+            && matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('d' | 'D' | '1'..='9')
+            )
+        {
+            if key.kind != KeyEventKind::Repeat {
+                self.notes
+                    .push("not sent — offline; retry after reconnecting".into());
+            }
+            return;
+        }
         let action = self.topic.key(key);
         self.topic_action(action);
     }
