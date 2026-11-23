@@ -124,10 +124,14 @@ environment once, canonicalizes the selected absolute path, and probes that
 exact path. Its internal per-step result carries both availability and the
 resolved executable into `HarnessRequest.executable`; it also carries the
 selected absolute invocation path captured before canonicalization as internal
-`executable_argv0`. On Unix, launch executes the canonical path with the
-selected invocation path as `argv[0]`, preserving symlink-dispatched shims. The
-launch does not reread the override or PATH, so a workspace-local executable
-cannot replace the readiness selection. This identity is internal: public
+`executable_argv0`. On Unix, native executables receive the selected invocation
+path as `argv[0]`, preserving native symlink-dispatched shims. For shebang
+scripts, the kernel passes the canonical script path to the interpreter, so the
+script's `$0` is the canonical path rather than the symlink alias; script-based
+basename dispatch is not preserved. Readiness and topic launch use that same
+canonical script path. Launch does not reread the override or PATH, so a
+workspace-local executable cannot replace the readiness selection. This
+identity is internal: public
 availability and ListHarnesses retain the existing `HarnessAvailability` shape.
 If preparation cannot return an executable identity, including on timeout or
 worker error, the step stops before launch with the existing retry/substitute
