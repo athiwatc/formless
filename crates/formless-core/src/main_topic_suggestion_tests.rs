@@ -813,51 +813,54 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     let sibling_id = inside_id.clone();
     let raw_context = context.to_string();
     let context_frame = crate::provenance::frame(READ_TOPIC_CONTEXT, &[], &raw_context);
-    let (transcript, search, framed_id, raw_id, user_quote_id, assistant_quote_id) = daemon
-        .with_store(|st| {
-            let framed = st.append_message_meta(
-                story_chat,
-                "tool",
-                &context_frame,
-                Some(crate::daemon::tool_result_meta(
-                    "read-context-framed",
-                    READ_TOPIC_CONTEXT,
-                    false,
-                )),
-            )?;
-            let raw = st.append_message_meta(
-                story_chat,
-                "tool",
-                &raw_context,
-                Some(crate::daemon::tool_result_meta(
-                    "read-context-raw",
-                    READ_TOPIC_CONTEXT,
-                    false,
-                )),
-            )?;
-            let user_quote = st.append_message_meta(
-                story_chat,
-                "user",
-                &raw_context,
-                Some(crate::daemon::tool_result_meta(
-                    "quoted-read-context",
-                    READ_TOPIC_CONTEXT,
-                    false,
-                )),
-            )?;
-            let assistant_quote = st.append_message(story_chat, "assistant", &raw_context)?;
-            let transcript = st.topic_read_conversation(&child_id, story_chat)?;
-            let search = st.topic_search_conversations(&child_id, &sibling_id)?;
-            Ok((
-                transcript,
-                search,
-                framed.id,
-                raw.id,
-                user_quote.id,
-                assistant_quote.id,
-            ))
-        })
-        .unwrap();
+    let (transcript, search, visible_search, framed_id, raw_id, user_quote_id, assistant_quote_id) =
+        daemon
+            .with_store(|st| {
+                let framed = st.append_message_meta(
+                    story_chat,
+                    "tool",
+                    &context_frame,
+                    Some(crate::daemon::tool_result_meta(
+                        "read-context-framed",
+                        READ_TOPIC_CONTEXT,
+                        false,
+                    )),
+                )?;
+                let raw = st.append_message_meta(
+                    story_chat,
+                    "tool",
+                    &raw_context,
+                    Some(crate::daemon::tool_result_meta(
+                        "read-context-raw",
+                        READ_TOPIC_CONTEXT,
+                        false,
+                    )),
+                )?;
+                let user_quote = st.append_message_meta(
+                    story_chat,
+                    "user",
+                    &raw_context,
+                    Some(crate::daemon::tool_result_meta(
+                        "quoted-read-context",
+                        READ_TOPIC_CONTEXT,
+                        false,
+                    )),
+                )?;
+                let assistant_quote = st.append_message(story_chat, "assistant", &raw_context)?;
+                let transcript = st.topic_read_conversation(&child_id, story_chat)?;
+                let search = st.topic_search_conversations(&child_id, &sibling_id)?;
+                let visible_search = st.topic_search_conversations(&child_id, &child_id)?;
+                Ok((
+                    transcript,
+                    search,
+                    visible_search,
+                    framed.id,
+                    raw.id,
+                    user_quote.id,
+                    assistant_quote.id,
+                ))
+            })
+            .unwrap();
     let messages = transcript["messages"].as_array().unwrap();
     let message = |id: &str| {
         messages
@@ -868,11 +871,13 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     let framed_message = message(&framed_id);
     let framed: Value = serde_json::from_str(framed_message["content"].as_str().unwrap()).unwrap();
     let framed_context: Value = serde_json::from_str(framed["content"].as_str().unwrap()).unwrap();
+    assert!(ids(&framed_context, "topics").contains(&child_id));
     assert!(!ids(&framed_context, "topics").contains(&inside_id));
     assert!(!ids(&framed_context, "proposals").contains(&inside_id));
     let raw_message = message(&raw_id);
     let raw_stored_context: Value =
         serde_json::from_str(raw_message["content"].as_str().unwrap()).unwrap();
+    assert!(ids(&raw_stored_context, "topics").contains(&child_id));
     assert!(!ids(&raw_stored_context, "topics").contains(&inside_id));
     assert!(!ids(&raw_stored_context, "proposals").contains(&inside_id));
     for (id, role) in [(&user_quote_id, "user"), (&assistant_quote_id, "assistant")] {
@@ -895,6 +900,14 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
         .unwrap()
         .iter()
         .all(|result| result["snippet"].as_str().unwrap().contains(&sibling_id)));
+    let visible_search_ids = visible_search
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["message_id"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(visible_search_ids.contains(&framed_id));
+    assert!(visible_search_ids.contains(&raw_id));
     for allow in [true, false] {
         daemon
             .handle(Request::SetTopicContextAccess {
