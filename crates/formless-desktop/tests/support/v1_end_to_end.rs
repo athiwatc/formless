@@ -192,16 +192,23 @@ impl Fixture {
         }
     }
     fn send(&self) -> String {
-        let value = self
-            .runtime
-            .block_on(self.daemon.handle(Request::SendMessage {
-                session_id: self.session.clone(),
-                content: "Private v1 answer".into(),
-                mode: SendMode::Send,
-                client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
-            }))
-            .unwrap();
-        value["run_id"].as_str().expect("Run identity").to_owned()
+        self.runtime.block_on(self.send_async()).unwrap()
+    }
+    fn send_async(&self) -> tokio::task::JoinHandle<String> {
+        let daemon = self.daemon.clone();
+        let session_id = self.session.clone();
+        self.runtime.spawn(async move {
+            let value = daemon
+                .handle(Request::SendMessage {
+                    session_id,
+                    content: "Private v1 answer".into(),
+                    mode: SendMode::Send,
+                    client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+                })
+                .await
+                .unwrap();
+            value["run_id"].as_str().expect("Run identity").to_owned()
+        })
     }
     fn snapshot(&self) -> Value {
         self.runtime
@@ -311,7 +318,7 @@ fn exercise_v1_view(cx: &mut TestAppContext, retry: bool) {
         s.sidebar().rows().iter().any(|row| row.id == f.session)
     });
     step(cx, handle, |window, cx| {
-        window.click(session_row_id(&f.session), cx)
+        open_saved_session(window, cx, &shell, &f.session)
     });
     until(cx, handle, &shell, "mid-answer baseline", |s, _| {
         s.live_stream_owner().is_some() && s.block_count() == 1
@@ -555,7 +562,7 @@ fn native_step_mode_changes_reach_real_daemon_without_starting_work_and_preserve
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
         step(cx, handle, |window, cx| {
-            window.click(session_row_id(&f.session), cx)
+            open_saved_session(window, cx, &shell, &f.session)
         });
         until(cx, handle, &shell, "mode metadata", |s, _| {
             s.step_mode_enable_target().is_some()
@@ -661,7 +668,7 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
     step(cx, h, |window, cx| {
-        window.click(session_row_id(&f.session), cx)
+        open_saved_session(window, cx, &shell, &f.session)
     });
     until(cx, h, &shell, "model canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
@@ -688,26 +695,51 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         });
     };
     let save = |cx: &mut TestAppContext, field: &'static str, value: &str| {
+        // Field selection, typing and Save are separate event-loop turns.
+        // Service daemon I/O between them, as the native application's timer
+        // does. Slow headless layout must not simulate an unresponsive consumer
+        // and overflow its deliberately bounded update queue during a Save.
+        // A previous Save's success notice is not this mutation's receipt.
+        pump(cx, h, &shell);
         step(cx, h, |window, cx| {
             window.click(field, cx);
+        });
+        pump(cx, h, &shell);
+        step(cx, h, |window, cx| {
             let i = shell.read(cx).session_edit_input().unwrap();
             i.update(cx, |i, cx| i.set_value(value, window, cx));
+        });
+        pump(cx, h, &shell);
+        let revision = step(cx, h, |window, cx| {
+            let revision = shell.read(cx).session_edit_revision().unwrap();
             assert!(window.find("session-model-paid-footer").visible());
             window.click("session-edit-save", cx);
+            revision
         });
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             pump(cx, h, &shell);
-            let done = step(cx, h, |window, _| {
-                window.find("session-edit-notice").value().is_some_and(|n| {
-                    n.starts_with("Saved and acknowledged")
-                        || n.starts_with("The current model/effort pair already matches")
-                })
+            let (done, notice) = step(cx, h, |window, cx| {
+                let notice = window
+                    .find("session-edit-notice")
+                    .value()
+                    .map(str::to_owned);
+                let done = shell.read(cx).session_edit_revision() != Some(revision)
+                    && notice.as_ref().is_some_and(|n| {
+                        n.starts_with("Saved and acknowledged")
+                            || n.starts_with("The current model/effort pair already matches")
+                    });
+                (done, notice)
             });
             if done {
                 break;
             }
-            assert!(Instant::now() < deadline, "model save receipt");
+            assert!(
+                Instant::now() < deadline,
+                "model save receipt for {field}={value:?}: {notice:?}; connection={}; stored model={}",
+                step(cx, h, |_, cx| shell.read(cx).client_status_notice().to_string()),
+                f.snapshot()["session"]["model"]
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     };
@@ -720,10 +752,25 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         "auto-test disabled; saving must not start work"
     );
     step(cx, h, |window, cx| window.click("session-edit-cancel", cx));
-    let _ = f.send();
-    f.wait("role resolved to provider model", || {
-        f.models.lock().unwrap().len() == 1
-    });
+    // Starting a Run and waiting for its provider must not stall the actual
+    // desktop consumer. Its legacy update queue is bounded; under CI load a
+    // blocking fixture wait could disconnect it just before the metadata save.
+    let sending = f.send_async();
+    until(
+        cx,
+        h,
+        &shell,
+        "role Run observed before mid-Run save",
+        |s, _| {
+            sending.is_finished()
+                && f.models.lock().unwrap().len() == 1
+                && s.sidebar().rows().iter().any(|row| {
+                    row.id == f.session
+                        && row.run_state == formless_desktop::model::RunState::Running
+                })
+        },
+    );
+    f.runtime.block_on(sending).unwrap();
     assert_eq!(f.models.lock().unwrap()[0], "v1-test");
     open_form(cx);
     save(cx, "session-edit-model", "v1-other-test");
@@ -739,10 +786,15 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         s.last_block_preview() == "A prefix before attachment A final 😀"
     });
     f.wait("first model Run idle", || f.snapshot()["running"] == false);
-    let _ = f.send();
-    f.wait("next Run uses saved model", || {
-        f.models.lock().unwrap().len() == 2
+    let sending = f.send_async();
+    until(cx, h, &shell, "next Run uses saved model", |s, _| {
+        sending.is_finished()
+            && f.models.lock().unwrap().len() == 2
+            && s.sidebar().rows().iter().any(|row| {
+                row.id == f.session && row.run_state == formless_desktop::model::RunState::Running
+            })
     });
+    f.runtime.block_on(sending).unwrap();
     assert_eq!(f.models.lock().unwrap()[1], "v1-other-test");
     f.extra.notify_one();
     f.complete[1].notify_one();
@@ -783,7 +835,7 @@ fn native_model_catalog_read_fill_and_save_follow_real_daemon_without_starting_w
     until(cx, h, &s, "catalog Session list", |s, _| {
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
-    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
     until(cx, h, &s, "catalog canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
     });
@@ -898,7 +950,7 @@ fn native_pending_inventory_reads_shared_metadata_without_consuming_and_refreshe
     until(cx, h, &s, "pending Session", |s, _| {
         s.sidebar().rows().iter().any(|r| r.id == f.session)
     });
-    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
     until(cx, h, &s, "pending canonical baseline", |s, _| {
         s.step_mode_enable_target().is_some()
     });
@@ -1072,7 +1124,7 @@ fn native_composer_confirms_pending_files_and_retains_unknown_after_a_peer_chang
         until(cx, h, &s, "native review Session", |s, _| {
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
-        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
         until(cx, h, &s, "native review baseline", |s, _| {
             s.step_mode_enable_target().is_some()
         });
@@ -1361,7 +1413,7 @@ fn native_reference_confirmation_uses_real_ipc_and_unknown_never_replays(cx: &mu
         until(cx, h, &s, "reference Session", |s, _| {
             s.sidebar().rows().iter().any(|r| r.id == f.session)
         });
-        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        step(cx, h, |w, cx| open_saved_session(w, cx, &s, &f.session));
         until(cx, h, &s, "reference baseline", |s, _| {
             s.step_mode_enable_target().is_some()
         });

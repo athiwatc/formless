@@ -2,6 +2,7 @@ use super::*;
 use formless_desktop::client::{Command as WireCommand, Update};
 use formless_desktop::questions::{Open, Outcome, State};
 use formless_protocol::{Event, Question, QuestionOption};
+use gpui_kit::SharedString;
 
 pub fn definition(session: &str) -> Open {
     Open::from_event(&Event::UserQuestion {
@@ -58,6 +59,7 @@ fn show(
     shell: &Entity<Shell>,
     question: Open,
 ) {
+    let button = SharedString::from(format!("open-question-{}", question.id));
     step(cx, handle, |window, cx| {
         shell.update(cx, |shell, cx| {
             shell.apply_client_update(
@@ -72,7 +74,111 @@ fn show(
         window.render_frame(cx);
         window.click("show-questions", cx);
         window.render_frame(cx);
-        window.click("open-question-native-question", cx);
+        window.click(button, cx);
+        window.render_frame(cx);
+    });
+}
+
+#[gpui_kit::test]
+fn harness_permissions_have_no_default_or_text_grant_and_exact_allow_or_explicit_deny_are_single_actions(
+    cx: &mut TestAppContext,
+) {
+    for size in [
+        WIDE,
+        Size {
+            width: px(560.),
+            height: px(900.),
+        },
+    ] {
+        for deny in [false, true] {
+            let (handle, shell) = open(cx, size, 0, 0);
+            let _ = daemon_view(cx, handle, &shell);
+            shell.update(cx, |shell, _| shell.take_client_commands());
+            let permission =
+                Open::from_event(&crate::fixture::harness_permission("codex-chat")).unwrap();
+            show(cx, handle, &shell, permission);
+            step(cx, handle, |window, cx| {
+                assert_eq!(window.find("question-submit").disabled(), Some(true));
+                assert!(window.try_find("question-input-anchor").is_none());
+                assert!(window
+                    .find("question-position")
+                    .value()
+                    .unwrap()
+                    .contains("only to this attempt"));
+                assert!(window
+                    .find("question-position")
+                    .value()
+                    .unwrap()
+                    .contains("Only you set saved topic rules"));
+                let origin = window.find("question-session").value().unwrap().to_string();
+                assert!(
+                    origin.contains("Codex")
+                        && origin.contains("review-x")
+                        && origin.contains("codex-chat"),
+                    "{origin}"
+                );
+                assert!(window
+                    .find("harness-permission-details")
+                    .value()
+                    .unwrap()
+                    .contains("reports/summary.csv"));
+                assert!(
+                    shell
+                        .update(cx, |shell, _| shell.take_client_commands())
+                        .is_empty(),
+                    "opening a permission must not grant it"
+                );
+                if deny {
+                    window.click("harness-permission-deny", cx);
+                } else {
+                    window.click(("question-option", 1usize), cx);
+                    window.render_frame(cx);
+                    assert_ne!(window.find("question-submit").disabled(), Some(true));
+                    window.click("question-submit", cx);
+                    window.render_frame(cx);
+                    window.click("question-submit", cx);
+                }
+                let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+                let [WireCommand::AnswerQuestion {
+                    question, answers, ..
+                }] = commands.as_slice()
+                else {
+                    panic!("expected one explicit permission command")
+                };
+                assert!(
+                    matches!(question.request(answers.clone()), formless_protocol::Request::HarnessPermissionDecision { permission_id, option_id } if permission_id == "native-permission" && option_id.as_deref() == (!deny).then_some("allow-attempt-id"))
+                );
+            });
+        }
+    }
+}
+
+#[gpui_kit::test]
+fn harness_question_origin_is_visible_without_loaded_topic_inventory(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let _ = daemon_view(cx, handle, &shell);
+    let mut event = formless_desktop::fixture::user_question("external-attempt-session");
+    if let Event::UserQuestion {
+        question_id,
+        topic_id,
+        attempt_id,
+        ..
+    } = &mut event
+    {
+        *question_id = "native-question".into();
+        *topic_id = Some("receipt-topic".into());
+        *attempt_id = Some("scan-receipts".into());
+    }
+    show(cx, handle, &shell, Open::from_event(&event).unwrap());
+    step(cx, handle, |window, cx| {
+        let origin = window.find("question-session").value().unwrap().to_string();
+        assert!(
+            origin.contains("receipt-topic")
+                && origin.contains("scan-receipts")
+                && origin.contains("external-attempt-session"),
+            "{origin}"
+        );
+        assert!(window.try_find("question-input-anchor").is_some());
         window.render_frame(cx);
     });
 }
