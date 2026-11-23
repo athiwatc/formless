@@ -798,21 +798,7 @@ impl Daemon {
             };
             if let Some(error) = error {
                 let saved = daemon.with_store(|st| {
-                    if st.get_topic_attempt(&attempt_id)?.is_some_and(|a| {
-                        matches!(
-                            a.status,
-                            TopicAttemptStatus::Running | TopicAttemptStatus::NeedsUser
-                        )
-                    }) {
-                        st.finish_topic_step(
-                            &attempt_id,
-                            TopicAttemptStatus::Failed,
-                            &error,
-                            &[],
-                            None,
-                        )?;
-                    }
-                    Ok(())
+                    st.finish_topic_step(&attempt_id, TopicAttemptStatus::Failed, &error, &[], None)
                 });
                 if let Err(error) = saved {
                     tracing::warn!("could not finalize topic attempt: {error:#}");
@@ -864,7 +850,6 @@ impl Daemon {
             };
             execution
         };
-        let execution = handler.finish().and(execution);
         self.finish_topic_attempt_execution(
             &topic.id,
             &attempt.id,
@@ -897,27 +882,16 @@ impl Daemon {
                 let summary = saved.summary.unwrap_or(result.message);
                 (status, summary, outputs, result.session_id)
             }
-            Err(error) => {
-                if matches!(
-                    saved.status,
-                    TopicAttemptStatus::Succeeded
-                        | TopicAttemptStatus::Failed
-                        | TopicAttemptStatus::Cancelled
-                        | TopicAttemptStatus::Abandoned
-                ) {
-                    tracing::warn!(attempt_id,error=%format!("{error:#}"),"harness error after terminal topic attempt report");
-                }
-                (
-                    if cancelled {
-                        TopicAttemptStatus::Cancelled
-                    } else {
-                        TopicAttemptStatus::Failed
-                    },
-                    format!("{error:#}"),
-                    vec![],
-                    None,
-                )
-            }
+            Err(error) => (
+                if cancelled {
+                    TopicAttemptStatus::Cancelled
+                } else {
+                    TopicAttemptStatus::Failed
+                },
+                format!("{error:#}"),
+                vec![],
+                None,
+            ),
         };
         self.with_store(|st| {
             st.finish_topic_step(
@@ -933,6 +907,31 @@ impl Daemon {
             topic_id: topic_id.into(),
         });
         Ok(())
+    }
+
+    pub(super) fn accept_topic_harness_result(
+        &self,
+        attempt_id: &str,
+        result: Result<HarnessResult>,
+        cancelled: bool,
+    ) -> Result<HarnessResult> {
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let saved = self
+                    .with_reader(|st| st.get_topic_attempt(attempt_id))?
+                    .context("attempt vanished")?;
+                if cancelled || saved.status != TopicAttemptStatus::Succeeded {
+                    return Err(error);
+                }
+                tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after successful topic report; daemon validation still required");
+                Ok(HarnessResult {
+                    session_id: saved.harness_session_id,
+                    message: saved.summary.unwrap_or_default(),
+                    events: vec![],
+                })
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1156,7 +1155,34 @@ impl Daemon {
         };
         let result = self
             .launch_topic_adapter(attempt, token, &request, handler, cancel)
-            .await?;
+            .await;
+        let result = self.accept_topic_harness_result(
+            &attempt.id,
+            handler.finish().and(result),
+            cancel.is_cancelled(),
+        )?;
+        let reported = self
+            .with_reader(|st| st.get_topic_attempt(&attempt.id))?
+            .context("attempt vanished")?;
+        let needs_revision = reported
+            .outputs
+            .iter()
+            .any(|output| matches!(output, TopicArtifact::GitRevision { .. }));
+        let head = if needs_revision || (step.access == StepAccess::Write && worktree.is_some()) {
+            if worktree.is_none() {
+                bail!("Git revision output requires a Git workspace");
+            }
+            Some(git(workspace, &["rev-parse", "HEAD"])?)
+        } else {
+            None
+        };
+        for artifact in &reported.outputs {
+            if let TopicArtifact::GitRevision { revision } = artifact {
+                if head.as_deref() != Some(revision.as_str()) {
+                    bail!("reported GitRevision does not match workspace HEAD");
+                }
+            }
+        }
         let mut outputs = vec![];
         if step.access == StepAccess::Write && worktree.is_some() {
             if !git(
@@ -1167,7 +1193,7 @@ impl Daemon {
             {
                 bail!("Git Write step did not leave a clean worktree");
             }
-            let revision = git(workspace, &["rev-parse", "HEAD"])?;
+            let revision = head.context("Git Write step has no HEAD")?;
             if Some(&revision) == base.as_ref() {
                 bail!("Git Write step did not create a new commit");
             }
@@ -1183,8 +1209,12 @@ impl Daemon {
             outputs.push(TopicArtifact::GitRevision { revision });
         }
         if step.access == StepAccess::Write && topic.workspace_kind == WorkspaceKind::Directory {
+            let directory = workspace.canonicalize()?;
+            if directory != workspace || !directory.is_dir() {
+                bail!("Directory Write workspace must remain the attempt's private directory");
+            }
             outputs.push(TopicArtifact::Directory {
-                path: workspace.to_string_lossy().into_owned(),
+                path: directory.to_string_lossy().into_owned(),
             });
         }
         drop(worktree);

@@ -233,12 +233,11 @@ impl Store {
             if !matches!(topic.status.as_str(),"running"|"needs_user") || matches!(before.status,TopicAttemptStatus::Cancelled|TopicAttemptStatus::Abandoned){return Ok(before);}
             let feature=topic_info(st,&before.topic_id)?.context("topic vanished")?.features.into_iter().find(|feature|feature.id==before.feature_id).context("feature vanished")?;
             if feature.active_attempt_id.as_ref().is_some_and(|active|active!=id){bail!("attempt was superseded");}
-            let terminal=matches!(before.status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::Failed);
-            if terminal && feature.active_attempt_id.is_none(){return Ok(before);}
-            let outputs=if terminal && (before.status!=TopicAttemptStatus::Succeeded || status!=TopicAttemptStatus::Succeeded){&[][..]}else{outputs};
-            let(status,summary)=if terminal{(before.status,before.summary.as_deref().unwrap_or(summary))}else{(status,summary)};
-            let mut merged=before.outputs.clone();
-            for output in outputs {if !merged.contains(output){merged.push(output.clone());}}
+            if feature.active_attempt_id.is_none() && matches!(before.status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::Failed){return Ok(before);}
+            let(status,summary)=if before.status==TopicAttemptStatus::Failed && status==TopicAttemptStatus::Succeeded{(before.status,before.summary.as_deref().unwrap_or(summary))}else{(status,summary)};
+            let publish=matches!(status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::NeedsUser);
+            let mut merged=if publish{st.validate_topic_reported_outputs(id,&before.outputs)?}else{vec![]};
+            if publish{for output in outputs {if !merged.contains(output){merged.push(output.clone());}}}
             let mut feature_outputs=feature.outputs;
             for output in &merged {if !feature_outputs.contains(output){feature_outputs.push(output.clone());}}
             st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session.or(before.harness_session_id.as_deref()),now()])?;
@@ -835,27 +834,7 @@ impl Store {
         }
         self.transaction(|st| {
             let attempt=st.authenticate_topic_attempt(id,token)?;
-            let mut outputs=outputs.to_vec();
-            for artifact in &mut outputs {
-                if let TopicArtifact::Directory{path}=artifact{
-                    let root:Option<String>=st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1",[id],|row|row.get(0))?;
-                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
-                    let directory=if Path::new(path).is_absolute(){PathBuf::from(&*path)}else{root.join(&*path)}.canonicalize()?;
-                    if !directory.starts_with(&root)||!directory.is_dir(){bail!("directory output must be inside this attempt's private outputs directory");}
-                    *path=directory.to_string_lossy().into_owned();
-                }
-                if let TopicArtifact::File {path,sha256} = artifact {
-                    let root: Option<String> = st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1", [id], |r|r.get(0))?;
-                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
-                    let file=if path.is_absolute(){path.clone()}else{root.join(&*path)}.canonicalize()?;
-                    if !file.starts_with(&root) || !file.is_file() {bail!("file output must be inside this attempt's private outputs directory");}
-                    if hash_bytes(&std::fs::read(&file)?) != *sha256 {bail!("file output SHA-256 does not match");}
-                    *path=file;
-                }
-                if let TopicArtifact::GitRevision {revision} = artifact {
-                    if !matches!(revision.len(),40|64) || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40- or 64-character SHA");}
-                }
-            }
+            let outputs=st.validate_topic_reported_outputs(id,outputs)?;
             let timestamp=now();
             st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,updated_at=?5 WHERE id=?1",
                 params![id,enum_text(status)?,summary,serde_json::to_string(&outputs)?,timestamp])?;
@@ -865,6 +844,68 @@ impl Store {
             if status==TopicAttemptStatus::NeedsUser {st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1", params![attempt.topic_id,timestamp])?;}
             topic_attempt(st,id)?.context("attempt vanished")
         })
+    }
+
+    fn validate_topic_reported_outputs(
+        &self,
+        id: &str,
+        outputs: &[TopicArtifact],
+    ) -> Result<Vec<TopicArtifact>> {
+        let st = self;
+        let mut outputs = outputs.to_vec();
+        for artifact in &mut outputs {
+            if let TopicArtifact::Directory { path } = artifact {
+                let root: Option<String> = st.conn.query_row(
+                    "SELECT outputs_dir FROM topic_attempts WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let root = PathBuf::from(root.context("attempt has no private outputs directory")?)
+                    .canonicalize()?;
+                let directory = if Path::new(path).is_absolute() {
+                    PathBuf::from(&*path)
+                } else {
+                    root.join(&*path)
+                }
+                .canonicalize()?;
+                if !directory.starts_with(&root) || !directory.is_dir() {
+                    bail!(
+                        "directory output must be inside this attempt's private outputs directory"
+                    );
+                }
+                *path = directory.to_string_lossy().into_owned();
+            }
+            if let TopicArtifact::File { path, sha256 } = artifact {
+                let root: Option<String> = st.conn.query_row(
+                    "SELECT outputs_dir FROM topic_attempts WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                let root = PathBuf::from(root.context("attempt has no private outputs directory")?)
+                    .canonicalize()?;
+                let file = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(&*path)
+                }
+                .canonicalize()?;
+                if !file.starts_with(&root) || !file.is_file() {
+                    bail!("file output must be inside this attempt's private outputs directory");
+                }
+                if hash_bytes(&std::fs::read(&file)?) != *sha256 {
+                    bail!("file output SHA-256 does not match");
+                }
+                *path = file;
+            }
+            if let TopicArtifact::GitRevision { revision } = artifact {
+                if !matches!(revision.len(), 40 | 64)
+                    || !revision.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!("Git revision must be a full 40- or 64-character SHA");
+                }
+            }
+        }
+        Ok(outputs)
     }
 
     pub(crate) fn fail_topic_workflow(&self, topic_id: &str, detail: &str) -> Result<TopicInfo> {

@@ -202,13 +202,16 @@ async fn topic_terminal_report_survives_a_fixture_adapter_late_update_error() {
         .unwrap_err()
         .to_string()
         .contains("no longer active"));
-    f.daemon()
-        .finish_topic_attempt_execution(
-            &f.topic.id,
+    let result = f
+        .daemon()
+        .accept_topic_harness_result(
             &f.attempt.id,
-            handler.finish().and(execution),
+            handler.finish().and(execution).map(|(result, _)| result),
             false,
         )
+        .unwrap();
+    f.daemon()
+        .finish_topic_attempt_execution(&f.topic.id, &f.attempt.id, Ok((result, vec![])), false)
         .unwrap();
     let saved = f.state();
     assert_eq!(saved.attempts[0].status, TopicAttemptStatus::Succeeded);

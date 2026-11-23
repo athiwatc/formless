@@ -96,7 +96,7 @@ fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
 }
 
 #[test]
-fn topic_finalization_preserves_all_terminal_statuses() {
+fn topic_validation_can_fail_reported_success_but_never_overwrites_cancelled_or_abandoned() {
     for status in [
         TopicAttemptStatus::Succeeded,
         TopicAttemptStatus::Failed,
@@ -146,10 +146,22 @@ fn topic_finalization_preserves_all_terminal_statuses() {
             TopicAttemptStatus::Succeeded
         };
         let saved = store
-            .finish_topic_step(&attempt.id, next, "late adapter result", &[], None)
+            .finish_topic_step(&attempt.id, next, "daemon validation failed", &[], None)
             .unwrap();
-        assert_eq!(saved.status, status);
-        assert_eq!(saved.summary, before.summary);
+        let expected = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            status
+        };
+        assert_eq!(saved.status, expected);
+        assert_eq!(
+            saved.summary,
+            if status == TopicAttemptStatus::Succeeded {
+                Some("daemon validation failed".into())
+            } else {
+                before.summary
+            }
+        );
         assert_eq!(saved.outputs, before.outputs);
         assert!(store.get_topic(&topic.id).unwrap().unwrap().features[0]
             .active_attempt_id
@@ -157,8 +169,8 @@ fn topic_finalization_preserves_all_terminal_statuses() {
         let again = store
             .finish_topic_step(&attempt.id, next, "duplicate late result", &[], None)
             .unwrap();
-        assert_eq!(again.status, status);
-        assert_eq!(again.summary, before.summary);
+        assert_eq!(again.status, expected);
+        assert_eq!(again.summary, saved.summary);
     }
 }
 

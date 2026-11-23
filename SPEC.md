@@ -7263,9 +7263,12 @@ Harness-reported directories must be inside that attempt's private outputs.
 Concurrent workflows and Write steps may share a source workspace because
 the old exclusive source-workspace lock is no longer acquired. Per-attempt
 leases/cancel tokens remain live through validation and are released on stop.
-Launcher finalization never replaces an already Succeeded, Failed, Cancelled
-or Abandoned attempt status. Errors after a terminal report are logged; the
-reported status, summary and outputs survive. CLI exit still releases the
+Harness-process and adapter errors after a successful report are logged and
+ignored at the adapter boundary. Daemon validation always runs afterward:
+dirty worktrees, HEAD/reported-revision mismatches, changed file hashes and
+invalid Directory outputs fail the attempt and discard its provisional outputs.
+Only validated outputs are published to the feature. Cancelled and Abandoned
+attempts are never overwritten. CLI exit still releases the
 active-attempt gate before explicit feature completion is allowed. A feature's
 successful terminal state is Ready, reached through topic_complete_feature,
 not automatically through report_result.
