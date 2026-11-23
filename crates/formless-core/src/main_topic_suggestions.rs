@@ -264,21 +264,7 @@ fn suggestion_tree_scope<'a>(
         return Ok(None);
     }
 
-    let mut children = HashMap::<&str, Vec<&str>>::new();
-    for topic in topics {
-        if let Some(parent) = topic.parent_topic_id.as_deref() {
-            children.entry(parent).or_default().push(&topic.id);
-        }
-    }
-    let mut visible = HashSet::new();
-    let mut pending = vec![current.id.as_str()];
-    while let Some(id) = pending.pop() {
-        if visible.insert(id) {
-            if let Some(children) = children.get(id) {
-                pending.extend(children.iter().copied());
-            }
-        }
-    }
+    let mut visible = HashSet::from([current.id.as_str()]);
     let mut parent = current.parent_topic_id.as_deref();
     while let Some(id) = parent {
         if !visible.insert(id) {

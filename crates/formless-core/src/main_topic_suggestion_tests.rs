@@ -563,7 +563,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     }
 
     let (_fixture, daemon) = Fixture::new(&Config::default());
-    let (main, story, scoped, all, scoped_proposals, outside) = daemon
+    let (main, story, child_id, inside_id, scoped, all, scoped_proposals, all_proposals) = daemon
         .with_store(|st| {
             let main = st.main_chat()?.id;
             let project = propose(st, &main, "Project", None)?;
@@ -585,17 +585,31 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
             let other = propose(st, &main, "Unrelated", None)?;
             let other = st.approve_topic(&other.id)?;
             let outside = propose(st, story_chat, "Outside", Some(other.id.clone()))?;
-            let scoped_proposals = BTreeSet::from([child.id.clone(), inside.id.clone()]);
-            let scoped = BTreeSet::from([
-                project.id,
-                story.id.clone(),
+            let child_id = child.id.clone();
+            let inside_id = inside.id.clone();
+            let scoped_proposals = BTreeSet::new();
+            let scoped = BTreeSet::from([project.id, story.id.clone()]);
+            let mut all = scoped.clone();
+            all.extend([
                 child.id,
                 grandchild.id,
                 inside.id.clone(),
+                sibling.id,
+                other.id,
+                outside.id.clone(),
             ]);
-            let mut all = scoped.clone();
-            all.extend([sibling.id, other.id, outside.id.clone()]);
-            Ok((main, story, scoped, all, scoped_proposals, outside.id))
+            let all_proposals =
+                BTreeSet::from([child_id.clone(), inside_id.clone(), outside.id.clone()]);
+            Ok((
+                main,
+                story,
+                child_id,
+                inside_id,
+                scoped,
+                all,
+                scoped_proposals,
+                all_proposals,
+            ))
         })
         .unwrap();
     let story_chat = story.topic_session_id.as_deref().unwrap();
@@ -622,6 +636,35 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     assert_eq!(context["current_topic_id"], story.id);
     assert_eq!(ids(&context, "topics"), scoped);
     assert_eq!(ids(&context, "proposals"), scoped_proposals);
+    let context_frame = crate::provenance::frame(READ_TOPIC_CONTEXT, &[], &context.to_string());
+    let transcript = daemon
+        .with_store(|st| {
+            st.append_message_meta(
+                story_chat,
+                "tool",
+                &context_frame,
+                Some(json!({"tool_call_id":"read-context","name":READ_TOPIC_CONTEXT}).to_string()),
+            )?;
+            st.topic_read_conversation(&child_id, story_chat)
+        })
+        .unwrap();
+    let stored_context = transcript["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["role"] == "tool"
+                && serde_json::from_str::<Value>(message["meta"].as_str().unwrap())
+                    .is_ok_and(|meta| meta["name"] == READ_TOPIC_CONTEXT)
+        })
+        .map(|message| {
+            let frame: Value =
+                serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            serde_json::from_str::<Value>(frame["content"].as_str().unwrap()).unwrap()
+        })
+        .unwrap();
+    assert!(!ids(&stored_context, "topics").contains(&inside_id));
+    assert!(!ids(&stored_context, "proposals").contains(&inside_id));
     for allow in [true, false] {
         daemon
             .handle(Request::SetTopicContextAccess {
@@ -633,9 +676,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
         let context = read(story_chat).await;
         if allow {
             assert_eq!(ids(&context, "topics"), all);
-            let mut expected = scoped_proposals.clone();
-            expected.insert(outside.clone());
-            assert_eq!(ids(&context, "proposals"), expected);
+            assert_eq!(ids(&context, "proposals"), all_proposals);
         } else {
             assert_eq!(ids(&context, "topics"), scoped);
             assert_eq!(ids(&context, "proposals"), scoped_proposals);
