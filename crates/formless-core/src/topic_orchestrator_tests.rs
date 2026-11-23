@@ -790,18 +790,6 @@ async fn topic_async_wait_surfaces_live_question_human_answer_and_informational_
         .unwrap()
         .run_id
         .clone();
-    let duplicate_run_id = f.daemon().with_store(|st| st.create_run(&session)).unwrap();
-    let duplicate_admission = f
-        .daemon()
-        .run_admissions
-        .locked()
-        .get(&resumed_run_id)
-        .unwrap()
-        .clone();
-    assert!(f
-        .daemon()
-        .launch_prepared_run(session.clone(), duplicate_run_id, duplicate_admission)
-        .is_err());
     let resumed_question = f
         .daemon()
         .wait_topic_steps(
@@ -814,6 +802,19 @@ async fn topic_async_wait_surfaces_live_question_human_answer_and_informational_
     assert_eq!(resumed_question["event"], "question");
     assert_eq!(resumed_question["question_id"], question["question_id"]);
     assert_eq!(resumed_question["user_only"], false);
+
+    let duplicate_run_id = f.daemon().with_store(|st| st.create_run(&session)).unwrap();
+    let duplicate_admission = f
+        .daemon()
+        .run_admissions
+        .locked()
+        .get(&resumed_run_id)
+        .unwrap()
+        .clone();
+    assert!(f
+        .daemon()
+        .launch_prepared_run(session.clone(), duplicate_run_id, duplicate_admission)
+        .is_err());
 
     let repeated_daemon = f.daemon().clone();
     let repeated_session = session.clone();
