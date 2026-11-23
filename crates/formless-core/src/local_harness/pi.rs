@@ -30,8 +30,8 @@ const BRIDGE_MESSAGE: &str = "formless-pi-mcp-registered";
 const EXTENSION_NAME: &str = "formless-pi-extension.ts";
 const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
 const REDACTED_CAPABILITY: &str = "[REDACTED]";
-const MAX_RPC_RECORD_BYTES: usize = 1024 * 1024;
-const MAX_EVENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RPC_RECORD_BYTES: usize = formless_protocol::MAX_FRAME_BYTES;
+const MAX_EVENT_HISTORY_BYTES: usize = 2 * MAX_RPC_RECORD_BYTES;
 const PROMPT_REJECTION_ERROR_LIMIT: usize = 512;
 const SIGN_IN_UNKNOWN: &str = "Sign-in unknown: Pi's read-only auth check requires a provider or model; there is no read-only CLI check for any provider. --list-models initializes writable state; auth.json alone omits environment, custom and ambient credentials.";
 
@@ -736,7 +736,10 @@ fn retain_rpc_event(
     let event_bytes = record_bytes.saturating_add(value_overhead);
     let next_size = history_bytes.saturating_add(event_bytes);
     if next_size > MAX_EVENT_HISTORY_BYTES {
-        bail!("Pi RPC semantic event history exceeded the 8 MiB limit");
+        bail!(
+            "Pi RPC semantic event history exceeded the {} MiB limit",
+            MAX_EVENT_HISTORY_BYTES / (1024 * 1024)
+        );
     }
     events.push(event);
     *history_bytes = next_size;
@@ -2410,7 +2413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_rpc_line_reader_enforces_one_mibibyte_records() {
+    async fn bounded_rpc_line_reader_enforces_record_limit() {
         use tokio::io::AsyncWriteExt;
 
         let (mut writer, reader) = tokio::io::duplex(32);
@@ -2424,15 +2427,12 @@ mod tests {
         assert_eq!(reader.next_line(8).await.unwrap(), Some(b"ok\n".to_vec()));
         assert_eq!(reader.next_line(8).await.unwrap(), None);
 
-        let (mut writer, reader) = tokio::io::duplex(MAX_RPC_RECORD_BYTES + 2);
-        writer
-            .write_all(&vec![b'x'; MAX_RPC_RECORD_BYTES + 1])
-            .await
-            .unwrap();
+        let (mut writer, reader) = tokio::io::duplex(16);
+        writer.write_all(b"123456789").await.unwrap();
         drop(writer);
         let mut reader = BoundedLineReader::new(reader);
-        let error = reader.next_line(MAX_RPC_RECORD_BYTES).await.unwrap_err();
-        assert!(error.to_string().contains("1048576-byte limit"));
+        let error = reader.next_line(8).await.unwrap_err();
+        assert!(error.to_string().contains("8-byte limit"));
     }
 
     #[test]
@@ -2466,17 +2466,66 @@ mod tests {
             .iter()
             .any(|event| event["type"] == "tool_execution_start"));
 
-        let oversized = json!({"type":"metadata","payload":"z".repeat(MAX_EVENT_HISTORY_BYTES)});
         let mut oversized_events = Vec::new();
         let mut oversized_history_bytes = 0;
+        let small_event = json!({"type":"metadata"});
+        retain_rpc_event(
+            &mut oversized_events,
+            &mut oversized_history_bytes,
+            small_event.clone(),
+            MAX_RPC_RECORD_BYTES,
+        )
+        .unwrap();
         let error = retain_rpc_event(
             &mut oversized_events,
             &mut oversized_history_bytes,
-            oversized,
-            MAX_EVENT_HISTORY_BYTES,
+            small_event,
+            MAX_RPC_RECORD_BYTES,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("8 MiB limit"));
+        assert!(error.to_string().contains("64 MiB limit"));
+    }
+
+    #[tokio::test]
+    async fn maximum_supported_artifact_result_fits_rpc_limits() {
+        use base64::Engine;
+        use tokio::io::AsyncWriteExt;
+
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(vec![0u8; crate::daemon::MAX_ATTACHMENT_BYTES]);
+        let tool_result = serde_json::to_string(&json!({
+            "artifact": {"kind": "file", "name": "maximum.bin"},
+            "base64": encoded,
+        }))
+        .unwrap();
+        let event = json!({
+            "type": "tool_execution_end",
+            "result": {"content": [{"type": "text", "text": tool_result}]},
+        });
+        let record = serde_json::to_vec(&event).unwrap();
+        assert!(record.len() <= MAX_RPC_RECORD_BYTES);
+        assert!(record.len() <= MAX_EVENT_HISTORY_BYTES);
+        drop(event);
+
+        let (mut writer, reader) = tokio::io::duplex(4 * 1024 * 1024);
+        let writer = tokio::spawn(async move {
+            let mut record = record;
+            record.push(b'\n');
+            writer.write_all(&record).await.unwrap();
+        });
+        let mut reader = BoundedLineReader::new(reader);
+        let line = reader
+            .next_line(MAX_RPC_RECORD_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.await.unwrap();
+        let event: Value = serde_json::from_slice(&line).unwrap();
+        let mut retained = Vec::new();
+        let mut history_bytes = 0;
+        retain_rpc_event(&mut retained, &mut history_bytes, event, line.len()).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(history_bytes <= MAX_EVENT_HISTORY_BYTES);
     }
 
     #[test]
