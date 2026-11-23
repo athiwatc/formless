@@ -1261,12 +1261,18 @@ impl Daemon {
                     handler,
                     cancel,
                     |mut command| {
-                        let _launch = self.topic_launch.locked();
-                        self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
-                        if cancel.is_cancelled() || self.shutdown.is_cancelled() {
-                            bail!("step cancelled before launch");
-                        }
-                        command.spawn().context("failed to start Pi RPC process")
+                        spawn_pi_with_topic_launch_guard(
+                            || self.topic_launch.locked(),
+                            cancel,
+                            &self.shutdown,
+                            || {
+                                self.with_reader(|st| {
+                                    st.authenticate_topic_attempt(&attempt.id, token)
+                                })
+                                .map(|_| ())
+                            },
+                            || command.spawn().context("failed to start Pi RPC process"),
+                        )
                     },
                 )
                 .await
@@ -1354,6 +1360,21 @@ impl Daemon {
     }
 }
 
+fn spawn_pi_with_topic_launch_guard<G, T>(
+    lock: impl FnOnce() -> G,
+    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
+    authenticate: impl FnOnce() -> Result<()>,
+    spawn: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _launch = lock();
+    authenticate()?;
+    if cancel.is_cancelled() || shutdown.is_cancelled() {
+        bail!("step cancelled before launch");
+    }
+    spawn()
+}
+
 fn executable(name: &str) -> Result<Option<PathBuf>> {
     std::env::var_os(name)
         .map(|value| {
@@ -1364,4 +1385,70 @@ fn executable(name: &str) -> Result<Option<PathBuf>> {
             Ok(path)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod pi_spawn_guard_tests {
+    use super::spawn_pi_with_topic_launch_guard;
+    use std::{
+        fs,
+        sync::{mpsc, Arc, Mutex},
+        thread,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cancellation_returned_before_guarded_spawn_prevents_launch() {
+        let directory =
+            std::env::temp_dir().join(format!("formless-pi-launch-guard-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("spawned");
+        let launch_lock = Arc::new(Mutex::new(()));
+        let cancel = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (lock_held_tx, lock_held_rx) = mpsc::channel();
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (spawn_release_tx, spawn_release_rx) = mpsc::channel();
+
+        let cancel_lock = launch_lock.clone();
+        let cancel_token = cancel.clone();
+        let cancel_thread = thread::spawn(move || {
+            let guard = cancel_lock.lock().unwrap();
+            lock_held_tx.send(()).unwrap();
+            prepared_rx.recv().unwrap();
+            cancel_token.cancel();
+            drop(guard);
+            cancelled_tx.send(()).unwrap();
+            let _ = spawn_release_tx.send(());
+        });
+        lock_held_rx.recv().unwrap();
+
+        let spawn_lock = launch_lock.clone();
+        let spawn_cancel = cancel.clone();
+        let spawn_shutdown = shutdown.clone();
+        let spawn_marker = marker.clone();
+        let spawn_thread = thread::spawn(move || {
+            let spawn = move || {
+                spawn_release_rx.recv().unwrap();
+                fs::write(spawn_marker, b"spawned")?;
+                Ok(())
+            };
+            prepared_tx.send(()).unwrap();
+            spawn_pi_with_topic_launch_guard(
+                || spawn_lock.lock().unwrap(),
+                &spawn_cancel,
+                &spawn_shutdown,
+                || Ok(()),
+                spawn,
+            )
+        });
+
+        cancelled_rx.recv().unwrap();
+        cancel_thread.join().unwrap();
+        let error = spawn_thread.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!marker.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
