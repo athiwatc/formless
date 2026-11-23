@@ -113,19 +113,28 @@ id, each with `kind=Acp` and `acp_agent` set. Registry probes run concurrently o
 blocking workers, capped at ten seconds each (the ACP handshake itself uses its
 eight-second deadline). Single-agent readiness uses the same dispatch.
 
+The named Gemini ordinary-question fixture uses a fresh, unsettled choice through
+the scoped Formless MCP `ask_user` tool. It asserts the existing ordinary
+`user_only=false` semantics, pending state until a user answer, empty-basis
+rejection, exact user-reply delivery, and completion with a scripted ACP stub;
+it does not run a real model or test a user-only question API.
+
 Topic readiness resolves the ACP override or agent command from the daemon's
 environment once, canonicalizes the selected absolute path, and probes that
 exact path. Its internal per-step result carries both availability and the
-resolved executable into `HarnessRequest.executable`; the launch does not reread
-the override or PATH, so a workspace-local executable cannot replace the
-readiness selection. This identity is internal: public availability and
-ListHarnesses retain the existing `HarnessAvailability` shape. If preparation
-cannot return an executable identity, including on timeout or worker error, the
-step stops before launch with the existing retry/substitute guidance. If the
-selected path disappears before spawn, launch fails without fallback. Each retry
-or approved substitute gets fresh preparation. Unknown authentication remains
-ready only when installed and `signed_in` is not `Some(false)`. This pins path
-selection, not executable contents.
+resolved executable into `HarnessRequest.executable`; it also carries the
+selected absolute invocation path captured before canonicalization as internal
+`executable_argv0`. On Unix, launch executes the canonical path with the
+selected invocation path as `argv[0]`, preserving symlink-dispatched shims. The
+launch does not reread the override or PATH, so a workspace-local executable
+cannot replace the readiness selection. This identity is internal: public
+availability and ListHarnesses retain the existing `HarnessAvailability` shape.
+If preparation cannot return an executable identity, including on timeout or
+worker error, the step stops before launch with the existing retry/substitute
+guidance. If the selected path disappears before spawn, launch fails without
+fallback. Each retry or approved substitute gets fresh preparation. Unknown
+authentication remains ready only when installed and `signed_in` is not
+`Some(false)`. This pins path selection, not executable contents.
 
 ## Installation observations
 
@@ -157,7 +166,9 @@ traffic are explicitly synthetic. Each profile checks launch argv, identity,
 setup errors/auth method IDs, prompt completion, update forwarding, verbatim
 permission options, and review permission rejection without running a real agent.
 
-Run fixtures with `cargo test -p formless-core local_harness --locked`.
+Run harness fixtures with `cargo test -p formless-core local_harness --locked`.
+Run the named Gemini ordinary-question fixture with
+`cargo test -p formless-bin --test topic_mcp_stdio named_gemini_topic_ask_user_waits_for_and_delivers_user_choice --locked`.
 For the ignored **live initialize-only** test, place installed executables or
 symlinks in a directory, include any interpreter needed by their launchers in PATH,
 and run:

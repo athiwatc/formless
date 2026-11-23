@@ -466,6 +466,7 @@ mod tests {
             mcp_args: Vec::new(),
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::new(),
         }
     }

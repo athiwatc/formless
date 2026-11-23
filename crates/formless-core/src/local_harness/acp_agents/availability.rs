@@ -26,6 +26,7 @@ pub fn availability(
 pub(crate) struct AvailabilityWithExecutable {
     pub availability: HarnessAvailability,
     pub executable: Option<PathBuf>,
+    pub executable_argv0: Option<OsString>,
 }
 
 pub(crate) fn availability_with_executable(
@@ -67,6 +68,7 @@ fn with_timeout_with_executable(
             return AvailabilityWithExecutable {
                 availability: result,
                 executable: None,
+                executable_argv0: None,
             };
         }
     };
@@ -77,6 +79,7 @@ fn with_timeout_with_executable(
             return AvailabilityWithExecutable {
                 availability: result,
                 executable: None,
+                executable_argv0: None,
             };
         }
         None => acp::find_executable(spec.program, environment),
@@ -89,8 +92,10 @@ fn with_timeout_with_executable(
         return AvailabilityWithExecutable {
             availability: result,
             executable: None,
+            executable_argv0: None,
         };
     };
+    let executable_argv0 = program.as_os_str().to_os_string();
     let program = match fs::canonicalize(program) {
         Ok(path) if acp::is_executable(&path) => path,
         Ok(_) => {
@@ -98,6 +103,7 @@ fn with_timeout_with_executable(
             return AvailabilityWithExecutable {
                 availability: result,
                 executable: None,
+                executable_argv0: None,
             };
         }
         Err(error) => {
@@ -105,6 +111,7 @@ fn with_timeout_with_executable(
             return AvailabilityWithExecutable {
                 availability: result,
                 executable: None,
+                executable_argv0: None,
             };
         }
     };
@@ -116,6 +123,7 @@ fn with_timeout_with_executable(
             return AvailabilityWithExecutable {
                 availability: result,
                 executable: Some(program),
+                executable_argv0: Some(executable_argv0.clone()),
             };
         }
     };
@@ -134,6 +142,7 @@ fn with_timeout_with_executable(
         mcp_args: vec![],
         mcp_env_vars: BRIDGE_ENV.iter().map(|name| (*name).into()).collect(),
         executable: Some(program.clone()),
+        executable_argv0: Some(executable_argv0.clone()),
         environment,
     };
     let probe = acp::probe_session(spec, &request, timeout);
@@ -163,6 +172,7 @@ fn with_timeout_with_executable(
     AvailabilityWithExecutable {
         availability: result,
         executable: Some(program),
+        executable_argv0: Some(executable_argv0.clone()),
     }
 }
 

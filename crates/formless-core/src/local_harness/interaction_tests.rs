@@ -141,6 +141,7 @@ mod fixture {
                 mcp_args: vec![],
                 mcp_env_vars: vec![],
                 executable: Some(self.0.join("agent")),
+                executable_argv0: None,
                 environment: BTreeMap::new(),
             }
         }

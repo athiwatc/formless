@@ -19,6 +19,7 @@ pub struct ProbeContext {
 pub(crate) struct HarnessReadiness {
     pub availability: HarnessAvailability,
     pub resolved_executable: Option<PathBuf>,
+    pub resolved_executable_argv0: Option<OsString>,
 }
 
 impl Default for ProbeContext {
@@ -96,7 +97,10 @@ fn executable_name(kind: HarnessKind) -> &'static str {
         _ => kind_name(kind),
     }
 }
-fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+pub(super) fn lookup(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
     let override_key = format!(
         "FORMLESS_TOPIC_{}_EXE",
         kind_name(kind).to_ascii_uppercase()
@@ -127,6 +131,13 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
     }
     None
 }
+pub(crate) fn resolve_executable(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    lookup(kind, environment)
+}
+
 pub(super) fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
     HarnessAvailability {
         kind,
@@ -321,17 +332,20 @@ async fn acp_readiness(ctx: &ProbeContext, agent: &str) -> HarnessReadiness {
         Ok(Ok(result)) => HarnessReadiness {
             availability: result.availability,
             resolved_executable: result.executable,
+            resolved_executable_argv0: result.executable_argv0,
         },
         Ok(Err(_)) => {
             base.detail = Some("probe failed".into());
             HarnessReadiness {
                 availability: base,
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             }
         }
         Err(_) => HarnessReadiness {
             availability: timed_out(base),
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
     }
 }
@@ -345,7 +359,15 @@ async fn dispatch(
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
         HarnessKind::Pi => fallback_probe(kind, ctx).await,
-        HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
+        HarnessKind::OpenCode => {
+            blocking_probe(
+                kind,
+                Some(ctx.executable.clone()),
+                ctx.environment.clone(),
+                super::opencode::availability,
+            )
+            .await
+        }
         HarnessKind::Antigravity => {
             blocking_probe(
                 kind,
@@ -391,6 +413,7 @@ async fn probe_environment_with_identity(
             return HarnessReadiness {
                 availability: base,
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             };
         };
         let ctx = ProbeContext {
@@ -414,6 +437,7 @@ async fn probe_environment_with_identity(
             return HarnessReadiness {
                 availability: timed_out(base),
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             }
         }
     };
@@ -430,6 +454,7 @@ async fn probe_environment_with_identity(
         return HarnessReadiness {
             availability: base,
             resolved_executable: None,
+            resolved_executable_argv0: None,
         };
     };
     base.installed = executable_file(&executable);
@@ -442,10 +467,12 @@ async fn probe_environment_with_identity(
         Ok(value) => HarnessReadiness {
             availability: value,
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
         Err(_) => HarnessReadiness {
             availability: timed_out(base),
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
     }
 }

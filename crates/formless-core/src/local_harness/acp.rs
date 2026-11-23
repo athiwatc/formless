@@ -186,6 +186,14 @@ impl PermissionHandler for Interactions<'_> {
 /// A blocking ACP adapter entry point such as `antigravity::run`.
 pub type Adapter =
     fn(&HarnessRequest, &mut dyn PermissionHandler, &CancellationToken) -> Result<HarnessResult>;
+pub type ProcessSpawner =
+    dyn FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send;
+pub type GuardedAdapter = fn(
+    &HarnessRequest,
+    &mut dyn PermissionHandler,
+    &CancellationToken,
+    &mut ProcessSpawner,
+) -> Result<HarnessResult>;
 
 /// Runs `adapter` on a blocking thread while `handler` answers its permission requests,
 /// questions and updates on the caller's task, so `handler` need not be `'static`.
@@ -207,6 +215,42 @@ pub async fn run_interactive(
             runtime,
         };
         adapter(&request, &mut interactions, &blocking_cancel)
+    });
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(ask) = asks.recv() => answer(handler, ask, &run_cancel).await,
+            result = &mut job => break result,
+        }
+    };
+    while let Ok(ask) = asks.try_recv() {
+        answer(handler, ask, &run_cancel).await;
+    }
+    result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?
+}
+
+pub async fn run_interactive_with_spawn<F>(
+    adapter: GuardedAdapter,
+    request: HarnessRequest,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+    mut spawn: F,
+) -> Result<HarnessResult>
+where
+    F: FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send + 'static,
+{
+    let (sender, mut asks) = tokio::sync::mpsc::unbounded_channel();
+    let run_cancel = cancel.child_token();
+    let _cancel_on_drop = run_cancel.clone().drop_guard();
+    let blocking_cancel = run_cancel.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut job = tokio::task::spawn_blocking(move || {
+        let forward = Forward(sender);
+        let mut interactions = Interactions {
+            handler: &forward,
+            runtime,
+        };
+        adapter(&request, &mut interactions, &blocking_cancel, &mut spawn)
     });
     let result = loop {
         tokio::select! {
@@ -356,7 +400,20 @@ pub fn run(
     permissions: &mut dyn PermissionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    let mut agent = AgentProcess::spawn(spec, request)?;
+    let mut spawn = |command, _cancel: &CancellationToken| {
+        SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+    };
+    run_with_spawn(spec, request, permissions, cancel, &mut spawn)
+}
+
+pub fn run_with_spawn(
+    spec: &AgentSpec,
+    request: &HarnessRequest,
+    permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+    spawn: &mut ProcessSpawner,
+) -> Result<HarnessResult> {
+    let mut agent = AgentProcess::spawn_with(spec, request, cancel, spawn)?;
     let (reader, writer) = agent.pipes()?;
     drive(spec, reader, writer, request, permissions, cancel, true)
 }
@@ -417,6 +474,7 @@ pub fn probe(
         mcp_env_vars: vec![],
         cwd,
         executable,
+        executable_argv0: None,
         environment: environment.clone(),
     };
     let mut agent = match AgentProcess::spawn(spec, &request) {
@@ -665,10 +723,27 @@ fn agent_program(
 
 impl AgentProcess {
     pub(super) fn spawn(spec: &AgentSpec, request: &HarnessRequest) -> Result<Self> {
+        let mut spawn = |command, _cancel: &CancellationToken| {
+            SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+        };
+        Self::spawn_with(spec, request, &CancellationToken::new(), &mut spawn)
+    }
+
+    fn spawn_with(
+        spec: &AgentSpec,
+        request: &HarnessRequest,
+        cancel: &CancellationToken,
+        spawn: &mut ProcessSpawner,
+    ) -> Result<Self> {
         validate(request)?;
         let process_environment = std::env::vars_os().collect();
         let program = agent_program(spec.program, request, &process_environment, cfg!(windows));
         let mut command = Command::new(&program);
+        #[cfg(unix)]
+        if let Some(argv0) = &request.executable_argv0 {
+            use std::os::unix::process::CommandExt;
+            command.arg0(argv0);
+        }
         command
             .args((spec.args)(request))
             .current_dir(&request.cwd)
@@ -691,7 +766,7 @@ impl AgentProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let process = SupervisedProcess::spawn(command).map_err(|error| {
+        let process = spawn(command, cancel).map_err(|error| {
             anyhow!(
                 "failed to start {} ({error}); is it installed and on PATH?",
                 spec.name
@@ -1291,6 +1366,86 @@ mod tests {
     use crate::local_harness::HarnessKind;
     use std::io::Cursor;
 
+    #[cfg(unix)]
+    #[test]
+    fn native_executable_receives_selected_invocation_argv0() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!(
+            "formless-acp-argv0-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("argv0.c");
+        let executable = root.join("native-shim");
+        let selected = root.join("gemini");
+        let marker = root.join("argv0");
+        let done = root.join("argv0-done");
+        std::fs::write(
+            &source,
+            "#include <stdio.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { FILE *f = fopen(getenv(\"ARGV0_MARKER\"), \"w\"); if (!f) return 2; fputs(argv[0], f); fclose(f); f = fopen(getenv(\"ARGV0_DONE\"), \"w\"); if (!f) return 3; fclose(f); return 0; }\n",
+        )
+        .unwrap();
+        let compiled = Command::new("cc")
+            .args(["-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        std::os::unix::fs::symlink(&executable, &selected).unwrap();
+        let environment = BTreeMap::from([
+            ("ARGV0_MARKER".into(), marker.as_os_str().to_os_string()),
+            ("ARGV0_DONE".into(), done.as_os_str().to_os_string()),
+        ]);
+        let readiness = super::super::acp_agents::availability_with_executable(
+            "gemini",
+            Some(selected.clone()),
+            &environment,
+        );
+        let canonical = std::fs::canonicalize(&executable).unwrap();
+        assert_eq!(readiness.executable.as_deref(), Some(canonical.as_path()));
+        assert_eq!(
+            readiness.executable_argv0.as_deref(),
+            Some(selected.as_os_str())
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            done.exists(),
+            "native readiness shim did not finish writing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            selected.to_string_lossy()
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(&done).unwrap();
+        let mut request = request(StepAccess::Write);
+        request.cwd = root.clone();
+        request.executable = readiness.executable;
+        request.executable_argv0 = readiness.executable_argv0;
+        request.environment.extend(environment);
+        let _agent = AgentProcess::spawn(&SPEC, &request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done.exists(), "native launch shim did not finish writing");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            selected.to_string_lossy()
+        );
+        drop(_agent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Captured from the released `agy acp` 1.5.14 `initialize` response (live, unauthenticated).
     const LIVE_INITIALIZE: &str = r#"{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},"sessionCapabilities":{"resume":{},"close":{},"load":{},"list":{},"additionalDirectories":{}}},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"},"authMethods":[{"id":"oauth-personal","name":"Log in with Google"}]},"id":1}"#;
     // Captured from the released `agy acp` 1.5.14 `session/new` response without a sign-in.
@@ -1312,6 +1467,7 @@ mod tests {
             mcp_args: vec!["mcp".into(), "--run".into(), "run-7".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::from([
                 ("FORMLESS_TOPIC_CAPABILITY".into(), "cap-secret".into()),
                 ("HOME".into(), "/home/user".into()),
@@ -1947,6 +2103,132 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.message, "done");
+    }
+
+    #[tokio::test]
+    async fn aborting_guarded_run_cancels_blocking_adapter_before_spawn() {
+        use crate::local_harness::InteractionFuture;
+        use std::{fs, path::PathBuf, thread};
+
+        struct NoInteractions;
+        impl InteractionHandler for NoInteractions {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                Box::pin(async { None })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async { None })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn wait_then_spawn(
+            request: &HarnessRequest,
+            _: &mut dyn PermissionHandler,
+            cancel: &CancellationToken,
+            spawn: &mut ProcessSpawner,
+        ) -> Result<HarnessResult> {
+            let path = |name: &str| -> Result<PathBuf> {
+                Ok(PathBuf::from(
+                    request
+                        .environment
+                        .get(&OsString::from(name))
+                        .context("missing abort-test path")?,
+                ))
+            };
+            let started = path("ACP_ABORT_STARTED")?;
+            let release = path("ACP_ABORT_RELEASE")?;
+            let finished = path("ACP_ABORT_FINISHED")?;
+            let spawn_called = path("ACP_ABORT_SPAWN_CALLED")?;
+            let spawn_marker = path("ACP_ABORT_SPAWN_MARKER")?;
+            fs::write(started, "ready")?;
+            while !release.exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if cancel.is_cancelled() {
+                fs::write(finished, "cancelled")?;
+                bail!("cancelled before spawn");
+            }
+            fs::write(finished, "not-cancelled")?;
+            let mut command = Command::new("touch");
+            command.arg(spawn_marker);
+            let _process = spawn(command, cancel)?;
+            fs::write(spawn_called, "spawned")?;
+            bail!("adapter reached spawn after wrapper was dropped")
+        }
+
+        let dir = std::env::temp_dir().join(format!("formless-acp-abort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let started = dir.join("started");
+        let release = dir.join("release");
+        let finished = dir.join("finished");
+        let spawn_called = dir.join("spawn-called");
+        let spawn_marker = dir.join("spawn-marker");
+        let mut request = request(StepAccess::Write);
+        request.environment.extend([
+            ("ACP_ABORT_STARTED".into(), started.clone().into_os_string()),
+            ("ACP_ABORT_RELEASE".into(), release.clone().into_os_string()),
+            (
+                "ACP_ABORT_FINISHED".into(),
+                finished.clone().into_os_string(),
+            ),
+            (
+                "ACP_ABORT_SPAWN_CALLED".into(),
+                spawn_called.clone().into_os_string(),
+            ),
+            (
+                "ACP_ABORT_SPAWN_MARKER".into(),
+                spawn_marker.clone().into_os_string(),
+            ),
+        ]);
+        let caller_cancel = CancellationToken::new();
+        let cancel = caller_cancel.clone();
+        let handler = NoInteractions;
+        let spawn_called_for_closure = spawn_called.clone();
+        let task = tokio::spawn(async move {
+            run_interactive_with_spawn(
+                wait_then_spawn,
+                request,
+                &handler,
+                &cancel,
+                move |command, _| {
+                    fs::write(&spawn_called_for_closure, "spawned")?;
+                    SupervisedProcess::spawn(command).map_err(|error| anyhow!(error))
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocking adapter did not start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        fs::write(&release, "continue").unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fs::read_to_string(&finished).ok().as_deref() != Some("cancelled") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("blocking adapter did not observe cancellation");
+        assert_eq!(fs::read_to_string(finished).unwrap(), "cancelled");
+        assert!(!spawn_called.exists());
+        assert!(!spawn_marker.exists());
+        assert!(!caller_cancel.is_cancelled());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

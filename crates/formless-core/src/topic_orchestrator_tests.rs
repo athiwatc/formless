@@ -2,11 +2,15 @@
 use super::*;
 use crate::local_harness::HarnessUpdate;
 use axum::response::IntoResponse;
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[path = "topic_opencode_dispatch_tests.rs"]
+mod opencode_dispatch;
 
 fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
@@ -35,6 +39,22 @@ if mode=='permission':
 if mode=='question':
     answer=rpc({'operation':'ask_user','questions':[{'question':'Use the user-approved accounting inputs?','options':[{'label':'Yes'},{'label':'No'}]}]})
     assert answer[0]['selected']==['Yes']
+if mode=='git_needs_user':
+    target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'needs-user.txt'
+    target.write_text('validated evidence')
+    outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
+    rpc({'operation':'report_result','status':'needs_user','summary':'Waiting for user confirmation','outputs':outputs})
+    sys.exit(9)
+if mode=='git_needs_user_revision':
+    revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+    rpc({'operation':'report_result','status':'needs_user','summary':'Waiting for user confirmation','outputs':[{'kind':'git_revision','revision':revision}]})
+    sys.exit(9)
+if mode=='report_empty_summary_nonzero':
+    target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'empty-summary.txt'
+    target.write_text('validated empty-summary output')
+    outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
+    rpc({'operation':'report_result','status':'succeeded','summary':'','outputs':outputs})
+    sys.exit(9)
 if mode in ('report_nonzero','report_dirty_nonzero','report_valid_file_nonzero','report_mutated_file','report_mutated_directory','report_wrong_revision','report_workspace_replaced'):
     outputs=[]
     target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'reported'
@@ -98,7 +118,7 @@ if mode=='substitute_model':
     if expected:assert sys.argv[sys.argv.index('--model')+1]==expected
     else:assert '--model' not in sys.argv
 readonly=('plan' in sys.argv or 'read-only' in sys.argv)
-if mode in ('git','git_isolated','git_merge'):
+if mode in ('git','git_isolated','git_distinct','git_merge'):
     def git(*args):return subprocess.check_output(['git',*args],stderr=subprocess.STDOUT,text=True).strip()
     if not readonly:
         if mode=='git_merge':
@@ -109,7 +129,7 @@ if mode in ('git','git_isolated','git_merge'):
             for item,tree in zip(inputs,trees):assert git('-C',tree['path'],'rev-parse','HEAD')==item['revision']
             git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','merge','--no-edit',inputs[1]['revision'])
         else:
-            filename='result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt' if mode=='git_isolated' else 'result.txt'
+            filename='result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt' if mode in ('git_isolated','git_distinct') else 'result.txt'
             pathlib.Path(filename).write_text('fixture change')
             git('add',filename);git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','fixture result')
     result=git('rev-parse','HEAD')
@@ -282,9 +302,9 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     assert_eq!(message.role, "user");
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
     assert!(message.content.contains(concat!(
-        "Available harness kinds: claude, codex, antigravity, acp, muse; ",
-        "pi and opencode currently return adapter-not-integrated errors. ",
-        "ACP requires acp_agent."
+        "Available harness kinds: claude, codex, antigravity, acp, muse, opencode; ",
+        "pi currently returns adapter-not-integrated errors. ",
+        "ACP requires acp_agent. OpenCode uses ACP."
     )));
     assert!(message
         .content
@@ -1004,6 +1024,7 @@ async fn topic_harness_errors_after_success_still_require_daemon_output_validati
     for (mode, error) in [
         ("report_nonzero", None),
         ("report_valid_file_nonzero", None),
+        ("report_empty_summary_nonzero", None),
         ("report_dirty_nonzero", Some("clean worktree")),
         ("report_mutated_file", Some("SHA-256")),
         (
@@ -1062,11 +1083,32 @@ async fn topic_harness_errors_after_success_still_require_daemon_output_validati
             assert!(state(&f, &topic.id).features[0].outputs.is_empty());
         } else {
             assert_eq!(done["status"], "succeeded", "{mode}: {done}");
-            assert_eq!(done["summary"], "reported success");
+            assert_eq!(
+                done["summary"],
+                if mode == "report_empty_summary_nonzero" {
+                    ""
+                } else {
+                    "reported success"
+                }
+            );
             assert_eq!(
                 done["outputs"].as_array().unwrap().len(),
-                usize::from(mode == "report_valid_file_nonzero")
+                usize::from(matches!(
+                    mode,
+                    "report_valid_file_nonzero" | "report_empty_summary_nonzero"
+                ))
             );
+            if mode == "report_empty_summary_nonzero" {
+                let outputs: Vec<TopicArtifact> =
+                    serde_json::from_value(done["outputs"].clone()).unwrap();
+                let TopicArtifact::File { path, .. } = &outputs[0] else {
+                    panic!("expected validated file output")
+                };
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "validated empty-summary output"
+                );
+            }
         }
         assert!(state(&f, &topic.id).features[0].active_attempt_id.is_none());
         if mode == "report_workspace_replaced" {
@@ -2012,6 +2054,133 @@ async fn topic_git_writes_have_distinct_branches_and_explicit_merge_gets_both_re
 }
 
 #[tokio::test]
+async fn git_write_needs_user_report_with_unchanged_head_keeps_validated_outputs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "git_needs_user");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let repo = repository(&f);
+    let original_head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let topic = topic(&f, Some(repo.clone()), true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_ref().unwrap(),
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "needs_user", "{result}");
+    assert_eq!(result["summary"], "Waiting for user confirmation");
+    let outputs: Vec<TopicArtifact> = serde_json::from_value(result["outputs"].clone()).unwrap();
+    assert_eq!(outputs.len(), 1);
+    let TopicArtifact::File { path, sha256 } = &outputs[0] else {
+        panic!("expected validated file output")
+    };
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes, b"validated evidence");
+    assert_eq!(sha256, &format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap(), original_head);
+    assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    f.daemon().request_shutdown();
+    ipc.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn git_write_needs_user_cannot_report_unchanged_cross_feature_input_revision() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "git_distinct");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let repo = repository(&f);
+    let topic = topic(&f, Some(repo), true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+
+    for feature in &topic.features {
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                session,
+                &step(&feature.id, HarnessKind::Claude, StepAccess::Write, &[]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "succeeded", "{result}");
+    }
+    let saved = state(&f, &topic.id);
+    let revision = |feature: &TopicFeatureInfo| {
+        feature
+            .outputs
+            .iter()
+            .rev()
+            .find_map(|output| match output {
+                TopicArtifact::GitRevision { revision } => Some(revision.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let target_base = revision(&saved.features[0]);
+    let cross_feature = revision(&saved.features[1]);
+    assert_ne!(target_base, cross_feature);
+    assert!(!saved.features[0]
+        .outputs
+        .contains(&TopicArtifact::GitRevision {
+            revision: cross_feature.clone()
+        }));
+
+    env.set("TOPIC_FIXTURE_MODE", "git_needs_user_revision");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[TopicArtifact::GitRevision {
+                    revision: cross_feature.clone(),
+                }],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(result["summary"]
+        .as_str()
+        .unwrap()
+        .contains("cannot include a GitRevision without a new commit"));
+    let saved = state(&f, &topic.id);
+    assert_eq!(revision(&saved.features[0]), target_base);
+    assert!(!saved.features[0]
+        .outputs
+        .contains(&TopicArtifact::GitRevision {
+            revision: cross_feature
+        }));
+    f.daemon().request_shutdown();
+    ipc.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn topic_directory_symlink_chains_follow_existing_prefixes_before_parent_components() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "plain");
@@ -2330,7 +2499,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let executable = script(&f, &env);
-    env.set("FORMLESS_TOPIC_OPENCODE_EXE", executable);
+    env.set("FORMLESS_TOPIC_PI_EXE", executable);
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -2342,7 +2511,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
             &session,
             &step(
                 &topic.features[0].id,
-                HarnessKind::OpenCode,
+                HarnessKind::Pi,
                 StepAccess::Write,
                 &[],
             ),
@@ -3187,12 +3356,14 @@ async fn topic_startup_retires_legacy_failed_kickoffs_but_preserves_resumable_ru
     }
 }
 
-fn agy_script(f: &Fixture, env: &crate::credential_env::EnvGuard) {
+fn agy_script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> std::path::PathBuf {
+    let target = f.root.join("fake-agy-target");
     let path = f.root.join("fake-agy");
     std::fs::write(
-        &path,
+        &target,
         r#"#!/usr/bin/env python3
 import sys,os,json,subprocess,pathlib
+pathlib.Path(os.environ['TOPIC_FIXTURE_PATHS']).open('a').write(sys.argv[0]+'\n')
 if sys.argv[1:2]==['models']:print('gemini-fixture');sys.exit()
 assert sys.argv[1:3]==['acp','--disable-telemetry'],sys.argv
 assert 'FORMLESS_TOPIC_CAPABILITY' not in os.environ
@@ -3225,9 +3396,12 @@ while True:
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
     env.set("FORMLESS_TOPIC_ANTIGRAVITY_EXE", &path);
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
+    env.set("TOPIC_FIXTURE_PATHS", f.root.join("agy-paths"));
+    path
 }
 
 fn gemini_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard, python: &Path) -> PathBuf {
@@ -3734,10 +3908,18 @@ async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and
             let decoy = f.root.join("override-decoy");
             std::fs::write(
                 &decoy,
-                "#!/bin/sh\\nprintf 'decoy' > \\\"$TOPIC_FIXTURE_DECOY_MARKER\\\"\\nexit 97\\n",
+                "#!/bin/sh\nprintf 'decoy' > \"$TOPIC_FIXTURE_DECOY_MARKER\"\nexit 97\n",
             )
             .unwrap();
             std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = f.root.join("decoy-marker");
+            let output = std::process::Command::new(&decoy)
+                .env("TOPIC_FIXTURE_DECOY_MARKER", &marker)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(97));
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "decoy");
+            std::fs::remove_file(marker).unwrap();
             let override_link = f.root.join("gemini-override");
             std::os::unix::fs::symlink(&executable, &override_link).unwrap();
             env.set("TOPIC_FIXTURE_OVERRIDE_LINK", &override_link);
@@ -3829,7 +4011,7 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
             if mode == "hold" { "hold" } else { "permission" },
         );
         let f = Fixture::new(&env);
-        agy_script(&f, &env);
+        let executable = agy_script(&f, &env);
         let topic = topic(&f, None, false);
         f.daemon()
             .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -3862,6 +4044,14 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
                 .parse()
                 .unwrap();
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            let paths = std::fs::read_to_string(f.root.join("agy-paths")).unwrap();
+            let observed: Vec<_> = paths.lines().collect();
+            let expected = executable.to_string_lossy();
+            assert!(observed.len() >= 3, "{observed:?}");
+            assert!(
+                observed.iter().all(|path| *path == expected.as_ref()),
+                "{observed:?}"
+            );
             continue;
         }
         wait_until(|| !f.daemon().harness_permissions.locked().is_empty()).await;
@@ -3891,9 +4081,16 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
             "{result}"
         );
         assert!(f.daemon().harness_permissions.locked().is_empty());
+        let paths = std::fs::read_to_string(f.root.join("agy-paths")).unwrap();
+        let observed: Vec<_> = paths.lines().collect();
+        let expected = executable.to_string_lossy();
+        assert!(observed.len() >= 3, "{observed:?}");
+        assert!(
+            observed.iter().all(|path| *path == expected.as_ref()),
+            "{observed:?}"
+        );
     }
 }
-
 fn grok_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-grok-acp");
     std::fs::write(
@@ -4231,4 +4428,40 @@ async fn topic_orchestrator_fixture_grok_acp_cancellation_cleans_up_process_grou
         assert!(grok_fixture_process_stopped(pid));
     }
     cleanup.disarm();
+}
+
+#[tokio::test]
+async fn topic_antigravity_missing_identity_fails_before_attempt_with_substitute_guidance() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    env.set("FORMLESS_TOPIC_ANTIGRAVITY_EXE", f.root.join("missing-agy"));
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+
+    let error = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Antigravity,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("CLI executable not found"), "{error}");
+    assert!(error.contains("retry"), "{error}");
+    assert!(
+        error.contains("topic_request_harness_substitute"),
+        "{error}"
+    );
+    assert!(state(&f, &topic.id).attempts.is_empty());
 }
