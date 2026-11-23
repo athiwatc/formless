@@ -1819,8 +1819,7 @@ impl State {
         permission: &HarnessPermission,
         color: bool,
     ) -> (bool, bool) {
-        let area = centered(frame.area(), 80, 70);
-        frame.render_widget(Clear, area);
+        let mut area = centered(frame.area(), 80, 70);
         let harness = harness_name(permission.harness, permission.acp_agent.as_deref());
         let step = self
             .topic(&permission.topic_id)
@@ -1875,9 +1874,10 @@ impl State {
             "only you can answer · no answer means denied",
             color,
         ));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.width == 0 || inner.height == 0 {
+        let mut inner = block.inner(area);
+        if inner.width == 0 {
+            frame.render_widget(Clear, area);
+            frame.render_widget(block, area);
             return (false, false);
         }
         let wrap = Wrap { trim: false };
@@ -1888,6 +1888,19 @@ impl State {
             .wrap(wrap)
             .line_count(inner.width);
         let minimum = header_rows.saturating_add(action_rows).saturating_add(3);
+        if minimum > usize::from(inner.height) {
+            let full_area = centered(frame.area(), 80, 100);
+            let full_inner = block.inner(full_area);
+            if full_inner.height > inner.height {
+                area = full_area;
+                inner = full_inner;
+            }
+        }
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        if inner.height == 0 {
+            return (false, false);
+        }
         if minimum > usize::from(inner.height) {
             frame.render_widget(
                 Paragraph::new(
@@ -2778,6 +2791,26 @@ mod tests {
             Action::PermissionDecision {
                 permission_id: "p1".into(),
                 option_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn permission_choices_expand_to_full_height_when_the_centered_panel_is_too_short() {
+        let mut prompt = permission("p1", serde_json::json!({"command": "run"}));
+        prompt.title = "Inspect command output before granting permission carefully".into();
+        let mut state = State::default();
+        state.push_permission(prompt);
+
+        let screen = permission_screen(&mut state, 30, 16);
+        assert!(screen.contains("1. Allow once"), "{screen}");
+        assert!(!screen.contains("Terminal too small"), "{screen}");
+        assert!(state.permission_options_visible);
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: Some("allow".into()),
             }
         );
     }
