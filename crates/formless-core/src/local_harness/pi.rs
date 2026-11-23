@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use formless_protocol::{HarnessAvailability, HarnessKind, Question, QuestionAnswer};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 use tokio_util::sync::CancellationToken;
@@ -30,6 +30,8 @@ const BRIDGE_MESSAGE: &str = "formless-pi-mcp-registered";
 const EXTENSION_NAME: &str = "formless-pi-extension.ts";
 const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
 const REDACTED_CAPABILITY: &str = "[REDACTED]";
+const MAX_RPC_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_EVENT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const SIGN_IN_UNKNOWN: &str = "Sign-in unknown: Pi's read-only auth check requires a provider or model; there is no read-only CLI check for any provider. --list-models initializes writable state; auth.json alone omits environment, custom and ambient credentials.";
 
 fn redact_text(text: &str, capability: Option<&str>) -> String {
@@ -663,6 +665,88 @@ pub async fn run(
     })
 }
 
+struct BoundedLineReader<R> {
+    reader: R,
+    buffered: Vec<u8>,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> BoundedLineReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffered: Vec::new(),
+            eof: false,
+        }
+    }
+
+    async fn next_line(&mut self, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
+        let mut chunk = [0; 8192];
+        loop {
+            if let Some(newline) = self.buffered.iter().position(|byte| *byte == b'\n') {
+                if newline > max_bytes {
+                    return Err(record_limit_error(max_bytes));
+                }
+                return Ok(Some(self.buffered.drain(..=newline).collect()));
+            }
+            if self.buffered.len() > max_bytes {
+                return Err(record_limit_error(max_bytes));
+            }
+            if self.eof {
+                return Ok((!self.buffered.is_empty()).then(|| std::mem::take(&mut self.buffered)));
+            }
+            let remaining = max_bytes
+                .saturating_add(1)
+                .saturating_sub(self.buffered.len())
+                .min(chunk.len());
+            let count = self.reader.read(&mut chunk[..remaining]).await?;
+            if count == 0 {
+                self.eof = true;
+            } else {
+                self.buffered.extend_from_slice(&chunk[..count]);
+            }
+        }
+    }
+}
+
+fn record_limit_error(max_bytes: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("Pi RPC record exceeded the {max_bytes}-byte limit"),
+    )
+}
+
+fn value_node_count(value: &Value) -> usize {
+    1usize.saturating_add(match value {
+        Value::Array(values) => values.iter().map(value_node_count).sum(),
+        Value::Object(values) => values.values().map(value_node_count).sum(),
+        _ => 0,
+    })
+}
+
+fn retain_rpc_event(
+    events: &mut Vec<Value>,
+    history_bytes: &mut usize,
+    event: Value,
+    record_bytes: usize,
+) -> Result<()> {
+    if matches!(
+        event["type"].as_str(),
+        Some("message_update" | "tool_execution_update")
+    ) {
+        return Ok(());
+    }
+    let value_overhead = value_node_count(&event).saturating_mul(std::mem::size_of::<Value>());
+    let event_bytes = record_bytes.saturating_add(value_overhead);
+    let next_size = history_bytes.saturating_add(event_bytes);
+    if next_size > MAX_EVENT_HISTORY_BYTES {
+        bail!("Pi RPC semantic event history exceeded the 8 MiB limit");
+    }
+    events.push(event);
+    *history_bytes = next_size;
+    Ok(())
+}
+
 async fn rpc_session(
     stdout: tokio::process::ChildStdout,
     input: mpsc::UnboundedSender<Value>,
@@ -675,8 +759,9 @@ async fn rpc_session(
     let send = |value| input.send(value).context("Pi RPC stdin closed");
     send(json!({"id": "state-1", "type": "get_state"}))?;
     send(json!({"id": "prompt-1", "type": "prompt", "message": prompt}))?;
-    let mut lines = BufReader::new(stdout).lines();
+    let mut lines = BoundedLineReader::new(BufReader::new(stdout));
     let mut events = Vec::new();
+    let mut history_bytes = 0;
     let mut dialogs = FuturesUnordered::new();
     let mut open = BTreeSet::new();
     let mut prompt_accepted = false;
@@ -711,13 +796,18 @@ async fn rpc_session(
                     send(response)?;
                 }
             }
-            line = lines.next_line() => {
+            line = lines.next_line(MAX_RPC_RECORD_BYTES) => {
                 let Some(line) = line.context("failed reading Pi RPC stdout")? else {
                     if cancelling { bail!("Pi run cancelled"); }
                     bail!("Pi RPC process exited before successful settle");
                 };
                 if line.is_empty() { continue; }
-                let mut event: Value = serde_json::from_str(&line).context("Pi RPC returned invalid JSONL")?;
+                let record_bytes = line.len();
+                let record = String::from_utf8(line).context("Pi RPC record was not UTF-8")?;
+                let line = record.strip_suffix('\n').unwrap_or(&record);
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if line.is_empty() { continue; }
+                let mut event: Value = serde_json::from_str(line).context("Pi RPC returned invalid JSONL")?;
                 redact_value(&mut event, capability);
                 if !event.is_object() { bail!("Pi RPC event was not an object"); }
                 match event["type"].as_str() {
@@ -773,13 +863,12 @@ async fn rpc_session(
                         }
                     }
                 }
-                events.push(event);
+                retain_rpc_event(&mut events, &mut history_bytes, event, record_bytes)?;
                 if settled && prompt_accepted && state_received && !cancel.is_cancelled() {
                     for id in &open {
                         send(json!({"type": "extension_ui_response", "id": id, "cancelled": true}))?;
                     }
-                    let output = events.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
-                    let mut result = parse_output(&output)?;
+                    let mut result = parse_events(events)?;
                     result.session_id = session_id;
                     return Ok(result);
                 }
@@ -973,12 +1062,6 @@ fn canonical_extension_path(extension_path: &Path) -> Result<PathBuf> {
 
 pub fn parse_output(stdout: &str) -> Result<HarnessResult> {
     let mut events = Vec::new();
-    let mut session_id = None;
-    let mut bridge_registered = false;
-    let mut settled = None;
-    let mut final_assistant = None;
-    let mut agent_end = None;
-
     for (index, raw_line) in stdout.split('\n').enumerate() {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
@@ -989,8 +1072,23 @@ pub fn parse_output(stdout: &str) -> Result<HarnessResult> {
         if !event.is_object() {
             bail!("Pi CLI JSONL event {} was not an object", index + 1);
         }
+        events.push(event);
+    }
+    parse_events(events)
+}
 
-        let event_position = events.len();
+fn parse_events(events: Vec<Value>) -> Result<HarnessResult> {
+    let mut session_id = None;
+    let mut bridge_registered = false;
+    let mut settled = None;
+    let mut final_assistant = None;
+    let mut agent_end = None;
+
+    for (index, event) in events.iter().enumerate() {
+        if !event.is_object() {
+            bail!("Pi RPC event {} was not an object", index + 1);
+        }
+        let event_position = index;
         match event.get("type").and_then(Value::as_str) {
             Some("agent_start") => {
                 settled = None;
@@ -1040,7 +1138,6 @@ pub fn parse_output(stdout: &str) -> Result<HarnessResult> {
             }
             _ => {}
         }
-        events.push(event);
     }
 
     if events.is_empty() {
@@ -1964,8 +2061,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        command_spec, command_spec_with_extension, parse_output, stage_extension,
-        BRIDGE_CUSTOM_TYPE, BRIDGE_MESSAGE, EXTENSION_NAME, EXTENSION_SOURCE, MCP_CONFIG_ENV,
+        command_spec, command_spec_with_extension, parse_events, parse_output, retain_rpc_event,
+        stage_extension, BoundedLineReader, BRIDGE_CUSTOM_TYPE, BRIDGE_MESSAGE, EXTENSION_NAME,
+        EXTENSION_SOURCE, MAX_EVENT_HISTORY_BYTES, MAX_RPC_RECORD_BYTES, MCP_CONFIG_ENV,
         READ_ONLY_GUIDANCE, WRITE_GUIDANCE,
     };
     use crate::local_harness::{HarnessKind, HarnessRequest, StepAccess};
@@ -2002,7 +2100,12 @@ mod tests {
             Some(cmd.clone())
         );
         assert_eq!(
-            super::find_pi_executable_for_platform(Path::new("pi"), Some(dir.as_os_str()), true, false),
+            super::find_pi_executable_for_platform(
+                Path::new("pi"),
+                Some(dir.as_os_str()),
+                true,
+                false
+            ),
             Some(cmd.clone())
         );
         assert_eq!(
@@ -2172,6 +2275,76 @@ mod tests {
             json!({"type": "agent_end", "willRetry": false}),
             json!({"type": "agent_settled", "aborted": false}),
         ]
+    }
+
+    #[tokio::test]
+    async fn bounded_rpc_line_reader_enforces_one_mibibyte_records() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(32);
+        writer.write_all(b"12345678\nok\n").await.unwrap();
+        drop(writer);
+        let mut reader = BoundedLineReader::new(reader);
+        assert_eq!(
+            reader.next_line(8).await.unwrap(),
+            Some(b"12345678\n".to_vec())
+        );
+        assert_eq!(reader.next_line(8).await.unwrap(), Some(b"ok\n".to_vec()));
+        assert_eq!(reader.next_line(8).await.unwrap(), None);
+
+        let (mut writer, reader) = tokio::io::duplex(MAX_RPC_RECORD_BYTES + 2);
+        writer
+            .write_all(&vec![b'x'; MAX_RPC_RECORD_BYTES + 1])
+            .await
+            .unwrap();
+        drop(writer);
+        let mut reader = BoundedLineReader::new(reader);
+        let error = reader.next_line(MAX_RPC_RECORD_BYTES).await.unwrap_err();
+        assert!(error.to_string().contains("1048576-byte limit"));
+    }
+
+    #[test]
+    fn rpc_history_discards_snapshots_and_preserves_bounded_semantic_events() {
+        let mut retained = Vec::new();
+        let mut history_bytes = 0;
+        for index in 0..1_000 {
+            for event in [
+                json!({"type":"message_update","snapshot":format!("{index}{}", "x".repeat(4_096))}),
+                json!({"type":"tool_execution_update","snapshot":format!("{index}{}", "y".repeat(4_096))}),
+            ] {
+                retain_rpc_event(&mut retained, &mut history_bytes, event, 4_096).unwrap();
+            }
+        }
+        assert!(retained.is_empty());
+        assert_eq!(history_bytes, 0);
+
+        let mut semantic = success_events("final result");
+        semantic.insert(
+            2,
+            json!({"type":"tool_execution_start","toolName":"read","args":{"path":"a.txt"}}),
+        );
+        for event in semantic {
+            let record_bytes = event.to_string().len();
+            retain_rpc_event(&mut retained, &mut history_bytes, event, record_bytes).unwrap();
+        }
+        let result = parse_events(retained).unwrap();
+        assert_eq!(result.message, "final result");
+        assert!(result
+            .events
+            .iter()
+            .any(|event| event["type"] == "tool_execution_start"));
+
+        let oversized = json!({"type":"metadata","payload":"z".repeat(MAX_EVENT_HISTORY_BYTES)});
+        let mut oversized_events = Vec::new();
+        let mut oversized_history_bytes = 0;
+        let error = retain_rpc_event(
+            &mut oversized_events,
+            &mut oversized_history_bytes,
+            oversized,
+            MAX_EVENT_HISTORY_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("8 MiB limit"));
     }
 
     #[test]
