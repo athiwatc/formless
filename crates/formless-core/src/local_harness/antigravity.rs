@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -41,7 +41,13 @@ pub fn run(
     permissions: &mut dyn PermissionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    acp::run(&SPEC, request, permissions, cancel)
+    let executable = require_selected_executable(request.executable.as_deref())?;
+    match acp::run(&SPEC, request, permissions, cancel) {
+        Err(error) if !executable_file(executable) => Err(error).context(format!(
+            "The Antigravity executable selected during readiness became unavailable; {EXECUTABLE_RETRY_GUIDANCE}"
+        )),
+        result => result,
+    }
 }
 
 pub fn run_with_spawn(
@@ -50,11 +56,18 @@ pub fn run_with_spawn(
     cancel: &CancellationToken,
     spawn: &mut acp::ProcessSpawner,
 ) -> Result<HarnessResult> {
-    acp::run_with_spawn(&SPEC, request, permissions, cancel, spawn)
+    let executable = require_selected_executable(request.executable.as_deref())?;
+    match acp::run_with_spawn(&SPEC, request, permissions, cancel, spawn) {
+        Err(error) if !executable_file(executable) => Err(error).context(format!(
+            "The Antigravity executable selected during readiness became unavailable; {EXECUTABLE_RETRY_GUIDANCE}"
+        )),
+        result => result,
+    }
 }
 
 /// Opens an `agy acp` session with the Formless bridge attached, without prompting.
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
+    require_selected_executable(request.executable.as_deref())?;
     acp::open_session(&SPEC, request)
 }
 
@@ -80,6 +93,122 @@ pub fn availability(
             .detail
             .or_else(|| (signed_in == Some(false)).then(|| SPEC.not_signed_in.to_owned())),
     }
+}
+
+const EXECUTABLE_RETRY_GUIDANCE: &str = "install Antigravity or set FORMLESS_TOPIC_ANTIGRAVITY_EXE, then retry or ask the user to choose another supported harness with topic_request_harness_substitute";
+
+pub(crate) async fn topic_readiness() -> (HarnessAvailability, Option<PathBuf>) {
+    topic_readiness_with_environment(
+        std::env::vars_os().collect(),
+        Duration::from_secs(10),
+        availability,
+    )
+    .await
+}
+
+async fn topic_readiness_with_environment(
+    environment: BTreeMap<OsString, OsString>,
+    timeout: Duration,
+    probe: fn(Option<PathBuf>, &BTreeMap<OsString, OsString>) -> HarnessAvailability,
+) -> (HarnessAvailability, Option<PathBuf>) {
+    let mut base = HarnessAvailability {
+        kind: HarnessKind::Antigravity,
+        acp_agent: None,
+        installed: false,
+        signed_in: None,
+        version: None,
+        detail: None,
+    };
+    let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let lookup_environment = environment.clone();
+    let executable = match tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            super::readiness::lookup(HarnessKind::Antigravity, &lookup_environment)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Some(executable))) => executable,
+        Ok(Ok(None)) => {
+            base.detail = Some(
+                "CLI executable not found; install agy or configure FORMLESS_TOPIC_ANTIGRAVITY_EXE"
+                    .into(),
+            );
+            return (base, None);
+        }
+        Ok(Err(_)) => {
+            base.detail = Some("probe failed".into());
+            return (base, None);
+        }
+        Err(_) => {
+            base.detail = Some("probe timed out".into());
+            return (base, None);
+        }
+    };
+    if !executable.is_absolute() {
+        base.detail = Some("Antigravity executable selection was not absolute".into());
+        return (base, None);
+    }
+
+    let mut probe_base = base;
+    probe_base.installed = executable_file(&executable);
+    let availability = match tokio::time::timeout_at(
+        deadline,
+        super::blocking_probe(
+            HarnessKind::Antigravity,
+            Some(executable.clone()),
+            environment,
+            probe,
+        ),
+    )
+    .await
+    {
+        Ok(availability) => availability,
+        Err(_) => {
+            probe_base.detail = Some("probe timed out".into());
+            probe_base
+        }
+    };
+    let resolved_executable = if matches!(
+        availability.detail.as_deref(),
+        Some("probe timed out" | "probe failed")
+    ) {
+        None
+    } else {
+        Some(executable)
+    };
+    (availability, resolved_executable)
+}
+
+pub(crate) fn topic_executable(executable: Option<&Path>) -> Result<PathBuf> {
+    Ok(require_selected_executable(executable)?.to_path_buf())
+}
+
+pub(crate) fn require_selected_executable(executable: Option<&Path>) -> Result<&Path> {
+    let Some(executable) = executable else {
+        bail!("Antigravity executable identity is missing; {EXECUTABLE_RETRY_GUIDANCE}");
+    };
+    if !executable.is_absolute() {
+        bail!("Antigravity executable identity is not absolute; {EXECUTABLE_RETRY_GUIDANCE}");
+    }
+    if !executable_file(executable) {
+        bail!("The Antigravity executable selected during readiness is no longer available; {EXECUTABLE_RETRY_GUIDANCE}");
+    }
+    Ok(executable)
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    metadata.is_file()
 }
 
 #[cfg(not(test))]
@@ -349,6 +478,19 @@ mod tests {
         HarnessRequest, StepAccess,
     };
     use super::parse_output;
+    #[cfg(unix)]
+    use super::topic_readiness_with_environment;
+    #[cfg(unix)]
+    use formless_protocol::HarnessAvailability;
+    #[cfg(unix)]
+    use std::time::Duration;
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
+    #[cfg(unix)]
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn sign_in_comes_from_the_models_command() {
@@ -361,6 +503,269 @@ mod tests {
             Some(false)
         );
         assert_eq!(super::signed_in_from(false, "network unreachable"), None);
+    }
+
+    #[cfg(unix)]
+    fn selected_path_probe(
+        executable: Option<PathBuf>,
+        _: &BTreeMap<OsString, OsString>,
+    ) -> HarnessAvailability {
+        HarnessAvailability {
+            kind: HarnessKind::Antigravity,
+            acp_agent: None,
+            installed: executable.as_ref().is_some_and(|path| path.is_file()),
+            signed_in: None,
+            version: executable.map(|path| path.to_string_lossy().into_owned()),
+            detail: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn failed_path_probe(
+        executable: Option<PathBuf>,
+        _: &BTreeMap<OsString, OsString>,
+    ) -> HarnessAvailability {
+        HarnessAvailability {
+            kind: HarnessKind::Antigravity,
+            acp_agent: None,
+            installed: executable.is_some(),
+            signed_in: None,
+            version: None,
+            detail: Some("probe failed".into()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn topic_readiness_probes_and_carries_one_path_into_the_request() {
+        let directory = TempWorkspace::new();
+        let selected = fake_agy(&directory.0, "#!/bin/sh\n");
+        let environment =
+            BTreeMap::from([(OsString::from("PATH"), directory.0.clone().into_os_string())]);
+
+        let (availability, executable) = topic_readiness_with_environment(
+            environment,
+            Duration::from_secs(1),
+            selected_path_probe,
+        )
+        .await;
+
+        assert!(availability.installed);
+        let expected = selected.to_string_lossy();
+        assert_eq!(availability.version.as_deref(), Some(expected.as_ref()));
+        assert_eq!(executable.as_deref(), Some(selected.as_path()));
+        let mut request = request(&directory.0);
+        request.executable = Some(super::topic_executable(executable.as_deref()).unwrap());
+        assert_eq!(
+            super::require_selected_executable(request.executable.as_deref()).unwrap(),
+            selected.as_path()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn topic_readiness_probes_and_carries_absolute_override_instead_of_path_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempWorkspace::new();
+        let path_directory = directory.0.join("path");
+        std::fs::create_dir_all(&path_directory).unwrap();
+        let path_candidate = fake_agy(&path_directory, "#!/bin/sh\n");
+        let override_path = directory.0.join("selected-agy");
+        std::fs::write(&override_path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&override_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), path_directory.into_os_string()),
+            (
+                OsString::from("FORMLESS_TOPIC_ANTIGRAVITY_EXE"),
+                override_path.clone().into_os_string(),
+            ),
+        ]);
+
+        let (availability, executable) = topic_readiness_with_environment(
+            environment,
+            Duration::from_secs(1),
+            selected_path_probe,
+        )
+        .await;
+
+        assert_ne!(path_candidate, override_path);
+        assert!(availability.installed);
+        let expected = override_path.to_string_lossy();
+        assert_eq!(availability.version.as_deref(), Some(expected.as_ref()));
+        assert_eq!(executable.as_deref(), Some(override_path.as_path()));
+        assert_eq!(
+            super::topic_executable(executable.as_deref()).unwrap(),
+            override_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn topic_readiness_preserves_the_selected_symlink_invocation_path() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TempWorkspace::new();
+        let target = directory.0.join("real-agy");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let invocation = directory.0.join("agy-shim");
+        symlink(&target, &invocation).unwrap();
+        let environment = BTreeMap::from([(
+            OsString::from("FORMLESS_TOPIC_ANTIGRAVITY_EXE"),
+            invocation.clone().into_os_string(),
+        )]);
+
+        let (availability, executable) = topic_readiness_with_environment(
+            environment,
+            Duration::from_secs(1),
+            selected_path_probe,
+        )
+        .await;
+
+        assert!(availability.installed);
+        let expected = invocation.to_string_lossy();
+        assert_eq!(availability.version.as_deref(), Some(expected.as_ref()));
+        assert_eq!(executable.as_deref(), Some(invocation.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn topic_readiness_without_identity_does_not_probe_or_fall_back() {
+        let directory = TempWorkspace::new();
+        let environment =
+            BTreeMap::from([(OsString::from("PATH"), directory.0.clone().into_os_string())]);
+
+        let (availability, executable) = topic_readiness_with_environment(
+            environment,
+            Duration::from_secs(1),
+            selected_path_probe,
+        )
+        .await;
+
+        assert!(!availability.installed);
+        assert!(availability.version.is_none());
+        assert!(availability
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("CLI executable not found")));
+        assert!(executable.is_none());
+        assert!(super::require_selected_executable(executable.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("topic_request_harness_substitute"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn topic_readiness_drops_identity_when_the_probe_fails() {
+        let directory = TempWorkspace::new();
+        let _selected = fake_agy(&directory.0, "#!/bin/sh\n");
+        let environment =
+            BTreeMap::from([(OsString::from("PATH"), directory.0.clone().into_os_string())]);
+
+        let (availability, executable) = topic_readiness_with_environment(
+            environment,
+            Duration::from_secs(1),
+            failed_path_probe,
+        )
+        .await;
+
+        assert!(availability.installed);
+        assert_eq!(availability.detail.as_deref(), Some("probe failed"));
+        assert!(executable.is_none());
+        assert!(super::require_selected_executable(executable.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("topic_request_harness_substitute"));
+    }
+
+    #[cfg(unix)]
+    struct RejectAll;
+
+    #[cfg(unix)]
+    impl super::PermissionHandler for RejectAll {
+        fn decide(&mut self, _: &super::acp::PermissionRequest<'_>) -> Option<String> {
+            None
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topic_run_without_identity_fails_before_any_path_fallback() {
+        let directory = TempWorkspace::new();
+        let fallback_directory = directory.0.join("fallback");
+        std::fs::create_dir_all(&fallback_directory).unwrap();
+        let _fallback_candidate = fake_agy(&fallback_directory, "#!/bin/sh\n");
+        let mut request = request(&directory.0);
+        request.executable = None;
+        request.mcp_command = std::env::current_exe().unwrap();
+        request
+            .environment
+            .insert(OsString::from("PATH"), fallback_directory.into_os_string());
+
+        let error = super::run(&request, &mut RejectAll, &CancellationToken::new())
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("executable identity is missing"), "{error}");
+        assert!(
+            error.contains("topic_request_harness_substitute"),
+            "{error}"
+        );
+        let spawn_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawn_called_by_callback = spawn_called.clone();
+        let mut spawn = move |_: std::process::Command, _: &CancellationToken| {
+            spawn_called_by_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("spawn must not be called without an executable identity");
+        };
+        let guarded_error = super::run_with_spawn(
+            &request,
+            &mut RejectAll,
+            &CancellationToken::new(),
+            &mut spawn,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            guarded_error.contains("executable identity is missing"),
+            "{guarded_error}"
+        );
+        assert!(!spawn_called.load(std::sync::atomic::Ordering::SeqCst));
+        let open_session_error = super::open_session(&request).unwrap_err().to_string();
+        assert!(
+            open_session_error.contains("executable identity is missing"),
+            "{open_session_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topic_run_rejects_a_removed_selected_executable_without_fallback() {
+        let directory = TempWorkspace::new();
+        let fallback_directory = directory.0.join("fallback");
+        std::fs::create_dir_all(&fallback_directory).unwrap();
+        let _fallback_candidate = fake_agy(&fallback_directory, "#!/bin/sh\n");
+        let selected = fake_agy(&directory.0, "#!/bin/sh\n");
+        std::fs::remove_file(&selected).unwrap();
+        let mut request = request(&directory.0);
+        request.executable = Some(selected);
+        request.mcp_command = std::env::current_exe().unwrap();
+        request
+            .environment
+            .insert(OsString::from("PATH"), fallback_directory.into_os_string());
+
+        let error = super::run(&request, &mut RejectAll, &CancellationToken::new())
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("no longer available"), "{error}");
+        assert!(
+            error.contains("topic_request_harness_substitute"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -401,12 +806,6 @@ sleep 5
         assert!(!missing.installed);
         assert_eq!(missing.signed_in, None);
     }
-    use std::{
-        collections::BTreeMap,
-        ffi::OsString,
-        path::{Path, PathBuf},
-    };
-
     #[cfg(unix)]
     fn fake_agy(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;

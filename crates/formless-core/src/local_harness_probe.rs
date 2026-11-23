@@ -91,7 +91,10 @@ fn executable_name(kind: HarnessKind) -> &'static str {
         _ => kind_name(kind),
     }
 }
-fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+pub(super) fn lookup(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
     let override_key = format!(
         "FORMLESS_TOPIC_{}_EXE",
         kind_name(kind).to_ascii_uppercase()

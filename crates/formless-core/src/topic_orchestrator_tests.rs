@@ -3344,12 +3344,14 @@ async fn topic_startup_retires_legacy_failed_kickoffs_but_preserves_resumable_ru
     }
 }
 
-fn agy_script(f: &Fixture, env: &crate::credential_env::EnvGuard) {
+fn agy_script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> std::path::PathBuf {
+    let target = f.root.join("fake-agy-target");
     let path = f.root.join("fake-agy");
     std::fs::write(
-        &path,
+        &target,
         r#"#!/usr/bin/env python3
 import sys,os,json,subprocess,pathlib
+pathlib.Path(os.environ['TOPIC_FIXTURE_PATHS']).open('a').write(sys.argv[0]+'\n')
 if sys.argv[1:2]==['models']:print('gemini-fixture');sys.exit()
 assert sys.argv[1:3]==['acp','--disable-telemetry'],sys.argv
 assert 'FORMLESS_TOPIC_CAPABILITY' not in os.environ
@@ -3382,9 +3384,12 @@ while True:
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
     env.set("FORMLESS_TOPIC_ANTIGRAVITY_EXE", &path);
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
+    env.set("TOPIC_FIXTURE_PATHS", f.root.join("agy-paths"));
+    path
 }
 
 #[tokio::test]
@@ -3396,7 +3401,7 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
             if mode == "hold" { "hold" } else { "permission" },
         );
         let f = Fixture::new(&env);
-        agy_script(&f, &env);
+        let executable = agy_script(&f, &env);
         let topic = topic(&f, None, false);
         f.daemon()
             .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -3429,6 +3434,14 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
                 .parse()
                 .unwrap();
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            let paths = std::fs::read_to_string(f.root.join("agy-paths")).unwrap();
+            let observed: Vec<_> = paths.lines().collect();
+            let expected = executable.to_string_lossy();
+            assert!(observed.len() >= 3, "{observed:?}");
+            assert!(
+                observed.iter().all(|path| *path == expected.as_ref()),
+                "{observed:?}"
+            );
             continue;
         }
         wait_until(|| !f.daemon().harness_permissions.locked().is_empty()).await;
@@ -3458,5 +3471,52 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
             "{result}"
         );
         assert!(f.daemon().harness_permissions.locked().is_empty());
+        let paths = std::fs::read_to_string(f.root.join("agy-paths")).unwrap();
+        let observed: Vec<_> = paths.lines().collect();
+        let expected = executable.to_string_lossy();
+        assert!(observed.len() >= 3, "{observed:?}");
+        assert!(
+            observed.iter().all(|path| *path == expected.as_ref()),
+            "{observed:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn topic_antigravity_missing_identity_fails_before_attempt_with_substitute_guidance() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let empty_path = f.root.join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    env.set("PATH", &empty_path);
+    env.remove("FORMLESS_TOPIC_ANTIGRAVITY_EXE");
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+
+    let error = f
+        .daemon()
+        .run_topic_step(
+            &session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Antigravity,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("CLI executable not found"), "{error}");
+    assert!(error.contains("retry"), "{error}");
+    assert!(
+        error.contains("topic_request_harness_substitute"),
+        "{error}"
+    );
+    assert!(state(&f, &topic.id).attempts.is_empty());
 }
