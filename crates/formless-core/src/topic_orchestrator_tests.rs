@@ -3076,6 +3076,138 @@ while True:
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
 }
 
+fn gemini_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard, python: &Path) {
+    let path = f.root.join("fake-gemini-acp");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import sys,os,json,subprocess,pathlib
+assert sys.argv[1:]==['--acp'],sys.argv
+assert 'FORMLESS_TOPIC_CAPABILITY' not in os.environ
+mode=os.environ.get('TOPIC_FIXTURE_MODE','allow')
+def send(message):sys.stdout.write(json.dumps(message)+'\n');sys.stdout.flush()
+def read():
+    line=sys.stdin.readline()
+    if not line:sys.exit(0)
+    return json.loads(line)
+while True:
+    message=read();method=message.get('method')
+    if method=='initialize':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'protocolVersion':1,'agentInfo':{'name':'gemini-cli','version':'fixture'}}})
+    elif method=='session/new':
+        servers=message['params']['mcpServers']
+        if servers:
+            assert servers[0]['name']=='formless'
+            assert any(item['name']=='FORMLESS_TOPIC_CAPABILITY' and item['value'] for item in servers[0]['env'])
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'sessionId':'gemini-topic'}})
+    elif method=='session/prompt':
+        prompt=message['id']
+        pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
+        if mode=='hold':
+            child=subprocess.Popen(['/bin/sleep','120'])
+            pathlib.Path(os.environ['TOPIC_FIXTURE_CHILD_PID']).write_text(str(child.pid))
+            while read().get('method')!='session/cancel':pass
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'cancelled'}})
+            continue
+        send({'jsonrpc':'2.0','id':900,'method':'session/request_permission','params':{'sessionId':'gemini-topic','toolCall':{'toolCallId':'gemini-call','kind':'write','title':'Gemini fixture permission'},'options':[{'optionId':'allow','name':'Allow once','kind':'allow_once'},{'optionId':'deny','name':'Reject','kind':'reject_once'}]}})
+        outcome=read()['result']['outcome']
+        if outcome.get('optionId')=='allow':
+            send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'gemini-topic','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Gemini fixture completed'}}}})
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'end_turn'}})
+        else:
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'cancelled'}})
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bin = f.root.join("acp-bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(python, bin.join("python3")).unwrap();
+    env.set("FORMLESS_TOPIC_ACP_EXE", &path);
+    env.set("TOPIC_FIXTURE_PID", f.root.join("gemini-pid"));
+    env.set("TOPIC_FIXTURE_CHILD_PID", f.root.join("gemini-child-pid"));
+    env.set("PATH", &bin);
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and_cancel() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let python = String::from_utf8(output.stdout).unwrap();
+    let python = PathBuf::from(python.trim());
+    for mode in ["allow", "hold"] {
+        env.set("TOPIC_FIXTURE_MODE", mode);
+        let f = Fixture::new(&env);
+        gemini_acp_script(&f, &env, &python);
+        let topic = topic(&f, None, false);
+        f.daemon()
+            .with_store(|st| st.claim_topic_workflow(&topic.id))
+            .unwrap();
+        let session = topic.topic_session_id.clone().unwrap();
+        let mut args = step(
+            &topic.features[0].id,
+            HarnessKind::Acp,
+            StepAccess::Write,
+            &[],
+        );
+        args["acp_agent"] = json!("gemini");
+        let daemon = f.daemon().clone();
+        let task = tokio::spawn(async move {
+            daemon
+                .run_topic_step_until_done(&session, &args, &CancellationToken::new())
+                .await
+        });
+        let pid_path = f.root.join("gemini-pid");
+        if mode == "hold" {
+            let child_pid_path = f.root.join("gemini-child-pid");
+            wait_until(|| pid_path.exists() && child_pid_path.exists()).await;
+            f.daemon()
+                .handle(Request::CancelTopic {
+                    topic_id: topic.id.clone(),
+                })
+                .await
+                .unwrap();
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result["status"], "cancelled", "{result}");
+            for path in [pid_path, child_pid_path] {
+                let pid: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
+                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            }
+            continue;
+        }
+        wait_until(|| !f.daemon().harness_permissions.locked().is_empty()).await;
+        assert!(pid_path.exists());
+        let permission_id = f
+            .daemon()
+            .harness_permissions
+            .locked()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        f.daemon()
+            .handle(Request::HarnessPermissionDecision {
+                permission_id,
+                option_id: Some("allow".into()),
+            })
+            .await
+            .unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result["status"], "succeeded", "{result}");
+        assert_eq!(result["harness"], "acp");
+        assert_eq!(result["acp_agent"], "gemini");
+        assert!(result["summary"]
+            .as_str()
+            .unwrap()
+            .contains("Gemini fixture completed"));
+        assert!(f.daemon().harness_permissions.locked().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permissions_and_cancel() {
     let env = crate::credential_env::EnvGuard::isolated();

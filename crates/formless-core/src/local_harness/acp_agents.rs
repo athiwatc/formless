@@ -192,6 +192,15 @@ pub fn run(
     acp::run(require_spec(id)?, request, handler, cancel)
 }
 
+pub fn run_request(
+    request: &HarnessRequest,
+    handler: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    let id = request.acp_agent.as_deref().context("missing acp_agent")?;
+    run(id, request, handler, cancel)
+}
+
 pub fn open_session(id: &str, request: &HarnessRequest) -> Result<String> {
     acp::open_session(require_spec(id)?, request)
 }
