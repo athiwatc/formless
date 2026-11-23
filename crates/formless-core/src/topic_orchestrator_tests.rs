@@ -45,6 +45,16 @@ if mode=='git_needs_user':
     outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
     rpc({'operation':'report_result','status':'needs_user','summary':'Waiting for user confirmation','outputs':outputs})
     sys.exit(9)
+if mode=='git_needs_user_revision':
+    revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+    rpc({'operation':'report_result','status':'needs_user','summary':'Waiting for user confirmation','outputs':[{'kind':'git_revision','revision':revision}]})
+    sys.exit(9)
+if mode=='report_empty_summary_nonzero':
+    target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'empty-summary.txt'
+    target.write_text('validated empty-summary output')
+    outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
+    rpc({'operation':'report_result','status':'succeeded','summary':'','outputs':outputs})
+    sys.exit(9)
 if mode in ('report_nonzero','report_dirty_nonzero','report_valid_file_nonzero','report_mutated_file','report_mutated_directory','report_wrong_revision','report_workspace_replaced'):
     outputs=[]
     target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'reported'
@@ -108,7 +118,7 @@ if mode=='substitute_model':
     if expected:assert sys.argv[sys.argv.index('--model')+1]==expected
     else:assert '--model' not in sys.argv
 readonly=('plan' in sys.argv or 'read-only' in sys.argv)
-if mode in ('git','git_isolated','git_merge'):
+if mode in ('git','git_isolated','git_distinct','git_merge'):
     def git(*args):return subprocess.check_output(['git',*args],stderr=subprocess.STDOUT,text=True).strip()
     if not readonly:
         if mode=='git_merge':
@@ -119,7 +129,7 @@ if mode in ('git','git_isolated','git_merge'):
             for item,tree in zip(inputs,trees):assert git('-C',tree['path'],'rev-parse','HEAD')==item['revision']
             git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','merge','--no-edit',inputs[1]['revision'])
         else:
-            filename='result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt' if mode=='git_isolated' else 'result.txt'
+            filename='result-'+os.environ['FORMLESS_TOPIC_ATTEMPT_ID']+'.txt' if mode in ('git_isolated','git_distinct') else 'result.txt'
             pathlib.Path(filename).write_text('fixture change')
             git('add',filename);git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','fixture result')
     result=git('rev-parse','HEAD')
@@ -1009,6 +1019,7 @@ async fn topic_harness_errors_after_success_still_require_daemon_output_validati
     for (mode, error) in [
         ("report_nonzero", None),
         ("report_valid_file_nonzero", None),
+        ("report_empty_summary_nonzero", None),
         ("report_dirty_nonzero", Some("clean worktree")),
         ("report_mutated_file", Some("SHA-256")),
         (
@@ -1067,11 +1078,32 @@ async fn topic_harness_errors_after_success_still_require_daemon_output_validati
             assert!(state(&f, &topic.id).features[0].outputs.is_empty());
         } else {
             assert_eq!(done["status"], "succeeded", "{mode}: {done}");
-            assert_eq!(done["summary"], "reported success");
+            assert_eq!(
+                done["summary"],
+                if mode == "report_empty_summary_nonzero" {
+                    ""
+                } else {
+                    "reported success"
+                }
+            );
             assert_eq!(
                 done["outputs"].as_array().unwrap().len(),
-                usize::from(mode == "report_valid_file_nonzero")
+                usize::from(matches!(
+                    mode,
+                    "report_valid_file_nonzero" | "report_empty_summary_nonzero"
+                ))
             );
+            if mode == "report_empty_summary_nonzero" {
+                let outputs: Vec<TopicArtifact> =
+                    serde_json::from_value(done["outputs"].clone()).unwrap();
+                let TopicArtifact::File { path, .. } = &outputs[0] else {
+                    panic!("expected validated file output")
+                };
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "validated empty-summary output"
+                );
+            }
         }
         assert!(state(&f, &topic.id).features[0].active_attempt_id.is_none());
         if mode == "report_workspace_replaced" {
@@ -2050,6 +2082,88 @@ async fn git_write_needs_user_report_with_unchanged_head_keeps_validated_outputs
     assert_eq!(sha256, &format!("{:x}", Sha256::digest(&bytes)));
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap(), original_head);
     assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    f.daemon().request_shutdown();
+    ipc.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn git_write_needs_user_cannot_report_unchanged_cross_feature_input_revision() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "git_distinct");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let repo = repository(&f);
+    let topic = topic(&f, Some(repo), true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let session = topic.topic_session_id.as_ref().unwrap();
+    let cancel = CancellationToken::new();
+
+    for feature in &topic.features {
+        let result = f
+            .daemon()
+            .run_topic_step_until_done(
+                session,
+                &step(&feature.id, HarnessKind::Claude, StepAccess::Write, &[]),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "succeeded", "{result}");
+    }
+    let saved = state(&f, &topic.id);
+    let revision = |feature: &TopicFeatureInfo| {
+        feature
+            .outputs
+            .iter()
+            .rev()
+            .find_map(|output| match output {
+                TopicArtifact::GitRevision { revision } => Some(revision.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let target_base = revision(&saved.features[0]);
+    let cross_feature = revision(&saved.features[1]);
+    assert_ne!(target_base, cross_feature);
+    assert!(!saved.features[0]
+        .outputs
+        .contains(&TopicArtifact::GitRevision {
+            revision: cross_feature.clone()
+        }));
+
+    env.set("TOPIC_FIXTURE_MODE", "git_needs_user_revision");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            session,
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[TopicArtifact::GitRevision {
+                    revision: cross_feature.clone(),
+                }],
+            ),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(result["summary"]
+        .as_str()
+        .unwrap()
+        .contains("cannot include a GitRevision without a new commit"));
+    let saved = state(&f, &topic.id);
+    assert_eq!(revision(&saved.features[0]), target_base);
+    assert!(!saved.features[0]
+        .outputs
+        .contains(&TopicArtifact::GitRevision {
+            revision: cross_feature
+        }));
     f.daemon().request_shutdown();
     ipc.await.unwrap().unwrap();
 }

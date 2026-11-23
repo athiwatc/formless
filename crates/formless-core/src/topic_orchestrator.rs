@@ -1212,20 +1212,20 @@ impl Daemon {
                     .summary
                     .as_deref()
                     .is_some_and(|summary| !summary.trim().is_empty());
-            if let Some(revision) = git_write_output_revision(
-                base.as_deref().context("missing worktree base")?,
-                revision,
-                needs_user_report,
-            )? {
-                git(
-                    workspace,
-                    &[
-                        "merge-base",
-                        "--is-ancestor",
-                        base.as_deref().context("missing worktree base")?,
-                        &revision,
-                    ],
-                )?;
+            let base = base.as_deref().context("missing worktree base")?;
+            if needs_user_report
+                && revision == base
+                && reported
+                    .outputs
+                    .iter()
+                    .any(|output| matches!(output, TopicArtifact::GitRevision { .. }))
+            {
+                bail!(
+                    "NeedsUser Git Write report cannot include a GitRevision without a new commit"
+                );
+            }
+            if let Some(revision) = git_write_output_revision(base, revision, needs_user_report)? {
+                git(workspace, &["merge-base", "--is-ancestor", base, &revision])?;
                 outputs.push(TopicArtifact::GitRevision { revision });
             }
         }
