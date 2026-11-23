@@ -811,37 +811,90 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     assert_eq!(ids(&context, "proposals"), scoped_proposals);
     assert!(ids(&context, "topics").contains(&inside_id));
     let sibling_id = inside_id.clone();
-    let context_frame = crate::provenance::frame(READ_TOPIC_CONTEXT, &[], &context.to_string());
-    let (transcript, search) = daemon
+    let raw_context = context.to_string();
+    let context_frame = crate::provenance::frame(READ_TOPIC_CONTEXT, &[], &raw_context);
+    let (transcript, search, framed_id, raw_id, user_quote_id, assistant_quote_id) = daemon
         .with_store(|st| {
-            st.append_message_meta(
+            let framed = st.append_message_meta(
                 story_chat,
                 "tool",
                 &context_frame,
-                Some(json!({"tool_call_id":"read-context","name":READ_TOPIC_CONTEXT}).to_string()),
+                Some(crate::daemon::tool_result_meta(
+                    "read-context-framed",
+                    READ_TOPIC_CONTEXT,
+                    false,
+                )),
             )?;
+            let raw = st.append_message_meta(
+                story_chat,
+                "tool",
+                &raw_context,
+                Some(crate::daemon::tool_result_meta(
+                    "read-context-raw",
+                    READ_TOPIC_CONTEXT,
+                    false,
+                )),
+            )?;
+            let user_quote = st.append_message_meta(
+                story_chat,
+                "user",
+                &raw_context,
+                Some(crate::daemon::tool_result_meta(
+                    "quoted-read-context",
+                    READ_TOPIC_CONTEXT,
+                    false,
+                )),
+            )?;
+            let assistant_quote = st.append_message(story_chat, "assistant", &raw_context)?;
             let transcript = st.topic_read_conversation(&child_id, story_chat)?;
             let search = st.topic_search_conversations(&child_id, &sibling_id)?;
-            Ok((transcript, search))
+            Ok((
+                transcript,
+                search,
+                framed.id,
+                raw.id,
+                user_quote.id,
+                assistant_quote.id,
+            ))
         })
         .unwrap();
-    assert!(search.as_array().unwrap().is_empty());
-    let stored_context = transcript["messages"]
+    let messages = transcript["messages"].as_array().unwrap();
+    let message = |id: &str| {
+        messages
+            .iter()
+            .find(|message| message["id"].as_str() == Some(id))
+            .unwrap()
+    };
+    let framed_message = message(&framed_id);
+    let framed: Value = serde_json::from_str(framed_message["content"].as_str().unwrap()).unwrap();
+    let framed_context: Value = serde_json::from_str(framed["content"].as_str().unwrap()).unwrap();
+    assert!(!ids(&framed_context, "topics").contains(&inside_id));
+    assert!(!ids(&framed_context, "proposals").contains(&inside_id));
+    let raw_message = message(&raw_id);
+    let raw_stored_context: Value =
+        serde_json::from_str(raw_message["content"].as_str().unwrap()).unwrap();
+    assert!(!ids(&raw_stored_context, "topics").contains(&inside_id));
+    assert!(!ids(&raw_stored_context, "proposals").contains(&inside_id));
+    for (id, role) in [(&user_quote_id, "user"), (&assistant_quote_id, "assistant")] {
+        let pasted = message(id);
+        assert_eq!(pasted["role"], role);
+        assert_eq!(pasted["content"], raw_context);
+    }
+    let search_ids = search
         .as_array()
         .unwrap()
         .iter()
-        .find(|message| {
-            message["role"] == "tool"
-                && serde_json::from_str::<Value>(message["meta"].as_str().unwrap())
-                    .is_ok_and(|meta| meta["name"] == READ_TOPIC_CONTEXT)
-        })
-        .map(|message| {
-            let frame: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
-            serde_json::from_str::<Value>(frame["content"].as_str().unwrap()).unwrap()
-        })
-        .unwrap();
-    assert!(!ids(&stored_context, "topics").contains(&inside_id));
-    assert!(!ids(&stored_context, "proposals").contains(&inside_id));
+        .map(|result| result["message_id"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        search_ids,
+        BTreeSet::from([user_quote_id, assistant_quote_id])
+    );
+    assert!(search
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|result| result["snippet"].as_str().unwrap().contains(&sibling_id)));
     for allow in [true, false] {
         daemon
             .handle(Request::SetTopicContextAccess {
