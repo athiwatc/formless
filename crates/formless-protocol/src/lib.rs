@@ -3702,7 +3702,30 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
-    Event(Event),
+    Event(#[serde(serialize_with = "serialize_server_event")] Event),
+}
+
+fn serialize_server_event<S>(event: &Event, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match event {
+        Event::HarnessPermissionRequested { .. } => {
+            let mut value =
+                serde_json::to_value(event).map_err(<S::Error as serde::ser::Error>::custom)?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                <S::Error as serde::ser::Error>::custom(
+                    "permission event must serialize as an object",
+                )
+            })?;
+            let kind = object.remove("kind").ok_or_else(|| {
+                <S::Error as serde::ser::Error>::custom("permission event must contain kind")
+            })?;
+            object.insert("permission_kind".into(), kind);
+            value.serialize(serializer)
+        }
+        _ => event.serialize(serializer),
+    }
 }
 
 /// Live update categories that a slow subscriber may miss. Repeated drops
@@ -3955,7 +3978,7 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acp_agent: Option<String>,
         title: String,
-        #[serde(rename = "permission_kind", alias = "kind")]
+        #[serde(alias = "permission_kind")]
         kind: String,
         raw_input: Option<serde_json::Value>,
         options: Vec<HarnessPermissionOption>,
@@ -5687,7 +5710,7 @@ mod harness_permission_event_wire_tests {
     }
 
     #[test]
-    fn pending_approval_event_replay_uses_new_key_and_accepts_legacy_nested_key() {
+    fn pending_approval_event_replay_preserves_legacy_key_and_accepts_both_names() {
         let events = vec![permission_event()];
         let response = ServerMessage::Response {
             id: 1,
@@ -5698,7 +5721,8 @@ mod harness_permission_event_wire_tests {
         let wire = serde_json::to_string(&response).unwrap();
         let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
         assert_eq!(value["kind"], "response");
-        assert_eq!(value["result"][0]["permission_kind"], "write");
+        assert_eq!(value["result"][0]["kind"], "write");
+        assert!(value["result"][0].get("permission_kind").is_none());
         assert_eq!(value["result"][0]["options"][0]["kind"], "allow_once");
         let decoded: ServerMessage = serde_json::from_str(&wire).unwrap();
         let ServerMessage::Response {
@@ -5729,6 +5753,13 @@ mod harness_permission_event_wire_tests {
             }]
         }]);
         let decoded: Vec<Event> = serde_json::from_value(legacy).unwrap();
+        assert_permission_event(decoded.into_iter().next().unwrap(), "write");
+
+        let mut permission_kind_nested = serde_json::to_value(vec![permission_event()]).unwrap();
+        let object = permission_kind_nested[0].as_object_mut().unwrap();
+        let kind = object.remove("kind").unwrap();
+        object.insert("permission_kind".into(), kind);
+        let decoded: Vec<Event> = serde_json::from_value(permission_kind_nested).unwrap();
         assert_permission_event(decoded.into_iter().next().unwrap(), "write");
     }
 }
