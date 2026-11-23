@@ -7232,22 +7232,32 @@ and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Neither sends
 a model turn, and no auth output is copied into detail or logs.
 
-Executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
 the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
 and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). FORMLESS_TOPIC_ACP_EXE applies
 to each ACP registry probe; without it each agent's own command is looked up on
 PATH. ACP dispatch runs the registry's bounded availability probe on a blocking
 worker, including initialize version (agentInfo.version, then _meta.agentVersion)
-and session/new sign-in checks. Pi, OpenCode, Antigravity,
-and Muse have dedicated dispatch arms currently reporting lookup-only
-availability with unknown auth. Adapter owners can replace those fallbacks
+and session/new sign-in checks. Pi, OpenCode, and Muse have dedicated fallback
+dispatch arms that look up the executable and run
+--version in a private cwd under the probe deadline, with kill-on-drop and
+process-group cleanup. Their auth remains unknown, including version failures.
+Antigravity retains its dedicated readiness probe.
+Adapter owners can replace those fallbacks
 with async probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
-process group on success, failure or timeout. Grok's registry probe reads
-_meta.agentVersion (minimum 1.0.92), reports signed_in true on session creation
-and false on -32000, and forces GROK_DISABLE_AUTOUPDATER=1 through the shared
-launcher. It never places XAI_API_KEY in arguments or sends a model turn.
+process group on success, failure or timeout.
+Adapter blocking probes must enforce their own internal deadline and kill
+child processes on drop: core's outer timeout cannot abort spawn_blocking.
+Core does not own the ACP agent registry and omits the bare ACP entry from
+ListHarnesses; the ACP adapter's registry supplies per-agent entries.
+The per-kind probe dispatch receives the selected acp_agent id, including
+for its current executable-only fallback. ACP is a protocol, not a CLI.
+Grok's registry probe reads _meta.agentVersion (minimum 1.0.92), reports
+signed_in true on session creation and false on -32000, and forces
+GROK_DISABLE_AUTOUPDATER=1 through the shared launcher. It never places
+XAI_API_KEY in arguments or sends a model turn.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.
@@ -7256,8 +7266,50 @@ trimmed step title; the next successful launch consumes it. A request to run
 the wanted harness then uses the explicitly approved substitute, which must
 itself be ready. Formless never substitutes without that approval. Other
 answers and cancellation record no approval and start no work.
+Only the suggestion's optional model and acp_agent are used for a substitute;
+an omitted model selects the substitute's default, never the original model.
 
 Terminal topic transitions close pending limit/substitute decisions with
 UserQuestionClosed answered_by=None. Finalizing one feature also closes its
 own decisions while leaving sibling work alone. Closed decisions no longer
 keep the daemon busy or leave stale user prompts.
+
+Every step owns a private attempt area. Git Write uses a worktree on
+formless/topic/<topic>/<attempt>, starting at the first selected GitRevision
+or otherwise its feature's latest revision/base. ReadOnly Git is detached.
+Every selected revision is also exposed through a detached input worktree
+whose path and exact revision are in the harness prompt. Cleanup removes
+worktrees on completion, failure and cancel; attempt branches retain commits.
+No operation changes the source checkout or moves the user's branch.
+
+Directory Write and ReadOnly steps recursively copy the source into their
+private workspace; a selected Directory input becomes the starting copy.
+Copies skip .git and reject special files, absolute symlink targets and
+targets escaping the source tree. Containment follows symlinks in the longest
+existing target prefix before resolving the remaining nonexistent components;
+existing prefixes reached again through .. are resolved as well.
+Unresolvable existing links are rejected. Relative internal links are
+preserved as-is, including dangling links. File data copying
+runs off the async executor and checks cancellation. The attempt area must
+be outside the source tree to avoid recursive/self-copying. Scratch steps
+get an empty private workspace. Directory Write automatically reports a
+Directory artifact pointing at its retained attempt workspace.
+
+Inputs may reference exact finalized artifacts from any feature of this
+topic. Every Directory input is copied to a distinct private input path;
+every File is copied and SHA-256 checked, and text inputs remain inline.
+Harness-reported directories must be inside that attempt's private outputs.
+Concurrent workflows and Write steps may share a source workspace because
+the old exclusive source-workspace lock is no longer acquired. Per-attempt
+leases/cancel tokens remain live through validation and are released on stop.
+Harness-process and adapter errors after a successful report are logged and
+ignored at the adapter boundary. Daemon validation always runs afterward:
+dirty worktrees, HEAD/reported-revision mismatches, changed file hashes and
+invalid Directory outputs fail the attempt and discard its provisional outputs.
+Only validated outputs are published to the feature. Cancelled and Abandoned
+attempts are never overwritten. CLI exit still releases the
+active-attempt gate before explicit feature completion is allowed. A feature's
+successful terminal state is Ready, reached through topic_complete_feature,
+not automatically through report_result.
+Combining outputs is explicit work in a later isolated step, never an
+automatic merge or push into the source workspace.

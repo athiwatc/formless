@@ -239,7 +239,7 @@
           const bytes = S.relayModule.wireBytes(text, S.relayModule.LIMITS.plaintext);
           // Known serialization/UTF8/GCM/base64/string copies and bounded
           // fragment lookahead. This is not a DOM/application-state RSS cap.
-          lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024);
+          lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024 + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
         }
       } catch (error) { return reject(error); }
       const timer = setTimeout(() => {
@@ -1301,6 +1301,7 @@
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
   let runningRefresh = null, runningExposed = false, runningExposureQueued = false;
+  let runningExposureEpoch = 0, runningExposurePending = false;
   function runningPanelExposed() {
     const sidebar = $("sidebar");
     // Read the actual layout; both viewport and container queries can hide
@@ -1310,6 +1311,10 @@
   }
   function syncRunningExposure() {
     const exposed = runningPanelExposed();
+    if (exposed && !runningExposed) {
+      runningExposureEpoch++;
+      runningExposurePending = true;
+    }
     if (exposed && !runningExposed && !runningExposureQueued) {
       runningExposureQueued = true;
       queueMicrotask(() => {
@@ -1319,38 +1324,39 @@
     }
     runningExposed = exposed;
   }
-  function sameRunningConnection(query) {
-    return query.ws === S.ws && query.conn === S.conn && query.channel === S.channel;
+  function sameRunningConnection(query, requireClientId = true) {
+    return query.ws === S.ws && query.channel === S.channel && (!requireClientId || query.conn === S.conn);
   }
   async function refreshRunning(reason = "event") {
     if (!S.channel || S.ws?.readyState !== 1 || (!S.local && !S.relayReady)) return;
-    if (runningRefresh && sameRunningConnection(runningRefresh)) {
+    if (runningRefresh && sameRunningConnection(runningRefresh, false)) {
       // A change may have happened after the read began; keep one follow-up.
-      // A periodic tick or a visibility change can reuse the current read.
+      // Timer ticks can share a read; the exposure generation fences its reply.
       if (reason === "event") runningRefresh.followUp = true;
       return;
     }
-    const query = runningRefresh = { ws: S.ws, conn: S.conn, channel: S.channel, followUp: false };
+    const query = runningRefresh = { ws: S.ws, conn: S.conn, channel: S.channel, exposure: runningExposureEpoch, followUp: false };
     const list = await request({ type: "list_invocations" }).catch(() => null);
     if (runningRefresh !== query) return;
     runningRefresh = null;
     if (!sameRunningConnection(query)) {
       // A Session subscription may change its client identifier without
       // reconnecting. Retry on this socket, but never paint that old reply.
-      if (query.ws === S.ws && query.channel === S.channel) refreshRunning();
+      if (sameRunningConnection(query, false)) refreshRunning();
       return;
     }
-    if (query.followUp) {
+    if (query.followUp || (runningExposed && query.exposure !== runningExposureEpoch)) {
       refreshRunning();
       return;
     }
     if (!list) return;
+    runningExposurePending = false;
     S.invocations = list;
     reconcileInvocationProgress(list);
     renderRunning(list);
   }
   function pollRunning() {
-    if (runningPanelExposed() && S.invocations?.length) refreshRunning("poll");
+    if (runningPanelExposed() && (runningExposurePending || S.invocations?.length)) refreshRunning("poll");
   }
   function runningRow(i, row) {
     if (!row) {
