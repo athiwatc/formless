@@ -53,7 +53,7 @@ Main Chat
 | **Topic Chats** | A topic owns one piece of work: a repo, a problem, a project. Topics nest to any depth — a single person may use *Main → Topic*, a team *Main → Project → Story → step*. |
 | **Your consent first** | A suggestion moves nothing. Messages move and work starts only after you approve in the client; a chat reply such as "yes" is not consent. |
 | **Advisory flows** | You can outline steps and pick a harness per step. The outline is advice: the Formless model in the Topic Chat decides the actual steps, may retry a failed step on another harness, and decides when the work is done. |
-| **Isolated steps** | Each step gets its own conversation and its own copy of the workspace — a private Git worktree for a repo, a private directory otherwise. Read-only Git steps check out the exact input revision. |
+| **Isolated steps** | Each step gets its own conversation and private workspace — a Git worktree for Git topics, or a fresh directory otherwise. Declared file inputs are staged separately. Read-only Git steps check out the exact input revision. |
 | **Questions and permissions** | Anything a harness asks mid-run surfaces in Formless. Only you can grant a permission; an unanswered or cancelled request is denied. |
 | **Scoped context** | A harness reads its own topic branch — the topic and its ancestors — not Main Chat or sibling topics, unless you allow wider context for that topic. |
 | **Nothing auto-merges** | Steps produce Git revisions, files or text. Formless never merges or pushes. |
