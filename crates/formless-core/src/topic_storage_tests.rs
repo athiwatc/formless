@@ -96,6 +96,110 @@ fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
 }
 
 #[test]
+fn topic_validation_can_fail_reported_success_but_never_overwrites_cancelled_or_abandoned() {
+    for status in [
+        TopicAttemptStatus::Succeeded,
+        TopicAttemptStatus::Failed,
+        TopicAttemptStatus::Cancelled,
+        TopicAttemptStatus::Abandoned,
+    ] {
+        let (store, _, _, request) = fixture();
+        let pending = store
+            .propose_topic(&request, WorkspaceKind::Directory, None)
+            .unwrap();
+        let topic = store.approve_topic(&pending.id).unwrap();
+        store.claim_topic_workflow(&topic.id).unwrap();
+        let token = "c".repeat(64);
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Step",
+                StepAccess::Write,
+                HarnessKind::Pi,
+                None,
+                None,
+                &[],
+                &token,
+                Path::new("/topic/repo"),
+            )
+            .unwrap();
+        match status {
+            TopicAttemptStatus::Succeeded | TopicAttemptStatus::Failed => {
+                store
+                    .report_topic_result(&attempt.id, &token, status, "original report", &[])
+                    .unwrap();
+            }
+            TopicAttemptStatus::Cancelled => {
+                store.cancel_topic(&topic.id).unwrap();
+            }
+            TopicAttemptStatus::Abandoned => {
+                store.recover_topic(&topic.id).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = store.get_topic_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(before.status, status);
+        let next = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            TopicAttemptStatus::Succeeded
+        };
+        let saved = store
+            .finish_topic_step(&attempt.id, next, "daemon validation failed", &[], None)
+            .unwrap();
+        let expected = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            status
+        };
+        assert_eq!(saved.status, expected);
+        assert_eq!(
+            saved.summary,
+            if status == TopicAttemptStatus::Succeeded {
+                Some("daemon validation failed".into())
+            } else {
+                before.summary
+            }
+        );
+        assert_eq!(saved.outputs, before.outputs);
+        assert!(store.get_topic(&topic.id).unwrap().unwrap().features[0]
+            .active_attempt_id
+            .is_none());
+        let again = store
+            .finish_topic_step(&attempt.id, next, "duplicate late result", &[], None)
+            .unwrap();
+        assert_eq!(again.status, expected);
+        assert_eq!(again.summary, saved.summary);
+    }
+}
+
+#[test]
+fn topic_isolated_workflows_can_share_a_source_workspace() {
+    let (store, source, _, mut request) = fixture();
+    let first = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&first.id).unwrap();
+    let message = store
+        .append_message(&source.id, "user", "Independent work")
+        .unwrap();
+    request.message_ids = vec![message.id];
+    request.name = "Other work".into();
+    let second = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&second.id).unwrap();
+    store.claim_topic_workflow(&first.id).unwrap();
+    store.claim_topic_workflow(&second.id).unwrap();
+    store.cancel_topic(&first.id).unwrap();
+    assert_eq!(
+        store.get_topic(&second.id).unwrap().unwrap().status,
+        TopicStatus::Running
+    );
+}
+
+#[test]
 fn topic_main_identity_is_non_creating_and_persistent() {
     let store = Store::open_in_memory().unwrap();
     assert!(!store.is_main_chat("unknown").unwrap());
