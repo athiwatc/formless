@@ -235,6 +235,10 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    QuestionAnswer {
+        question: OpenQuestion,
+        index: usize,
+    },
     ProviderRetry {
         session_id: String,
     },
@@ -684,6 +688,7 @@ struct PendingSend {
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
 /// answers its questions in order.
+#[derive(Clone, PartialEq)]
 struct OpenQuestion {
     id: String,
     session_id: String,
@@ -3296,6 +3301,32 @@ impl App {
                         self.finish_queued_save(session_id, *edit, draft, saved, error.as_deref());
                         continue;
                     }
+                    if let Pending::QuestionAnswer { question, index } = &kind {
+                        if !ok {
+                            let still_open =
+                                self.questions_awaiting_close.remove(&question.id).is_some();
+                            if still_open
+                                && !self.questions.iter().any(|open| open.id == question.id)
+                            {
+                                let mut restored = question.clone();
+                                restored.answers.pop();
+                                restored.reset_choice();
+                                let session_id = restored.session_id.clone();
+                                self.questions
+                                    .insert((*index).min(self.questions.len()), restored);
+                                if self.is_current(&session_id)
+                                    && self.activity.as_ref().is_none_or(|activity| {
+                                        activity.label == "awaiting your answer"
+                                    })
+                                {
+                                    self.set_activity("awaiting your answer");
+                                }
+                            }
+                            self.notes
+                                .push(format!("daemon: {}", error.clone().unwrap_or_default()));
+                        }
+                        continue;
+                    }
                     if self.stale_search(&kind) {
                         continue;
                     }
@@ -3478,6 +3509,9 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::QuestionAnswer { .. } => {
+                            unreachable!("question answers are handled above")
+                        }
                         Pending::TourSession => self.open_tour_reply(result),
                         Pending::TourRun { session_id, run_id } => {
                             self.apply_tour_status(&session_id, &run_id, &result);
@@ -7580,11 +7614,17 @@ impl App {
         let open = self.questions.remove(i);
         self.questions_awaiting_close
             .insert(open.id.clone(), open.session_id.clone());
-        self.fire(Request::AnswerQuestion {
-            question_id: open.id,
-            answer: QuestionAnswer::summary_of(&open.answers),
-            answers: open.answers,
-        });
+        self.request(
+            Pending::QuestionAnswer {
+                question: open.clone(),
+                index: i,
+            },
+            Request::AnswerQuestion {
+                question_id: open.id,
+                answer: QuestionAnswer::summary_of(&open.answers),
+                answers: open.answers,
+            },
+        );
     }
 
     fn session_name(&self, id: &str) -> String {
@@ -25592,6 +25632,141 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
             .any(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. })));
+    }
+
+    #[test]
+    fn rejected_free_text_answer_restores_the_question_prompt() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (client, requests) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.on_event(Event::UserQuestion {
+            user_only: true,
+            topic_id: Some("topic".into()),
+            attempt_id: Some("attempt".into()),
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Choose an offered option".into(),
+                header: None,
+                options: vec![
+                    QuestionOption {
+                        label: "Allow".into(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "Deny".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+        });
+
+        for c in "please allow this".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+
+        assert!(app.questions.is_empty());
+        assert!(app.questions_awaiting_close.contains_key("q1"));
+        let request = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .find(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. }))
+            .expect("answer request");
+        assert!(matches!(
+            &request.request,
+            Request::AnswerQuestion { answers, .. }
+                if answers[0].text.as_deref() == Some("please allow this")
+        ));
+
+        incoming_tx
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: None,
+                error: Some("select one offered option".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+
+        let open = &app.questions[app.current_question().unwrap()];
+        assert_eq!(
+            open.questions[open.answers.len()].question,
+            "Choose an offered option"
+        );
+        assert!(app.questions[0].answers.is_empty());
+        assert!(!app.questions_awaiting_close.contains_key("q1"));
+        assert!(app.input.is_empty());
+        assert!(render(&mut app, 100, 30).contains("Choose an offered option"));
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note == "daemon: select one offered option"));
+    }
+
+    #[test]
+    fn rejected_answer_does_not_restore_a_prompt_closed_before_the_reply() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (client, requests) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.on_event(Event::UserQuestion {
+            user_only: true,
+            topic_id: Some("topic".into()),
+            attempt_id: Some("attempt".into()),
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Choose an offered option".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Allow".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+        for c in "free answer".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        let request_id = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .find_map(|envelope| {
+                matches!(envelope.request, Request::AnswerQuestion { .. }).then_some(envelope.id)
+            })
+            .expect("answer request");
+
+        app.on_event(Event::UserQuestionClosed {
+            question_id: "q1".into(),
+            answered_by: None,
+        });
+        incoming_tx
+            .send(ServerMessage::Response {
+                id: request_id,
+                ok: false,
+                result: None,
+                error: Some("select one offered option".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+
+        assert!(app.questions.is_empty());
+        assert!(!app.questions_awaiting_close.contains_key("q1"));
+        assert!(app.activity_text().is_none());
     }
 
     #[test]
