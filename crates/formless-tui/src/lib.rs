@@ -10349,7 +10349,6 @@ impl App {
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
             && !self.vim_input.waiting_for_argument()
-            && self.current_question().is_none()
             && self.find.is_none()
             && (self.approvals.is_empty() || self.input_focus)
             && self.call_focus_key(&key)
@@ -25633,6 +25632,61 @@ mod tests {
         assert!(!requests
             .try_iter()
             .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .any(|envelope| matches!(&envelope.request, Request::InterruptRun { .. })));
+    }
+
+    #[test]
+    fn vim_normal_escape_leaves_chat_focus_without_interrupting_during_question() {
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        app.call_focus = Some("msg:assistant".into());
+        app.on_event(Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Continue?".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Yes".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+
+        app.key(key(KeyCode::Esc));
+
+        assert!(app.call_focus.is_none());
+        assert!(app.current_question().is_some());
+        assert!(app.running());
+        assert!(requests.try_recv().is_err());
+
+        app.key(key(KeyCode::Enter));
+
+        assert!(app.current_question().is_none());
+        assert!(app.questions_awaiting_close.contains_key("q1"));
+        let requests = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(requests
+            .iter()
+            .any(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. })));
+        assert!(!requests
+            .iter()
             .any(|envelope| matches!(&envelope.request, Request::InterruptRun { .. })));
     }
 
