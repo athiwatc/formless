@@ -113,11 +113,15 @@ id, each with `kind=Acp` and `acp_agent` set. Registry probes run concurrently o
 blocking workers, capped at ten seconds each (the ACP handshake itself uses its
 eight-second deadline). Single-agent readiness uses the same dispatch.
 
-The named Gemini ordinary-question fixture uses a fresh, unsettled choice through
-the scoped Formless MCP `ask_user` tool. It asserts the existing ordinary
-`user_only=false` semantics, pending state until a user answer, empty-basis
-rejection, exact user-reply delivery, and completion with a scripted ACP stub;
-it does not run a real model or test a user-only question API.
+The named Gemini ordinary-question fixture uses the same supported
+`user_only=false` question shape in two cases through scoped Formless MCP and a
+scripted ACP stub. An exact approved choice settles through
+`topic_answer_question` with its source message ID, exact quote, and nonempty
+explanatory basis. An unsupported offered choice, supplied with a nonempty
+basis and the exact source message ID and quote, is rejected; the question
+stays pending until the human reply reaches the stub.
+This covers the Formless tool and transport path, not an authenticated or live
+model turn or a user-only question API.
 
 Topic readiness resolves the ACP override or agent command from the daemon's
 environment once, canonicalizes the selected absolute path, and probes that
@@ -172,7 +176,7 @@ permission options, and review permission rejection without running a real agent
 
 Run harness fixtures with `cargo test -p formless-core local_harness --locked`.
 Run the named Gemini ordinary-question fixture with
-`cargo test -p formless-bin --test topic_mcp_stdio named_gemini_topic_ask_user_waits_for_and_delivers_user_choice --locked`.
+`cargo test -p formless-bin --test topic_mcp_stdio named_gemini_topic_question_uses_grounding_and_human_fallback --locked`.
 For the ignored **live initialize-only** test, place installed executables or
 symlinks in a directory, include any interpreter needed by their launchers in PATH,
 and run:
