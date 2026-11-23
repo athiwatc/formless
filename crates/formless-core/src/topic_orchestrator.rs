@@ -386,7 +386,7 @@ impl Daemon {
                             {
                                 continue;
                             }
-                            if !user_only || seen.insert(format!("question:{question_id}")) {
+                            if seen.insert(format!("question:{question_id}")) {
                                 return Ok(
                                     json!({"event":"question","question_id":question_id,"attempt_id":attempt_id,"questions":questions,"user_only":user_only}),
                                 );

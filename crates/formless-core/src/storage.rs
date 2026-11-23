@@ -1739,6 +1739,24 @@ impl Store {
         Ok(self.conn.prepare_cached(sql)?.execute(params)?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_topic_human_answer_receipt_commit_failure_for_test(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE topic_answer_commit_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE topic_answer_commit_child (
+                 parent_id TEXT NOT NULL REFERENCES topic_answer_commit_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TRIGGER topic_answer_commit_failure
+             AFTER INSERT ON messages
+             WHEN NEW.generated_by = 'topic_human_answer'
+             BEGIN
+                 INSERT INTO topic_answer_commit_child(parent_id) VALUES ('missing');
+             END;",
+        )?;
+        Ok(())
+    }
+
     /// `prepare` through the connection's statement cache.
     fn ps(&self, sql: &str) -> Result<rusqlite::CachedStatement<'_>> {
         Ok(self.conn.prepare_cached(sql)?)

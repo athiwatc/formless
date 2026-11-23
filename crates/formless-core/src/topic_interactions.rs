@@ -885,7 +885,7 @@ impl Daemon {
         question_id: &str,
         answer: &str,
         answers: Vec<QuestionAnswer>,
-    ) -> Result<Option<MessageInfo>> {
+    ) -> Result<(bool, Option<MessageInfo>)> {
         self.answer_topic_human_question_inner(context, question_id, answer, answers, |_| {})
     }
 
@@ -897,7 +897,7 @@ impl Daemon {
         answer: &str,
         answers: Vec<QuestionAnswer>,
         before_send: F,
-    ) -> Result<Option<MessageInfo>>
+    ) -> Result<(bool, Option<MessageInfo>)>
     where
         F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
     {
@@ -911,11 +911,12 @@ impl Daemon {
         answer: &str,
         answers: Vec<QuestionAnswer>,
         before_send: F,
-    ) -> Result<Option<MessageInfo>>
+    ) -> Result<(bool, Option<MessageInfo>)>
     where
         F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
     {
         let mut delivery_failed = false;
+        let mut delivered = false;
         self.with_store(|st| {
             match st.transaction(|st| {
                 let mut waiters = self.questions.locked();
@@ -926,14 +927,14 @@ impl Daemon {
                     waiters.remove(question_id);
                     return Ok(None);
                 }
-                let delivered =
+                let normalized_answers =
                     normalized_topic_answers(&context.questions, answer, answers.clone());
                 let receipt = st.append_topic_human_answer_receipt(
                     &context.topic_id,
                     &context.attempt_id,
                     question_id,
                     &context.questions,
-                    &delivered,
+                    &normalized_answers,
                 )?;
                 before_send(sender);
                 let sender = waiters.remove(question_id).unwrap();
@@ -941,13 +942,24 @@ impl Daemon {
                     delivery_failed = true;
                     bail!("harness question expired before human answer delivery");
                 }
+                delivered = true;
                 self.question_answered_by
                     .locked()
                     .insert(question_id.into(), "user".into());
                 Ok(Some(receipt))
             }) {
-                Err(_) if delivery_failed => Ok(None),
-                result => result,
+                Ok(Some(receipt)) => Ok((true, Some(receipt))),
+                Ok(None) => Ok((false, None)),
+                Err(_) if delivery_failed => Ok((false, None)),
+                Err(error) if delivered => {
+                    tracing::warn!(
+                        question_id,
+                        error = %error,
+                        "human answer delivered but its receipt transaction did not commit"
+                    );
+                    Ok((true, None))
+                }
+                Err(error) => Err(error),
             }
         })
     }

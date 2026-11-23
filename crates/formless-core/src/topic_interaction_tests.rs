@@ -1314,6 +1314,125 @@ async fn topic_model_answer_reuses_exact_same_attempt_human_answer_receipt() {
 }
 
 #[tokio::test]
+async fn topic_model_answer_rejects_partial_human_answer_receipt() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new_with_request(&env, "Ledger format: CSV");
+    let questions = vec![
+        Question::single("Ledger format?".into(), vec!["CSV".into(), "JSON".into()]),
+        Question::single(
+            "Retention policy?".into(),
+            vec!["Short".into(), "Long".into()],
+        ),
+    ];
+    let handler = f.handler();
+    let first_questions = questions.clone();
+    let first_waiting = tokio::spawn(async move {
+        handler
+            .ask_question(first_questions, &CancellationToken::new())
+            .await
+    });
+    let mut events = f.events();
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id,
+                answer: "CSV".into(),
+                answers: vec![QuestionAnswer {
+                    selected: vec!["CSV".into()],
+                    text: None,
+                }],
+            })
+            .await
+            .unwrap()["answered"],
+        true
+    );
+    let partial_answer = first_waiting.await.unwrap().unwrap();
+    assert_eq!(partial_answer.len(), 2);
+    assert_eq!(partial_answer[0].selected, vec!["CSV"]);
+    assert!(partial_answer[1].selected.is_empty());
+    assert!(partial_answer[1].text.is_none());
+
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    let receipt = f
+        .daemon()
+        .with_reader(|st| st.list_messages(session))
+        .unwrap()
+        .into_iter()
+        .find(|message| message.generated_by.as_deref() == Some("topic_human_answer"))
+        .unwrap();
+    let handler = f.handler();
+    let repeated_questions = questions.clone();
+    let second_waiting = tokio::spawn(async move {
+        handler
+            .ask_question(repeated_questions, &CancellationToken::new())
+            .await
+    });
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let evidence = json!({"message_id":receipt.id,"quote":receipt.content});
+    let incomplete = json!({
+        "question_id":question_id,
+        "answers":[{"selected":["CSV"]}],
+        "basis":"The first choice was answered",
+        "evidence":evidence,
+    });
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(session, &incomplete)
+        .is_err());
+    let guessed = json!({
+        "question_id":incomplete["question_id"],
+        "answers":[{"selected":["CSV"]},{"selected":["Short"]}],
+        "basis":"The missing choice was inferred",
+        "evidence":incomplete["evidence"],
+    });
+    assert!(f
+        .daemon()
+        .answer_topic_question_tool(session, &guessed)
+        .is_err());
+    assert!(f
+        .daemon()
+        .questions
+        .locked()
+        .contains_key(guessed["question_id"].as_str().unwrap()));
+    assert_eq!(
+        f.daemon()
+            .handle(Request::AnswerQuestion {
+                question_id: guessed["question_id"].as_str().unwrap().into(),
+                answer: "CSV and short retention".into(),
+                answers: vec![
+                    QuestionAnswer {
+                        selected: vec!["CSV".into()],
+                        text: None,
+                    },
+                    QuestionAnswer {
+                        selected: vec!["Short".into()],
+                        text: None,
+                    },
+                ],
+            })
+            .await
+            .unwrap()["answered"],
+        true
+    );
+    let final_answers = second_waiting.await.unwrap().unwrap();
+    assert_eq!(final_answers[0].selected, vec!["CSV"]);
+    assert_eq!(final_answers[1].selected, vec!["Short"]);
+}
+
+#[tokio::test]
 async fn topic_model_answer_rejects_receipts_for_changed_question_options() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = TopicFixture::new_with_request(&env, "Ledger format: CSV");
@@ -1455,7 +1574,6 @@ async fn topic_human_answer_receipt_snapshot_is_atomic_and_source_chat_input_sup
                 },
             )
             .unwrap()
-            .unwrap()
     });
     snapshot_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(f.daemon().store.try_lock().is_err());
@@ -1472,7 +1590,9 @@ async fn topic_human_answer_receipt_snapshot_is_atomic_and_source_chat_input_sup
     });
     attempting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     release_tx.send(()).unwrap();
-    let receipt = answer.await.unwrap();
+    let (delivered, receipt) = answer.await.unwrap();
+    assert!(delivered);
+    let receipt = receipt.unwrap();
     writer.await.unwrap();
     assert_eq!(waiting.await.unwrap().unwrap()[0].selected, vec!["CSV"]);
 
@@ -1614,7 +1734,9 @@ async fn topic_human_answer_send_failure_rolls_back_receipt() {
     });
     ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     waiting.abort();
-    assert!(answer.await.unwrap().unwrap().is_none());
+    let (delivered, receipt) = answer.await.unwrap().unwrap();
+    assert!(!delivered);
+    assert!(receipt.is_none());
     assert!(waiting.await.unwrap_err().is_cancelled());
     let session = f.topic.topic_session_id.as_ref().unwrap();
     assert!(!f
@@ -1623,6 +1745,68 @@ async fn topic_human_answer_send_failure_rolls_back_receipt() {
         .unwrap()
         .iter()
         .any(|message| message.generated_by.as_deref() == Some("topic_human_answer")));
+}
+
+#[tokio::test]
+async fn topic_human_answer_commit_failure_reports_delivery_without_receipt_or_retry() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new_with_request(&env, "Ledger format: CSV");
+    f.daemon()
+        .with_store(|st| st.inject_topic_human_answer_receipt_commit_failure_for_test())
+        .unwrap();
+    let handler = f.handler();
+    let waiting = tokio::spawn(async move {
+        handler
+            .ask_question(
+                vec![Question::single(
+                    "Ledger format?".into(),
+                    vec!["CSV".into(), "JSON".into()],
+                )],
+                &CancellationToken::new(),
+            )
+            .await
+    });
+    let mut events = f.events();
+    let Event::UserQuestion { question_id, .. } = next_event(&mut events, |event| {
+        matches!(event, Event::UserQuestion { .. })
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let answer = || Request::AnswerQuestion {
+        question_id: question_id.clone(),
+        answer: "CSV".into(),
+        answers: vec![QuestionAnswer {
+            selected: vec!["CSV".into()],
+            text: None,
+        }],
+    };
+    assert_eq!(f.daemon().handle(answer()).await.unwrap()["answered"], true);
+    assert_eq!(waiting.await.unwrap().unwrap()[0].selected, vec!["CSV"]);
+    assert_eq!(
+        f.daemon().handle(answer()).await.unwrap()["answered"],
+        false
+    );
+
+    let session = f.topic.topic_session_id.as_ref().unwrap();
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(session))
+        .unwrap();
+    assert!(!messages
+        .iter()
+        .any(|message| message.generated_by.as_deref() == Some("topic_human_answer")));
+    assert!(!messages
+        .iter()
+        .any(|message| message.content.contains("Orchestrator answer")));
+    assert!(
+        !std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+            event,
+            ServerMessage::Event(Event::MessageAppended { message, .. })
+                if message.generated_by.as_deref() == Some("topic_human_answer")
+        ))
+    );
 }
 
 #[tokio::test]

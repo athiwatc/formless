@@ -728,6 +728,32 @@ async fn topic_async_wait_surfaces_live_question_human_answer_and_informational_
     assert_eq!(question["event"], "question");
     assert_eq!(question["user_only"], false);
     assert_eq!(f.daemon().topic_steps.locked().len(), 1);
+    let second_daemon = f.daemon().clone();
+    let second_session = session.clone();
+    let second_attempt_id = launched["attempt_id"].as_str().unwrap().to_owned();
+    let second_cancel = CancellationToken::new();
+    let second_wait_cancel = second_cancel.clone();
+    let mut second_wait = tokio::spawn(async move {
+        second_daemon
+            .wait_topic_steps(
+                &second_session,
+                &json!({"attempt_ids":[second_attempt_id],"timeout_secs":30}),
+                &second_wait_cancel,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut second_wait)
+            .await
+            .is_err()
+    );
+    second_cancel.cancel();
+    let second_result = tokio::time::timeout(Duration::from_secs(5), second_wait)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_result["event"], "cancelled");
     let answered = f
         .daemon()
         .handle(Request::AnswerQuestion {

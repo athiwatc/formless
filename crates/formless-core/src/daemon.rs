@@ -4223,9 +4223,8 @@ impl Daemon {
                     .as_ref()
                     .and_then(|event| self.topic_human_answer_context(&question_id, event));
                 if let Some(context) = topic_answer_context {
-                    let receipt =
+                    let (answered, receipt) =
                         self.answer_topic_human_question(context, &question_id, &answer, answers)?;
-                    let answered = receipt.is_some();
                     if let Some(message) = receipt {
                         self.broadcast(Event::MessageAppended {
                             session_id: message.session_id.clone(),
