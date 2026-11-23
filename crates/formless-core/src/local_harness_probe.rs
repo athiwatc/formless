@@ -302,7 +302,15 @@ async fn dispatch(
             )
             .await
         }
-        HarnessKind::Antigravity => fallback_probe(kind, ctx).await,
+        HarnessKind::Antigravity => {
+            blocking_probe(
+                kind,
+                Some(ctx.executable.clone()),
+                ctx.environment.clone(),
+                crate::local_harness::antigravity::availability,
+            )
+            .await
+        }
         HarnessKind::Acp => {
             let mut value = availability(kind, Some(&ctx.executable));
             value.acp_agent = agent.map(str::to_owned);

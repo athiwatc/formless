@@ -177,11 +177,14 @@ fn probe_version(
         });
     }
     let status = loop {
-        if let Some(status) = process.try_wait().map_err(|_| ProbeError {
+        if process.has_exited().map_err(|_| ProbeError {
             installed: true,
             detail: "OpenCode version process status could not be read.",
         })? {
-            break status;
+            break process.finish().map_err(|_| ProbeError {
+                installed: true,
+                detail: "OpenCode version process status could not be read.",
+            })?;
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -192,7 +195,6 @@ fn probe_version(
         }
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     };
-    drop(process);
     if !status.success() {
         return Err(ProbeError {
             installed: true,

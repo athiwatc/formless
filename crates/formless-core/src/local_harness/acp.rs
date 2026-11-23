@@ -158,7 +158,7 @@ impl PermissionHandler for Interactions<'_> {
         let permission = HarnessPermissionRequest {
             title: text("title"),
             kind: text("kind"),
-            raw_input: request.tool_call.get("rawInput").cloned(),
+            raw_input: permission_raw_input(request.tool_call),
             options,
         };
         self.runtime
@@ -179,6 +179,128 @@ impl PermissionHandler for Interactions<'_> {
             .block_on(self.handler.ask_question(questions, cancel))?;
         serde_json::to_value(answers).ok()
     }
+}
+
+/// A blocking ACP adapter entry point such as `antigravity::run`.
+pub type Adapter =
+    fn(&HarnessRequest, &mut dyn PermissionHandler, &CancellationToken) -> Result<HarnessResult>;
+
+/// Runs `adapter` on a blocking thread while `handler` answers its permission requests,
+/// questions and updates on the caller's task, so `handler` need not be `'static`.
+/// Cancelling `cancel` stops the run; this returns only after the adapter has returned.
+pub async fn run_interactive(
+    adapter: Adapter,
+    request: HarnessRequest,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+) -> Result<HarnessResult> {
+    let (sender, mut asks) = tokio::sync::mpsc::unbounded_channel();
+    let run_cancel = cancel.child_token();
+    let blocking_cancel = run_cancel.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut job = tokio::task::spawn_blocking(move || {
+        let forward = Forward(sender);
+        let mut interactions = Interactions {
+            handler: &forward,
+            runtime,
+        };
+        adapter(&request, &mut interactions, &blocking_cancel)
+    });
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(ask) = asks.recv() => answer(handler, ask, &run_cancel).await,
+            result = &mut job => break result,
+        }
+    };
+    while let Ok(ask) = asks.try_recv() {
+        answer(handler, ask, &run_cancel).await;
+    }
+    result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?
+}
+
+enum Ask {
+    Permission(
+        HarnessPermissionRequest,
+        tokio::sync::oneshot::Sender<Option<String>>,
+    ),
+    Question(
+        Vec<formless_protocol::Question>,
+        tokio::sync::oneshot::Sender<Option<Vec<formless_protocol::QuestionAnswer>>>,
+    ),
+    Update(HarnessUpdate),
+}
+
+/// A failed update (e.g. the attempt already reported its result) never fails the run.
+async fn answer(handler: &dyn InteractionHandler, ask: Ask, cancel: &CancellationToken) {
+    match ask {
+        Ask::Permission(request, reply) => {
+            let _ = reply.send(handler.request_permission(request, cancel).await);
+        }
+        Ask::Question(questions, reply) => {
+            let _ = reply.send(handler.ask_question(questions, cancel).await);
+        }
+        Ask::Update(update) => {
+            let _ = handler.on_update(update);
+        }
+    }
+}
+
+/// Hands each interaction from the blocking adapter thread to `run_interactive`'s task.
+struct Forward(tokio::sync::mpsc::UnboundedSender<Ask>);
+
+impl InteractionHandler for Forward {
+    fn request_permission<'a>(
+        &'a self,
+        request: HarnessPermissionRequest,
+        cancel: &'a CancellationToken,
+    ) -> super::InteractionFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.0.send(Ask::Permission(request, reply)).ok()?;
+            tokio::select! {
+                answer = answer => answer.ok().flatten(),
+                _ = cancel.cancelled() => None,
+            }
+        })
+    }
+
+    fn ask_question<'a>(
+        &'a self,
+        questions: Vec<formless_protocol::Question>,
+        cancel: &'a CancellationToken,
+    ) -> super::InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+        Box::pin(async move {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            self.0.send(Ask::Question(questions, reply)).ok()?;
+            tokio::select! {
+                answer = answer => answer.ok().flatten(),
+                _ = cancel.cancelled() => None,
+            }
+        })
+    }
+
+    fn on_update(&self, update: HarnessUpdate) -> Result<()> {
+        self.0
+            .send(Ask::Update(update))
+            .map_err(|_| anyhow!("interaction handler is closed"))
+    }
+}
+
+/// The tool call's `rawInput`, with any vendor `_meta` kept under `_meta`; a non-object
+/// input is wrapped as `{"input": ...}` so the metadata has somewhere to go.
+fn permission_raw_input(tool_call: &Value) -> Option<Value> {
+    let input = tool_call.get("rawInput").cloned();
+    let Some(meta) = tool_call.get("_meta").cloned() else {
+        return input;
+    };
+    let mut raw = match input {
+        Some(Value::Object(object)) => object,
+        Some(Value::Null) | None => serde_json::Map::new(),
+        Some(other) => serde_json::Map::from_iter([("input".to_owned(), other)]),
+    };
+    raw.insert("_meta".into(), meta);
+    Some(Value::Object(raw))
 }
 
 #[derive(serde::Deserialize)]
@@ -256,6 +378,105 @@ pub fn open_session(spec: &AgentSpec, request: &HarnessRequest) -> Result<String
             .session_id
             .expect("opened sessions always have an id")
     })
+}
+
+/// What an ACP `initialize` handshake says about an installed harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The executable started and answered ACP.
+    pub installed: bool,
+    /// It also passed the spec's protocol and version check.
+    pub compatible: bool,
+    pub version: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[cfg(not(test))]
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(test)]
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Starts the agent and runs ACP `initialize` only: no session, no sign-in, no bridge.
+/// Sign-in is not visible at this step, so callers probe it separately.
+pub fn probe(
+    spec: &AgentSpec,
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Probe {
+    let cwd = std::env::temp_dir();
+    let request = HarnessRequest {
+        kind: super::HarnessKind::Acp,
+        acp_agent: None,
+        model: None,
+        prompt: "probe".into(),
+        access: StepAccess::Write,
+        mcp_command: cwd.clone(),
+        mcp_args: vec![],
+        mcp_env_vars: vec![],
+        cwd,
+        executable,
+        environment: environment.clone(),
+    };
+    let mut agent = match AgentProcess::spawn(spec, &request) {
+        Ok(agent) => agent,
+        Err(error) => {
+            return Probe {
+                installed: false,
+                compatible: false,
+                version: None,
+                detail: Some(format!("{error:#}")),
+            }
+        }
+    };
+    let cancel = CancellationToken::new();
+    let timer = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(PROBE_TIMEOUT);
+        timer.cancel();
+    });
+    let initialized = agent
+        .pipes()
+        .and_then(|(reader, writer)| probe_lines(spec, reader, writer, &cancel));
+    drop(agent);
+    probe_result(spec, initialized)
+}
+
+fn probe_lines<R: BufRead + Send + 'static, W: Write>(
+    spec: &AgentSpec,
+    reader: R,
+    writer: W,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    Rpc::new(spec, reader, writer, cancel, StepAccess::Write).initialize(spec, &mut RejectAll)
+}
+
+fn probe_result(spec: &AgentSpec, initialized: Result<Value>) -> Probe {
+    let initialized = match initialized {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            return Probe {
+                installed: false,
+                compatible: false,
+                version: None,
+                detail: Some(format!(
+                    "{} did not answer ACP initialize: {error:#}",
+                    spec.name
+                )),
+            }
+        }
+    };
+    let version = initialized
+        .pointer("/agentInfo/version")
+        .or_else(|| initialized.pointer("/_meta/agentVersion"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let checked = (spec.check_agent)(&initialized);
+    Probe {
+        installed: true,
+        compatible: checked.is_ok(),
+        version,
+        detail: checked.err().map(|error| format!("{error:#}")),
+    }
 }
 
 pub(super) fn validate(request: &HarnessRequest) -> Result<()> {
@@ -364,43 +585,8 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
     prompt: bool,
 ) -> Result<HarnessResult> {
     validate(request)?;
-    let mut rpc = Rpc {
-        lines: read_lines(reader),
-        writer,
-        cancel: cancel.clone(),
-        name: spec.name,
-        bridge_tool: spec.bridge_tool,
-        vendor_request: spec.vendor_request,
-        prompting: false,
-        cancel_deadline: None,
-        next_id: 0,
-        events: Vec::new(),
-        message: String::new(),
-        session_id: None,
-        access: request.access,
-    };
-
-    let mut client_capabilities = json!({
-        "fs": {"readTextFile": false, "writeTextFile": false},
-        "terminal": false
-    });
-    (spec.client_capabilities)(&mut client_capabilities);
-    let initialized = rpc
-        .call(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": client_capabilities,
-                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
-            }),
-            permissions,
-        )?
-        .map_err(|code| {
-            anyhow!(
-                "{} rejected ACP initialize (JSON-RPC error {code}).",
-                spec.name
-            )
-        })?;
+    let mut rpc = Rpc::new(spec, reader, writer, cancel, request.access);
+    let initialized = rpc.initialize(spec, permissions)?;
     (spec.check_agent)(&initialized)?;
 
     let env: Vec<Value> = request
@@ -696,6 +882,57 @@ struct Rpc<W> {
 }
 
 impl<W: Write> Rpc<W> {
+    fn new<R: BufRead + Send + 'static>(
+        spec: &AgentSpec,
+        reader: R,
+        writer: W,
+        cancel: &CancellationToken,
+        access: StepAccess,
+    ) -> Self {
+        Rpc {
+            lines: read_lines(reader),
+            writer,
+            cancel: cancel.clone(),
+            name: spec.name,
+            bridge_tool: spec.bridge_tool,
+            vendor_request: spec.vendor_request,
+            prompting: false,
+            cancel_deadline: None,
+            next_id: 0,
+            events: Vec::new(),
+            message: String::new(),
+            session_id: None,
+            access,
+        }
+    }
+
+    fn initialize(
+        &mut self,
+        spec: &AgentSpec,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<Value> {
+        let mut client_capabilities = json!({
+            "fs": {"readTextFile": false, "writeTextFile": false},
+            "terminal": false
+        });
+        (spec.client_capabilities)(&mut client_capabilities);
+        self.call(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "clientCapabilities": client_capabilities,
+                "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
+            }),
+            permissions,
+        )?
+        .map_err(|code| {
+            anyhow!(
+                "{} rejected ACP initialize (JSON-RPC error {code}).",
+                spec.name
+            )
+        })
+    }
+
     fn send(&mut self, message: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(message)?;
         line.push(b'\n');
@@ -1242,6 +1479,73 @@ mod tests {
     }
 
     #[test]
+    fn probe_reports_version_and_compatibility_from_initialize() {
+        let probe_input = |line: &str| {
+            let mut written = Vec::new();
+            let initialized = probe_lines(
+                &SPEC,
+                Cursor::new(format!("{line}\n")),
+                &mut written,
+                &CancellationToken::new(),
+            );
+            let sent: Value =
+                serde_json::from_str(String::from_utf8(written).unwrap().lines().next().unwrap())
+                    .unwrap();
+            assert_eq!(sent["method"], "initialize");
+            probe_result(&SPEC, initialized)
+        };
+        assert_eq!(
+            probe_input(LIVE_INITIALIZE),
+            Probe {
+                installed: true,
+                compatible: true,
+                version: Some("1.5.14".into()),
+                detail: None,
+            }
+        );
+        let old = probe_input(&LIVE_INITIALIZE.replace("1.5.14", "1.4.0"));
+        assert!(old.installed && !old.compatible);
+        assert_eq!(old.version.as_deref(), Some("1.4.0"));
+        assert!(old.detail.unwrap().contains("agy update"));
+        let rejected =
+            probe_input(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}"#);
+        assert!(!rejected.installed && !rejected.compatible);
+    }
+
+    #[test]
+    fn probe_reports_a_missing_executable_as_not_installed() {
+        let probe = probe(
+            &SPEC,
+            Some(PathBuf::from("/nonexistent/formless-test-agy")),
+            &BTreeMap::new(),
+        );
+        assert!(!probe.installed && !probe.compatible);
+        assert!(probe.version.is_none());
+    }
+
+    #[test]
+    fn permission_raw_input_keeps_vendor_meta() {
+        let meta = json!({"x.ai/tool": {"read_only": false}});
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": {"a": 1}, "_meta": meta})),
+            Some(json!({"a": 1, "_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": "ls", "_meta": meta})),
+            Some(json!({"input": "ls", "_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"_meta": meta})),
+            Some(json!({"_meta": meta}))
+        );
+        assert_eq!(
+            permission_raw_input(&json!({"rawInput": [1]})),
+            Some(json!([1]))
+        );
+        assert_eq!(permission_raw_input(&json!({})), None);
+    }
+
+    #[test]
     fn interactions_forward_permissions_questions_and_updates_to_the_daemon() {
         use crate::local_harness::InteractionFuture;
         use std::sync::Mutex;
@@ -1309,6 +1613,54 @@ mod tests {
             .ask_question(&json!([{"question": "which?"}]), &CancellationToken::new())
             .unwrap();
         assert_eq!(answers, json!([{"selected": [], "text": "which?"}]));
+    }
+
+    #[tokio::test]
+    async fn run_interactive_survives_rejected_updates() {
+        use crate::local_harness::InteractionFuture;
+        struct Reported;
+        impl InteractionHandler for Reported {
+            fn request_permission<'a>(
+                &'a self,
+                _: HarnessPermissionRequest,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<String>> {
+                Box::pin(async { Some("allow".into()) })
+            }
+            fn ask_question<'a>(
+                &'a self,
+                _: Vec<formless_protocol::Question>,
+                _: &'a CancellationToken,
+            ) -> InteractionFuture<'a, Option<Vec<formless_protocol::QuestionAnswer>>> {
+                Box::pin(async { None })
+            }
+            fn on_update(&self, _: HarnessUpdate) -> Result<()> {
+                bail!("attempt already reported")
+            }
+        }
+        fn adapter(
+            request: &HarnessRequest,
+            permissions: &mut dyn PermissionHandler,
+            _: &CancellationToken,
+        ) -> Result<HarnessResult> {
+            let lines = [
+                LIVE_INITIALIZE.into(),
+                SESSION_NEW.into(),
+                permission(90, "execute"),
+                update("done"),
+                stop(3, "end_turn"),
+            ];
+            drive_lines(request, &lines, permissions).0
+        }
+        let result = run_interactive(
+            adapter,
+            request(StepAccess::Write),
+            &Reported,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.message, "done");
     }
 
     #[test]

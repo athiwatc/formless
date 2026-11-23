@@ -465,7 +465,7 @@ impl Daemon {
 
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex and opencode; pi, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never merge or push. Never modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex, antigravity and opencode; pi, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from finalized feature outputs in this topic, as selected for this step. Combine inputs only when instructed, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
         let start = async {
             let session = topic
                 .topic_session_id
@@ -1131,6 +1131,7 @@ impl Daemon {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
                 HarnessKind::OpenCode => executable("FORMLESS_TOPIC_OPENCODE_EXE")?,
+                HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
                 _ => None,
             },
             environment: BTreeMap::from([
@@ -1250,11 +1251,52 @@ impl Daemon {
             HarnessKind::Pi => bail!("Pi adapter not integrated yet; choose Claude or Codex"),
             HarnessKind::OpenCode => local_harness::run(request, handler, cancel).await,
             HarnessKind::Antigravity => {
-                bail!("Antigravity adapter not integrated yet; choose Claude or Codex")
+                self.run_topic_acp(
+                    attempt,
+                    token,
+                    local_harness::antigravity::run,
+                    request,
+                    handler.as_ref(),
+                    cancel,
+                )
+                .await
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
             HarnessKind::Muse => bail!("Muse adapter not integrated yet; choose Claude or Codex"),
         }
+    }
+
+    async fn run_topic_acp(
+        self: &Arc<Self>,
+        attempt: &TopicAttemptInfo,
+        token: &str,
+        adapter: local_harness::acp::Adapter,
+        request: &HarnessRequest,
+        handler: &dyn InteractionHandler,
+        cancel: &CancellationToken,
+    ) -> Result<HarnessResult> {
+        {
+            let _launch = self.topic_launch.locked();
+            self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                bail!("step cancelled before launch");
+            }
+        }
+        let run_cancel = cancel.child_token();
+        let stop = run_cancel.clone();
+        let shutdown = self.shutdown.clone();
+        let watcher = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            stop.cancel();
+        });
+        let result =
+            local_harness::acp::run_interactive(adapter, request.clone(), handler, &run_cancel)
+                .await;
+        watcher.abort();
+        if self.shutdown.is_cancelled() {
+            bail!("daemon is shutting down");
+        }
+        result
     }
 
     async fn run_topic_cli(

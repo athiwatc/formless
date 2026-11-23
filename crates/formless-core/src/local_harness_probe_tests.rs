@@ -112,8 +112,14 @@ async fn list_probes_run_concurrently_and_opencode_uses_adapter() {
         .contains("free default model"));
     assert!(values[2..]
         .iter()
-        .filter(|value| value.kind != HarnessKind::OpenCode)
+        .filter(|value| {
+            value.kind != HarnessKind::OpenCode && value.kind != HarnessKind::Antigravity
+        })
         .all(|value| value.signed_in.is_none() && value.version.as_deref() == Some("fixture 1.0")));
+    let antigravity = &values[4];
+    assert_eq!(antigravity.kind, HarnessKind::Antigravity);
+    assert_ne!(antigravity.version.as_deref(), Some("fixture 1.0"));
+    assert_ne!(antigravity.signed_in, Some(true));
 }
 
 #[tokio::test]
