@@ -6696,8 +6696,6 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
-`FORMLESS_TOPIC_OPENCODE_EXE` is used only by the fixture for the unavailable
-OpenCode adapter; the shipped binary does not read it.
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
@@ -7196,10 +7194,11 @@ checks its version before using usage --json and only confirms sign-in when
 it receives a Meta account allowance. These probes do not send model turns
 or copy raw auth output into detail or logs.
 
-CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
-the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
-and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode and
-Antigravity have dedicated dispatch arms that run --version
+Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
+or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
+its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
+`FORMLESS_TOPIC_MUSE_EXE`. An availability result does not mean the step adapter
+is integrated: Pi, OpenCode and Antigravity have dedicated dispatch arms that run --version
 in a private cwd under the probe deadline, with kill-on-drop and process-group
 cleanup; their auth remains unknown, including version failures. ACP reports
 lookup-only availability and preserves its configured agent. Adapter owners
