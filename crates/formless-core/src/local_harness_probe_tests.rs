@@ -17,6 +17,8 @@ if '--version' in sys.argv:
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
         while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
     print('fixture 1.0');sys.exit()
+if pathlib.Path(sys.argv[0]).name=='acp':
+    pathlib.Path(os.environ['PROBE_ACP_STARTS'],str(os.getpid())).touch()
 mode=os.environ.get('PROBE_MODE','ok')
 if mode=='hang':time.sleep(120)
 if sys.argv[1:]==['auth','status']:
@@ -93,9 +95,20 @@ async fn list_probes_run_concurrently_and_fallbacks_report_versions() {
     }
     ctx.environment
         .insert("PROBE_GATE".into(), root.0.clone().into_os_string());
+    let acp_starts = root.0.join("acp-starts");
+    std::fs::create_dir(&acp_starts).unwrap();
+    ctx.environment.insert(
+        "PROBE_ACP_STARTS".into(),
+        acp_starts.clone().into_os_string(),
+    );
     let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
     let acp_ids = super::super::acp_agents::agent_ids();
     assert_eq!(values.len(), 6 + acp_ids.len());
+    assert_eq!(
+        std::fs::read_dir(acp_starts).unwrap().count(),
+        acp_ids.len(),
+        "ListHarnesses should launch one ACP probe per registry id"
+    );
     assert!(values.iter().all(|value| value.installed));
     assert!(values[..2]
         .iter()
@@ -262,24 +275,24 @@ async fn official_probe_timeout_is_unknown_and_bounded() {
 #[tokio::test]
 async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() {
     let (_root, mut ctx) = fixture();
-    let value = dispatch(HarnessKind::Acp, &ctx, Some("grok")).await;
-    assert_eq!(value.acp_agent.as_deref(), Some("grok"));
+    let value = dispatch(HarnessKind::Acp, &ctx, Some("gemini")).await;
+    assert_eq!(value.acp_agent.as_deref(), Some("gemini"));
     assert!(value.installed);
     assert!(value.signed_in.is_none());
     ctx.environment.clear();
     let missing = probe_environment(
         HarnessKind::Acp,
-        Some("grok"),
+        Some("gemini"),
         &ctx.environment,
         Duration::from_secs(1),
     )
     .await;
-    assert_eq!(missing.acp_agent.as_deref(), Some("grok"));
+    assert_eq!(missing.acp_agent.as_deref(), Some("gemini"));
     assert!(!missing.installed);
-    assert_eq!(
-        missing.detail.as_deref(),
-        Some("ACP agent executable is not configured")
-    );
+    assert!(missing
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("not installed")));
 }
 
 #[tokio::test]
