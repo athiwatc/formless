@@ -9,8 +9,10 @@ Antigravity sessions through the core interaction handler; Antigravity retains
 its own spec. Core topic steps dispatch registered ACP profiles when
 `HarnessKind::Acp` is paired with a valid `acp_agent`. The named Gemini topic
 fixture covers launch, permission forwarding, completion, and cancellation
-using a scripted ACP process. Installed-CLI checks cover initialize/readiness
-only; no authenticated model turns or native Windows `.cmd` execution have been
+using a scripted ACP process. Topic fixtures also cover readiness-selected
+executable identity, explicit overrides, workspace decoys, and fail-closed
+missing/disappearing executables. Installed-CLI checks cover initialize/readiness
+only; no authenticated model turns or native Windows .cmd execution have been
 verified.
 
 `HarnessRequest.access` (`StepAccess::ReadOnly` or `Write`) controls mode/argv
@@ -110,6 +112,20 @@ Core's `ListHarnesses` handler expands ACP into one availability entry per regis
 id, each with `kind=Acp` and `acp_agent` set. Registry probes run concurrently on
 blocking workers, capped at ten seconds each (the ACP handshake itself uses its
 eight-second deadline). Single-agent readiness uses the same dispatch.
+
+Topic readiness resolves the ACP override or agent command from the daemon's
+environment once, canonicalizes the selected absolute path, and probes that
+exact path. Its internal per-step result carries both availability and the
+resolved executable into `HarnessRequest.executable`; the launch does not reread
+the override or PATH, so a workspace-local executable cannot replace the
+readiness selection. This identity is internal: public availability and
+ListHarnesses retain the existing `HarnessAvailability` shape. If preparation
+cannot return an executable identity, including on timeout or worker error, the
+step stops before launch with the existing retry/substitute guidance. If the
+selected path disappears before spawn, launch fails without fallback. Each retry
+or approved substitute gets fresh preparation. Unknown authentication remains
+ready only when installed and `signed_in` is not `Some(false)`. This pins path
+selection, not executable contents.
 
 ## Installation observations
 

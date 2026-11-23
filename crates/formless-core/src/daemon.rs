@@ -1898,10 +1898,26 @@ impl Daemon {
         self.propose_topic_with_git(proposal, std::ffi::OsStr::new("git"))
     }
 
+    pub(crate) fn propose_topic_suggestion(
+        &self,
+        proposal: &TopicProposalRequest,
+    ) -> Result<TopicInfo> {
+        self.persist_topic_proposal(proposal, std::ffi::OsStr::new("git"), true)
+    }
+
     fn propose_topic_with_git(
         &self,
         proposal: &TopicProposalRequest,
         git: &std::ffi::OsStr,
+    ) -> Result<TopicInfo> {
+        self.persist_topic_proposal(proposal, git, false)
+    }
+
+    fn persist_topic_proposal(
+        &self,
+        proposal: &TopicProposalRequest,
+        git: &std::ffi::OsStr,
+        from_suggestion_tool: bool,
     ) -> Result<TopicInfo> {
         let mut normalized = proposal.clone();
         let (kind, base) = match &proposal.workspace {
@@ -1957,10 +1973,19 @@ impl Daemon {
                 }
             }
         };
-        let topic = self.with_store(|st| st.propose_topic(&normalized, kind, base.as_deref()))?;
-        self.broadcast(Event::TopicChanged {
-            topic_id: topic.id.clone(),
-        });
+        let (topic, created) = self.with_store(|st| {
+            if from_suggestion_tool {
+                if let Some(existing) = st.existing_topic_suggestion(&normalized)? {
+                    return Ok((existing, false));
+                }
+            }
+            Ok((st.propose_topic(&normalized, kind, base.as_deref())?, true))
+        })?;
+        if created {
+            self.broadcast(Event::TopicChanged {
+                topic_id: topic.id.clone(),
+            });
+        }
         Ok(topic)
     }
 
@@ -8746,6 +8771,11 @@ impl Daemon {
         if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
             return call_failed("error: interrupted".into());
         }
+        if crate::main_topic_suggestions::is_topic_tool(&tc.name) {
+            if let Err(error) = self.check_topic_tool_access(session_id, agent_depth) {
+                return call_failed(format!("error: {error}"));
+            }
+        }
         let mut args: Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
@@ -8814,6 +8844,13 @@ impl Daemon {
             });
         }
         let text = match tc.name.as_str() {
+            crate::main_topic_suggestions::READ_TOPIC_CONTEXT
+            | crate::main_topic_suggestions::PROPOSE_TOPIC => {
+                match self.execute_topic_suggestion(session_id, &tc.name, &args) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => call_failed(format!("error: {error}")),
+                }
+            }
             toolreg::TOPIC_LIST_CONVERSATIONS
             | toolreg::TOPIC_READ_CONVERSATION
             | toolreg::TOPIC_SEARCH_CONVERSATIONS => match self.with_reader(|st| {
@@ -10634,7 +10671,14 @@ impl Daemon {
             let mut task_cost = Some(0.0);
             let sub_defs = || -> Result<Vec<Value>> {
                 self.with_store(|st| {
-                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                    let mut defs =
+                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)?;
+                    defs.retain(|def| {
+                        !def["function"]["name"]
+                            .as_str()
+                            .is_some_and(crate::main_topic_suggestions::is_topic_tool)
+                    });
+                    Ok(defs)
                 })
             };
             let mut messages = vec![json!({
@@ -20067,6 +20111,10 @@ mod branch_summary;
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
 mod approval_daemon_tests;
+
+#[cfg(test)]
+#[path = "main_topic_suggestion_tests.rs"]
+mod main_topic_suggestion_tests;
 
 #[cfg(test)]
 #[path = "sensitive_read_daemon_tests.rs"]

@@ -15,8 +15,11 @@ use serde_json::{json, Value};
 
 pub use formless_protocol::{HarnessKind, StepAccess};
 
+pub mod muse;
+
 #[path = "local_harness_probe.rs"]
 mod readiness;
+pub(crate) use readiness::harness_readiness;
 pub use readiness::{
     acp_probe, blocking_probe, claude_probe, codex_probe, harness_availability, list_harnesses,
     ProbeContext,
@@ -156,18 +159,12 @@ pub(crate) fn validate_acp_agent(kind: Option<HarnessKind>, agent: Option<&str>)
     Ok(())
 }
 
-pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
+fn validate_request(request: &HarnessRequest) -> Result<()> {
     validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
-    if request.kind == HarnessKind::Antigravity {
-        return antigravity::command_spec(request);
-    }
     if request.kind == HarnessKind::Acp {
         bail!("ACP is interactive; use local_harness::run instead of command_spec");
     }
-    if matches!(
-        request.kind,
-        HarnessKind::Pi | HarnessKind::OpenCode | HarnessKind::Acp | HarnessKind::Muse
-    ) {
+    if matches!(request.kind, HarnessKind::Pi | HarnessKind::OpenCode) {
         bail!(
             "{:?} adapter not integrated yet; use Claude or Codex for now",
             request.kind
@@ -199,7 +196,24 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
             bail!("MCP environment variable names must be shell-independent identifiers");
         }
     }
+    Ok(())
+}
 
+pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
+    if request.kind == HarnessKind::Antigravity {
+        validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+        return antigravity::command_spec(request);
+    }
+    validate_request(request)?;
+    if request.kind == HarnessKind::Muse {
+        bail!("Muse Code requires the interactive harness runner");
+    }
+    if !matches!(request.kind, HarnessKind::Claude | HarnessKind::Codex) {
+        bail!(
+            "{:?} adapter not integrated yet; use Claude or Codex for now",
+            request.kind
+        );
+    }
     let program = request
         .executable
         .clone()
@@ -315,6 +329,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
         HarnessKind::Antigravity => antigravity::parse_output(stdout),
+        HarnessKind::Muse => bail!("Muse Code requires the interactive harness runner"),
         _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
     }
 }
@@ -617,14 +632,19 @@ mod access_tests {
                     .to_string()
                     .contains("antigravity::run"));
             } else {
+                let expected = if kind == HarnessKind::Muse {
+                    "requires the interactive harness runner"
+                } else {
+                    "adapter not integrated yet"
+                };
                 assert!(command_spec(&request)
                     .unwrap_err()
                     .to_string()
-                    .contains("adapter not integrated yet"));
+                    .contains(expected));
                 assert!(parse_output(kind, "{}")
                     .unwrap_err()
                     .to_string()
-                    .contains("adapter not integrated yet"));
+                    .contains(expected));
             }
         }
         let antigravity = HarnessRequest {

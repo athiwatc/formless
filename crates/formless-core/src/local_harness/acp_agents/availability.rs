@@ -20,15 +20,38 @@ pub fn availability(
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> HarnessAvailability {
-    with_timeout(id, executable, environment, TIMEOUT)
+    availability_with_executable(id, executable, environment).availability
 }
 
+pub(crate) struct AvailabilityWithExecutable {
+    pub availability: HarnessAvailability,
+    pub executable: Option<PathBuf>,
+}
+
+pub(crate) fn availability_with_executable(
+    id: &str,
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+) -> AvailabilityWithExecutable {
+    with_timeout_with_executable(id, executable, environment, TIMEOUT)
+}
+
+#[cfg(test)]
 fn with_timeout(
     id: &str,
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
 ) -> HarnessAvailability {
+    with_timeout_with_executable(id, executable, environment, timeout).availability
+}
+
+fn with_timeout_with_executable(
+    id: &str,
+    executable: Option<PathBuf>,
+    environment: &BTreeMap<OsString, OsString>,
+    timeout: Duration,
+) -> AvailabilityWithExecutable {
     let mut result = HarnessAvailability {
         kind: HarnessKind::Acp,
         acp_agent: Some(id.into()),
@@ -41,14 +64,20 @@ fn with_timeout(
         Ok(spec) => spec,
         Err(error) => {
             result.detail = Some(error.to_string());
-            return result;
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: None,
+            };
         }
     };
     let program = match executable {
         Some(path) if path.is_absolute() => acp::is_executable(&path).then_some(path),
         Some(_) => {
             result.detail = Some("ACP executable override must be an absolute path.".into());
-            return result;
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: None,
+            };
         }
         None => acp::find_executable(spec.program, environment),
     };
@@ -57,14 +86,37 @@ fn with_timeout(
             "{} is not installed or its executable is not on PATH.",
             spec.name
         ));
-        return result;
+        return AvailabilityWithExecutable {
+            availability: result,
+            executable: None,
+        };
+    };
+    let program = match fs::canonicalize(program) {
+        Ok(path) if acp::is_executable(&path) => path,
+        Ok(_) => {
+            result.detail = Some("ACP executable is not executable.".into());
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: None,
+            };
+        }
+        Err(error) => {
+            result.detail = Some(format!("Could not resolve ACP executable path: {error}"));
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: None,
+            };
+        }
     };
     result.installed = true;
     let cwd = match ProbeDir::new() {
         Ok(cwd) => cwd,
         Err(error) => {
             result.detail = Some(format!("Could not create ACP probe directory: {error}"));
-            return result;
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: Some(program),
+            };
         }
     };
     let mut environment = environment.clone();
@@ -81,7 +133,7 @@ fn with_timeout(
         mcp_command: cwd.0.clone(),
         mcp_args: vec![],
         mcp_env_vars: BRIDGE_ENV.iter().map(|name| (*name).into()).collect(),
-        executable: Some(program),
+        executable: Some(program.clone()),
         environment,
     };
     let probe = acp::probe_session(spec, &request, timeout);
@@ -108,7 +160,10 @@ fn with_timeout(
         }
         Err(error) => result.detail = Some(format!("ACP readiness is unknown: {error:#}")),
     }
-    result
+    AvailabilityWithExecutable {
+        availability: result,
+        executable: Some(program),
+    }
 }
 
 struct ProbeDir(PathBuf);
