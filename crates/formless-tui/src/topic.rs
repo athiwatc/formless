@@ -623,6 +623,9 @@ pub struct State {
     pending_reviewed: HashSet<String>,
     permissions: Vec<HarnessPermission>,
     rendered_permission_id: Option<String>,
+    permission_options_visible: bool,
+    permission_scroll_id: Option<String>,
+    permission_input_scroll: u16,
     last_refresh: Option<std::time::Instant>,
 }
 
@@ -638,6 +641,9 @@ impl Default for State {
             pending_reviewed: HashSet::new(),
             permissions: Vec::new(),
             rendered_permission_id: None,
+            permission_options_visible: false,
+            permission_scroll_id: None,
+            permission_input_scroll: 0,
             last_refresh: None,
         }
     }
@@ -702,6 +708,11 @@ impl State {
         {
             self.permissions.push(permission);
             self.rendered_permission_id = None;
+            self.permission_options_visible = false;
+            if self.permissions.len() == 1 {
+                self.permission_scroll_id = None;
+                self.permission_input_scroll = 0;
+            }
         }
     }
 
@@ -712,12 +723,20 @@ impl State {
             .position(|open| open.permission_id == permission_id)?;
         let permission = self.permissions.remove(index);
         self.rendered_permission_id = None;
+        self.permission_options_visible = false;
+        if index == 0 {
+            self.permission_scroll_id = None;
+            self.permission_input_scroll = 0;
+        }
         Some(permission)
     }
 
     /// Drops prompts from a daemon that went away; returns how many.
     pub fn clear_permissions(&mut self) -> usize {
         self.rendered_permission_id = None;
+        self.permission_options_visible = false;
+        self.permission_scroll_id = None;
+        self.permission_input_scroll = 0;
         std::mem::take(&mut self.permissions).len()
     }
 
@@ -728,8 +747,35 @@ impl State {
         let Some(permission) = self.permissions.first() else {
             return Action::None;
         };
-        if self.rendered_permission_id.as_deref() != Some(&permission.permission_id) {
+        if self.rendered_permission_id.as_deref() != Some(permission.permission_id.as_str()) {
             return Action::None;
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.permission_input_scroll = self.permission_input_scroll.saturating_sub(1);
+                return Action::None;
+            }
+            KeyCode::Down => {
+                self.permission_input_scroll = self.permission_input_scroll.saturating_add(1);
+                return Action::None;
+            }
+            KeyCode::PageUp => {
+                self.permission_input_scroll = self.permission_input_scroll.saturating_sub(10);
+                return Action::None;
+            }
+            KeyCode::PageDown => {
+                self.permission_input_scroll = self.permission_input_scroll.saturating_add(10);
+                return Action::None;
+            }
+            KeyCode::Home => {
+                self.permission_input_scroll = 0;
+                return Action::None;
+            }
+            KeyCode::End => {
+                self.permission_input_scroll = u16::MAX;
+                return Action::None;
+            }
+            _ => {}
         }
         let decide = |option_id: Option<String>| Action::PermissionDecision {
             permission_id: permission.permission_id.clone(),
@@ -738,6 +784,9 @@ impl State {
         let action = match key.code {
             KeyCode::Esc | KeyCode::Char('d' | 'D') => decide(None),
             KeyCode::Char(c @ '1'..='9') => {
+                if !self.permission_options_visible {
+                    return Action::None;
+                }
                 match permission.options.get(c as usize - '1' as usize) {
                     Some(option) => decide(Some(option.option_id.clone())),
                     None => return Action::None,
@@ -747,6 +796,9 @@ impl State {
         };
         self.permissions.remove(0);
         self.rendered_permission_id = None;
+        self.permission_options_visible = false;
+        self.permission_scroll_id = None;
+        self.permission_input_scroll = 0;
         action
     }
 
@@ -1709,11 +1761,19 @@ impl State {
     /// Drawn last in the frame: permission keys are handled before every
     /// other overlay, so the prompt must never be hidden beneath one.
     pub fn draw_permission_overlay(&mut self, frame: &mut Frame, color: bool) {
-        if let Some(permission) = self.permissions.first() {
-            self.draw_permission(frame, permission, color);
-            self.rendered_permission_id = Some(permission.permission_id.clone());
+        if let Some(permission) = self.permissions.first().cloned() {
+            if self.permission_scroll_id.as_deref() != Some(permission.permission_id.as_str()) {
+                self.permission_scroll_id = Some(permission.permission_id.clone());
+                self.permission_input_scroll = 0;
+            }
+            let (visible, options_visible) = self.draw_permission(frame, &permission, color);
+            self.rendered_permission_id = visible.then(|| permission.permission_id.clone());
+            self.permission_options_visible = options_visible;
         } else {
             self.rendered_permission_id = None;
+            self.permission_options_visible = false;
+            self.permission_scroll_id = None;
+            self.permission_input_scroll = 0;
         }
     }
 
@@ -1744,7 +1804,12 @@ impl State {
         }
     }
 
-    fn draw_permission(&self, frame: &mut Frame, permission: &HarnessPermission, color: bool) {
+    fn draw_permission(
+        &mut self,
+        frame: &mut Frame,
+        permission: &HarnessPermission,
+        color: bool,
+    ) -> (bool, bool) {
         let area = centered(frame.area(), 80, 70);
         frame.render_widget(Clear, area);
         let harness = harness_name(permission.harness, permission.acp_agent.as_deref());
@@ -1759,7 +1824,7 @@ impl State {
             .map(|attempt| format!(" / {}", attempt.step_title))
             .unwrap_or_default();
         let topic = self.topic_path(&permission.topic_id).join(" / ");
-        let mut lines = vec![
+        let header = vec![
             Line::from(format!(
                 "{}{step} · {harness}",
                 if topic.is_empty() {
@@ -1777,41 +1842,92 @@ impl State {
                 permission.kind, permission.session_id
             )),
         ];
-        if let Some(input) = &permission.raw_input {
-            let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
-            lines.extend(
-                pretty
-                    .lines()
-                    .take(12)
-                    .map(|line| Line::from(format!("  {line}"))),
-            );
-        }
-        lines.push(Line::default());
+        let mut action_lines = Vec::new();
         for (index, option) in permission.options.iter().enumerate() {
             let note = match option.kind {
                 HarnessPermissionOptionKind::AllowAlways => " (this attempt only)",
                 _ => "",
             };
-            lines.push(Line::from(format!("{}. {}{note}", index + 1, option.name)));
+            action_lines.push(Line::from(format!("{}. {}{note}", index + 1, option.name)));
         }
         if self.permissions.len() > 1 {
-            lines.push(Line::from(format!(
+            action_lines.push(Line::from(format!(
                 "{} more permission request(s) waiting.",
                 self.permissions.len() - 1
             )));
         }
+        action_lines.push(Line::from("1-9 choose · Esc/d deny"));
         let block = crate::ui::panel(
             format!(" {harness} asks for permission "),
             color,
             Color::Yellow,
         )
         .title_bottom(crate::ui::hint(
-            "1-9 choose · Esc/d deny · only you can answer; no answer means denied",
+            "only you can answer · no answer means denied",
             color,
         ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        if inner.width == 0 || inner.height == 0 {
+            return (false, false);
+        }
+        let wrap = Wrap { trim: false };
+        let header_rows = Paragraph::new(header.clone())
+            .wrap(wrap)
+            .line_count(inner.width);
+        let action_rows = Paragraph::new(action_lines.clone())
+            .wrap(wrap)
+            .line_count(inner.width);
+        let minimum = header_rows.saturating_add(action_rows).saturating_add(3);
+        if minimum > usize::from(inner.height) {
+            frame.render_widget(
+                Paragraph::new(
+                    "Terminal too small to show permission choices. Resize to choose; Esc/d denies.",
+                )
+                .wrap(wrap),
+                inner,
+            );
+            return (true, false);
+        }
+        let chunks = Layout::vertical([
+            Constraint::Length(u16::try_from(header_rows).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(u16::try_from(action_rows).unwrap_or(u16::MAX)),
+        ])
+        .split(inner);
+        frame.render_widget(Paragraph::new(header).wrap(wrap), chunks[0]);
+        let raw_lines: Vec<Line> = permission
+            .raw_input
+            .as_ref()
+            .map(|input| serde_json::to_string_pretty(input).unwrap_or_default())
+            .unwrap_or_else(|| "(no raw input)".into())
+            .lines()
+            .map(|line| Line::from(format!("  {line}")))
+            .collect();
+        let raw_input = Paragraph::new(raw_lines).wrap(wrap);
+        let total_rows = raw_input.line_count(chunks[2].width);
+        let max_scroll = total_rows.saturating_sub(usize::from(chunks[2].height));
+        self.permission_input_scroll = self
+            .permission_input_scroll
+            .min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
+        let scroll = usize::from(self.permission_input_scroll);
+        let first = scroll.saturating_add(1).min(total_rows);
+        let last = scroll
+            .saturating_add(usize::from(chunks[2].height))
+            .min(total_rows);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Input rows {first}-{last} of {total_rows} · ↑/↓ PgUp/PgDn Home/End"
+            )),
+            chunks[1],
+        );
+        frame.render_widget(raw_input.scroll((self.permission_input_scroll, 0)), chunks[2]);
+        frame.render_widget(
+            Paragraph::new(action_lines).wrap(wrap),
+            chunks[3],
+        );
+        (true, true)
     }
 
     fn draw_picker(&self, frame: &mut Frame, area: Rect, color: bool) {
@@ -2507,6 +2623,42 @@ mod tests {
         }
     }
 
+    fn permission(id: &str, raw_input: serde_json::Value) -> HarnessPermission {
+        HarnessPermission {
+            permission_id: id.into(),
+            session_id: "harness-session".into(),
+            topic_id: "t1".into(),
+            attempt_id: "a1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run a command".into(),
+            kind: "execute".into(),
+            raw_input: Some(raw_input),
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        }
+    }
+
+    fn permission_screen(state: &mut State, width: u16, height: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .unwrap();
+        terminal
+            .draw(|frame| state.draw_permission_overlay(frame, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn proposal_defaults_latest_request_and_contains_only_explicit_selections() {
         let source = session("main");
@@ -2523,6 +2675,51 @@ mod tests {
         assert_eq!(request.workspace, Some(PathBuf::from("/repo")));
         assert!(request.outline.is_empty(), "Formless plans by default");
         assert_eq!(request.parent_topic_id, None);
+    }
+
+    #[test]
+    fn permission_input_scrolls_past_long_wrapped_input_with_choices_pinned() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("aa_long".into(), serde_json::json!("x".repeat(100)));
+        for index in 0..18 {
+            fields.insert(format!("field_{index:02}"), serde_json::json!(index));
+        }
+        fields.insert("zz_tail".into(), serde_json::json!("tail-beyond-twelve"));
+        let mut state = State::default();
+        state.push_permission(permission("p1", serde_json::Value::Object(fields)));
+
+        let first = permission_screen(&mut state, 60, 18);
+        assert!(first.contains("Input rows"), "{first}");
+        assert!(first.contains("1. Allow once"), "{first}");
+        assert!(!first.contains("tail-beyond-twelve"), "{first}");
+
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Action::None
+        );
+        let last = permission_screen(&mut state, 60, 18);
+        assert!(last.contains("tail-beyond-twelve"), "{last}");
+        assert!(last.contains("1. Allow once"), "{last}");
+    }
+
+    #[test]
+    fn tiny_permission_view_does_not_accept_invisible_allow_options() {
+        let mut state = State::default();
+        state.push_permission(permission("p1", serde_json::json!({"command": "run"})));
+        let screen = permission_screen(&mut state, 30, 8);
+        assert!(screen.contains("Terminal too small"), "{screen}");
+        assert!(!screen.contains("1. Allow once"), "{screen}");
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(
+            state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: None,
+            }
+        );
     }
 
     #[test]
