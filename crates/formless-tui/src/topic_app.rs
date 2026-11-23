@@ -35,6 +35,10 @@ impl App {
     }
 
     pub(crate) fn refresh_topics(&mut self) {
+        self.refresh_topics_with_main(false);
+    }
+
+    fn refresh_topics_with_main(&mut self, include_main: bool) {
         if !self.topic.enabled() {
             return;
         }
@@ -46,10 +50,11 @@ impl App {
             },
             Request::ListTopics,
         );
-        if !self
-            .pending
-            .values()
-            .any(|pending| matches!(pending, Pending::TopicMain { .. }))
+        if (include_main || self.topic.main().is_some())
+            && !self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::TopicMain { .. }))
         {
             self.request_main_chat(false);
         }
@@ -89,7 +94,7 @@ impl App {
         match name {
             "main" => self.open_main_chat(),
             "topics" => {
-                self.refresh_topics();
+                self.refresh_topics_with_main(true);
                 self.topic.open_picker();
             }
             _ => {
@@ -192,7 +197,7 @@ impl App {
     fn topic_action(&mut self, action: Action) {
         match action {
             Action::None | Action::Close => {}
-            Action::Refresh => self.refresh_topics(),
+            Action::Refresh => self.refresh_topics_with_main(true),
             Action::OpenMain => self.open_main_chat(),
             Action::OpenTopic(topic_id) => self.open_node(Node::Topic(topic_id)),
             Action::OpenAttempt {
@@ -1407,6 +1412,34 @@ mod tests {
         app.topic_slash("topics", "");
         assert!(!app.topic.overlay_open());
         assert!(app.notes.last().unwrap().contains("topic_orchestration_v2"));
+    }
+
+    #[test]
+    fn background_topic_refresh_does_not_create_main_chat() {
+        let (mut app, wire) = connected(vec![]);
+        app.refresh_topics();
+        assert!(wire
+            .requests()
+            .iter()
+            .all(|request| !matches!(request.request, Request::GetMainChat)));
+
+        app.topic_slash("topics", "");
+        let main = wire
+            .requests()
+            .into_iter()
+            .find(|request| matches!(request.request, Request::GetMainChat))
+            .expect("explicit hierarchy navigation loads Main Chat");
+        wire.respond(
+            &mut app,
+            main.id,
+            serde_json::json!({"id":"main","name":"Main Chat","created_at":"","updated_at":""}),
+        );
+
+        let before = wire.requests().len();
+        app.refresh_topics();
+        assert!(wire.requests()[before..]
+            .iter()
+            .any(|request| matches!(request.request, Request::GetMainChat)));
     }
 
     fn render(app: &mut App, width: u16) -> String {
