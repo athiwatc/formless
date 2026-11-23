@@ -15,6 +15,8 @@ mod production_overlay_tests;
 
 #[path = "support/attachments.rs"]
 mod attachment_tests;
+#[path = "support/topics.rs"]
+mod topic_tests;
 
 use std::time::{Duration, Instant};
 
@@ -903,6 +905,21 @@ const TOGGLE_SIDEBAR: &str = "ctrl-b";
 const TOGGLE_INSPECTOR: &str = "cmd-alt-b";
 #[cfg(not(target_os = "macos"))]
 const TOGGLE_INSPECTOR: &str = "ctrl-alt-b";
+
+/// Topic navigation replaces the legacy sidebar; ordinary saved sessions
+/// remain reachable through the native Sessions directory.
+fn open_saved_session(window: &mut Window, cx: &mut App, shell: &Entity<Shell>, id: &str) {
+    window.render_frame(cx);
+    if window.try_find(session_row_id(id)).is_some() {
+        window.click(session_row_id(id), cx);
+    } else {
+        shell.update(cx, |s, cx| {
+            s.run_command(Command::GoTo(Destination::Sessions), window, cx)
+        });
+        window.render_frame(cx);
+        window.click(directory_row_id(id), cx);
+    }
+}
 
 /// One window update. Events a control emits (a composer Enter, for one) are
 /// delivered when the update ends, so an assertion about their effect belongs
