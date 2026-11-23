@@ -689,7 +689,7 @@ async fn topic_async_wait_concurrent_completions_empty_errors_and_cancel() {
 }
 
 #[tokio::test]
-async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_permission() {
+async fn topic_async_wait_surfaces_live_question_human_answer_and_informational_permission() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "question");
     let f = Fixture::new(&env);
@@ -728,7 +728,135 @@ async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_
     assert_eq!(question["event"], "question");
     assert_eq!(question["user_only"], false);
     assert_eq!(f.daemon().topic_steps.locked().len(), 1);
-    let answered=f.daemon().answer_topic_question_tool(&session,&json!({"question_id":question["question_id"],"answers":[{"selected":["Yes"]}],"basis":"The user's moved request says: Account for X and Y."})).unwrap();
+    let second_daemon = f.daemon().clone();
+    let second_session = session.clone();
+    let second_attempt_id = launched["attempt_id"].as_str().unwrap().to_owned();
+    let second_cancel = CancellationToken::new();
+    let second_wait_cancel = second_cancel.clone();
+    let mut second_wait = tokio::spawn(async move {
+        second_daemon
+            .wait_topic_steps(
+                &second_session,
+                &json!({"attempt_ids":[second_attempt_id],"timeout_secs":30}),
+                &second_wait_cancel,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut second_wait)
+            .await
+            .is_err()
+    );
+    second_cancel.cancel();
+    let second_result = tokio::time::timeout(Duration::from_secs(5), second_wait)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_result["event"], "cancelled");
+
+    let _model_server = model(
+        &f,
+        &env,
+        &topic,
+        HarnessKind::Claude,
+        HarnessKind::Codex,
+        true,
+    )
+    .await;
+    let cfg = Config::load(&f.paths).unwrap();
+    let resume_forecast = f
+        .daemon()
+        .with_reader(|st| {
+            crate::forecast::estimate_store(
+                st,
+                &cfg,
+                &ForecastInput {
+                    session_id: Some(session.clone()),
+                    draft: "Resume the topic work".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    f.daemon()
+        .start_run_forecast(session.clone(), Some(resume_forecast))
+        .unwrap();
+    let resumed_run_id = f
+        .daemon()
+        .runs
+        .locked()
+        .get(&session)
+        .unwrap()
+        .run_id
+        .clone();
+    let resumed_question = f
+        .daemon()
+        .wait_topic_steps(
+            &session,
+            &json!({"attempt_ids":[launched["attempt_id"]]}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed_question["event"], "question");
+    assert_eq!(resumed_question["question_id"], question["question_id"]);
+    assert_eq!(resumed_question["user_only"], false);
+
+    let duplicate_run_id = f.daemon().with_store(|st| st.create_run(&session)).unwrap();
+    let duplicate_admission = f
+        .daemon()
+        .run_admissions
+        .locked()
+        .get(&resumed_run_id)
+        .unwrap()
+        .clone();
+    assert!(f
+        .daemon()
+        .launch_prepared_run(session.clone(), duplicate_run_id, duplicate_admission)
+        .is_err());
+
+    let repeated_daemon = f.daemon().clone();
+    let repeated_session = session.clone();
+    let repeated_attempt_id = launched["attempt_id"].as_str().unwrap().to_owned();
+    let repeated_cancel = CancellationToken::new();
+    let repeated_wait_cancel = repeated_cancel.clone();
+    let mut repeated_wait = tokio::spawn(async move {
+        repeated_daemon
+            .wait_topic_steps(
+                &repeated_session,
+                &json!({"attempt_ids":[repeated_attempt_id],"timeout_secs":30}),
+                &repeated_wait_cancel,
+            )
+            .await
+    });
+    let repeated_timeout =
+        tokio::time::timeout(Duration::from_millis(50), &mut repeated_wait).await;
+    assert!(
+        repeated_timeout.is_err(),
+        "same-run wait should block, got {repeated_timeout:?}"
+    );
+    repeated_cancel.cancel();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), repeated_wait)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()["event"],
+        "cancelled"
+    );
+    let answered = f
+        .daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: question["question_id"].as_str().unwrap().into(),
+            answer: "Yes".into(),
+            answers: vec![QuestionAnswer {
+                selected: vec!["Yes".into()],
+                text: None,
+            }],
+        })
+        .await
+        .unwrap();
     assert_eq!(answered["answered"], true);
     assert_eq!(
         f.daemon()
@@ -741,6 +869,7 @@ async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_
             .unwrap()["status"],
         "succeeded"
     );
+    settled(&f, &session).await;
     env.set("TOPIC_FIXTURE_MODE", "permission");
     let permission_step = f
         .daemon()
