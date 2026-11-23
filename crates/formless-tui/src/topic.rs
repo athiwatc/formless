@@ -2181,49 +2181,39 @@ impl State {
             return;
         };
         let verb = match action {
-            ConfirmedAction::Approve => "Approve selected requests (move messages only)",
-            ConfirmedAction::ApproveAndStart => {
-                "Approve, move the requests, and start the workflow"
-            }
-            ConfirmedAction::Start => "Start topic workflow",
-            ConfirmedAction::Cancel => "Cancel topic",
-            ConfirmedAction::Recover => "Recover topic workflow",
-            ConfirmedAction::Retry { .. } => "Retry topic feature",
+            ConfirmedAction::Approve => "Approve",
+            ConfirmedAction::ApproveAndStart => "Approve + start",
+            ConfirmedAction::Start => "Start",
+            ConfirmedAction::Cancel => "Cancel",
+            ConfirmedAction::Recover => "Recover",
+            ConfirmedAction::Retry { .. } => "Retry",
         };
-        let mut lines = topic_lines(topic, color);
-        lines.extend([
-            Line::default(),
-            Line::styled(
-                verb,
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
-            ),
-            Line::from(match action {
+        let name: String = topic.name.chars().take(48).collect();
+        let name = if topic.name.chars().count() > 48 {
+            format!("{name}…")
+        } else {
+            name
+        };
+        let consequence = match action {
                 ConfirmedAction::Approve => {
-                    "Moves the selected requests into this topic. Harness work does not start yet."
+                    "Moves selected requests into this topic; workflow does not start."
                 }
                 ConfirmedAction::ApproveAndStart => {
-                    "Moves the selected requests, then starts the Formless orchestrator once."
+                    "Moves selected requests, then starts the workflow once."
                 }
-                ConfirmedAction::Start => {
-                    "The Formless model runs the work in the Topic Chat, using the outline as advice."
-                }
+                ConfirmedAction::Start => "Starts the Formless workflow for this topic.",
                 ConfirmedAction::Cancel => {
-                    "Stops the orchestrator and any running harness work. Nothing starts again until you start it."
+                    "Stops the workflow and running harness work."
                 }
                 ConfirmedAction::Recover => {
-                    "Marks interrupted work failed and abandons its running attempts. Retry a work item to run it again."
+                    "Marks interrupted work failed and abandons running attempts."
                 }
-                ConfirmedAction::Retry { .. } => {
-                    "Resets this work item to pending. Start the topic again to run it."
-                }
-            }),
-            Line::from("Nothing is merged or pushed automatically; outputs are listed in Topic Details."),
-            Line::from("Enter/y confirm · Esc/n cancel"),
-        ]);
+                ConfirmedAction::Retry { .. } => "Resets this work item to pending.",
+        };
+        let lines = vec![Line::from(format!("Topic: {name}")), Line::from(consequence)];
         frame.render_widget(Clear, area);
-        let block = crate::ui::panel(" Confirm Topic Action ", color, Color::Yellow);
+        let block = crate::ui::panel(format!(" Confirm · {verb} "), color, Color::Yellow)
+            .title_bottom(crate::ui::hint("Enter/y confirm · Esc/n cancel", color));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -2762,6 +2752,45 @@ mod tests {
                 option_id: None,
             }
         );
+    }
+
+    #[test]
+    fn confirmation_keeps_action_and_controls_visible_with_long_topic_details() {
+        let mut long_topic = topic("t1", TopicStatus::PendingApproval);
+        long_topic.name = "A very long feature name ".repeat(12);
+        let mut long_attempt = attempt("a1", "harness-session");
+        long_attempt.detail = Some("unbounded harness output that must not enter this confirmation".repeat(8));
+        long_topic.attempts.push(long_attempt);
+        let mut state = State::default();
+        state.update_topics(vec![long_topic]);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10))
+            .unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                state.draw_confirmation(
+                    frame,
+                    area,
+                    "t1",
+                    &ConfirmedAction::Approve,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Confirm · Approve"), "{screen}");
+        assert!(screen.contains("Enter/y confirm"), "{screen}");
+        assert!(screen.contains("Esc/n cancel"), "{screen}");
+        assert!(!screen.contains("unbounded harness output"), "{screen}");
     }
 
     #[test]
