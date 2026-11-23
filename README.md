@@ -29,8 +29,8 @@ Talk in Main Chat, organize work into Topic Chats, and let Formless drive the co
 Formless is a local orchestrator for AI work. You talk to one assistant; when a
 request turns into real work, Formless moves it into its own Topic Chat, plans
 the steps and hands each step to an agent harness installed on your machine,
-such as Claude Code or Codex. Their questions, permission requests and results
-come back into the same conversation.
+such as Claude Code, Codex, or Muse Code. Their questions, permission requests
+and results come back into the same conversation.
 
 It is not only for code. A flow is whatever steps you describe — *scan receipts
 → do the accounting → write the report* works the same way as *build → review*.
@@ -64,11 +64,11 @@ Integrated adapters use each harness's official local interface and a private,
 per-step MCP bridge back to the topic. Install and sign in to a harness the
 usual way; Formless does not ship or log in to them for you.
 
-Current topic-step adapters are Claude Code and Codex, using their official
-non-interactive CLIs. Pi, OpenCode, Antigravity, Grok Build, Muse Code and
-additional ACP agents are still in progress.
+Current topic-step adapters are Claude Code and Codex via their official
+non-interactive CLIs, and Muse Code via its `muse serve` protocol. Pi, OpenCode,
+Antigravity, Grok Build, and additional ACP profiles are still in progress.
 
-Either integrated harness can take any step, including the same harness on
+Any integrated harness can take any step, including the same harness on
 both sides of a hand-off. A harness's own permission modes are not an OS
 sandbox; the isolated worktree or directory is the boundary.
 
@@ -96,8 +96,8 @@ One daemon owns all state; every client is a thin view of it, so closing one nev
 | Client | Start it |
 |---|---|
 | Terminal UI | `formless` — the current Session and Run interface; topic navigation is not integrated yet |
-| Desktop app | native GPUI app ([overview](crates/formless-desktop/README.md)) |
-| Browser | `formless relay enable` — end-to-end encrypted, works on phones ([relay](relay/README.md)) |
+| Desktop app | native GPUI app with Main Chat and nested Topic Chats ([overview](crates/formless-desktop/README.md)) |
+| Browser | `formless relay enable` — end-to-end encrypted, with Main Chat and nested Topic Chats; works on phones ([relay](relay/README.md)) |
 | CLI | `formless run "…"` — scriptable, with JSON output; `formless chat` opens an interactive line-mode chat |
 
 Keys and commands: [docs/keys.md](docs/keys.md). Every CLI command: [docs/cli.md](docs/cli.md).
@@ -116,7 +116,7 @@ scheduled Jobs plug into the same registry.
                                                          ├─ Main Chat · Topics · Runs (SQLite)
                                                          ├─ Tool registry ─▶ QuickJS sandbox
                                                          ├─ Providers: Chat Completions · Responses · Anthropic
-                                                         └─ Harness steps ─▶ Claude · Codex · Pi · ACP …
+                                                         └─ Harness steps ─▶ Claude Code · Codex · Muse Code
 ```
 
 Architecture, the Tool system and self-optimisation: [docs/architecture.md](docs/architecture.md).
