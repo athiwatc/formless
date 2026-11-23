@@ -14928,15 +14928,21 @@ fn others_text(others: &[AttachedClient]) -> String {
         .join(", ")
 }
 
-fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
-    let who = match role {
-        "user" => "You",
-        "system-note" => "System",
-        _ => "Formless",
+fn chat_header(
+    app: &App,
+    role: &str,
+    generated_by: Option<&str>,
+    when: Option<&str>,
+) -> Line<'static> {
+    let (who, style_role) = match (role, generated_by) {
+        ("user", Some(marker)) => (format!("Formless · generated: {marker}"), "assistant"),
+        ("user", None) => ("You".to_owned(), "user"),
+        ("system-note", _) => ("System".to_owned(), "system-note"),
+        _ => ("Formless".to_owned(), "assistant"),
     };
     let mut spans = vec![
-        Span::styled("▍", role_style(app.color, role)),
-        Span::styled(who.to_string(), role_style(app.color, role)),
+        Span::styled("▍", role_style(app.color, style_role)),
+        Span::styled(who, role_style(app.color, style_role)),
     ];
     if let Some(t) = when
         .filter(|_| app.show_timestamps)
@@ -16814,19 +16820,22 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         .map(|(id, _, _)| id)
         .filter(|id| !id.is_empty())
         .collect();
-    let mut group: Option<&'static str> = None;
+    let mut group: Option<String> = None;
     // Header only when the speaker changes; a blank line separates turns.
     let open_group = |lines: &mut Vec<Line<'static>>,
-                      group: &mut Option<&'static str>,
+                      group: &mut Option<String>,
                       role: &str,
+                      generated_by: Option<&str>,
                       when: Option<&str>| {
-        let g = speaker(role);
-        if *group != Some(g) {
+        let key = generated_by
+            .map(|marker| format!("generated:{marker}"))
+            .unwrap_or_else(|| speaker(role).to_owned());
+        if group.as_deref() != Some(key.as_str()) {
             if group.is_some() {
                 lines.push(Line::raw(""));
             }
-            lines.push(chat_header(app, g, when));
-            *group = Some(g);
+            lines.push(chat_header(app, role, generated_by, when));
+            *group = Some(key);
         }
     };
     let footers = run_footers(app);
@@ -16850,7 +16859,13 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         match m.role.as_str() {
             "user" => {
                 user_lines.push(lines.len());
-                open_group(&mut lines, &mut group, "user", when);
+                open_group(
+                    &mut lines,
+                    &mut group,
+                    "user",
+                    m.generated_by.as_deref(),
+                    when,
+                );
                 if let Some(from) = sent_elsewhere(app, m) {
                     lines.push(Line::styled(
                         format!("  sent from {from}"),
@@ -16900,11 +16915,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 if result_call_id(m).is_some_and(|id| called.contains(&id)) {
                     continue;
                 }
-                open_group(&mut lines, &mut group, "assistant", when);
+                open_group(&mut lines, &mut group, "assistant", None, when);
                 lines.push(tool_result_line(m, app.color));
             }
             "system-note" => {
-                open_group(&mut lines, &mut group, "system-note", when);
+                open_group(&mut lines, &mut group, "system-note", None, when);
                 for l in m.content.lines() {
                     lines.push(Line::styled(
                         format!("  {l}"),
@@ -16913,7 +16928,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
             }
             _ => {
-                open_group(&mut lines, &mut group, "assistant", when);
+                open_group(&mut lines, &mut group, "assistant", None, when);
                 if let Some(via) = served_by(m) {
                     lines.push(Line::styled(format!("  {via}"), ui::dim(app.color)));
                 }
@@ -16986,7 +17001,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     // subtree folds to one line.
     let shown = live_tree(&app.live_tools);
     if !shown.is_empty() {
-        open_group(&mut lines, &mut group, "assistant", None);
+        open_group(&mut lines, &mut group, "assistant", None, None);
         for (call, folded) in shown {
             let version = if call.version > 0 {
                 format!(" v{}", call.version)

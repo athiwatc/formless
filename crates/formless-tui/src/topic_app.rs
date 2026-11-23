@@ -1185,6 +1185,39 @@ mod tests {
     }
 
     #[test]
+    fn generated_user_messages_render_with_marker_attribution() {
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        let mut generated = formless_protocol::MessageInfo {
+            id: "generated".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "Same kickoff text".into(),
+            created_at: String::new(),
+            meta: None,
+            generated_by: Some("topic_kickoff".into()),
+        };
+        let genuine = formless_protocol::MessageInfo {
+            id: "genuine".into(),
+            session_id: "s1".into(),
+            seq: 2,
+            role: "user".into(),
+            content: "Same kickoff text".into(),
+            created_at: String::new(),
+            meta: None,
+            generated_by: None,
+        };
+        generated.seq = 1;
+        app.messages = vec![generated, genuine];
+
+        let screen = render(&mut app, 120);
+        assert!(screen.contains("Formless · generated: topic_kickoff"), "{screen}");
+        assert!(screen.contains("You"), "{screen}");
+        assert_eq!(screen.matches("Same kickoff text").count(), 2, "{screen}");
+    }
+
+    #[test]
     fn cancel_asks_first_then_sends_cancel_topic() {
         let (mut app, wire) = connected(vec![topic("t1", TopicStatus::Running)]);
         app.topic_slash("topic", "cancel t1");

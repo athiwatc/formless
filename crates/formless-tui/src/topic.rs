@@ -274,7 +274,11 @@ impl ProposalForm {
     ) -> Self {
         let mut user_messages: Vec<_> = messages
             .iter()
-            .filter(|message| message.role == "user" && message.session_id == source.id)
+            .filter(|message| {
+                message.role == "user"
+                    && message.session_id == source.id
+                    && message.generated_by.is_none()
+            })
             .cloned()
             .collect();
         user_messages.sort_by_key(|message| message.seq);
@@ -2662,15 +2666,19 @@ mod tests {
     #[test]
     fn proposal_defaults_latest_request_and_contains_only_explicit_selections() {
         let source = session("main");
+        let mut generated = message("generated", 4, "user", "Same kickoff text");
+        generated.generated_by = Some("topic_kickoff".into());
         let messages = [
             message("u1", 1, "user", "First request"),
             message("a1", 2, "assistant", "Answer"),
-            message("u2", 3, "user", "Second request"),
+            message("u2", 3, "user", "Same kickoff text"),
+            generated,
         ];
         let parents = vec![(None, "Main Chat".to_string())];
         let form = ProposalForm::new(&source, &messages, "/repo", "Work", parents, None);
         let request = form.request().unwrap();
         assert_eq!(request.message_ids, ["u2"]);
+        assert_eq!(form.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["u1", "u2"]);
         assert_eq!(request.source_session_id, "main");
         assert_eq!(request.workspace, Some(PathBuf::from("/repo")));
         assert!(request.outline.is_empty(), "Formless plans by default");
