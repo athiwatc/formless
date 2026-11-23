@@ -2580,12 +2580,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maximum_supported_artifact_result_fits_rpc_limits() {
+    async fn maximum_topic_input_artifact_fits_rpc_lifecycle_limits() {
         use base64::Engine;
         use tokio::io::AsyncWriteExt;
 
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(vec![0u8; crate::daemon::MAX_ATTACHMENT_BYTES]);
+        const MAX_TOPIC_INPUT_BYTES: usize = 16 * 1024 * 1024;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(vec![0u8; MAX_TOPIC_INPUT_BYTES]);
         let tool_result = serde_json::to_string(&json!({
             "artifact": {"kind": "file", "name": "maximum.bin"},
             "base64": encoded,
@@ -2593,11 +2594,13 @@ mod tests {
         .unwrap();
         let event = json!({
             "type": "tool_execution_end",
+            "toolName": "read_artifact",
+            "toolCallId": "artifact-1",
             "result": {"content": [{"type": "text", "text": tool_result}]},
         });
         let record = serde_json::to_vec(&event).unwrap();
         assert!(record.len() <= MAX_RPC_RECORD_BYTES);
-        assert!(record.len() <= MAX_EVENT_HISTORY_BYTES);
+        let record_bytes = record.len() + 1;
         drop(event);
 
         let (mut writer, reader) = tokio::io::duplex(4 * 1024 * 1024);
@@ -2613,12 +2616,56 @@ mod tests {
             .unwrap()
             .unwrap();
         writer.await.unwrap();
+        assert_eq!(line.len(), record_bytes);
         let event: Value = serde_json::from_slice(&line).unwrap();
+        drop(line);
+        let mut duplicate = event.clone();
+        duplicate["toolCallId"] = json!("artifact-2");
+        let semantic = vec![
+            json!({"type":"agent_start"}),
+            json!({"type":"session","id":"artifact-session"}),
+            bridge_event(),
+            json!({"type":"turn_start"}),
+            json!({
+                "type":"tool_execution_start",
+                "toolName":"read_artifact",
+                "toolCallId":"artifact-1",
+                "args":{"path":"maximum.bin"}
+            }),
+            event,
+            json!({
+                "type":"tool_execution_start",
+                "toolName":"read_artifact",
+                "toolCallId":"artifact-2",
+                "args":{"path":"maximum.bin"}
+            }),
+            duplicate,
+            assistant_event("maximum artifact read complete", "stop"),
+            json!({"type":"agent_end","willRetry":false}),
+            json!({"type":"agent_settled","aborted":false}),
+        ];
         let mut retained = Vec::new();
         let mut history_bytes = 0;
-        retain_rpc_event(&mut retained, &mut history_bytes, event, line.len()).unwrap();
-        assert_eq!(retained.len(), 1);
+        for event in semantic {
+            let record_bytes = if event["type"] == "tool_execution_end" {
+                record_bytes
+            } else {
+                serde_json::to_vec(&event).unwrap().len()
+            };
+            assert!(record_bytes <= MAX_RPC_RECORD_BYTES);
+            retain_rpc_event(&mut retained, &mut history_bytes, event, record_bytes).unwrap();
+        }
+        assert_eq!(
+            retained
+                .iter()
+                .filter(|event| event["type"] == "tool_execution_end")
+                .count(),
+            2
+        );
+        assert!(history_bytes >= 2 * record_bytes);
         assert!(history_bytes <= MAX_EVENT_HISTORY_BYTES);
+        let result = parse_events(retained).unwrap();
+        assert_eq!(result.message, "maximum artifact read complete");
     }
 
     #[test]
