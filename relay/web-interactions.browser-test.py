@@ -85,7 +85,7 @@ HOOK = r"""
     S.current="first";
     S.sessions=[session("first","First Session"),session("second","Second Session")];
     S.liveRun={id:"run-a",ended:true};
-    S.queued=[{id:7,revision:1,content:"  first\r\nsecond  "}];
+    S.queued=[{id:7,revision:12,content:"  first\r\nsecond  "}];
     renderQueue();
     F.reply("list_models", {models:["first-model","other-model"]});
     F.reply("run_files", {run_id:"run-a",files:[{path:"fixture.txt",status:"modified",revertible:true}]});
@@ -93,6 +93,8 @@ HOOK = r"""
       h("button", {type:"button",onclick:showRunFiles}, "Files"));
     $("composer").prepend(controls);
   };
+  F.reviseQueued = () => onEvent({type:"queue_changed", session_id:S.current, queued:[{...S.queued[0], revision:13}]});
+  F.legacyQueued = () => { delete S.queued[0].revision; renderQueue(); };
   F.askFixtureQuestion = () => onEvent({type:"user_question",session_id:"first",question_id:"question-a",question:"Fixture question"});
   F.advanceRun = () => onEvent({type:"run_started",session_id:S.current,run_id:"run-b"});
   F.switchFixtureSession = () => { S.current="second"; sessionSeq++; };
@@ -468,10 +470,10 @@ def action_dialogs(page):
     expect(modal.get_by_text("Fixture question")).to_be_visible()
     modal.get_by_role("button", name="Cancel").click()
     expect(modal).to_be_hidden()
-    assert page.evaluate("__interaction.calls.find(x=>x.type==='edit_queued_if_current')") == {
-        "type": "edit_queued_if_current", "session_id": "first", "id": 7,
-        "revision": 1, "content": "  first\r\nsecond  ",
-    }
+    assert calls(page, "edit_queued_if_current") == [
+        {"type": "edit_queued_if_current", "session_id": "first", "id": 7, "revision": 12,
+         "content": "  first\r\nsecond  "},
+    ]
 
     edit.click()
     expect(field).to_be_focused()
@@ -479,12 +481,23 @@ def action_dialogs(page):
     modal.get_by_role("button", name="Save").click()
     expect(modal).to_be_hidden()
     expect(edit).to_be_focused()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').at(-1).content") == "  edited\ntext  "
+    assert calls(page, "edit_queued_if_current")[-1] == {
+        "type": "edit_queued_if_current", "session_id": "first", "id": 7, "revision": 12,
+        "content": "  edited\ntext  ",
+    }
     edit.click()
     field.fill("discard this edit")
     page.keyboard.press("Escape")
     expect(edit).to_be_focused()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').length") == 2
+    assert len(calls(page, "edit_queued_if_current")) == 2
+
+    edit.click()
+    page.evaluate("__interaction.reviseQueued()")
+    expect(field).to_be_focused()
+    field.fill("stale queue revision")
+    modal.get_by_role("button", name="Save").click()
+    expect(modal).to_be_hidden()
+    assert len(calls(page, "edit_queued_if_current")) == 2
 
     rating = page.locator("#fixture-actions").get_by_role("button", name="👎")
     rating.click()
@@ -539,7 +552,14 @@ def action_dialogs(page):
     field.fill("stale queue edit")
     modal.get_by_role("button", name="Save").click()
     expect(modal).to_be_hidden()
-    assert page.evaluate("__interaction.calls.filter(x=>x.type==='edit_queued_if_current').length") == 2
+    assert len(calls(page, "edit_queued_if_current")) == 2
+
+    page.evaluate("__interaction.legacyQueued()")
+    edit.click()
+    expect(page.get_by_role("alert").filter(has_text="Update the daemon to edit queued messages safely.")).to_be_visible()
+    expect(modal).to_be_hidden()
+    assert len(calls(page, "edit_queued_if_current")) == 2
+    assert not calls(page, "edit_queued")
 
 
 CASES = {

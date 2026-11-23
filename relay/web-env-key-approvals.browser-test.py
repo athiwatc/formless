@@ -77,6 +77,7 @@ def check(page):
         ('MYSQL_PWD', 'session'),
         ('db_pwd', 'always'),
         ('PRIMARY_KEY_TOKEN', 'session'),
+        ('AUTHORIZATION', 'hour'),
         ('DATABASE_URL', 'session'),
         ('redis_url', 'hour'),
         ('MONGODB_URI', 'always'),

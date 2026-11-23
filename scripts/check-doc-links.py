@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check exact private-repository links without trusting lychee's repo-wide fallback."""
+"""Check exact private-repository links and public evidence links without trusting lychee's repo-wide fallback."""
+import base64
 import json
 import os
 import re
@@ -22,11 +23,13 @@ def api_get(endpoint, token):
     # Endpoints are constructed below, never taken as arbitrary input URLs.
     if not endpoint.startswith("/") and endpoint != "":
         raise ValueError("invalid API endpoint")
-    request = Request(API + endpoint, headers={
-        "Authorization": "Bearer " + token,
+    headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-    })
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = Request(API + endpoint, headers=headers)
     try:
         with build_opener(NoRedirects()).open(request, timeout=20) as response:
             return json.load(response)
@@ -110,6 +113,50 @@ def validate_repository_url(url, get):
     return "^" + re.escape(url) + "$"
 
 
+def public_repository_route(url):
+    """Return exact public API checks for pinned evidence links."""
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.query:
+        return None
+    prefix = "/" + REPOSITORY
+    if not parsed.path.startswith(prefix + "/"):
+        return None
+    path = parsed.path[len(prefix):]
+    if not parsed.fragment:
+        run = re.fullmatch(r"/actions/runs/([1-9][0-9]*)", path)
+        pull = re.fullmatch(r"/pull/([1-9][0-9]*)", path)
+        if run:
+            return path, None
+        if pull:
+            return "/pulls/" + pull[1], None
+    blob = re.fullmatch(r"/blob/([0-9a-f]{7,40})/([A-Za-z0-9._/-]+)", path)
+    line = re.fullmatch(r"L([1-9][0-9]{0,8})", parsed.fragment)
+    if blob and (line or not parsed.fragment) and all(
+            p not in ("", ".", "..") for p in blob[2].split("/")):
+        return "/contents/" + quote(blob[2], safe="/") + "?ref=" + blob[1], (int(line[1]) if line else 0)
+    return None
+
+
+def validate_public_repository_url(url, route, get):
+    endpoint, line = route
+    data = get(endpoint)
+    if not isinstance(data, dict) or data.get("html_url") != url.split("#", 1)[0]:
+        raise ValueError("public repository link identity mismatch")
+    if line is not None and data.get("type") != "file":
+        raise ValueError("public repository link must name a file")
+    if line:
+        if data.get("encoding") != "base64":
+            raise ValueError("public repository link must name a readable file")
+        try:
+            contents = base64.b64decode("".join(data["content"].split()), validate=True)
+        except (KeyError, ValueError, AttributeError):
+            raise ValueError("public repository file content unavailable") from None
+        lines = contents.count(b"\n") + bool(contents and not contents.endswith(b"\n"))
+        if line > lines:
+            raise ValueError("public repository link line is out of range")
+    return "^" + re.escape(url) + "$"
+
+
 def clean_environment():
     env = os.environ.copy()
     # Never pass authentication to the general URL checker or child processes.
@@ -127,7 +174,7 @@ def main(argv):
     if not token:
         raise ValueError("missing scoped GitHub token")
     env = clean_environment()
-    dumped = subprocess.run([binary, "--dump", *sources], env=env,
+    dumped = subprocess.run([binary, "--dump", "--include-fragments", *sources], env=env,
                             text=True, capture_output=True, check=True)
     private_urls = sorted({line.strip() for line in dumped.stdout.splitlines()
                            if is_repository_url(line.strip())})
@@ -136,10 +183,18 @@ def main(argv):
         if endpoint not in cache:
             cache[endpoint] = api_get(endpoint, token)
         return cache[endpoint]
+    public_cache = {}
+    def get_public(endpoint):
+        if endpoint not in public_cache:
+            public_cache[endpoint] = api_get(endpoint, None)
+        return public_cache[endpoint]
     exclusions = []
     for url in private_urls:
-        exclusions.extend(["--exclude", validate_repository_url(url, get)])
-    print("Validated " + str(len(private_urls)) + " exact private GitHub URLs.")
+        route = public_repository_route(url)
+        pattern = (validate_public_repository_url(url, route, get_public) if route
+                   else validate_repository_url(url, get))
+        exclusions.extend(["--exclude", pattern])
+    print("Validated " + str(len(private_urls)) + " exact repository GitHub URLs.")
     command = [binary, "--no-progress", "--include-fragments",
                "--accept", "200,206,429", "--max-retries", "2", "--timeout", "20",
                *exclusions, *sources]
