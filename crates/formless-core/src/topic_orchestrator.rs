@@ -1,5 +1,6 @@
 use super::*;
 use crate::local_harness::{self, HarnessRequest, HarnessResult, InteractionHandler};
+use formless_runtime::process_group::SupervisedProcess;
 use serde::Deserialize;
 #[cfg(unix)]
 use std::os::unix::{
@@ -921,16 +922,15 @@ impl Daemon {
                 let saved = self
                     .with_reader(|st| st.get_topic_attempt(attempt_id))?
                     .context("attempt vanished")?;
-                if cancelled
-                    || !matches!(
-                        saved.status,
-                        TopicAttemptStatus::Succeeded | TopicAttemptStatus::NeedsUser
-                    )
-                    || saved
+                let recoverable = match saved.status {
+                    TopicAttemptStatus::Succeeded => true,
+                    TopicAttemptStatus::NeedsUser => saved
                         .summary
                         .as_deref()
-                        .is_none_or(|summary| summary.trim().is_empty())
-                {
+                        .is_some_and(|summary| !summary.trim().is_empty()),
+                    _ => false,
+                };
+                if cancelled || !recoverable {
                     return Err(error);
                 }
                 tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after a validated topic report; daemon validation still required");
@@ -1207,19 +1207,27 @@ impl Daemon {
                 bail!("Git Write step did not leave a clean worktree");
             }
             let revision = head.context("Git Write step has no HEAD")?;
-            if Some(&revision) == base.as_ref() {
-                bail!("Git Write step did not create a new commit");
+            let needs_user_report = reported.status == TopicAttemptStatus::NeedsUser
+                && reported
+                    .summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.trim().is_empty());
+            if let Some(revision) = git_write_output_revision(
+                base.as_deref().context("missing worktree base")?,
+                revision,
+                needs_user_report,
+            )? {
+                git(
+                    workspace,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        base.as_deref().context("missing worktree base")?,
+                        &revision,
+                    ],
+                )?;
+                outputs.push(TopicArtifact::GitRevision { revision });
             }
-            git(
-                workspace,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    base.as_deref().context("missing worktree base")?,
-                    &revision,
-                ],
-            )?;
-            outputs.push(TopicArtifact::GitRevision { revision });
         }
         if step.access == StepAccess::Write && topic.workspace_kind == WorkspaceKind::Directory {
             let directory = workspace.canonicalize()?;
@@ -1262,20 +1270,14 @@ impl Daemon {
             }
             HarnessKind::Pi => bail!("Pi adapter not integrated yet; choose Claude or Codex"),
             HarnessKind::OpenCode => {
-                {
-                    let _launch = self.topic_launch.locked();
-                    self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
-                    if cancel.is_cancelled() || self.shutdown.is_cancelled() {
-                        bail!("step cancelled before launch");
-                    }
-                }
-                local_harness::run(request, handler, cancel).await
+                let spawn = self.topic_process_spawner(&attempt.id, token, || {});
+                local_harness::opencode::run_with_spawn(request, handler, cancel, spawn).await
             }
             HarnessKind::Antigravity => {
                 self.run_topic_acp(
                     attempt,
                     token,
-                    local_harness::antigravity::run,
+                    local_harness::antigravity::run_with_spawn,
                     request,
                     handler.as_ref(),
                     cancel,
@@ -1291,18 +1293,11 @@ impl Daemon {
         self: &Arc<Self>,
         attempt: &TopicAttemptInfo,
         token: &str,
-        adapter: local_harness::acp::Adapter,
+        adapter: local_harness::acp::GuardedAdapter,
         request: &HarnessRequest,
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
     ) -> Result<HarnessResult> {
-        {
-            let _launch = self.topic_launch.locked();
-            self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
-            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
-                bail!("step cancelled before launch");
-            }
-        }
         let run_cancel = cancel.child_token();
         let stop = run_cancel.clone();
         let shutdown = self.shutdown.clone();
@@ -1310,14 +1305,45 @@ impl Daemon {
             shutdown.cancelled().await;
             stop.cancel();
         });
-        let result =
-            local_harness::acp::run_interactive(adapter, request.clone(), handler, &run_cancel)
-                .await;
+        let spawn = self.topic_process_spawner(&attempt.id, token, || {});
+        let result = local_harness::acp::run_interactive_with_spawn(
+            adapter,
+            request.clone(),
+            handler,
+            &run_cancel,
+            spawn,
+        )
+        .await;
         watcher.abort();
         if self.shutdown.is_cancelled() {
             bail!("daemon is shutting down");
         }
         result
+    }
+
+    pub(super) fn topic_process_spawner<F>(
+        self: &Arc<Self>,
+        attempt_id: &str,
+        token: &str,
+        before_lock: F,
+    ) -> impl FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send + 'static
+    where
+        F: FnMut() + Send + 'static,
+    {
+        let daemon = self.clone();
+        let attempt_id = attempt_id.to_owned();
+        let token = token.to_owned();
+        let shutdown = self.shutdown.clone();
+        let mut before_lock = before_lock;
+        move |command, cancel| {
+            before_lock();
+            let _launch = daemon.topic_launch.locked();
+            daemon.with_reader(|st| st.authenticate_topic_attempt(&attempt_id, &token))?;
+            if cancel.is_cancelled() || shutdown.is_cancelled() {
+                bail!("step cancelled before launch");
+            }
+            SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+        }
     }
 
     async fn run_topic_cli(
@@ -1390,6 +1416,20 @@ impl Daemon {
         }
         local_harness::parse_output(request.kind, &stdout)
     }
+}
+
+fn git_write_output_revision(
+    base: &str,
+    revision: String,
+    needs_user_report: bool,
+) -> Result<Option<String>> {
+    if revision == base {
+        if needs_user_report {
+            return Ok(None);
+        }
+        bail!("Git Write step did not create a new commit");
+    }
+    Ok(Some(revision))
 }
 
 fn executable(name: &str) -> Result<Option<PathBuf>> {

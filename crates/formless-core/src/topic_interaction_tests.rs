@@ -299,6 +299,25 @@ async fn topic_needs_user_report_survives_acp_error_without_assistant_text() {
         .is_err());
 }
 
+#[tokio::test]
+async fn succeeded_topic_report_with_empty_summary_still_recovers() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = TopicFixture::new(&env);
+    f.daemon()
+        .with_store(|st| {
+            st.finish_topic_step(&f.attempt.id, TopicAttemptStatus::Succeeded, "", &[], None)
+        })
+        .unwrap();
+
+    let acp_error: anyhow::Result<crate::local_harness::HarnessResult> =
+        Err(anyhow::anyhow!("ACP ended without assistant text"));
+    let recovered = f
+        .daemon()
+        .accept_topic_harness_result(&f.attempt.id, acp_error, false)
+        .unwrap();
+    assert_eq!(recovered.message, "");
+}
+
 fn permission(always: bool) -> HarnessPermissionRequest {
     HarnessPermissionRequest {
         title: "Read invoices".into(),

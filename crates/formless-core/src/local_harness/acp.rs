@@ -184,6 +184,14 @@ impl PermissionHandler for Interactions<'_> {
 /// A blocking ACP adapter entry point such as `antigravity::run`.
 pub type Adapter =
     fn(&HarnessRequest, &mut dyn PermissionHandler, &CancellationToken) -> Result<HarnessResult>;
+pub type ProcessSpawner =
+    dyn FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send;
+pub type GuardedAdapter = fn(
+    &HarnessRequest,
+    &mut dyn PermissionHandler,
+    &CancellationToken,
+    &mut ProcessSpawner,
+) -> Result<HarnessResult>;
 
 /// Runs `adapter` on a blocking thread while `handler` answers its permission requests,
 /// questions and updates on the caller's task, so `handler` need not be `'static`.
@@ -205,6 +213,41 @@ pub async fn run_interactive(
             runtime,
         };
         adapter(&request, &mut interactions, &blocking_cancel)
+    });
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(ask) = asks.recv() => answer(handler, ask, &run_cancel).await,
+            result = &mut job => break result,
+        }
+    };
+    while let Ok(ask) = asks.try_recv() {
+        answer(handler, ask, &run_cancel).await;
+    }
+    result.map_err(|error| anyhow!("ACP adapter task failed: {error}"))?
+}
+
+pub async fn run_interactive_with_spawn<F>(
+    adapter: GuardedAdapter,
+    request: HarnessRequest,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+    mut spawn: F,
+) -> Result<HarnessResult>
+where
+    F: FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send + 'static,
+{
+    let (sender, mut asks) = tokio::sync::mpsc::unbounded_channel();
+    let run_cancel = cancel.child_token();
+    let blocking_cancel = run_cancel.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let mut job = tokio::task::spawn_blocking(move || {
+        let forward = Forward(sender);
+        let mut interactions = Interactions {
+            handler: &forward,
+            runtime,
+        };
+        adapter(&request, &mut interactions, &blocking_cancel, &mut spawn)
     });
     let result = loop {
         tokio::select! {
@@ -354,7 +397,20 @@ pub fn run(
     permissions: &mut dyn PermissionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
-    let mut agent = AgentProcess::spawn(spec, request)?;
+    let mut spawn = |command, _cancel: &CancellationToken| {
+        SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+    };
+    run_with_spawn(spec, request, permissions, cancel, &mut spawn)
+}
+
+pub fn run_with_spawn(
+    spec: &AgentSpec,
+    request: &HarnessRequest,
+    permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+    spawn: &mut ProcessSpawner,
+) -> Result<HarnessResult> {
+    let mut agent = AgentProcess::spawn_with(spec, request, cancel, spawn)?;
     let (reader, writer) = agent.pipes()?;
     drive(spec, reader, writer, request, permissions, cancel, true)
 }
@@ -530,6 +586,18 @@ pub(super) struct AgentProcess(SupervisedProcess);
 
 impl AgentProcess {
     pub(super) fn spawn(spec: &AgentSpec, request: &HarnessRequest) -> Result<Self> {
+        let mut spawn = |command, _cancel: &CancellationToken| {
+            SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+        };
+        Self::spawn_with(spec, request, &CancellationToken::new(), &mut spawn)
+    }
+
+    fn spawn_with(
+        spec: &AgentSpec,
+        request: &HarnessRequest,
+        cancel: &CancellationToken,
+        spawn: &mut ProcessSpawner,
+    ) -> Result<Self> {
         validate(request)?;
         let program = request
             .executable
@@ -558,7 +626,7 @@ impl AgentProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let process = SupervisedProcess::spawn(command).map_err(|error| {
+        let process = spawn(command, cancel).map_err(|error| {
             anyhow!(
                 "failed to start {} ({error}); is it installed and on PATH?",
                 spec.name

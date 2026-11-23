@@ -219,6 +219,21 @@ pub async fn run(
     interactions: Arc<dyn InteractionHandler>,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
+    let spawn = |command, _cancel: &CancellationToken| {
+        SupervisedProcess::spawn(command).map_err(anyhow::Error::msg)
+    };
+    run_with_spawn(request, interactions, cancel, spawn).await
+}
+
+pub(crate) async fn run_with_spawn<F>(
+    request: &HarnessRequest,
+    interactions: Arc<dyn InteractionHandler>,
+    cancel: &CancellationToken,
+    mut spawn: F,
+) -> Result<HarnessResult>
+where
+    F: FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send + 'static,
+{
     let request = prepare(request)?;
     let runtime = tokio::runtime::Handle::current();
     let cancel = cancel.child_token();
@@ -234,7 +249,7 @@ pub async fn run(
             handler: interactions.as_ref(),
             runtime,
         });
-        acp::run(&SPEC, &request, &mut permissions, &cancel)
+        acp::run_with_spawn(&SPEC, &request, &mut permissions, &cancel, &mut spawn)
     })
     .await
     .context("OpenCode ACP task failed")?

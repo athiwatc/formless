@@ -277,6 +277,36 @@ async fn cancelled_topic_attempt_does_not_spawn_opencode() {
     assert!(!f.root.join("opencode-started").exists());
 }
 
+#[test]
+fn cancellation_while_queued_on_launch_lock_prevents_actual_spawn() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let (attempt, token) = attempt(&f);
+    let daemon = f.daemon().clone();
+    let cancel = CancellationToken::new();
+    let marker = f.root.join("queued-spawn-marker");
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(format!("touch {}", marker.display()));
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let spawn_daemon = daemon.clone();
+    let lock_probe = daemon.clone();
+    let launch_guard = daemon.topic_launch.locked();
+    let attempt_id = attempt.id;
+    let spawn_cancel = cancel.clone();
+    let task = std::thread::spawn(move || {
+        let mut spawner = spawn_daemon.topic_process_spawner(&attempt_id, &token, move || {
+            assert!(lock_probe.topic_launch.try_lock().is_err());
+            ready_tx.send(()).unwrap();
+        });
+        spawner(command, &spawn_cancel)
+    });
+    ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    cancel.cancel();
+    drop(launch_guard);
+    assert!(task.join().unwrap().is_err());
+    assert!(!marker.exists());
+}
+
 struct RelativePathDirectory(PathBuf);
 
 impl Drop for RelativePathDirectory {

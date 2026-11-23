@@ -44,6 +44,15 @@ pub fn run(
     acp::run(&SPEC, request, permissions, cancel)
 }
 
+pub fn run_with_spawn(
+    request: &HarnessRequest,
+    permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+    spawn: &mut acp::ProcessSpawner,
+) -> Result<HarnessResult> {
+    acp::run_with_spawn(&SPEC, request, permissions, cancel, spawn)
+}
+
 /// Opens an `agy acp` session with the Formless bridge attached, without prompting.
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
     acp::open_session(&SPEC, request)

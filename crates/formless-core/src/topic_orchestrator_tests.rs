@@ -2,6 +2,7 @@
 use super::*;
 use crate::local_harness::HarnessUpdate;
 use axum::response::IntoResponse;
+use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     path::{Path, PathBuf},
@@ -38,6 +39,12 @@ if mode=='permission':
 if mode=='question':
     answer=rpc({'operation':'ask_user','questions':[{'question':'Use the user-approved accounting inputs?','options':[{'label':'Yes'},{'label':'No'}]}]})
     assert answer[0]['selected']==['Yes']
+if mode=='git_needs_user':
+    target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'needs-user.txt'
+    target.write_text('validated evidence')
+    outputs=[{'kind':'file','path':str(target),'sha256':hashlib.sha256(target.read_bytes()).hexdigest()}]
+    rpc({'operation':'report_result','status':'needs_user','summary':'Waiting for user confirmation','outputs':outputs})
+    sys.exit(9)
 if mode in ('report_nonzero','report_dirty_nonzero','report_valid_file_nonzero','report_mutated_file','report_mutated_directory','report_wrong_revision','report_workspace_replaced'):
     outputs=[]
     target=pathlib.Path(os.environ['FORMLESS_TOPIC_OUTPUTS_DIR'])/'reported'
@@ -2000,6 +2007,51 @@ async fn topic_git_writes_have_distinct_branches_and_explicit_merge_gets_both_re
         )
         .is_ok());
     }
+}
+
+#[tokio::test]
+async fn git_write_needs_user_report_with_unchanged_head_keeps_validated_outputs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "git_needs_user");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let repo = repository(&f);
+    let original_head = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let topic = topic(&f, Some(repo.clone()), true);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_ref().unwrap(),
+            &step(
+                &topic.features[0].id,
+                HarnessKind::Claude,
+                StepAccess::Write,
+                &[],
+            ),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "needs_user", "{result}");
+    assert_eq!(result["summary"], "Waiting for user confirmation");
+    let outputs: Vec<TopicArtifact> = serde_json::from_value(result["outputs"].clone()).unwrap();
+    assert_eq!(outputs.len(), 1);
+    let TopicArtifact::File { path, sha256 } = &outputs[0] else {
+        panic!("expected validated file output")
+    };
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(bytes, b"validated evidence");
+    assert_eq!(sha256, &format!("{:x}", Sha256::digest(&bytes)));
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]).unwrap(), original_head);
+    assert!(git(&repo, &["status", "--porcelain"]).unwrap().is_empty());
+    f.daemon().request_shutdown();
+    ipc.await.unwrap().unwrap();
 }
 
 #[tokio::test]
