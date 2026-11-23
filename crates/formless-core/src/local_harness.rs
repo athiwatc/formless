@@ -20,6 +20,7 @@ pub use readiness::{
     acp_probe, blocking_probe, claude_probe, codex_probe, harness_availability, list_harnesses,
     ProbeContext,
 };
+pub(crate) use readiness::harness_readiness;
 
 pub struct HarnessPermissionRequest {
     pub title: String,

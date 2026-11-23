@@ -1373,7 +1373,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_launch_uses_workspace_relative_path_before_global_fallback() {
+    fn unix_launch_uses_readiness_executable_over_workspace_relative_path() {
         use std::os::unix::fs::PermissionsExt;
 
         let process_cwd = std::env::current_dir().unwrap();
@@ -1427,9 +1427,10 @@ mod tests {
             "ACP_LAUNCH_MARKER_COMPLETE".into(),
             marker_complete.as_os_str().to_os_string(),
         );
+        request.executable = Some(std::fs::canonicalize(daemon_bin.join("gemini")).unwrap());
         assert_eq!(
             agent_program("gemini", &request, &BTreeMap::new(), false),
-            PathBuf::from("gemini")
+            request.executable.clone().unwrap()
         );
 
         let spec = crate::local_harness::acp_agents::spec("gemini").unwrap();
@@ -1444,7 +1445,7 @@ mod tests {
         );
         let selected = std::fs::read_to_string(&marker).unwrap();
         drop(agent);
-        assert_eq!(selected, "workspace");
+        assert_eq!(selected, "daemon");
 
         std::fs::remove_dir_all(&daemon_bin).unwrap();
         std::fs::remove_dir_all(&workspace).unwrap();

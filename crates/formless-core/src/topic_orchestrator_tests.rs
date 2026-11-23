@@ -3076,14 +3076,15 @@ while True:
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
 }
 
-fn gemini_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard, python: &Path) {
+fn gemini_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard, python: &Path) -> PathBuf {
     let path = f.root.join("fake-gemini-acp");
     std::fs::write(
         &path,
         r#"#!/usr/bin/env python3
 import sys,os,json,subprocess,pathlib
-assert sys.argv[1:]==['--acp'],sys.argv
+assert sys.argv[1:] in (['--acp'],['--acp','--approval-mode','plan']),sys.argv
 assert 'FORMLESS_TOPIC_CAPABILITY' not in os.environ
+with pathlib.Path(os.environ['TOPIC_FIXTURE_TRUSTED_STARTS']).open('a') as starts:starts.write('trusted\n')
 mode=os.environ.get('TOPIC_FIXTURE_MODE','allow')
 def send(message):sys.stdout.write(json.dumps(message)+'\n');sys.stdout.flush()
 def read():
@@ -3099,6 +3100,13 @@ while True:
         if servers:
             assert servers[0]['name']=='formless'
             assert any(item['name']=='FORMLESS_TOPIC_CAPABILITY' and item['value'] for item in servers[0]['env'])
+        else:
+            link=os.environ.get('TOPIC_FIXTURE_OVERRIDE_LINK')
+            if link:
+                pathlib.Path(link).unlink()
+                pathlib.Path(link).symlink_to(os.environ['TOPIC_FIXTURE_OVERRIDE_TARGET'])
+            selected=os.environ.get('TOPIC_FIXTURE_SELECTED_EXECUTABLE')
+            if selected:pathlib.Path(selected).unlink()
         send({'jsonrpc':'2.0','id':message['id'],'result':{'sessionId':'gemini-topic'}})
     elif method=='session/prompt':
         prompt=message['id']
@@ -3108,6 +3116,10 @@ while True:
             pathlib.Path(os.environ['TOPIC_FIXTURE_CHILD_PID']).write_text(str(child.pid))
             while read().get('method')!='session/cancel':pass
             send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'cancelled'}})
+            continue
+        if mode=='complete':
+            send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'gemini-topic','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Gemini fixture completed'}}}})
+            send({'jsonrpc':'2.0','id':prompt,'result':{'stopReason':'end_turn'}})
             continue
         send({'jsonrpc':'2.0','id':900,'method':'session/request_permission','params':{'sessionId':'gemini-topic','toolCall':{'toolCallId':'gemini-call','kind':'write','title':'Gemini fixture permission'},'options':[{'optionId':'allow','name':'Allow once','kind':'allow_once'},{'optionId':'deny','name':'Reject','kind':'reject_once'}]}})
         outcome=read()['result']['outcome']
@@ -3123,10 +3135,12 @@ while True:
     let bin = f.root.join("acp-bin");
     std::fs::create_dir(&bin).unwrap();
     std::os::unix::fs::symlink(python, bin.join("python3")).unwrap();
-    env.set("FORMLESS_TOPIC_ACP_EXE", &path);
     env.set("TOPIC_FIXTURE_PID", f.root.join("gemini-pid"));
     env.set("TOPIC_FIXTURE_CHILD_PID", f.root.join("gemini-child-pid"));
+    env.set("TOPIC_FIXTURE_TRUSTED_STARTS", f.root.join("gemini-starts"));
+    env.set("TOPIC_FIXTURE_DECOY_MARKER", f.root.join("gemini-decoy-started"));
     env.set("PATH", &bin);
+    path
 }
 
 fn pid_is_running(pid: i32) -> bool {
@@ -3144,6 +3158,214 @@ fn pid_is_running(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+struct CwdFixtureDir(PathBuf);
+
+impl Drop for CwdFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn add_workspace_gemini_decoy(repo: &Path, relative_bin: &Path) {
+    let bin = repo.join(relative_bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("gemini");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf 'decoy' > \"$TOPIC_FIXTURE_DECOY_MARKER\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let relative = relative_bin.join("gemini");
+    git(repo, &["add", relative.to_str().unwrap()]).unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "workspace ACP decoy",
+        ],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn topic_gemini_uses_daemon_resolved_executable_over_workspace_path_decoy() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set("TOPIC_FIXTURE_MODE", "complete");
+    env.set("TOPIC_FIXTURE_OVERRIDE_LINK", "");
+    env.set("TOPIC_FIXTURE_SELECTED_EXECUTABLE", "");
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let python = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let f = Fixture::new(&env);
+    let relative_root = PathBuf::from("target").join(f.root.file_name().unwrap());
+    let relative_bin = relative_root.join("bin");
+    let cwd_root = std::env::current_dir().unwrap().join(&relative_root);
+    let _cwd_fixture = CwdFixtureDir(cwd_root.clone());
+    std::fs::create_dir_all(cwd_root.join("bin")).unwrap();
+
+    let repo = repository(&f);
+    add_workspace_gemini_decoy(&repo, &relative_bin);
+    let executable = gemini_acp_script(&f, &env, &python);
+    std::os::unix::fs::symlink(&executable, cwd_root.join("bin/gemini")).unwrap();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set(
+        "TOPIC_FIXTURE_DECOY_MARKER",
+        f.root.join("gemini-decoy-started"),
+    );
+    env.set(
+        "PATH",
+        std::env::join_paths([
+            relative_bin,
+            python.parent().unwrap().to_path_buf(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap(),
+    );
+
+    let topic = topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::ReadOnly,
+        &[],
+    );
+    args["acp_agent"] = json!("gemini");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_deref().unwrap(),
+            &args,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("gemini-starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(!f.root.join("gemini-decoy-started").exists());
+}
+
+#[tokio::test]
+async fn topic_acp_missing_resolution_stops_before_launch_with_retry_guidance() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let empty_path = f.root.join("empty-path");
+    std::fs::create_dir(&empty_path).unwrap();
+    env.set("PATH", &empty_path);
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::Write,
+        &[],
+    );
+    args["acp_agent"] = json!("gemini");
+
+    let error = f
+        .daemon()
+        .run_topic_step(
+            topic.topic_session_id.as_deref().unwrap(),
+            &args,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not ready"), "{error}");
+    assert!(error.contains("topic_request_harness_substitute"), "{error}");
+    assert!(!f.root.join("gemini-starts").exists());
+}
+
+#[tokio::test]
+async fn topic_acp_removed_resolved_executable_does_not_fall_back_to_workspace_decoy() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "complete");
+    env.set("TOPIC_FIXTURE_OVERRIDE_LINK", "");
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let python = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let f = Fixture::new(&env);
+    let relative_bin = PathBuf::from("target")
+        .join(f.root.file_name().unwrap())
+        .join("bin");
+    let repo = repository(&f);
+    add_workspace_gemini_decoy(&repo, &relative_bin);
+    let executable = gemini_acp_script(&f, &env, &python);
+    env.set("FORMLESS_TOPIC_ACP_EXE", &executable);
+    env.set("TOPIC_FIXTURE_SELECTED_EXECUTABLE", &executable);
+    env.set(
+        "TOPIC_FIXTURE_DECOY_MARKER",
+        f.root.join("gemini-decoy-started"),
+    );
+    env.set(
+        "PATH",
+        std::env::join_paths([
+            relative_bin,
+            python.parent().unwrap().to_path_buf(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap(),
+    );
+    let topic = topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::ReadOnly,
+        &[],
+    );
+    args["acp_agent"] = json!("gemini");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_deref().unwrap(),
+            &args,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("gemini-starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!f.root.join("gemini-decoy-started").exists());
+}
+
 #[tokio::test]
 async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and_cancel() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -3156,8 +3378,26 @@ async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and
     let python = PathBuf::from(python.trim());
     for mode in ["allow", "hold"] {
         env.set("TOPIC_FIXTURE_MODE", mode);
+        env.set("TOPIC_FIXTURE_SELECTED_EXECUTABLE", "");
         let f = Fixture::new(&env);
-        gemini_acp_script(&f, &env, &python);
+        let executable = gemini_acp_script(&f, &env, &python);
+        if mode == "allow" {
+            let decoy = f.root.join("override-decoy");
+            std::fs::write(
+                &decoy,
+                "#!/bin/sh\\nprintf 'decoy' > \\\"$TOPIC_FIXTURE_DECOY_MARKER\\\"\\nexit 97\\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let override_link = f.root.join("gemini-override");
+            std::os::unix::fs::symlink(&executable, &override_link).unwrap();
+            env.set("TOPIC_FIXTURE_OVERRIDE_LINK", &override_link);
+            env.set("TOPIC_FIXTURE_OVERRIDE_TARGET", &decoy);
+            env.set("FORMLESS_TOPIC_ACP_EXE", &override_link);
+        } else {
+            env.set("TOPIC_FIXTURE_OVERRIDE_LINK", "");
+            env.set("FORMLESS_TOPIC_ACP_EXE", &executable);
+        }
         let topic = topic(&f, None, false);
         f.daemon()
             .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -3220,6 +3460,14 @@ async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and
             .unwrap()
             .contains("Gemini fixture completed"));
         assert!(f.daemon().harness_permissions.locked().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(f.root.join("gemini-starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert!(!f.root.join("gemini-decoy-started").exists());
     }
 }
 

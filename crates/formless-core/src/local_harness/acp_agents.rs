@@ -3,6 +3,7 @@
 mod availability;
 
 pub use availability::availability;
+pub(crate) use availability::availability_with_executable;
 
 use std::ffi::OsString;
 

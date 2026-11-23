@@ -16,6 +16,11 @@ pub struct ProbeContext {
     pub timeout: Duration,
 }
 
+pub(crate) struct HarnessReadiness {
+    pub availability: HarnessAvailability,
+    pub resolved_executable: Option<PathBuf>,
+}
+
 impl Default for ProbeContext {
     fn default() -> Self {
         Self {
@@ -295,6 +300,48 @@ where
     }
 }
 
+async fn acp_readiness(ctx: &ProbeContext, agent: &str) -> HarnessReadiness {
+    let executable = ctx
+        .environment
+        .get(std::ffi::OsStr::new("FORMLESS_TOPIC_ACP_EXE"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            (!ctx.executable.as_os_str().is_empty()).then(|| ctx.executable.clone())
+        });
+    let mut base = availability(HarnessKind::Acp, executable.as_deref());
+    base.acp_agent = Some(agent.into());
+    let id = agent.to_owned();
+    let environment = ctx.environment.clone();
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            super::acp_agents::availability_with_executable(
+                &id,
+                executable,
+                &environment,
+            )
+        }),
+    )
+    .await
+    {
+        Ok(Ok(result)) => HarnessReadiness {
+            availability: result.availability,
+            resolved_executable: result.executable,
+        },
+        Ok(Err(_)) => {
+            base.detail = Some("probe failed".into());
+            HarnessReadiness {
+                availability: base,
+                resolved_executable: None,
+            }
+        }
+        Err(_) => HarnessReadiness {
+            availability: timed_out(base),
+            resolved_executable: None,
+        },
+    }
+}
+
 async fn dispatch(
     kind: HarnessKind,
     ctx: &ProbeContext,
@@ -320,25 +367,7 @@ async fn dispatch(
                 value.detail = Some("ACP availability requires an acp_agent registry id.".into());
                 return value;
             };
-            let id = agent.to_owned();
-            let executable = ctx
-                .environment
-                .get(std::ffi::OsStr::new("FORMLESS_TOPIC_ACP_EXE"))
-                .map(PathBuf::from)
-                .or_else(|| {
-                    (!ctx.executable.as_os_str().is_empty()).then(|| ctx.executable.clone())
-                });
-            let mut value = blocking_probe(
-                kind,
-                executable,
-                ctx.environment.clone(),
-                move |executable, environment| {
-                    super::acp_agents::availability(&id, executable, environment)
-                },
-            )
-            .await;
-            value.acp_agent = Some(agent.into());
-            value
+            acp_readiness(ctx, agent).await.availability
         }
         HarnessKind::Muse => fallback_probe(kind, ctx).await,
     }
@@ -349,15 +378,33 @@ async fn probe_environment(
     environment: &BTreeMap<OsString, OsString>,
     timeout: Duration,
 ) -> HarnessAvailability {
+    probe_environment_with_identity(kind, agent, environment, timeout)
+        .await
+        .availability
+}
+
+async fn probe_environment_with_identity(
+    kind: HarnessKind,
+    agent: Option<&str>,
+    environment: &BTreeMap<OsString, OsString>,
+    timeout: Duration,
+) -> HarnessReadiness {
     let mut base = availability(kind, None);
     base.acp_agent = agent.map(str::to_owned);
     if kind == HarnessKind::Acp {
+        let Some(agent) = agent else {
+            base.detail = Some("ACP availability requires an acp_agent registry id.".into());
+            return HarnessReadiness {
+                availability: base,
+                resolved_executable: None,
+            };
+        };
         let ctx = ProbeContext {
             executable: PathBuf::new(),
             environment: environment.clone(),
             timeout,
         };
-        return dispatch(kind, &ctx, agent).await;
+        return acp_readiness(&ctx, agent).await;
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let lookup_environment = environment.clone();
@@ -369,7 +416,12 @@ async fn probe_environment(
     {
         Ok(Ok(path)) => path,
         Ok(Err(_)) => None,
-        Err(_) => return timed_out(base),
+        Err(_) => {
+            return HarnessReadiness {
+                availability: timed_out(base),
+                resolved_executable: None,
+            }
+        }
     };
     let Some(executable) = executable else {
         base.detail = Some(if kind == HarnessKind::Acp {
@@ -381,7 +433,10 @@ async fn probe_environment(
                 kind_name(kind).to_ascii_uppercase()
             )
         });
-        return base;
+        return HarnessReadiness {
+            availability: base,
+            resolved_executable: None,
+        };
     };
     base.installed = executable_file(&executable);
     let ctx = ProbeContext {
@@ -390,18 +445,32 @@ async fn probe_environment(
         timeout,
     };
     match tokio::time::timeout_at(deadline, dispatch(kind, &ctx, agent)).await {
-        Ok(value) => value,
-        Err(_) => timed_out(base),
+        Ok(value) => HarnessReadiness {
+            availability: value,
+            resolved_executable: None,
+        },
+        Err(_) => HarnessReadiness {
+            availability: timed_out(base),
+            resolved_executable: None,
+        },
     }
 }
-pub async fn harness_availability(kind: HarnessKind, agent: Option<&str>) -> HarnessAvailability {
-    probe_environment(
+
+pub(crate) async fn harness_readiness(
+    kind: HarnessKind,
+    agent: Option<&str>,
+) -> HarnessReadiness {
+    probe_environment_with_identity(
         kind,
         agent,
         &std::env::vars_os().collect(),
         Duration::from_secs(10),
     )
     .await
+}
+
+pub async fn harness_availability(kind: HarnessKind, agent: Option<&str>) -> HarnessAvailability {
+    harness_readiness(kind, agent).await.availability
 }
 async fn list_environment(
     environment: BTreeMap<OsString, OsString>,
