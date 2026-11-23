@@ -166,19 +166,46 @@ fn find_pi_executable_for_platform(
     windows: bool,
     require_executable: bool,
 ) -> Option<PathBuf> {
+    find_pi_executable_for_platform_in_cwd(program, search_path, windows, require_executable, None)
+}
+
+fn find_pi_executable_for_platform_in_cwd(
+    program: &Path,
+    search_path: Option<&OsStr>,
+    windows: bool,
+    require_executable: bool,
+    execution_cwd: Option<&Path>,
+) -> Option<PathBuf> {
     if program.as_os_str().is_empty() {
         return None;
     }
     if program.is_absolute() || program.components().count() > 1 {
-        return candidate_for_platform(program, windows, require_executable);
+        let program = resolve_candidate_path(program, execution_cwd);
+        return candidate_for_platform(&program, windows, require_executable);
     }
-    for directory in std::env::split_paths(search_path?) {
-        let path = directory.join(program);
+    let search_path = search_path?;
+    let directories: Vec<_> = if search_path.is_empty() {
+        vec![PathBuf::new()]
+    } else {
+        std::env::split_paths(search_path).collect()
+    };
+    for directory in directories {
+        let path = resolve_candidate_path(&directory.join(program), execution_cwd);
         if let Some(path) = candidate_for_platform(&path, windows, require_executable) {
             return Some(path);
         }
     }
     None
+}
+
+fn resolve_candidate_path(path: &Path, execution_cwd: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
+    } else if let Some(execution_cwd) = execution_cwd {
+        execution_cwd.join(path)
+    } else {
+        path.to_owned()
+    }
 }
 
 fn resolve_request_executable(
@@ -187,6 +214,7 @@ fn resolve_request_executable(
     process_override: Option<&OsStr>,
     search_path: Option<&OsStr>,
     request_path_overridden: bool,
+    execution_cwd: &Path,
     windows: bool,
     require_executable: bool,
 ) -> Result<PathBuf> {
@@ -194,9 +222,13 @@ fn resolve_request_executable(
         .or_else(|| request_override.map(Path::new))
         .or_else(|| process_override.map(Path::new))
         .unwrap_or_else(|| Path::new("pi"));
-    if let Some(resolved) =
-        find_pi_executable_for_platform(program, search_path, windows, require_executable)
-    {
+    if let Some(resolved) = find_pi_executable_for_platform_in_cwd(
+        program,
+        search_path,
+        windows,
+        require_executable,
+        Some(execution_cwd),
+    ) {
         return Ok(resolved);
     }
     if request_path_overridden && !program.is_absolute() && program.components().count() == 1 {
@@ -391,6 +423,11 @@ pub fn command_spec_with_extension(
         .map(OsString::as_os_str);
     let process_path = std::env::var_os("PATH");
     let process_override = std::env::var_os("FORMLESS_TOPIC_PI_EXE");
+    let execution_cwd = if request.cwd.is_absolute() {
+        request.cwd.clone()
+    } else {
+        std::env::current_dir()?.join(&request.cwd)
+    };
     let program = resolve_request_executable(
         request.executable.as_deref(),
         request
@@ -400,6 +437,7 @@ pub fn command_spec_with_extension(
         process_override.as_deref(),
         request_path.or(process_path.as_deref()),
         request_path.is_some(),
+        &execution_cwd,
         cfg!(windows),
         cfg!(unix),
     )?;
@@ -2213,6 +2251,7 @@ mod tests {
                 None,
                 Some(dir.as_os_str()),
                 true,
+                &dir,
                 true,
                 false,
             )
@@ -2246,6 +2285,7 @@ mod tests {
                 Some(exe.as_os_str()),
                 Some(dir.as_os_str()),
                 true,
+                &dir,
                 true,
                 false,
             )
@@ -2699,6 +2739,86 @@ mod tests {
         assert_eq!(spec.program, override_executable);
         fs::remove_dir_all(attempt_dir).unwrap();
         fs::remove_dir_all(bin_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_spec_resolves_relative_path_entries_from_attempt_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (attempt_dir, extension) = staged_extension();
+        let daemon_dir = temp_dir();
+        let daemon_bin = daemon_dir.join("bin");
+        let absolute_bin = temp_dir();
+        fs::create_dir_all(&daemon_bin).unwrap();
+        let daemon_pi = daemon_bin.join("pi");
+        let absolute_pi = absolute_bin.join("pi");
+        for path in [&daemon_pi, &absolute_pi] {
+            fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let search_path =
+            std::env::join_paths([OsString::from("bin"), absolute_bin.as_os_str().into()]).unwrap();
+        assert_eq!(
+            super::find_pi_executable_for_platform_in_cwd(
+                Path::new("pi"),
+                Some(&search_path),
+                false,
+                true,
+                Some(&daemon_dir),
+            ),
+            Some(daemon_pi)
+        );
+
+        let mut request = request(StepAccess::Write);
+        request.cwd = attempt_dir.clone();
+        request.executable = None;
+        request
+            .environment
+            .insert(OsString::from("PATH"), search_path);
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, absolute_pi);
+        fs::remove_dir_all(attempt_dir).unwrap();
+        fs::remove_dir_all(daemon_dir).unwrap();
+        fs::remove_dir_all(absolute_bin).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_spec_resolves_empty_and_relative_path_from_attempt_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (attempt_dir, extension) = staged_extension();
+        let current_pi = attempt_dir.join("pi");
+        let relative_bin = attempt_dir.join("relative-bin");
+        let relative_pi = relative_bin.join("pi");
+        fs::create_dir(&relative_bin).unwrap();
+        for path in [&current_pi, &relative_pi] {
+            fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let mut request = request(StepAccess::Write);
+        request.cwd = attempt_dir.clone();
+        request.executable = None;
+        request
+            .environment
+            .insert(OsString::from("PATH"), OsString::new());
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, current_pi);
+
+        request.executable = Some(PathBuf::from("relative-bin/pi"));
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, relative_pi);
+
+        request.executable = None;
+        request
+            .environment
+            .insert(OsString::from("PATH"), OsString::from("relative-bin"));
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, relative_pi);
+        fs::remove_dir_all(attempt_dir).unwrap();
     }
 
     #[test]
