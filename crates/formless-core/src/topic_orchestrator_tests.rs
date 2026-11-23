@@ -3486,10 +3486,7 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
 async fn topic_antigravity_missing_identity_fails_before_attempt_with_substitute_guidance() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
-    let empty_path = f.root.join("empty-path");
-    std::fs::create_dir_all(&empty_path).unwrap();
-    env.set("PATH", &empty_path);
-    env.remove("FORMLESS_TOPIC_ANTIGRAVITY_EXE");
+    env.set("FORMLESS_TOPIC_ANTIGRAVITY_EXE", f.root.join("missing-agy"));
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
