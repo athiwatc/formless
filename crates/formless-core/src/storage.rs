@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use formless_protocol::{
     MessageInfo, ModuleInfo, PromptProposalInfo, SearchHit, SessionInfo, SubagentInfo,
-    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
+    TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo, TopicAttemptInfo, TopicFeatureInfo,
+    TopicInfo,
 };
 use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -64,6 +65,13 @@ pub use runfile_storage::{
 
 #[path = "run_state_storage.rs"]
 mod run_state_storage;
+
+#[path = "topic_storage.rs"]
+mod topic_storage;
+
+#[cfg(test)]
+#[path = "topic_storage_tests.rs"]
+mod topic_storage_tests;
 
 #[path = "attachment_expiry.rs"]
 mod attachment_expiry;
@@ -794,7 +802,62 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 70;
+pub const SCHEMA_VERSION: i64 = 76;
+
+#[path = "topic_context.rs"]
+mod topic_context;
+
+#[path = "topic_schema_v72.rs"]
+mod topic_schema_v72;
+
+#[cfg(test)]
+#[path = "topic_schema_v72_tests.rs"]
+mod topic_schema_v72_tests;
+
+const SCHEMA_V71: &str = "
+CREATE TABLE IF NOT EXISTS profile_metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS topics (
+ id TEXT PRIMARY KEY,name TEXT NOT NULL,parent_topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
+ workspace TEXT,workspace_kind TEXT NOT NULL,
+ base_revision TEXT,outline TEXT NOT NULL DEFAULT '[]',
+ source_session_id TEXT NOT NULL,
+ topic_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,status TEXT NOT NULL,
+ redirect_message_id TEXT,rejection_reason TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topics_status_updated ON topics(status,updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_topics_parent ON topics(parent_topic_id);
+CREATE TABLE IF NOT EXISTS topic_repo_locks (
+ workspace TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,acquired_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS topic_source_messages (
+ topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,source_session_id TEXT NOT NULL,
+ message_id TEXT NOT NULL,source_seq INTEGER NOT NULL,source_content TEXT NOT NULL,
+ source_content_hash TEXT NOT NULL,moved_at TEXT,PRIMARY KEY(topic_id,message_id));
+CREATE TABLE IF NOT EXISTS topic_features (
+ id TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+ source_message_id TEXT NOT NULL,source_seq INTEGER NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,
+ active_attempt_id TEXT,outputs TEXT NOT NULL DEFAULT '[]',attempt_count INTEGER NOT NULL DEFAULT 0,
+ detail TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topic_features_status ON topic_features(topic_id,status,source_seq);
+CREATE TABLE IF NOT EXISTS topic_attempts (
+ id TEXT PRIMARY KEY,topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+ feature_id TEXT NOT NULL REFERENCES topic_features(id) ON DELETE CASCADE,step_title TEXT NOT NULL,
+ access TEXT NOT NULL,harness_kind TEXT NOT NULL,model TEXT,acp_agent TEXT,inputs TEXT NOT NULL DEFAULT '[]',
+ outputs TEXT NOT NULL DEFAULT '[]',summary TEXT,status TEXT NOT NULL,
+ conversation_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ capability_hash TEXT NOT NULL,worktree_path TEXT,outputs_dir TEXT,harness_session_id TEXT,child_pid INTEGER,
+ detail TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_topic_attempts_feature ON topic_attempts(feature_id,created_at);
+";
+
+fn migrate_v71(c: &Connection) -> Result<()> {
+    add_column(c, "sessions", "parent_session_id TEXT")?;
+    add_column(c, "sessions", "session_kind TEXT NOT NULL DEFAULT 'chat'")?;
+    add_column(c, "sessions", "topic_id TEXT")?;
+    add_column(c, "sessions", "topic_attempt_id TEXT")?;
+    add_column(c, "sessions", "harness_kind TEXT")?;
+    c.execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, session_kind);")?;
+    c.execute_batch(SCHEMA_V71)?;
+    Ok(())
+}
 
 fn unsupported_preview_schema(version: i64) -> bool {
     matches!(version, 68 | 69)
@@ -883,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 68] = [
+const MIGRATIONS: [(i64, MigrationStep); 74] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1214,6 +1277,22 @@ const MIGRATIONS: [(i64, MigrationStep); 68] = [
         add_column(c, "queued_messages", "position INTEGER")?;
         add_column(c, "queued_messages", "revision INTEGER NOT NULL DEFAULT 0")?;
         Ok(c.execute_batch("CREATE INDEX IF NOT EXISTS idx_queued_order ON queued_messages(session_id,COALESCE(position,id),id)")?)
+    }),
+    (71, migrate_v71),
+    (72, topic_schema_v72::migrate),
+    (73, |c| {
+        add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
+    }),
+    (74, |c| add_column(c, "messages", "generated_by TEXT")),
+    (75, |c| {
+        add_column(c, "topics", "permission_rules TEXT NOT NULL DEFAULT '[]'")
+    }),
+    (76, |c| {
+        add_column(
+            c,
+            "topics",
+            r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
+        )
     }),
 ];
 
@@ -1703,6 +1782,13 @@ impl Store {
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
         Ok(MessageInfo {
+            generated_by: r
+                .as_ref()
+                .column_index("generated_by")
+                .ok()
+                .map(|index| r.get::<_, Option<String>>(index))
+                .transpose()?
+                .flatten(),
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             seq: r.get("seq")?,
@@ -1986,13 +2072,36 @@ impl Store {
         Ok(rows)
     }
 
+    pub(crate) fn topic_session_family(&self, id: &str) -> Result<Vec<String>> {
+        let descendants = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE family(id) AS (SELECT ?1 UNION
+                 SELECT s.id FROM sessions s JOIN family f ON s.parent_session_id=f.id
+                 WHERE s.session_kind='topic_attempt' OR EXISTS(
+                   SELECT 1 FROM topics child JOIN topics parent ON child.parent_topic_id=parent.id
+                   WHERE child.topic_session_id=s.id AND parent.topic_session_id=f.id))
+                 SELECT id FROM family",
+            )?
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(descendants)
+    }
+
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         self.note_rewrite();
         self.transaction(|st| {
-            st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![id])?;
-            st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![id])?;
-            st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![id])?;
-            Ok(st.ex("DELETE FROM sessions WHERE id=?1", params![id])? > 0)
+            let descendants=st.topic_session_family(id)?;
+            let mut deleted=false;
+            for session_id in descendants {
+                st.ex("DELETE FROM topics WHERE source_session_id=?1 AND status IN ('pending_approval','rejected')",params![session_id])?;
+                st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
+                st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
+                st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;
+                let changed=st.ex("DELETE FROM sessions WHERE id=?1",params![session_id])?>0;
+                deleted|=session_id==id && changed;
+            }
+            Ok(deleted)
         })
     }
 
@@ -2076,6 +2185,16 @@ impl Store {
         content: &str,
         meta: Option<String>,
     ) -> Result<MessageInfo> {
+        self.append_message_generated(session_id, role, content, meta, None)
+    }
+    pub(crate) fn append_message_generated(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        meta: Option<String>,
+        generated_by: Option<&str>,
+    ) -> Result<MessageInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         // One write transaction, taken up front (IMMEDIATE): the next seq is
@@ -2085,14 +2204,15 @@ impl Store {
         let tx=&st.conn;
         let seq: i64 = tx
             .prepare_cached(
-                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
-                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6 FROM messages WHERE session_id=?2 \
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) \
+                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6, ?7 FROM messages WHERE session_id=?2 \
                  RETURNING seq",
             )?
-            .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
+            .query_row(params![id, session_id, role, content, t, meta,generated_by], |r| r.get(0))?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
         Ok(MessageInfo {
+            generated_by:generated_by.map(str::to_owned),
             id,
             session_id: session_id.into(),
             seq,
@@ -2290,6 +2410,7 @@ impl Store {
         name: Option<String>,
         up_to_seq: Option<i64>,
     ) -> Result<Option<SessionInfo>> {
+        self.ensure_topic_chat_writable(id)?;
         self.transaction(|st| st.fork_session_locked(id, name, up_to_seq))
     }
 
@@ -2323,7 +2444,7 @@ impl Store {
         let fork = self.create_session(Some(name))?;
         self.set_session_model(&fork.id, orig.model, orig.reasoning_effort)?;
         for message in messages {
-            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta])?;
+            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta,message.generated_by])?;
         }
         let complete = up_to_seq.is_none()
             || !self.conn.query_row(
@@ -2430,6 +2551,7 @@ impl Store {
         message_id: &str,
         content: &str,
     ) -> Result<Option<MessageInfo>> {
+        self.ensure_topic_chat_writable(session_id)?;
         let found = self.get_message(session_id, message_id)?;
         let Some(mut msg) = found else {
             return Ok(None);
@@ -2465,13 +2587,20 @@ impl Store {
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
+        self.transaction(|st|{
+        let topic:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1)",[session_id],|row|row.get(0))?;
+        if topic {st.abandon_resumable_runs(session_id)?;}
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.ex(
+        st.ex(
             "INSERT INTO runs(id,session_id,status,created_at,updated_at,start_message_id,start_message_seq) VALUES(?1,?2,'running',?3,?3,(SELECT id FROM messages WHERE session_id=?2 ORDER BY seq DESC,rowid DESC LIMIT 1),(SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?2))",
             params![id, session_id, t],
         )?;
         Ok(id)
+        })
+    }
+    pub(crate) fn abandon_resumable_runs(&self, session: &str) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE runs SET status='abandoned',updated_at=?2 WHERE session_id=?1 AND status IN ('paused','interrupted')",params![session,now()])?)
     }
     pub fn run_status(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self
@@ -6890,6 +7019,37 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?)
+    }
+
+    /// Paths of a Session's artifacts (to delete with it).
+    pub(crate) fn session_artifact_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id,path FROM artifacts WHERE session_id=?1")?
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn orphaned_artifact_records(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.conn.prepare("SELECT id,session_id FROM artifacts WHERE session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=artifacts.session_id)")?
+            .query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn artifact_reference_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id FROM sessions")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn session_references_artifact(
+        &self,
+        id: &str,
+        session: &str,
+        owner: &str,
+    ) -> Result<bool> {
+        crate::attachment_access::session_references_artifact(&self.conn, id, session, owner)
     }
 
     /// Paths of a Session's artifacts (to delete with it).

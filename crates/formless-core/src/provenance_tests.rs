@@ -301,6 +301,7 @@ async fn compaction_and_structured_systems_preserve_the_trust_boundary_on_the_wi
         "https://source.example/opaque?token=private",
     );
     let call = formless_protocol::MessageInfo {
+        generated_by: None,
         id: "call".into(),
         session_id: "session".into(),
         seq: 1,

@@ -3990,6 +3990,9 @@ mod tests {
 
     fn question(id: &str) -> formless_protocol::Event {
         Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
             question_id: id.into(),
             session_id: "a".into(),
             question: "Which option ไทย?".into(),
@@ -4090,6 +4093,7 @@ mod tests {
         engine.receive(ServerMessage::Event(event.clone())).unwrap();
         engine
             .receive(ServerMessage::Event(Event::UserQuestionClosed {
+                answered_by: None,
                 question_id: "q".into(),
             }))
             .unwrap();
@@ -5375,6 +5379,7 @@ mod tests {
 
     fn snapshot(id: &str, text: &str) -> Value {
         let message = MessageInfo {
+            generated_by: None,
             id: "m1".into(),
             session_id: id.into(),
             seq: 1,

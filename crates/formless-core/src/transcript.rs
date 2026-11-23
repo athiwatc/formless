@@ -312,6 +312,7 @@ mod tests {
 
     fn msg(role: &str, content: &str, meta: Option<&str>) -> MessageInfo {
         MessageInfo {
+            generated_by: None,
             id: String::new(),
             session_id: String::new(),
             seq: 0,

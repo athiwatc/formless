@@ -1,6 +1,7 @@
 """Local shipped-UI fixture support; no daemon, credentials or remote sources."""
 import functools
 import http.server
+import math
 from pathlib import Path
 import threading
 from playwright.sync_api import sync_playwright
@@ -49,28 +50,44 @@ def resize_and_settle(page, width, font):
             const root = document.documentElement;
             const viewport = window.visualViewport;
             return innerWidth === width && innerHeight === height
+                && document.fonts.status === "loaded"
                 && root.hasAttribute("data-visual-viewport")
                 && Math.abs(parseFloat(root.style.getPropertyValue("--app-viewport-width"))
                     - (viewport?.width ?? width)) < .01
                 && Math.abs(parseFloat(root.style.getPropertyValue("--app-viewport-height"))
                     - (viewport?.height ?? height)) < .01
+                && Math.abs(document.querySelector("#app").getBoundingClientRect().width - width) < 1
                 && parseFloat(getComputedStyle(root).fontSize) === font;
         }
     """, arg=[width, height, font])
 
+
+def tab_geometry(page):
+    return page.locator('#tabs').evaluate('''e=>{
+      const r=e.getBoundingClientRect();
+      const buttons=[...e.querySelectorAll('button')].map(b=>{
+        const r=b.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right};
+      });
+      const gap=parseFloat(getComputedStyle(e).columnGap) || 0;
+      return {client:e.clientWidth,scroll:e.scrollWidth,top:r.top,bottom:r.bottom,left:r.left,right:r.right,
+        required:buttons.reduce((sum,b)=>sum+b.right-b.left,0)+gap*(buttons.length-1),buttons};
+    }''')
 
 def check(page):
     page.set_default_timeout(5000)
     page.evaluate('__fixture.setup()')
     for width,font in [(320,16),(480,16),(320,32),(1200,16)]:
         resize_and_settle(page, width, font)
-        geometry=page.locator('#tabs').evaluate('''e=>{
-          const r=e.getBoundingClientRect();return {client:e.clientWidth,scroll:e.scrollWidth,top:r.top,bottom:r.bottom,left:r.left,right:r.right,
-            buttons:[...e.querySelectorAll('button')].map(b=>{const r=b.getBoundingClientRect();return {top:r.top,bottom:r.bottom,left:r.left,right:r.right};})};
-        }''')
+        geometry=tab_geometry(page)
+        if width==1200:
+            if geometry['required']>geometry['right']-geometry['left']:
+                width+=math.ceil(geometry['required'])
+                resize_and_settle(page,width,font)
+                geometry=tab_geometry(page)
+            assert geometry['required']<=geometry['right']-geometry['left'],('desktop fit precondition',width,font,geometry)
+            assert len({round(b['top']) for b in geometry['buttons']})==1,('fitting desktop stays one row',width,font,geometry)
         assert geometry['scroll']<=geometry['client']+1,(width,font,'no hidden horizontal tabs',geometry)
         assert all(b['left']>=geometry['left']-1 and b['right']<=geometry['right']+1 and b['top']>=geometry['top']-1 and b['bottom']<=geometry['bottom']+1 for b in geometry['buttons']),(width,font,geometry)
-        if width==1200: assert len({round(b['top']) for b in geometry['buttons']})==1,('fitting desktop stays one row',width,font,geometry)
     resize_and_settle(page, 320, 16)
     buttons=page.locator('#tabs button')
     for index in range(buttons.count()):

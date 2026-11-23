@@ -7009,3 +7009,257 @@ their existing precedence. The complete semantic-colour audit is recorded in
 The Metrics token-usage chart distinguishes cached, fresh and completion tokens
 with `░`, `▒` and `█` patterns and a legend. Colorblind and NO_COLOR views also
 show the component counts, so coincident palette colours carry no unique data.
+
+## Topic orchestration contract v2
+
+The daemon advertises `topic_orchestration_v2` in Ping. A human proposes selected
+messages with an optional workspace and an advisory outline (zero to twenty
+steps, each with a nonblank title, optional harness/model and ReadOnly or Write
+access). Features may decompose a single original request into independent work
+items. Approval moves each selected message once, preserves attachment
+provenance, and creates the canonical Topic Chat. Attempt conversations are
+read-only to chat clients; Topic Chat remains sendable.
+
+A clean Git workspace records its base commit. A non-Git directory uses the
+existing directory; an omitted workspace creates a private
+`<profile-data>/topic-workspaces/<topic-id>` directory at approval, not proposal.
+Each attempt has a child conversation and a private
+`<profile-data>/topic-attempts/<attempt-id>/outputs` directory. Results contain
+GitRevision, File (path and SHA-256), or Text artifacts, a summary and a
+succeeded/failed/needs_user status. The Formless orchestrator, not the outline or
+an individual harness, decides when a feature is complete. There are at most
+twelve attempts per work item.
+
+The scoped harness operations are ListConversations, ReadConversation,
+AppendConversation (own attempt only), ReadArtifact (input index), and
+ReportResult. Tokens are authenticated against the active attempt and topic;
+no approval, rejection, start, merge or push operation is exposed. File input
+reads return base64 content after scope, size and SHA-256 checks.
+
+CancelTopic cancels approved, running or needs-user work and releases its
+workspace lock. Pending proposals use RejectTopic instead. RetryTopicFeature
+resets only the selected feature to Pending and the topic to Approved; it does
+not start anything or move messages again. Start on a Running topic errors
+without changing it.
+
+StartTopicWorkflow claims the topic and sends a kickoff to a normal Formless
+model Run in Topic Chat. Its tool snapshot includes topic_run_step,
+topic_complete_feature and topic_fail_feature only for Running/NeedsUser topics.
+The outline is advisory; the model chooses each independent step. A normal
+Run end with open work yields NeedsUser; a Run error fails the topic. User
+messages resume normal model Runs. No merge or push is performed. Start
+failures persist detail, fail features and release the workspace lock.
+
+Git steps use private worktrees under profile data: Write branches from the
+latest feature revision (or the base); ReadOnly detaches at the exact selected
+input revision. A successful Write must produce a clean new descendant HEAD.
+Each attempt has a private staging directory, including Git attempts.
+Directory/Scratch steps use private directories with copied read-only file
+inputs. File/text outputs are reported through scoped MCP. A failed step is
+returned to the model without automatically failing the feature; it can choose
+another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+actionable adapter-not-integrated step results.
+
+CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
+on Unix (the direct child on Windows). The last launch check is serialized
+with cancellation. On restart live attempts become Abandoned and Running
+topics become NeedsUser, with durable detail and no automatic restart.
+
+The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
+It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
+`FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
+must never be included in prompts, argv or transcripts. The bridge exposes
+AskUser and RequestPermission in addition to the scoped conversation/artifact
+operations. RequestPermission only raises a user request; it cannot decide one.
+An undecided or cancelled permission is denied. The bridge uses the existing
+five-minute IPC request deadline; cancellation closes pending requests.
+
+Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
+its read-only sandbox. On every harness the isolated worktree/private outputs
+directory is the real boundary. Pi ReadOnly is tool-restricted (`--tools`
+allowlist); OpenCode ReadOnly is permission-restricted (agent rules). Neither
+Pi nor OpenCode has an OS sandbox. Harness-specific permissions are not an
+OS-level boundary, and permission denials must be retained in attempt output.
+
+Topics form an arbitrary hierarchy. An explicit `parent_topic_id` must name an
+existing topic that has been approved. Otherwise a proposal from an existing
+Topic Chat defaults to that topic as parent; other sources create roots.
+ListTopics includes all levels and their parent IDs. Cyclic parent chains are
+rejected. Permanent deletion/purge removes descendant topics and their canonical
+conversations; cancellation affects only the selected topic, not its children.
+Purging a source removes pending/rejected proposals, not approved topics.
+Source-owned attachments referenced by surviving moved topic messages are retained.
+
+Harness and topic-model conversation tools default to the topic branch: the
+topic and all ancestor Topic Chats and their attempt transcripts, not Main
+Chat, siblings or unrelated sessions. The user-only SetTopicContextAccess
+sets persisted allow_external_context (default false); opting in permits all
+non-deleted conversations. List/read/search share this scope. Search is a
+case-insensitive substring match returning at most 40 bounded snippets.
+
+The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
+in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
+are otherwise opaque until adapter integration. It is retained in advisory
+steps and attempt metadata.
+
+Harness questions reuse UserQuestion, AnswerQuestion and UserQuestionClosed on
+the canonical attempt conversation. Topic MCP AskUser and InteractionHandler
+ask_question accept 1–4 existing Question objects (labeled options and
+multi_select) and return an ordered optional list of QuestionAnswer; cancellation
+returns None. Pending questions and permissions pause their attempt and feature
+in NeedsUser and resume them when answered, without reviving terminal work.
+
+HarnessPermissionRequested/Closed and the user-only HarnessPermissionDecision
+request handle permissions. Only offered option IDs are accepted; None rejects.
+PendingApprovals and subscription attention replay include open permissions.
+No model tool or scoped MCP operation can decide a permission. Cancellation,
+attempt termination, shutdown and dropped interaction futures close undecided
+requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
+memory, scoped to the current attempt and the exact kind/title/input, never
+persisted. Adapters consume the adapter-agnostic local_harness InteractionHandler
+permission/question/update hooks; updates append structured canonical messages.
+
+The topic orchestrator may answer a pending harness question using
+`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
+or references the user's settling message/decision. Every model answer is
+visible in Topic Chat with the harness, attempt, questions, answers and basis.
+User-only questions cannot be answered by this tool. First answer wins.
+UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
+absent/null for cancellation or expiry.
+
+MessageInfo.generated_by is an optional typed canonical marker (serde default).
+Topic kickoff messages retain role=user for normal SendMessage admission, but
+are inserted atomically with generated_by="topic_kickoff". Transcript reads,
+events and forks preserve the marker. Both proposal and approval reject source
+messages with any generated_by value; generated instructions are not new user
+requests and cannot be moved as topic requests.
+
+Pending harness permissions and user-only questions also send a best-effort
+desktop notification through spawn_blocking. Notifications include the topic
+name, harness and redacted prompt title, never raw_input. Errors are ignored
+after logging. FORMLESS_TOPIC_NOTIFICATIONS=0 disables them; unit fixtures use
+an injected capture sink and never invoke OS notifications.
+
+topic_run_step launches asynchronously and returns {attempt_id,
+conversation_session_id}. Independent features can run concurrently; a feature
+still permits only one active step. topic_wait {attempt_ids?, timeout_secs?}
+waits for a finished attempt, a question or an informational permission notice.
+timeout_secs defaults to 600 and must be in 1..=600. An empty selection or no
+active work returns a snapshot immediately. Attempt IDs are scoped to this
+topic; completion and user-only informational notices are consumed once per
+Topic Chat daemon lifetime. Ordinary harness questions remain pending until
+answered. Cancellation and daemon shutdown unblock waits. There is no child
+model run. Normal model-run completion with open work marks NeedsUser and
+appends a durable "send a message to continue" note; harnesses may continue,
+but no model follow-up is started automatically. Run interruption/error
+cancels those steps.
+
+Topic permission rules are persisted and edited only by the user/client
+AddTopicPermissionRule and RemoveTopicPermissionRule requests, never MCP or
+model tools. Optional harness, ACP-agent and permission-kind filters are ANDed.
+Patterns are case-sensitive full-string globs (* any characters, ? one Unicode
+character); either the title or a string raw_input.command may match. Reject
+rules take precedence. Rules prefer the offered AllowOnce/RejectOnce option,
+falling back to the same polarity's Always option; an unavailable polarity
+falls through to the user. Each automatic decision emits requested and closed
+events (by="rule:<id>") and an attempt-transcript audit message. Unmatched
+permissions retain the normal prompt and away notification.
+The core rule-ineligible-kind denylist starts with trust_workspace: it always
+requires a fresh user decision, even with wildcard Reject rules or an earlier
+Always answer. Rule patterns contain 1..=1024 characters; a topic allows at
+most 256 saved rules.
+
+SetTopicLimits is a user/client-only persisted control. Defaults allow three
+retries after the first attempt of a feature+trimmed step title, and twenty
+attempts across a topic. Both values accept the full u32 range; zero retries
+still allows the first attempt, while zero total attempts blocks all launches.
+Caps are checked atomically at launch, including concurrent launches. Hitting
+a cap refuses launch, marks the topic and feature NeedsUser, and raises a
+user_only question: "Raise limit and continue" or "Stop". Model answers are
+rejected. Raising increments the hit cap by its default (3 or 20, saturating)
+and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
+a model or harness automatically. SetTopicLimits itself changes limits only.
+
+ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
+10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
+detail "probe timed out". A harness is ready iff installed and signed_in is
+not Some(false): unknown auth is ready. Planning receives fresh availability,
+and each step refreshes its selected harness before launching. Claude uses
+--version and auth status; Codex uses --version and login status. Neither sends
+a model turn, and no auth output is copied into detail or logs.
+
+CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
+the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
+and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
+and Muse have dedicated dispatch arms that look up the executable and run
+--version in a private cwd under the probe deadline, with kill-on-drop and
+process-group cleanup. Their auth remains unknown, including version failures.
+Adapter owners can replace those fallbacks
+with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+probe initializes and creates a session with no MCP servers in a private
+temporary cwd, never prompts, maps configured auth errors, and kills its
+process group on success, failure or timeout.
+Adapter blocking probes must enforce their own internal deadline and kill
+child processes on drop: core's outer timeout cannot abort spawn_blocking.
+Core does not own the ACP agent registry and omits the bare ACP entry from
+ListHarnesses; the ACP adapter's registry supplies per-agent entries.
+The per-kind probe dispatch receives the selected acp_agent id, including
+for its current executable-only fallback. ACP is a protocol, not a CLI.
+
+topic_request_harness_substitute raises a user_only question with "Sign in and
+retry", "Use <substitute>", and "Skip step". Model answers are rejected.
+Only a user's Use answer records an approval for that topic, feature and
+trimmed step title; the next successful launch consumes it. A request to run
+the wanted harness then uses the explicitly approved substitute, which must
+itself be ready. Formless never substitutes without that approval. Other
+answers and cancellation record no approval and start no work.
+Only the suggestion's optional model and acp_agent are used for a substitute;
+an omitted model selects the substitute's default, never the original model.
+
+Terminal topic transitions close pending limit/substitute decisions with
+UserQuestionClosed answered_by=None. Finalizing one feature also closes its
+own decisions while leaving sibling work alone. Closed decisions no longer
+keep the daemon busy or leave stale user prompts.
+
+Every step owns a private attempt area. Git Write uses a worktree on
+formless/topic/<topic>/<attempt>, starting at the first selected GitRevision
+or otherwise its feature's latest revision/base. ReadOnly Git is detached.
+Every selected revision is also exposed through a detached input worktree
+whose path and exact revision are in the harness prompt. Cleanup removes
+worktrees on completion, failure and cancel; attempt branches retain commits.
+No operation changes the source checkout or moves the user's branch.
+
+Directory Write and ReadOnly steps recursively copy the source into their
+private workspace; a selected Directory input becomes the starting copy.
+Copies skip .git and reject special files, absolute symlink targets and
+targets escaping the source tree. Containment follows symlinks in the longest
+existing target prefix before resolving the remaining nonexistent components;
+existing prefixes reached again through .. are resolved as well.
+Unresolvable existing links are rejected. Relative internal links are
+preserved as-is, including dangling links. File data copying
+runs off the async executor and checks cancellation. The attempt area must
+be outside the source tree to avoid recursive/self-copying. Scratch steps
+get an empty private workspace. Directory Write automatically reports a
+Directory artifact pointing at its retained attempt workspace.
+
+Inputs may reference exact finalized artifacts from any feature of this
+topic. Every Directory input is copied to a distinct private input path;
+every File is copied and SHA-256 checked, and text inputs remain inline.
+Harness-reported directories must be inside that attempt's private outputs.
+Concurrent workflows and Write steps may share a source workspace because
+the old exclusive source-workspace lock is no longer acquired. Per-attempt
+leases/cancel tokens remain live through validation and are released on stop.
+Harness-process and adapter errors after a successful report are logged and
+ignored at the adapter boundary. Daemon validation always runs afterward:
+dirty worktrees, HEAD/reported-revision mismatches, changed file hashes and
+invalid Directory outputs fail the attempt and discard its provisional outputs.
+Only validated outputs are published to the feature. Cancelled and Abandoned
+attempts are never overwritten. CLI exit still releases the
+active-attempt gate before explicit feature completion is allowed. A feature's
+successful terminal state is Ready, reached through topic_complete_feature,
+not automatically through report_result.
+Combining outputs is explicit work in a later isolated step, never an
+automatic merge or push into the source workspace.
