@@ -19,6 +19,7 @@ pub struct ProbeContext {
 pub(crate) struct HarnessReadiness {
     pub availability: HarnessAvailability,
     pub resolved_executable: Option<PathBuf>,
+    pub resolved_executable_argv0: Option<OsString>,
 }
 
 impl Default for ProbeContext {
@@ -321,17 +322,20 @@ async fn acp_readiness(ctx: &ProbeContext, agent: &str) -> HarnessReadiness {
         Ok(Ok(result)) => HarnessReadiness {
             availability: result.availability,
             resolved_executable: result.executable,
+            resolved_executable_argv0: result.executable_argv0,
         },
         Ok(Err(_)) => {
             base.detail = Some("probe failed".into());
             HarnessReadiness {
                 availability: base,
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             }
         }
         Err(_) => HarnessReadiness {
             availability: timed_out(base),
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
     }
 }
@@ -391,6 +395,7 @@ async fn probe_environment_with_identity(
             return HarnessReadiness {
                 availability: base,
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             };
         };
         let ctx = ProbeContext {
@@ -414,6 +419,7 @@ async fn probe_environment_with_identity(
             return HarnessReadiness {
                 availability: timed_out(base),
                 resolved_executable: None,
+                resolved_executable_argv0: None,
             }
         }
     };
@@ -430,6 +436,7 @@ async fn probe_environment_with_identity(
         return HarnessReadiness {
             availability: base,
             resolved_executable: None,
+            resolved_executable_argv0: None,
         };
     };
     base.installed = executable_file(&executable);
@@ -442,10 +449,12 @@ async fn probe_environment_with_identity(
         Ok(value) => HarnessReadiness {
             availability: value,
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
         Err(_) => HarnessReadiness {
             availability: timed_out(base),
             resolved_executable: None,
+            resolved_executable_argv0: None,
         },
     }
 }

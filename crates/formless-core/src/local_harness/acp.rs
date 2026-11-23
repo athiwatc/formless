@@ -417,6 +417,7 @@ pub fn probe(
         mcp_env_vars: vec![],
         cwd,
         executable,
+        executable_argv0: None,
         environment: environment.clone(),
     };
     let mut agent = match AgentProcess::spawn(spec, &request) {
@@ -669,6 +670,11 @@ impl AgentProcess {
         let process_environment = std::env::vars_os().collect();
         let program = agent_program(spec.program, request, &process_environment, cfg!(windows));
         let mut command = Command::new(&program);
+        #[cfg(unix)]
+        if let Some(argv0) = &request.executable_argv0 {
+            use std::os::unix::process::CommandExt;
+            command.arg0(argv0);
+        }
         command
             .args((spec.args)(request))
             .current_dir(&request.cwd)
@@ -1291,6 +1297,86 @@ mod tests {
     use crate::local_harness::HarnessKind;
     use std::io::Cursor;
 
+    #[cfg(unix)]
+    #[test]
+    fn native_executable_receives_selected_invocation_argv0() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!(
+            "formless-acp-argv0-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("argv0.c");
+        let executable = root.join("native-shim");
+        let selected = root.join("gemini");
+        let marker = root.join("argv0");
+        let done = root.join("argv0-done");
+        std::fs::write(
+            &source,
+            "#include <stdio.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { FILE *f = fopen(getenv(\"ARGV0_MARKER\"), \"w\"); if (!f) return 2; fputs(argv[0], f); fclose(f); f = fopen(getenv(\"ARGV0_DONE\"), \"w\"); if (!f) return 3; fclose(f); return 0; }\n",
+        )
+        .unwrap();
+        let compiled = Command::new("cc")
+            .args(["-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        std::os::unix::fs::symlink(&executable, &selected).unwrap();
+        let environment = BTreeMap::from([
+            ("ARGV0_MARKER".into(), marker.as_os_str().to_os_string()),
+            ("ARGV0_DONE".into(), done.as_os_str().to_os_string()),
+        ]);
+        let readiness = super::super::acp_agents::availability_with_executable(
+            "gemini",
+            Some(selected.clone()),
+            &environment,
+        );
+        let canonical = std::fs::canonicalize(&executable).unwrap();
+        assert_eq!(readiness.executable.as_deref(), Some(canonical.as_path()));
+        assert_eq!(
+            readiness.executable_argv0.as_deref(),
+            Some(selected.as_os_str())
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            done.exists(),
+            "native readiness shim did not finish writing"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            selected.to_string_lossy()
+        );
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(&done).unwrap();
+        let mut request = request(StepAccess::Write);
+        request.cwd = root.clone();
+        request.executable = readiness.executable;
+        request.executable_argv0 = readiness.executable_argv0;
+        request.environment.extend(environment);
+        let _agent = AgentProcess::spawn(&SPEC, &request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done.exists(), "native launch shim did not finish writing");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            selected.to_string_lossy()
+        );
+        drop(_agent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Captured from the released `agy acp` 1.5.14 `initialize` response (live, unauthenticated).
     const LIVE_INITIALIZE: &str = r#"{"jsonrpc":"2.0","result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true,"audio":false,"embeddedContext":true},"sessionCapabilities":{"resume":{},"close":{},"load":{},"list":{},"additionalDirectories":{}}},"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"},"authMethods":[{"id":"oauth-personal","name":"Log in with Google"}]},"id":1}"#;
     // Captured from the released `agy acp` 1.5.14 `session/new` response without a sign-in.
@@ -1312,6 +1398,7 @@ mod tests {
             mcp_args: vec!["mcp".into(), "--run".into(), "run-7".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::from([
                 ("FORMLESS_TOPIC_CAPABILITY".into(), "cap-secret".into()),
                 ("HOME".into(), "/home/user".into()),

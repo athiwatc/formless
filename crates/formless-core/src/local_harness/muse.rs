@@ -961,6 +961,7 @@ mod tests {
             mcp_args: vec!["mcp".into()],
             mcp_env_vars: vec!["FORMLESS_FIXTURE_TOKEN".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::from([(
                 "FORMLESS_FIXTURE_TOKEN".into(),
                 "fixture secret".into(),

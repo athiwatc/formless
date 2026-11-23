@@ -32,6 +32,7 @@ fn request(access: StepAccess) -> HarnessRequest {
         mcp_args: vec!["mcp".into()],
         mcp_env_vars: vec![],
         executable: None,
+        executable_argv0: None,
         environment: BTreeMap::new(),
     }
 }

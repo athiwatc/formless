@@ -71,6 +71,7 @@ pub struct HarnessRequest {
     pub mcp_args: Vec<String>,
     pub mcp_env_vars: Vec<String>,
     pub executable: Option<PathBuf>,
+    pub executable_argv0: Option<OsString>,
     pub environment: BTreeMap<OsString, OsString>,
 }
 
@@ -443,6 +444,7 @@ mod tests {
             ],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: Some(PathBuf::from("/opt/test/harness")),
+            executable_argv0: None,
             environment: BTreeMap::new(),
         }
     }
@@ -610,6 +612,7 @@ mod access_tests {
                 mcp_args: vec![],
                 mcp_env_vars: vec![],
                 executable: None,
+                executable_argv0: None,
                 environment: BTreeMap::new(),
             };
             if matches!(kind, HarnessKind::Claude | HarnessKind::Codex) {
@@ -657,6 +660,7 @@ mod access_tests {
             mcp_args: vec![],
             mcp_env_vars: vec![],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::new(),
         };
         assert!(command_spec(&antigravity)

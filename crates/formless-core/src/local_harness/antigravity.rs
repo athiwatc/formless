@@ -508,6 +508,7 @@ sleep 5
             mcp_args: vec!["mcp-argument-secret".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: Some(PathBuf::from("/secret/agy")),
+            executable_argv0: None,
             environment: BTreeMap::<OsString, OsString>::new(),
         }
     }

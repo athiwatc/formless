@@ -663,6 +663,7 @@ impl Daemon {
             local_harness::harness_readiness(step.harness, step.acp_agent.as_deref()).await;
         let availability = readiness.availability;
         let resolved_acp_executable = readiness.resolved_executable;
+        let resolved_acp_executable_argv0 = readiness.resolved_executable_argv0;
         let missing_acp_executable =
             step.harness == HarnessKind::Acp && resolved_acp_executable.is_none();
         if !availability.installed
@@ -802,6 +803,7 @@ impl Daemon {
                 step_cancel,
                 run_cancel,
                 resolved_acp_executable,
+                resolved_acp_executable_argv0,
             ))
             .catch_unwind()
             .await;
@@ -839,6 +841,7 @@ impl Daemon {
         step_cancel: CancellationToken,
         cancel: CancellationToken,
         resolved_acp_executable: Option<PathBuf>,
+        resolved_acp_executable_argv0: Option<OsString>,
     ) -> Result<()> {
         let feature = topic
             .features
@@ -859,6 +862,7 @@ impl Daemon {
                 handler.as_ref(),
                 &step_cancel,
                 resolved_acp_executable.as_deref(),
+                resolved_acp_executable_argv0.as_deref(),
             );
             tokio::pin!(execution);
             let execution = tokio::select! {
@@ -966,6 +970,7 @@ impl Daemon {
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
         resolved_acp_executable: Option<&Path>,
+        resolved_acp_executable_argv0: Option<&std::ffi::OsStr>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
         let mut extra_worktrees = Vec::new();
@@ -1157,6 +1162,11 @@ impl Daemon {
                 ),
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
+            },
+            executable_argv0: if step.harness == HarnessKind::Acp {
+                resolved_acp_executable_argv0.map(|value| value.to_os_string())
+            } else {
+                None
             },
             environment: BTreeMap::from([
                 (CAPABILITY.into(), OsString::from(token)),
