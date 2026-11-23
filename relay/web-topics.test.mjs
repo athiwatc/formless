@@ -254,6 +254,38 @@ test('permissions preserve native choices, require exact explicit decisions, and
   assert.equal(c.S.approvals.length, 0);
 });
 
+test('full live permission envelopes dispatch across sessions without confusing permission and envelope kinds', () => {
+  let renders = 0;
+  const c = setup(['onMessage', 'onEvent', 'addApproval'], {
+    branchSummaryEvent() {}, notifyFor() {}, scheduleEventRender() {},
+    renderApproval() { renders++; }
+  });
+  c.S.approvals = [];
+  c.S.sessionSnapshot = { events: [] };
+  const event = JSON.parse('{"kind":"event","type":"harness_permission_requested","permission_id":"p","session_id":"transcript","topic_id":"topic","attempt_id":"a","harness":"claude","title":"Write file?","permission_kind":"write","raw_input":{"command":"write file"},"options":[{"option_id":"native-allow","name":"Allow once","kind":"allow_once"},{"option_id":"native-deny","name":"Reject once","kind":"reject_once"}]}');
+  c.onMessage(event);
+  assert.equal(renders, 1, 'live request renders while Main Chat is open');
+  assert.equal(c.S.approvals.length, 1);
+  assert.equal(c.S.approvals[0].kind, 'harness');
+  assert.equal(c.S.approvals[0].permissionKind, 'write', 'outer event kind is never the permission label');
+  assert.deepEqual(json(c.S.approvals[0].options), event.options);
+  assert.deepEqual(json(c.S.sessionSnapshot.events), [event], 'racing session loads retain the event');
+  c.onMessage(JSON.parse('{"kind":"event","type":"harness_permission_closed","permission_id":"p","option_id":"native-deny","by":null}'));
+  assert.equal(c.S.approvals.length, 0, 'live closure removes the prompt across sessions');
+});
+
+test('permission snapshots accept corrected and legacy nested kind fields', () => {
+  const c = setup(['applySessionLiveState', 'addApproval'], { showQuestion() {}, renderApproval() {}, renderStatus() {}, cancelAsk() {} });
+  c.S.approvals = []; c.S.running = new Set(); c.S.questions = [];
+  for (const field of ['permission_kind', 'kind']) {
+    const event = { type: 'harness_permission_requested', permission_id: 'p', session_id: 'transcript', [field]: 'write', options: [] };
+    c.applySessionLiveState('main', { running: false, pending_events: [event] }, []);
+    assert.equal(c.S.approvals[0].permissionKind, 'write', field);
+    c.applySessionLiveState('main', { running: false, pending_events: [] }, []);
+    assert.equal(c.S.approvals.length, 0, 'authoritative empty snapshot clears the request');
+  }
+});
+
 test('permission failures stay pending and old-connection results cannot remove reconnected requests', async () => {
   const wait = defer();
   const c = setup(['decideHarnessPermission'], { renderApproval() {}, renderStatus() {}, request: async () => { throw new Error('offline'); } });

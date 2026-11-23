@@ -7856,7 +7856,7 @@
       detail: ev.detail || null, context: ev.context || null, summary: ev.summary, already: ev.already_allowed || [],
       code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
       topic_id: ev.topic_id, attempt_id: ev.attempt_id, harness: ev.harness, acp_agent: ev.acp_agent,
-      title: ev.title, permissionKind: ev.kind, raw_input: ev.raw_input, options: ev.options || [],
+      title: ev.title, permissionKind: ev.permission_kind ?? ev.kind, raw_input: ev.raw_input, options: ev.options || [],
       pathOptions: ev.path_options || [], picks: {} });
   }
   function clearQuestions() {
