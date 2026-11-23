@@ -102,48 +102,129 @@ async fn availability_with_path(
 }
 
 fn find_pi_executable(program: &Path, search_path: Option<&OsStr>) -> Option<PathBuf> {
-    fn candidate(path: &Path) -> Option<PathBuf> {
-        #[cfg(windows)]
-        if path.extension().is_none() {
-            if let Some(path) = candidate(&path.with_extension("exe")) {
-                return Some(path);
-            }
-        }
-        if !path.is_file() {
+    find_pi_executable_for_platform(program, search_path, cfg!(windows), cfg!(unix))
+}
+
+fn candidate_file(path: &Path, require_executable: bool) -> Option<PathBuf> {
+    #[cfg(not(unix))]
+    let _ = require_executable;
+    if !path.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    if require_executable {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        if unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) }
+            != 0
+        {
             return None;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-            if unsafe {
-                libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
-            } != 0
+    }
+    Some(path.to_owned())
+}
+
+fn candidate_for_platform(path: &Path, windows: bool, require_executable: bool) -> Option<PathBuf> {
+    if windows && path.extension().is_none() {
+        for extension in ["exe", "cmd", "bat"] {
+            if let Some(candidate) =
+                candidate_file(&path.with_extension(extension), require_executable)
             {
-                return None;
+                return Some(candidate);
             }
         }
-        Some(path.to_owned())
     }
+    candidate_file(path, require_executable)
+}
 
+fn find_pi_executable_for_platform(
+    program: &Path,
+    search_path: Option<&OsStr>,
+    windows: bool,
+    require_executable: bool,
+) -> Option<PathBuf> {
     if program.as_os_str().is_empty() {
         return None;
     }
     if program.is_absolute() || program.components().count() > 1 {
-        return candidate(program);
+        return candidate_for_platform(program, windows, require_executable);
     }
     for directory in std::env::split_paths(search_path?) {
         let path = directory.join(program);
-        if let Some(path) = candidate(&path) {
+        if let Some(path) = candidate_for_platform(&path, windows, require_executable) {
             return Some(path);
         }
     }
     None
 }
 
+fn resolve_request_executable(
+    executable: Option<&Path>,
+    request_override: Option<&OsStr>,
+    process_override: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+    request_path_overridden: bool,
+    windows: bool,
+    require_executable: bool,
+) -> Result<PathBuf> {
+    let program = executable
+        .or_else(|| request_override.map(Path::new))
+        .or_else(|| process_override.map(Path::new))
+        .unwrap_or_else(|| Path::new("pi"));
+    if let Some(resolved) =
+        find_pi_executable_for_platform(program, search_path, windows, require_executable)
+    {
+        return Ok(resolved);
+    }
+    if request_path_overridden && !program.is_absolute() && program.components().count() == 1 {
+        bail!("Pi executable was not found in the request PATH");
+    }
+    Ok(program.to_owned())
+}
+
+fn is_batch_executable(program: &Path) -> bool {
+    program.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "cmd" | "bat"
+        )
+    })
+}
+
+fn command_parts_for_platform(
+    program: &Path,
+    args: &[OsString],
+    command_processor: Option<&OsStr>,
+    windows: bool,
+) -> (PathBuf, Vec<OsString>) {
+    if !windows || !is_batch_executable(program) {
+        return (program.to_owned(), args.to_vec());
+    }
+    let mut command_args = vec![
+        OsString::from("/d"),
+        OsString::from("/c"),
+        OsString::from("call"),
+        program.as_os_str().to_owned(),
+    ];
+    command_args.extend_from_slice(args);
+    (
+        command_processor
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd.exe")),
+        command_args,
+    )
+}
+
 async fn probe_version(executable: &Path) -> std::result::Result<String, &'static str> {
-    let mut child = tokio::process::Command::new(executable)
-        .arg("--version")
+    let command_processor = std::env::var_os("COMSPEC");
+    let (program, args) = command_parts_for_platform(
+        executable,
+        &[OsString::from("--version")],
+        command_processor.as_deref(),
+        cfg!(windows),
+    );
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -321,11 +402,34 @@ pub fn command_spec_with_extension(
 
     let mut environment = request.environment.clone();
     environment.insert(OsString::from(MCP_CONFIG_ENV), OsString::from(mcp_config));
+    let request_path = request
+        .environment
+        .get(OsStr::new("PATH"))
+        .map(OsString::as_os_str);
+    let process_path = std::env::var_os("PATH");
+    let process_override = std::env::var_os("FORMLESS_TOPIC_PI_EXE");
+    let program = resolve_request_executable(
+        request.executable.as_deref(),
+        request
+            .environment
+            .get(OsStr::new("FORMLESS_TOPIC_PI_EXE"))
+            .map(OsString::as_os_str),
+        process_override.as_deref(),
+        request_path.or(process_path.as_deref()),
+        request_path.is_some(),
+        cfg!(windows),
+        cfg!(unix),
+    )?;
+    let process_command = std::env::var_os("COMSPEC");
+    let command_processor = request
+        .environment
+        .get(OsStr::new("COMSPEC"))
+        .map(OsString::as_os_str)
+        .or(process_command.as_deref());
+    let (program, args) =
+        command_parts_for_platform(&program, &args, command_processor, cfg!(windows));
     Ok(CommandSpec {
-        program: request
-            .executable
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("pi")),
+        program,
         args,
         cwd: request.cwd.clone(),
         environment,
@@ -1885,25 +1989,123 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn executable_lookup_windows_explicit_extensionless_path() {
+    fn windows_executable_resolution_uses_exe_then_batch_and_request_path() {
         let dir = temp_dir();
         let extensionless = dir.join("pi");
         let exe = dir.join("pi.exe");
         let cmd = dir.join("pi.cmd");
+        let bat = dir.join("pi.bat");
         fs::write(&cmd, "@exit /b 0\r\n").unwrap();
-        assert_eq!(super::find_pi_executable(&extensionless, None), None);
-        assert_eq!(super::find_pi_executable(&cmd, None), Some(cmd));
+        assert_eq!(
+            super::find_pi_executable_for_platform(&extensionless, None, true, false),
+            Some(cmd.clone())
+        );
+        assert_eq!(
+            super::find_pi_executable_for_platform(Path::new("pi"), Some(dir.as_os_str()), true, false),
+            Some(cmd.clone())
+        );
+        assert_eq!(
+            super::resolve_request_executable(
+                None,
+                None,
+                None,
+                Some(dir.as_os_str()),
+                true,
+                true,
+                false,
+            )
+            .unwrap(),
+            cmd.clone()
+        );
+        assert_eq!(
+            super::find_pi_executable_for_platform(&cmd, None, true, false),
+            Some(cmd.clone())
+        );
         fs::write(&exe, "lookup fixture").unwrap();
         assert_eq!(
-            super::find_pi_executable(&extensionless, None),
+            super::find_pi_executable_for_platform(&extensionless, None, true, false),
             Some(exe.clone())
         );
         assert_eq!(
-            super::find_pi_executable(Path::new("pi"), Some(dir.as_os_str())),
-            Some(exe)
+            super::find_pi_executable_for_platform(
+                Path::new("pi"),
+                Some(dir.as_os_str()),
+                true,
+                false
+            ),
+            Some(exe.clone())
         );
+        let request_override = dir.join("override.cmd");
+        fs::write(&request_override, "@exit /b 0\r\n").unwrap();
+        assert_eq!(
+            super::resolve_request_executable(
+                None,
+                Some(request_override.as_os_str()),
+                Some(exe.as_os_str()),
+                Some(dir.as_os_str()),
+                true,
+                true,
+                false,
+            )
+            .unwrap(),
+            request_override
+        );
+        fs::remove_file(cmd).unwrap();
+        fs::remove_file(exe).unwrap();
+        fs::write(&bat, "@exit /b 0\r\n").unwrap();
+        assert_eq!(
+            super::find_pi_executable_for_platform(&extensionless, None, true, false),
+            Some(bat)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_batch_execution_uses_command_arguments_without_joining() {
+        let program = Path::new(r"C:\Users\test user\npm\pi.cmd");
+        let processor = std::ffi::OsStr::new(r"C:\Windows\System32\cmd.exe");
+        let args = vec![
+            OsString::from("--version"),
+            OsString::from("model with spaces"),
+        ];
+        let (program, command_args) =
+            super::command_parts_for_platform(program, &args, Some(processor), true);
+        assert_eq!(program, PathBuf::from(processor));
+        assert_eq!(
+            command_args,
+            [
+                OsString::from("/d"),
+                OsString::from("/c"),
+                OsString::from("call"),
+                OsString::from(r"C:\Users\test user\npm\pi.cmd"),
+                OsString::from("--version"),
+                OsString::from("model with spaces"),
+            ]
+        );
+        let (program, direct_args) = super::command_parts_for_platform(
+            Path::new(r"C:\Program Files\Pi\pi.exe"),
+            &args,
+            Some(processor),
+            true,
+        );
+        assert_eq!(program, PathBuf::from(r"C:\Program Files\Pi\pi.exe"));
+        assert_eq!(direct_args, args);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_spec_runs_explicit_cmd_via_comspec() {
+        let dir = temp_dir();
+        let extension = stage_extension(&dir).unwrap();
+        let cmd = dir.join("pi.cmd");
+        fs::write(&cmd, "@exit /b 0\r\n").unwrap();
+        let mut request = request(StepAccess::Write);
+        request.executable = Some(cmd.clone());
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        let processor = std::env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+        assert_eq!(spec.program, PathBuf::from(processor));
+        assert_eq!(spec.args[0..4], ["/d", "/c", "call", cmd.to_str().unwrap()]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2112,6 +2314,37 @@ mod tests {
         assert_eq!(spec.program, PathBuf::from("pi"));
         assert!(!spec.args.iter().any(|arg| arg == "--model"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_spec_resolves_pi_from_request_path_and_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (attempt_dir, extension) = staged_extension();
+        let bin_dir = temp_dir();
+        let executable = bin_dir.join("pi");
+        let override_executable = bin_dir.join("pi-override");
+        for path in [&executable, &override_executable] {
+            fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut request = request(StepAccess::Write);
+        request.executable = None;
+        request
+            .environment
+            .insert(OsString::from("PATH"), bin_dir.as_os_str().to_owned());
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, executable);
+
+        request.environment.insert(
+            OsString::from("FORMLESS_TOPIC_PI_EXE"),
+            override_executable.as_os_str().to_owned(),
+        );
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, override_executable);
+        fs::remove_dir_all(attempt_dir).unwrap();
+        fs::remove_dir_all(bin_dir).unwrap();
     }
 
     #[test]

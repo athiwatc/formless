@@ -4,7 +4,7 @@ The Pi adapter implements the shared `local_harness::HarnessRequest` contract. I
 
 ## Use
 
-Stage the embedded extension in the attempt-private directory, then build and run the command without a shell:
+Stage the embedded extension in the attempt-private directory, then build and run the RPC command:
 
 ```rust
 let extension = local_harness::pi::stage_extension(&attempt_private_dir)?;
@@ -35,6 +35,11 @@ executable lookup, independently of whether the version probe succeeds. The
 probe runs only `--version`, with null stdin/stderr, a three-second timeout and
 at most 129 bytes of stdout; only a version number is retained. Failures produce
 static diagnostics, not subprocess output or configuration values.
+
+On Windows, extensionless Pi paths resolve `.exe`, then `.cmd`, then `.bat`,
+while explicit extensions remain exact. Run-time lookup honors the request's
+`PATH`. Batch shims are invoked through the configured command processor using
+discrete command arguments rather than a constructed shell command string.
 
 `signed_in` is deliberately `None`, with an explanatory detail. Pi 1.6.0 has an
 official `auth check --provider <provider> --json --no-refresh` command, using
