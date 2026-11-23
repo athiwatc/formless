@@ -1250,7 +1250,7 @@ async fn exact_32mib_session_reply_crosses_the_native_relay_wire_with_all_fragme
     ))
     .await
     .unwrap();
-    let reply = peer.next().await.unwrap().unwrap();
+    let reply = peer.next_full_size_reply().await.unwrap().unwrap();
     let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
     assert_eq!(reply["cid"], "maxdown");
     let line = channel.open(reply["f"].as_str().unwrap()).unwrap();
