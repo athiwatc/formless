@@ -385,7 +385,7 @@ enum Pending {
     TopicPermission {
         permission_id: String,
     },
-    HarnessPermissions,
+    HarnessPermissions { closed: HashSet<String> },
     TopicControl {
         topic_id: Option<String>,
         done: String,
@@ -2618,7 +2618,12 @@ impl App {
         self.pending.insert(subscribe, Pending::Subscribed);
         self.pending_since.insert(subscribe, Instant::now());
         let permissions = client.send(Request::PendingApprovals);
-        self.pending.insert(permissions, Pending::HarnessPermissions);
+        self.pending.insert(
+            permissions,
+            Pending::HarnessPermissions {
+                closed: HashSet::new(),
+            },
+        );
         self.pending_since.insert(permissions, Instant::now());
         let id = client.send(Request::GetSession {
             id: session_id.clone(),
@@ -3745,11 +3750,15 @@ impl App {
                                 styled: Vec::new(),
                             });
                         }
-                        Pending::HarnessPermissions => {
+                        Pending::HarnessPermissions { closed } => {
                             let events: Vec<Event> =
                                 serde_json::from_value(result).unwrap_or_default();
                             for event in events {
-                                if matches!(&event, Event::HarnessPermissionRequested { .. }) {
+                                if matches!(
+                                    &event,
+                                    Event::HarnessPermissionRequested { permission_id, .. }
+                                        if !closed.contains(permission_id)
+                                ) {
                                     self.topic_permission_event(event);
                                 }
                             }
@@ -5883,7 +5892,12 @@ impl App {
             },
         );
         if self.offline.is_none() {
-            self.request(Pending::HarnessPermissions, Request::PendingApprovals);
+            self.request(
+                Pending::HarnessPermissions {
+                    closed: HashSet::new(),
+                },
+                Request::PendingApprovals,
+            );
         }
         self.request(
             Pending::ContextFill,
@@ -5999,6 +6013,13 @@ impl App {
             self.forecast.revision = self.forecast.revision.wrapping_add(1);
             self.forecast.hint = None;
             self.forecast.approved = None;
+        }
+        if let Event::HarnessPermissionClosed { permission_id, .. } = &ev {
+            for pending in self.pending.values_mut() {
+                if let Pending::HarnessPermissions { closed } = pending {
+                    closed.insert(permission_id.clone());
+                }
+            }
         }
         if self.offline.is_some() && self.client.is_some() && reconnect_state_event(&ev) {
             self.reconnect_events.push(ev.clone());
@@ -27230,7 +27251,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_harness_permissions_restore_from_daemon_wire_snapshot() {
+    fn pending_harness_permissions_restore_from_snapshot_without_resurrecting_closed_requests() {
         let event = Event::HarnessPermissionRequested {
             permission_id: "c0ac0268-db77-4a49-b669-bac028f35207".into(),
             session_id: "52593398-66c0-4f10-9cd0-bdc5ebac9f28".into(),
@@ -27283,10 +27304,23 @@ mod tests {
         };
 
         app.switch_session("52593398-66c0-4f10-9cd0-bdc5ebac9f28".into());
-        let initial_query = pending_request_id(outbound.try_iter().collect());
-        send_wire(ServerMessage::Event(event.clone()));
-        app.drain_daemon();
-        assert!(app.topic.has_permission(), "live event reaches permission queue");
+        let initial_lines = outbound.try_iter().collect::<Vec<_>>();
+        let initial_requests = initial_lines
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<formless_protocol::RequestEnvelope>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let subscribe_at = initial_requests
+            .iter()
+            .position(|request| matches!(&request.request, Request::Subscribe { .. }))
+            .expect("current-session subscription");
+        let pending_at = initial_requests
+            .iter()
+            .position(|request| matches!(&request.request, Request::PendingApprovals))
+            .expect("pending-permissions snapshot request");
+        assert!(subscribe_at < pending_at);
+        let initial_query = pending_request_id(initial_lines);
 
         send_wire(ServerMessage::Response {
             id: initial_query,
@@ -27314,6 +27348,27 @@ mod tests {
         let screen = render(&mut app, 100, 40);
         assert!(screen.contains("Fixture simulated write"), "{screen}");
         assert!(screen.contains("1. Allow once"), "{screen}");
+
+        app.clear_attention();
+        app.begin_reconnect_snapshot();
+        let close_race_query = pending_request_id(outbound.try_iter().collect());
+        send_wire(ServerMessage::Event(Event::HarnessPermissionClosed {
+            permission_id: "c0ac0268-db77-4a49-b669-bac028f35207".into(),
+            option_id: None,
+            by: None,
+        }));
+        app.drain_daemon();
+        send_wire(ServerMessage::Response {
+            id: close_race_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(
+            !app.topic.has_permission(),
+            "a closed permission from an older snapshot is not restored"
+        );
     }
 
     #[test]
