@@ -15,7 +15,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-const CAPABILITY: &str = "FORMLESS_TOPIC_CAPABILITY";
+const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -29,7 +29,38 @@ const BRIDGE_CUSTOM_TYPE: &str = "formless-pi-bridge";
 const BRIDGE_MESSAGE: &str = "formless-pi-mcp-registered";
 const EXTENSION_NAME: &str = "formless-pi-extension.ts";
 const EXTENSION_SOURCE: &str = include_str!("pi_extension.ts");
+const REDACTED_CAPABILITY: &str = "[REDACTED]";
 const SIGN_IN_UNKNOWN: &str = "Sign-in unknown: Pi's read-only auth check requires a provider or model; there is no read-only CLI check for any provider. --list-models initializes writable state; auth.json alone omits environment, custom and ambient credentials.";
+
+fn redact_text(text: &str, capability: Option<&str>) -> String {
+    capability
+        .filter(|capability| !capability.is_empty())
+        .map(|capability| text.replace(capability, REDACTED_CAPABILITY))
+        .unwrap_or_else(|| text.to_owned())
+}
+
+fn redact_value(value: &mut Value, capability: Option<&str>) {
+    let Some(capability) = capability.filter(|capability| !capability.is_empty()) else {
+        return;
+    };
+    match value {
+        Value::String(text) => *text = redact_text(text, Some(capability)),
+        Value::Array(values) => {
+            for value in values {
+                redact_value(value, Some(capability));
+            }
+        }
+        Value::Object(object) => {
+            let entries = std::mem::take(object);
+            for (key, mut value) in entries {
+                let key = redact_text(&key, Some(capability));
+                redact_value(&mut value, Some(capability));
+                object.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
 
 pub async fn availability(executable: Option<&Path>) -> HarnessAvailability {
     let override_executable = std::env::var_os("FORMLESS_TOPIC_PI_EXE");
@@ -414,6 +445,12 @@ pub async fn run(
         bail!("Pi run cancelled");
     }
     let spec = command_spec_with_extension(request, staged_extension)?;
+    let capability = request
+        .environment
+        .get(OsStr::new(super::TOPIC_CAPABILITY_ENV))
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let mut command = tokio::process::Command::from(spec.command());
     #[cfg(unix)]
     {
@@ -472,7 +509,16 @@ pub async fn run(
         }
         result
     });
-    let outcome = rpc_session(stdout, input, errors, &request.prompt, handler, cancel).await;
+    let outcome = rpc_session(
+        stdout,
+        input,
+        errors,
+        &request.prompt,
+        handler,
+        cancel,
+        capability.as_deref(),
+    )
+    .await;
     if outcome.is_err() {
         child.terminate();
     }
@@ -509,7 +555,7 @@ pub async fn run(
     };
     finish().map_err(|error| {
         let context = format!("Pi RPC execution failed: {error}; stderr tail: {stderr_tail}");
-        error.context(context)
+        anyhow::anyhow!("{}", redact_text(&context, capability.as_deref()))
     })
 }
 
@@ -520,6 +566,7 @@ async fn rpc_session(
     prompt: &str,
     handler: &dyn InteractionHandler,
     cancel: &CancellationToken,
+    capability: Option<&str>,
 ) -> Result<HarnessResult> {
     let send = |value| input.send(value).context("Pi RPC stdin closed");
     send(json!({"id": "state-1", "type": "get_state"}))?;
@@ -566,7 +613,8 @@ async fn rpc_session(
                     bail!("Pi RPC process exited before successful settle");
                 };
                 if line.is_empty() { continue; }
-                let event: Value = serde_json::from_str(&line).context("Pi RPC returned invalid JSONL")?;
+                let mut event: Value = serde_json::from_str(&line).context("Pi RPC returned invalid JSONL")?;
+                redact_value(&mut event, capability);
                 if !event.is_object() { bail!("Pi RPC event was not an object"); }
                 match event["type"].as_str() {
                     Some("response") => match event["id"].as_str() {
@@ -1318,6 +1366,88 @@ while IFS= read -r remaining; do :; done
                 |update| matches!(update, HarnessUpdate::Message { content } if content == text)
             ));
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_rpc_redacts_capability_from_events_questions_and_diagnostics() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let (dir, extension, mut request) = fake_pi("");
+        let secret = request.environment[&OsString::from(crate::local_harness::TOPIC_CAPABILITY_ENV)]
+            .to_string_lossy()
+            .into_owned();
+        let nonsecret_path = "/private/nonsecret-path";
+        request.environment.insert(
+            OsString::from("FORMLESS_DATA_DIR"),
+            OsString::from(nonsecret_path),
+        );
+
+        let mut question = ui("input");
+        question["title"] = json!(format!("question {secret}"));
+        let mut tool_args = serde_json::Map::new();
+        tool_args.insert(secret.clone(), json!(format!("nested {secret}")));
+        tool_args.insert("path".into(), json!(nonsecret_path));
+        let events = [
+            json!({"type":"tool_execution_start","toolName":"read","args":{"nested":tool_args}}),
+            json!({"type":"tool_execution_update","toolName":"read","result":format!("tool snapshot {secret}")}),
+            json!({"type":"extension_ui_request","id":"question","method":"input","title":question["title"]}),
+            json!({"type":"extension_ui_request","id":"notice","method":"notify","message":format!("notification {secret}")}),
+            json!({"type":"message_update","assistantMessageEvent":{"content":[{"type":"text","text":format!("stream {secret}")}]}}),
+            json!({"type":"tool_execution_end","toolName":"read","result":{"nested":format!("tool result {secret}")}}),
+        ];
+        let mut body = START.to_owned();
+        body.push_str(&format!("printf '%s\\n' '{}'\nIFS= read -r answer\nprintf '{{\"type\":\"received_answer\",\"value\":%s}}\\n' \"$answer\"\n", question));
+        for event in events {
+            body.push_str(&format!("printf '%s\\n' '{}'\n", event));
+        }
+        body.push_str(&format!(
+            "printf '%s\\n' '{}' '{}' '{}'\nwhile IFS= read -r remaining; do :; done\n",
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":format!("final {secret}")}],"stopReason":"stop"}}),
+            json!({"type":"agent_end","willRetry":false}),
+            json!({"type":"agent_settled","aborted":false}),
+        ));
+        fs::write(
+            request.executable.as_ref().unwrap(),
+            format!("#!/bin/sh\nset -eu\n{body}\n"),
+        )
+        .unwrap();
+        let handler = RecordingHandler::new(true, false);
+        let result = timeout(
+            Duration::from_secs(10),
+            run(&request, &extension, &handler, &CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let question = &handler.questions.lock().unwrap()[0];
+        assert_eq!(question.header.as_deref(), Some("question [REDACTED]"));
+        let updates = handler.updates.lock().unwrap();
+        assert!(updates.iter().any(|update| matches!(update, HarnessUpdate::ToolCall { input, .. } if input["nested"]["[REDACTED]"] == "nested [REDACTED]" && input["nested"]["path"] == nonsecret_path)));
+        assert!(updates.iter().any(|update| matches!(update, HarnessUpdate::Message { content } if content == "notification [REDACTED]")));
+        assert!(updates.iter().any(|update| matches!(update, HarnessUpdate::Message { content } if content == "final [REDACTED]")));
+        assert_eq!(result.message, "final [REDACTED]");
+        let events = serde_json::to_string(&result.events).unwrap();
+        assert!(!events.contains(&secret));
+        assert!(events.contains("[REDACTED]"));
+        assert!(events.contains(nonsecret_path));
+        drop(updates);
+        fs::remove_dir_all(dir).unwrap();
+
+        let (dir, extension, request) = fake_pi(&format!("printf '%s\\n' 'stderr {secret} {nonsecret_path}' >&2\nexit 1"));
+        let error = run(
+            &request,
+            &extension,
+            &RecordingHandler::new(true, false),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(!error.contains(&secret));
+        assert!(error.contains("stderr [REDACTED]"));
+        assert!(error.contains(nonsecret_path));
         fs::remove_dir_all(dir).unwrap();
     }
 

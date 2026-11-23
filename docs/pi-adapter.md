@@ -71,6 +71,8 @@ Responses use `type:"extension_ui_response"` and the dialog's `id`. No answer, a
 
 Completed assistant text and thinking blocks become Message and Thought updates, respectively; streaming deltas are not duplicated. Tool execution starts become ToolCall updates. Pi core does not prompt for bash/write permission, so `request_permission` is deliberately unused. A permission policy must be implemented explicitly by a Pi extension; dialogs from such an extension are still relayed as questions.
 
+Before an RPC event is exposed to the interaction handler or retained in the result, exact occurrences of the nonempty `FORMLESS_TOPIC_CAPABILITY` value are redacted recursively from JSON strings and object keys. The same redaction applies to returned RPC errors and the bounded stderr tail. Other environment values, including paths, are not redacted.
+
 Success requires an acknowledged prompt, explicit bridge-registration evidence, a final successful assistant `message_end`, terminal `agent_end`, and non-aborted `agent_settled`, validated using the same `parse_output` reducer as the JSONL parser. This does not prove that an MCP tool was called successfully. The runner closes stdin, waits up to three seconds for process exit and rejects non-zero status. Early exit, invalid JSON and incomplete output fail with a bounded stderr tail.
 
 Cancellation sends `cancelled:true` for every open dialog before `abort`, also cancels dialogs arriving during abort, and allows three seconds for an abort response or settlement. It returns a cancellation error, never a partial success. On errors or cancellation the runner terminates the process; on normal completion it closes stdin and waits up to three seconds for exit before killing and reaping the child.

@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub use formless_protocol::{HarnessKind, StepAccess};
+pub(crate) const TOPIC_CAPABILITY_ENV: &str = "FORMLESS_TOPIC_CAPABILITY";
 pub mod pi;
 
 #[path = "local_harness_probe.rs"]
