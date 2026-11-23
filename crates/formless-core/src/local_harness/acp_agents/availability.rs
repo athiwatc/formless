@@ -36,6 +36,7 @@ pub(crate) fn availability_with_executable(
     with_timeout_with_executable(id, executable, environment, TIMEOUT)
 }
 
+#[cfg(test)]
 fn with_timeout(
     id: &str,
     executable: Option<PathBuf>,
