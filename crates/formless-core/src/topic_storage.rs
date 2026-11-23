@@ -683,6 +683,47 @@ impl Store {
             .collect()
     }
 
+    pub(crate) fn topic_source_content_unchanged(
+        &self,
+        topic_id: &str,
+        source_session_id: &str,
+        selected: &std::collections::BTreeSet<&str>,
+    ) -> Result<bool> {
+        let mut statement = self.conn.prepare(
+            "SELECT source.message_id,source.source_content_hash,message.role,message.content,message.generated_by
+             FROM topic_source_messages source
+             LEFT JOIN messages message
+               ON message.id=source.message_id AND message.session_id=source.source_session_id
+             WHERE source.topic_id=?1 AND source.source_session_id=?2",
+        )?;
+        let sources = statement
+            .query_map(params![topic_id, source_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if sources.len() != selected.len() {
+            return Ok(false);
+        }
+        for (message_id, snapshot, role, content, generated_by) in sources {
+            if !selected.contains(message_id.as_str())
+                || role.as_deref() != Some("user")
+                || generated_by.is_some()
+                || content
+                    .as_deref()
+                    .is_none_or(|content| hash_token(content) != snapshot)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn get_topic(&self, topic_id: &str) -> Result<Option<TopicInfo>> {
         topic_info(self, topic_id)
     }

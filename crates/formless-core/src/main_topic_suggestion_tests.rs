@@ -374,6 +374,62 @@ async fn main_topic_chat_suggests_two_features_and_rejection_leaves_the_original
 }
 
 #[tokio::test]
+async fn topic_suggestion_dedup_rejects_edited_source_messages() {
+    let (_fixture, daemon) = Fixture::new(&Config::default());
+    let (main, message) = daemon
+        .with_store(|st| {
+            let main = st.main_chat()?;
+            let message = st.append_message(&main.id, "user", "Add the original feature")?;
+            Ok((main, message))
+        })
+        .unwrap();
+    let args = |request: &str| {
+        json!({
+            "name": "Feature",
+            "message_ids": [message.id],
+            "features": [{"source_message_id": message.id, "request": request}],
+        })
+    };
+    let (created, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        args("Add the original feature"),
+    )
+    .await;
+    assert!(!failed, "{created}");
+    let topic: TopicInfo = serde_json::from_str(&created).unwrap();
+    daemon
+        .with_store(|st| {
+            st.edit_message(&main.id, &message.id, "Add the edited feature")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (result, failed) = dispatch(
+        &daemon,
+        &main.id,
+        0,
+        PROPOSE_TOPIC,
+        args("Add the edited feature"),
+    )
+    .await;
+    assert!(failed && result.contains("changed since the pending proposal"), "{result}");
+    let current = daemon
+        .with_reader(|st| {
+            let current = st.get_message(&main.id, &message.id)?.unwrap();
+            assert_eq!(current.content, "Add the edited feature");
+            assert_eq!(st.list_topics()?.len(), 1);
+            st.get_topic(&topic.id)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, TopicStatus::PendingApproval);
+    assert!(current.attempts.is_empty());
+}
+
+#[tokio::test]
 async fn main_topic_suggests_accounting_outline_without_workspace() {
     let (_fixture, daemon) = Fixture::new(&Config::default());
     let request = "Set up accounting: scan receipts, do accounting, then create reports.";

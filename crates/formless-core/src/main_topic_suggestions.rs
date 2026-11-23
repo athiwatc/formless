@@ -233,6 +233,10 @@ impl Store {
         }) {
             let sources = source_ids(&topic);
             if topic.status == TopicStatus::PendingApproval && sources == selected {
+                ensure!(
+                    self.topic_source_content_unchanged(&topic.id, source, &selected)?,
+                    "a source message changed since the pending proposal; reject it and send a new request before proposing again"
+                );
                 for step in &proposal.outline {
                     crate::local_harness::validate_acp_agent(
                         step.harness,
