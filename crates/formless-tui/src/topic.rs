@@ -2204,9 +2204,11 @@ impl State {
             ConfirmedAction::Start => "Starts the Formless workflow for this topic.",
             ConfirmedAction::Cancel => "Stops the workflow and running harness work.",
             ConfirmedAction::Recover => {
-                "Marks interrupted work failed and abandons running attempts."
+                "Marks interrupted work failed; retry it, then start the topic again to rerun it."
             }
-            ConfirmedAction::Retry { .. } => "Resets this work item to pending.",
+            ConfirmedAction::Retry { .. } => {
+                "Resets this work item to pending; start the topic again to run it."
+            }
         };
         let lines = vec![
             Line::from(format!("Topic: {name}")),
@@ -2659,6 +2661,31 @@ mod tests {
             .join("\n")
     }
 
+    fn confirmation_screen(
+        state: &State,
+        action: &ConfirmedAction,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                state.draw_confirmation(frame, area, "t1", action, false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn proposal_defaults_latest_request_and_contains_only_explicit_selections() {
         let source = session("main");
@@ -2787,6 +2814,31 @@ mod tests {
         assert!(screen.contains("Enter/y confirm"), "{screen}");
         assert!(screen.contains("Esc/n cancel"), "{screen}");
         assert!(!screen.contains("unbounded harness output"), "{screen}");
+    }
+
+    #[test]
+    fn retry_and_recover_confirmations_explain_the_separate_start() {
+        let mut state = State::default();
+        state.update_topics(vec![topic("t1", TopicStatus::Running)]);
+        let retry = confirmation_screen(
+            &state,
+            &ConfirmedAction::Retry {
+                feature_id: "f1".into(),
+            },
+            120,
+            16,
+        );
+        assert!(
+            retry.contains("Resets this work item to pending; start the topic again to run it."),
+            "{retry}"
+        );
+        let recover = confirmation_screen(&state, &ConfirmedAction::Recover, 120, 16);
+        assert!(
+            recover.contains(
+                "Marks interrupted work failed; retry it, then start the topic again to rerun it."
+            ),
+            "{recover}"
+        );
     }
 
     #[test]

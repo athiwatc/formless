@@ -14939,7 +14939,8 @@ fn chat_header(
     when: Option<&str>,
 ) -> Line<'static> {
     let (who, style_role) = match (role, generated_by) {
-        ("user", Some(marker)) => (format!("Formless · generated: {marker}"), "assistant"),
+        ("user", Some("topic_kickoff")) => ("Formless · workflow kickoff".to_owned(), "assistant"),
+        ("user", Some(_)) => ("Formless · generated".to_owned(), "assistant"),
         ("user", None) => ("You".to_owned(), "user"),
         ("system-note", _) => ("System".to_owned(), "system-note"),
         _ => ("Formless".to_owned(), "assistant"),

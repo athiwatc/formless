@@ -1212,25 +1212,35 @@ mod tests {
             meta: None,
             generated_by: Some("topic_kickoff".into()),
         };
-        let genuine = formless_protocol::MessageInfo {
-            id: "genuine".into(),
+        let other_generated = formless_protocol::MessageInfo {
+            id: "other-generated".into(),
             session_id: "s1".into(),
             seq: 2,
             role: "user".into(),
             content: "Same kickoff text".into(),
             created_at: String::new(),
             meta: None,
+            generated_by: Some("private_internal_marker".into()),
+        };
+        let genuine = formless_protocol::MessageInfo {
+            id: "genuine".into(),
+            session_id: "s1".into(),
+            seq: 3,
+            role: "user".into(),
+            content: "Same kickoff text".into(),
+            created_at: String::new(),
+            meta: None,
             generated_by: None,
         };
-        app.messages = vec![generated, genuine];
+        app.messages = vec![generated, other_generated, genuine];
 
         let screen = render(&mut app, 120);
-        assert!(
-            screen.contains("Formless · generated: topic_kickoff"),
-            "{screen}"
-        );
+        assert!(screen.contains("Formless · workflow kickoff"), "{screen}");
+        assert!(screen.contains("Formless · generated"), "{screen}");
         assert!(screen.contains("You"), "{screen}");
-        assert_eq!(screen.matches("Same kickoff text").count(), 2, "{screen}");
+        assert!(!screen.contains("topic_kickoff"), "{screen}");
+        assert!(!screen.contains("private_internal_marker"), "{screen}");
+        assert_eq!(screen.matches("Same kickoff text").count(), 3, "{screen}");
     }
 
     #[test]
