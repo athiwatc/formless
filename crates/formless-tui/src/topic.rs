@@ -338,6 +338,11 @@ impl ProposalForm {
         })
     }
 
+    fn enter_review(&mut self) {
+        self.step = ProposalStep::Review;
+        self.scroll = 0;
+    }
+
     fn parent_label(&self) -> &str {
         self.parents
             .get(self.parent_index)
@@ -466,7 +471,7 @@ impl ProposalForm {
                     KeyCode::Left | KeyCode::Right if self.cycle(key.code == KeyCode::Right) => {}
                     KeyCode::Enter => {
                         if self.field_index + 1 >= count {
-                            self.step = ProposalStep::Review;
+                            self.enter_review();
                         } else {
                             self.field_index += 1;
                         }
@@ -1025,7 +1030,7 @@ impl State {
 
     pub fn proposal_failed(&mut self) {
         if let Some(proposal) = self.proposal.as_mut() {
-            proposal.step = ProposalStep::Review;
+            proposal.enter_review();
         }
     }
 
@@ -2794,6 +2799,56 @@ mod tests {
         form.field_index = form.field_count() - 1;
         form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(form.step, ProposalStep::Review);
+        assert_eq!(form.request().unwrap().message_ids, ["short"]);
+
+        let mut state = State::default();
+        state.proposal = Some(form);
+        let screen = proposal_screen(&state, 80, 20);
+        assert!(
+            screen.contains("Review before creating the proposal"),
+            "{screen}"
+        );
+        assert!(screen.contains("Short request"), "{screen}");
+        assert!(!screen.contains("Long request detail"), "{screen}");
+        let action = state
+            .proposal
+            .as_mut()
+            .unwrap()
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Action::Propose(request) = action else {
+            panic!("expected proposal action");
+        };
+        assert_eq!(request.message_ids, ["short"]);
+    }
+
+    #[test]
+    fn review_scroll_resets_after_fields_then_requests_navigation() {
+        let source = session("main");
+        let long_request = "Long request detail.\n".repeat(80);
+        let messages = [
+            message("short", 1, "user", "Short request"),
+            message("long", 2, "user", &long_request),
+        ];
+        let mut form = ProposalForm::new(&source, &messages, "/repo", "Work", vec![], None);
+        form.name.set("Topic");
+        form.step = ProposalStep::Review;
+        for _ in 0..20 {
+            form.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        form.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(form.step, ProposalStep::Fields);
+        form.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(form.step, ProposalStep::Messages);
+        assert!(form.scroll > 0);
+
+        form.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        form.field_index = form.field_count() - 1;
+        form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(form.step, ProposalStep::Review);
+        assert_eq!(form.scroll, 0);
         assert_eq!(form.request().unwrap().message_ids, ["short"]);
 
         let mut state = State::default();
