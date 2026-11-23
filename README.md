@@ -54,7 +54,7 @@ Main Chat
 | **Your consent first** | A suggestion moves nothing. Messages move and work starts only after you approve in the client; a chat reply such as "yes" is not consent. |
 | **Advisory flows** | You can outline steps and pick a harness per step. The outline is advice: the Formless model in the Topic Chat decides the actual steps, may retry a failed step on another harness, and decides when the work is done. |
 | **Isolated steps** | Each step gets its own conversation and private workspace — a Git worktree for Git topics, or a fresh directory otherwise. Declared file inputs are staged separately. Read-only Git steps check out the exact input revision. |
-| **Questions and permissions** | The model may answer an ordinary harness question only from storage-verified evidence: a complete approved-request quote in the narrow `stem: option` form or a matching human-answer receipt from the same attempt. Otherwise it stays pending for your direct answer. The model never answers user-only questions or permissions; permission outcomes stay under user control. |
+| **Questions and permissions** | Formless can answer ordinary harness questions only when verified evidence from your approved request or a matching prior human answer explicitly supports the choice. Otherwise it asks you. User-only questions and permissions remain yours to decide. |
 | **Scoped context** | A harness reads its own topic branch — the topic and its ancestors — not Main Chat or sibling topics, unless you allow wider context for that topic. |
 | **Nothing auto-merges** | Steps produce Git revisions, files or text. Formless never merges or pushes. |
 
