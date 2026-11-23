@@ -659,10 +659,37 @@ impl Daemon {
             step.acp_agent = approval.substitute.acp_agent.clone();
             step.model = approval.substitute.model.clone();
         }
-        let availability =
-            local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;
-        if !availability.installed || availability.signed_in == Some(false) {
-            bail!("{:?} is not ready: {}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness,availability.detail.as_deref().unwrap_or("not signed in"));
+        let (availability, resolved_antigravity_executable) = if step.harness
+            == HarnessKind::Antigravity
+        {
+            local_harness::antigravity::topic_readiness().await
+        } else {
+            (
+                local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await,
+                None,
+            )
+        };
+        let missing_antigravity_identity =
+            step.harness == HarnessKind::Antigravity && resolved_antigravity_executable.is_none();
+        if !availability.installed
+            || availability.signed_in == Some(false)
+            || missing_antigravity_identity
+        {
+            let detail =
+                availability
+                    .detail
+                    .as_deref()
+                    .unwrap_or(if missing_antigravity_identity {
+                        "Antigravity executable identity could not be resolved"
+                    } else {
+                        "not signed in"
+                    });
+            bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+        }
+        if step.harness == HarnessKind::Antigravity {
+            local_harness::antigravity::require_selected_executable(
+                resolved_antigravity_executable.as_deref(),
+            )?;
         }
         if step.inputs.iter().any(|input| {
             !topic
@@ -786,6 +813,7 @@ impl Daemon {
                 inputs,
                 step_cancel,
                 run_cancel,
+                resolved_antigravity_executable,
             ))
             .catch_unwind()
             .await;
@@ -822,6 +850,7 @@ impl Daemon {
         inputs: Vec<TopicArtifact>,
         step_cancel: CancellationToken,
         cancel: CancellationToken,
+        resolved_antigravity_executable: Option<PathBuf>,
     ) -> Result<()> {
         let feature = topic
             .features
@@ -841,6 +870,7 @@ impl Daemon {
                 &inputs,
                 handler.as_ref(),
                 &step_cancel,
+                resolved_antigravity_executable.as_deref(),
             );
             tokio::pin!(execution);
             let execution = tokio::select! {
@@ -947,6 +977,7 @@ impl Daemon {
         inputs: &[TopicArtifact],
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
+        resolved_antigravity_executable: Option<&Path>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
         let mut extra_worktrees = Vec::new();
@@ -1130,7 +1161,9 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
-                HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
+                HarnessKind::Antigravity => Some(local_harness::antigravity::topic_executable(
+                    resolved_antigravity_executable,
+                )?),
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
             },
