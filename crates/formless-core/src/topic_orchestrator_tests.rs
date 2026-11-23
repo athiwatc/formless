@@ -3703,9 +3703,10 @@ async fn topic_grok_removed_resolved_executable_does_not_fall_back_to_workspace_
     assert_eq!(result["status"], "failed", "{result}");
     assert_eq!(result["acp_agent"], "grok", "{result}");
     let startup_error = result["summary"].as_str().unwrap_or_default();
+    let not_found_error = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
     assert!(
         startup_error.contains("failed to start Grok Build")
-            && startup_error.contains("No such file or directory"),
+            && startup_error.contains(&not_found_error),
         "expected startup failure for removed selected Grok executable at {}: {result}",
         selected.display()
     );
