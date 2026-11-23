@@ -5053,6 +5053,15 @@
   $("jump").onclick = () => scrollToBottom(true);
 
   // An interrupted/paused last Run (SPEC §5.4): why, and what to do.
+  async function abandonRun() {
+    const sid = S.current, runId = S.unfinished?.run_id;
+    if (!sid || (S.topicsAvailable && currentTopicAttempt())) return;
+    const result = await act({ type: "abandon_run", session_id: sid });
+    if (!result || S.current !== sid || S.unfinished?.run_id !== runId) return;
+    S.unfinished = null;
+    renderRunBanner();
+    note(result.abandoned ? "This run has ended; it cannot be resumed." : "There is no paused run to abandon.");
+  }
   function renderRunBanner() {
     const box = $("run-banner");
     const u = S.unfinished;
@@ -5072,9 +5081,7 @@
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
         await resumeRun();
       } }, tr("Resume")),
-      h("button", { class: "btn small", type: "button", onclick: async () => {
-        if (await act({ type: "abandon_run", session_id: S.current }, "Abandoned")) { S.unfinished = null; renderRunBanner(); }
-      } }, tr("Abandon")));
+      h("button", { class: "btn small", type: "button", onclick: () => abandonRun() }, tr("Abandon")));
   }
 
   /** Step mode (SPEC §5.9): the call waiting for a decision. */
@@ -8422,9 +8429,7 @@
       await resumeRun();
     } },
     { name: "abandon", group: "Run control", desc: "drop an interrupted or paused Run", run: async () => {
-      if (!S.current) return;
-      const r = await act({ type: "abandon_run", session_id: S.current });
-      if (r) note(r.abandoned ? "abandoned the interrupted run" : "nothing to abandon");
+      await abandonRun();
     } },
     { name: "agents", args: "[N]", group: "Run control", desc: "list sub-agents, or show one's transcript", run: async (arg) => {
       if (!S.current) return;

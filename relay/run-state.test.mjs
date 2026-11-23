@@ -75,6 +75,23 @@ test('resumable completion preserves the matching pause explanation and not anot
   c.S.unfinished={status:'abandoned'};c.renderRunBanner();
   assert.equal(text(elements.get('run-banner')),'','a terminal snapshot cannot render recovery controls');
 });
+test('explicit native Abandon clears recovery and replaces the paused footer only after acknowledgement',async()=>{
+  const{c,elements}=setup(),notes=[];
+  vm.runInContext(['abandonRun','renderRunBanner'].map(fn).join('\n'),c);
+  c.note=(message,error)=>notes.push({message,error:!!error});
+  c.S.unfinished={run_id:'r',status:'paused'};
+  c.renderRunBanner();
+  const abandon=elements.get('run-banner').children.find(n=>text(n)==='Abandon');
+  c.act=async()=>null;await abandon.props.onclick();
+  assert.equal(c.S.unfinished.run_id,'r');assert.equal(notes.length,0);
+  c.act=async()=>({abandoned:true});await abandon.props.onclick();
+  assert.equal(c.S.unfinished,null);assert.equal(text(elements.get('run-banner')),'');
+  assert.equal(notes[0].error,false);assert.match(notes[0].message,/has ended.*cannot be resumed/);
+  const waiting=deferred();c.act=()=>waiting.promise;c.S.unfinished={run_id:'old',status:'paused'};
+  const abandoning=c.abandonRun();c.S.unfinished={run_id:'new',status:'paused'};
+  waiting.resolve({abandoned:true});await abandoning;
+  assert.equal(c.S.unfinished.run_id,'new','a delayed old acknowledgement cannot erase new recovery state');
+});
 test('all unfinished calls are a subset of total and never labeled finished outcomes',()=>{
   const{c}=setup();
   const block=c.recapBlock({...recap('paused',5),unfinished_calls:5,used:[],built:[]});
