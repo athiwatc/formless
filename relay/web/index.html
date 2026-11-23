@@ -68,6 +68,8 @@
         <input id="search" type="search" placeholder="Search all sessions" aria-label="Search all sessions" autocapitalize="none" autocorrect="off" inputmode="search">
       </form>
       <div id="search-results" class="search-results hidden"></div>
+      <nav id="topic-nav" class="topic-nav hidden" aria-label="Main and topic chats"></nav>
+      <h3 id="other-chats-label" class="sidebar-label hidden">Other conversations</h3>
       <ul id="sessions" class="session-list"></ul>
       <div id="running" class="running hidden"></div>
     </aside>
@@ -79,11 +81,13 @@
         <div class="chat-head">
           <h2 id="session-title" class="session-title">No session</h2>
           <div class="chat-head-actions">
+            <button class="btn small" id="propose-topic" type="button" hidden>Move to topic…</button>
             <label class="toggle"><input type="checkbox" id="show-thinking" checked> thinking</label>
             <button class="btn ghost small" id="fork-btn" type="button" title="Fork this session (/fork)">Fork</button>
             <button class="btn ghost small" id="export-session" type="button" title="Download session bundle">Export</button>
           </div>
         </div>
+        <div id="topic-context" class="topic-context hidden" aria-label="Topic workflow"></div>
         <div id="transcript" class="transcript" tabindex="0" aria-live="polite"></div>
         <button id="jump" class="jump hidden" type="button">↓ New output</button>
         <form id="composer" class="composer">
@@ -225,7 +229,7 @@
 <!-- Generic prompt/confirm dialog -->
 <div id="ask-backdrop" class="backdrop hidden">
   <form class="modal" id="ask-form" role="dialog" aria-modal="true" aria-labelledby="ask-title" aria-describedby="ask-text">
-    <h2 id="ask-title"></h2>
+    <h2 id="ask-title" tabindex="-1"></h2>
     <p id="ask-text" class="muted"></p>
     <fieldset id="ask-fields">
       <div id="ask-body"></div>

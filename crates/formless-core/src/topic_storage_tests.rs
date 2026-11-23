@@ -618,7 +618,7 @@ fn topic_empty_features_fallback_approval_idempotence_and_rejection() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     let redirects: i64 = store
         .conn
         .query_row(
@@ -677,7 +677,7 @@ fn topic_xy_moves_original_once_and_features_progress_independently() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     store.claim_topic_workflow(&topic.id).unwrap();
     let token = "secret".repeat(8);
     let step = store
@@ -1104,7 +1104,7 @@ fn topic_cancel_and_retry_matrix_preserves_messages_and_never_starts_work() {
                 .list_messages(retried.topic_session_id.as_deref().unwrap())
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert_eq!(
             store

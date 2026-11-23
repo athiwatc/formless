@@ -28,7 +28,8 @@ function setup(names, extras = {}) {
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, note() {}, autosize() {},
+    renderChips() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
+    renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras });
   installEventRenderFixture(context, fn);
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
@@ -398,6 +399,92 @@ function node(tag, attrs, ...children) {
 }
 const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] : [];
 const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
+test('generated user-role messages render as Formless and cannot be moved or edited as user requests', () => {
+  const transcript = node('div');
+  const copied = [];
+  const c = setup(['renderHistory', 'messageBody', 'messageMenu', 'beginEdit', 'assistantStopNote'], {
+    h: node, isRunning: () => false, markdown: text => node('p', null, text),
+    speaker: role => role === 'user' ? 'user' : 'assistant',
+    sentElsewhere: () => null, withMentions: text => text, attachmentTags: () => [], steerStep: () => null,
+    renderLive() {}, renderComposer() {}, closePopover() {}, placePopover() {}, messageCopyText: () => 'message',
+    copy: text => copied.push(text),
+  });
+  const lookup = c.$;
+  c.$ = id => id === 'transcript' ? transcript : lookup(id);
+  vm.runInContext('const rendered = new Map(); const WHO = { user: "You", assistant: "Formless" }; let popover;', c);
+  c.S.daemonOnline = true;
+  const original = { id: 'original', role: 'user', content: 'Original request: keep my raw JSON {"installed":false} and orchestration wording.' };
+  const kickoff = { id: 'kickoff', role: 'user', content: 'Internal instructions' };
+  c.S.messages = [original, kickoff];
+  c.renderHistory();
+  assert.equal(all(transcript).filter(n => n.attrs.class === 'who user').length, 2);
+
+  // Updating only provenance must invalidate the cached body and attribution.
+  kickoff.generated_by = 'topic_kickoff';
+  c.S.messages.push({ id: 'retry', role: 'user', content: 'Retry instructions', generated_by: '' });
+  c.renderHistory();
+  const user = all(transcript).filter(n => n.attrs.class === 'who user');
+  assert.equal(user.length, 1);
+  assert.match(plainText(user[0]), /^You/);
+  assert.equal(all(transcript).filter(n => n.attrs.class === 'who assistant').length, 1);
+  assert.match(plainText(all(transcript).find(n => n.attrs.class === 'who assistant')), /^Formless/);
+  assert.match(plainText(transcript), /Internal instructions.*Retry instructions/);
+  const disclosures = all(transcript).filter(n => n.tag === 'details' && n.attrs.class === 'generated-details');
+  assert.equal(disclosures.length, 2);
+  assert.ok(disclosures.every(n => !n.attrs.open), 'raw generated instructions are collapsed by default');
+  assert.equal(plainText(disclosures[0].children.find(n => n.tag === 'pre')), kickoff.content);
+  assert.equal(plainText(disclosures[1].children.find(n => n.tag === 'pre')), c.S.messages[2].content);
+  const defaultText = n => typeof n === 'string' ? n : (n?.children || []).filter(child => n.tag !== 'details' || child.tag === 'summary').map(defaultText).join('');
+  assert.match(defaultText(transcript), /Workflow requested/);
+  assert.doesNotMatch(defaultText(transcript), /Internal instructions|Retry instructions/);
+  assert.ok(defaultText(transcript).includes(original.content), 'real user text is not summarized or filtered');
+  const edit = all(user[0]).find(n => n.tag === 'button');
+  edit.attrs.onclick();
+  assert.equal(c.S.editMessageId, original.id);
+  c.beginEdit(kickoff);
+  assert.equal(c.S.editMessageId, original.id);
+  assert.equal(c.$('input').value, original.content);
+
+  for (const m of [original, kickoff, c.S.messages[2]]) {
+    c.S.topicsAvailable = true;
+    c.messageMenu(c.$('trigger'), m, node('div'));
+    const labels = plainText(vm.runInContext('popover', c));
+    all(vm.runInContext('popover', c)).find(n => n.tag === 'button' && plainText(n) === 'Copy').attrs.onclick();
+    assert.equal(copied.pop(), m.generated_by != null ? m.content : 'message', 'Copy retains original instructions even when the disclosure is closed');
+    assert.equal(labels.includes('Move to topic'), m === original);
+    assert.equal(labels.includes('Edit & re-run'), m === original);
+    if (m === original) assert.match(labels, /drops the later turns/);
+  }
+});
+
+test('edit mode warns before truncating any later history, including generated kickoffs', () => {
+  const elements = new Map();
+  const c = setup(['beginEdit', 'cancelEdit', 'renderComposer'], {
+    h: node, isRunning: () => false, composerEnterSends: () => true, enterModeHint: () => 'Enter sends',
+    topicForSession: () => null, renderTopicContext() {},
+    $: id => {
+      if (!elements.has(id)) elements.set(id, Object.assign(node('div'), { classList: { add() {}, remove() {}, toggle() {} }, focus() {} }));
+      return elements.get(id);
+    },
+  });
+  vm.runInContext('const historyRender = {};', c);
+  const request = { id: 'request', role: 'user', content: 'Actual request' };
+  c.S.messages = [request];
+  c.beginEdit(request);
+  assert.doesNotMatch(plainText(c.$('compose-mode')), /deletes/);
+  c.S.messages.push({ id: 'kickoff', role: 'user', generated_by: 'topic_kickoff', content: 'Internal instructions' });
+  c.renderComposer();
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  c.cancelEdit();
+  c.beginEdit(request); // Shared path for inline, message menu and /edit.
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  c.S.messages = [request, { id: 'answer', role: 'assistant', content: 'Ordinary reply' }];
+  c.renderComposer();
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  assert.equal(c.S.editMessageId, request.id);
+  assert.equal(c.$('input').value, request.content);
+});
+
 test('hostile persisted Markdown has bounded nesting and preserves readable text', () => {
   const c = setup(['link', 'inline', 'splitRow', 'blocks', 'list', 'markdown'], { h: node });
   vm.runInContext(source.slice(source.indexOf('  const SAFE_URL'), source.indexOf('  function link')), c);

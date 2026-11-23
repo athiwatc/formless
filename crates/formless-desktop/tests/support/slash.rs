@@ -395,6 +395,101 @@ fn slash_changed_filter_resets_selection_and_scroll(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn metadata_prefills_cannot_replace_canonical_values_in_read_only_attempts(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::session_edit::{Instructions, Metadata};
+    let discover = |s: &Entity<Shell>, id: &str, w: &mut Window, cx: &mut App| {
+        let (_, mut topic) = fixture::topic_workspace();
+        topic.attempts[0].conversation_session_id = id.into();
+        s.update(cx, |s, cx| {
+            s.apply_client_update(Update::TopicSupport(true), w, cx);
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(formless_desktop::topics::Reply::Inventory(vec![topic])),
+                },
+                w,
+                cx,
+            );
+        });
+    };
+    for discovery in 0..3 {
+        for (text, expected) in [
+            ("/rename Unsaved name", "Confirmed name"),
+            ("/tag unsaved", "saved-tag"),
+            ("/instructions unsaved", "saved instructions"),
+            ("/pin", "Unpinned"),
+        ] {
+            let (h, s) = open(cx, WIDE, 0, 0);
+            let sessions = daemon_view(cx, h, &s);
+            step(cx, h, |w, cx| {
+                select(&s, &sessions[0].id, w, cx);
+                draft(&s, text, w, cx);
+                if discovery == 0 {
+                    discover(&s, &sessions[0].id, w, cx);
+                    s.update(cx, |s, _| s.take_client_commands());
+                }
+            });
+            cx.run_until_parked();
+            step(cx, h, |w, cx| w.press("enter", cx));
+            step(cx, h, |w, cx| {
+                let commands = s.update(cx, |s, _| s.take_client_commands());
+                let [Wire::ReadSessionDetails {
+                    connection,
+                    operation,
+                    session_id,
+                }] = commands.as_slice()
+                else {
+                    panic!("metadata read only")
+                };
+                let mut metadata = Metadata::from_session(&sessions[0]).unwrap();
+                metadata.name = "Confirmed name".into();
+                metadata.tags = vec!["saved-tag".into()];
+                metadata.pinned = false;
+                metadata.instructions = Instructions::Text("saved instructions".into());
+                if discovery == 1 {
+                    discover(&s, session_id, w, cx);
+                }
+                s.update(cx, |s, cx| {
+                    s.apply_client_update(
+                        Update::SessionDetails {
+                            connection: *connection,
+                            operation: *operation,
+                            session_id: session_id.clone(),
+                            result: Ok(metadata),
+                        },
+                        w,
+                        cx,
+                    );
+                    s.take_client_commands();
+                });
+                if discovery == 2 {
+                    discover(&s, session_id, w, cx);
+                }
+                settle_frames(w, cx);
+                if text == "/pin" {
+                    assert!(w
+                        .find("session-edit-pin-value")
+                        .value()
+                        .unwrap()
+                        .contains("unpinned"));
+                } else {
+                    assert_eq!(
+                        w.find("session-edit-read-only-value").value(),
+                        Some(expected)
+                    );
+                }
+                w.click("session-edit-copy", cx);
+                assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), expected);
+                assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+            });
+        }
+    }
+}
+
+#[gpui_kit::test]
 fn slash_metadata_arguments_prefill_but_never_save_without_review(cx: &mut TestAppContext) {
     use formless_desktop::session_edit::{Instructions, Metadata};
     for (text, expected) in [

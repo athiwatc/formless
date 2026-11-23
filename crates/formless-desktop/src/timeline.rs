@@ -34,7 +34,7 @@ pub fn accessible_text_stats() -> (u64, u64, u64) {
 }
 
 use crate::memory::limits;
-use crate::model::BlockKind;
+use crate::model::{BlockKind, GeneratedMessage};
 
 /// How long changes may wait before the view is told, so a burst of deltas
 /// costs one update. Roughly one frame at 60 Hz.
@@ -418,6 +418,7 @@ pub enum Anchor {
 pub struct TimelineBlock {
     pub id: u64,
     pub kind: BlockKind,
+    generated: Option<GeneratedMessage>,
     attachments: Vec<crate::transcript_attachments::Attachment>,
     markdown: String,
     fences: FenceIndex,
@@ -436,6 +437,7 @@ impl TimelineBlock {
         let mut block = Self {
             id,
             kind,
+            generated: None,
             attachments: Vec::new(),
             markdown,
             fences: FenceIndex::default(),
@@ -452,6 +454,15 @@ impl TimelineBlock {
 
     pub fn attachments(&self) -> &[crate::transcript_attachments::Attachment] {
         &self.attachments
+    }
+
+    pub fn generated(&self) -> Option<GeneratedMessage> {
+        self.generated
+    }
+
+    pub(crate) fn with_generated(mut self, generated: Option<GeneratedMessage>) -> Self {
+        self.generated = generated;
+        self
     }
 
     pub(crate) fn with_attachments(
