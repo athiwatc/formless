@@ -616,14 +616,21 @@ fn find_executable_with_platform(
         .cloned()
         .or_else(|| std::env::var_os("PATH"))?;
     let suffixes: Vec<_> = if windows {
-        let extensions = environment
-            .get(OsStr::new("PATHEXT"))
-            .cloned()
-            .or_else(|| std::env::var_os("PATHEXT"))
-            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-        std::iter::once(String::new())
-            .chain(extensions.to_string_lossy().split(';').map(str::to_owned))
-            .collect()
+        if Path::new(program).extension().is_some() {
+            vec![String::new()]
+        } else {
+            let extensions = environment
+                .get(OsStr::new("PATHEXT"))
+                .cloned()
+                .or_else(|| std::env::var_os("PATHEXT"))
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            extensions
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }
     } else {
         vec![String::new()]
     };
@@ -646,6 +653,9 @@ fn agent_program(
 ) -> PathBuf {
     if let Some(executable) = &request.executable {
         return executable.clone();
+    }
+    if !windows {
+        return PathBuf::from(program);
     }
     let mut environment = process_environment.clone();
     environment.extend(request.environment.clone());
@@ -1311,7 +1321,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn agent_launch_resolves_windows_pathext_shims_and_preserves_override() {
+    fn windows_pathext_skips_extensionless_shims_and_preserves_precedence_and_override() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -1319,18 +1329,29 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        let shim = root.join("gemini.CMD");
-        std::fs::write(&shim, "fixture").unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let extensionless = first.join("gemini");
+        std::fs::write(&extensionless, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&extensionless, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cmd_shim = first.join("gemini.CMD");
+        std::fs::write(&cmd_shim, "fixture").unwrap();
+        std::fs::set_permissions(&cmd_shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exe = second.join("gemini.EXE");
+        std::fs::write(&exe, "fixture").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut request = request(StepAccess::Write);
         request.environment.insert(
             "PATH".into(),
-            std::env::join_paths([root.as_os_str()]).unwrap(),
+            std::env::join_paths([first.as_os_str(), second.as_os_str()]).unwrap(),
         );
-        request.environment.insert("PATHEXT".into(), ".CMD".into());
-        let expected = std::path::absolute(&shim).unwrap();
+        request
+            .environment
+            .insert("PATHEXT".into(), ".EXE;.CMD".into());
+        let expected = std::path::absolute(&cmd_shim).unwrap();
         let process_environment = BTreeMap::new();
         assert_eq!(
             find_executable_with_platform("gemini", &request.environment, true),
@@ -1348,6 +1369,78 @@ mod tests {
             override_path
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_launch_uses_workspace_relative_path_before_global_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let target = process_cwd.join("target");
+        let target_preexisted = target.exists();
+        let name = format!(
+            "formless-acp-path-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let relative_bin = PathBuf::from("target").join(&name);
+        let daemon_bin = process_cwd.join(&relative_bin);
+        let workspace = std::env::temp_dir().join(format!("formless-{name}"));
+        let workspace_bin = workspace.join(&relative_bin);
+        let global_bin = workspace.join("global");
+        let marker = workspace.join("selected");
+        for directory in [&daemon_bin, &workspace_bin, &global_bin] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        for (directory, selected) in [
+            (&daemon_bin, "daemon"),
+            (&workspace_bin, "workspace"),
+            (&global_bin, "global"),
+        ] {
+            let executable = directory.join("gemini");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '%s' '{selected}' > \"$ACP_LAUNCH_MARKER\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let mut request = request(StepAccess::Write);
+        request.kind = HarnessKind::Acp;
+        request.acp_agent = Some("gemini".into());
+        request.cwd = workspace.clone();
+        request.environment.insert(
+            "PATH".into(),
+            std::env::join_paths([relative_bin.as_os_str(), OsStr::new("global")]).unwrap(),
+        );
+        request.environment.insert(
+            "ACP_LAUNCH_MARKER".into(),
+            marker.as_os_str().to_os_string(),
+        );
+        assert_eq!(
+            agent_program("gemini", &request, &BTreeMap::new(), false),
+            PathBuf::from("gemini")
+        );
+
+        let spec = crate::local_harness::acp_agents::spec("gemini").unwrap();
+        let agent = AgentProcess::spawn(spec, &request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "workspace PATH executable did not launch");
+        let selected = std::fs::read_to_string(&marker).unwrap();
+        drop(agent);
+        assert_eq!(selected, "workspace");
+
+        std::fs::remove_dir_all(&daemon_bin).unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        if !target_preexisted {
+            let _ = std::fs::remove_dir(&target);
+        }
     }
 
     fn update(text: &str) -> String {
