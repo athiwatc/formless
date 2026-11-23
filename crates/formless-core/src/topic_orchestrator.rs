@@ -659,26 +659,49 @@ impl Daemon {
             step.acp_agent = approval.substitute.acp_agent.clone();
             step.model = approval.substitute.model.clone();
         }
-        let readiness =
-            local_harness::harness_readiness(step.harness, step.acp_agent.as_deref()).await;
-        let availability = readiness.availability;
-        let resolved_acp_executable = readiness.resolved_executable;
-        let resolved_acp_executable_argv0 = readiness.resolved_executable_argv0;
+        let (
+            availability,
+            resolved_acp_executable,
+            resolved_acp_executable_argv0,
+            resolved_antigravity_executable,
+        ) = if step.harness == HarnessKind::Antigravity {
+            let (availability, executable) = local_harness::antigravity::topic_readiness().await;
+            (availability, None, None, executable)
+        } else {
+            let readiness =
+                local_harness::harness_readiness(step.harness, step.acp_agent.as_deref()).await;
+            (
+                readiness.availability,
+                readiness.resolved_executable,
+                readiness.resolved_executable_argv0,
+                None,
+            )
+        };
         let missing_acp_executable =
             step.harness == HarnessKind::Acp && resolved_acp_executable.is_none();
+        let missing_antigravity_identity =
+            step.harness == HarnessKind::Antigravity && resolved_antigravity_executable.is_none();
         if !availability.installed
             || availability.signed_in == Some(false)
             || missing_acp_executable
+            || missing_antigravity_identity
         {
             let detail = availability
                 .detail
                 .as_deref()
                 .unwrap_or(if missing_acp_executable {
                     "ACP executable identity could not be resolved"
+                } else if missing_antigravity_identity {
+                    "Antigravity executable identity could not be resolved"
                 } else {
                     "not signed in"
                 });
             bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+        }
+        if step.harness == HarnessKind::Antigravity {
+            local_harness::antigravity::require_selected_executable(
+                resolved_antigravity_executable.as_deref(),
+            )?;
         }
         if step.inputs.iter().any(|input| {
             !topic
@@ -804,6 +827,7 @@ impl Daemon {
                 run_cancel,
                 resolved_acp_executable,
                 resolved_acp_executable_argv0,
+                resolved_antigravity_executable,
             ))
             .catch_unwind()
             .await;
@@ -842,6 +866,7 @@ impl Daemon {
         cancel: CancellationToken,
         resolved_acp_executable: Option<PathBuf>,
         resolved_acp_executable_argv0: Option<OsString>,
+        resolved_antigravity_executable: Option<PathBuf>,
     ) -> Result<()> {
         let feature = topic
             .features
@@ -863,6 +888,7 @@ impl Daemon {
                 &step_cancel,
                 resolved_acp_executable.as_deref(),
                 resolved_acp_executable_argv0.as_deref(),
+                resolved_antigravity_executable.as_deref(),
             );
             tokio::pin!(execution);
             let execution = tokio::select! {
@@ -971,6 +997,7 @@ impl Daemon {
         cancel: &CancellationToken,
         resolved_acp_executable: Option<&Path>,
         resolved_acp_executable_argv0: Option<&std::ffi::OsStr>,
+        resolved_antigravity_executable: Option<&Path>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
         let mut extra_worktrees = Vec::new();
@@ -1154,7 +1181,9 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
-                HarnessKind::Antigravity => executable("FORMLESS_TOPIC_ANTIGRAVITY_EXE")?,
+                HarnessKind::Antigravity => Some(local_harness::antigravity::topic_executable(
+                    resolved_antigravity_executable,
+                )?),
                 HarnessKind::Acp => Some(
                     resolved_acp_executable
                         .context("ACP topic launch is missing its readiness executable")?

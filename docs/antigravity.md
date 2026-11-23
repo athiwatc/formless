@@ -2,6 +2,8 @@
 
 Formless connects to Antigravity through the official `agy acp` server (Agent Client Protocol v1), using the installed CLI and its existing sign-in. `local_harness::antigravity::run(&HarnessRequest, &mut dyn PermissionHandler, &CancellationToken)` starts `agy acp --disable-telemetry`, negotiates ACP v1, opens a session whose `session/new.mcpServers` holds only the Formless bridge (`mcp_command`, `mcp_args`, and the `mcp_env_vars` values), sends the prompt, and returns the streamed agent message. No Antigravity settings or MCP config files are written. The bridge's variables are sent over the ACP pipe and removed from the `agy` process environment, and `agy` stderr is discarded.
 
+For topic steps, Formless resolves the daemon's absolute executable override or PATH candidate once, probes that invocation path, then carries the same path to the ACP launch. This pins path selection, not immutable file contents or symlink targets; a selected symlink invocation path is kept to preserve its `argv[0]` behavior.
+
 The ACP client itself is shared in `local_harness::acp` (`AgentSpec`, `run`, `PermissionHandler`). Antigravity supplies `antigravity::SPEC`: the `agy acp` arguments, the 1.5.14 version floor, the sign-in hint and the `plan` read-only mode. Handlers also receive each `session/update` through `on_update`.
 
 - **Sign-in:** Formless never calls ACP `authenticate` or handles credentials. If `agy` is not signed in, `run` returns "Antigravity is not signed in. Run `agy` ... sign-in".
