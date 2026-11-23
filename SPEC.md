@@ -7067,7 +7067,8 @@ topics become NeedsUser, with durable detail and no automatic restart.
 
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
-CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
