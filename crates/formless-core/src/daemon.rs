@@ -6468,6 +6468,7 @@ impl Daemon {
                 },
             );
         }
+        self.topic_wait_seen.locked().remove(&session_id);
         self.run_admissions
             .locked()
             .insert(run_id.clone(), admission.clone());
