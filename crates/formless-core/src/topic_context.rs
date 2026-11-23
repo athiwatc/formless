@@ -1,4 +1,5 @@
 use super::*;
+use crate::main_topic_suggestions::{suggestion_tree_scope, READ_TOPIC_CONTEXT};
 use anyhow::bail;
 
 impl Store {
@@ -44,8 +45,17 @@ impl Store {
         {
             bail!("conversation is outside this topic's context scope");
         }
+        let visible = self.topic_context_scope(id)?;
+        let mut messages = self.list_messages(session)?;
+        for message in &mut messages {
+            message.content = scope_topic_context_result(
+                &message.content,
+                message.meta.as_deref(),
+                visible.as_ref(),
+            );
+        }
         Ok(
-            json!({"session":self.get_session(session)?.context("conversation not found")?,"messages":self.list_messages(session)?}),
+            json!({"session":self.get_session(session)?.context("conversation not found")?,"messages":messages}),
         )
     }
     pub(crate) fn topic_search_conversations(&self, id: &str, query: &str) -> Result<Value> {
@@ -56,12 +66,16 @@ impl Store {
         if query.len() > 1000 {
             bail!("search query exceeds 1000 bytes");
         }
+        let visible = self.topic_context_scope(id)?;
         let scope = serde_json::to_string(&self.topic_context_sessions(id)?)?;
-        let mut statement=self.conn.prepare("SELECT session_id,id,content FROM messages WHERE session_id IN (SELECT value FROM json_each(?1)) ORDER BY created_at DESC,rowid DESC")?;
+        let mut statement=self.conn.prepare("SELECT session_id,id,meta,content FROM messages WHERE session_id IN (SELECT value FROM json_each(?1)) ORDER BY created_at DESC,rowid DESC")?;
         let mut rows = statement.query([scope])?;
         let mut matches = vec![];
         while let Some(row) = rows.next()? {
-            let content: String = row.get(2)?;
+            let meta: Option<String> = row.get(2)?;
+            let raw_content: String = row.get(3)?;
+            let content =
+                scope_topic_context_result(&raw_content, meta.as_deref(), visible.as_ref());
             let folded = content.to_lowercase();
             if let Some(offset) = folded.find(&query) {
                 let mut folded_bytes = 0;
@@ -81,5 +95,51 @@ impl Store {
             }
         }
         Ok(json!(matches))
+    }
+
+    fn topic_context_scope(&self, id: &str) -> Result<Option<std::collections::HashSet<String>>> {
+        let topics = self.list_topics()?;
+        Ok(suggestion_tree_scope(&topics, id)?
+            .map(|visible| visible.into_iter().map(str::to_owned).collect()))
+    }
+}
+
+fn scope_topic_context_result(
+    content: &str,
+    meta: Option<&str>,
+    visible: Option<&std::collections::HashSet<String>>,
+) -> String {
+    let Some(visible) = visible else {
+        return content.to_owned();
+    };
+    let metadata_name = meta
+        .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+        .and_then(|meta| meta["name"].as_str().map(str::to_owned));
+    let mut frame = serde_json::from_str::<Value>(content).unwrap_or(Value::Null);
+    let framed = frame["source_tool"].as_str() == Some(READ_TOPIC_CONTEXT);
+    if !framed && metadata_name.as_deref() != Some(READ_TOPIC_CONTEXT) {
+        return content.to_owned();
+    }
+    let mut context = if framed {
+        frame["content"]
+            .as_str()
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+    } else {
+        serde_json::from_str::<Value>(content).ok()
+    };
+    let Some(context) = context.as_mut() else {
+        return String::new();
+    };
+    for collection in ["topics", "proposals"] {
+        if let Some(entries) = context[collection].as_array_mut() {
+            entries.retain(|entry| entry["id"].as_str().is_some_and(|id| visible.contains(id)));
+        }
+    }
+    let context = serde_json::to_string(context).unwrap_or_else(|_| "{}".into());
+    if framed {
+        frame["content"] = Value::String(context);
+        serde_json::to_string(&frame).unwrap_or_default()
+    } else {
+        context
     }
 }

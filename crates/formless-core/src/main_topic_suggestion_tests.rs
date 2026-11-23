@@ -415,7 +415,10 @@ async fn topic_suggestion_dedup_rejects_edited_source_messages() {
         args("Add the edited feature"),
     )
     .await;
-    assert!(failed && result.contains("changed since the pending proposal"), "{result}");
+    assert!(
+        failed && result.contains("changed since the pending proposal"),
+        "{result}"
+    );
     let current = daemon
         .with_reader(|st| {
             let current = st.get_message(&main.id, &message.id)?.unwrap();
@@ -470,7 +473,10 @@ async fn topic_suggestions_reject_overlapping_pending_sources() {
         }),
     )
     .await;
-    assert!(failed && result.contains("overlap a pending topic proposal"), "{result}");
+    assert!(
+        failed && result.contains("overlap a pending topic proposal"),
+        "{result}"
+    );
     daemon
         .with_store(|st| {
             assert_eq!(st.list_topics()?.len(), 1);
@@ -515,8 +521,7 @@ async fn topic_context_excludes_generated_user_messages() {
     let normal = daemon
         .with_store(|st| st.append_message(&main.id, "user", "A real request"))
         .unwrap();
-    let (context, failed) =
-        dispatch(&daemon, &main.id, 0, READ_TOPIC_CONTEXT, json!({})).await;
+    let (context, failed) = dispatch(&daemon, &main.id, 0, READ_TOPIC_CONTEXT, json!({})).await;
     assert!(!failed, "{context}");
     let context: Value = serde_json::from_str(&context).unwrap();
     let messages = context["messages"].as_array().unwrap();
@@ -536,7 +541,10 @@ async fn topic_context_excludes_generated_user_messages() {
         }),
     )
     .await;
-    assert!(failed && result.contains("generated messages cannot be proposed"), "{result}");
+    assert!(
+        failed && result.contains("generated messages cannot be proposed"),
+        "{result}"
+    );
 }
 
 #[tokio::test]
@@ -753,17 +761,16 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
             let outside = propose(st, story_chat, "Outside", Some(other.id.clone()))?;
             let child_id = child.id.clone();
             let inside_id = inside.id.clone();
-            let scoped_proposals = BTreeSet::new();
-            let scoped = BTreeSet::from([project.id, story.id.clone()]);
-            let mut all = scoped.clone();
-            all.extend([
+            let scoped_proposals = BTreeSet::from([child.id.clone(), inside.id.clone()]);
+            let scoped = BTreeSet::from([
+                project.id,
+                story.id.clone(),
                 child.id,
                 grandchild.id,
                 inside.id.clone(),
-                sibling.id,
-                other.id,
-                outside.id.clone(),
             ]);
+            let mut all = scoped.clone();
+            all.extend([sibling.id, other.id, outside.id.clone()]);
             let all_proposals =
                 BTreeSet::from([child_id.clone(), inside_id.clone(), outside.id.clone()]);
             Ok((
@@ -802,8 +809,10 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
     assert_eq!(context["current_topic_id"], story.id);
     assert_eq!(ids(&context, "topics"), scoped);
     assert_eq!(ids(&context, "proposals"), scoped_proposals);
+    assert!(ids(&context, "topics").contains(&inside_id));
+    let sibling_id = inside_id.clone();
     let context_frame = crate::provenance::frame(READ_TOPIC_CONTEXT, &[], &context.to_string());
-    let transcript = daemon
+    let (transcript, search) = daemon
         .with_store(|st| {
             st.append_message_meta(
                 story_chat,
@@ -811,9 +820,12 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                 &context_frame,
                 Some(json!({"tool_call_id":"read-context","name":READ_TOPIC_CONTEXT}).to_string()),
             )?;
-            st.topic_read_conversation(&child_id, story_chat)
+            let transcript = st.topic_read_conversation(&child_id, story_chat)?;
+            let search = st.topic_search_conversations(&child_id, &sibling_id)?;
+            Ok((transcript, search))
         })
         .unwrap();
+    assert!(search.as_array().unwrap().is_empty());
     let stored_context = transcript["messages"]
         .as_array()
         .unwrap()
@@ -824,8 +836,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                     .is_ok_and(|meta| meta["name"] == READ_TOPIC_CONTEXT)
         })
         .map(|message| {
-            let frame: Value =
-                serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            let frame: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
             serde_json::from_str::<Value>(frame["content"].as_str().unwrap()).unwrap()
         })
         .unwrap();

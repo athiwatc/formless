@@ -717,10 +717,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut candidates = Vec::<TopicSuggestionCandidate>::new();
         for (id, status, parent_topic_id, workspace, workspace_kind, message_id) in rows {
-            if candidates
-                .last()
-                .is_none_or(|candidate| candidate.id != id)
-            {
+            if candidates.last().is_none_or(|candidate| candidate.id != id) {
                 candidates.push(TopicSuggestionCandidate {
                     id,
                     status,

@@ -226,10 +226,7 @@ impl Store {
             "every selected source message must have a feature request"
         );
         let mut covered = BTreeSet::new();
-        for topic in self
-            .topic_suggestion_candidates(source)?
-            .into_iter()
-        {
+        for topic in self.topic_suggestion_candidates(source)? {
             let candidate_workspace = if topic.workspace_kind == "scratch" {
                 None
             } else {
@@ -284,7 +281,7 @@ impl Store {
     }
 }
 
-fn suggestion_tree_scope<'a>(
+pub(crate) fn suggestion_tree_scope<'a>(
     topics: &'a [TopicInfo],
     current_id: &str,
 ) -> Result<Option<HashSet<&'a str>>> {
@@ -297,7 +294,21 @@ fn suggestion_tree_scope<'a>(
         return Ok(None);
     }
 
-    let mut visible = HashSet::from([current.id.as_str()]);
+    let mut children = HashMap::<&str, Vec<&str>>::new();
+    for topic in topics {
+        if let Some(parent) = topic.parent_topic_id.as_deref() {
+            children.entry(parent).or_default().push(&topic.id);
+        }
+    }
+    let mut visible = HashSet::new();
+    let mut pending = vec![current.id.as_str()];
+    while let Some(id) = pending.pop() {
+        if visible.insert(id) {
+            if let Some(children) = children.get(id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+    }
     let mut parent = current.parent_topic_id.as_deref();
     while let Some(id) = parent {
         if !visible.insert(id) {
