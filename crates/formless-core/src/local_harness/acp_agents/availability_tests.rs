@@ -1,4 +1,4 @@
-use std::{os::unix::fs::PermissionsExt, time::Instant};
+use std::{ffi::OsStr, os::unix::fs::PermissionsExt, path::Path, time::Instant};
 
 use serde_json::{json, Value};
 
@@ -366,7 +366,7 @@ fn live_acp_agents_availability_installed_binaries() {
     let mut checked = 0;
     for id in agent_ids() {
         let binary = bin_dir.join(spec(id).unwrap().program);
-        if !is_executable(&binary) {
+        if !acp::is_executable(&binary) {
             continue;
         }
         let home = root.0.join(id);

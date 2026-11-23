@@ -7,9 +7,9 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -581,13 +581,83 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
 /// The agent and every process it starts (MCP servers, tools); dropping it kills them all.
 pub(super) struct AgentProcess(SupervisedProcess);
 
+pub(super) fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub(super) fn find_executable(
+    program: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    find_executable_with_platform(program, environment, cfg!(windows))
+}
+
+fn find_executable_with_platform(
+    program: &str,
+    environment: &BTreeMap<OsString, OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let path = environment
+        .get(OsStr::new("PATH"))
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))?;
+    let suffixes: Vec<_> = if windows {
+        let extensions = environment
+            .get(OsStr::new("PATHEXT"))
+            .cloned()
+            .or_else(|| std::env::var_os("PATHEXT"))
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        std::iter::once(String::new())
+            .chain(extensions.to_string_lossy().split(';').map(str::to_owned))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for directory in std::env::split_paths(&path) {
+        for suffix in &suffixes {
+            let candidate = directory.join(format!("{program}{suffix}"));
+            if is_executable(&candidate) {
+                return std::path::absolute(candidate).ok();
+            }
+        }
+    }
+    None
+}
+
+fn agent_program(
+    program: &str,
+    request: &HarnessRequest,
+    process_environment: &BTreeMap<OsString, OsString>,
+    windows: bool,
+) -> PathBuf {
+    if let Some(executable) = &request.executable {
+        return executable.clone();
+    }
+    let mut environment = process_environment.clone();
+    environment.extend(request.environment.clone());
+    find_executable_with_platform(program, &environment, windows)
+        .unwrap_or_else(|| PathBuf::from(program))
+}
+
 impl AgentProcess {
     pub(super) fn spawn(spec: &AgentSpec, request: &HarnessRequest) -> Result<Self> {
         validate(request)?;
-        let program = request
-            .executable
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(spec.program));
+        let process_environment = std::env::vars_os().collect();
+        let program = agent_program(spec.program, request, &process_environment, cfg!(windows));
         let mut command = Command::new(&program);
         command
             .args((spec.args)(request))
@@ -1237,6 +1307,47 @@ mod tests {
                 ("HOME".into(), "/home/user".into()),
             ]),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_launch_resolves_windows_pathext_shims_and_preserves_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "formless-acp-launch-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let shim = root.join("gemini.CMD");
+        std::fs::write(&shim, "fixture").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut request = request(StepAccess::Write);
+        request.environment.insert(
+            "PATH".into(),
+            std::env::join_paths([root.as_os_str()]).unwrap(),
+        );
+        request.environment.insert("PATHEXT".into(), ".CMD".into());
+        let expected = std::path::absolute(&shim).unwrap();
+        let process_environment = BTreeMap::new();
+        assert_eq!(
+            find_executable_with_platform("gemini", &request.environment, true),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            agent_program("gemini", &request, &process_environment, true),
+            expected
+        );
+
+        let override_path = root.join("explicit-agent.exe");
+        request.executable = Some(override_path.clone());
+        assert_eq!(
+            agent_program("gemini", &request, &process_environment, true),
+            override_path
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn update(text: &str) -> String {
