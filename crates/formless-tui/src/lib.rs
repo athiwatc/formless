@@ -1984,6 +1984,7 @@ struct App {
     /// Inline images (SPEC §10.2): the terminal's protocol, the
     /// thumbnails this frame places and those last sent.
     image_proto: Option<images::Protocol>,
+    kitty_images_suppressed: bool,
     /// Side pane widths in the multi-pane layout, percent (left, right).
     pane_widths: (u16, u16),
     /// While an approval is open: whether keys go to the input (Tab
@@ -2314,6 +2315,7 @@ impl App {
             chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
+            kitty_images_suppressed: false,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
             input_focus: false,
             approval_explain: false,
@@ -12348,6 +12350,32 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.topic.draw_permission_overlay(f, app.color);
 }
 
+fn paint_inline_images(app: &mut App, out: &mut impl Write, links_ready: bool) {
+    let Some(proto) = app.image_proto else {
+        app.kitty_images_suppressed = false;
+        return;
+    };
+    if proto == images::Protocol::Kitty && app.topic.has_permission() {
+        if !app.kitty_images_suppressed {
+            let _ = images::paint(out, proto, &[]);
+            app.painted_images.clear();
+            app.kitty_images_suppressed = true;
+        }
+        return;
+    }
+    app.kitty_images_suppressed = false;
+    if !links_ready || app.image_placed == app.painted_images {
+        return;
+    }
+    if app.painted_images.is_empty() {
+        let _ = images::paint(out, proto, &app.image_placed);
+        app.painted_images.clone_from(&app.image_placed);
+    } else {
+        app.painted_images.clear();
+        app.force_redraw = true;
+    }
+}
+
 fn draw_app_frame(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
@@ -20472,19 +20500,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                 .update(&mut stdout(), frame.buffer, found)
                 .is_ok();
             // Defer new thumbnails when a link repaint will retry on their cells.
-            if let Some(proto) = app.image_proto.filter(|_| links_ready) {
-                if app.image_placed != app.painted_images {
-                    if app.painted_images.is_empty() {
-                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
-                        app.painted_images = app.image_placed.clone();
-                    } else {
-                        // Old thumbnails stay on screen until cleared:
-                        // redraw from scratch, then paint the new ones.
-                        app.painted_images.clear();
-                        app.force_redraw = true;
-                    }
-                }
-            }
+            paint_inline_images(&mut app, &mut stdout(), links_ready);
             // Handle everything queued before the next draw, so a burst of
             // scroll events costs one frame, not one frame each.
             let mut wait = Duration::from_millis(50);
@@ -20760,6 +20776,7 @@ mod tests {
             chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
+            kitty_images_suppressed: false,
             pane_widths: (22, 26),
             input_focus: false,
             approval_explain: false,
@@ -27802,6 +27819,58 @@ mod tests {
             render(&mut app, 100, 12);
             assert!(app.image_placed.is_empty());
         }
+    }
+
+    #[test]
+    fn kitty_thumbnails_are_cleared_while_permission_prompt_is_visible() {
+        let mut app = test_app();
+        app.image_proto = Some(images::Protocol::Kitty);
+        app.topic.push_permission(topic::HarnessPermission {
+            permission_id: "p1".into(),
+            session_id: "harness-session".into(),
+            topic_id: "t1".into(),
+            attempt_id: "a1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run a command".into(),
+            kind: "execute".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        });
+
+        let screen = render(&mut app, 30, 16);
+        assert!(screen.contains("1. Allow once"), "{screen}");
+        let thumbnail = images::Placed {
+            x: 4,
+            y: 5,
+            cols: 20,
+            path: "/missing/thumbnail.png".into(),
+        };
+        app.image_placed = vec![thumbnail.clone()];
+        app.painted_images = vec![thumbnail];
+
+        let mut output = Vec::new();
+        paint_inline_images(&mut app, &mut output, false);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(app.painted_images.is_empty());
+        assert!(app.kitty_images_suppressed);
+
+        let mut repeated = Vec::new();
+        paint_inline_images(&mut app, &mut repeated, false);
+        assert!(repeated.is_empty(), "don't resend deletes every frame");
+        assert_eq!(
+            app.topic
+                .key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            topic::Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: Some("allow".into()),
+            }
+        );
     }
 
     #[test]
