@@ -204,16 +204,8 @@ pub fn harness_availability(info: &formless_protocol::HarnessAvailability) -> St
         }
     };
     format!(
-        "{} · {status}{}{}",
-        chosen_harness(Some(info.kind), info.acp_agent.as_deref()),
-        info.version
-            .as_ref()
-            .map(|v| format!(" · version {v}"))
-            .unwrap_or_default(),
-        info.detail
-            .as_ref()
-            .map(|d| format!(" · {d}"))
-            .unwrap_or_default()
+        "{} · {status}",
+        chosen_harness(Some(info.kind), info.acp_agent.as_deref())
     )
 }
 

@@ -146,6 +146,7 @@ impl TranscriptState {
             Err(error) => return self.need_reload(ReloadReason::InvalidMessage(error)),
         };
         let kind = block_kind(message);
+        let generated = crate::model::GeneratedMessage::of(message);
         let attachments = if message.role == "user" {
             crate::transcript_attachments::decode(message.meta.as_deref())
         } else {
@@ -160,6 +161,7 @@ impl TranscriptState {
                 Some(old) => {
                     !hidden
                         && old.kind == kind
+                        && old.generated() == generated
                         && old.markdown() == message.content
                         && old.attachments() == attachments
                 }
@@ -184,6 +186,7 @@ impl TranscriptState {
         if !hidden {
             timeline.append_persisted(
                 TimelineBlock::new(seq, kind, message.content.clone())
+                    .with_generated(generated)
                     .with_attachments(attachments),
             );
             changed = true;
@@ -473,6 +476,20 @@ mod tests {
                 let blocks = transcript.timeline().blocks();
                 assert_eq!(blocks[0].kind.label(), "You");
                 assert_eq!(blocks[1].kind.label(), "Note");
+                assert_eq!(blocks[0].generated(), None);
+                assert_eq!(
+                    blocks[1].generated().unwrap().details_label(),
+                    if marker == "topic_kickoff" {
+                        "Orchestration details"
+                    } else {
+                        "Message details"
+                    }
+                );
+                assert_eq!(
+                    blocks[0].markdown(),
+                    blocks[1].markdown(),
+                    "summaries never replace canonical source"
+                );
                 assert_eq!(blocks[1].attachments().len(), 1);
                 assert!(transcript.reload_needed().is_none());
             }

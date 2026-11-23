@@ -251,6 +251,49 @@ pub(super) fn availability(ui: &Ui, busy: bool, cx: &mut Context<Shell>) -> AnyE
             )
             .text_xs(),
         );
+        if ui.show_harness_details {
+            for (field, value) in [
+                ("version", &harness.version),
+                ("diagnostic", &harness.detail),
+            ] {
+                if let Some(value) = value {
+                    panel = panel.child(
+                        readable(
+                            SharedString::from(format!("topic-harness-{field}-{index}")),
+                            format!(
+                                "{} · {field}: {value}",
+                                topics::chosen_harness(
+                                    Some(harness.kind),
+                                    harness.acp_agent.as_deref()
+                                )
+                            ),
+                        )
+                        .text_xs(),
+                    );
+                }
+            }
+        }
+    }
+    if ui
+        .state
+        .harnesses
+        .iter()
+        .any(|harness| harness.detail.is_some() || harness.version.is_some())
+    {
+        panel = panel.child(
+            Button::new("topic-harness-details")
+                .small()
+                .ghost()
+                .label(if ui.show_harness_details {
+                    "Hide readiness details"
+                } else {
+                    "Show readiness details"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.topic_ui.show_harness_details = !this.topic_ui.show_harness_details;
+                    cx.notify();
+                })),
+        );
     }
     panel.into_any_element()
 }

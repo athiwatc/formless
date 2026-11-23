@@ -106,7 +106,7 @@ impl UnfinishedRun {
 
 /// Display daemon-generated user turns as notes, not as the user's words.
 pub fn block_kind(message: &MessageInfo) -> BlockKind {
-    if message.role == "user" && message.generated_by.is_some() {
+    if crate::model::GeneratedMessage::of(message).is_some() {
         return BlockKind::Note;
     }
     match message.role.as_str() {
@@ -231,6 +231,7 @@ pub(crate) fn message_sequence(asked: &str, message: &MessageInfo) -> Result<u64
 fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlock>, DecodeError> {
     let id = message_sequence(asked, &message)?;
     let kind = block_kind(&message);
+    let generated = crate::model::GeneratedMessage::of(&message);
     if kind == BlockKind::Assistant && message.content.trim().is_empty() {
         return Ok(None);
     }
@@ -240,7 +241,9 @@ fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlo
         Vec::new()
     };
     Ok(Some(
-        TimelineBlock::new(id, kind, message.content).with_attachments(attachments),
+        TimelineBlock::new(id, kind, message.content)
+            .with_generated(generated)
+            .with_attachments(attachments),
     ))
 }
 

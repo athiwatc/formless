@@ -4732,8 +4732,9 @@ impl Shell {
                 // line that says so goes above and below the text, because a
                 // window can be far taller than the viewport.
                 let streaming = blocks.is_streaming() && index + 1 == blocks.len();
-                let above = block_window_line(block, streaming, "top", &shell, cx);
-                let below = block_window_line(block, streaming, "bottom", &shell, cx);
+                let generated = block.generated();
+                let above = generated.is_none().then(|| block_window_line(block, streaming, "top", &shell, cx)).flatten();
+                let below = generated.is_none().then(|| block_window_line(block, streaming, "bottom", &shell, cx)).flatten();
                 v_flex()
                     .id(("block", id))
                     .test_support()
@@ -4758,6 +4759,16 @@ impl Shell {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(Label::new(block.kind.label()).font_semibold())
+                            .children(generated.map(|generated| {
+                                let shell = shell.clone();
+                                Button::new(SharedString::from(format!("block-{id}-details")))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(generated.details_label())
+                                    .on_click(move |_, window, cx| {
+                                        shell.update(cx, |this, cx| this.view_block(id as u64, window, cx).ok());
+                                    })
+                            }))
                             .child({
                                 let shell = shell.clone();
                                 Button::new(SharedString::from(format!("block-{id}-copy-source")))
@@ -4795,9 +4806,12 @@ impl Shell {
                         // assistive technology is reading the window (GPUI
                         // builds no accessibility tree otherwise), and in
                         // the test harness, which has no platform to ask.
-                        let text = SharedString::from(block.preview().clone());
+                        let text = generated.map(|generated| SharedString::from(generated.summary()))
+                            .unwrap_or_else(|| SharedString::from(block.preview().clone()));
                         let read = window.is_a11y_active() || cfg!(feature = "test-support");
-                        let accessible: SharedString = if read {
+                        let accessible: SharedString = if let Some(generated) = generated {
+                            generated.summary().into()
+                        } else if read {
                             block.accessible_text().into()
                         } else {
                             text.clone()
@@ -6307,6 +6321,30 @@ impl Shell {
     fn render_inspector(&self, modal: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.inspector_focus.is_focused(window);
         let row = self.sidebar.active_row();
+        // SessionInfo.preview is the latest user-role turn and carries no
+        // provenance. Use canonical metadata, not its text, to summarize it.
+        let last_message = if self.client.is_some() {
+            if self.client_snapshot_ready {
+                self.blocks
+                    .borrow()
+                    .blocks()
+                    .iter()
+                    .rev()
+                    .find(|block| block.kind == BlockKind::User || block.generated().is_some())
+                    .map(|block| {
+                        block
+                            .generated()
+                            .map(|generated| generated.summary().to_owned())
+                            .unwrap_or_else(|| block.markdown().chars().take(2000).collect())
+                    })
+                    .unwrap_or_else(|| "None".into())
+            } else {
+                "Loading last message…".into()
+            }
+        } else {
+            row.and_then(|row| row.preview.clone())
+                .unwrap_or_else(|| "None".into())
+        };
         // Each detail is one line to assistive technology: its name, then
         // its value.
         let detail = |id: &'static str, label: &'static str, value: String| {
@@ -6366,8 +6404,7 @@ impl Shell {
             .child(detail(
                 "inspector-last-message",
                 "Last message",
-                row.and_then(|row| row.preview.clone())
-                    .unwrap_or_else(|| "None".to_string()),
+                last_message,
             ))
             .when(self.client.is_some(), |details| {
                 details.child(self.render_session_usage(cx))

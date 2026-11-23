@@ -20,6 +20,7 @@ pub(super) struct Ui {
     tree_scroll: ScrollHandle,
     pending_open: Option<String>,
     show_outline_details: bool,
+    show_harness_details: bool,
     policy: Option<policy::Editor>,
 }
 
@@ -31,6 +32,7 @@ impl Ui {
         self.selected.clear();
         self.pending_open = None;
         self.show_outline_details = false;
+        self.show_harness_details = false;
         self.parent = None;
         self.choosing_parent = false;
         self.policy = None;
@@ -39,6 +41,7 @@ impl Ui {
         self.selected.retain(|id| available.contains(id.as_str()));
     }
     pub fn session_changed(&mut self, session: Option<&str>) {
+        self.show_harness_details = false;
         self.policy = None;
         self.proposing = false;
         self.selected.clear();
@@ -78,6 +81,7 @@ impl Ui {
             tree_scroll: ScrollHandle::new(),
             pending_open: None,
             show_outline_details: false,
+            show_harness_details: false,
             policy: None,
         }
     }

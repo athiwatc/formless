@@ -215,8 +215,10 @@ fn policy_receipt_keeps_the_current_read_only_attempt_and_shows_unknown_sign_in_
                             acp_agent: None,
                             installed: true,
                             signed_in: None,
-                            version: None,
-                            detail: None,
+                            version: Some("test-version".into()),
+                            detail: Some(
+                                "{\"signed_in\":null,\"diagnostic\":\"raw status\"}".into(),
+                            ),
                         },
                     ])),
                 },
@@ -237,7 +239,93 @@ fn policy_receipt_keeps_the_current_read_only_attempt_and_shows_unknown_sign_in_
             .value()
             .unwrap()
             .contains("sign-in status unknown"));
+        assert!(!window
+            .find("topic-harness-ready-0")
+            .value()
+            .unwrap()
+            .contains("test-version"));
+        assert!(window.try_find("topic-harness-diagnostic-0").is_none());
+        reveal_topic_control(window, cx, "topic-harness-details");
+        window.click("topic-harness-details", cx);
+        window.render_frame(cx);
+        assert!(window
+            .find("topic-harness-diagnostic-0")
+            .value()
+            .unwrap()
+            .contains("{\"signed_in\":null"));
+        reveal_topic_control(window, cx, "topic-harness-details");
+        window.click("topic-harness-details", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("topic-harness-diagnostic-0").is_none());
         assert!(shell.update(cx, |s, _| s.take_client_commands()).is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    workspace(cx, handle, &shell);
+    let raw =
+        "Launch independent features concurrently.\nHarness readiness: [{\"installed\":false}]";
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("topic-topic-formless", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-last-message").value(),
+            Some("Last message: Loading last message…")
+        );
+        let generation = shell.read(cx).client_generation();
+        let mut messages = vec![
+            serde_json::json!({"id":"real","session_id":"topic-chat","seq":1,"role":"user","content":raw,"created_at":"now"}),
+        ];
+        let install = |messages: &[serde_json::Value], window: &mut Window, cx: &mut App| {
+            shell.update(cx, |s, cx| s.apply_client_update(Update::Snapshot {
+                generation,
+                snapshot: replies::session_snapshot("topic-chat", &serde_json::json!({"session":{"id":"topic-chat"},"running":false,"messages":messages})).unwrap(),
+            }, window, cx));
+        };
+        install(&messages, window, cx);
+        window.render_frame(cx);
+        assert_eq!(window.find(("block", 1usize)).label(), Some("You"));
+        assert!(window
+            .find(("block-text", 1usize))
+            .value()
+            .unwrap()
+            .contains("Harness readiness"));
+        assert_eq!(
+            window.find("inspector-last-message").value(),
+            Some(format!("Last message: {raw}").as_str())
+        );
+        messages.push(serde_json::json!({"id":"generated","session_id":"topic-chat","seq":2,"role":"user","generated_by":"topic_kickoff","content":raw,"created_at":"now"}));
+        install(&messages, window, cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let summary = formless_desktop::model::GeneratedMessage::TopicKickoff.summary();
+        assert_eq!(window.find(("block", 2usize)).label(), Some("Note"));
+        assert_eq!(window.find(("block-text", 2usize)).value(), Some(summary));
+        assert_eq!(
+            window.find("inspector-last-message").value(),
+            Some(format!("Last message: {summary}").as_str())
+        );
+        window.click("block-2-details", cx);
+        window.render_frame(cx);
+        assert!(shell.read(cx).viewer_rows().is_some());
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(raw.into())
+        );
+        window.press("escape", cx);
+        messages.push(serde_json::json!({"id":"real-again","session_id":"topic-chat","seq":3,"role":"user","content":raw,"created_at":"now"}));
+        install(&messages, window, cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("inspector-last-message").value(),
+            Some(format!("Last message: {raw}").as_str())
+        );
     });
 }
 
