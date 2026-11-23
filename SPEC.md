@@ -991,6 +991,32 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
+The singleton Main Chat answers everyday questions in place. For an explicit
+request to organize work, the Main or Topic Chat assistant can call
+`read_topic_context` for recent persisted user messages, the working directory,
+and the topic hierarchy. Work can be in any domain. A proposal can name a
+workspace or use scratch space. An outline reflects only stated or standing
+preferences, can assign any supported harness to any step, and is advisory:
+the Formless model in Topic Chat makes the final decisions.
+`propose_topic` records a `pending_approval` topic for the same consent UI
+used by manual proposals. Independent features can reference the same
+original message, and each proposed feature is visible in the shared topic
+inventory. When the user has not specified a parent, a proposal from a Topic
+Chat defaults under that topic; a proposal from Main defaults directly under
+Main. Attempt sessions and nested agents do not get suggestion tools.
+Topic Chat suggestions see the current topic, its ancestors and descendants,
+unless the user enables external context. Main sees the whole tree. The
+Topic Chat assistant may answer a harness question only with a basis in a user
+request or decision, and never answers user-only questions or permissions.
+Approval, rejection, cancellation, permission rules, limits and external
+context access are user actions, not assistant tools.
+Suggesting or declining never moves a message or starts a
+harness; only an explicit approval in the client can authorize that. A chat
+reply, including “yes”, is not consent. Repeating a pending suggestion for
+the same source chat, messages, workspace, and parent returns the existing
+proposal; declining it does not cause the assistant to propose it again
+automatically.
+
 - Each user message in a Session starts a **Run**: the agent loops
   (think → tool call(s) → observe) autonomously until it produces a final
   answer, is interrupted, or pauses on provider failure/limit-free errors.
@@ -6681,7 +6707,7 @@ Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
-`FORMLESS_FIXTURE_INSTALL_TARGET`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`, `FORMLESS_FIXTURE_TOKEN`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -7070,7 +7096,9 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+another harness. Antigravity, ACP profiles, and Muse Code use their integrated
+interactive adapters; ACP requires a valid acp_agent, and Muse Code requires
+one-run workspace trust from the user. Pi and OpenCode currently return
 actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
@@ -7081,7 +7109,7 @@ topics become NeedsUser, with durable detail and no automatic restart.
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
 CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
-`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, and
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
@@ -7114,10 +7142,10 @@ sets persisted allow_external_context (default false); opting in permits all
 non-deleted conversations. List/read/search share this scope. Search is a
 case-insensitive substring match returning at most 40 bounded snippets.
 
-The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
-in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
-are otherwise opaque until adapter integration. It is retained in advisory
-steps and attempt metadata.
+The wire also includes ACP (acp) and Muse (muse). ACP dispatches through the
+registered named-agent adapter and requires acp_agent to be nonempty and
+present only for ACP; selectors are validated against the registry and retained
+in advisory steps and attempt metadata.
 
 Harness questions reuse UserQuestion, AnswerQuestion and UserQuestionClosed on
 the canonical attempt conversation. Topic MCP AskUser and InteractionHandler
@@ -7203,22 +7231,45 @@ entry per ACP registry id with acp_agent set. Every probe is capped at
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
---version and auth status; Codex uses --version and login status. Neither sends
-a model turn, and no auth output is copied into detail or logs.
+--version and auth status; Codex uses --version and login status. Muse Code
+checks its version before using usage --json and only confirms sign-in when
+it receives a Meta account allowance. These probes do not send model turns
+or copy raw auth output into detail or logs.
 
-CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
-the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
-and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). FORMLESS_TOPIC_ACP_EXE applies
-to each ACP registry probe; without it each agent's own command is looked up on
-PATH. ACP dispatch runs the registry's bounded availability probe on a blocking
-worker, including initialize version (agentInfo.version, then _meta.agentVersion)
-and session/new sign-in checks. Pi, OpenCode, and Muse have dedicated fallback
-dispatch arms that look up the executable and run
---version in a private cwd under the probe deadline, with kill-on-drop and
-process-group cleanup. Their auth remains unknown, including version failures.
-Antigravity retains its dedicated readiness probe.
-Adapter owners can replace those fallbacks
-with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths;
+otherwise each kind resolves its command from PATH. This includes
+FORMLESS_TOPIC_OPENCODE_EXE, FORMLESS_TOPIC_PI_EXE, and FORMLESS_TOPIC_MUSE_EXE.
+Pi and OpenCode use bounded --version fallback probes in a private cwd. Muse
+Code checks its version before usage --json and confirms sign-in only when it
+receives a Meta account allowance. Antigravity retains its dedicated readiness
+probe.
+
+ACP applies FORMLESS_TOPIC_ACP_EXE to each named-agent preparation; otherwise
+the agent's command is resolved from the daemon's PATH. Readiness canonicalizes
+the selected absolute path and probes that same path on a bounded blocking
+worker, including initialize version (agentInfo.version, then
+_meta.agentVersion) and session/new sign-in checks. Each topic step carries the
+availability and resolved executable internally; the public HarnessAvailability
+and ListHarnesses shapes remain unchanged. The topic launch receives the same
+absolute executable that readiness probed and never rereads the ACP override or
+PATH. Workspace-local PATH entries therefore cannot substitute a different ACP
+executable. If preparation does not produce an executable identity, the step
+stops before attempt launch with the existing retry/substitute guidance. When
+an identity exists, unknown authentication retains the existing ready behavior
+(installed && signed_in != Some(false)). If the selected path disappears before
+spawn, launch fails without a PATH fallback. Resolution is fresh after each
+retry or approved substitute; this pins path selection, not executable
+contents.
+
+The reusable ACP probe initializes and creates a session with no MCP servers in
+a private temporary cwd, never prompts, maps configured auth errors, and kills
+its process group on success, failure or timeout. ACP's inner probe deadline is
+eight seconds; the blocking worker is bounded at ten seconds. Adapter blocking
+probes must enforce their own internal deadline and kill child processes on
+drop: core's outer timeout cannot abort spawn_blocking. Core does not own the
+ACP agent registry and omits the bare ACP entry from ListHarnesses; the ACP
+adapter's registry supplies per-agent entries. The per-kind probe dispatch
+receives the selected acp_agent id.
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.

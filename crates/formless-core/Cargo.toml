@@ -50,7 +50,7 @@ tokio-util.workspace = true
 toml.workspace = true
 toml_edit = "0.22"
 tracing.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 axum = { version = "0.8", features = ["ws"] }
 
 # Native filesystem operations use platform ABI constants (including Darwin statfs).

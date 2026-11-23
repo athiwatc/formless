@@ -6,6 +6,12 @@ fn fixture() -> (ProbeDirectory, ProbeContext) {
     let path = root.0.join("fixture");
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,time,pathlib,subprocess
+if pathlib.Path(sys.argv[0]).name=='muse':
+    if sys.argv[1:]==['--version']:
+        print('Muse Code 1.4.24');sys.exit()
+    if sys.argv[1:]==['usage','--json']:
+        print(json.dumps({'schemaVersion':1,'allowance':{'tier':'fixture'}}));sys.exit()
+    sys.exit(7)
 if '--version' in sys.argv:
     if os.environ.get('PROBE_VERSION_FAIL'):sys.exit(1)
     if os.environ.get('PROBE_VERSION_HANG'):
@@ -85,7 +91,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
-async fn list_probes_run_concurrently_and_fallbacks_report_versions() {
+async fn list_probes_run_concurrently_and_report_fallbacks_and_muse_allowance() {
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -153,8 +159,8 @@ async fn list_probes_run_concurrently_and_fallbacks_report_versions() {
         .all(|value| value.signed_in.is_none() && value.version.is_none()));
     let muse = values.last().unwrap();
     assert_eq!(muse.kind, HarnessKind::Muse);
-    assert_eq!(muse.signed_in, None);
-    assert_eq!(muse.version.as_deref(), Some("fixture 1.0"));
+    assert_eq!(muse.version.as_deref(), Some("1.4.24"));
+    assert_eq!(muse.signed_in, Some(true));
 }
 
 #[tokio::test]
@@ -332,7 +338,7 @@ async fn fallback_missing_version_failure_and_timeout_keep_auth_unknown_and_kill
     ctx.executable = executable;
     ctx.environment
         .insert("PROBE_VERSION_FAIL".into(), "1".into());
-    let failed = dispatch(HarnessKind::Muse, &ctx, None).await;
+    let failed = dispatch(HarnessKind::Pi, &ctx, None).await;
     assert!(failed.installed);
     assert_eq!(failed.signed_in, None);
     assert_eq!(failed.version, None);

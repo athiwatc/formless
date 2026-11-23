@@ -31,9 +31,9 @@ impl Default for ProbeContext {
     }
 }
 
-struct ProbeDirectory(PathBuf);
+pub(super) struct ProbeDirectory(pub(super) PathBuf);
 impl ProbeDirectory {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("formless-probe-{}", uuid::Uuid::new_v4()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -127,7 +127,7 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
     }
     None
 }
-fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
+pub(super) fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
     HarnessAvailability {
         kind,
         acp_agent: None,
@@ -305,9 +305,7 @@ async fn acp_readiness(ctx: &ProbeContext, agent: &str) -> HarnessReadiness {
         .environment
         .get(std::ffi::OsStr::new("FORMLESS_TOPIC_ACP_EXE"))
         .map(PathBuf::from)
-        .or_else(|| {
-            (!ctx.executable.as_os_str().is_empty()).then(|| ctx.executable.clone())
-        });
+        .or_else(|| (!ctx.executable.as_os_str().is_empty()).then(|| ctx.executable.clone()));
     let mut base = availability(HarnessKind::Acp, executable.as_deref());
     base.acp_agent = Some(agent.into());
     let id = agent.to_owned();
@@ -315,11 +313,7 @@ async fn acp_readiness(ctx: &ProbeContext, agent: &str) -> HarnessReadiness {
     match tokio::time::timeout(
         Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
-            super::acp_agents::availability_with_executable(
-                &id,
-                executable,
-                &environment,
-            )
+            super::acp_agents::availability_with_executable(&id, executable, &environment)
         }),
     )
     .await
@@ -369,7 +363,7 @@ async fn dispatch(
             };
             acp_readiness(ctx, agent).await.availability
         }
-        HarnessKind::Muse => fallback_probe(kind, ctx).await,
+        HarnessKind::Muse => super::muse::probe(ctx).await,
     }
 }
 async fn probe_environment(
@@ -456,10 +450,7 @@ async fn probe_environment_with_identity(
     }
 }
 
-pub(crate) async fn harness_readiness(
-    kind: HarnessKind,
-    agent: Option<&str>,
-) -> HarnessReadiness {
+pub(crate) async fn harness_readiness(kind: HarnessKind, agent: Option<&str>) -> HarnessReadiness {
     probe_environment_with_identity(
         kind,
         agent,

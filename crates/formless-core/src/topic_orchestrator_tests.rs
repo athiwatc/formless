@@ -282,8 +282,8 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     assert_eq!(message.role, "user");
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
     assert!(message.content.contains(concat!(
-        "Available harness kinds: claude, codex, antigravity, acp; ",
-        "pi, opencode and muse currently return adapter-not-integrated errors. ",
+        "Available harness kinds: claude, codex, antigravity, acp, muse; ",
+        "pi and opencode currently return adapter-not-integrated errors. ",
         "ACP requires acp_agent."
     )));
     assert!(message
@@ -2330,7 +2330,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     let executable = script(&f, &env);
-    env.set("FORMLESS_TOPIC_MUSE_EXE", executable);
+    env.set("FORMLESS_TOPIC_OPENCODE_EXE", executable);
     let topic = topic(&f, None, false);
     f.daemon()
         .with_store(|st| st.claim_topic_workflow(&topic.id))
@@ -2342,7 +2342,7 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
             &session,
             &step(
                 &topic.features[0].id,
-                HarnessKind::Muse,
+                HarnessKind::OpenCode,
                 StepAccess::Write,
                 &[],
             ),
@@ -2390,6 +2390,160 @@ async fn topic_orchestrator_fixture_unavailable_adapter_and_missing_executable_a
         )
         .await
         .is_err());
+}
+
+async fn run_muse_fixture(shutdown: bool) {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let path = f.root.join("fake-muse");
+    std::fs::write(&path, r#"#!/usr/bin/env python3
+import json, os, sys, time, uuid
+if sys.argv[1:] == ["--version"]:
+    print("Muse Code 1.4.24")
+    sys.exit()
+if sys.argv[1:] == ["usage", "--json"]:
+    print(json.dumps({"schemaVersion":1,"allowance":{"tier":"fixture"}}))
+    sys.exit()
+session, turn = str(uuid.uuid4()), str(uuid.uuid4())
+def receive(method):
+    request = json.loads(sys.stdin.readline())
+    assert request["method"] == method
+    return request
+def respond(request, result):
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+def notify(method, **params):
+    print(json.dumps({"jsonrpc": "2.0", "method": method, "params": {"sessionId":session, **params}}), flush=True)
+assert "--trust-workspace" in sys.argv and "--disable-write" in sys.argv and "--disable-shell" in sys.argv
+assert "FORMLESS_TOPIC_CAPABILITY" not in os.environ
+respond(receive("initialize"), {"schema":{"version":1}, "sessionDurability":"ephemeral", "grantedCapabilities":["sessionMcp"]})
+receive("initialized")
+request = receive("session/start")
+assert request["params"]["workspaceRoot"] == os.getcwd()
+bridge, = request["params"]["config"]["mcpServers"].values()
+assert bridge["mode"] == "required" and bridge["env"]["FORMLESS_TOPIC_CAPABILITY"]
+respond(request, {"session":{"sessionId":session, "path":"", "approvalMode":{"mode":"promptUnmatched"}}})
+request = receive("turn/start")
+respond(request, {"status":"accepted", "disposition":"started", "commandId":request["params"]["commandId"], "turnId":turn})
+if fixture_pid := os.environ.get("TOPIC_FIXTURE_MUSE_PID"):
+    with open(fixture_pid, "w") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(120)
+item = {"itemId":"message", "kind":"agentMessage", "turnId":turn, "messagePhase":"finalAnswer"}
+notify("item/started", item=item)
+notify("item/delta", itemId="message", field="text", delta="Muse ")
+notify("item/delta", itemId="message", field="text", delta="fixture complete")
+notify("item/completed", item={**item, "text":"Muse fixture complete"})
+notify("turn/completed", turnId=turn, terminal="completed")
+assert sys.stdin.readline() == ""
+"#).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    env.set("FORMLESS_TOPIC_MUSE_EXE", &path);
+    let pid_path = f.root.join("muse-pid");
+    if shutdown {
+        env.set("TOPIC_FIXTURE_MUSE_PID", &pid_path);
+    }
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let args = step(
+        &topic.features[0].id,
+        HarnessKind::Muse,
+        StepAccess::ReadOnly,
+        &[],
+    );
+    let daemon = f.daemon().clone();
+    let (tx, mut events) = mpsc::channel(64);
+    daemon.subs.locked().push(Subscriber {
+        conn: 99,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    let task = tokio::spawn(async move {
+        daemon
+            .run_topic_step_until_done(&session, &args, &CancellationToken::new())
+            .await
+    });
+    let (permission_id, options) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let ServerMessage::Event(Event::HarnessPermissionRequested {
+                permission_id,
+                harness,
+                kind,
+                options,
+                ..
+            }) = events.recv().await.unwrap()
+            {
+                assert_eq!(harness, HarnessKind::Muse);
+                assert_eq!(kind, "trust_workspace");
+                break (permission_id, options);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let allow_once = options
+        .into_iter()
+        .find(|option| option.kind == formless_protocol::HarnessPermissionOptionKind::AllowOnce)
+        .unwrap();
+    f.daemon()
+        .handle(Request::HarnessPermissionDecision {
+            permission_id,
+            option_id: Some(allow_once.option_id),
+        })
+        .await
+        .unwrap();
+    let pid = if shutdown {
+        wait_until(|| std::fs::read_to_string(&pid_path).is_ok_and(|pid| !pid.is_empty())).await;
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        f.daemon().shutdown.cancel();
+        Some(pid)
+    } else {
+        None
+    };
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    if let Some(pid) = pid {
+        assert_eq!(result["status"], "cancelled", "{result}");
+        assert_eq!(result["summary"], "Muse Code run cancelled");
+        wait_until(|| unsafe { libc::kill(pid, 0) } == -1).await;
+        return;
+    }
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["summary"], "Muse fixture complete");
+    let conversation = result["conversation_session_id"].as_str().unwrap();
+    let messages = f
+        .daemon()
+        .with_reader(|st| st.list_messages(conversation))
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Muse fixture complete"]
+    );
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_muse_grants_one_run_trust_and_streams() {
+    run_muse_fixture(false).await;
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_shutdown_stops_active_muse_step() {
+    run_muse_fixture(true).await;
 }
 
 #[tokio::test]
@@ -3108,6 +3262,8 @@ while True:
             selected=os.environ.get('TOPIC_FIXTURE_SELECTED_EXECUTABLE')
             if selected:pathlib.Path(selected).unlink()
         send({'jsonrpc':'2.0','id':message['id'],'result':{'sessionId':'gemini-topic'}})
+    elif method=='session/set_mode':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{}})
     elif method=='session/prompt':
         prompt=message['id']
         pathlib.Path(os.environ['TOPIC_FIXTURE_PID']).write_text(str(os.getpid()))
@@ -3138,7 +3294,10 @@ while True:
     env.set("TOPIC_FIXTURE_PID", f.root.join("gemini-pid"));
     env.set("TOPIC_FIXTURE_CHILD_PID", f.root.join("gemini-child-pid"));
     env.set("TOPIC_FIXTURE_TRUSTED_STARTS", f.root.join("gemini-starts"));
-    env.set("TOPIC_FIXTURE_DECOY_MARKER", f.root.join("gemini-decoy-started"));
+    env.set(
+        "TOPIC_FIXTURE_DECOY_MARKER",
+        f.root.join("gemini-decoy-started"),
+    );
     env.set("PATH", &bin);
     path
 }
@@ -3254,7 +3413,7 @@ async fn topic_gemini_uses_daemon_resolved_executable_over_workspace_path_decoy(
         .await
         .unwrap();
 
-    assert_eq!(result["status"], "completed", "{result}");
+    assert_eq!(result["status"], "succeeded", "{result}");
     assert_eq!(
         std::fs::read_to_string(f.root.join("gemini-starts"))
             .unwrap()
@@ -3296,7 +3455,10 @@ async fn topic_acp_missing_resolution_stops_before_launch_with_retry_guidance() 
         .unwrap_err()
         .to_string();
     assert!(error.contains("not ready"), "{error}");
-    assert!(error.contains("topic_request_harness_substitute"), "{error}");
+    assert!(
+        error.contains("topic_request_harness_substitute"),
+        "{error}"
+    );
     assert!(!f.root.join("gemini-starts").exists());
 }
 
