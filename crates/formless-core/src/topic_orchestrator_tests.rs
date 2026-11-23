@@ -3129,6 +3129,21 @@ while True:
     env.set("PATH", &bin);
 }
 
+fn pid_is_running(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, rest)| rest.starts_with('Z'))
+        })
+        == Some(true)
+    {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 #[tokio::test]
 async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and_cancel() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -3175,7 +3190,7 @@ async fn topic_orchestrator_fixture_gemini_acp_step_launches_with_permission_and
             assert_eq!(result["status"], "cancelled", "{result}");
             for path in [pid_path, child_pid_path] {
                 let pid: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
-                assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+                wait_until(|| !pid_is_running(pid)).await;
             }
             continue;
         }
