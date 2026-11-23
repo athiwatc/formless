@@ -11,9 +11,9 @@ assert.ok(functionEnd > functionStart, "docs topic resolver is complete");
 const context = vm.createContext({});
 vm.runInContext(source.slice(functionStart, functionEnd), context);
 
-const topicsLine = source.split("\n").find((line) => line.includes("const DOCS_TOPICS = {") && line.includes("docs/architecture.md"));
+const topicsLine = source.split("\n").find((line) => line.includes("const topics = {") && line.includes("docs/architecture.md"));
 assert.ok(topicsLine, "web docs topic table exists");
-const topics = vm.runInNewContext(`(${topicsLine.trim().replace(/^const DOCS_TOPICS = /, "").replace(/;$/, "")})`);
+const topics = vm.runInNewContext(`(${topicsLine.trim().replace(/^const topics = /, "").replace(/;$/, "")})`);
 const docsCommandLine = source.split("\n").find((line) => line.includes('{ name: "docs",'));
 assert.ok(docsCommandLine, "docs command is registered");
 
@@ -26,5 +26,5 @@ test("web /docs topic resolution matches exact, unique-prefix, and ambiguity rul
   assert.equal(resolve("a").error, 'ambiguous docs topic "a": matches approvals, architecture');
   assert.equal(resolve("c").error, 'ambiguous docs topic "c": matches capabilities, cli');
   assert.equal(resolve("not-a-topic").error, `unknown docs topic "not-a-topic". Available topics: ${Object.keys(topics).join(", ")}`);
-  assert.ok(docsCommandLine.includes('Object.keys(DOCS_TOPICS).join(", ")'));
+  assert.ok(docsCommandLine.includes('Object.keys(topics).join(", ")'));
 });
