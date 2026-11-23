@@ -7736,8 +7736,10 @@
     if (matches.length > 1) {
       return { error: `ambiguous docs topic "${topic}": matches ${matches.join(", ")}` };
     }
-    return { error: `unknown docs topic "${topic}"` };
+    return { error: `unknown docs topic "${topic}". Available topics: ${names.join(", ")}` };
   }
+
+  const DOCS_TOPICS = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", docker: "docs/docker.md", mcp: "docs/mcp.md", skills: "docs/skills.md", jobs: "docs/jobs.md", spec: "SPEC.md", usage: "docs/usage.md", cli: "docs/cli.md", architecture: "docs/architecture.md" };
 
   const COMMANDS = [
     { name: "new", args: "[TEMPLATE]", group: "Session", desc: "start a new Session, optionally from a template", run: (arg) => (arg ? newFromTemplate(arg) : newSession()) },
@@ -7819,12 +7821,11 @@
       if (!model) return note("usage: /pull MODEL", true);
       if (await act({ type: "ollama_pull", model })) note("pulling " + model + " with Ollama…");
     } },
-    { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: gallery, capabilities, approvals, keys, troubleshooting", run: (arg) => {
+    { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: " + Object.keys(DOCS_TOPICS).join(", "), run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
-      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", docker: "docs/docker.md", mcp: "docs/mcp.md", skills: "docs/skills.md", jobs: "docs/jobs.md", spec: "SPEC.md", usage: "docs/usage.md", cli: "docs/cli.md", architecture: "docs/architecture.md" };
-      const topic = resolveDocsTopic(topics, arg);
+      const topic = resolveDocsTopic(DOCS_TOPICS, arg);
       if (topic.error) return note(topic.error, true);
-      window.open(base + topics[topic.key], "_blank", "noopener");
+      window.open(base + DOCS_TOPICS[topic.key], "_blank", "noopener");
     } },
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
