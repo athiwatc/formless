@@ -1,5 +1,5 @@
 use crate::input::InputLine;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use formless_protocol::{
     HarnessKind, HarnessPermissionOption, HarnessPermissionOptionKind, MessageInfo, Request,
     SessionInfo, StepAccess, TopicArtifact, TopicAttemptInfo, TopicAttemptStatus,
@@ -622,6 +622,7 @@ pub struct State {
     proposal: Option<ProposalForm>,
     pending_reviewed: HashSet<String>,
     permissions: Vec<HarnessPermission>,
+    rendered_permission_id: Option<String>,
     last_refresh: Option<std::time::Instant>,
 }
 
@@ -636,6 +637,7 @@ impl Default for State {
             proposal: None,
             pending_reviewed: HashSet::new(),
             permissions: Vec::new(),
+            rendered_permission_id: None,
             last_refresh: None,
         }
     }
@@ -699,6 +701,7 @@ impl State {
             .any(|open| open.permission_id == permission.permission_id)
         {
             self.permissions.push(permission);
+            self.rendered_permission_id = None;
         }
     }
 
@@ -707,18 +710,27 @@ impl State {
             .permissions
             .iter()
             .position(|open| open.permission_id == permission_id)?;
-        Some(self.permissions.remove(index))
+        let permission = self.permissions.remove(index);
+        self.rendered_permission_id = None;
+        Some(permission)
     }
 
     /// Drops prompts from a daemon that went away; returns how many.
     pub fn clear_permissions(&mut self) -> usize {
+        self.rendered_permission_id = None;
         std::mem::take(&mut self.permissions).len()
     }
 
     fn permission_key(&mut self, key: KeyEvent) -> Action {
+        if key.kind == KeyEventKind::Repeat {
+            return Action::None;
+        }
         let Some(permission) = self.permissions.first() else {
             return Action::None;
         };
+        if self.rendered_permission_id.as_deref() != Some(&permission.permission_id) {
+            return Action::None;
+        }
         let decide = |option_id: Option<String>| Action::PermissionDecision {
             permission_id: permission.permission_id.clone(),
             option_id,
@@ -734,6 +746,7 @@ impl State {
             _ => return Action::None,
         };
         self.permissions.remove(0);
+        self.rendered_permission_id = None;
         action
     }
 
@@ -1695,9 +1708,12 @@ impl State {
 
     /// Drawn last in the frame: permission keys are handled before every
     /// other overlay, so the prompt must never be hidden beneath one.
-    pub fn draw_permission_overlay(&self, frame: &mut Frame, color: bool) {
+    pub fn draw_permission_overlay(&mut self, frame: &mut Frame, color: bool) {
         if let Some(permission) = self.permissions.first() {
             self.draw_permission(frame, permission, color);
+            self.rendered_permission_id = Some(permission.permission_id.clone());
+        } else {
+            self.rendered_permission_id = None;
         }
     }
 

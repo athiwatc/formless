@@ -1127,6 +1127,7 @@ mod tests {
             "nothing is auto-answered"
         );
         press(&mut app, KeyCode::Char('2'));
+        let _ = render(&mut app, 120);
         press(&mut app, KeyCode::Esc);
         assert_eq!(
             permission_decisions(&wire),
@@ -1150,6 +1151,36 @@ mod tests {
         assert_eq!(
             app.notes.last().unwrap(),
             "Topic rule r7 answered \"Run cargo test\": denied."
+        );
+    }
+
+    #[test]
+    fn permission_decisions_require_the_front_prompt_to_be_drawn() {
+        let (mut app, wire) = connected(vec![topic("t1", TopicStatus::Running)]);
+        app.on_event(permission_event("p1"));
+        app.on_event(permission_event("p2"));
+
+        press(&mut app, KeyCode::Char('1'));
+        assert!(permission_decisions(&wire).is_empty());
+
+        let _ = render(&mut app, 120);
+        let mut repeated = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        repeated.kind = crossterm::event::KeyEventKind::Repeat;
+        app.topic_permission_key(repeated);
+        assert!(permission_decisions(&wire).is_empty());
+
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(permission_decisions(&wire), [("p1".into(), Some("allow".into()))]);
+
+        let _ = render(&mut app, 120);
+        press(&mut app, KeyCode::Char('1'));
+        assert_eq!(
+            permission_decisions(&wire),
+            [
+                ("p1".into(), Some("allow".into())),
+                ("p2".into(), Some("allow".into()))
+            ]
         );
     }
 
