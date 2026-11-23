@@ -7277,8 +7277,9 @@ Adapter blocking probes must enforce their own internal deadline and kill
 child processes on drop: core's outer timeout cannot abort spawn_blocking.
 Core does not own the ACP agent registry and omits the bare ACP entry from
 ListHarnesses; the ACP adapter's registry supplies per-agent entries.
-The per-kind probe dispatch receives the selected acp_agent id, including
-for its current executable-only fallback. ACP is a protocol, not a CLI.
+The per-kind probe dispatch receives the selected acp_agent id. Named ACP
+profiles use the shared runner and retain the resolved executable identity from
+readiness through topic launch; they do not use an executable-only fallback.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.
