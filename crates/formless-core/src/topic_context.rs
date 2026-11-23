@@ -1,5 +1,5 @@
 use super::*;
-use crate::main_topic_suggestions::{suggestion_tree_scope, READ_TOPIC_CONTEXT};
+use crate::main_topic_suggestions::READ_TOPIC_CONTEXT;
 use anyhow::bail;
 
 impl Store {
@@ -100,9 +100,57 @@ impl Store {
     }
 
     fn topic_context_scope(&self, id: &str) -> Result<Option<std::collections::HashSet<String>>> {
-        let topics = self.list_topics()?;
-        Ok(suggestion_tree_scope(&topics, id)?
-            .map(|visible| visible.into_iter().map(str::to_owned).collect()))
+        let mut statement = self
+            .conn
+            .prepare("SELECT id,parent_topic_id,allow_external_context FROM topics")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut parents = std::collections::HashMap::<String, Option<String>>::new();
+        let mut children = std::collections::HashMap::<String, Vec<String>>::new();
+        let mut external = std::collections::HashSet::new();
+        for (topic_id, parent_id, allow_external_context) in rows {
+            if allow_external_context {
+                external.insert(topic_id.clone());
+            }
+            if let Some(parent_id) = &parent_id {
+                children
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(topic_id.clone());
+            }
+            parents.insert(topic_id, parent_id);
+        }
+        let Some(parent) = parents.get(id) else {
+            bail!("source topic not found");
+        };
+        if external.contains(id) {
+            return Ok(None);
+        }
+
+        let mut visible = std::collections::HashSet::new();
+        let mut pending = vec![id.to_owned()];
+        while let Some(topic_id) = pending.pop() {
+            if visible.insert(topic_id.clone()) {
+                if let Some(descendants) = children.get(&topic_id) {
+                    pending.extend(descendants.iter().cloned());
+                }
+            }
+        }
+        let mut ancestor = parent.as_deref();
+        while let Some(topic_id) = ancestor {
+            if !visible.insert(topic_id.to_owned()) {
+                break;
+            }
+            ancestor = parents.get(topic_id).and_then(|parent| parent.as_deref());
+        }
+        Ok(Some(visible))
     }
 }
 
