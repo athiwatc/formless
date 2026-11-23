@@ -4050,7 +4050,7 @@
     const items = [];
     if (m.role === "tool") items.push(item("Copy output", () => copy(m.content || "", "the output")));
     else if (m.content) {
-      const text = messageCopyText(node);
+      const text = m.role === "user" && m.generated_by != null ? m.content : messageCopyText(node);
       items.push(item("Copy", () => copy(text, "the message")));
       items.push(item("Copy as Markdown", () => copy(m.content, "as Markdown")));
     }

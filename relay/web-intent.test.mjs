@@ -401,11 +401,13 @@ const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] 
 const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
 test('generated user-role messages render as Formless and cannot be moved or edited as user requests', () => {
   const transcript = node('div');
+  const copied = [];
   const c = setup(['renderHistory', 'messageBody', 'messageMenu', 'beginEdit', 'assistantStopNote'], {
     h: node, isRunning: () => false, markdown: text => node('p', null, text),
     speaker: role => role === 'user' ? 'user' : 'assistant',
     sentElsewhere: () => null, withMentions: text => text, attachmentTags: () => [], steerStep: () => null,
     renderLive() {}, renderComposer() {}, closePopover() {}, placePopover() {}, messageCopyText: () => 'message',
+    copy: text => copied.push(text),
   });
   const lookup = c.$;
   c.$ = id => id === 'transcript' ? transcript : lookup(id);
@@ -447,6 +449,8 @@ test('generated user-role messages render as Formless and cannot be moved or edi
     c.S.topicsAvailable = true;
     c.messageMenu(c.$('trigger'), m, node('div'));
     const labels = plainText(vm.runInContext('popover', c));
+    all(vm.runInContext('popover', c)).find(n => n.tag === 'button' && plainText(n) === 'Copy').attrs.onclick();
+    assert.equal(copied.pop(), m.generated_by != null ? m.content : 'message', 'Copy retains original instructions even when the disclosure is closed');
     assert.equal(labels.includes('Move to topic'), m === original);
     assert.equal(labels.includes('Edit & re-run'), m === original);
     if (m === original) assert.match(labels, /drops the later turns/);
