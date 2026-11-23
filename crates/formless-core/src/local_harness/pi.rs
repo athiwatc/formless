@@ -693,10 +693,16 @@ where
         }
         Ok(result)
     };
-    finish().map_err(|error| {
-        let context = format!("Pi RPC execution failed: {error}; stderr tail: {stderr_tail}");
-        anyhow::anyhow!("{}", redact_text(&context, capability.as_deref()))
-    })
+    finish().map_err(|error| rpc_execution_error(error, &stderr_tail, capability.as_deref()))
+}
+
+fn rpc_execution_error(
+    error: anyhow::Error,
+    stderr_tail: &str,
+    capability: Option<&str>,
+) -> anyhow::Error {
+    let context = format!("Pi RPC execution failed: {error:#}; stderr tail: {stderr_tail}");
+    anyhow::anyhow!("{}", redact_text(&context, capability))
 }
 
 struct BoundedLineReader<R> {
@@ -2094,6 +2100,17 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
         assert!(error.to_string().contains("cancelled"));
         assert!(!request.cwd.join("spawned-marker").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_rpc_record_diagnostic_keeps_limit_cause_and_redacts_stderr() {
+        let error = anyhow::Error::new(record_limit_error(MAX_RPC_RECORD_BYTES))
+            .context("failed reading Pi RPC stdout");
+        let diagnostic = rpc_execution_error(error, "secret-token", Some("secret-token"));
+        let diagnostic = format!("{diagnostic:#}");
+        assert!(diagnostic.contains(&format!("{}-byte limit", MAX_RPC_RECORD_BYTES)));
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains("secret-token"));
     }
 
     #[cfg(unix)]
