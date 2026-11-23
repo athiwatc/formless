@@ -12402,7 +12402,7 @@ fn paint_inline_images(app: &mut App, out: &mut impl Write, links_ready: bool) {
         app.kitty_images_suppressed = false;
         return;
     };
-    if proto == images::Protocol::Kitty && app.topic.has_permission() {
+    if proto == images::Protocol::Kitty && (app.topic.has_permission() || app.pager.is_some()) {
         if !app.kitty_images_suppressed {
             let _ = images::paint(out, proto, &[]);
             app.painted_images.clear();
@@ -28298,6 +28298,59 @@ mod tests {
         let chat = render(&mut app, 100, 40);
         assert!(chat.contains("🖼 shot.png"), "{chat}");
         assert_eq!(app.image_placed, placed);
+        let mut restored = Vec::new();
+        paint_inline_images(&mut app, &mut restored, true);
+        assert!(String::from_utf8(restored).unwrap().contains("\x1b_Ga=T"));
+        assert_eq!(app.painted_images, placed);
+    }
+
+    #[test]
+    fn kitty_inline_images_are_suppressed_until_raw_pager_closes() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let png = app.paths.data_dir.join("pager-shot.png");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
+        app.image_proto = Some(images::Protocol::Kitty);
+        let mut image_message = msg("user", "image");
+        image_message.meta = Some(
+            serde_json::json!({"attachments": [{
+                "name": "pager-shot.png",
+                "mime": "image/png",
+                "path": png.to_string_lossy(),
+            }]})
+            .to_string(),
+        );
+        app.messages = vec![image_message];
+
+        render(&mut app, 100, 40);
+        let placed = app.image_placed.clone();
+        assert_eq!(placed.len(), 1);
+        let mut initial = Vec::new();
+        paint_inline_images(&mut app, &mut initial, true);
+        assert!(String::from_utf8(initial).unwrap().contains("\x1b_Ga=T"));
+
+        app.pager = Some(Pager {
+            title: "Workflow kickoff instructions".into(),
+            lines: vec!["raw instructions".into()],
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("Workflow kickoff instructions"), "{screen}");
+        assert_eq!(app.image_placed, placed);
+        let mut hidden = Vec::new();
+        paint_inline_images(&mut app, &mut hidden, true);
+        let hidden = String::from_utf8(hidden).unwrap();
+        assert!(hidden.contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(!hidden.contains("\x1b_Ga=T"));
+        assert!(app.painted_images.is_empty());
+
+        app.pager = None;
+        render(&mut app, 100, 40);
         let mut restored = Vec::new();
         paint_inline_images(&mut app, &mut restored, true);
         assert!(String::from_utf8(restored).unwrap().contains("\x1b_Ga=T"));
