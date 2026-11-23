@@ -20,4 +20,4 @@ cargo test -p formless-core --lib --no-default-features live_muse_msp_bridge -- 
 
 It checks bridge registration and fail-closed startup using the local Echo provider, without signing in or invoking a Meta model.
 
-References: [Permissions and safety](https://dev.meta.ai/docs/muse-code/permissions), [MCP and toolsets](https://dev.meta.ai/docs/muse-code/extending#mcp-servers), and [Muse Session Protocol](https://meta-models.github.io/muse-code-sdk/).
+References: [Permissions and safety](https://dev.meta.ai/docs/muse-code/permissions), [MCP and toolsets](https://dev.meta.ai/docs/muse-code/extending), and [Muse Session Protocol](https://meta-models.github.io/muse-code-sdk/).
