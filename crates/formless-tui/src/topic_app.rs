@@ -1236,11 +1236,15 @@ mod tests {
 
         let screen = render(&mut app, 120);
         assert!(screen.contains("Formless · workflow kickoff"), "{screen}");
+        assert!(
+            screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
         assert!(screen.contains("Formless · generated"), "{screen}");
         assert!(screen.contains("You"), "{screen}");
         assert!(!screen.contains("topic_kickoff"), "{screen}");
         assert!(!screen.contains("private_internal_marker"), "{screen}");
-        assert_eq!(screen.matches("Same kickoff text").count(), 3, "{screen}");
+        assert_eq!(screen.matches("Same kickoff text").count(), 2, "{screen}");
     }
 
     #[test]

@@ -11620,7 +11620,14 @@ impl App {
         let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
         self.messages
             .iter()
-            .find(|m| m.id == id && m.role == "user")
+            .find(|m| m.id == id && m.role == "user" && m.generated_by.is_none())
+    }
+
+    fn focused_workflow_kickoff(&self) -> Option<&MessageInfo> {
+        let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
+        self.messages.iter().find(|m| {
+            m.id == id && m.role == "user" && m.generated_by.as_deref() == Some("topic_kickoff")
+        })
     }
 
     /// Editing a message with later user turns discards them, so the
@@ -11640,14 +11647,17 @@ impl App {
         let focus = self.call_focus.as_deref()?;
         if let Some(id) = focus.strip_prefix("msg:") {
             let m = self.messages.iter().find(|m| m.id == id)?;
-            let text = match (markdown, m.role.as_str()) {
-                (true, "user") => format!("**You:**\n\n{}", m.content),
-                _ => m.content.clone(),
-            };
-            let what = if m.role == "user" {
-                "your message"
+            let text = if markdown && m.role == "user" {
+                let (attribution, _) = message_attribution(&m.role, m.generated_by.as_deref());
+                format!("**{attribution}:**\n\n{}", m.content)
             } else {
-                "the answer"
+                m.content.clone()
+            };
+            let what = match (m.role.as_str(), m.generated_by.as_deref()) {
+                ("user", Some("topic_kickoff")) => "the workflow kickoff",
+                ("user", Some(_)) => "the generated message",
+                ("user", None) => "your message",
+                _ => "the answer",
             };
             return Some((text, what.into()));
         }
@@ -11775,9 +11785,8 @@ impl App {
         true
     }
 
-    /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
-    /// while a call is focused Enter toggles it, `z`/`Z` expand or
-    /// collapse all, and Esc or any other key leaves the focus.
+    /// Chat focus (SPEC §10.2): `[`/`]` on an empty input move it; Enter
+    /// toggles a call or opens kickoff instructions, and Esc leaves focus.
     fn call_focus_key(&mut self, key: &KeyEvent) -> bool {
         if !self.input.is_empty() || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             return false;
@@ -11800,7 +11809,25 @@ impl App {
             _ if self.call_focus.is_none() => return false,
             KeyCode::Enter => {
                 let id = self.call_focus.clone().unwrap();
-                if !id.starts_with("msg:") && !self.expanded_calls.remove(&id) {
+                if id.starts_with("msg:") {
+                    if let Some(content) = self
+                        .focused_workflow_kickoff()
+                        .map(|message| message.content.clone())
+                    {
+                        self.reviewing = None;
+                        self.pager = Some(Pager {
+                            title: "Workflow kickoff instructions".into(),
+                            lines: content
+                                .split('\n')
+                                .map(text::escape_terminal_line)
+                                .collect(),
+                            top: 0,
+                            left: 0,
+                            viewport: Default::default(),
+                            styled: Vec::new(),
+                        });
+                    }
+                } else if !self.expanded_calls.remove(&id) {
                     self.expanded_calls.insert(id);
                 }
                 self.scroll_to_focus = true;
@@ -14961,19 +14988,23 @@ fn others_text(others: &[AttachedClient]) -> String {
         .join(", ")
 }
 
+fn message_attribution(role: &str, generated_by: Option<&str>) -> (&'static str, &'static str) {
+    match (role, generated_by) {
+        ("user", Some("topic_kickoff")) => ("Formless · workflow kickoff", "assistant"),
+        ("user", Some(_)) => ("Formless · generated", "assistant"),
+        ("user", None) => ("You", "user"),
+        ("system-note", _) => ("System", "system-note"),
+        _ => ("Formless", "assistant"),
+    }
+}
+
 fn chat_header(
     app: &App,
     role: &str,
     generated_by: Option<&str>,
     when: Option<&str>,
 ) -> Line<'static> {
-    let (who, style_role) = match (role, generated_by) {
-        ("user", Some("topic_kickoff")) => ("Formless · workflow kickoff".to_owned(), "assistant"),
-        ("user", Some(_)) => ("Formless · generated".to_owned(), "assistant"),
-        ("user", None) => ("You".to_owned(), "user"),
-        ("system-note", _) => ("System".to_owned(), "system-note"),
-        _ => ("Formless".to_owned(), "assistant"),
-    };
+    let (who, style_role) = message_attribution(role, generated_by);
     let mut spans = vec![
         Span::styled("▍", role_style(app.color, style_role)),
         Span::styled(who, role_style(app.color, style_role)),
@@ -16576,10 +16607,12 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
 }
 
 /// The keys for a focused message, under it.
-fn focus_hint(color: bool, user: bool) -> Line<'static> {
+fn focus_hint(color: bool, user: bool, workflow_kickoff: bool) -> Line<'static> {
     Line::styled(
         if user {
             "  ▲ e edit & re-run from here · f fork from here · c copy · C Markdown · [ ] move · Esc"
+        } else if workflow_kickoff {
+            "  ▲ Enter view raw instructions · c copy · C copy as Markdown · [ ] move · Esc"
         } else {
             "  ▲ c copy · C copy as Markdown · [ ] move · Esc"
         },
@@ -16918,8 +16951,19 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 if focused {
                     focus_line = Some(lines.len());
                 }
-                for l in m.content.lines() {
-                    lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                let workflow_kickoff = m.generated_by.as_deref() == Some("topic_kickoff");
+                if workflow_kickoff {
+                    lines.push(mention_line("Workflow kickoff for this topic.", app.color));
+                    if !focused {
+                        lines.push(Line::styled(
+                            "  [ ] select · Enter view raw instructions",
+                            ui::dim(app.color),
+                        ));
+                    }
+                } else {
+                    for l in m.content.lines() {
+                        lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                    }
                 }
                 for name in expired_attachments(m) {
                     lines.push(Line::styled(
@@ -16944,7 +16988,11 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     }
                 }
                 if focused {
-                    lines.push(focus_hint(app.color, true));
+                    lines.push(focus_hint(
+                        app.color,
+                        m.generated_by.is_none(),
+                        workflow_kickoff,
+                    ));
                 }
             }
             "tool" => {
@@ -16982,7 +17030,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     lines.push(Line::styled(format!("  {note}"), ui::dim(app.color)));
                 }
                 if focused {
-                    lines.push(focus_hint(app.color, false));
+                    lines.push(focus_hint(app.color, false, false));
                 }
                 if let Some(meta) = &m.meta {
                     for call in persisted_calls(meta) {
@@ -23992,6 +24040,13 @@ mod tests {
         }
     }
 
+    fn workflow_kickoff_content() -> String {
+        format!(
+            "Run each selected feature in an isolated harness.\n{}\nFinal instruction \u{1b}[31m",
+            "Detailed workflow instruction. ".repeat(100)
+        )
+    }
+
     #[test]
     fn stored_stops_remain_visible_when_history_is_opened() {
         let mut app = test_app();
@@ -27008,6 +27063,128 @@ mod tests {
             .contains("message 3 from the bottom"));
         app.slash("copy 9");
         assert_eq!(app.notes.last().unwrap(), "there are 4 messages to copy");
+    }
+
+    #[test]
+    fn generated_workflow_kickoff_is_summarized_and_opens_raw_instructions() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = workflow_kickoff_content();
+        let mut kickoff = msg("user", &raw);
+        kickoff.id = "kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        let mut other_generated = msg("user", "Other generated text stays visible.");
+        other_generated.generated_by = Some("other_marker".into());
+        let mut assistant = msg("assistant", "Assistant text stays visible.");
+        assistant.generated_by = Some("topic_kickoff".into());
+
+        let mut app = test_app();
+        app.messages = vec![kickoff.clone(), other_generated, assistant];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Formless · workflow kickoff"), "{screen}");
+        assert!(
+            screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[ ] select · Enter view raw instructions"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Run each selected feature"), "{screen}");
+        assert!(
+            screen.contains("Other generated text stays visible."),
+            "{screen}"
+        );
+        assert!(screen.contains("Assistant text stays visible."), "{screen}");
+        assert!(app.focus_items().contains(&"msg:kickoff".into()));
+
+        app.call_focus = Some("msg:kickoff".into());
+        let focused = render(&mut app, 120, 30);
+        assert!(focused.contains("Enter view raw instructions"), "{focused}");
+        assert!(focused.contains("C copy as Markdown"), "{focused}");
+        assert!(!focused.contains("e edit & re-run"), "{focused}");
+        assert!(!focused.contains("f fork from here"), "{focused}");
+        assert!(app.focused_user_message().is_none());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**Formless · workflow kickoff:**\n\n{raw}")
+        );
+
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Char('e')));
+        assert!(app.editing_id.is_none() && app.input.is_empty());
+        app.key(key(KeyCode::Char('f')));
+        assert!(app.fork_prefill.is_none());
+        assert!(requests.try_recv().is_err());
+
+        app.key(key(KeyCode::Enter));
+        let pager = app.pager.as_ref().expect("kickoff instruction pager");
+        assert_eq!(pager.title, "Workflow kickoff instructions");
+        assert_eq!(
+            pager.lines,
+            raw.split('\n')
+                .map(text::escape_terminal_line)
+                .collect::<Vec<_>>()
+        );
+        assert!(pager.lines[1].len() > 2000);
+        assert_eq!(app.messages[0].content, raw);
+    }
+
+    #[test]
+    fn empty_workflow_kickoff_opens_an_empty_raw_pager() {
+        let mut kickoff = msg("user", "");
+        kickoff.id = "empty-kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        let mut app = test_app();
+        app.messages = vec![kickoff];
+        app.call_focus = Some("msg:empty-kickoff".into());
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let pager = app.pager.as_ref().expect("empty kickoff instruction pager");
+        assert_eq!(pager.title, "Workflow kickoff instructions");
+        assert_eq!(pager.lines, [""]);
+        assert!(app.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn matching_genuine_user_text_stays_raw_and_editable_and_forkable() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = workflow_kickoff_content();
+        let mut genuine = msg("user", &raw);
+        genuine.id = "genuine".into();
+        let mut app = test_app();
+        app.messages = vec![genuine.clone()];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("You"), "{screen}");
+        assert!(screen.contains("Run each selected feature"), "{screen}");
+        assert!(
+            !screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        app.call_focus = Some("msg:genuine".into());
+        assert!(app.focused_user_message().is_some());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**You:**\n\n{raw}")
+        );
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.editing_id.as_deref(), Some("genuine"));
+        assert_eq!(&*app.input, raw);
+
+        let mut fork_app = test_app();
+        fork_app.messages = vec![genuine];
+        fork_app.call_focus = Some("msg:genuine".into());
+        let (client, requests) = DaemonClient::recording();
+        fork_app.client = Some(client);
+        fork_app.key(key(KeyCode::Char('f')));
+        assert_eq!(fork_app.fork_prefill.as_deref(), Some(raw.as_str()));
+        assert!(requests.try_recv().is_ok());
     }
 
     #[test]
