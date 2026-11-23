@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+use crate::main_topic_suggestions::{self, PROPOSE_TOPIC, READ_TOPIC_CONTEXT};
 use crate::storage::Store;
 use formless_protocol::ToolInfo;
 
@@ -49,7 +50,7 @@ pub const UPDATE_PLAN: &str = "update_plan";
 /// Most steps a plan may have, and longest step text.
 pub const MAX_PLAN_ITEMS: usize = 20;
 pub const MAX_PLAN_TEXT: usize = 200;
-pub const RESERVED: [&str; 35] = [
+pub const RESERVED: [&str; 37] = [
     TOPIC_REQUEST_HARNESS_SUBSTITUTE,
     TOPIC_WAIT,
     TOPIC_LIST_CONVERSATIONS,
@@ -81,6 +82,8 @@ pub const RESERVED: [&str; 35] = [
     READ_METRICS,
     RUN_SCRIPT,
     UPDATE_PLAN,
+    READ_TOPIC_CONTEXT,
+    PROPOSE_TOPIC,
     TOPIC_RUN_STEP,
     TOPIC_ANSWER_QUESTION,
     TOPIC_COMPLETE_FEATURE,
@@ -760,7 +763,9 @@ pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String>
 /// The Tools the agent may see: neither retired nor switched off.
 fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
     let mut tools = store.list_tools(false)?;
-    tools.retain(|t| !t.disabled);
+    tools.retain(|t| {
+        !t.disabled && !main_topic_suggestions::is_topic_tool(&t.name.to_ascii_lowercase())
+    });
     Ok(tools)
 }
 
@@ -1020,6 +1025,7 @@ pub fn builtin_schema(name: &str) -> Option<Value> {
         .get_or_init(|| {
             builtin_definitions()
                 .into_iter()
+                .chain(main_topic_suggestions::definitions())
                 .filter_map(|d| {
                     let name = d["function"]["name"].as_str()?.to_string();
                     Some((name, d["function"]["parameters"].clone()))
@@ -1261,6 +1267,11 @@ fn definitions(
         .map(|t| t.name.to_lowercase())
         .collect();
     let mut defs = builtin_definitions();
+    if let Some(session_id) = session_id {
+        if store.topic_suggestion_source(session_id)?.is_some() {
+            defs.extend(main_topic_suggestions::definitions());
+        }
+    }
     if !session_id
         .map(|id| store.is_topic_orchestrator(id))
         .transpose()?
@@ -1323,11 +1334,12 @@ fn definitions(
     // refresh point (compaction): removing it would rewrite the cached
     // prefix. Calling it reports that it is retired.
     if let Some(s) = session_id {
-        let builtins = defs.iter().take_while(|d| is_builtin(fn_name(d))).count();
-        let mut registry: Vec<Value> = defs.split_off(builtins);
+        let mut registry: Vec<Value> = defs.split_off(trusted_builtins);
         for (_, def) in store.pinned_inactive(s)? {
             if let Ok(def) = serde_json::from_str::<Value>(&def) {
-                registry.push(def);
+                if !main_topic_suggestions::is_topic_tool(&fn_name(&def).to_ascii_lowercase()) {
+                    registry.push(def);
+                }
             }
         }
         // Same order as the listing itself: pinned first, then by name.

@@ -465,7 +465,7 @@ impl Daemon {
 
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex; pi, opencode, antigravity, acp and muse currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex, muse; pi, opencode, antigravity and acp currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
         let start = async {
             let session = topic
                 .topic_session_id
@@ -1097,9 +1097,20 @@ impl Daemon {
             .map(|(revision, tree)| json!({"revision":revision,"path":tree.path}))
             .collect();
         let prompt=format!("Topic: {}\nFeature {}: {}\nStep: {}\n{}\nAccess: {:?}\nInputs: {}\nGit input worktrees: {}\nWrite file outputs only to {} and report their SHA-256 via report_result. Text outputs can be reported directly. Never push or modify the source workspace or its branch. Combine inputs only in this private workspace when instructed. For Git Write create a clean new commit; the daemon verifies HEAD. Use the scoped Formless MCP for questions, conversations and reporting outputs.\n",topic.name,feature.id,feature.request,step.title,step.instructions,step.access,serde_json::to_string(inputs)?,serde_json::to_string(&git_inputs)?,outputs_dir.display());
-        let message = self.with_store(|st| {
-            st.append_message(&attempt.conversation_session_id, "user", &prompt)
-        })?;
+        let message = GENERATED_MESSAGE
+            .scope("topic_attempt_instructions".into(), async {
+                self.with_store(|st| {
+                    let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+                    st.append_message_generated(
+                        &attempt.conversation_session_id,
+                        "user",
+                        &prompt,
+                        None,
+                        generated_by.as_deref(),
+                    )
+                })
+            })
+            .await?;
         self.broadcast(Event::MessageAppended {
             session_id: attempt.conversation_session_id.clone(),
             message,
@@ -1130,6 +1141,7 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
             },
             environment: BTreeMap::from([
@@ -1254,7 +1266,7 @@ impl Daemon {
                 bail!("Antigravity adapter not integrated yet; choose Claude or Codex")
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
-            HarnessKind::Muse => bail!("Muse adapter not integrated yet; choose Claude or Codex"),
+            HarnessKind::Muse => local_harness::muse::run(request, handler, cancel).await,
         }
     }
 
