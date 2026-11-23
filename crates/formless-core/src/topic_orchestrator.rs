@@ -1255,14 +1255,21 @@ impl Daemon {
                     .join("topic-attempts")
                     .join(&attempt.id);
                 let staged = local_harness::pi::stage_extension(&private)?;
-                {
-                    let _launch = self.topic_launch.locked();
-                    self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
-                    if cancel.is_cancelled() || self.shutdown.is_cancelled() {
-                        bail!("step cancelled before launch");
-                    }
-                }
-                local_harness::pi::run(request, &staged, handler, cancel).await
+                local_harness::pi::run_with_spawn(
+                    request,
+                    &staged,
+                    handler,
+                    cancel,
+                    |mut command| {
+                        let _launch = self.topic_launch.locked();
+                        self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+                        if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                            bail!("step cancelled before launch");
+                        }
+                        command.spawn().context("failed to start Pi RPC process")
+                    },
+                )
+                .await
             }
             HarnessKind::OpenCode => {
                 bail!("OpenCode adapter not integrated yet; choose Claude or Codex")

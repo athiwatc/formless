@@ -547,6 +547,32 @@ pub async fn run(
     handler: &dyn InteractionHandler,
     cancel: &CancellationToken,
 ) -> Result<HarnessResult> {
+    let spawn_cancel = cancel.clone();
+    run_with_spawn(
+        request,
+        staged_extension,
+        handler,
+        cancel,
+        move |mut command| {
+            if spawn_cancel.is_cancelled() {
+                bail!("Pi run cancelled");
+            }
+            command.spawn().context("failed to start Pi RPC process")
+        },
+    )
+    .await
+}
+
+pub(crate) async fn run_with_spawn<F>(
+    request: &HarnessRequest,
+    staged_extension: &Path,
+    handler: &dyn InteractionHandler,
+    cancel: &CancellationToken,
+    spawn: F,
+) -> Result<HarnessResult>
+where
+    F: FnOnce(tokio::process::Command) -> Result<tokio::process::Child> + Send,
+{
     if cancel.is_cancelled() {
         bail!("Pi run cancelled");
     }
@@ -574,10 +600,7 @@ pub async fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if cancel.is_cancelled() {
-        bail!("Pi run cancelled");
-    }
-    let mut child = PiChild(command.spawn().context("failed to start Pi RPC process")?);
+    let mut child = PiChild(spawn(command)?);
     let mut stdin = child.stdin.take().context("Pi stdin unavailable")?;
     let stdout = child.stdout.take().context("Pi stdout unavailable")?;
     let mut stderr = child.stderr.take().context("Pi stderr unavailable")?;
@@ -1994,6 +2017,44 @@ printf '{{"type":"received_answer","value":%s}}\n' "$answer"
         .await
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
+        assert!(!request.cwd.join("spawned-marker").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_after_command_preparation_prevents_spawn() {
+        let _guard = FAKE_PROCESS_LOCK.lock().await;
+        let (dir, extension, request) = fake_pi("touch spawned-marker; exit 99");
+        let cancel = CancellationToken::new();
+        let thread_cancel = cancel.clone();
+        let spawn_cancel = cancel.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let thread_barrier = barrier.clone();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let cancel_thread = std::thread::spawn(move || {
+            thread_barrier.wait();
+            thread_cancel.cancel();
+            cancelled_tx.send(()).unwrap();
+        });
+
+        let result = run_with_spawn(
+            &request,
+            &extension,
+            &RecordingHandler::new(true, false),
+            &cancel,
+            move |mut command| {
+                barrier.wait();
+                cancelled_rx.recv().unwrap();
+                if spawn_cancel.is_cancelled() {
+                    bail!("step cancelled before launch");
+                }
+                command.spawn().context("failed to start Pi RPC process")
+            },
+        )
+        .await;
+        cancel_thread.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
         assert!(!request.cwd.join("spawned-marker").exists());
         fs::remove_dir_all(dir).unwrap();
     }
