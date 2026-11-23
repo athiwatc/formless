@@ -2,7 +2,7 @@
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
 struct Fixture(PathBuf);
@@ -29,6 +29,13 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+struct IsolatedProcess(Child);
+impl Drop for IsolatedProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 fn invoke(root: &Path, args: &[&str]) -> Output {
@@ -90,6 +97,42 @@ fn invoke(root: &Path, args: &[&str]) -> Output {
 }
 #[test]
 fn restore_preview_leaves_an_existing_locked_profile_untouched() {
+    // Keep this immediate freeze after exec so parallel siblings cannot inherit its shared lock.
+    let mut child = IsolatedProcess(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restore_preview_leaves_an_existing_locked_profile_untouched_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "isolated backup preview fixture failed: {status}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "isolated backup preview fixture exceeded 60 seconds"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[ignore = "private after-exec fixture for locked-profile backup preview"]
+fn restore_preview_leaves_an_existing_locked_profile_untouched_fixture() {
     use formless_core::profile_lock::ProfileLock;
 
     let root = Fixture::new("backup-plan");

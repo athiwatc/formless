@@ -35,6 +35,7 @@ pub mod thai;
 #[cfg(feature = "gui")]
 pub mod theme;
 pub mod timeline;
+pub mod topics;
 pub mod transcript;
 pub mod transcript_attachments;
 

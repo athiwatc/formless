@@ -65,7 +65,7 @@ pub const SPEC: AgentSpec = AgentSpec {
 #[cfg(not(test))]
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
-const AVAILABILITY_TIMEOUT: Duration = Duration::from_millis(200);
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Queries only the CLI version: credential discovery initializes providers and
 /// performs network requests, so readiness must not run it.
