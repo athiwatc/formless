@@ -4060,7 +4060,7 @@
       items.push(item("Move to topic…", () => proposeTopic(m.id)));
     }
     if (m.role === "user" && m.generated_by == null && !isRunning() && !currentTopicAttempt()) {
-      const last = [...S.messages].reverse().find((x) => x.role === "user" && x.generated_by == null) === m;
+      const last = S.messages[S.messages.length - 1]?.id === m.id;
       items.push(item(last ? "Edit & re-run" : "Edit & re-run (drops the later turns)", () => beginEdit(m)));
     }
     if (!currentTopicAttempt()) items.push(item("Fork from here", async () => {
@@ -5262,7 +5262,8 @@
     mode.replaceChildren();
     if (S.editMessageId) {
       mode.classList.remove("hidden");
-      mode.append("Editing your last message — sending re-runs from there.",
+      const last = S.messages[S.messages.length - 1]?.id === S.editMessageId;
+      mode.append(last ? "Editing your last message — sending re-runs from there." : "Editing this message — sending deletes all later messages and re-runs from here.",
         h("button", { class: "btn ghost small", type: "button", onclick: cancelEdit }, "Cancel"));
     } else mode.classList.add("hidden");
     const s = S.sessions.find((x) => x.id === S.current);

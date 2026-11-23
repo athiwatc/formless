@@ -440,7 +440,36 @@ test('generated user-role messages render as Formless and cannot be moved or edi
     const labels = plainText(vm.runInContext('popover', c));
     assert.equal(labels.includes('Move to topic'), m === original);
     assert.equal(labels.includes('Edit & re-run'), m === original);
+    if (m === original) assert.match(labels, /drops the later turns/);
   }
+});
+
+test('edit mode warns before truncating any later history, including generated kickoffs', () => {
+  const elements = new Map();
+  const c = setup(['beginEdit', 'cancelEdit', 'renderComposer'], {
+    h: node, isRunning: () => false, composerEnterSends: () => true, enterModeHint: () => 'Enter sends',
+    topicForSession: () => null, renderTopicContext() {},
+    $: id => {
+      if (!elements.has(id)) elements.set(id, Object.assign(node('div'), { classList: { add() {}, remove() {}, toggle() {} }, focus() {} }));
+      return elements.get(id);
+    },
+  });
+  vm.runInContext('const historyRender = {};', c);
+  const request = { id: 'request', role: 'user', content: 'Actual request' };
+  c.S.messages = [request];
+  c.beginEdit(request);
+  assert.doesNotMatch(plainText(c.$('compose-mode')), /deletes/);
+  c.S.messages.push({ id: 'kickoff', role: 'user', generated_by: 'topic_kickoff', content: 'Internal instructions' });
+  c.renderComposer();
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  c.cancelEdit();
+  c.beginEdit(request); // Shared path for inline, message menu and /edit.
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  c.S.messages = [request, { id: 'answer', role: 'assistant', content: 'Ordinary reply' }];
+  c.renderComposer();
+  assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
+  assert.equal(c.S.editMessageId, request.id);
+  assert.equal(c.$('input').value, request.content);
 });
 
 test('hostile persisted Markdown has bounded nesting and preserves readable text', () => {
