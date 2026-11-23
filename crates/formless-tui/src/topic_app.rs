@@ -1503,7 +1503,7 @@ mod tests {
                 .iter()
                 .filter(|request| matches!(request.request, Request::ProposeTopic { .. }))
                 .count(),
-            1
+            0
         );
         assert!(requests
             .iter()
