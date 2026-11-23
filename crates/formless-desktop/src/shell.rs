@@ -5624,12 +5624,17 @@ impl Shell {
                             .map(|tag| directory::visual_text(tag))
                             .collect::<Vec<_>>()
                             .join(", ");
+                        // Inventory previews carry no authorship. Only the
+                        // trusted loaded transcript can identify generated text.
+                        let message_preview = this
+                            .loaded_generated_preview(&row.id)
+                            .unwrap_or_else(|| row.preview.as_deref().unwrap_or(""));
                         let preview = if tag_preview.is_empty() {
-                            directory::visual_text(row.preview.as_deref().unwrap_or(""))
+                            directory::visual_text(message_preview)
                         } else {
                             format!(
                                 "Tags: {tag_preview} · {}",
-                                directory::visual_text(row.preview.as_deref().unwrap_or(""))
+                                directory::visual_text(message_preview)
                             )
                         };
                         Some(
@@ -5638,7 +5643,7 @@ impl Shell {
                                 .test_support()
                                 .role(Role::ListBoxOption)
                                 .aria_label(row.title.clone())
-                                .aria_description(meta.clone())
+                                .aria_description(format!("{meta} · {preview}"))
                                 .aria_selected(selected)
                                 .aria_position_in_set(index + 1)
                                 .aria_size_of_set(this.directory.matches().len())
@@ -6318,6 +6323,28 @@ impl Shell {
 
     /// The Context panel. As a modal overlay it is a focus trap: Tab stays
     /// inside it until it is dismissed.
+    /// Inventory-only rows must stay verbatim: matching their wording to an
+    /// older generated message could hide a genuine user message. No fetches,
+    /// cached guesses, or changes to the canonical inventory/search source.
+    fn loaded_generated_preview(&self, session: &str) -> Option<&'static str> {
+        if self.client.is_none()
+            || !self.client_snapshot_ready
+            || self.sidebar.active_id() != Some(session)
+            || self.transcript_state.as_ref()?.session_id() != session
+            || self.transcript_reload_needed().is_some()
+        {
+            return None;
+        }
+        self.blocks
+            .borrow()
+            .blocks()
+            .iter()
+            .rev()
+            .find(|block| block.kind == BlockKind::User || block.generated().is_some())?
+            .generated()
+            .map(crate::model::GeneratedMessage::summary)
+    }
+
     fn render_inspector(&self, modal: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.inspector_focus.is_focused(window);
         let row = self.sidebar.active_row();

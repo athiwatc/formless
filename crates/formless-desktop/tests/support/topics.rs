@@ -270,6 +270,13 @@ fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source
     let raw =
         "Launch independent features concurrently.\nHarness readiness: [{\"installed\":false}]";
     step(cx, handle, |window, cx| {
+        shell.update(cx, |s, cx| {
+            let mut rows = fixture::topic_workspace().0;
+            for row in &mut rows {
+                row.preview = Some(raw.into());
+            }
+            s.apply_client_update(Update::Sessions(rows), window, cx);
+        });
         window.render_frame(cx);
         window.click("topic-topic-formless", cx);
         window.render_frame(cx);
@@ -284,8 +291,29 @@ fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source
         let install = |messages: &[serde_json::Value], window: &mut Window, cx: &mut App| {
             shell.update(cx, |s, cx| s.apply_client_update(Update::Snapshot {
                 generation,
-                snapshot: replies::session_snapshot("topic-chat", &serde_json::json!({"session":{"id":"topic-chat"},"running":false,"messages":messages})).unwrap(),
+                snapshot: replies::session_snapshot("topic-chat", &serde_json::json!({"session":{"id":"topic-chat","preview":raw},"running":false,"messages":messages})).unwrap(),
             }, window, cx));
+        };
+        let directory = |expected: &str, window: &mut Window, cx: &mut App| {
+            shell.update(cx, |s, cx| {
+                s.run_command(Command::GoTo(Destination::Sessions), window, cx)
+            });
+            window.render_frame(cx);
+            assert!(window
+                .find(directory_row_id("topic-chat"))
+                .description()
+                .unwrap()
+                .contains(expected));
+            // Same words, no canonical marker: the other row stays untouched.
+            assert!(window
+                .find(directory_row_id("main"))
+                .description()
+                .unwrap()
+                .contains("Harness readiness"));
+            shell.update(cx, |s, cx| {
+                s.run_command(Command::GoTo(Destination::Chat), window, cx)
+            });
+            window.render_frame(cx);
         };
         install(&messages, window, cx);
         window.render_frame(cx);
@@ -299,6 +327,7 @@ fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source
             window.find("inspector-last-message").value(),
             Some(format!("Last message: {raw}").as_str())
         );
+        directory("Harness readiness", window, cx);
         messages.push(serde_json::json!({"id":"generated","session_id":"topic-chat","seq":2,"role":"user","generated_by":"topic_kickoff","content":raw,"created_at":"now"}));
         install(&messages, window, cx);
         window.render_frame(cx);
@@ -310,6 +339,7 @@ fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source
             window.find("inspector-last-message").value(),
             Some(format!("Last message: {summary}").as_str())
         );
+        directory(summary, window, cx);
         window.click("block-2-details", cx);
         window.render_frame(cx);
         assert!(shell.read(cx).viewer_rows().is_some());
@@ -326,6 +356,7 @@ fn generated_kickoff_summary_and_inspector_preserve_genuine_text_and_full_source
             window.find("inspector-last-message").value(),
             Some(format!("Last message: {raw}").as_str())
         );
+        directory("Harness readiness", window, cx);
     });
 }
 
