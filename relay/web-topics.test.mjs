@@ -445,6 +445,26 @@ test('topic panel shows independently ready work items and generic outputs', () 
   assert.doesNotMatch(content, /Move & start/);
 });
 
+test('failed work items retain raw diagnostics behind a disclosure and offer workflow retry', () => {
+  let nodes;
+  const c = setup(['topicForSession', 'currentTopicAttempt', 'topicStatusLabel', 'harnessLabel', 'topicBadge', 'topicWorkflowLabel', 'topicPath', 'topicArtifacts', 'renderTopicContext'], {
+    $: () => ({ classList: { toggle() {} } }), h: element,
+    replaceTopicContent: (_, signature, children) => { nodes = children; } });
+  const failed = topic('failed');
+  failed.features[0].status = 'failed';
+  failed.features[0].detail = 'orchestrator run ended with paused';
+  c.S.topics = [failed]; c.S.current = 'side';
+  c.renderTopicContext();
+  const tree = element('div', null, nodes);
+  const details = descendants(tree).find(n => n.tag === 'details');
+  assert.ok(details);
+  assert.equal(details.props.open, undefined);
+  assert.equal(descendants(details).find(n => n.tag === 'pre').children[0], failed.features[0].detail);
+  const buttons = descendants(tree).filter(n => n.tag === 'button').flatMap(n => n.children);
+  assert.ok(buttons.includes('Retry work item'));
+  assert.ok(!buttons.includes('Resume') && !buttons.includes('Abandon'));
+});
+
 test('proposal request binds selected messages and workflow without moving or starting work', async () => {
   const calls = [], fields = new Map();
   const c = setup(['proposeTopic', 'recordValue', 'harnessLabel', 'topicPath', 'topicOutlineEditor'], {

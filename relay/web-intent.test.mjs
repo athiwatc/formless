@@ -411,7 +411,7 @@ test('generated user-role messages render as Formless and cannot be moved or edi
   c.$ = id => id === 'transcript' ? transcript : lookup(id);
   vm.runInContext('const rendered = new Map(); const WHO = { user: "You", assistant: "Formless" }; let popover;', c);
   c.S.daemonOnline = true;
-  const original = { id: 'original', role: 'user', content: 'Original request' };
+  const original = { id: 'original', role: 'user', content: 'Original request: keep my raw JSON {"installed":false} and orchestration wording.' };
   const kickoff = { id: 'kickoff', role: 'user', content: 'Internal instructions' };
   c.S.messages = [original, kickoff];
   c.renderHistory();
@@ -427,6 +427,15 @@ test('generated user-role messages render as Formless and cannot be moved or edi
   assert.equal(all(transcript).filter(n => n.attrs.class === 'who assistant').length, 1);
   assert.match(plainText(all(transcript).find(n => n.attrs.class === 'who assistant')), /^Formless/);
   assert.match(plainText(transcript), /Internal instructions.*Retry instructions/);
+  const disclosures = all(transcript).filter(n => n.tag === 'details' && n.attrs.class === 'chip generated-details');
+  assert.equal(disclosures.length, 2);
+  assert.ok(disclosures.every(n => !n.attrs.open), 'raw generated instructions are collapsed by default');
+  assert.equal(plainText(disclosures[0].children.find(n => n.tag === 'pre')), kickoff.content);
+  assert.equal(plainText(disclosures[1].children.find(n => n.tag === 'pre')), c.S.messages[2].content);
+  const defaultText = n => typeof n === 'string' ? n : (n?.children || []).filter(child => n.tag !== 'details' || child.tag === 'summary').map(defaultText).join('');
+  assert.match(defaultText(transcript), /Workflow requested/);
+  assert.doesNotMatch(defaultText(transcript), /Internal instructions|Retry instructions/);
+  assert.ok(defaultText(transcript).includes(original.content), 'real user text is not summarized or filtered');
   const edit = all(user[0]).find(n => n.tag === 'button');
   edit.attrs.onclick();
   assert.equal(c.S.editMessageId, original.id);

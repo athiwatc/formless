@@ -1913,7 +1913,9 @@
         children.push(h("div", { class: "topic-features", "aria-label": "Work item progress" }, topic.features.map((feature, i) =>
         h("article", { class: "topic-feature", "data-feature-id": feature.id }, h("div", { class: "topic-feature-head" },
           h("span", { class: "muted" }, String(i + 1).padStart(2, "0")), h("strong", null, feature.request), topicBadge(feature.status)),
-          feature.detail ? h("p", { class: "topic-feature-detail" }, feature.detail) : null,
+          feature.detail ? feature.status === "failed"
+            ? h("details", { class: "chip topic-feature-detail" }, h("summary", null, "Work item details"), h("pre", null, feature.detail))
+            : h("p", { class: "topic-feature-detail" }, feature.detail) : null,
           feature.attempt_count ? h("small", { class: "muted" }, feature.attempt_count + " attempts") : null,
           feature.outputs?.length ? h("ul", { class: "topic-outputs" }, topicArtifacts(feature.outputs)) : null,
           ["failed", "needs_user", "complete", "cancelled"].includes(topic.status) ? control("Retry work item", "retry-" + feature.id, () => retryTopicFeature(topic, feature)) : null))));
@@ -4197,6 +4199,13 @@
             ...attachmentTags(m),
             ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
             ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
+        } else if (m.role === "user" && m.generated_by != null) {
+          const kickoff = m.generated_by === "topic_kickoff";
+          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(
+            h("p", null, h("strong", null, kickoff ? "Workflow requested." : "Background instructions added."),
+              kickoff ? " Your requests and outline were sent to Formless to coordinate this topic." : " Formless added instructions for this conversation."),
+            h("details", { class: "chip generated-details" }, h("summary", null, kickoff ? "Orchestration details" : "Message details"), h("pre", null, m.content))
+          )));
         } else if (m.role === "tool") {
           open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || "", m.meta))));
         } else if (m.role === "system-note") {
@@ -5047,8 +5056,9 @@
   function renderRunBanner() {
     const box = $("run-banner");
     const u = S.unfinished;
-    box.classList.toggle("hidden", !u || isRunning());
-    if (!u) return box.replaceChildren();
+    const resumable = u && ["paused", "interrupted"].includes(u.status);
+    box.classList.toggle("hidden", !resumable || isRunning());
+    if (!resumable) return box.replaceChildren();
     // An explained provider error (SPEC §4.4): what happened, what to do,
     // and the raw error behind "details".
     const x = u.explained;
@@ -8973,11 +8983,12 @@
         if (here) {
           if (S.planState && S.planState.run_id === ev.run_id) S.planState = { ...S.planState, run_status: ev.type === "run_paused" ? "paused" : ev.status };
           renderPlan();
-          // run_paused carries the error (and its explanation); the
-          // run_finished that follows must not wipe it.
-          if (ev.type === "run_paused") S.unfinished = { status: "paused", error: ev.error, explained: ev.explained };
-          else if (ev.status === "completed") S.unfinished = null;
-          else if (!S.unfinished) S.unfinished = { status: ev.status };
+          // Preserve a paused run's explanation only while it can resume.
+          // Topic orchestration can finalize the same run as abandoned.
+          if (ev.type === "run_paused") S.unfinished = { run_id: ev.run_id, status: "paused", error: ev.error, explained: ev.explained };
+          else if (["paused", "interrupted"].includes(ev.status)) S.unfinished = {
+            ...(S.unfinished?.run_id === ev.run_id ? S.unfinished : {}), run_id: ev.run_id, status: ev.status };
+          else S.unfinished = null;
           renderRunBanner();
         }
         if (here) {
@@ -8985,6 +8996,7 @@
           S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
+          else if (ev.status === "abandoned") note("This run has ended; it cannot be resumed.");
           else if (ev.status !== "completed") note("run " + ev.status, ev.status !== "interrupted");
           scheduleEventRender({ history: true });
         }
