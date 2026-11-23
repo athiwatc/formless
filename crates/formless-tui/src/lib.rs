@@ -27321,6 +27321,13 @@ mod tests {
         assert!(subscribe_at < pending_at);
         let initial_query = pending_request_id(initial_lines);
 
+        send_wire(ServerMessage::Event(event.clone()));
+        app.drain_daemon();
+        assert!(
+            app.topic.has_permission(),
+            "live wire event reaches the queue"
+        );
+
         send_wire(ServerMessage::Response {
             id: initial_query,
             ok: true,
