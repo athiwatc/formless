@@ -17121,7 +17121,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         ));
     }
     if !app.streaming.is_empty() || app.running() {
-        open_group(&mut lines, &mut group, "assistant", None);
+        open_group(&mut lines, &mut group, "assistant", None, None);
         app.streaming_markdown(width)
             .append_to(&mut lines, &mut markdown_links);
         if app.streaming.is_empty() {

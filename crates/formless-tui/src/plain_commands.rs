@@ -33,7 +33,10 @@ pub(super) fn expand(snapshot: &Snapshot, input: &str) -> Result<Option<String>,
         .find(char::is_whitespace)
         .unwrap_or(invocation.len());
     let name = &invocation[..end];
-    if reserved_command_names().iter().any(|builtin| builtin == name) {
+    if reserved_command_names()
+        .iter()
+        .any(|builtin| builtin == name)
+    {
         return Ok(None);
     }
     let Some(command) = snapshot.find(name) else {
@@ -121,8 +124,11 @@ mod tests {
         let directory = app.paths.config_dir.join("commands");
         std::fs::create_dir_all(&directory).unwrap();
         for name in ["main", "topic", "topics"] {
-            std::fs::write(directory.join(format!("{name}.md")), format!("{name} $ARGUMENTS"))
-                .unwrap();
+            std::fs::write(
+                directory.join(format!("{name}.md")),
+                format!("{name} $ARGUMENTS"),
+            )
+            .unwrap();
         }
         let session: SessionInfo = serde_json::from_value(serde_json::json!({
             "id":"s", "name":"Plain", "created_at":"", "updated_at":""

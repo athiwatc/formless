@@ -1931,11 +1931,11 @@ impl State {
             )),
             chunks[1],
         );
-        frame.render_widget(raw_input.scroll((self.permission_input_scroll, 0)), chunks[2]);
         frame.render_widget(
-            Paragraph::new(action_lines).wrap(wrap),
-            chunks[3],
+            raw_input.scroll((self.permission_input_scroll, 0)),
+            chunks[2],
         );
+        frame.render_widget(Paragraph::new(action_lines).wrap(wrap), chunks[3]);
         (true, true)
     }
 
@@ -2195,22 +2195,23 @@ impl State {
             name
         };
         let consequence = match action {
-                ConfirmedAction::Approve => {
-                    "Moves selected requests into this topic; workflow does not start."
-                }
-                ConfirmedAction::ApproveAndStart => {
-                    "Moves selected requests, then starts the workflow once."
-                }
-                ConfirmedAction::Start => "Starts the Formless workflow for this topic.",
-                ConfirmedAction::Cancel => {
-                    "Stops the workflow and running harness work."
-                }
-                ConfirmedAction::Recover => {
-                    "Marks interrupted work failed and abandons running attempts."
-                }
-                ConfirmedAction::Retry { .. } => "Resets this work item to pending.",
+            ConfirmedAction::Approve => {
+                "Moves selected requests into this topic; workflow does not start."
+            }
+            ConfirmedAction::ApproveAndStart => {
+                "Moves selected requests, then starts the workflow once."
+            }
+            ConfirmedAction::Start => "Starts the Formless workflow for this topic.",
+            ConfirmedAction::Cancel => "Stops the workflow and running harness work.",
+            ConfirmedAction::Recover => {
+                "Marks interrupted work failed and abandons running attempts."
+            }
+            ConfirmedAction::Retry { .. } => "Resets this work item to pending.",
         };
-        let lines = vec![Line::from(format!("Topic: {name}")), Line::from(consequence)];
+        let lines = vec![
+            Line::from(format!("Topic: {name}")),
+            Line::from(consequence),
+        ];
         frame.render_widget(Clear, area);
         let block = crate::ui::panel(format!(" Confirm · {verb} "), color, Color::Yellow)
             .title_bottom(crate::ui::hint("Enter/y confirm · Esc/n cancel", color));
@@ -2642,8 +2643,8 @@ mod tests {
     }
 
     fn permission_screen(state: &mut State, width: u16, height: u16) -> String {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
-            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| state.draw_permission_overlay(frame, false))
             .unwrap();
@@ -2673,7 +2674,13 @@ mod tests {
         let form = ProposalForm::new(&source, &messages, "/repo", "Work", parents, None);
         let request = form.request().unwrap();
         assert_eq!(request.message_ids, ["u2"]);
-        assert_eq!(form.messages.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(), ["u1", "u2"]);
+        assert_eq!(
+            form.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["u1", "u2"]
+        );
         assert_eq!(request.source_session_id, "main");
         assert_eq!(request.workspace, Some(PathBuf::from("/repo")));
         assert!(request.outline.is_empty(), "Formless plans by default");
@@ -2689,10 +2696,7 @@ mod tests {
         form.workspace.set("/keep/workspace");
         form.step = ProposalStep::Fields;
         form.field_index = 2;
-        form.key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::CONTROL,
-        ));
+        form.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         assert_eq!(form.step, ProposalStep::Messages);
         assert_eq!(form.name.expanded(), "Keep this name");
         assert_eq!(form.workspace.expanded(), "/keep/workspace");
@@ -2700,10 +2704,7 @@ mod tests {
         assert_eq!(form.field_index, 2);
 
         form.step = ProposalStep::Review;
-        form.key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::CONTROL,
-        ));
+        form.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
         assert_eq!(form.step, ProposalStep::Messages);
         assert_eq!(form.name.expanded(), "Keep this name");
         assert_eq!(form.selected, HashSet::from(["u1".into()]));
@@ -2759,23 +2760,18 @@ mod tests {
         let mut long_topic = topic("t1", TopicStatus::PendingApproval);
         long_topic.name = "A very long feature name ".repeat(12);
         let mut long_attempt = attempt("a1", "harness-session");
-        long_attempt.detail = Some("unbounded harness output that must not enter this confirmation".repeat(8));
+        long_attempt.detail =
+            Some("unbounded harness output that must not enter this confirmation".repeat(8));
         long_topic.attempts.push(long_attempt);
         let mut state = State::default();
         state.update_topics(vec![long_topic]);
 
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10))
-            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                state.draw_confirmation(
-                    frame,
-                    area,
-                    "t1",
-                    &ConfirmedAction::Approve,
-                    false,
-                )
+                state.draw_confirmation(frame, area, "t1", &ConfirmedAction::Approve, false)
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
