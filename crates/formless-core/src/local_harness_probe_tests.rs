@@ -238,7 +238,7 @@ async fn fallback_missing_version_failure_and_timeout_keep_auth_unknown_and_kill
     ctx.timeout = Duration::from_millis(300);
     let timed = tokio::time::timeout(
         Duration::from_secs(2),
-        dispatch(HarnessKind::Antigravity, &ctx, None),
+        dispatch(HarnessKind::Muse, &ctx, None),
     )
     .await
     .unwrap();
