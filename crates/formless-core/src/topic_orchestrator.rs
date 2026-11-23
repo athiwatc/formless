@@ -1097,9 +1097,20 @@ impl Daemon {
             .map(|(revision, tree)| json!({"revision":revision,"path":tree.path}))
             .collect();
         let prompt=format!("Topic: {}\nFeature {}: {}\nStep: {}\n{}\nAccess: {:?}\nInputs: {}\nGit input worktrees: {}\nWrite file outputs only to {} and report their SHA-256 via report_result. Text outputs can be reported directly. Never push or modify the source workspace or its branch. Combine inputs only in this private workspace when instructed. For Git Write create a clean new commit; the daemon verifies HEAD. Use the scoped Formless MCP for questions, conversations and reporting outputs.\n",topic.name,feature.id,feature.request,step.title,step.instructions,step.access,serde_json::to_string(inputs)?,serde_json::to_string(&git_inputs)?,outputs_dir.display());
-        let message = self.with_store(|st| {
-            st.append_message(&attempt.conversation_session_id, "user", &prompt)
-        })?;
+        let message = GENERATED_MESSAGE
+            .scope("topic_attempt_instructions".into(), async {
+                self.with_store(|st| {
+                    let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+                    st.append_message_generated(
+                        &attempt.conversation_session_id,
+                        "user",
+                        &prompt,
+                        None,
+                        generated_by.as_deref(),
+                    )
+                })
+            })
+            .await?;
         self.broadcast(Event::MessageAppended {
             session_id: attempt.conversation_session_id.clone(),
             message,
