@@ -781,8 +781,41 @@ pub enum BlockKind {
     Assistant,
     ToolSummary,
     RunRecap,
-    /// A note the daemon adds to a transcript (role `system-note`).
+    /// A daemon-added note, including generated user-role workflow kickoffs.
     Note,
+}
+
+/// Bounded presentation metadata; the full generated source stays in the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedMessage {
+    TopicKickoff,
+    Background,
+}
+
+impl GeneratedMessage {
+    pub fn of(message: &formless_protocol::MessageInfo) -> Option<Self> {
+        if message.role != "user" {
+            return None;
+        }
+        Some(match message.generated_by.as_deref()? {
+            "topic_kickoff" => Self::TopicKickoff,
+            _ => Self::Background,
+        })
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::TopicKickoff => "Workflow requested. Your requests and outline were sent to Formless to coordinate this topic.",
+            Self::Background => "Background instructions added. Formless added instructions for this conversation.",
+        }
+    }
+
+    pub fn details_label(self) -> &'static str {
+        match self {
+            Self::TopicKickoff => "Orchestration details",
+            Self::Background => "Message details",
+        }
+    }
 }
 
 impl BlockKind {

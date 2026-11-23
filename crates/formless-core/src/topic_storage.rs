@@ -1,15 +1,191 @@
 use super::*;
 use anyhow::{anyhow, bail, Context};
 use formless_protocol::{
-    HarnessKind, StepAccess, TopicArtifact, TopicAttemptStatus, TopicFeatureProposal,
-    TopicProposalRequest, WorkspaceKind,
+    HarnessKind, Question, QuestionAnswer, StepAccess, TopicArtifact, TopicAttemptStatus,
+    TopicFeatureProposal, TopicProposalRequest, WorkspaceKind,
 };
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
+pub(crate) struct TopicSuggestionCandidate {
+    pub id: String,
+    pub status: String,
+    pub parent_topic_id: Option<String>,
+    pub workspace: Option<std::path::PathBuf>,
+    pub workspace_kind: String,
+    pub source_message_ids: HashSet<String>,
+}
+
+const TOPIC_GROUNDING_CONTEXT_MARKER: &str = "topic_grounding_context";
+const TOPIC_HUMAN_ANSWER_MARKER: &str = "topic_human_answer";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TopicHumanAnswerReceipt {
+    pub version: u8,
+    pub source_question_id: String,
+    pub topic_id: String,
+    pub feature_id: String,
+    pub attempt_id: String,
+    pub questions: Vec<Question>,
+    pub answers: Vec<QuestionAnswer>,
+    pub context_fingerprint: String,
+}
+
+fn topic_human_answer_receipt_content(receipt: &TopicHumanAnswerReceipt) -> Result<String> {
+    Ok(format!(
+        "Human answer for harness question {} (attempt {})\nQuestions: {}\nAnswers: {}",
+        receipt.source_question_id,
+        receipt.attempt_id,
+        serde_json::to_string(&receipt.questions)?,
+        serde_json::to_string(&receipt.answers)?
+    ))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ResolvedTopicAnswerEvidence {
+    pub message_id: String,
+    pub quote: String,
+    pub source: String,
+    pub topic_id: String,
+    pub feature_id: String,
+    pub attempt_id: String,
+    pub context_fingerprint: String,
+}
+
+#[derive(serde::Serialize)]
+struct TopicHumanContextEntry<'a> {
+    id: &'a str,
+    session_id: &'a str,
+    seq: i64,
+    role: &'a str,
+    content: &'a str,
+    meta: &'a Option<String>,
+    generated_by: &'a Option<String>,
+}
+
 impl Store {
+    pub(crate) fn set_topic_limits(
+        &self,
+        id: &str,
+        limits: &formless_protocol::TopicLimits,
+    ) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            if st.conn.execute(
+                "UPDATE topics SET limits=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(limits)?, now()],
+            )? != 1
+            {
+                bail!("topic not found");
+            }
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn topic_step_limit(
+        &self,
+        id: &str,
+        feature: &str,
+        title: &str,
+    ) -> Result<Option<bool>> {
+        let topic = topic_info(self, id)?.context("topic not found")?;
+        let feature = topic
+            .features
+            .iter()
+            .find(|f| f.id == feature)
+            .context("feature not found")?;
+        if !matches!(
+            topic.status,
+            formless_protocol::TopicStatus::Running | formless_protocol::TopicStatus::NeedsUser
+        ) || !matches!(
+            feature.status,
+            formless_protocol::TopicFeatureStatus::Pending
+                | formless_protocol::TopicFeatureStatus::NeedsUser
+        ) || feature.active_attempt_id.is_some()
+        {
+            bail!("feature is terminal or has an active attempt");
+        }
+        if topic.attempts.len() as u64 >= u64::from(topic.limits.max_attempts_per_topic) {
+            return Ok(Some(true));
+        }
+        if topic
+            .attempts
+            .iter()
+            .filter(|attempt| {
+                attempt.feature_id == feature.id && attempt.step_title == title.trim()
+            })
+            .count() as u64
+            > u64::from(topic.limits.max_retries_per_step)
+        {
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+    pub(crate) fn mark_topic_limit(&self, id: &str, feature: &str) -> Result<()> {
+        self.transaction(|st|{
+            st.conn.execute("UPDATE topic_features SET status='needs_user',detail='topic step limit reached',updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status IN ('pending','needs_user')",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+            Ok(())
+        })
+    }
+    pub(crate) fn raise_topic_limit(&self, id: &str, feature: &str, total: bool) -> Result<()> {
+        self.transaction(|st|{
+            let mut topic=topic_info(st,id)?.context("topic not found")?;
+            if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){bail!("topic no longer active");}
+            if total{topic.limits.max_attempts_per_topic=topic.limits.max_attempts_per_topic.saturating_add(20);}
+            else{topic.limits.max_retries_per_step=topic.limits.max_retries_per_step.saturating_add(3);}
+            st.set_topic_limits(id,&topic.limits)?;
+            st.conn.execute("UPDATE topic_features SET status='pending',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2 AND active_attempt_id IS NULL AND status='needs_user'",params![id,feature,now()])?;
+            st.conn.execute("UPDATE topics SET status='running',updated_at=?2 WHERE id=?1 AND status='needs_user'",params![id,now()])?;
+            Ok(())
+        })
+    }
+    pub(crate) fn add_topic_permission_rule(
+        &self,
+        id: &str,
+        mut rule: formless_protocol::TopicPermissionRule,
+    ) -> Result<TopicInfo> {
+        if rule.pattern.is_empty() || rule.pattern.chars().count() > 1024 {
+            bail!("permission rule pattern must contain 1..=1024 characters");
+        }
+        if rule
+            .acp_agent
+            .as_ref()
+            .is_some_and(|agent| agent.trim().is_empty())
+            || rule.acp_agent.is_some() && rule.harness.is_some_and(|kind| kind != HarnessKind::Acp)
+        {
+            bail!("acp_agent requires an ACP harness filter");
+        }
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            if topic.permission_rules.len() >= 256 {
+                bail!("topic reached the 256 permission rule limit");
+            }
+            rule.rule_id = uuid::Uuid::new_v4().to_string();
+            topic.permission_rules.push(rule);
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
+    pub(crate) fn remove_topic_permission_rule(&self, id: &str, rule: &str) -> Result<TopicInfo> {
+        self.transaction(|st| {
+            let mut topic = topic_info(st, id)?.context("topic not found")?;
+            let previous = topic.permission_rules.len();
+            topic.permission_rules.retain(|saved| saved.rule_id != rule);
+            if previous == topic.permission_rules.len() {
+                bail!("permission rule not found");
+            }
+            st.conn.execute(
+                "UPDATE topics SET permission_rules=?2,updated_at=?3 WHERE id=?1",
+                params![id, serde_json::to_string(&topic.permission_rules)?, now()],
+            )?;
+            topic_info(st, id)?.context("topic vanished")
+        })
+    }
     pub(crate) fn update_topic_message(&self, message: &MessageInfo) -> Result<()> {
         self.note_rewrite();
         self.conn.execute(
@@ -23,6 +199,398 @@ impl Store {
         )?;
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn delete_topic_message_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_session_kind_for_test(&self, session_id: &str, kind: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET session_kind=?2 WHERE id=?1",
+            params![session_id, kind],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_topic_message_generated_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        generated_by: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET generated_by=?3 WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id, generated_by],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_topic_message_role_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET role=?3 WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id, role],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn topic_grounding_context_messages(
+        &self,
+        topic_id: &str,
+        excluded_message_id: Option<&str>,
+    ) -> Result<Vec<MessageInfo>> {
+        if self.get_topic(topic_id)?.is_none() {
+            bail!("topic not found");
+        }
+        let sessions = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE ancestors(id,parent_topic_id,topic_session_id,source_session_id) AS (
+                   SELECT id,parent_topic_id,topic_session_id,source_session_id FROM topics WHERE id=?1
+                   UNION
+                   SELECT parent.id,parent.parent_topic_id,parent.topic_session_id,parent.source_session_id
+                   FROM topics parent JOIN ancestors child ON child.parent_topic_id=parent.id
+                 ), candidates(session_id) AS (
+                   SELECT topic_session_id FROM ancestors WHERE topic_session_id IS NOT NULL
+                   UNION SELECT source_session_id FROM ancestors
+                 )
+                 SELECT DISTINCT s.id FROM sessions s JOIN candidates c ON c.session_id=s.id
+                 WHERE s.deleted_at IS NULL AND s.session_kind IN ('main','topic','chat') ORDER BY s.id",
+            )?
+            .query_map([topic_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut messages = Vec::new();
+        for session_id in sessions {
+            messages.extend(
+                self.list_messages(&session_id)?
+                    .into_iter()
+                    .filter(|message| {
+                        message.id.as_str() != excluded_message_id.unwrap_or_default()
+                            && ((message.role == "user" && message.generated_by.is_none())
+                                || message.generated_by.as_deref()
+                                    == Some(TOPIC_HUMAN_ANSWER_MARKER))
+                    }),
+            );
+        }
+        messages.sort_by(|left, right| {
+            (&left.session_id, left.seq, &left.id).cmp(&(&right.session_id, right.seq, &right.id))
+        });
+        Ok(messages)
+    }
+    pub(crate) fn topic_grounding_context_fingerprint(
+        &self,
+        topic_id: &str,
+        excluded_message_id: Option<&str>,
+    ) -> Result<String> {
+        let messages = self.topic_grounding_context_messages(topic_id, excluded_message_id)?;
+        fingerprint_topic_human_context(&messages)
+    }
+    pub(crate) fn append_topic_human_answer_receipt(
+        &self,
+        topic_id: &str,
+        attempt_id: &str,
+        question_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+    ) -> Result<MessageInfo> {
+        let topic = self.get_topic(topic_id)?.context("topic not found")?;
+        let attempt = self
+            .get_topic_attempt(attempt_id)?
+            .context("harness attempt not found")?;
+        let session_id = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        if attempt.topic_id != topic_id {
+            bail!("harness attempt belongs to another topic");
+        }
+        let Some(feature) = topic
+            .features
+            .iter()
+            .find(|feature| feature.id == attempt.feature_id)
+        else {
+            bail!("harness attempt feature not found");
+        };
+        let context_fingerprint = self.topic_grounding_context_fingerprint(topic_id, None)?;
+        let receipt = TopicHumanAnswerReceipt {
+            version: 1,
+            source_question_id: question_id.into(),
+            topic_id: topic_id.into(),
+            feature_id: feature.id.clone(),
+            attempt_id: attempt_id.into(),
+            questions: questions.to_vec(),
+            answers: answers.to_vec(),
+            context_fingerprint,
+        };
+        let content = topic_human_answer_receipt_content(&receipt)?;
+        let meta = json!({"topic_human_answer": receipt}).to_string();
+        self.append_message_generated(
+            session_id,
+            "system-note",
+            &content,
+            Some(meta),
+            Some(TOPIC_HUMAN_ANSWER_MARKER),
+        )
+    }
+    pub(crate) fn resolve_topic_answer_evidence(
+        &self,
+        session_id: &str,
+        topic_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let topic = self.get_topic(topic_id)?.context("topic not found")?;
+        if topic.topic_session_id.as_deref() != Some(session_id) {
+            bail!("answer evidence must be resolved in this topic's canonical conversation");
+        }
+        let attempt = self
+            .get_topic_attempt(attempt_id)?
+            .context("harness attempt not found")?;
+        if attempt.topic_id != topic_id {
+            bail!("answer evidence is outside the pending attempt's topic");
+        }
+        let feature = topic
+            .features
+            .iter()
+            .find(|feature| feature.id == attempt.feature_id)
+            .context("pending attempt feature not found")?;
+        if evidence_message_id == feature.source_message_id {
+            return self.resolve_approved_request_evidence(
+                &topic,
+                &attempt.feature_id,
+                attempt_id,
+                questions,
+                answers,
+                evidence_message_id,
+                quote,
+            );
+        }
+        self.resolve_human_answer_evidence(
+            &topic,
+            &attempt.feature_id,
+            attempt_id,
+            questions,
+            answers,
+            evidence_message_id,
+            quote,
+        )
+    }
+    fn resolve_approved_request_evidence(
+        &self,
+        topic: &TopicInfo,
+        feature_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let topic_session = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        let snapshots = {
+            let mut statement = self.conn.prepare(
+                "SELECT message_id,source_content,source_content_hash,moved_at
+                 FROM topic_source_messages WHERE topic_id=?1 ORDER BY source_seq,message_id",
+            )?;
+            let rows = statement
+                .query_map([&topic.id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if snapshots.is_empty() {
+            bail!("topic has no approved request snapshots");
+        }
+        let mut selected_content = None;
+        for (message_id, source_content, source_hash, moved_at) in &snapshots {
+            if moved_at.is_none() || hash_token(source_content) != *source_hash {
+                bail!("an approved request snapshot is missing or invalid; ask the user");
+            }
+            let live = self.get_message(topic_session, message_id)?.context(
+                "an approved request is missing from the topic conversation; ask the user",
+            )?;
+            if live.role != "user"
+                || live.generated_by.is_some()
+                || live.content != *source_content
+                || hash_token(&live.content) != *source_hash
+            {
+                bail!("an approved request changed or is not a live human message; ask the user");
+            }
+            if message_id == evidence_message_id {
+                selected_content = Some(source_content.as_str());
+            }
+        }
+        let source_content =
+            selected_content.context("evidence is not the active feature's approved request")?;
+        if snapshots.iter().any(|(message_id, content, _, _)| {
+            message_id != evidence_message_id && content != source_content
+        }) {
+            bail!("other approved requests make this choice ambiguous; ask the user");
+        }
+        if quote.trim() != source_content.trim() {
+            bail!("evidence quote must be the complete approved request");
+        }
+        let (stem, selected_label) = explicit_single_choice(questions, answers)?;
+        let options = questions[0]
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<HashSet<_>>();
+        let matching_labels = parse_choice_directives(source_content)
+            .into_iter()
+            .filter(|(source_stem, source_label)| {
+                source_stem == &stem && options.contains(source_label.as_str())
+            })
+            .map(|(_, source_label)| source_label)
+            .collect::<HashSet<_>>();
+        if matching_labels.len() != 1 {
+            bail!("approved request is not one unambiguous choice for this question; ask the user");
+        }
+        let source_label = matching_labels.into_iter().next().unwrap();
+        if source_label != selected_label {
+            bail!("selected answer does not match the approved request; ask the user");
+        }
+        let baseline = self.topic_approval_context_fingerprint(&topic.id, topic_session)?;
+        let current_messages = self.topic_grounding_context_messages(&topic.id, None)?;
+        let current = fingerprint_topic_human_context(&current_messages)?;
+        if current != baseline {
+            bail!("in-scope human context changed since topic approval; ask the user");
+        }
+        for message in &current_messages {
+            if message.id == evidence_message_id || !message.content.contains(&stem) {
+                continue;
+            }
+            let matching = parse_choice_directives(&message.content)
+                .into_iter()
+                .filter(|(other_stem, _)| other_stem == &stem)
+                .map(|(_, other_label)| other_label)
+                .collect::<HashSet<_>>();
+            if matching.len() != 1 || !matching.contains(&selected_label) {
+                bail!("surrounding human context makes this choice ambiguous; ask the user");
+            }
+        }
+        Ok(ResolvedTopicAnswerEvidence {
+            message_id: evidence_message_id.into(),
+            quote: quote.trim().into(),
+            source: "approved_request".into(),
+            topic_id: topic.id.clone(),
+            feature_id: feature_id.into(),
+            attempt_id: attempt_id.into(),
+            context_fingerprint: baseline,
+        })
+    }
+    fn resolve_human_answer_evidence(
+        &self,
+        topic: &TopicInfo,
+        feature_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let session_id = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        let message = self
+            .get_message(session_id, evidence_message_id)?
+            .context("evidence is not a message in this topic conversation")?;
+        if message.role != "system-note"
+            || message.generated_by.as_deref() != Some(TOPIC_HUMAN_ANSWER_MARKER)
+            || quote.trim() != message.content.trim()
+        {
+            bail!("evidence is not a complete trusted human-answer receipt");
+        }
+        let metadata: serde_json::Value = serde_json::from_str(
+            message
+                .meta
+                .as_deref()
+                .context("human-answer receipt metadata is missing")?,
+        )?;
+        let receipt: TopicHumanAnswerReceipt =
+            serde_json::from_value(metadata["topic_human_answer"].clone())?;
+        if message.content != topic_human_answer_receipt_content(&receipt)? {
+            bail!("human-answer receipt content does not match its typed metadata");
+        }
+        if receipt.version != 1
+            || receipt.topic_id != topic.id
+            || receipt.feature_id != feature_id
+            || receipt.attempt_id != attempt_id
+            || receipt.questions != questions
+            || receipt.answers != answers
+        {
+            bail!("human answer does not match this attempt's exact question and answers");
+        }
+        let current =
+            self.topic_grounding_context_fingerprint(&topic.id, Some(evidence_message_id))?;
+        if current != receipt.context_fingerprint {
+            bail!("in-scope human context changed after this answer; ask the user");
+        }
+        Ok(ResolvedTopicAnswerEvidence {
+            message_id: evidence_message_id.into(),
+            quote: quote.trim().into(),
+            source: "human_answer".into(),
+            topic_id: topic.id.clone(),
+            feature_id: feature_id.into(),
+            attempt_id: attempt_id.into(),
+            context_fingerprint: current,
+        })
+    }
+    fn topic_approval_context_fingerprint(
+        &self,
+        topic_id: &str,
+        topic_session_id: &str,
+    ) -> Result<String> {
+        let receipts = self
+            .list_messages(topic_session_id)?
+            .into_iter()
+            .filter(|message| {
+                message.generated_by.as_deref() == Some(TOPIC_GROUNDING_CONTEXT_MARKER)
+            })
+            .collect::<Vec<_>>();
+        if receipts.len() != 1 || receipts[0].role != "system-note" {
+            bail!("approved human-context snapshot is unavailable; ask the user");
+        }
+        let meta: serde_json::Value = serde_json::from_str(
+            receipts[0]
+                .meta
+                .as_deref()
+                .context("approved human-context snapshot metadata is missing")?,
+        )?;
+        if meta["topic_grounding_context"]["version"] != 1
+            || meta["topic_grounding_context"]["topic_id"] != topic_id
+        {
+            bail!("approved human-context snapshot metadata is invalid; ask the user");
+        }
+        meta["topic_grounding_context"]["fingerprint"]
+            .as_str()
+            .map(str::to_owned)
+            .context("approved human-context fingerprint is missing")
+    }
+
     pub(crate) fn topic_for_session(&self, session: &str) -> Result<Option<TopicInfo>> {
         let id: Option<String> = self
             .conn
@@ -46,6 +614,7 @@ impl Store {
     pub(crate) fn finish_topic_orchestrator(
         &self,
         session: &str,
+        run_id: &str,
         status: &str,
     ) -> Result<Option<String>> {
         self.transaction(|st|{
@@ -53,18 +622,20 @@ impl Store {
             if !matches!(topic.status,formless_protocol::TopicStatus::Running|formless_protocol::TopicStatus::NeedsUser){return Ok(None);}
             if matches!(status,"paused"|"failed"|"error") {
                 st.fail_topic_workflow(&topic.id,&format!("orchestrator run ended with {status}"))?;
+                st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?3 WHERE id=?1 AND session_id=?2 AND status IN ('paused','failed','error')",params![run_id,session,now()])?;
             } else if topic.features.iter().any(|feature|matches!(feature.status,formless_protocol::TopicFeatureStatus::Pending|formless_protocol::TopicFeatureStatus::Running|formless_protocol::TopicFeatureStatus::NeedsUser)) {
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![topic.id,now()])?;
-                if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically.")?;}
+                if let Some(session)=&topic.topic_session_id {st.append_message(session,"system-note","The orchestrator stopped with open work. Send a message to continue; nothing was restarted automatically. Active harness attempts, if any, keep running.")?;}
             }
             Ok(Some(topic.id))
         })
     }
     pub(crate) fn recover_topic_workflows(&self) -> Result<()> {
         self.transaction(|st|{
+            st.conn.execute("UPDATE runs SET status='abandoned',updated_at=?1 WHERE status IN ('paused','interrupted') AND EXISTS(SELECT 1 FROM topics t WHERE t.topic_session_id=runs.session_id AND (EXISTS(SELECT 1 FROM runs newer WHERE newer.session_id=runs.session_id AND (newer.created_at>runs.created_at OR (newer.created_at=runs.created_at AND newer.rowid>runs.rowid))) OR (t.status NOT IN ('running','needs_user') AND EXISTS(SELECT 1 FROM messages m WHERE m.id=runs.start_message_id AND m.session_id=t.topic_session_id AND m.generated_by='topic_kickoff'))))",params![now()])?;
             let topics:Vec<String>=st.conn.prepare("SELECT id FROM topics WHERE status IN ('running','needs_user')")?.query_map([],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
             for id in topics {
-                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='abandoned',detail='daemon restarted; child outcome is unknown',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))",params![id,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,detail='daemon restarted; inspect abandoned attempts before continuing',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')",params![id,now()])?;
                 st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1",params![id,now()])?;
                 let topic=topic_row(st,&id)?.context("topic vanished")?;
@@ -86,7 +657,7 @@ impl Store {
         self.transaction(|st|{
             let topic=st.topic_for_session(session)?.context("not a Topic Chat")?;
             if !st.is_topic_orchestrator(session)?{bail!("topic is not running or waiting for input");}
-            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
+            let changed=st.conn.execute("UPDATE topic_features SET status=?3,detail=?4,updated_at=?5 WHERE topic_id=?1 AND id=?2 AND status IN ('pending','needs_user') AND active_attempt_id IS NULL AND NOT EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND feature_id=?2 AND status='running')",params![topic.id,feature,if ready{"ready"}else{"failed"},detail,now()])?;
             if changed!=1{bail!("feature is missing, terminal, or has an active attempt");}
             let open:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND status IN ('pending','running','needs_user'))",[&topic.id],|row|row.get(0))?;
             if !open {
@@ -111,11 +682,14 @@ impl Store {
             if !matches!(topic.status.as_str(),"running"|"needs_user") || matches!(before.status,TopicAttemptStatus::Cancelled|TopicAttemptStatus::Abandoned){return Ok(before);}
             let feature=topic_info(st,&before.topic_id)?.context("topic vanished")?.features.into_iter().find(|feature|feature.id==before.feature_id).context("feature vanished")?;
             if feature.active_attempt_id.as_ref().is_some_and(|active|active!=id){bail!("attempt was superseded");}
-            let mut merged=before.outputs.clone();
-            for output in outputs {if !merged.contains(output){merged.push(output.clone());}}
+            if feature.active_attempt_id.is_none() && matches!(before.status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::Failed){return Ok(before);}
+            let(status,summary)=if before.status==TopicAttemptStatus::Failed && status==TopicAttemptStatus::Succeeded{(before.status,before.summary.as_deref().unwrap_or(summary))}else{(status,summary)};
+            let publish=matches!(status,TopicAttemptStatus::Succeeded|TopicAttemptStatus::NeedsUser);
+            let mut merged=if publish{st.validate_topic_reported_outputs(id,&before.outputs)?}else{vec![]};
+            if publish{for output in outputs {if !merged.contains(output){merged.push(output.clone());}}}
             let mut feature_outputs=feature.outputs;
             for output in &merged {if !feature_outputs.contains(output){feature_outputs.push(output.clone());}}
-            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session,now()])?;
+            st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,harness_session_id=?5,updated_at=?6 WHERE id=?1",params![id,enum_text(status)?,summary,serde_json::to_string(&merged)?,harness_session.or(before.harness_session_id.as_deref()),now()])?;
             st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,outputs=?3,detail=NULL,updated_at=?4 WHERE id=?1",params![before.feature_id,if status==TopicAttemptStatus::NeedsUser{"needs_user"}else{"pending"},serde_json::to_string(&feature_outputs)?,now()])?;
             if before.summary.as_deref()!=Some(summary) && !st.list_messages(&before.conversation_session_id)?.iter().any(|message|message.role=="assistant" && message.content==summary){st.append_message(&before.conversation_session_id,"assistant",summary)?;}
             topic_attempt(st,id)?.context("attempt vanished")
@@ -308,6 +882,7 @@ impl Store {
                 if message.role != "user" {
                     bail!("only user messages can be proposed as feature requests");
                 }
+                if message.generated_by.is_some(){bail!("generated messages cannot be proposed as feature requests");}
                 selected.push(message);
             }
             selected.sort_by_key(|message| message.seq);
@@ -409,7 +984,7 @@ impl Store {
                 bail!("only a pending topic can be approved");
             }
             let active: bool = st.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status IN ('running','paused'))
+                "SELECT COALESCE((SELECT status IN ('running','paused','interrupted') FROM runs WHERE session_id=?1 ORDER BY created_at DESC,rowid DESC LIMIT 1),0)
                       OR EXISTS(SELECT 1 FROM queued_messages WHERE session_id=?1)",
                 params![topic.source_session_id],
                 |row| row.get(0),
@@ -461,6 +1036,7 @@ impl Store {
             for (seq, (message_id, source_seq, snapshot)) in refs.iter().enumerate() {
                 let current = st.get_message(&topic.source_session_id, message_id)?
                     .ok_or_else(|| anyhow!("selected source message {message_id} no longer exists"))?;
+                if current.generated_by.is_some(){bail!("generated messages cannot be moved to topics");}
                 if current.role != "user" || hash_token(&current.content) != *snapshot {
                     bail!("selected source message {message_id} changed since proposal; create a new proposal to approve the edited request");
                 }
@@ -500,6 +1076,22 @@ impl Store {
             st.conn.execute(
                 "UPDATE topics SET topic_session_id=?2,status='approved',updated_at=?3 WHERE id=?1",
                 params![topic_id, session.id, timestamp],
+            )?;
+            let context_fingerprint = st.topic_grounding_context_fingerprint(topic_id, None)?;
+            let context_meta = json!({
+                "topic_grounding_context": {
+                    "version": 1,
+                    "topic_id": topic_id,
+                    "fingerprint": context_fingerprint,
+                }
+            })
+            .to_string();
+            st.append_message_generated(
+                &session.id,
+                "system-note",
+                "Approved requests recorded. You will be asked about choices they do not settle.",
+                Some(context_meta),
+                Some(TOPIC_GROUNDING_CONTEXT_MARKER),
             )?;
             let redirect = st.append_message(
                 &topic.source_session_id,
@@ -556,6 +1148,93 @@ impl Store {
             .collect()
     }
 
+    pub(crate) fn topic_suggestion_candidates(
+        &self,
+        source_session_id: &str,
+    ) -> Result<Vec<TopicSuggestionCandidate>> {
+        let mut statement = self.conn.prepare(
+            "SELECT t.id,t.status,t.parent_topic_id,t.workspace,t.workspace_kind,sm.message_id
+             FROM topics t
+             LEFT JOIN topic_source_messages sm ON sm.topic_id=t.id
+             WHERE t.source_session_id=?1
+             ORDER BY t.id,sm.source_seq",
+        )?;
+        let rows = statement
+            .query_map([source_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut candidates = Vec::<TopicSuggestionCandidate>::new();
+        for (id, status, parent_topic_id, workspace, workspace_kind, message_id) in rows {
+            if candidates.last().is_none_or(|candidate| candidate.id != id) {
+                candidates.push(TopicSuggestionCandidate {
+                    id,
+                    status,
+                    parent_topic_id,
+                    workspace: workspace.map(std::path::PathBuf::from),
+                    workspace_kind,
+                    source_message_ids: HashSet::new(),
+                });
+            }
+            if let Some(message_id) = message_id {
+                candidates
+                    .last_mut()
+                    .expect("candidate was just inserted")
+                    .source_message_ids
+                    .insert(message_id);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn topic_source_content_unchanged(
+        &self,
+        topic_id: &str,
+        source_session_id: &str,
+        selected: &std::collections::BTreeSet<&str>,
+    ) -> Result<bool> {
+        let mut statement = self.conn.prepare(
+            "SELECT source.message_id,source.source_content_hash,message.role,message.content,message.generated_by
+             FROM topic_source_messages source
+             LEFT JOIN messages message
+               ON message.id=source.message_id AND message.session_id=source.source_session_id
+             WHERE source.topic_id=?1 AND source.source_session_id=?2",
+        )?;
+        let sources = statement
+            .query_map(params![topic_id, source_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if sources.len() != selected.len() {
+            return Ok(false);
+        }
+        for (message_id, snapshot, role, content, generated_by) in sources {
+            if !selected.contains(message_id.as_str())
+                || role.as_deref() != Some("user")
+                || generated_by.is_some()
+                || content
+                    .as_deref()
+                    .is_none_or(|content| hash_token(content) != snapshot)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn get_topic(&self, topic_id: &str) -> Result<Option<TopicInfo>> {
         topic_info(self, topic_id)
     }
@@ -588,7 +1267,7 @@ impl Store {
                 _ => bail!("only an approved, running or needs-user topic can be cancelled"),
             }
             let timestamp = now();
-            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,timestamp])?;
+            st.conn.execute("UPDATE topic_attempts SET status='cancelled',detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,timestamp])?;
             st.conn.execute("UPDATE topic_features SET status='cancelled',active_attempt_id=NULL,detail='topic cancelled',updated_at=?2 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,timestamp])?;
             st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1", [topic_id])?;
             st.conn.execute("UPDATE topics SET status='cancelled',updated_at=?2 WHERE id=?1", params![topic_id,timestamp])?;
@@ -604,13 +1283,7 @@ impl Store {
                     "topic must be approved and not already running before its workflow can start"
                 );
             }
-            let workspace = topic.workspace.context("approved topic has no workspace")?;
-            st.conn
-                .execute(
-                    "INSERT INTO topic_repo_locks(workspace,topic_id,acquired_at) VALUES(?1,?2,?3)",
-                    params![workspace, topic_id, now()],
-                )
-                .context("workspace already has an active topic workflow")?;
+            topic.workspace.context("approved topic has no workspace")?;
             st.conn.execute(
                 "UPDATE topics SET status='running',updated_at=?2 WHERE id=?1",
                 params![topic_id, now()],
@@ -643,11 +1316,11 @@ impl Store {
         self.transaction(|st| {
             let topic = topic_row(st, topic_id)?.context("topic not found")?;
             if !matches!(topic.status.as_str(),"running"|"needs_user") { bail!("topic must be running to launch an attempt"); }
-            let (status, count, active): (String, u32, Option<String>) = st.conn.query_row(
+            let (status, _count, active): (String, u32, Option<String>) = st.conn.query_row(
                 "SELECT status,attempt_count,active_attempt_id FROM topic_features WHERE topic_id=?1 AND id=?2",
                 params![topic_id,feature_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
             if !matches!(status.as_str(),"pending"|"needs_user") || active.is_some() { bail!("feature is not pending or already has an active attempt"); }
-            if count >= 12 { bail!("work item reached the 12-attempt limit"); }
+            if st.topic_step_limit(topic_id,feature_id,step_title)?.is_some(){bail!("topic step limit reached");}
             let id = uuid::Uuid::new_v4().to_string();
             let session = st.create_session(Some(format!("{}: {}", harness_label(harness), step_title.trim())))?;
             let outputs_dir = st.artifact_root.as_ref().and_then(|root|root.parent())
@@ -713,36 +1386,85 @@ impl Store {
         }
         self.transaction(|st| {
             let attempt=st.authenticate_topic_attempt(id,token)?;
-            let mut outputs=outputs.to_vec();
-            for artifact in &mut outputs {
-                if let TopicArtifact::File {path,sha256} = artifact {
-                    let root: Option<String> = st.conn.query_row("SELECT outputs_dir FROM topic_attempts WHERE id=?1", [id], |r|r.get(0))?;
-                    let root=PathBuf::from(root.context("attempt has no private outputs directory")?).canonicalize()?;
-                    let file=if path.is_absolute(){path.clone()}else{root.join(&*path)}.canonicalize()?;
-                    if !file.starts_with(&root) || !file.is_file() {bail!("file output must be inside this attempt's private outputs directory");}
-                    if hash_bytes(&std::fs::read(&file)?) != *sha256 {bail!("file output SHA-256 does not match");}
-                    *path=file;
-                }
-                if let TopicArtifact::GitRevision {revision} = artifact {
-                    if !matches!(revision.len(),40|64) || !revision.bytes().all(|b|b.is_ascii_hexdigit()) {bail!("Git revision must be a full 40- or 64-character SHA");}
-                }
-            }
+            let outputs=st.validate_topic_reported_outputs(id,outputs)?;
             let timestamp=now();
             st.conn.execute("UPDATE topic_attempts SET status=?2,summary=?3,outputs=?4,updated_at=?5 WHERE id=?1",
                 params![id,enum_text(status)?,summary,serde_json::to_string(&outputs)?,timestamp])?;
             st.append_message(&attempt.conversation_session_id,"assistant",summary)?;
-            st.conn.execute("UPDATE topic_features SET status=?2,active_attempt_id=NULL,updated_at=?3 WHERE id=?1",
-                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"pending"},timestamp])?;
+            st.conn.execute("UPDATE topic_features SET status=?2,updated_at=?3 WHERE id=?1",
+                params![attempt.feature_id,if status==TopicAttemptStatus::NeedsUser {"needs_user"}else{"running"},timestamp])?;
             if status==TopicAttemptStatus::NeedsUser {st.conn.execute("UPDATE topics SET status='needs_user',updated_at=?2 WHERE id=?1", params![attempt.topic_id,timestamp])?;}
             topic_attempt(st,id)?.context("attempt vanished")
         })
+    }
+
+    fn validate_topic_reported_outputs(
+        &self,
+        id: &str,
+        outputs: &[TopicArtifact],
+    ) -> Result<Vec<TopicArtifact>> {
+        let st = self;
+        let mut outputs = outputs.to_vec();
+        for artifact in &mut outputs {
+            if let TopicArtifact::Directory { path } = artifact {
+                let root: Option<String> = st.conn.query_row(
+                    "SELECT outputs_dir FROM topic_attempts WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )?;
+                let root = PathBuf::from(root.context("attempt has no private outputs directory")?)
+                    .canonicalize()?;
+                let directory = if Path::new(path).is_absolute() {
+                    PathBuf::from(&*path)
+                } else {
+                    root.join(&*path)
+                }
+                .canonicalize()?;
+                if !directory.starts_with(&root) || !directory.is_dir() {
+                    bail!(
+                        "directory output must be inside this attempt's private outputs directory"
+                    );
+                }
+                *path = directory.to_string_lossy().into_owned();
+            }
+            if let TopicArtifact::File { path, sha256 } = artifact {
+                let root: Option<String> = st.conn.query_row(
+                    "SELECT outputs_dir FROM topic_attempts WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                let root = PathBuf::from(root.context("attempt has no private outputs directory")?)
+                    .canonicalize()?;
+                let file = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(&*path)
+                }
+                .canonicalize()?;
+                if !file.starts_with(&root) || !file.is_file() {
+                    bail!("file output must be inside this attempt's private outputs directory");
+                }
+                if hash_bytes(&std::fs::read(&file)?) != *sha256 {
+                    bail!("file output SHA-256 does not match");
+                }
+                *path = file;
+            }
+            if let TopicArtifact::GitRevision { revision } = artifact {
+                if !matches!(revision.len(), 40 | 64)
+                    || !revision.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    bail!("Git revision must be a full 40- or 64-character SHA");
+                }
+            }
+        }
+        Ok(outputs)
     }
 
     pub(crate) fn fail_topic_workflow(&self, topic_id: &str, detail: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
             if topic.status=="running" || topic.status=="needs_user" {
-                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('running','needs_user')", params![topic_id,detail,now()])?;
+                st.conn.execute("UPDATE topic_attempts SET status='failed',detail=?2,updated_at=?3 WHERE topic_id=?1 AND (status IN ('running','needs_user') OR id IN (SELECT active_attempt_id FROM topic_features WHERE topic_id=?1))", params![topic_id,detail,now()])?;
                 st.conn.execute("UPDATE topic_features SET status='failed',active_attempt_id=NULL,detail=?2,updated_at=?3 WHERE topic_id=?1 AND status IN ('pending','running','needs_user')", params![topic_id,detail,now()])?;
                 st.conn.execute("DELETE FROM topic_repo_locks WHERE topic_id=?1",[topic_id])?;
                 st.conn.execute("UPDATE topics SET status='failed',updated_at=?2 WHERE id=?1",params![topic_id,now()])?;
@@ -762,6 +1484,8 @@ impl Store {
     pub fn retry_topic_feature(&self, topic_id: &str, feature_id: &str) -> Result<TopicInfo> {
         self.transaction(|st| {
             let topic=topic_row(st,topic_id)?.context("topic not found")?;
+            let live:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topic_features WHERE topic_id=?1 AND active_attempt_id IS NOT NULL) OR EXISTS(SELECT 1 FROM topic_attempts WHERE topic_id=?1 AND status='running')",[topic_id],|row|row.get(0))?;
+            if live{bail!("topic has unfinished attempts; wait for them or cancel/recover before retrying");}
             if !matches!(topic.status.as_str(),"approved"|"failed"|"complete"|"needs_user"|"cancelled") {bail!("topic must be approved or terminal before retry; recover a running topic first");}
             let changed=st.conn.execute("UPDATE topic_features SET status='pending',active_attempt_id=NULL,outputs='[]',detail=NULL,updated_at=?3 WHERE topic_id=?1 AND id=?2",params![topic_id,feature_id,now()])?;
             if changed!=1 {bail!("topic feature not found");}
@@ -843,8 +1567,16 @@ fn topic_info(st: &Store, id: &str) -> Result<Option<TopicInfo>> {
         )
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(TopicInfo {
-        permission_rules: vec![],
-        limits: Default::default(),
+        permission_rules: serde_json::from_str(&st.conn.query_row(
+            "SELECT permission_rules FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
+        limits: serde_json::from_str(&st.conn.query_row(
+            "SELECT limits FROM topics WHERE id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )?)?,
         allow_external_context: st.conn.query_row(
             "SELECT allow_external_context FROM topics WHERE id=?1",
             [id],
@@ -925,6 +1657,151 @@ fn enum_text<T: serde::Serialize>(value: T) -> Result<String> {
 fn hash_token(token: &str) -> String {
     hash_bytes(token.as_bytes())
 }
+
+fn fingerprint_topic_human_context(messages: &[MessageInfo]) -> Result<String> {
+    let snapshot = messages
+        .iter()
+        .map(|message| TopicHumanContextEntry {
+            id: &message.id,
+            session_id: &message.session_id,
+            seq: message.seq,
+            role: &message.role,
+            content: &message.content,
+            meta: &message.meta,
+            generated_by: &message.generated_by,
+        })
+        .collect::<Vec<_>>();
+    Ok(hash_token(&serde_json::to_string(&snapshot)?))
+}
+
+fn explicit_single_choice(
+    questions: &[Question],
+    answers: &[QuestionAnswer],
+) -> Result<(String, String)> {
+    if questions.len() != 1 || answers.len() != 1 {
+        bail!("approved request evidence supports only one complete choice question");
+    }
+    let question = &questions[0];
+    let text = question.question.trim();
+    if question.header.is_some()
+        || question.multi_select
+        || text != question.question
+        || text.matches('?').count() != 1
+        || has_ambiguous_choice_clause(text)
+    {
+        bail!("question is not an exact single-choice form settled by a request directive");
+    }
+    let stem = text
+        .strip_suffix('?')
+        .filter(|stem| !stem.is_empty() && stem.trim() == *stem)
+        .context("question must end with one exact stem and a question mark")?;
+    if !is_choice_atom(stem) {
+        bail!("question stem must contain only letters, digits, spaces, hyphens, or underscores");
+    }
+    let mut labels = HashSet::new();
+    if question.options.is_empty()
+        || question.options.iter().any(|option| {
+            !is_choice_atom(&option.label)
+                || option.label.trim() != option.label
+                || option
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !description.trim().is_empty())
+                || !labels.insert(option.label.as_str())
+        })
+    {
+        bail!("question options must have unique, nonempty labels");
+    }
+    let answer = &answers[0];
+    if answer.selected.len() != 1
+        || answer
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || !labels.contains(answer.selected[0].as_str())
+    {
+        bail!("approved request evidence requires exactly one offered selection and no free text");
+    }
+    Ok((stem.to_owned(), answer.selected[0].clone()))
+}
+
+fn parse_choice_directives(content: &str) -> Vec<(String, String)> {
+    let content = content.trim();
+    if content.is_empty() || content.contains('\n') || content.contains('\r') {
+        return Vec::new();
+    }
+    let mut variants = vec![content];
+    if let Some(without_period) = content.strip_suffix('.') {
+        if !without_period.ends_with('.') {
+            variants.push(without_period);
+        }
+    }
+    let mut directives = Vec::new();
+    for variant in variants {
+        if variant.matches(':').count() != 1 {
+            continue;
+        }
+        let Some((stem, label)) = variant.split_once(": ") else {
+            continue;
+        };
+        if stem.is_empty()
+            || stem.trim() != stem
+            || !is_choice_atom(stem)
+            || label.is_empty()
+            || label.trim() != label
+            || !is_choice_atom(label)
+            || has_ambiguous_choice_clause(stem)
+            || has_ambiguous_choice_clause(label)
+        {
+            continue;
+        }
+        let directive = (stem.to_owned(), label.to_owned());
+        if !directives.contains(&directive) {
+            directives.push(directive);
+        }
+    }
+    directives
+}
+
+fn is_choice_atom(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+}
+
+fn has_ambiguous_choice_clause(text: &str) -> bool {
+    text.split(|character: char| !character.is_alphanumeric())
+        .any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "not"
+                    | "no"
+                    | "nor"
+                    | "never"
+                    | "without"
+                    | "if"
+                    | "when"
+                    | "unless"
+                    | "until"
+                    | "provided"
+                    | "assuming"
+                    | "or"
+                    | "and"
+                    | "but"
+                    | "except"
+                    | "otherwise"
+                    | "instead"
+                    | "maybe"
+                    | "perhaps"
+                    | "might"
+                    | "could"
+                    | "possibly"
+                    | "probably"
+            )
+        })
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))

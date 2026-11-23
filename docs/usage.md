@@ -95,7 +95,33 @@ also show their own keys in the footer.
 | `←` `→` `Home` `End`, `Ctrl+A/E/W/U/K`, `Alt+B/F/D` | edit the message (readline keys) |
 | `Ctrl+C` | clear the typed message; press again within 2 s to detach (the daemon keeps running, nothing is lost) |
 
-Common slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
+Common slash commands: `/help /new /sessions /main /topics /topic /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
+
+#### Main Chat and Topic Chats
+
+On a daemon with topic orchestration, `/main` opens the canonical Main Chat and
+`/topics` browses it and nested Topic Chats, including their harness
+conversations. Terminals at least 110 columns wide show a conversation rail;
+narrower terminals use a picker and breadcrumb.
+
+Use `/topic` to propose moving selected genuine user requests from Main Chat
+into a Topic Chat. A proposal moves nothing until you approve it; work starts
+only after a separate confirmation unless you explicitly approve and start
+together. The Main Chat assistant may suggest a proposal, but that suggestion
+is not consent. Topic Chats accept messages; harness transcripts are
+read-only, and ready features are never merged automatically. `/topic ID`
+reviews a proposal or shows a topic's features, attempts and revisions. Use
+`/topic start`, `/topic cancel`, `/topic recover`, `/topic retry TOPIC FEATURE`
+or `/topic reject TOPIC REASON` to manage the topic.
+
+The orchestrator can answer an ordinary harness question only with
+storage-verified evidence: a complete quote of the active feature's approved
+request in the narrow single-choice `stem: option` form, or a trusted prior
+human-answer receipt from the same attempt for identical questions and
+answers. It does not paraphrase or infer a general semantic answer. If evidence
+is missing, changed or ambiguous, the question stays pending for your direct
+answer. The model cannot answer user-only questions or permissions; permission
+decisions remain under your control.
 
 You can add your own prompt commands as Markdown files in the current profile's
 `<config>/commands/` directory or the current project's `.formless/commands/`.

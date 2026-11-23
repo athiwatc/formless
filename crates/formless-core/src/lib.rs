@@ -29,6 +29,7 @@ pub mod jobs;
 pub mod local_harness;
 pub mod local_servers;
 pub mod logs;
+mod main_topic_suggestions;
 pub mod mcp;
 pub mod mcp_auth;
 pub mod mcp_catalog;

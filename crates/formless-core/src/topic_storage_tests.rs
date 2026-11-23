@@ -23,6 +23,183 @@ fn fixture() -> (Store, SessionInfo, MessageInfo, TopicProposalRequest) {
 }
 
 #[test]
+fn topic_default_limits_cap_twenty_attempts_and_zero_blocks_first_launch() {
+    let (store, _, _, request) = fixture();
+    let pending = store
+        .propose_topic(&request, WorkspaceKind::Directory, None)
+        .unwrap();
+    let topic = store.approve_topic(&pending.id).unwrap();
+    assert_eq!(topic.limits, formless_protocol::TopicLimits::default());
+    store.claim_topic_workflow(&topic.id).unwrap();
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: 0,
+                max_attempts_per_topic: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+            .unwrap(),
+        Some(true)
+    );
+    store
+        .set_topic_limits(&topic.id, &formless_protocol::TopicLimits::default())
+        .unwrap();
+    for n in 0..20 {
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                &format!("step {n}"),
+                StepAccess::ReadOnly,
+                HarnessKind::Claude,
+                None,
+                None,
+                &[],
+                &"c".repeat(64),
+                Path::new("/topic/repo"),
+            )
+            .unwrap();
+        store
+            .finish_topic_step(
+                &attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "done",
+                &[],
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+            .unwrap(),
+        Some(true)
+    );
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: u32::MAX,
+                max_attempts_per_topic: u32::MAX,
+            },
+        )
+        .unwrap();
+    assert!(store
+        .topic_step_limit(&topic.id, &topic.features[0].id, "new step")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn topic_validation_can_fail_reported_success_but_never_overwrites_cancelled_or_abandoned() {
+    for status in [
+        TopicAttemptStatus::Succeeded,
+        TopicAttemptStatus::Failed,
+        TopicAttemptStatus::Cancelled,
+        TopicAttemptStatus::Abandoned,
+    ] {
+        let (store, _, _, request) = fixture();
+        let pending = store
+            .propose_topic(&request, WorkspaceKind::Directory, None)
+            .unwrap();
+        let topic = store.approve_topic(&pending.id).unwrap();
+        store.claim_topic_workflow(&topic.id).unwrap();
+        let token = "c".repeat(64);
+        let attempt = store
+            .begin_topic_attempt(
+                &topic.id,
+                &topic.features[0].id,
+                "Step",
+                StepAccess::Write,
+                HarnessKind::Pi,
+                None,
+                None,
+                &[],
+                &token,
+                Path::new("/topic/repo"),
+            )
+            .unwrap();
+        match status {
+            TopicAttemptStatus::Succeeded | TopicAttemptStatus::Failed => {
+                store
+                    .report_topic_result(&attempt.id, &token, status, "original report", &[])
+                    .unwrap();
+            }
+            TopicAttemptStatus::Cancelled => {
+                store.cancel_topic(&topic.id).unwrap();
+            }
+            TopicAttemptStatus::Abandoned => {
+                store.recover_topic(&topic.id).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = store.get_topic_attempt(&attempt.id).unwrap().unwrap();
+        assert_eq!(before.status, status);
+        let next = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            TopicAttemptStatus::Succeeded
+        };
+        let saved = store
+            .finish_topic_step(&attempt.id, next, "daemon validation failed", &[], None)
+            .unwrap();
+        let expected = if status == TopicAttemptStatus::Succeeded {
+            TopicAttemptStatus::Failed
+        } else {
+            status
+        };
+        assert_eq!(saved.status, expected);
+        assert_eq!(
+            saved.summary,
+            if status == TopicAttemptStatus::Succeeded {
+                Some("daemon validation failed".into())
+            } else {
+                before.summary
+            }
+        );
+        assert_eq!(saved.outputs, before.outputs);
+        assert!(store.get_topic(&topic.id).unwrap().unwrap().features[0]
+            .active_attempt_id
+            .is_none());
+        let again = store
+            .finish_topic_step(&attempt.id, next, "duplicate late result", &[], None)
+            .unwrap();
+        assert_eq!(again.status, expected);
+        assert_eq!(again.summary, saved.summary);
+    }
+}
+
+#[test]
+fn topic_isolated_workflows_can_share_a_source_workspace() {
+    let (store, source, _, mut request) = fixture();
+    let first = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&first.id).unwrap();
+    let message = store
+        .append_message(&source.id, "user", "Independent work")
+        .unwrap();
+    request.message_ids = vec![message.id];
+    request.name = "Other work".into();
+    let second = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    store.approve_topic(&second.id).unwrap();
+    store.claim_topic_workflow(&first.id).unwrap();
+    store.claim_topic_workflow(&second.id).unwrap();
+    store.cancel_topic(&first.id).unwrap();
+    assert_eq!(
+        store.get_topic(&second.id).unwrap().unwrap().status,
+        TopicStatus::Running
+    );
+}
+
+#[test]
 fn topic_main_identity_is_non_creating_and_persistent() {
     let store = Store::open_in_memory().unwrap();
     assert!(!store.is_main_chat("unknown").unwrap());
@@ -30,6 +207,106 @@ fn topic_main_identity_is_non_creating_and_persistent() {
     let first = store.main_chat().unwrap();
     assert!(store.is_main_chat(&first.id).unwrap());
     assert_eq!(store.main_chat().unwrap().id, first.id);
+}
+
+#[test]
+fn topic_generated_messages_cannot_be_proposed_or_approved_and_forks_keep_marker() {
+    let (store, source, message, proposal) = fixture();
+    let pending = store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE messages SET generated_by='topic_kickoff' WHERE id=?1",
+            [&message.id],
+        )
+        .unwrap();
+    assert!(store
+        .approve_topic(&pending.id)
+        .unwrap_err()
+        .to_string()
+        .contains("generated"));
+    assert!(store
+        .get_message(&source.id, &message.id)
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_topic(&pending.id)
+        .unwrap()
+        .unwrap()
+        .topic_session_id
+        .is_none());
+    assert!(store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap_err()
+        .to_string()
+        .contains("generated"));
+    let fork = store.fork_session(&source.id, None, None).unwrap().unwrap();
+    assert_eq!(
+        store.list_messages(&fork.id).unwrap()[0]
+            .generated_by
+            .as_deref(),
+        Some("topic_kickoff")
+    );
+    let generated = store
+        .append_message_generated(
+            &source.id,
+            "user",
+            "new kickoff",
+            None,
+            Some("topic_kickoff"),
+        )
+        .unwrap();
+    assert_eq!(generated.generated_by.as_deref(), Some("topic_kickoff"));
+    assert_eq!(
+        store
+            .get_message(&source.id, &generated.id)
+            .unwrap()
+            .unwrap()
+            .generated_by,
+        generated.generated_by
+    );
+}
+
+#[test]
+fn topic_generated_marker_migrates_v73_and_survives_reopen() {
+    let root = std::env::temp_dir().join(format!("fl-generated-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("formless.db");
+    let store = Store::open(&path).unwrap();
+    let session = store.create_session(None).unwrap();
+    let old = store
+        .append_message(&session.id, "user", "User request")
+        .unwrap();
+    store
+        .conn
+        .execute_batch("ALTER TABLE messages DROP COLUMN generated_by;PRAGMA user_version=73;")
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert!(store
+        .get_message(&session.id, &old.id)
+        .unwrap()
+        .unwrap()
+        .generated_by
+        .is_none());
+    let generated = store
+        .append_message_generated(&session.id, "user", "Kickoff", None, Some("topic_kickoff"))
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store
+            .get_message(&session.id, &generated.id)
+            .unwrap()
+            .unwrap()
+            .generated_by
+            .as_deref(),
+        Some("topic_kickoff")
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -59,6 +336,15 @@ fn topic_context_branch_scope_search_and_external_opt_in() {
             TopicAttemptStatus::Succeeded,
             "done",
             &[],
+        )
+        .unwrap();
+    store
+        .finish_topic_step(
+            &ancestor.id,
+            TopicAttemptStatus::Succeeded,
+            "done",
+            &[],
+            None,
         )
         .unwrap();
     store
@@ -156,6 +442,34 @@ fn topic_context_branch_scope_search_and_external_opt_in() {
             .len(),
         40
     );
+}
+
+#[test]
+fn topic_context_search_snippet_maps_unicode_expansion_to_original_characters() {
+    let (store, _, _, proposal) = fixture();
+    let pending = store
+        .propose_topic(&proposal, WorkspaceKind::Directory, None)
+        .unwrap();
+    let topic = store.approve_topic(&pending.id).unwrap();
+    let session = topic.topic_session_id.unwrap();
+    store
+        .append_message(&session, "user", &format!("{} needle", "İ".repeat(100)))
+        .unwrap();
+    let found = store
+        .topic_search_conversations(&topic.id, "NEEDLE")
+        .unwrap();
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    let snippet = found[0]["snippet"].as_str().unwrap();
+    assert!(snippet.ends_with(" needle"));
+    assert!(snippet.starts_with('İ'));
+    assert!(snippet.chars().count() <= 240);
+    let inside_expansion = store
+        .topic_search_conversations(&topic.id, "\u{307}")
+        .unwrap();
+    assert!(inside_expansion[0]["snippet"]
+        .as_str()
+        .unwrap()
+        .starts_with('İ'));
 }
 
 #[test]
@@ -304,7 +618,7 @@ fn topic_empty_features_fallback_approval_idempotence_and_rejection() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     let redirects: i64 = store
         .conn
         .query_row(
@@ -363,7 +677,7 @@ fn topic_xy_moves_original_once_and_features_progress_independently() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     store.claim_topic_workflow(&topic.id).unwrap();
     let token = "secret".repeat(8);
     let step = store
@@ -474,7 +788,7 @@ fn topic_invalid_feature_sources_blank_duplicates_and_empty_selection_are_reject
 
 #[test]
 fn topic_approval_rejects_edited_or_busy_source() {
-    for state in ["edited", "running", "paused", "queued"] {
+    for state in ["edited", "running", "paused", "interrupted", "queued"] {
         let (store, source, message, request) = fixture();
         let topic = store
             .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
@@ -489,7 +803,7 @@ fn topic_approval_rejects_edited_or_busy_source() {
                     )
                     .unwrap();
             }
-            "running" | "paused" => {
+            "running" | "paused" | "interrupted" => {
                 let run = store.create_run(&source.id).unwrap();
                 store.set_run_status(&run, state).unwrap();
             }
@@ -541,6 +855,68 @@ fn topic_retry_failed_and_corrupt_status_fail_closed() {
         )
         .unwrap();
     assert!(store.get_topic(&topic.id).is_err());
+}
+
+#[test]
+fn topic_approval_ignores_historical_paused_runs_and_new_runs_retire_resume_targets() {
+    let (store, _, _, mut request) = fixture();
+    let parent = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let parent = store.approve_topic(&parent.id).unwrap();
+    request.source_session_id = parent.topic_session_id.unwrap();
+    request.parent_topic_id = Some(parent.id);
+    let source = store
+        .get_session(&request.source_session_id)
+        .unwrap()
+        .unwrap();
+    let topic = store
+        .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+        .unwrap();
+    let old = store.create_run(&source.id).unwrap();
+    store.set_run_status(&old, "paused").unwrap();
+    store
+        .set_run_error(&old, "provider failure retained")
+        .unwrap();
+    let latest = store.create_run(&source.id).unwrap();
+    assert_eq!(
+        store.run_status(&old).unwrap().as_deref(),
+        Some("abandoned")
+    );
+    assert_eq!(
+        store.run_error(&old).unwrap().as_deref(),
+        Some("provider failure retained")
+    );
+    store.set_run_status(&latest, "abandoned").unwrap();
+    store.set_run_status(&old, "paused").unwrap();
+    assert!(store.unfinished_last_run(&source.id).unwrap().is_none());
+    store.approve_topic(&topic.id).unwrap();
+    assert_eq!(store.abandon_resumable_runs(&source.id).unwrap(), 1);
+    assert_eq!(
+        store.run_status(&old).unwrap().as_deref(),
+        Some("abandoned")
+    );
+}
+
+#[test]
+fn topic_supersession_cleanup_preserves_ordinary_run_history_and_metrics() {
+    let (store, source, _, _) = fixture();
+    let paused = store.create_run(&source.id).unwrap();
+    store.set_run_status(&paused, "paused").unwrap();
+    let interrupted = store.create_run(&source.id).unwrap();
+    store.set_run_status(&interrupted, "interrupted").unwrap();
+    let latest = store.create_run(&source.id).unwrap();
+    store.set_run_status(&latest, "completed").unwrap();
+    store.recover_topic_workflows().unwrap();
+    assert_eq!(
+        store.run_status(&paused).unwrap().as_deref(),
+        Some("paused")
+    );
+    assert_eq!(
+        store.run_status(&interrupted).unwrap().as_deref(),
+        Some("interrupted")
+    );
+    assert!(store.unfinished_last_run(&source.id).unwrap().is_none());
 }
 
 #[test]
@@ -728,7 +1104,7 @@ fn topic_cancel_and_retry_matrix_preserves_messages_and_never_starts_work() {
                 .list_messages(retried.topic_session_id.as_deref().unwrap())
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert_eq!(
             store
@@ -820,6 +1196,15 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
         .unwrap();
     store.approve_topic(&topic.id).unwrap();
     store.claim_topic_workflow(&topic.id).unwrap();
+    store
+        .set_topic_limits(
+            &topic.id,
+            &formless_protocol::TopicLimits {
+                max_retries_per_step: 11,
+                max_attempts_per_topic: 12,
+            },
+        )
+        .unwrap();
     let token = "token".repeat(8);
     for count in 1..=12 {
         let attempt = store
@@ -858,6 +1243,15 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
             .report_topic_result(&attempt.id, &token, TopicAttemptStatus::Succeeded, "", &[])
             .unwrap();
         assert!(result.outputs.is_empty());
+        store
+            .finish_topic_step(
+                &attempt.id,
+                TopicAttemptStatus::Succeeded,
+                "validated",
+                &[],
+                None,
+            )
+            .unwrap();
         assert_eq!(
             store.get_topic(&topic.id).unwrap().unwrap().features[0].attempt_count,
             count
@@ -877,6 +1271,101 @@ fn topic_result_restrictions_empty_outputs_and_attempt_limit() {
             Path::new("/topic/build")
         )
         .is_err());
+}
+
+#[test]
+fn topic_reported_unvalidated_attempts_remain_active_for_stop_and_recovery() {
+    for reported in [
+        TopicAttemptStatus::Succeeded,
+        TopicAttemptStatus::Failed,
+        TopicAttemptStatus::NeedsUser,
+    ] {
+        for action in ["cancel", "fail", "recover", "restart"] {
+            let (store, _, _, request) = fixture();
+            let topic = store
+                .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
+                .unwrap();
+            let session = store
+                .approve_topic(&topic.id)
+                .unwrap()
+                .topic_session_id
+                .unwrap();
+            store.claim_topic_workflow(&topic.id).unwrap();
+            let token = "capability".repeat(5);
+            let first = store
+                .begin_topic_attempt(
+                    &topic.id,
+                    &topic.features[0].id,
+                    "Validated",
+                    StepAccess::ReadOnly,
+                    HarnessKind::Claude,
+                    None,
+                    None,
+                    &[],
+                    &token,
+                    Path::new("/topic/validated"),
+                )
+                .unwrap();
+            store
+                .finish_topic_step(
+                    &first.id,
+                    TopicAttemptStatus::Succeeded,
+                    "validated",
+                    &[],
+                    None,
+                )
+                .unwrap();
+            let second = store
+                .begin_topic_attempt(
+                    &topic.id,
+                    &topic.features[0].id,
+                    "Provisional",
+                    StepAccess::ReadOnly,
+                    HarnessKind::Claude,
+                    None,
+                    None,
+                    &[],
+                    &token,
+                    Path::new("/topic/provisional"),
+                )
+                .unwrap();
+            store
+                .report_topic_result(&second.id, &token, reported, "reported", &[])
+                .unwrap();
+            assert!(store
+                .finish_topic_feature(&session, &topic.features[0].id, true, "too early")
+                .is_err());
+            let expected = match action {
+                "cancel" => {
+                    store.cancel_topic(&topic.id).unwrap();
+                    TopicAttemptStatus::Cancelled
+                }
+                "fail" => {
+                    store
+                        .fail_topic_workflow(&topic.id, "provider failed")
+                        .unwrap();
+                    TopicAttemptStatus::Failed
+                }
+                "recover" => {
+                    store.recover_topic(&topic.id).unwrap();
+                    TopicAttemptStatus::Abandoned
+                }
+                "restart" => {
+                    store.recover_topic_workflows().unwrap();
+                    TopicAttemptStatus::Abandoned
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                store.get_topic_attempt(&second.id).unwrap().unwrap().status,
+                expected
+            );
+            assert_eq!(
+                store.get_topic_attempt(&first.id).unwrap().unwrap().status,
+                TopicAttemptStatus::Succeeded
+            );
+        }
+    }
 }
 
 fn nested_topic(store: &Store, source: &str, parent: Option<String>) -> Result<TopicInfo> {

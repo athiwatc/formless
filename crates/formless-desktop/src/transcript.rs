@@ -145,8 +145,9 @@ impl TranscriptState {
             Ok(seq) => seq,
             Err(error) => return self.need_reload(ReloadReason::InvalidMessage(error)),
         };
-        let kind = block_kind(&message.role);
-        let attachments = if kind == BlockKind::User {
+        let kind = block_kind(message);
+        let generated = crate::model::GeneratedMessage::of(message);
+        let attachments = if message.role == "user" {
             crate::transcript_attachments::decode(message.meta.as_deref())
         } else {
             Vec::new()
@@ -160,6 +161,7 @@ impl TranscriptState {
                 Some(old) => {
                     !hidden
                         && old.kind == kind
+                        && old.generated() == generated
                         && old.markdown() == message.content
                         && old.attachments() == attachments
                 }
@@ -184,6 +186,7 @@ impl TranscriptState {
         if !hidden {
             timeline.append_persisted(
                 TimelineBlock::new(seq, kind, message.content.clone())
+                    .with_generated(generated)
                     .with_attachments(attachments),
             );
             changed = true;
@@ -329,6 +332,7 @@ mod tests {
 
     fn message(seq: i64, role: &str, content: &str) -> MessageInfo {
         MessageInfo {
+            generated_by: None,
             id: format!("m{seq}"),
             session_id: "s1".into(),
             seq,
@@ -448,6 +452,48 @@ mod tests {
         );
         assert!(!t.timeline().is_streaming());
         assert!(t.reload_needed().is_none());
+    }
+
+    #[test]
+    fn generated_user_turns_are_notes_in_snapshots_and_live_events_not_text_heuristics() {
+        for marker in ["topic_kickoff", "future_generator", ""] {
+            let real = message(1, "user", "Launch independent features concurrently");
+            let mut generated = message(2, "user", &real.content);
+            generated.generated_by = Some(marker.into());
+            generated.meta =
+                Some(json!({"attachments":[{"name":"request.txt","bytes":5}]}).to_string());
+            let mut live = Transcript::new(snapshot(&[real.clone()]));
+            assert!(
+                live.apply(&Event::MessageAppended {
+                    session_id: "s1".into(),
+                    message: generated.clone(),
+                })
+                .timeline_changed
+            );
+            let loaded = Transcript::new(snapshot(&[real, generated]));
+            assert_eq!(shown(&live), shown(&loaded));
+            for transcript in [&live, &loaded] {
+                let blocks = transcript.timeline().blocks();
+                assert_eq!(blocks[0].kind.label(), "You");
+                assert_eq!(blocks[1].kind.label(), "Note");
+                assert_eq!(blocks[0].generated(), None);
+                assert_eq!(
+                    blocks[1].generated().unwrap().details_label(),
+                    if marker == "topic_kickoff" {
+                        "Orchestration details"
+                    } else {
+                        "Message details"
+                    }
+                );
+                assert_eq!(
+                    blocks[0].markdown(),
+                    blocks[1].markdown(),
+                    "summaries never replace canonical source"
+                );
+                assert_eq!(blocks[1].attachments().len(), 1);
+                assert!(transcript.reload_needed().is_none());
+            }
+        }
     }
 
     #[test]

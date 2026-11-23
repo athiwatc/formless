@@ -75,6 +75,40 @@ fn confirm(cx: &mut TestAppContext, h: WindowHandle<Root>, s: &Entity<Shell>) ->
     })
 }
 
+#[gpui_kit::test]
+fn harness_inventory_retires_an_already_reviewed_reference_write(cx: &mut TestAppContext) {
+    let (h, s, id) = setup(cx);
+    read(cx, h, &s, &id, value(&id, 1));
+    step(cx, h, |w, cx| {
+        activate(w, cx, "reference-review-0");
+        let operation = s.read(cx).reference_review_operation().unwrap();
+        let form = s.read(cx).session_edit_revision().unwrap();
+        let (_, mut topic) = fixture::topic_workspace();
+        topic.attempts[0].conversation_session_id = id.clone();
+        s.update(cx, |s, cx| {
+            s.apply_client_update(Update::TopicSupport(true), w, cx);
+            s.apply_client_update(
+                Update::Topics {
+                    connection: 0,
+                    operation: None,
+                    result: Ok(formless_desktop::topics::Reply::Inventory(vec![topic])),
+                },
+                w,
+                cx,
+            );
+            s.take_client_commands();
+            s.confirm_presented_reference(form, operation, w, cx);
+            assert!(
+                s.take_client_commands().is_empty(),
+                "read-only callbacks must not detach references"
+            );
+        });
+        settle_frames(w, cx);
+        assert_eq!(w.find("reference-review-0").disabled(), Some(true));
+        assert_eq!(w.find("reference-confirm").disabled(), Some(true));
+    });
+}
+
 fn load_chat_details(
     window: &mut Window,
     cx: &mut App,

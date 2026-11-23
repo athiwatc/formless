@@ -151,6 +151,7 @@ pub(crate) fn dimension_image(dims: Option<(u32, u32)>) -> String {
 /// render these virtual messages without changing the original transcript.
 pub(crate) fn dangling_messages(st: &Store, session: &str) -> Result<Vec<MessageInfo>> {
     Ok(st.dangling_tool_calls(session)?.into_iter().map(|(id,name)|MessageInfo {
+        generated_by: None,
         id: String::new(), session_id:session.into(),seq:0,role:"tool".into(),
         content:"error: the run stopped before this call finished; it was not retried. Run it again if it is still needed.".into(),
         created_at:String::new(),meta:Some(crate::daemon::tool_result_meta(&id,&name,true)),
@@ -438,6 +439,7 @@ pub(crate) fn estimate_store_with_window(
     let mut preview_range = None;
     if !input.draft.is_empty() {
         let message = MessageInfo {
+            generated_by: None,
             id: "forecast".into(),
             session_id: input.session_id.clone().unwrap_or_default(),
             seq: 0,

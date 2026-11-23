@@ -10,7 +10,115 @@ pub(super) struct PendingPermission {
     sender: oneshot::Sender<Option<String>>,
 }
 
+pub(super) struct TopicDecision {
+    topic_id: String,
+    feature_id: String,
+    kind: TopicDecisionKind,
+}
+enum TopicDecisionKind {
+    Limit(bool),
+    Substitute {
+        step_title: String,
+        wanted: HarnessChoice,
+        substitute: HarnessChoice,
+        response: oneshot::Sender<String>,
+    },
+}
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HarnessChoice {
+    pub harness: HarnessKind,
+    pub acp_agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ApprovedSubstitute {
+    pub wanted: HarnessChoice,
+    pub substitute: HarnessChoice,
+}
+impl TopicDecision {
+    fn options(&self) -> Vec<String> {
+        match &self.kind {
+            TopicDecisionKind::Limit(_) => vec!["Raise limit and continue".into(), "Stop".into()],
+            TopicDecisionKind::Substitute { substitute, .. } => vec![
+                "Sign in and retry".into(),
+                format!("Use {:?}", substitute.harness),
+                "Skip step".into(),
+            ],
+        }
+    }
+}
+struct DecisionLease {
+    daemon: Arc<Daemon>,
+    id: String,
+}
+impl Drop for DecisionLease {
+    fn drop(&mut self) {
+        if self
+            .daemon
+            .topic_decisions
+            .locked()
+            .remove(&self.id)
+            .is_some()
+        {
+            self.daemon.broadcast(Event::UserQuestionClosed {
+                question_id: self.id.clone(),
+                answered_by: None,
+            });
+        }
+    }
+}
+
 pub(super) type AlwaysPermissions = Arc<StdMutex<HashMap<String, HarnessPermissionOptionKind>>>;
+
+fn rule_eligible(kind: &str) -> bool {
+    !matches!(kind, "trust_workspace")
+}
+
+pub(super) fn permission_glob(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<_> = pattern.chars().collect();
+    let value: Vec<_> = value.chars().collect();
+    let (mut p, mut v, mut star, mut retry) = (0, 0, None, 0);
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if let Some(previous) = star {
+            retry += 1;
+            v = retry;
+            p = previous + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn permission_option_ids(request: &HarnessPermissionRequest) -> Result<()> {
+    let mut ids = std::collections::HashSet::new();
+    if request
+        .options
+        .iter()
+        .any(|option| option.option_id.is_empty() || !ids.insert(&option.option_id))
+    {
+        bail!("permission option IDs must be unique and nonempty");
+    }
+    Ok(())
+}
+
+enum RulePermission {
+    Unmatched,
+    Prompt,
+    Decided(String),
+}
 
 struct Handler {
     daemon: Arc<Daemon>,
@@ -18,6 +126,13 @@ struct Handler {
     token: String,
     always: AlwaysPermissions,
     open: StdMutex<Option<MessageInfo>>,
+}
+
+#[derive(Clone)]
+pub(super) struct TopicHumanAnswerContext {
+    topic_id: String,
+    attempt_id: String,
+    questions: Vec<Question>,
 }
 
 impl InteractionHandler for Handler {
@@ -34,8 +149,19 @@ impl InteractionHandler for Handler {
                 .daemon
                 .with_reader(|st| st.authenticate_topic_attempt(&self.attempt_id, &self.token))
                 .ok()?;
+            permission_option_ids(&request).ok()?;
+            let rule = self
+                .daemon
+                .apply_topic_permission_rule(&attempt, &self.token, &request)
+                .ok()?;
+            if let RulePermission::Decided(answer) = rule {
+                return Some(answer);
+            }
             let key = json!([request.kind, request.title, request.raw_input]).to_string();
-            let cached = self.always.locked().get(&key).copied();
+            let cached = (rule_eligible(&request.kind)
+                && matches!(rule, RulePermission::Unmatched))
+            .then(|| self.always.locked().get(&key).copied())
+            .flatten();
             if let Some(kind) = cached {
                 let allow = kind == HarnessPermissionOptionKind::AllowAlways;
                 return request
@@ -57,6 +183,7 @@ impl InteractionHandler for Handler {
                     })
                     .map(|option| option.option_id.clone());
             }
+            let eligible = rule_eligible(&request.kind);
             let options = request.options.clone();
             let answer = self
                 .daemon
@@ -69,11 +196,12 @@ impl InteractionHandler for Handler {
                 .and_then(|id| options.iter().find(|option| &option.option_id == id))
                 .map(|option| option.kind)
                 .filter(|kind| {
-                    matches!(
-                        kind,
-                        HarnessPermissionOptionKind::AllowAlways
-                            | HarnessPermissionOptionKind::RejectAlways
-                    )
+                    eligible
+                        && matches!(
+                            kind,
+                            HarnessPermissionOptionKind::AllowAlways
+                                | HarnessPermissionOptionKind::RejectAlways
+                        )
                 })
             {
                 self.always.locked().insert(key, kind);
@@ -178,7 +306,7 @@ impl Drop for Lease {
                 .is_some()
             {
                 self.daemon.broadcast(Event::UserQuestionClosed {
-                    answered_by: None,
+                    answered_by: self.daemon.question_answered_by.locked().remove(&self.id),
                     question_id: self.id.clone(),
                 });
             }
@@ -193,6 +321,649 @@ impl Drop for Lease {
 }
 
 impl Daemon {
+    pub(super) fn raise_topic_limit_question(
+        &self,
+        topic: &TopicInfo,
+        feature: &str,
+        total: bool,
+    ) -> Result<()> {
+        if self.topic_decisions.locked().values().any(|decision| {
+            decision.topic_id == topic.id
+                && decision.feature_id == feature
+                && matches!(decision.kind,TopicDecisionKind::Limit(hit) if hit==total)
+        }) {
+            return Ok(());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let title = format!(
+            "Limit reached: {}",
+            if total {
+                "attempts per topic"
+            } else {
+                "retries for this step"
+            }
+        );
+        let message = self.with_store(|st| {
+            st.append_message(
+                topic
+                    .topic_session_id
+                    .as_ref()
+                    .context("missing Topic Chat")?,
+                "system-note",
+                &title,
+            )
+        })?;
+        self.broadcast(Event::MessageAppended {
+            session_id: message.session_id.clone(),
+            message,
+        });
+        self.topic_decisions.locked().insert(
+            id.clone(),
+            TopicDecision {
+                topic_id: topic.id.clone(),
+                feature_id: feature.into(),
+                kind: TopicDecisionKind::Limit(total),
+            },
+        );
+        self.broadcast(Event::UserQuestion {
+            question_id: id,
+            session_id: topic
+                .topic_session_id
+                .clone()
+                .context("missing Topic Chat")?,
+            topic_id: Some(topic.id.clone()),
+            attempt_id: None,
+            user_only: true,
+            question: title.clone(),
+            options: vec!["Raise limit and continue".into(), "Stop".into()],
+            questions: vec![Question::single(
+                title,
+                vec!["Raise limit and continue".into(), "Stop".into()],
+            )],
+        });
+        self.broadcast(Event::TopicChanged {
+            topic_id: topic.id.clone(),
+        });
+        Ok(())
+    }
+    pub(super) fn answer_topic_decision(
+        &self,
+        id: &str,
+        answer: &str,
+        answers: &[QuestionAnswer],
+    ) -> Result<Value> {
+        let selected = if answers.is_empty() {
+            answer
+        } else {
+            if answers.len() != 1
+                || answers[0].selected.len() != 1
+                || answers[0]
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| !text.trim().is_empty())
+            {
+                bail!("select one offered option");
+            }
+            &answers[0].selected[0]
+        };
+        let topic = self.with_store(|st| {
+            let mut decisions = self.topic_decisions.locked();
+            let decision = decisions.get(id).context("question no longer pending")?;
+            if !decision.options().iter().any(|option| option == selected) {
+                bail!("select one offered option");
+            }
+            if let TopicDecisionKind::Limit(total) = decision.kind {
+                if selected == "Raise limit and continue" {
+                    st.raise_topic_limit(&decision.topic_id, &decision.feature_id, total)?;
+                }
+            } else {
+                let topic = st
+                    .get_topic(&decision.topic_id)?
+                    .context("topic vanished")?;
+                if !matches!(topic.status, TopicStatus::Running | TopicStatus::NeedsUser) {
+                    bail!("topic is no longer active");
+                }
+            }
+            let decision = decisions.remove(id).context("question no longer pending")?;
+            if let TopicDecisionKind::Substitute {
+                step_title,
+                wanted,
+                substitute,
+                response,
+            } = decision.kind
+            {
+                if selected == format!("Use {:?}", substitute.harness) {
+                    self.topic_substitutes.locked().insert(
+                        (decision.topic_id.clone(), decision.feature_id, step_title),
+                        ApprovedSubstitute { wanted, substitute },
+                    );
+                }
+                let _ = response.send(selected.to_owned());
+            }
+            Ok(decision.topic_id)
+        })?;
+        self.broadcast(Event::UserQuestionClosed {
+            question_id: id.into(),
+            answered_by: Some("user".into()),
+        });
+        self.broadcast(Event::TopicChanged { topic_id: topic });
+        Ok(json!({"answered":true}))
+    }
+    pub(super) async fn request_topic_harness_substitute(
+        self: &Arc<Self>,
+        session: &str,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            feature_id: String,
+            step_title: String,
+            wanted: HarnessChoice,
+            substitute: HarnessChoice,
+            reason: String,
+        }
+        let request: Request = serde_json::from_value(args.clone())?;
+        for choice in [&request.wanted, &request.substitute] {
+            crate::local_harness::validate_acp_agent(
+                Some(choice.harness),
+                choice.acp_agent.as_deref(),
+            )?;
+        }
+        if request.step_title.trim().is_empty()
+            || request.reason.trim().is_empty()
+            || request.reason.len() > 8192
+        {
+            bail!("step title and bounded reason are required");
+        }
+        if request.wanted == request.substitute {
+            bail!("wanted and substitute must differ");
+        }
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        if !matches!(topic.status, TopicStatus::Running | TopicStatus::NeedsUser)
+            || !topic.features.iter().any(|feature| {
+                feature.id == request.feature_id
+                    && matches!(
+                        feature.status,
+                        TopicFeatureStatus::Pending | TopicFeatureStatus::NeedsUser
+                    )
+            })
+        {
+            bail!("feature is not pending in an active topic");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let (response, receiver) = oneshot::channel();
+        let question = format!(
+            "Use {:?} instead of {:?} for {}? {}",
+            request.substitute.harness,
+            request.wanted.harness,
+            request.step_title.trim(),
+            request.reason
+        );
+        let decision = TopicDecision {
+            topic_id: topic.id.clone(),
+            feature_id: request.feature_id,
+            kind: TopicDecisionKind::Substitute {
+                step_title: request.step_title.trim().into(),
+                wanted: request.wanted,
+                substitute: request.substitute,
+                response,
+            },
+        };
+        let options = decision.options();
+        let _lease = DecisionLease {
+            daemon: self.clone(),
+            id: id.clone(),
+        };
+        {
+            let _launch = self.topic_launch.locked();
+            let current = self
+                .with_reader(|st| st.get_topic(&topic.id))?
+                .context("topic vanished")?;
+            if cancel.is_cancelled()
+                || self.shutdown.is_cancelled()
+                || !matches!(
+                    current.status,
+                    TopicStatus::Running | TopicStatus::NeedsUser
+                )
+            {
+                bail!("substitute request cancelled");
+            }
+            self.topic_decisions.locked().insert(id.clone(), decision);
+            self.broadcast(Event::UserQuestion {
+                question_id: id,
+                session_id: session.into(),
+                topic_id: Some(topic.id.clone()),
+                attempt_id: None,
+                user_only: true,
+                question: question.clone(),
+                options: options.clone(),
+                questions: vec![Question::single(question, options)],
+            });
+        }
+        tokio::select! {
+            _=cancel.cancelled()=>bail!("substitute request cancelled"),
+            _=self.shutdown.cancelled()=>bail!("daemon shutting down"),
+            answer=receiver=>Ok(json!({"answer":answer.context("substitute question cancelled")?})),
+        }
+    }
+    fn apply_topic_permission_rule(
+        &self,
+        attempt: &TopicAttemptInfo,
+        token: &str,
+        request: &HarnessPermissionRequest,
+    ) -> Result<RulePermission> {
+        if !rule_eligible(&request.kind) {
+            return Ok(RulePermission::Prompt);
+        }
+        let (matched, decision) = self.with_store(|st| {
+            st.transaction(|st| {
+                st.authenticate_topic_attempt(&attempt.id, token)?;
+                let topic = st.get_topic(&attempt.topic_id)?.context("topic vanished")?;
+                let mut matches = topic.permission_rules.iter().filter(|rule| {
+                    rule.harness.is_none_or(|kind| kind == attempt.harness)
+                        && rule
+                            .acp_agent
+                            .as_ref()
+                            .is_none_or(|agent| Some(agent) == attempt.acp_agent.as_ref())
+                        && rule.kind.as_ref().is_none_or(|kind| kind == &request.kind)
+                        && (permission_glob(&rule.pattern, &request.title)
+                            || request
+                                .raw_input
+                                .as_ref()
+                                .and_then(|raw| raw.get("command"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|command| permission_glob(&rule.pattern, command)))
+                });
+                let first = matches.next();
+                let rule = first.and_then(|first| {
+                    if first.decision == formless_protocol::TopicRuleDecision::Reject {
+                        Some(first)
+                    } else {
+                        Some(
+                            matches
+                                .find(|rule| {
+                                    rule.decision == formless_protocol::TopicRuleDecision::Reject
+                                })
+                                .unwrap_or(first),
+                        )
+                    }
+                });
+                let Some(rule) = rule else {
+                    return Ok((false, None));
+                };
+                let preferred = if rule.decision == formless_protocol::TopicRuleDecision::Reject {
+                    HarnessPermissionOptionKind::RejectOnce
+                } else {
+                    HarnessPermissionOptionKind::AllowOnce
+                };
+                let option = request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == preferred)
+                    .or_else(|| {
+                        request.options.iter().find(|option| {
+                            matches!(
+                                (preferred, option.kind),
+                                (
+                                    HarnessPermissionOptionKind::AllowOnce,
+                                    HarnessPermissionOptionKind::AllowAlways
+                                ) | (
+                                    HarnessPermissionOptionKind::RejectOnce,
+                                    HarnessPermissionOptionKind::RejectAlways
+                                )
+                            )
+                        })
+                    });
+                let Some(option) = option else {
+                    return Ok((true, None));
+                };
+                let permission_id = uuid::Uuid::new_v4().to_string();
+                let message = st.append_message(
+                    &attempt.conversation_session_id,
+                    "system-note",
+                    &format!(
+                        "Permission {permission_id}: option {} selected by rule:{}",
+                        option.option_id, rule.rule_id
+                    ),
+                )?;
+                Ok((
+                    true,
+                    Some((
+                        permission_id,
+                        rule.rule_id.clone(),
+                        option.option_id.clone(),
+                        message,
+                    )),
+                ))
+            })
+        })?;
+        let Some((permission_id, rule, option, message)) = decision else {
+            return Ok(if matched {
+                RulePermission::Prompt
+            } else {
+                RulePermission::Unmatched
+            });
+        };
+        self.broadcast(Event::MessageAppended {
+            session_id: attempt.conversation_session_id.clone(),
+            message,
+        });
+        self.broadcast(Event::HarnessPermissionRequested {
+            permission_id: permission_id.clone(),
+            session_id: attempt.conversation_session_id.clone(),
+            topic_id: attempt.topic_id.clone(),
+            attempt_id: attempt.id.clone(),
+            harness: attempt.harness,
+            acp_agent: attempt.acp_agent.clone(),
+            title: request.title.clone(),
+            kind: request.kind.clone(),
+            raw_input: request.raw_input.clone(),
+            options: request.options.clone(),
+        });
+        self.broadcast(Event::HarnessPermissionClosed {
+            permission_id,
+            option_id: Some(option.clone()),
+            by: Some(format!("rule:{rule}")),
+        });
+        Ok(RulePermission::Decided(option))
+    }
+    pub(super) fn notify_topic_attention(
+        &self,
+        topic_id: Option<&str>,
+        attempt_id: Option<&str>,
+        prompt: &str,
+    ) {
+        if std::env::var("FORMLESS_TOPIC_NOTIFICATIONS")
+            .ok()
+            .as_deref()
+            == Some("0")
+        {
+            return;
+        }
+        let topic = topic_id.and_then(|id| self.with_reader(|st| st.get_topic(id)).ok().flatten());
+        let harness = attempt_id
+            .and_then(|id| {
+                self.with_reader(|st| st.get_topic_attempt(id))
+                    .ok()
+                    .flatten()
+            })
+            .map(|attempt| format!("{:?}", attempt.harness))
+            .unwrap_or_else(|| "Topic orchestration".into());
+        let title = format!(
+            "Formless: {} needs you",
+            topic.map(|t| t.name).unwrap_or_else(|| "Topic".into())
+        );
+        let body = format!("{harness}: {prompt}");
+        let title = crate::secrets::redact(&title)
+            .0
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(100)
+            .collect::<String>();
+        let body = crate::secrets::redact(&body)
+            .0
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect::<String>();
+        #[cfg(test)]
+        self.topic_notifications.locked().push((title, body));
+        #[cfg(not(test))]
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || {
+                formless_runtime::desktop_notify(&title, &body)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("topic notification failed: {error}"),
+                Err(error) => tracing::warn!("topic notification task failed: {error}"),
+            }
+        });
+    }
+    pub(super) fn answer_topic_question_tool(&self, session: &str, args: &Value) -> Result<Value> {
+        let basis = args["basis"].as_str().context("basis is required")?.trim();
+        if basis.is_empty() {
+            bail!("basis must explain the answer; evidence must be verified separately");
+        }
+        let question_id = args["question_id"]
+            .as_str()
+            .context("question_id is required")?;
+        let topic = self
+            .with_reader(|st| st.topic_for_session(session))?
+            .context("not a Topic Chat")?;
+        let event = self
+            .pending_attention
+            .locked()
+            .iter()
+            .find(|event| matches!(event,Event::UserQuestion{question_id:id,..} if id==question_id))
+            .cloned()
+            .context("question is not pending")?;
+        let Event::UserQuestion {
+            topic_id,
+            attempt_id,
+            questions,
+            user_only,
+            ..
+        } = event
+        else {
+            unreachable!()
+        };
+        if topic_id.as_deref() != Some(topic.id.as_str()) {
+            bail!("question is outside this topic");
+        }
+        if user_only {
+            bail!("this question is user_only and must be answered by the user");
+        }
+        let attempt_id =
+            attempt_id.context("only harness questions can be answered by this tool")?;
+        let evidence = args.get("evidence").context("evidence is required")?;
+        let evidence_message_id = evidence["message_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .context("evidence.message_id is required")?;
+        let evidence_quote = evidence["quote"]
+            .as_str()
+            .filter(|quote| !quote.trim().is_empty())
+            .context("evidence.quote is required")?;
+        let answers: Vec<QuestionAnswer> = serde_json::from_value(args["answers"].clone())?;
+        if answers.len() != questions.len()
+            || answers.iter().any(|answer| {
+                answer.selected.is_empty()
+                    && answer
+                        .text
+                        .as_deref()
+                        .is_none_or(|text| text.trim().is_empty())
+            })
+        {
+            bail!("supply one non-empty answer per question");
+        }
+        let message = self.with_store(|st| {
+            st.transaction(|st| {
+                if !st.is_topic_orchestrator(session)? {
+                    bail!("topic is not active");
+                }
+                let attempt = st
+                    .get_topic_attempt(&attempt_id)?
+                    .context("attempt not found")?;
+                let mut waiters = self.questions.locked();
+                if !waiters.contains_key(question_id) {
+                    return Ok(None);
+                }
+                let resolved = st.resolve_topic_answer_evidence(
+                    session,
+                    &topic.id,
+                    &attempt_id,
+                    &questions,
+                    &answers,
+                    evidence_message_id,
+                    evidence_quote,
+                )?;
+                let message = st.append_message_meta(
+                    session,
+                    "assistant",
+                    &format!(
+                        "Orchestrator answer for {:?}, attempt {}\nQuestions: {}\nAnswers: {}\nBasis: {}\nEvidence: {} ({})\nEvidence quote: {}",
+                        attempt.harness,
+                        attempt_id,
+                        serde_json::to_string(&questions)?,
+                        serde_json::to_string(&answers)?,
+                        basis,
+                        resolved.message_id,
+                        resolved.source,
+                        resolved.quote,
+                    ),
+                    Some(
+                        json!({
+                            "topic_question_answer": question_id,
+                            "answered_by": "model",
+                            "basis": basis,
+                            "evidence": resolved,
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                self.question_answered_by
+                    .locked()
+                    .insert(question_id.into(), "model".into());
+                if waiters
+                    .remove(question_id)
+                    .unwrap()
+                    .send((String::new(), answers))
+                    .is_err()
+                {
+                    self.question_answered_by.locked().remove(question_id);
+                    bail!("question expired before delivery");
+                }
+                Ok(Some(message))
+            })
+        })?;
+        if let Some(message) = message {
+            self.broadcast(Event::MessageAppended {
+                session_id: session.into(),
+                message,
+            });
+            Ok(json!({"answered":true}))
+        } else {
+            Ok(json!({"answered":false}))
+        }
+    }
+
+    pub(super) fn topic_human_answer_context(
+        &self,
+        question_id: &str,
+        event: &Event,
+    ) -> Option<TopicHumanAnswerContext> {
+        let Event::UserQuestion {
+            topic_id: Some(topic_id),
+            attempt_id: Some(attempt_id),
+            user_only: false,
+            questions,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let expected = (topic_id.clone(), attempt_id.clone());
+        if self.topic_questions.locked().get(question_id) != Some(&expected) {
+            return None;
+        }
+        Some(TopicHumanAnswerContext {
+            topic_id: topic_id.clone(),
+            attempt_id: attempt_id.clone(),
+            questions: questions.clone(),
+        })
+    }
+
+    pub(super) fn answer_topic_human_question(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(bool, Option<MessageInfo>)> {
+        self.answer_topic_human_question_inner(context, question_id, answer, answers, |_| {})
+    }
+
+    #[cfg(test)]
+    pub(super) fn answer_topic_human_question_with_hook<F>(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+        before_send: F,
+    ) -> Result<(bool, Option<MessageInfo>)>
+    where
+        F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
+    {
+        self.answer_topic_human_question_inner(context, question_id, answer, answers, before_send)
+    }
+
+    fn answer_topic_human_question_inner<F>(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+        before_send: F,
+    ) -> Result<(bool, Option<MessageInfo>)>
+    where
+        F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
+    {
+        let mut delivery_failed = false;
+        let mut delivered = false;
+        self.with_store(|st| {
+            match st.transaction(|st| {
+                let mut waiters = self.questions.locked();
+                let Some(sender) = waiters.get(question_id) else {
+                    return Ok(None);
+                };
+                if sender.is_closed() {
+                    waiters.remove(question_id);
+                    return Ok(None);
+                }
+                let normalized_answers =
+                    normalized_topic_answers(&context.questions, answer, answers.clone());
+                let receipt = st.append_topic_human_answer_receipt(
+                    &context.topic_id,
+                    &context.attempt_id,
+                    question_id,
+                    &context.questions,
+                    &normalized_answers,
+                )?;
+                before_send(sender);
+                let sender = waiters.remove(question_id).unwrap();
+                if sender.send((answer.to_owned(), answers)).is_err() {
+                    delivery_failed = true;
+                    bail!("harness question expired before human answer delivery");
+                }
+                delivered = true;
+                self.question_answered_by
+                    .locked()
+                    .insert(question_id.into(), "user".into());
+                Ok(Some(receipt))
+            }) {
+                Ok(Some(receipt)) => Ok((true, Some(receipt))),
+                Ok(None) => Ok((false, None)),
+                Err(_) if delivery_failed => Ok((false, None)),
+                Err(error) if delivered => {
+                    tracing::warn!(
+                        question_id,
+                        error = %error,
+                        "human answer delivered but its receipt transaction did not commit"
+                    );
+                    Ok((true, None))
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     pub(crate) fn topic_interaction_handler(
         self: &Arc<Self>,
         attempt_id: &str,
@@ -259,6 +1030,7 @@ impl Daemon {
             return Ok(None);
         }
         let permission_id = uuid::Uuid::new_v4().to_string();
+        let notification_title = request.title.clone();
         let (sender, mut receiver) = oneshot::channel();
         self.with_store(|st| {
             st.transaction(|st| {
@@ -287,6 +1059,11 @@ impl Daemon {
                 Ok(())
             })
         })?;
+        self.notify_topic_attention(
+            Some(&attempt.topic_id),
+            Some(&attempt.id),
+            &notification_title,
+        );
         let _lease = Lease {
             daemon: self.clone(),
             id: permission_id.clone(),
@@ -329,7 +1106,38 @@ impl Daemon {
         removed.is_some()
     }
 
+    pub(super) fn close_topic_decisions(&self, topic_id: &str, feature_id: Option<&str>) {
+        self.topic_substitutes
+            .locked()
+            .retain(|(topic, feature, _), _| {
+                topic != topic_id || feature_id.is_some_and(|id| id != feature)
+            });
+        let ids = {
+            let mut decisions = self.topic_decisions.locked();
+            let ids: Vec<_> = decisions
+                .iter()
+                .filter(|(_, decision)| {
+                    decision.topic_id == topic_id
+                        && feature_id.is_none_or(|id| id == decision.feature_id)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                decisions.remove(id);
+            }
+            ids
+        };
+        for question_id in ids {
+            self.broadcast(Event::UserQuestionClosed {
+                question_id,
+                answered_by: None,
+            });
+        }
+    }
     pub(super) fn close_topic_interactions(&self, topic_id: &str, attempt_id: Option<&str>) {
+        if attempt_id.is_none() {
+            self.close_topic_decisions(topic_id, None);
+        }
         let attempts = match attempt_id {
             Some(id) => vec![id.to_owned()],
             None => self
@@ -367,7 +1175,7 @@ impl Daemon {
             self.questions.locked().remove(&id);
             if self.topic_questions.locked().remove(&id).is_some() {
                 self.broadcast(Event::UserQuestionClosed {
-                    answered_by: None,
+                    answered_by: self.question_answered_by.locked().remove(&id),
                     question_id: id,
                 });
             }
@@ -465,21 +1273,33 @@ impl Daemon {
         self.broadcast(Event::TopicChanged {
             topic_id: attempt.topic_id,
         });
-        let reply = tokio::select! {
-            _ = self.shutdown.cancelled() => None,
-            reply=prompt_reply::wait(&self.questions,&id,receiver,cancel,||{}) => reply,
-        };
-        Ok(reply.map(|(answer, answers)| {
-            let answers = if answers.is_empty() {
-                vec![questions[0].parse_reply(&answer)]
-            } else {
-                answers
-            };
-            answers
-                .into_iter()
-                .chain(std::iter::repeat_with(QuestionAnswer::default))
-                .take(questions.len())
-                .collect()
-        }))
+        let reply = prompt_reply::wait_until(
+            &self.questions,
+            &id,
+            receiver,
+            async {
+                tokio::select! {_=self.shutdown.cancelled()=>{},_=cancel.cancelled()=>{}}
+            },
+            || {},
+        )
+        .await;
+        Ok(reply.map(|(answer, answers)| normalized_topic_answers(&questions, &answer, answers)))
     }
+}
+
+fn normalized_topic_answers(
+    questions: &[Question],
+    answer: &str,
+    answers: Vec<QuestionAnswer>,
+) -> Vec<QuestionAnswer> {
+    let answers = if answers.is_empty() {
+        vec![questions[0].parse_reply(answer)]
+    } else {
+        answers
+    };
+    answers
+        .into_iter()
+        .chain(std::iter::repeat_with(QuestionAnswer::default))
+        .take(questions.len())
+        .collect()
 }

@@ -30,16 +30,16 @@ env:
 jobs:
   build-test:
     name: Build and test (${{ matrix.platform }})
-    # Never execute fork contributions on the persistent self-hosted machine.
+    # Preserve the existing same-repository PR policy on hosted runners.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macOS ARM64
-            runner: [self-hosted, macOS, ARM64]
+            runner: macos-15
           - platform: Linux X64
-            runner: [self-hosted, Linux, X64]
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -48,18 +48,18 @@ jobs:
         run: |
           set -euo pipefail
           if command -v cc >/dev/null && command -v python3 >/dev/null &&
-             command -v pkg-config >/dev/null && pkg-config --exists dbus-1; then
+             command -v pkg-config >/dev/null && pkg-config --exists dbus-1 &&
+             command -v pdftoppm >/dev/null && command -v pdftotext >/dev/null &&
+             python3 -c "import ensurepip" 2>/dev/null; then
             exit 0
           fi
-          # Native jobs also support runners hosted inside a container, where
-          # sibling Docker jobs cannot resolve the runner's bind-mount paths.
           command -v apt-get >/dev/null
           ci_privilege=()
           if [[ "$(id -u)" != 0 ]]; then
             ci_privilege=(sudo -n)
           fi
           "${ci_privilege[@]}" apt-get update
-          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config python3
+          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config poppler-utils python3 python3-venv
 
       - uses: actions/checkout@v7
         with:
@@ -94,8 +94,6 @@ jobs:
           node-version: '24'
 
       - name: Verify runner Python
-        # setup-python's macOS builds require /Users/runner permissions.
-        # Use the native Python already used by this runner's docs workflow.
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
             # The Debian/RPM manifest fixture parses Cargo.toml with tomllib.
@@ -167,7 +165,7 @@ jobs:
           done
           if ((${#missing_poppler[@]})); then
             printf 'Required Poppler tools missing from PATH (%s).\n' "${missing_poppler[*]}" >&2
-            echo 'See the Linux relay browser checks section in docs/self-hosted-ci.md for runner prerequisites.' >&2
+            echo 'See the Linux relay browser checks section in docs/self-hosted-ci.md for required packages.' >&2
             exit 1
           fi
           python3 -c 'import sys; assert sys.version_info >= (3, 10), "Chromium tests require Python 3.10+"'
@@ -175,7 +173,7 @@ jobs:
           python="$CI_DIR/browser-python/bin/python"
           export PLAYWRIGHT_BROWSERS_PATH="$CI_DIR/browser-engines"
           "$python" -m pip install --disable-pip-version-check --no-cache-dir 'playwright==1.62.0'
-          "$python" -m playwright install chromium --no-shell --no-progress
+          "$python" -m playwright install --with-deps chromium --no-shell --no-progress
           FORMLESS_CHROMIUM_EXECUTABLE=$("$python" - <<'PY'
           import asyncio
           from playwright.async_api import async_playwright

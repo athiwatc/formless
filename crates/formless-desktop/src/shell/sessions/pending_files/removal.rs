@@ -14,7 +14,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.pending_files_current(owner)
+        if self
+            .session_editor
+            .as_ref()
+            .is_none_or(|p| !self.topic_session_mutation_allowed(&p.id))
+            || !self.pending_files_current(owner)
             || self.current_modal(self.layout(window)) != Some(Modal::SessionEditor)
             || !self.keep_session_edit_input(window, cx)
         {
@@ -95,7 +99,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.pending_files_current(owner)
+        if self
+            .session_editor
+            .as_ref()
+            .is_none_or(|p| !self.topic_session_mutation_allowed(&p.id))
+            || !self.pending_files_current(owner)
             || self.current_modal(self.layout(window)) != Some(Modal::SessionEditor)
             || !self.keep_session_edit_input(window, cx)
         {
@@ -188,7 +196,8 @@ impl Shell {
             .as_ref()
             .map(|c| c.reference_status())
             .unwrap_or_default();
-        let ready = self.pending_files_current(owner)
+        let ready = self.topic_session_mutation_allowed(&p.id)
+            && self.pending_files_current(owner)
             && p.pending_files.pending.is_none()
             && !status.blocked();
         let mut body = v_flex().gap_2();

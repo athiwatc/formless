@@ -46,6 +46,48 @@ class LocalNamingModelDocs(unittest.TestCase):
 
 
 class LinkChecks(unittest.TestCase):
+    def test_public_evidence_uses_exact_endpoints_and_line(self):
+        for suffix, endpoint, extra in [
+            ("/actions/runs/123", "/actions/runs/123", {}),
+            ("/pull/2081", "/pulls/2081", {}),
+            ("/blob/6372d587/file.rs#L2", "/contents/file.rs?ref=6372d587",
+             {"type": "file", "encoding": "base64", "content": "b25lCnR3bw=="}),
+        ]:
+            with self.subTest(suffix=suffix):
+                url = ROOT + suffix
+                seen = []
+                data = {"html_url": url.split("#")[0], **extra}
+                route = links.public_repository_route(url)
+                self.assertIsNotNone(route)
+                pattern = links.validate_public_repository_url(
+                    url, route, lambda ep: seen.append(ep) or data)
+                self.assertEqual(seen, [endpoint])
+                self.assertIsNotNone(re.fullmatch(pattern, url))
+                with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                    links.validate_public_repository_url(url, route, lambda ep: {"html_url": ROOT})
+
+    def test_public_evidence_rejects_unsafe_routes_and_missing_lines(self):
+        for suffix in ["/actions/runs/123?x=1", "/pull/0", "/pull/2081#invalid",
+                       "/blob/6372d587/../file.rs#L1", "/blob/main/file.rs#L1",
+                       "/blob/6372d587/file.rs#L0"]:
+            self.assertIsNone(links.public_repository_route(ROOT + suffix))
+        url = ROOT + "/blob/6372d587/file.rs#L2"
+        data = {"html_url": url.split("#")[0], "type": "file",
+                "encoding": "base64", "content": "b25lCg=="}
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            links.validate_public_repository_url(url, links.public_repository_route(url),
+                                                 lambda ep: data)
+
+    def test_public_evidence_uses_no_token_and_must_pass_before_exclusion(self):
+        url = ROOT + "/actions/runs/123"
+        with patch.dict(os.environ, {"FORMLESS_LINK_GITHUB_TOKEN": "dummy"}), \
+             patch.object(links.subprocess, "run", return_value=SimpleNamespace(stdout=url)) as run, \
+             patch.object(links, "api_get", side_effect=ValueError("HTTP 404")) as api:
+            with self.assertRaisesRegex(ValueError, "HTTP 404"):
+                links.main(["script", "lychee", "README.md"])
+        api.assert_called_once_with("/actions/runs/123", None)
+        self.assertEqual(run.call_count, 1)
+
     def test_private_root(self):
         calls = []
         self.assertEqual(links.validate_repository_url(ROOT, lambda p: calls.append(p) or {}), "^https://github\\.com/athiwatc/formless$")

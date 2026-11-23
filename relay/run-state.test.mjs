@@ -48,6 +48,50 @@ test('older owned plan event cannot overwrite current state; copied interrupted 
 test('connection replacement discards delayed stored recap and plan',async()=>{
   const{c}=setup(),wait=deferred();c.act=()=>wait.promise;const loading=c.openSession('s');c.clearLiveState();wait.resolve(snapshot('r1'));await loading;assert.equal(c.S.recap,null);assert.equal(c.S.planState,null);
 });
+test('terminal RunFinished clears an earlier pause instead of offering stale recovery',()=>{
+  for(const status of ['abandoned','cancelled','completed','failed','error']) {
+    const{c,elements}=setup();
+    vm.runInContext(fn('renderRunBanner'),c);
+    c.S.liveRun={id:'r',ended:false};c.S.running.add('s');
+    c.onEvent({type:'run_paused',session_id:'s',run_id:'r',error:'raw provider error',explained:{message:'The provider request failed.'}});
+    assert.match(text(elements.get('run-banner')),/Resume.*Abandon/);
+    c.onEvent({type:'run_finished',session_id:'s',run_id:'r',status});
+    assert.equal(c.S.unfinished,null,status);
+    assert.equal(text(elements.get('run-banner')),'',status);
+    assert.ok(!c.S.running.has('s'));
+  }
+});
+test('resumable completion preserves the matching pause explanation and not another run error',()=>{
+  const{c,elements}=setup();vm.runInContext(fn('renderRunBanner'),c);
+  c.S.liveRun={id:'r',ended:false};
+  c.onEvent({type:'run_paused',session_id:'s',run_id:'r',error:'raw error',explained:{message:'A readable reason'}});
+  c.onEvent({type:'run_finished',session_id:'s',run_id:'r',status:'paused'});
+  assert.match(text(elements.get('run-banner')),/A readable reason.*raw error.*Resume/);
+  c.S.liveRun={id:'new',ended:false};
+  c.onEvent({type:'run_finished',session_id:'s',run_id:'new',status:'interrupted'});
+  assert.equal(c.S.unfinished.status,'interrupted');
+  assert.doesNotMatch(text(elements.get('run-banner')),/raw error|A readable reason/);
+  assert.match(text(elements.get('run-banner')),/Resume/);
+  c.S.unfinished={status:'abandoned'};c.renderRunBanner();
+  assert.equal(text(elements.get('run-banner')),'','a terminal snapshot cannot render recovery controls');
+});
+test('explicit native Abandon clears recovery and replaces the paused footer only after acknowledgement',async()=>{
+  const{c,elements}=setup(),notes=[];
+  vm.runInContext(['abandonRun','renderRunBanner'].map(fn).join('\n'),c);
+  c.note=(message,error)=>notes.push({message,error:!!error});
+  c.S.unfinished={run_id:'r',status:'paused'};
+  c.renderRunBanner();
+  const abandon=elements.get('run-banner').children.find(n=>text(n)==='Abandon');
+  c.act=async()=>null;await abandon.props.onclick();
+  assert.equal(c.S.unfinished.run_id,'r');assert.equal(notes.length,0);
+  c.act=async()=>({abandoned:true});await abandon.props.onclick();
+  assert.equal(c.S.unfinished,null);assert.equal(text(elements.get('run-banner')),'');
+  assert.equal(notes[0].error,false);assert.match(notes[0].message,/has ended.*cannot be resumed/);
+  const waiting=deferred();c.act=()=>waiting.promise;c.S.unfinished={run_id:'old',status:'paused'};
+  const abandoning=c.abandonRun();c.S.unfinished={run_id:'new',status:'paused'};
+  waiting.resolve({abandoned:true});await abandoning;
+  assert.equal(c.S.unfinished.run_id,'new','a delayed old acknowledgement cannot erase new recovery state');
+});
 test('all unfinished calls are a subset of total and never labeled finished outcomes',()=>{
   const{c}=setup();
   const block=c.recapBlock({...recap('paused',5),unfinished_calls:5,used:[],built:[]});

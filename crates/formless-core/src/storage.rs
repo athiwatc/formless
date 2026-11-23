@@ -802,7 +802,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 73;
+pub const SCHEMA_VERSION: i64 = 76;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 71] = [
+const MIGRATIONS: [(i64, MigrationStep); 74] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1282,6 +1282,17 @@ const MIGRATIONS: [(i64, MigrationStep); 71] = [
     (72, topic_schema_v72::migrate),
     (73, |c| {
         add_column(c,"topics","allow_external_context INTEGER NOT NULL DEFAULT 0 CHECK(allow_external_context IN (0,1))")
+    }),
+    (74, |c| add_column(c, "messages", "generated_by TEXT")),
+    (75, |c| {
+        add_column(c, "topics", "permission_rules TEXT NOT NULL DEFAULT '[]'")
+    }),
+    (76, |c| {
+        add_column(
+            c,
+            "topics",
+            r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
+        )
     }),
 ];
 
@@ -1728,6 +1739,24 @@ impl Store {
         Ok(self.conn.prepare_cached(sql)?.execute(params)?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_topic_human_answer_receipt_commit_failure_for_test(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE topic_answer_commit_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE topic_answer_commit_child (
+                 parent_id TEXT NOT NULL REFERENCES topic_answer_commit_parent(id)
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             CREATE TRIGGER topic_answer_commit_failure
+             AFTER INSERT ON messages
+             WHEN NEW.generated_by = 'topic_human_answer'
+             BEGIN
+                 INSERT INTO topic_answer_commit_child(parent_id) VALUES ('missing');
+             END;",
+        )?;
+        Ok(())
+    }
+
     /// `prepare` through the connection's statement cache.
     fn ps(&self, sql: &str) -> Result<rusqlite::CachedStatement<'_>> {
         Ok(self.conn.prepare_cached(sql)?)
@@ -1771,6 +1800,13 @@ impl Store {
     }
     fn row_msg(r: &rusqlite::Row) -> rusqlite::Result<MessageInfo> {
         Ok(MessageInfo {
+            generated_by: r
+                .as_ref()
+                .column_index("generated_by")
+                .ok()
+                .map(|index| r.get::<_, Option<String>>(index))
+                .transpose()?
+                .flatten(),
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             seq: r.get("seq")?,
@@ -2167,6 +2203,16 @@ impl Store {
         content: &str,
         meta: Option<String>,
     ) -> Result<MessageInfo> {
+        self.append_message_generated(session_id, role, content, meta, None)
+    }
+    pub(crate) fn append_message_generated(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        meta: Option<String>,
+        generated_by: Option<&str>,
+    ) -> Result<MessageInfo> {
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
         // One write transaction, taken up front (IMMEDIATE): the next seq is
@@ -2176,14 +2222,15 @@ impl Store {
         let tx=&st.conn;
         let seq: i64 = tx
             .prepare_cached(
-                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
-                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6 FROM messages WHERE session_id=?2 \
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) \
+                 SELECT ?1, ?2, COALESCE(MAX(seq),0)+1, ?3, ?4, ?5, ?6, ?7 FROM messages WHERE session_id=?2 \
                  RETURNING seq",
             )?
-            .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
+            .query_row(params![id, session_id, role, content, t, meta,generated_by], |r| r.get(0))?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
         Ok(MessageInfo {
+            generated_by:generated_by.map(str::to_owned),
             id,
             session_id: session_id.into(),
             seq,
@@ -2265,6 +2312,45 @@ impl Store {
                 Self::row_msg,
             )
             .optional()?)
+    }
+
+    pub(crate) fn topic_suggestion_source(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::main_topic_suggestions::SuggestionSource>> {
+        use crate::main_topic_suggestions::SuggestionSource;
+        let active: Option<(String, Option<String>)> = self
+            .ps("SELECT session_kind, topic_id FROM sessions WHERE id=?1 AND deleted_at IS NULL")?
+            .query_row(params![session_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        match active {
+            Some((kind, Some(id))) if kind == "topic" => Ok(Some(SuggestionSource::Topic(id))),
+            Some((kind, _)) if kind == "main" && self.is_main_chat(session_id)? => {
+                Ok(Some(SuggestionSource::Main))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn recent_topic_messages(&self, session_id: &str) -> Result<Vec<Value>> {
+        let mut stmt = self.ps(
+            "SELECT id, seq, CASE WHEN length(CAST(content AS BLOB)) <= 4096 THEN content END
+             FROM messages WHERE session_id=?1 AND role='user' AND generated_by IS NULL
+             ORDER BY seq DESC LIMIT 8",
+        )?;
+        let mut rows = stmt
+            .query_map(params![session_id], |row| {
+                let content = row.get::<_, Option<String>>(2)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "seq": row.get::<_, i64>(1)?,
+                    "content_omitted": content.is_none(),
+                    "content": content,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
     }
 
     /// Fork source prefix, decoded within the existing fork transaction.
@@ -2415,7 +2501,7 @@ impl Store {
         let fork = self.create_session(Some(name))?;
         self.set_session_model(&fork.id, orig.model, orig.reasoning_effort)?;
         for message in messages {
-            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta])?;
+            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta,message.generated_by])?;
         }
         let complete = up_to_seq.is_none()
             || !self.conn.query_row(
@@ -2558,13 +2644,20 @@ impl Store {
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
+        self.transaction(|st|{
+        let topic:bool=st.conn.query_row("SELECT EXISTS(SELECT 1 FROM topics WHERE topic_session_id=?1)",[session_id],|row|row.get(0))?;
+        if topic {st.abandon_resumable_runs(session_id)?;}
         let id = uuid::Uuid::new_v4().to_string();
         let t = now();
-        self.ex(
+        st.ex(
             "INSERT INTO runs(id,session_id,status,created_at,updated_at,start_message_id,start_message_seq) VALUES(?1,?2,'running',?3,?3,(SELECT id FROM messages WHERE session_id=?2 ORDER BY seq DESC,rowid DESC LIMIT 1),(SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?2))",
             params![id, session_id, t],
         )?;
         Ok(id)
+        })
+    }
+    pub(crate) fn abandon_resumable_runs(&self, session: &str) -> Result<usize> {
+        Ok(self.conn.execute("UPDATE runs SET status='abandoned',updated_at=?2 WHERE session_id=?1 AND status IN ('paused','interrupted')",params![session,now()])?)
     }
     pub fn run_status(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self
@@ -6996,6 +7089,25 @@ impl Store {
             .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
+    pub(crate) fn orphaned_artifact_records(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.conn.prepare("SELECT id,session_id FROM artifacts WHERE session_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sessions WHERE sessions.id=artifacts.session_id)")?
+            .query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn artifact_reference_sessions(&self) -> Result<Vec<String>> {
+        Ok(self
+            .conn
+            .prepare("SELECT id FROM sessions")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub(crate) fn session_references_artifact(
+        &self,
+        id: &str,
+        session: &str,
+        owner: &str,
+    ) -> Result<bool> {
+        crate::attachment_access::session_references_artifact(&self.conn, id, session, owner)
+    }
 
     /// Paths of a Session's artifacts (to delete with it).
     pub fn session_artifact_paths(&self, session_id: &str) -> Result<Vec<String>> {
@@ -7868,6 +7980,8 @@ impl ContextCache {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<BuiltContext> {
+        let system_prompt =
+            crate::main_topic_suggestions::system_prompt(store, session_id, system_prompt)?;
         let (checkpoint, summary, up_to) = store
             .latest_checkpoint_record(session_id)?
             .unwrap_or_default();
@@ -7882,7 +7996,7 @@ impl ContextCache {
             // proxies reject a second or mid-conversation `system` (§11
             // summary included).
             let system = if summary.is_empty() {
-                crate::provenance::mandatory_system(system_prompt)
+                crate::provenance::mandatory_system(&system_prompt)
             } else {
                 let origins =
                     store.data_origins(session_id, &format!("checkpoint:{checkpoint}"))?;

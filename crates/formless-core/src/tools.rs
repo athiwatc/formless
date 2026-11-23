@@ -3,10 +3,14 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+use crate::main_topic_suggestions::{self, PROPOSE_TOPIC, READ_TOPIC_CONTEXT};
 use crate::storage::Store;
 use formless_protocol::ToolInfo;
 
 pub const TOPIC_RUN_STEP: &str = "topic_run_step";
+pub const TOPIC_REQUEST_HARNESS_SUBSTITUTE: &str = "topic_request_harness_substitute";
+pub const TOPIC_ANSWER_QUESTION: &str = "topic_answer_question";
+pub const TOPIC_WAIT: &str = "topic_wait";
 pub const TOPIC_LIST_CONVERSATIONS: &str = "topic_list_conversations";
 pub const TOPIC_READ_CONVERSATION: &str = "topic_read_conversation";
 pub const TOPIC_SEARCH_CONVERSATIONS: &str = "topic_search_conversations";
@@ -46,7 +50,9 @@ pub const UPDATE_PLAN: &str = "update_plan";
 /// Most steps a plan may have, and longest step text.
 pub const MAX_PLAN_ITEMS: usize = 20;
 pub const MAX_PLAN_TEXT: usize = 200;
-pub const RESERVED: [&str; 32] = [
+pub const RESERVED: [&str; 37] = [
+    TOPIC_REQUEST_HARNESS_SUBSTITUTE,
+    TOPIC_WAIT,
     TOPIC_LIST_CONVERSATIONS,
     TOPIC_READ_CONVERSATION,
     TOPIC_SEARCH_CONVERSATIONS,
@@ -76,7 +82,10 @@ pub const RESERVED: [&str; 32] = [
     READ_METRICS,
     RUN_SCRIPT,
     UPDATE_PLAN,
+    READ_TOPIC_CONTEXT,
+    PROPOSE_TOPIC,
     TOPIC_RUN_STEP,
+    TOPIC_ANSWER_QUESTION,
     TOPIC_COMPLETE_FEATURE,
     TOPIC_FAIL_FEATURE,
 ];
@@ -754,7 +763,9 @@ pub fn normalize_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String>
 /// The Tools the agent may see: neither retired nor switched off.
 fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
     let mut tools = store.list_tools(false)?;
-    tools.retain(|t| !t.disabled);
+    tools.retain(|t| {
+        !t.disabled && !main_topic_suggestions::is_topic_tool(&t.name.to_ascii_lowercase())
+    });
     Ok(tools)
 }
 
@@ -946,7 +957,7 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
 
 /// The built-in tools' definitions, as listed to the model.
 fn topic_step_definition() -> Value {
-    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Run one independent harness step for this topic. The outline is advisory. Choose harness and access. Inputs must be exact artifacts from this feature's outputs. Never merge or push.","parameters":{
+    json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Launch one isolated harness step asynchronously; returns attempt_id and conversation_session_id immediately. Use topic_wait for results and pending interactions. One step per feature may run at a time, with concurrent writes in separate workspaces. Inputs must be exact artifacts from finalized outputs of any feature in this topic. All selected inputs are supplied, allowing an explicitly requested combining step. Never push or change the source workspace or its branch.","parameters":{
         "type":"object","properties":{"feature_id":{"type":"string"},"title":{"type":"string"},"instructions":{"type":"string"},"harness":{"type":"string","enum":["claude","codex","pi","opencode","antigravity","acp","muse"]},"acp_agent":{"type":"string"},"model":{"type":"string"},"access":{"type":"string","enum":["read_only","write"]},"inputs":{"type":"array","items":{"type":"object"}}},
         "required":["feature_id","title","instructions","harness","access"],"additionalProperties":false}}})
 }
@@ -965,7 +976,13 @@ fn topic_context_definition(name: &str, field: Option<&str>) -> Value {
 }
 pub fn builtin_definitions() -> Vec<Value> {
     vec![
+        json!({"type":"function","function":{"name":TOPIC_WAIT,"description":"Wait for the next finished attempt, harness question or informational user-only permission notice. Answer a harness question only with exact storage-verified evidence through topic_answer_question; basis text alone is not proof. Unsupported or ambiguous evidence must remain pending for direct user response; do not create a duplicate ask_user prompt. Permissions cannot be decided by the model. With no active work, or after a timeout, returns a status snapshot.","parameters":{"type":"object","properties":{"attempt_ids":{"type":"array","items":{"type":"string"}},"timeout_secs":{"type":"integer","minimum":1,"maximum":600,"default":600}},"additionalProperties":false}}}),
+        json!({"type":"function","function":{"name":TOPIC_ANSWER_QUESTION,"description":"Answer only when evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt for this same attempt with identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation/quotes within either atom and nonempty option descriptions are unsupported. Conditional, negation, conjunction and uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are rejected. No paraphrase or general semantic matching: ambiguous, changed or unsupported evidence must remain pending for direct user response; do not create a duplicate ask_user prompt. basis is explanation, not proof. User-only questions and permissions cannot be answered by the model.","parameters":{"type":"object","properties":{"question_id":{"type":"string"},"answers":{"type":"array","items":{"type":"object","properties":{"selected":{"type":"array","items":{"type":"string"}},"text":{"type":"string"}}}},"basis":{"type":"string","minLength":1},"evidence":{"type":"object","properties":{"message_id":{"type":"string","minLength":1},"quote":{"type":"string","minLength":1}},"required":["message_id","quote"],"additionalProperties":false}},"required":["question_id","answers","basis","evidence"],"additionalProperties":false}}}),
         topic_step_definition(),
+        json!({"type":"function","function":{"name":TOPIC_REQUEST_HARNESS_SUBSTITUTE,"description":"Ask the user to approve a different harness for this exact feature and step. Never substitute without approval. The user may sign in and retry, use the substitute, or skip. The model cannot answer this user-only question.","parameters":{"type":"object","properties":{
+            "feature_id":{"type":"string"},"step_title":{"type":"string"},"wanted":{"type":"object","properties":{"harness":{"type":"string"},"acp_agent":{"type":"string"}},"required":["harness"],"additionalProperties":false},
+            "substitute":{"type":"object","properties":{"harness":{"type":"string"},"acp_agent":{"type":"string"},"model":{"type":"string"}},"required":["harness"],"additionalProperties":false},"reason":{"type":"string","minLength":1,"maxLength":8192}
+        },"required":["feature_id","step_title","wanted","substitute","reason"],"additionalProperties":false}}}),
         topic_context_definition(TOPIC_LIST_CONVERSATIONS,None),
         topic_context_definition(TOPIC_READ_CONVERSATION,Some("session_id")),
         topic_context_definition(TOPIC_SEARCH_CONVERSATIONS,Some("query")),
@@ -1008,6 +1025,7 @@ pub fn builtin_schema(name: &str) -> Option<Value> {
         .get_or_init(|| {
             builtin_definitions()
                 .into_iter()
+                .chain(main_topic_suggestions::definitions())
                 .filter_map(|d| {
                     let name = d["function"]["name"].as_str()?.to_string();
                     Some((name, d["function"]["parameters"].clone()))
@@ -1249,6 +1267,11 @@ fn definitions(
         .map(|t| t.name.to_lowercase())
         .collect();
     let mut defs = builtin_definitions();
+    if let Some(session_id) = session_id {
+        if store.topic_suggestion_source(session_id)?.is_some() {
+            defs.extend(main_topic_suggestions::definitions());
+        }
+    }
     if !session_id
         .map(|id| store.is_topic_orchestrator(id))
         .transpose()?
@@ -1259,6 +1282,9 @@ fn definitions(
                 definition["function"]["name"].as_str(),
                 Some(
                     TOPIC_RUN_STEP
+                        | TOPIC_REQUEST_HARNESS_SUBSTITUTE
+                        | TOPIC_WAIT
+                        | TOPIC_ANSWER_QUESTION
                         | TOPIC_COMPLETE_FEATURE
                         | TOPIC_FAIL_FEATURE
                         | TOPIC_LIST_CONVERSATIONS
@@ -1308,11 +1334,12 @@ fn definitions(
     // refresh point (compaction): removing it would rewrite the cached
     // prefix. Calling it reports that it is retired.
     if let Some(s) = session_id {
-        let builtins = defs.iter().take_while(|d| is_builtin(fn_name(d))).count();
-        let mut registry: Vec<Value> = defs.split_off(builtins);
+        let mut registry: Vec<Value> = defs.split_off(trusted_builtins);
         for (_, def) in store.pinned_inactive(s)? {
             if let Ok(def) = serde_json::from_str::<Value>(&def) {
-                registry.push(def);
+                if !main_topic_suggestions::is_topic_tool(&fn_name(&def).to_ascii_lowercase()) {
+                    registry.push(def);
+                }
             }
         }
         // Same order as the listing itself: pinned first, then by name.

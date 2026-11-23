@@ -5,7 +5,7 @@
 <h1>Formless</h1>
 
 <p><strong>One conversation that runs your AI agents.</strong><br/>
-Talk in Main Chat, organize work into Topic Chats, and let Formless drive the coding agents you already have installed.</p>
+Talk in Main Chat, organize work into Topic Chats, and let Formless drive the harnesses you already use.</p>
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
@@ -54,7 +54,7 @@ Main Chat
 | **Your consent first** | A suggestion moves nothing. Messages move and work starts only after you approve in the client; a chat reply such as "yes" is not consent. |
 | **Advisory flows** | You can outline steps and pick a harness per step. The outline is advice: the Formless model in the Topic Chat decides the actual steps, may retry a failed step on another harness, and decides when the work is done. |
 | **Isolated steps** | Each step gets its own conversation and private workspace — a Git worktree for Git topics, or a fresh directory otherwise. Declared file inputs are staged separately. Read-only Git steps check out the exact input revision. |
-| **Questions and permissions** | Anything a harness asks mid-run surfaces in Formless. Only you can grant a permission; an unanswered or cancelled request is denied. |
+| **Questions and permissions** | The model may answer an ordinary harness question only from storage-verified evidence: a complete approved-request quote in the narrow `stem: option` form or a matching human-answer receipt from the same attempt. Otherwise it stays pending for your direct answer. The model never answers user-only questions or permissions; permission outcomes stay under user control. |
 | **Scoped context** | A harness reads its own topic branch — the topic and its ancestors — not Main Chat or sibling topics, unless you allow wider context for that topic. |
 | **Nothing auto-merges** | Steps produce Git revisions, files or text. Formless never merges or pushes. |
 
@@ -62,7 +62,9 @@ Main Chat
 
 Integrated adapters use each harness's official local interface and a private,
 per-step MCP bridge back to the topic. Install and sign in to a harness the
-usual way; Formless does not ship or log in to them for you.
+usual way; Formless does not ship or log in to them for you. Availability
+distinguishes installation from sign-in: an unknown sign-in status is not proof
+that a harness is signed in or authenticated.
 
 Current topic-step adapters are Claude Code and Codex via their official
 non-interactive CLIs, and Muse Code via its `muse serve` protocol. Pi, OpenCode,
@@ -96,7 +98,7 @@ One daemon owns all state; every client is a thin view of it, so closing one nev
 
 | Client | Start it |
 |---|---|
-| Terminal UI | `formless` — the current Session and Run interface; topic navigation is not integrated yet |
+| Terminal UI | `formless` — Main Chat and nested Topic Chats via `/main`, `/topics`, and `/topic` |
 | Desktop app | native GPUI app with Main Chat and nested Topic Chats ([overview](crates/formless-desktop/README.md)) |
 | Browser | `formless relay enable` — end-to-end encrypted, with Main Chat and nested Topic Chats; works on phones ([relay](relay/README.md)) |
 | CLI | `formless run "…"` — scriptable, with JSON output; `formless chat` opens an interactive line-mode chat |
