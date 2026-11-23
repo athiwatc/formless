@@ -6681,7 +6681,7 @@ Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
-`FORMLESS_FIXTURE_INSTALL_TARGET`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`, `FORMLESS_FIXTURE_TOKEN`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -7057,8 +7057,9 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
-actionable adapter-not-integrated step results.
+another harness. Muse Code uses its interactive session protocol and requires
+one-run workspace trust from the user. Pi, OpenCode, Antigravity and ACP
+currently return actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7067,7 +7068,7 @@ topics become NeedsUser, with durable detail and no automatic restart.
 
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
-CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
@@ -7188,17 +7189,21 @@ ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
---version and auth status; Codex uses --version and login status. Neither sends
-a model turn, and no auth output is copied into detail or logs.
+--version and auth status; Codex uses --version and login status. Muse Code
+checks its version before using usage --json and only confirms sign-in when
+it receives a Meta account allowance. These probes do not send model turns
+or copy raw auth output into detail or logs.
 
-CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
-the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
-and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-and Muse have dedicated dispatch arms that look up the executable and run
---version in a private cwd under the probe deadline, with kill-on-drop and
-process-group cleanup. Their auth remains unknown, including version failures.
-Adapter owners can replace those fallbacks
-with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
+or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
+its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
+`FORMLESS_TOPIC_MUSE_EXE`. An availability result does not mean the step adapter
+is integrated: Pi, OpenCode and Antigravity have dedicated dispatch arms that run --version
+in a private cwd under the probe deadline, with kill-on-drop and process-group
+cleanup; their auth remains unknown, including version failures. ACP reports
+lookup-only availability and preserves its configured agent. Adapter owners
+can replace these fallbacks with async probes or the bounded spawn_blocking
+probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
