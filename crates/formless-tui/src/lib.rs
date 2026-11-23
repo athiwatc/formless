@@ -6592,6 +6592,11 @@ impl App {
                 question_id,
                 answered_by,
             } => {
+                let closed_session = self
+                    .questions
+                    .iter()
+                    .find(|question| question.id == question_id)
+                    .map(|question| question.session_id.clone());
                 if answered_by.as_deref() == Some("model") {
                     let asker = self
                         .questions
@@ -6606,6 +6611,22 @@ impl App {
                     });
                 }
                 self.questions.retain(|q| q.id != question_id);
+                let current_session_has_question = self.current.as_deref().is_some_and(|session| {
+                    self.questions
+                        .iter()
+                        .any(|question| question.session_id == session)
+                });
+                if closed_session
+                    .as_deref()
+                    .is_some_and(|session| self.is_current(session))
+                    && !current_session_has_question
+                    && self
+                        .activity
+                        .as_ref()
+                        .is_some_and(|activity| activity.label == "awaiting your answer")
+                {
+                    self.activity = None;
+                }
             }
             Event::SessionClients {
                 session_id,
@@ -22798,6 +22819,43 @@ mod tests {
         assert!(!app.running());
         assert!(app.activity_text().is_none());
         assert!(app.thinking.is_empty(), "thinking is ephemeral per Run");
+    }
+
+    #[test]
+    fn awaiting_answer_footer_tracks_open_questions_in_current_session() {
+        let question = |question_id: &str, session_id: &str| Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: question_id.into(),
+            session_id: session_id.into(),
+            question: format!("Question {question_id}?"),
+            options: Vec::new(),
+            questions: Vec::new(),
+        };
+        let close = |question_id: &str| Event::UserQuestionClosed {
+            question_id: question_id.into(),
+            answered_by: None,
+        };
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.on_event(question("q1", "s1"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+
+        app.on_event(question("q2", "s1"));
+        app.on_event(question("other-session", "s2"));
+        app.on_event(close("unknown"));
+        app.on_event(close("q1"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+
+        app.on_event(close("q2"));
+        assert!(app.activity_text().is_none());
+        let screen = render(&mut app, 120, 30);
+        assert!(!screen.contains("awaiting your answer"), "{screen}");
+        assert!(app
+            .questions
+            .iter()
+            .any(|question| question.id == "other-session"));
     }
 
     #[test]
