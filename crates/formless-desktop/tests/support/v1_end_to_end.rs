@@ -696,14 +696,20 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
     };
     let save = |cx: &mut TestAppContext, field: &'static str, value: &str| {
         // Field selection, typing and Save are separate event-loop turns.
+        // Service daemon I/O between them, as the native application's timer
+        // does. Slow headless layout must not simulate an unresponsive consumer
+        // and overflow its deliberately bounded update queue during a Save.
         // A previous Save's success notice is not this mutation's receipt.
+        pump(cx, h, &shell);
         step(cx, h, |window, cx| {
             window.click(field, cx);
         });
+        pump(cx, h, &shell);
         step(cx, h, |window, cx| {
             let i = shell.read(cx).session_edit_input().unwrap();
             i.update(cx, |i, cx| i.set_value(value, window, cx));
         });
+        pump(cx, h, &shell);
         let revision = step(cx, h, |window, cx| {
             let revision = shell.read(cx).session_edit_revision().unwrap();
             assert!(window.find("session-model-paid-footer").visible());
