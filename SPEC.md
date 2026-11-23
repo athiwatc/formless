@@ -997,6 +997,32 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
+The singleton Main Chat answers everyday questions in place. For an explicit
+request to organize work, the Main or Topic Chat assistant can call
+`read_topic_context` for recent persisted user messages, the working directory,
+and the topic hierarchy. Work can be in any domain. A proposal can name a
+workspace or use scratch space. An outline reflects only stated or standing
+preferences, can assign any supported harness to any step, and is advisory:
+the Formless model in Topic Chat makes the final decisions.
+`propose_topic` records a `pending_approval` topic for the same consent UI
+used by manual proposals. Independent features can reference the same
+original message, and each proposed feature is visible in the shared topic
+inventory. When the user has not specified a parent, a proposal from a Topic
+Chat defaults under that topic; a proposal from Main defaults directly under
+Main. Attempt sessions and nested agents do not get suggestion tools.
+Topic Chat suggestions see the current topic, its ancestors and descendants,
+unless the user enables external context. Main sees the whole tree. The
+Topic Chat assistant may answer a harness question only with a basis in a user
+request or decision, and never answers user-only questions or permissions.
+Approval, rejection, cancellation, permission rules, limits and external
+context access are user actions, not assistant tools.
+Suggesting or declining never moves a message or starts a
+harness; only an explicit approval in the client can authorize that. A chat
+reply, including “yes”, is not consent. Repeating a pending suggestion for
+the same source chat, messages, workspace, and parent returns the existing
+proposal; declining it does not cause the assistant to propose it again
+automatically.
+
 - Each user message in a Session starts a **Run**: the agent loops
   (think → tool call(s) → observe) autonomously until it produces a final
   answer, is interrupted, or pauses on provider failure/limit-free errors.
@@ -6687,7 +6713,7 @@ Private subprocess fixtures also use these test-only variables (no product
 configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_FIXTURE_CURL_STATUS`, `FORMLESS_FIXTURE_INSTALL_MARKER`,
-`FORMLESS_FIXTURE_INSTALL_TARGET`,
+`FORMLESS_FIXTURE_INSTALL_TARGET`, `FORMLESS_FIXTURE_TOKEN`,
 `FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
 `FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PIPE_BUSY_CHILD`,
 `FORMLESS_PIPE_BUSY_DATA`, `FORMLESS_PIPE_BUSY_CONFIG`,
@@ -7063,8 +7089,10 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. OpenCode, Antigravity, ACP and Muse currently return
-actionable adapter-not-integrated step results.
+another harness. Muse Code uses its interactive session protocol and requires
+one-run workspace trust from the user. Pi uses its integrated RPC adapter.
+OpenCode, Antigravity and ACP currently return actionable adapter-not-integrated
+step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7073,7 +7101,8 @@ topics become NeedsUser, with durable detail and no automatic restart.
 
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
-CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, and
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
+`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
@@ -7083,10 +7112,12 @@ operations. RequestPermission only raises a user request; it cannot decide one.
 An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
 
-The Pi adapter's availability probe accepts `FORMLESS_TOPIC_PI_EXE` as an
-executable override before searching PATH for `pi`. It only runs `--version`;
-sign-in remains unknown because Pi has no read-only, any-provider CLI auth
-probe. It does not write Pi configuration or isolate the user's agent directory.
+The Pi adapter's availability probe accepts an absolute `FORMLESS_TOPIC_PI_EXE`
+override before searching absolute PATH directories for `pi`; it skips relative
+or empty PATH entries and does not fall back to a bare `pi`. It only runs
+`--version`; sign-in remains unknown because Pi has no read-only, any-provider
+CLI auth probe. It does not write Pi configuration or isolate the user's agent
+directory.
 
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
@@ -7126,6 +7157,11 @@ in NeedsUser and resume them when answered, without reviving terminal work.
 HarnessPermissionRequested/Closed and the user-only HarnessPermissionDecision
 request handle permissions. Only offered option IDs are accepted; None rejects.
 PendingApprovals and subscription attention replay include open permissions.
+In flattened ServerMessage::Event messages, HarnessPermissionRequested
+serializes its permission kind as `permission_kind` to avoid the outer `kind`
+discriminator. Nested PendingApprovals event lists retain `kind` for older
+clients, and readers accept either name. Old full envelopes with duplicate
+`kind` keys remain ambiguous to JSON clients.
 No model tool or scoped MCP operation can decide a permission. Cancellation,
 attempt termination, shutdown and dropped interaction futures close undecided
 requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
@@ -7199,17 +7235,21 @@ ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
 detail "probe timed out". A harness is ready iff installed and signed_in is
 not Some(false): unknown auth is ready. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
---version and auth status; Codex uses --version and login status. Neither sends
-a model turn, and no auth output is copied into detail or logs.
+--version and auth status; Codex uses --version and login status. Muse Code
+checks its version before using usage --json and only confirms sign-in when
+it receives a Meta account allowance. These probes do not send model turns
+or copy raw auth output into detail or logs.
 
-CLI executable overrides are absolute FORMLESS_TOPIC_<KIND>_EXE paths, otherwise
-the kind's command is looked up on PATH. This includes FORMLESS_TOPIC_PI_EXE
-and FORMLESS_TOPIC_MUSE_EXE (pi and muse on PATH). Pi, OpenCode, Antigravity,
-and Muse have dedicated dispatch arms that look up the executable and run
---version in a private cwd under the probe deadline, with kill-on-drop and
-process-group cleanup. Their auth remains unknown, including version failures.
-Adapter owners can replace those fallbacks
-with async probes or the bounded spawn_blocking probe hook. The reusable ACP
+Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
+or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
+its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
+`FORMLESS_TOPIC_MUSE_EXE`. Pi has adapter-specific availability and an
+attempt-private RPC runner. OpenCode and Antigravity have availability-only
+fallback probes that run --version in a private cwd under the probe deadline,
+with kill-on-drop and process-group cleanup; their auth remains unknown,
+including version failures. ACP reports lookup-only availability and preserves
+its configured agent. Adapter owners can replace these fallbacks with async
+probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
