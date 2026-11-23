@@ -7241,6 +7241,10 @@ probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
+
+Antigravity readiness resolves `agy`, verifies ACP v1 and the minimum supported
+version, then runs `agy models` to determine sign-in. An explicit sign-in prompt
+means not signed in; inconclusive failures remain unknown.
 Adapter blocking probes must enforce their own internal deadline and kill
 child processes on drop: core's outer timeout cannot abort spawn_blocking.
 Core does not own the ACP agent registry and omits the bare ACP entry from
