@@ -991,6 +991,32 @@ task, with quality as a gate**.
 
 ### 5.2 Run lifecycle
 
+The singleton Main Chat answers everyday questions in place. For an explicit
+request to organize work, the Main or Topic Chat assistant can call
+`read_topic_context` for recent persisted user messages, the working directory,
+and the topic hierarchy. Work can be in any domain. A proposal can name a
+workspace or use scratch space. An outline reflects only stated or standing
+preferences, can assign any supported harness to any step, and is advisory:
+the Formless model in Topic Chat makes the final decisions.
+`propose_topic` records a `pending_approval` topic for the same consent UI
+used by manual proposals. Independent features can reference the same
+original message, and each proposed feature is visible in the shared topic
+inventory. When the user has not specified a parent, a proposal from a Topic
+Chat defaults under that topic; a proposal from Main defaults directly under
+Main. Attempt sessions and nested agents do not get suggestion tools.
+Topic Chat suggestions see the current topic, its ancestors and descendants,
+unless the user enables external context. Main sees the whole tree. The
+Topic Chat assistant may answer a harness question only with a basis in a user
+request or decision, and never answers user-only questions or permissions.
+Approval, rejection, cancellation, permission rules, limits and external
+context access are user actions, not assistant tools.
+Suggesting or declining never moves a message or starts a
+harness; only an explicit approval in the client can authorize that. A chat
+reply, including “yes”, is not consent. Repeating a pending suggestion for
+the same source chat, messages, workspace, and parent returns the existing
+proposal; declining it does not cause the assistant to propose it again
+automatically.
+
 - Each user message in a Session starts a **Run**: the agent loops
   (think → tool call(s) → observe) autonomously until it produces a final
   answer, is interrupted, or pauses on provider failure/limit-free errors.
