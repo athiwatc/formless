@@ -38,8 +38,8 @@ static diagnostics, not subprocess output or configuration values.
 
 On Windows, extensionless Pi paths resolve `.exe`, then `.cmd`, then `.bat`,
 while explicit extensions remain exact. Run-time lookup honors the request's
-`PATH`. Batch shims are invoked through the configured command processor using
-discrete command arguments rather than a constructed shell command string.
+`PATH`. Batch shims are passed directly to Rust's `Command` with each argument
+kept separate; no shell command string is assembled.
 
 `signed_in` is deliberately `None`, with an explanatory detail. Pi 1.6.0 has an
 official `auth check --provider <provider> --json --no-refresh` command, using

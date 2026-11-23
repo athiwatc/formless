@@ -205,49 +205,9 @@ fn resolve_request_executable(
     Ok(program.to_owned())
 }
 
-fn is_batch_executable(program: &Path) -> bool {
-    program.extension().is_some_and(|extension| {
-        matches!(
-            extension.to_string_lossy().to_ascii_lowercase().as_str(),
-            "cmd" | "bat"
-        )
-    })
-}
-
-fn command_parts_for_platform(
-    program: &Path,
-    args: &[OsString],
-    command_processor: Option<&OsStr>,
-    windows: bool,
-) -> (PathBuf, Vec<OsString>) {
-    if !windows || !is_batch_executable(program) {
-        return (program.to_owned(), args.to_vec());
-    }
-    let mut command_args = vec![
-        OsString::from("/d"),
-        OsString::from("/c"),
-        OsString::from("call"),
-        program.as_os_str().to_owned(),
-    ];
-    command_args.extend_from_slice(args);
-    (
-        command_processor
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("cmd.exe")),
-        command_args,
-    )
-}
-
 async fn probe_version(executable: &Path) -> std::result::Result<String, &'static str> {
-    let command_processor = std::env::var_os("COMSPEC");
-    let (program, args) = command_parts_for_platform(
-        executable,
-        &[OsString::from("--version")],
-        command_processor.as_deref(),
-        cfg!(windows),
-    );
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
+    let mut child = tokio::process::Command::new(executable)
+        .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -443,14 +403,6 @@ pub fn command_spec_with_extension(
         cfg!(windows),
         cfg!(unix),
     )?;
-    let process_command = std::env::var_os("COMSPEC");
-    let command_processor = request
-        .environment
-        .get(OsStr::new("COMSPEC"))
-        .map(OsString::as_os_str)
-        .or(process_command.as_deref());
-    let (program, args) =
-        command_parts_for_platform(&program, &args, command_processor, cfg!(windows));
     Ok(CommandSpec {
         program,
         args,
@@ -2307,51 +2259,88 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn windows_batch_execution_uses_command_arguments_without_joining() {
-        let program = Path::new(r"C:\Users\test user\npm\pi.cmd");
-        let processor = std::ffi::OsStr::new(r"C:\Windows\System32\cmd.exe");
-        let args = vec![
-            OsString::from("--version"),
-            OsString::from("model with spaces"),
+    fn batch_command_spec_keeps_literal_program_and_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let command_file = dir.join("pi % &.cmd");
+        fs::write(&command_file, "@exit /b 0\r\n").unwrap();
+        fs::set_permissions(&command_file, fs::Permissions::from_mode(0o700)).unwrap();
+        let extension_dir = dir.join("extension % & location");
+        fs::create_dir(&extension_dir).unwrap();
+        let extension = stage_extension(&extension_dir).unwrap();
+        let mut request = request(StepAccess::Write);
+        request.executable = Some(command_file.clone());
+
+        let spec = command_spec_with_extension(&request, &extension).unwrap();
+        assert_eq!(spec.program, command_file);
+        let expected_prefix = [
+            OsString::from("--mode"),
+            OsString::from("rpc"),
+            OsString::from("--no-session"),
+            OsString::from("--no-extensions"),
+            OsString::from("-e"),
+            OsString::from("builtin:mcp"),
+            OsString::from("-e"),
         ];
-        let (program, command_args) =
-            super::command_parts_for_platform(program, &args, Some(processor), true);
-        assert_eq!(program, PathBuf::from(processor));
+        assert_eq!(&spec.args[..expected_prefix.len()], &expected_prefix);
         assert_eq!(
-            command_args,
-            [
-                OsString::from("/d"),
-                OsString::from("/c"),
-                OsString::from("call"),
-                OsString::from(r"C:\Users\test user\npm\pi.cmd"),
-                OsString::from("--version"),
-                OsString::from("model with spaces"),
-            ]
+            spec.args[expected_prefix.len()].as_os_str(),
+            extension.as_os_str()
         );
-        let (program, direct_args) = super::command_parts_for_platform(
-            Path::new(r"C:\Program Files\Pi\pi.exe"),
-            &args,
-            Some(processor),
-            true,
+
+        let mut command = std::process::Command::new(&spec.program);
+        command.args(&spec.args);
+        assert_eq!(command.get_program(), spec.program.as_os_str());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            spec.args
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
         );
-        assert_eq!(program, PathBuf::from(r"C:\Program Files\Pi\pi.exe"));
-        assert_eq!(direct_args, args);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
-    fn command_spec_runs_explicit_cmd_via_comspec() {
+    fn command_spec_runs_explicit_cmd_directly() {
         let dir = temp_dir();
-        let extension = stage_extension(&dir).unwrap();
+        let extension_dir = dir.join("extension % & location");
+        fs::create_dir(&extension_dir).unwrap();
+        let extension = stage_extension(&extension_dir).unwrap();
         let cmd = dir.join("pi.cmd");
         fs::write(&cmd, "@exit /b 0\r\n").unwrap();
         let mut request = request(StepAccess::Write);
         request.executable = Some(cmd.clone());
         let spec = command_spec_with_extension(&request, &extension).unwrap();
-        let processor = std::env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
-        assert_eq!(spec.program, PathBuf::from(processor));
-        assert_eq!(spec.args[0..4], ["/d", "/c", "call", cmd.to_str().unwrap()]);
+        assert_eq!(spec.program, cmd);
+        let expected_prefix = [
+            OsString::from("--mode"),
+            OsString::from("rpc"),
+            OsString::from("--no-session"),
+            OsString::from("--no-extensions"),
+            OsString::from("-e"),
+            OsString::from("builtin:mcp"),
+            OsString::from("-e"),
+        ];
+        assert_eq!(&spec.args[..expected_prefix.len()], &expected_prefix);
+        assert_eq!(
+            spec.args[expected_prefix.len()].as_os_str(),
+            extension.as_os_str()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn probe_version_runs_explicit_cmd_directly() {
+        let dir = temp_dir();
+        let cmd = dir.join("pi.cmd");
+        fs::write(&cmd, "@echo 1.2.3\r\n").unwrap();
+        assert_eq!(super::probe_version(&cmd).await.unwrap(), "1.2.3");
         fs::remove_dir_all(dir).unwrap();
     }
 
