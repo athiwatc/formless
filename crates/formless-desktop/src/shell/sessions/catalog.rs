@@ -44,7 +44,8 @@ impl Shell {
     fn catalog_ready(&self) -> bool {
         self.client_connected
             && self.session_editor.as_ref().is_some_and(|p| {
-                !p.retired
+                self.topic_session_mutation_allowed(&p.id)
+                    && !p.retired
                     && p.waiting.is_none()
                     && p.field == Field::Model
                     && p.metadata.as_ref().is_some_and(|m| m.selection.is_some())

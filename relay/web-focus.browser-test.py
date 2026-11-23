@@ -61,7 +61,7 @@ def expose_script(route):
     exposure = '''
     window.__focus817 = {
       S,h,openArtifact,openModelPicker,openSwitcher,showHelp,showRunFiles,modal,
-      ask,closeAsk,renderApproval,sessionMenu,messageMenu,closePopover,toast,onEvent,
+      ask,closeAsk,showHarnessStatus,renderApproval,sessionMenu,messageMenu,closePopover,toast,onEvent,
       renderHistory,renderSessions,renderChrome,setView,
       openDialog,closeDialog,activeDialog,focusReturn,
       calls:[], deferredArtifact:false, deferredModels:false,
@@ -94,6 +94,8 @@ def expose_script(route):
       }
       if(req.type==='run_files') return {run_id:'fixture-run',files:[{path:'example.txt',status:'unchanged',revertible:false}],untracked_writes_possible:false};
       if(req.type==='list_tools'||req.type==='list_modules') return [];
+      if(req.type==='list_harnesses') return ['claude','codex','pi','opencode','antigravity','acp','muse'].map(kind=>({
+        kind,installed:true,signed_in:null,detail:'Long harness probe detail. '.repeat(12)}));
       return null;
     };
     act = reply817;
@@ -322,6 +324,24 @@ def run():
                 page.wait_for_timeout(25)
                 check(not page.evaluate('!!__focus817.activeDialog()'), label + ' safe backdrop closes on repeated open')
                 check(page.locator('#fixture-tools-open').evaluate('(e)=>e===document.activeElement'), label + ' backdrop restores trigger')
+
+            # Read-only status lists open at their heading, even when long enough
+            # to scroll. Reopening must not retain the previous footer position.
+            for viewport in ({'width':1280,'height':900}, {'width':390,'height':640}):
+                page.set_viewport_size(viewport)
+                for opening in range(2):
+                    invoke(page, '__focus817.showHarnessStatus()')
+                    page.wait_for_selector('#ask-backdrop:not(.hidden)')
+                    check(page.locator('#ask-title').evaluate('(e)=>e===document.activeElement'), 'harness status initially focuses heading')
+                    check(page.locator('#ask-form').evaluate('(e)=>e.scrollTop===0'), 'harness status starts scrolled to top')
+                    check(page.locator('#ask-form').evaluate('''e=>{const bounds=e.getBoundingClientRect();
+                      const title=document.querySelector('#ask-title').getBoundingClientRect();
+                      const guidance=document.querySelector('#ask-text').getBoundingClientRect();
+                      return title.top>=bounds.top && guidance.bottom<=bounds.bottom;}'''), 'harness heading and substitution guidance visible on open')
+                    focus_cycle(page, '#ask-backdrop:not(.hidden)', 'tall harness status')
+                    page.locator('#ask-form').evaluate('(e)=>e.scrollTop=e.scrollHeight')
+                    close_and_return(page, '#ask-backdrop:not(.hidden)', '#fixture-tools-open', 'tall harness status')
+            page.set_viewport_size({'width':1280,'height':900})
 
             # A deferred viewer must remember its original invoking control before
             # awaiting content, rather than whoever gains focus during the await.

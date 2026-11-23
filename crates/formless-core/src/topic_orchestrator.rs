@@ -386,7 +386,7 @@ impl Daemon {
                             {
                                 continue;
                             }
-                            if !user_only || seen.insert(format!("question:{question_id}")) {
+                            if seen.insert(format!("question:{question_id}")) {
                                 return Ok(
                                     json!({"event":"question","question_id":question_id,"attempt_id":attempt_id,"questions":questions,"user_only":user_only}),
                                 );
@@ -467,7 +467,7 @@ impl Daemon {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
         let kickoff = format!(
             concat!(
-                "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer harness questions with topic_answer_question only when a nonempty basis quotes or references a user's message or decision; never answer user_only questions or permissions. Use ask_user if you lack a basis. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
+                "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
                 "Features, workspace and advisory outline:\n{}\n",
                 "Available harness kinds: claude, codex, pi, muse; opencode, antigravity and acp currently return adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
             ),
@@ -1104,9 +1104,20 @@ impl Daemon {
             .map(|(revision, tree)| json!({"revision":revision,"path":tree.path}))
             .collect();
         let prompt=format!("Topic: {}\nFeature {}: {}\nStep: {}\n{}\nAccess: {:?}\nInputs: {}\nGit input worktrees: {}\nWrite file outputs only to {} and report their SHA-256 via report_result. Text outputs can be reported directly. Never push or modify the source workspace or its branch. Combine inputs only in this private workspace when instructed. For Git Write create a clean new commit; the daemon verifies HEAD. Use the scoped Formless MCP for questions, conversations and reporting outputs.\n",topic.name,feature.id,feature.request,step.title,step.instructions,step.access,serde_json::to_string(inputs)?,serde_json::to_string(&git_inputs)?,outputs_dir.display());
-        let message = self.with_store(|st| {
-            st.append_message(&attempt.conversation_session_id, "user", &prompt)
-        })?;
+        let message = GENERATED_MESSAGE
+            .scope("topic_attempt_instructions".into(), async {
+                self.with_store(|st| {
+                    let generated_by = GENERATED_MESSAGE.try_with(Clone::clone).ok();
+                    st.append_message_generated(
+                        &attempt.conversation_session_id,
+                        "user",
+                        &prompt,
+                        None,
+                        generated_by.as_deref(),
+                    )
+                })
+            })
+            .await?;
         self.broadcast(Event::MessageAppended {
             session_id: attempt.conversation_session_id.clone(),
             message,

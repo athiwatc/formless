@@ -128,6 +128,13 @@ struct Handler {
     open: StdMutex<Option<MessageInfo>>,
 }
 
+#[derive(Clone)]
+pub(super) struct TopicHumanAnswerContext {
+    topic_id: String,
+    attempt_id: String,
+    questions: Vec<Question>,
+}
+
 impl InteractionHandler for Handler {
     fn request_permission<'a>(
         &'a self,
@@ -721,7 +728,7 @@ impl Daemon {
     pub(super) fn answer_topic_question_tool(&self, session: &str, args: &Value) -> Result<Value> {
         let basis = args["basis"].as_str().context("basis is required")?.trim();
         if basis.is_empty() {
-            bail!("basis must quote or reference a user message or decision");
+            bail!("basis must explain the answer; evidence must be verified separately");
         }
         let question_id = args["question_id"]
             .as_str()
@@ -754,6 +761,15 @@ impl Daemon {
         }
         let attempt_id =
             attempt_id.context("only harness questions can be answered by this tool")?;
+        let evidence = args.get("evidence").context("evidence is required")?;
+        let evidence_message_id = evidence["message_id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty())
+            .context("evidence.message_id is required")?;
+        let evidence_quote = evidence["quote"]
+            .as_str()
+            .filter(|quote| !quote.trim().is_empty())
+            .context("evidence.quote is required")?;
         let answers: Vec<QuestionAnswer> = serde_json::from_value(args["answers"].clone())?;
         if answers.len() != questions.len()
             || answers.iter().any(|answer| {
@@ -766,22 +782,66 @@ impl Daemon {
         {
             bail!("supply one non-empty answer per question");
         }
-        let message=self.with_store(|st|st.transaction(|st|{
-            if !st.is_topic_orchestrator(session)?{bail!("topic is not active");}
-            let attempt=st.get_topic_attempt(&attempt_id)?.context("attempt not found")?;
-            let mut waiters=self.questions.locked();
-            if !waiters.contains_key(question_id){return Ok(None);}
-            let message=st.append_message_meta(session,"assistant",&format!(
-                "Orchestrator answer for {:?}, attempt {}\nQuestions: {}\nAnswers: {}\nBasis: {}",
-                attempt.harness,attempt_id,serde_json::to_string(&questions)?,serde_json::to_string(&answers)?,basis
-            ),Some(json!({"topic_question_answer":question_id,"answered_by":"model","basis":basis}).to_string()))?;
-            self.question_answered_by.locked().insert(question_id.into(),"model".into());
-            if waiters.remove(question_id).unwrap().send((String::new(),answers)).is_err(){
-                self.question_answered_by.locked().remove(question_id);
-                bail!("question expired before delivery");
-            }
-            Ok(Some(message))
-        }))?;
+        let message = self.with_store(|st| {
+            st.transaction(|st| {
+                if !st.is_topic_orchestrator(session)? {
+                    bail!("topic is not active");
+                }
+                let attempt = st
+                    .get_topic_attempt(&attempt_id)?
+                    .context("attempt not found")?;
+                let mut waiters = self.questions.locked();
+                if !waiters.contains_key(question_id) {
+                    return Ok(None);
+                }
+                let resolved = st.resolve_topic_answer_evidence(
+                    session,
+                    &topic.id,
+                    &attempt_id,
+                    &questions,
+                    &answers,
+                    evidence_message_id,
+                    evidence_quote,
+                )?;
+                let message = st.append_message_meta(
+                    session,
+                    "assistant",
+                    &format!(
+                        "Orchestrator answer for {:?}, attempt {}\nQuestions: {}\nAnswers: {}\nBasis: {}\nEvidence: {} ({})\nEvidence quote: {}",
+                        attempt.harness,
+                        attempt_id,
+                        serde_json::to_string(&questions)?,
+                        serde_json::to_string(&answers)?,
+                        basis,
+                        resolved.message_id,
+                        resolved.source,
+                        resolved.quote,
+                    ),
+                    Some(
+                        json!({
+                            "topic_question_answer": question_id,
+                            "answered_by": "model",
+                            "basis": basis,
+                            "evidence": resolved,
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                self.question_answered_by
+                    .locked()
+                    .insert(question_id.into(), "model".into());
+                if waiters
+                    .remove(question_id)
+                    .unwrap()
+                    .send((String::new(), answers))
+                    .is_err()
+                {
+                    self.question_answered_by.locked().remove(question_id);
+                    bail!("question expired before delivery");
+                }
+                Ok(Some(message))
+            })
+        })?;
         if let Some(message) = message {
             self.broadcast(Event::MessageAppended {
                 session_id: session.into(),
@@ -791,6 +851,117 @@ impl Daemon {
         } else {
             Ok(json!({"answered":false}))
         }
+    }
+
+    pub(super) fn topic_human_answer_context(
+        &self,
+        question_id: &str,
+        event: &Event,
+    ) -> Option<TopicHumanAnswerContext> {
+        let Event::UserQuestion {
+            topic_id: Some(topic_id),
+            attempt_id: Some(attempt_id),
+            user_only: false,
+            questions,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let expected = (topic_id.clone(), attempt_id.clone());
+        if self.topic_questions.locked().get(question_id) != Some(&expected) {
+            return None;
+        }
+        Some(TopicHumanAnswerContext {
+            topic_id: topic_id.clone(),
+            attempt_id: attempt_id.clone(),
+            questions: questions.clone(),
+        })
+    }
+
+    pub(super) fn answer_topic_human_question(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+    ) -> Result<(bool, Option<MessageInfo>)> {
+        self.answer_topic_human_question_inner(context, question_id, answer, answers, |_| {})
+    }
+
+    #[cfg(test)]
+    pub(super) fn answer_topic_human_question_with_hook<F>(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+        before_send: F,
+    ) -> Result<(bool, Option<MessageInfo>)>
+    where
+        F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
+    {
+        self.answer_topic_human_question_inner(context, question_id, answer, answers, before_send)
+    }
+
+    fn answer_topic_human_question_inner<F>(
+        &self,
+        context: TopicHumanAnswerContext,
+        question_id: &str,
+        answer: &str,
+        answers: Vec<QuestionAnswer>,
+        before_send: F,
+    ) -> Result<(bool, Option<MessageInfo>)>
+    where
+        F: FnOnce(&tokio::sync::oneshot::Sender<(String, Vec<QuestionAnswer>)>),
+    {
+        let mut delivery_failed = false;
+        let mut delivered = false;
+        self.with_store(|st| {
+            match st.transaction(|st| {
+                let mut waiters = self.questions.locked();
+                let Some(sender) = waiters.get(question_id) else {
+                    return Ok(None);
+                };
+                if sender.is_closed() {
+                    waiters.remove(question_id);
+                    return Ok(None);
+                }
+                let normalized_answers =
+                    normalized_topic_answers(&context.questions, answer, answers.clone());
+                let receipt = st.append_topic_human_answer_receipt(
+                    &context.topic_id,
+                    &context.attempt_id,
+                    question_id,
+                    &context.questions,
+                    &normalized_answers,
+                )?;
+                before_send(sender);
+                let sender = waiters.remove(question_id).unwrap();
+                if sender.send((answer.to_owned(), answers)).is_err() {
+                    delivery_failed = true;
+                    bail!("harness question expired before human answer delivery");
+                }
+                delivered = true;
+                self.question_answered_by
+                    .locked()
+                    .insert(question_id.into(), "user".into());
+                Ok(Some(receipt))
+            }) {
+                Ok(Some(receipt)) => Ok((true, Some(receipt))),
+                Ok(None) => Ok((false, None)),
+                Err(_) if delivery_failed => Ok((false, None)),
+                Err(error) if delivered => {
+                    tracing::warn!(
+                        question_id,
+                        error = %error,
+                        "human answer delivered but its receipt transaction did not commit"
+                    );
+                    Ok((true, None))
+                }
+                Err(error) => Err(error),
+            }
+        })
     }
 
     pub(crate) fn topic_interaction_handler(
@@ -1112,17 +1283,23 @@ impl Daemon {
             || {},
         )
         .await;
-        Ok(reply.map(|(answer, answers)| {
-            let answers = if answers.is_empty() {
-                vec![questions[0].parse_reply(&answer)]
-            } else {
-                answers
-            };
-            answers
-                .into_iter()
-                .chain(std::iter::repeat_with(QuestionAnswer::default))
-                .take(questions.len())
-                .collect()
-        }))
+        Ok(reply.map(|(answer, answers)| normalized_topic_answers(&questions, &answer, answers)))
     }
+}
+
+fn normalized_topic_answers(
+    questions: &[Question],
+    answer: &str,
+    answers: Vec<QuestionAnswer>,
+) -> Vec<QuestionAnswer> {
+    let answers = if answers.is_empty() {
+        vec![questions[0].parse_reply(answer)]
+    } else {
+        answers
+    };
+    answers
+        .into_iter()
+        .chain(std::iter::repeat_with(QuestionAnswer::default))
+        .take(questions.len())
+        .collect()
 }

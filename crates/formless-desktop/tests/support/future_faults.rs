@@ -1,7 +1,7 @@
 //! Unix-only IPC fault schedules, using a real private daemon and fake provider.
 #![cfg(unix)]
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 enum Fault {
@@ -16,6 +16,7 @@ struct Proxy {
     value: Arc<Mutex<Option<Value>>>,
     upstream_eof: Arc<AtomicBool>,
     closed_by: Arc<Mutex<Option<&'static str>>>,
+    discarded_transcript_deltas: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Proxy {
@@ -28,6 +29,7 @@ impl Proxy {
         let value = Arc::new(Mutex::new(None));
         let upstream_eof = Arc::new(AtomicBool::new(false));
         let closed_by = Arc::new(Mutex::new(None));
+        let discarded_transcript_deltas = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn({
             let upstream = fixture.endpoint.clone();
             let arm = arm.clone();
@@ -36,6 +38,7 @@ impl Proxy {
             let value = value.clone();
             let upstream_eof = upstream_eof.clone();
             let closed_by = closed_by.clone();
+            let discarded_transcript_deltas = discarded_transcript_deltas.clone();
             async move {
                 loop {
                     let (front, _) = listener.accept().await.unwrap();
@@ -73,6 +76,7 @@ impl Proxy {
                     let responses = async {
                         let mut lines = BufReader::new(back_read).lines();
                         let mut held: Option<String> = None;
+                        let mut draining_finished_run = false;
                         loop {
                             tokio::select! {
                                 biased;
@@ -92,6 +96,11 @@ impl Proxy {
                                         }
                                     };
                                     let frame:ServerMessage=serde_json::from_str(&line).unwrap();
+                                    // This client subscribes to opt-in attempt envelopes,
+                                    // not just the legacy MessageDelta stream.
+                                    let transcript_delta = matches!(&frame, ServerMessage::Event(Event::TranscriptAttempt { update })
+                                        if matches!(&update.change, formless_protocol::TranscriptAttemptChange::Delta { .. }));
+                                    let provisional = transcript_delta || matches!(&frame, ServerMessage::Event(Event::MessageDelta { .. } | Event::RunUsage { .. }));
                                     let intercept=match (&frame,fault) {
                                         (ServerMessage::Response{id,..},Fault::StatusReply)=>*selected.lock().unwrap()==Some(*id),
                                         (_,Fault::ServerRead)=>arm.swap(false,Ordering::SeqCst),
@@ -103,11 +112,19 @@ impl Proxy {
                                         reached.notify_one();
                                         if matches!(fault,Fault::StatusReply) {held=Some(line);continue;}
                                         release.notified().await;
+                                        // ServerRead is released only after the observer saw
+                                        // RunFinished. Discard the obsolete provisional frames
+                                        // while draining this failed connection, rather than
+                                        // saturating the UI consumer or sleeping per frame.
+                                        // The assertion requires the real upstream EOF and a
+                                        // complete canonical baseline on a new connection.
+                                        draining_finished_run = true;
+                                    }
+                                    if draining_finished_run && provisional {
+                                        if transcript_delta { discarded_transcript_deltas.fetch_add(1, Ordering::SeqCst); }
+                                        continue;
                                     }
                                     front_write.write_all(line.as_bytes()).await?;
-                                    // Keep the measured UI consumer from becoming
-                                    // the saturated queue when draining old IPC data.
-                                    if matches!(fault,Fault::ServerRead) {tokio::time::sleep(Duration::from_millis(1)).await;}
                                 }
                             }
                         }
@@ -125,6 +142,7 @@ impl Proxy {
             value,
             upstream_eof,
             closed_by,
+            discarded_transcript_deltas,
             task,
         }
     }
@@ -258,6 +276,10 @@ async fn future_edit_rejects_delayed_status_from_the_truncated_history() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn future_server_queue_saturation_disconnects_and_recovers_canonically() {
+    // Exceed both the daemon's 4096-frame queue and large OS socket
+    // buffers. A tiny delta keeps the canonical snapshot small; frame
+    // count, not answer size, is what must saturate the server here.
+    const PRESSURE_FRAMES: usize = 65_536;
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-server-queue-key");
     let burst = Arc::new(Notify::new());
@@ -266,8 +288,8 @@ async fn future_server_queue_saturation_disconnects_and_recovers_canonically() {
     let fixture=Fixture::start(app(axum::routing::post({let burst=burst.clone();let complete=complete.clone();let calls=calls.clone();move|| {
         let burst=burst.clone();let complete=complete.clone();calls.fetch_add(1,Ordering::SeqCst);
         async move {
-            let chunk=encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"0123456789abcdef"}})]);
-            let chunks=VecDeque::from([(None,prefix("Before pressure ")),(Some(burst),chunk.repeat(8192)),(Some(complete),tail("END"))]);
+            let chunk=encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})]);
+            let chunks=VecDeque::from([(None,prefix("Before pressure ")),(Some(burst),chunk.repeat(PRESSURE_FRAMES)),(Some(complete),tail("END"))]);
             let stream=futures_util::stream::unfold(chunks,|mut chunks|async move {
                 let (gate,text)=chunks.pop_front()?;if let Some(gate)=gate {gate.notified().await;}
                 Some((Ok::<_,std::io::Error>(text),chunks))
@@ -297,7 +319,7 @@ async fn future_server_queue_saturation_disconnects_and_recovers_canonically() {
     })
     .await;
     proxy.release.notify_one();
-    let expected = format!("Before pressure {}END", "0123456789abcdef".repeat(8192));
+    let expected = format!("Before pressure {}END", "x".repeat(PRESSURE_FRAMES));
     until(&client, "server-pressure-canonical-recovery", |u| {
         if let Update::Transcript(b) = u {
             if b.owner.connection != connection && b.owner.connection == client.connection() {
@@ -313,9 +335,14 @@ async fn future_server_queue_saturation_disconnects_and_recovers_canonically() {
         proxy.upstream_eof.load(Ordering::SeqCst),
         "the upstream server, rather than the UI consumer, must end its saturated connection"
     );
+    let discarded = proxy.discarded_transcript_deltas.load(Ordering::SeqCst);
+    assert!(
+        discarded > 0,
+        "the fault must drain real opt-in transcript deltas, not only legacy MessageDelta frames"
+    );
     eprintln!(
         "reader_server_pressure_metrics {}",
-        json!({"provider_delta_frames":8192,"canonical_payload_bytes":expected.len(),"server_closure_observed":proxy.closed_by.lock().unwrap().as_ref(),"provider_calls":calls.load(Ordering::SeqCst),"ui_consumer_deliberately_stalled":false})
+        json!({"provider_delta_frames":PRESSURE_FRAMES,"canonical_payload_bytes":expected.len(),"server_closure_observed":proxy.closed_by.lock().unwrap().as_ref(),"discarded_transcript_deltas":discarded,"provider_calls":calls.load(Ordering::SeqCst),"ui_consumer_deliberately_stalled":false})
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     drop(client);

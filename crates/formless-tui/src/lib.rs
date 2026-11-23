@@ -45,6 +45,8 @@ mod text_history;
 mod theme;
 #[cfg(test)]
 mod toast_preview_tests;
+mod topic;
+mod topic_app;
 mod tour;
 mod ui;
 mod user_commands_ui;
@@ -233,6 +235,10 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    QuestionAnswer {
+        question: OpenQuestion,
+        index: usize,
+    },
     ProviderRetry {
         session_id: String,
     },
@@ -344,6 +350,52 @@ enum Pending {
     UpdateModule,
     ListSessions,
     GetSession,
+    TopicCapability {
+        epoch: u64,
+    },
+    TopicMain {
+        generation: u64,
+        open: bool,
+    },
+    TopicList {
+        generation: u64,
+    },
+    TopicGet {
+        topic_id: String,
+        epoch: u64,
+    },
+    TopicPropose,
+    TopicApprove {
+        topic_id: String,
+        source_session_id: String,
+        start_after_approval: bool,
+    },
+    TopicStart {
+        topic_id: String,
+    },
+    TopicReject {
+        topic_id: String,
+    },
+    TopicRecover {
+        topic_id: String,
+    },
+    TopicRetry {
+        topic_id: String,
+        feature_id: String,
+    },
+    TopicCancel {
+        topic_id: String,
+    },
+    TopicPermission {
+        permission_id: String,
+    },
+    HarnessPermissions {
+        closed: HashSet<String>,
+    },
+    TopicControl {
+        topic_id: Option<String>,
+        done: String,
+    },
     ReconnectSession,
     CreateSession,
     ForkSession,
@@ -448,6 +500,8 @@ fn attention_key(event: &Event) -> Option<(u8, &str)> {
         }
         Event::PromotionApprovalRequested { promotion_id, .. }
         | Event::PromotionApprovalResolved { promotion_id } => Some((2, promotion_id)),
+        Event::HarnessPermissionRequested { permission_id, .. }
+        | Event::HarnessPermissionClosed { permission_id, .. } => Some((3, permission_id)),
         _ => None,
     }
 }
@@ -458,6 +512,7 @@ fn attention_request(event: &Event) -> bool {
         Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. }
             | Event::PromotionApprovalRequested { .. }
+            | Event::HarnessPermissionRequested { .. }
     )
 }
 
@@ -633,6 +688,7 @@ struct PendingSend {
 
 /// An open `ask_user` call (SPEC §5.5); `answers` fills as the user
 /// answers its questions in order.
+#[derive(Clone, PartialEq)]
 struct OpenQuestion {
     id: String,
     session_id: String,
@@ -643,6 +699,8 @@ struct OpenQuestion {
     cursor: usize,
     /// Ticked options of a multi-select question.
     checked: Vec<bool>,
+    /// The Formless model may not answer this one.
+    user_only: bool,
 }
 
 impl OpenQuestion {
@@ -654,6 +712,7 @@ impl OpenQuestion {
             answers: Vec::new(),
             cursor: 0,
             checked: Vec::new(),
+            user_only: false,
         };
         q.reset_choice();
         q
@@ -1751,6 +1810,11 @@ struct App {
     inbox: Option<mpsc::Receiver<ServerMessage>>,
     clipboard_write: clipboard_write::ClipboardWrite,
     sessions: Vec<SessionInfo>,
+    topic: topic::State,
+    topic_main_generation: u64,
+    topic_list_generation: u64,
+    topic_epoch: u64,
+    pending_topic_actions: HashSet<String>,
     session_idx: usize,
     session_filter: lists::ListFilter,
     session_comparison_revision: u64,
@@ -1887,6 +1951,7 @@ struct App {
     /// Open `ask_user` calls. The next typed line answers the current
     /// Session's oldest one, one question at a time.
     questions: Vec<OpenQuestion>,
+    questions_awaiting_close: HashMap<String, String>,
     /// Latest Run usage per Session, for the status line (SPEC §10.6).
     run_usage: HashMap<String, formless_protocol::UsageInfo>,
     /// The current Session's Runs, for the footer under each answer.
@@ -1928,6 +1993,7 @@ struct App {
     /// Inline images (SPEC §10.2): the terminal's protocol, the
     /// thumbnails this frame places and those last sent.
     image_proto: Option<images::Protocol>,
+    kitty_images_suppressed: bool,
     /// Side pane widths in the multi-pane layout, percent (left, right).
     pane_widths: (u16, u16),
     /// While an approval is open: whether keys go to the input (Tab
@@ -2145,6 +2211,11 @@ impl App {
             inbox: None,
             clipboard_write: Default::default(),
             sessions: Vec::new(),
+            topic: topic::State::default(),
+            topic_main_generation: 0,
+            topic_list_generation: 0,
+            topic_epoch: 0,
+            pending_topic_actions: HashSet::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
@@ -2235,6 +2306,7 @@ impl App {
             conn: None,
             others: Vec::new(),
             questions: Vec::new(),
+            questions_awaiting_close: HashMap::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
             session_runs: Vec::new(),
@@ -2253,6 +2325,7 @@ impl App {
             chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
+            kitty_images_suppressed: false,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
             input_focus: false,
             approval_explain: false,
@@ -2387,6 +2460,7 @@ impl App {
         self.inbox = Some(inbox);
         self.send_request(Pending::DaemonMode, Request::Status);
         self.send_request(Pending::ListSessions, Request::ListSessions);
+        self.topic_connected();
         self.refresh_description_reviews(false);
         if self.offline.is_some() {
             self.begin_reconnect_snapshot();
@@ -2520,9 +2594,16 @@ impl App {
                 self.questions.len()
             ));
         }
+        let permissions = self.topic.clear_permissions();
+        if permissions > 0 {
+            self.notes.push(format!(
+                "{permissions} harness permission request(s) from the old daemon discarded"
+            ));
+        }
         self.approvals.clear();
         self.promotions.clear();
         self.questions.clear();
+        self.questions_awaiting_close.clear();
         self.approval_summaries.clear();
         self.approval_batches.clear();
         self.approval_scopes.clear();
@@ -2546,6 +2627,14 @@ impl App {
         });
         self.pending.insert(subscribe, Pending::Subscribed);
         self.pending_since.insert(subscribe, Instant::now());
+        let permissions = client.send(Request::PendingApprovals);
+        self.pending.insert(
+            permissions,
+            Pending::HarnessPermissions {
+                closed: HashSet::new(),
+            },
+        );
+        self.pending_since.insert(permissions, Instant::now());
         let id = client.send(Request::GetSession {
             id: session_id.clone(),
         });
@@ -2977,6 +3066,10 @@ impl App {
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
+            if matches!(kind, Pending::TopicPropose) {
+                self.topic_proposal_timed_out();
+                continue;
+            }
             if matches!(kind, Pending::SuggestName { .. }) {
                 self.cancel_rename();
             }
@@ -3122,6 +3215,7 @@ impl App {
 
     fn drain_daemon(&mut self) {
         self.expire_pending();
+        self.topic_tick();
         self.restore_attachment_drafts();
         let Some(inbox) = self.inbox.take() else {
             return;
@@ -3207,6 +3301,32 @@ impl App {
                         self.finish_queued_save(session_id, *edit, draft, saved, error.as_deref());
                         continue;
                     }
+                    if let Pending::QuestionAnswer { question, index } = &kind {
+                        if !ok {
+                            let still_open =
+                                self.questions_awaiting_close.remove(&question.id).is_some();
+                            if still_open
+                                && !self.questions.iter().any(|open| open.id == question.id)
+                            {
+                                let mut restored = question.clone();
+                                restored.answers.pop();
+                                restored.reset_choice();
+                                let session_id = restored.session_id.clone();
+                                self.questions
+                                    .insert((*index).min(self.questions.len()), restored);
+                                if self.is_current(&session_id)
+                                    && self.activity.as_ref().is_none_or(|activity| {
+                                        activity.label == "awaiting your answer"
+                                    })
+                                {
+                                    self.set_activity("awaiting your answer");
+                                }
+                            }
+                            self.notes
+                                .push(format!("daemon: {}", error.clone().unwrap_or_default()));
+                        }
+                        continue;
+                    }
                     if self.stale_search(&kind) {
                         continue;
                     }
@@ -3281,6 +3401,10 @@ impl App {
                             }));
                         }
                     }
+                    if kind.is_topic() {
+                        self.topic_reply(kind, ok, result, error);
+                        continue;
+                    }
                     if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation != self.branch_summary.generation)
                     {
                         continue;
@@ -3345,6 +3469,21 @@ impl App {
                         Pending::ApprovalDecision { .. } => {
                             unreachable!("approval acknowledgements handled above")
                         }
+                        Pending::TopicCapability { .. }
+                        | Pending::TopicMain { .. }
+                        | Pending::TopicList { .. }
+                        | Pending::TopicGet { .. }
+                        | Pending::TopicPropose
+                        | Pending::TopicApprove { .. }
+                        | Pending::TopicStart { .. }
+                        | Pending::TopicReject { .. }
+                        | Pending::TopicRecover { .. }
+                        | Pending::TopicRetry { .. }
+                        | Pending::TopicCancel { .. }
+                        | Pending::TopicPermission { .. }
+                        | Pending::TopicControl { .. } => {
+                            unreachable!("topic replies handled above")
+                        }
                         Pending::HunkReview { reply, action } => {
                             self.hunk_review_result(reply, action, result)
                         }
@@ -3370,6 +3509,9 @@ impl App {
                             }
                         }
                         Pending::SendMessage => {}
+                        Pending::QuestionAnswer { .. } => {
+                            unreachable!("question answers are handled above")
+                        }
                         Pending::TourSession => self.open_tour_reply(result),
                         Pending::TourRun { session_id, run_id } => {
                             self.apply_tour_status(&session_id, &run_id, &result);
@@ -3646,6 +3788,19 @@ impl App {
                                 viewport: Default::default(),
                                 styled: Vec::new(),
                             });
+                        }
+                        Pending::HarnessPermissions { closed } => {
+                            let events: Vec<Event> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            for event in events {
+                                if matches!(
+                                    &event,
+                                    Event::HarnessPermissionRequested { permission_id, .. }
+                                        if !closed.contains(permission_id)
+                                ) {
+                                    self.topic_permission_event(event);
+                                }
+                            }
                         }
                         Pending::RevokeAll => {
                             let family = self.grants_family.take();
@@ -5775,6 +5930,14 @@ impl App {
                 client: Some("TUI".into()),
             },
         );
+        if self.offline.is_none() {
+            self.request(
+                Pending::HarnessPermissions {
+                    closed: HashSet::new(),
+                },
+                Request::PendingApprovals,
+            );
+        }
         self.request(
             Pending::ContextFill,
             Request::ContextUsage {
@@ -5890,6 +6053,13 @@ impl App {
             self.forecast.hint = None;
             self.forecast.approved = None;
         }
+        if let Event::HarnessPermissionClosed { permission_id, .. } = &ev {
+            for pending in self.pending.values_mut() {
+                if let Pending::HarnessPermissions { closed } = pending {
+                    closed.insert(permission_id.clone());
+                }
+            }
+        }
         if self.offline.is_some() && self.client.is_some() && reconnect_state_event(&ev) {
             self.reconnect_events.push(ev.clone());
             if attention_key(&ev).is_some() {
@@ -5918,10 +6088,10 @@ impl App {
         match ev {
             // This client keeps legacy Subscribe. Correlated answer frames
             // belong only to explicit future-attempt consumers.
-            Event::TranscriptAttempt { .. }
-            | Event::TopicChanged { .. }
-            | Event::HarnessPermissionRequested { .. }
-            | Event::HarnessPermissionClosed { .. } => {}
+            Event::TranscriptAttempt { .. } => {}
+            ev @ (Event::HarnessPermissionRequested { .. }
+            | Event::HarnessPermissionClosed { .. }) => self.topic_permission_event(ev),
+            Event::TopicChanged { topic_id } => self.topic_changed(topic_id),
             Event::MessageAppended {
                 session_id,
                 message,
@@ -6416,13 +6586,15 @@ impl App {
                 question,
                 options,
                 mut questions,
+                user_only,
                 ..
             } => {
                 // An older daemon sends only the single-question form.
                 if questions.is_empty() {
                     questions.push(Question::single(question, options));
                 }
-                let open = OpenQuestion::new(question_id, session_id, questions);
+                let mut open = OpenQuestion::new(question_id, session_id, questions);
+                open.user_only = user_only;
                 self.notes.push(open.prompt());
                 if self.is_current(&open.session_id) {
                     self.set_activity("awaiting your answer");
@@ -6453,8 +6625,50 @@ impl App {
                 }
                 self.run_usage.insert(session_id, usage);
             }
-            Event::UserQuestionClosed { question_id, .. } => {
+            Event::UserQuestionClosed {
+                question_id,
+                answered_by,
+            } => {
+                let open_session = self
+                    .questions
+                    .iter()
+                    .find(|question| question.id == question_id)
+                    .map(|question| question.session_id.clone());
+                let closed_session =
+                    open_session.or_else(|| self.questions_awaiting_close.remove(&question_id));
+                if answered_by.as_deref() == Some("model") {
+                    let asker = closed_session
+                        .as_deref()
+                        .and_then(|session| self.topic.harness_label_for_session(session));
+                    self.notes.push(match asker {
+                        Some(asker) => format!(
+                            "Formless answered the question from {asker}; the answer is in the Topic Chat."
+                        ),
+                        None => "Formless answered an open question.".into(),
+                    });
+                }
+                self.questions_awaiting_close.remove(&question_id);
                 self.questions.retain(|q| q.id != question_id);
+                let current_session_has_question = self.current.as_deref().is_some_and(|session| {
+                    self.questions
+                        .iter()
+                        .any(|question| question.session_id == session)
+                        || self
+                            .questions_awaiting_close
+                            .values()
+                            .any(|closed_session| closed_session == session)
+                });
+                if closed_session
+                    .as_deref()
+                    .is_some_and(|session| self.is_current(session))
+                    && !current_session_has_question
+                    && self
+                        .activity
+                        .as_ref()
+                        .is_some_and(|activity| activity.label == "awaiting your answer")
+                {
+                    self.activity = None;
+                }
             }
             Event::SessionClients {
                 session_id,
@@ -7085,11 +7299,14 @@ impl App {
                 .push("not sent — offline; your input is kept as a draft".into());
             return;
         }
+        if self.topic_blocks_submit() {
+            return;
+        }
         if let Some(edit) = self.editing_queued {
             self.submit_queued_edit(edit);
             return;
         }
-        if !self.expand_user_command() {
+        if !self.expand_user_command() || self.topic_blocks_submit() {
             return;
         }
         let text = self.input.expanded();
@@ -7395,11 +7612,19 @@ impl App {
             return;
         }
         let open = self.questions.remove(i);
-        self.fire(Request::AnswerQuestion {
-            question_id: open.id,
-            answer: QuestionAnswer::summary_of(&open.answers),
-            answers: open.answers,
-        });
+        self.questions_awaiting_close
+            .insert(open.id.clone(), open.session_id.clone());
+        self.request(
+            Pending::QuestionAnswer {
+                question: open.clone(),
+                index: i,
+            },
+            Request::AnswerQuestion {
+                question_id: open.id,
+                answer: QuestionAnswer::summary_of(&open.answers),
+                answers: open.answers,
+            },
+        );
     }
 
     fn session_name(&self, id: &str) -> String {
@@ -7749,6 +7974,8 @@ impl App {
                 Request::CreateSession { name: None },
             ),
             "sessions" => self.open_view(View::Sessions),
+            "main" | "topics" | "topic" => self.topic_slash(cmd, ""),
+            cmd if cmd.starts_with("topic ") => self.topic_slash("topic", &cmd[6..]),
             "fork" => {
                 if let Some(id) = self.current.clone() {
                     self.request(
@@ -9713,6 +9940,12 @@ impl App {
                 editor.vim.cancel_pending_argument();
             }
         }
+        if self.topic.has_permission()
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.topic_permission_key(key);
+            return;
+        }
         if self.hunk_review_is_visible() {
             self.hunk_review_key(key);
             return;
@@ -9816,6 +10049,9 @@ impl App {
         }
         if self.rollback_pick.is_some() {
             self.rollback_key(key);
+            return;
+        }
+        if self.topic_key(key) {
             return;
         }
         if self.model_overlay.is_some()
@@ -10153,7 +10389,6 @@ impl App {
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
             && !self.vim_input.waiting_for_argument()
-            && self.current_question().is_none()
             && self.find.is_none()
             && (self.approvals.is_empty() || self.input_focus)
             && self.call_focus_key(&key)
@@ -11494,7 +11729,16 @@ impl App {
         let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
         self.messages
             .iter()
-            .find(|m| m.id == id && m.role == "user")
+            .find(|m| m.id == id && m.role == "user" && m.generated_by.is_none())
+    }
+
+    fn focused_topic_instructions(&self) -> Option<&MessageInfo> {
+        let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
+        self.messages.iter().find(|m| {
+            m.id == id
+                && m.role == "user"
+                && generated_topic_instructions(m.generated_by.as_deref()).is_some()
+        })
     }
 
     /// Editing a message with later user turns discards them, so the
@@ -11514,12 +11758,17 @@ impl App {
         let focus = self.call_focus.as_deref()?;
         if let Some(id) = focus.strip_prefix("msg:") {
             let m = self.messages.iter().find(|m| m.id == id)?;
-            let text = match (markdown, m.role.as_str()) {
-                (true, "user") => format!("**You:**\n\n{}", m.content),
-                _ => m.content.clone(),
+            let text = if markdown && m.role == "user" {
+                let (attribution, _) = message_attribution(&m.role, m.generated_by.as_deref());
+                format!("**{attribution}:**\n\n{}", m.content)
+            } else {
+                m.content.clone()
             };
             let what = if m.role == "user" {
-                "your message"
+                generated_topic_instructions(m.generated_by.as_deref())
+                    .map(|instructions| instructions.copy_label)
+                    .or_else(|| m.generated_by.is_some().then_some("the generated message"))
+                    .unwrap_or("your message")
             } else {
                 "the answer"
             };
@@ -11649,11 +11898,21 @@ impl App {
         true
     }
 
-    /// Tool-call focus (SPEC §10.2): `[`/`]` on an empty input move it;
-    /// while a call is focused Enter toggles it, `z`/`Z` expand or
-    /// collapse all, and Esc or any other key leaves the focus.
+    /// Chat focus (SPEC §10.2): `[`/`]` on an empty input move it; Enter
+    /// toggles a call or opens generated topic instructions, and Esc leaves focus.
     fn call_focus_key(&mut self, key: &KeyEvent) -> bool {
-        if !self.input.is_empty() || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        if key.code == KeyCode::Esc
+            && self.call_focus.is_some()
+            && self.input.is_empty()
+            && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        {
+            self.call_focus = None;
+            return true;
+        }
+        if self.current_question().is_some()
+            || !self.input.is_empty()
+            || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+        {
             return false;
         }
         let ids = self.focus_items();
@@ -11674,7 +11933,29 @@ impl App {
             _ if self.call_focus.is_none() => return false,
             KeyCode::Enter => {
                 let id = self.call_focus.clone().unwrap();
-                if !id.starts_with("msg:") && !self.expanded_calls.remove(&id) {
+                if id.starts_with("msg:") {
+                    if let Some((content, title)) = self.focused_topic_instructions().map(|m| {
+                        (
+                            m.content.clone(),
+                            generated_topic_instructions(m.generated_by.as_deref())
+                                .expect("focused topic instructions have a display")
+                                .pager_title,
+                        )
+                    }) {
+                        self.reviewing = None;
+                        self.pager = Some(Pager {
+                            title: title.into(),
+                            lines: content
+                                .split('\n')
+                                .map(text::escape_terminal_line)
+                                .collect(),
+                            top: 0,
+                            left: 0,
+                            viewport: Default::default(),
+                            styled: Vec::new(),
+                        });
+                    }
+                } else if !self.expanded_calls.remove(&id) {
                     self.expanded_calls.insert(id);
                 }
                 self.scroll_to_focus = true;
@@ -12119,6 +12400,10 @@ impl App {
             ed.apply_modal_line(line);
             return;
         }
+        if self.topic.overlay_open() && self.approvals.is_empty() && self.promotions.is_empty() {
+            self.topic.paste(text);
+            return;
+        }
         // Paste is literal query text while searching the pager. Otherwise
         // it stops here so it cannot reach the covered surface.
         if let Some(pager) = &mut self.pager {
@@ -12214,6 +12499,40 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.image_placed.clear();
+    draw_app_frame(f, app);
+    // Permission keys are handled before every view, so the prompt is drawn
+    // over every view, including ones that return early.
+    app.topic.draw_permission_overlay(f, app.color);
+}
+
+fn paint_inline_images(app: &mut App, out: &mut impl Write, links_ready: bool) {
+    let Some(proto) = app.image_proto else {
+        app.kitty_images_suppressed = false;
+        return;
+    };
+    if proto == images::Protocol::Kitty && (app.topic.has_permission() || app.pager.is_some()) {
+        if !app.kitty_images_suppressed {
+            let _ = images::paint(out, proto, &[]);
+            app.painted_images.clear();
+            app.kitty_images_suppressed = true;
+        }
+        return;
+    }
+    app.kitty_images_suppressed = false;
+    if !links_ready || app.image_placed == app.painted_images {
+        return;
+    }
+    if app.painted_images.is_empty() {
+        let _ = images::paint(out, proto, &app.image_placed);
+        app.painted_images.clone_from(&app.image_placed);
+    } else {
+        app.painted_images.clear();
+        app.force_redraw = true;
+    }
+}
+
+fn draw_app_frame(f: &mut Frame, app: &mut App) {
     app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
     app.list_wheel_region.set(None);
@@ -12252,7 +12571,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Chat if pane_layout(app.multi_pane, chunks[1].width) => {
             chat_focus = draw_panes(f, chunks[1], app);
         }
-        View::Chat => chat_focus = draw_chat(f, chunks[1], app),
+        View::Chat => chat_focus = topic_app::draw_chat_with_topics(f, chunks[1], app),
         View::Sessions => draw_sessions(f, chunks[1], app),
         View::Settings => draw_settings(f, chunks[1], app),
         View::Tools => draw_tools(f, chunks[1], app),
@@ -12274,6 +12593,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         chat_focus,
     );
     draw_status(f, chunks[3], app, chat_focus);
+    if app.topic.overlay_open() {
+        app.topic.draw_overlay(f, app.color);
+    }
     // Give the form the full frame after drawing its background. Approval
     // and other modal overlays below keep their existing priority.
     if app.view == View::Settings {
@@ -12285,7 +12607,15 @@ fn draw(f: &mut Frame, app: &mut App) {
         let palette = app.palette_items();
         let question = app.current_question().map(|i| &app.questions[i]);
         if let Some(q) = question.filter(|_| palette.is_empty() && modal.is_none()) {
-            draw_question_panel(f, chunks[1], q, !app.input.is_empty(), app.color);
+            let context = app.topic.harness_label_for_session(&q.session_id);
+            draw_question_panel(
+                f,
+                chunks[1],
+                q,
+                context.as_deref(),
+                !app.input.is_empty(),
+                app.color,
+            );
         } else if !palette.is_empty() {
             draw_palette(f, chunks[2], &palette, app.palette_sel, app.color);
         } else if let Some(m) = app.mention.as_ref().filter(|m| !m.dismissed) {
@@ -12696,12 +13026,25 @@ fn mention_line(text: &str, color: bool) -> Line<'static> {
 
 /// An open `ask_user` question (SPEC §5.5), at the bottom of the chat
 /// area just above the input.
-fn draw_question_panel(f: &mut Frame, chat: Rect, open: &OpenQuestion, typing: bool, color: bool) {
+fn draw_question_panel(
+    f: &mut Frame,
+    chat: Rect,
+    open: &OpenQuestion,
+    context: Option<&str>,
+    typing: bool,
+    color: bool,
+) {
     let q = open.current();
     let total = open.questions.len();
     let mut title = String::from(" Question");
     if total > 1 {
         title.push_str(&format!(" {}/{total}", open.answers.len() + 1));
+    }
+    if let Some(context) = context {
+        title.push_str(&format!(" · {context}"));
+    }
+    if open.user_only {
+        title.push_str(" · only you can answer");
     }
     if let Some(h) = &q.header {
         title.push_str(&format!(" · {h}"));
@@ -14773,15 +15116,58 @@ fn others_text(others: &[AttachedClient]) -> String {
         .join(", ")
 }
 
-fn chat_header(app: &App, role: &str, when: Option<&str>) -> Line<'static> {
-    let who = match role {
-        "user" => "You",
-        "system-note" => "System",
-        _ => "Formless",
-    };
+#[derive(Clone, Copy)]
+struct GeneratedTopicInstructions {
+    summary: &'static str,
+    pager_title: &'static str,
+    attribution: &'static str,
+    copy_label: &'static str,
+}
+
+fn generated_topic_instructions(marker: Option<&str>) -> Option<GeneratedTopicInstructions> {
+    match marker {
+        Some("topic_kickoff") => Some(GeneratedTopicInstructions {
+            summary: "Workflow kickoff for this topic.",
+            pager_title: "Workflow kickoff instructions",
+            attribution: "Formless · workflow kickoff",
+            copy_label: "the workflow kickoff",
+        }),
+        Some("topic_attempt_instructions") => Some(GeneratedTopicInstructions {
+            summary: "Instructions for this topic attempt.",
+            pager_title: "Topic attempt instructions",
+            attribution: "Formless · topic attempt instructions",
+            copy_label: "the topic attempt instructions",
+        }),
+        _ => None,
+    }
+}
+
+fn message_attribution(role: &str, generated_by: Option<&str>) -> (&'static str, &'static str) {
+    if role == "user" {
+        if let Some(instructions) = generated_topic_instructions(generated_by) {
+            (instructions.attribution, "assistant")
+        } else if generated_by.is_some() {
+            ("Formless · generated", "assistant")
+        } else {
+            ("You", "user")
+        }
+    } else if role == "system-note" {
+        ("System", "system-note")
+    } else {
+        ("Formless", "assistant")
+    }
+}
+
+fn chat_header(
+    app: &App,
+    role: &str,
+    generated_by: Option<&str>,
+    when: Option<&str>,
+) -> Line<'static> {
+    let (who, style_role) = message_attribution(role, generated_by);
     let mut spans = vec![
-        Span::styled("▍", role_style(app.color, role)),
-        Span::styled(who.to_string(), role_style(app.color, role)),
+        Span::styled("▍", role_style(app.color, style_role)),
+        Span::styled(who, role_style(app.color, style_role)),
     ];
     if let Some(t) = when
         .filter(|_| app.show_timestamps)
@@ -16381,10 +16767,12 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
 }
 
 /// The keys for a focused message, under it.
-fn focus_hint(color: bool, user: bool) -> Line<'static> {
+fn focus_hint(color: bool, user: bool, generated_instructions: bool) -> Line<'static> {
     Line::styled(
         if user {
             "  ▲ e edit & re-run from here · f fork from here · c copy · C Markdown · [ ] move · Esc"
+        } else if generated_instructions {
+            "  ▲ Enter view raw instructions · c copy · C copy as Markdown · [ ] move · Esc"
         } else {
             "  ▲ c copy · C copy as Markdown · [ ] move · Esc"
         },
@@ -16659,19 +17047,22 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         .map(|(id, _, _)| id)
         .filter(|id| !id.is_empty())
         .collect();
-    let mut group: Option<&'static str> = None;
+    let mut group: Option<String> = None;
     // Header only when the speaker changes; a blank line separates turns.
     let open_group = |lines: &mut Vec<Line<'static>>,
-                      group: &mut Option<&'static str>,
+                      group: &mut Option<String>,
                       role: &str,
+                      generated_by: Option<&str>,
                       when: Option<&str>| {
-        let g = speaker(role);
-        if *group != Some(g) {
+        let key = generated_by
+            .map(|marker| format!("generated:{marker}"))
+            .unwrap_or_else(|| speaker(role).to_owned());
+        if group.as_deref() != Some(key.as_str()) {
             if group.is_some() {
                 lines.push(Line::raw(""));
             }
-            lines.push(chat_header(app, g, when));
-            *group = Some(g);
+            lines.push(chat_header(app, role, generated_by, when));
+            *group = Some(key);
         }
     };
     let footers = run_footers(app);
@@ -16694,8 +17085,16 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         let first_line = lines.len();
         match m.role.as_str() {
             "user" => {
-                user_lines.push(lines.len());
-                open_group(&mut lines, &mut group, "user", when);
+                if m.generated_by.is_none() {
+                    user_lines.push(lines.len());
+                }
+                open_group(
+                    &mut lines,
+                    &mut group,
+                    "user",
+                    m.generated_by.as_deref(),
+                    when,
+                );
                 if let Some(from) = sent_elsewhere(app, m) {
                     lines.push(Line::styled(
                         format!("  sent from {from}"),
@@ -16708,12 +17107,24 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         fg(app.color, Color::Yellow),
                     ));
                 }
-                let focused = app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
+                let focused = app.current_question().is_none()
+                    && app.call_focus.as_deref() == Some(&format!("msg:{}", m.id));
                 if focused {
                     focus_line = Some(lines.len());
                 }
-                for l in m.content.lines() {
-                    lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                if let Some(instructions) = generated_topic_instructions(m.generated_by.as_deref())
+                {
+                    lines.push(mention_line(instructions.summary, app.color));
+                    if !focused && app.current_question().is_none() {
+                        lines.push(Line::styled(
+                            "  [ ] select · Enter view raw instructions",
+                            ui::dim(app.color),
+                        ));
+                    }
+                } else {
+                    for l in m.content.lines() {
+                        lines.push(mention_line(&truncate_chars(l, 2000), app.color));
+                    }
                 }
                 for name in expired_attachments(m) {
                     lines.push(Line::styled(
@@ -16738,18 +17149,22 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     }
                 }
                 if focused {
-                    lines.push(focus_hint(app.color, true));
+                    lines.push(focus_hint(
+                        app.color,
+                        m.generated_by.is_none(),
+                        generated_topic_instructions(m.generated_by.as_deref()).is_some(),
+                    ));
                 }
             }
             "tool" => {
                 if result_call_id(m).is_some_and(|id| called.contains(&id)) {
                     continue;
                 }
-                open_group(&mut lines, &mut group, "assistant", when);
+                open_group(&mut lines, &mut group, "assistant", None, when);
                 lines.push(tool_result_line(m, app.color));
             }
             "system-note" => {
-                open_group(&mut lines, &mut group, "system-note", when);
+                open_group(&mut lines, &mut group, "system-note", None, when);
                 for l in m.content.lines() {
                     lines.push(Line::styled(
                         format!("  {l}"),
@@ -16758,7 +17173,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
             }
             _ => {
-                open_group(&mut lines, &mut group, "assistant", when);
+                open_group(&mut lines, &mut group, "assistant", None, when);
                 if let Some(via) = served_by(m) {
                     lines.push(Line::styled(format!("  {via}"), ui::dim(app.color)));
                 }
@@ -16776,7 +17191,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     lines.push(Line::styled(format!("  {note}"), ui::dim(app.color)));
                 }
                 if focused {
-                    lines.push(focus_hint(app.color, false));
+                    lines.push(focus_hint(app.color, false, false));
                 }
                 if let Some(meta) = &m.meta {
                     for call in persisted_calls(meta) {
@@ -16831,7 +17246,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     // subtree folds to one line.
     let shown = live_tree(&app.live_tools);
     if !shown.is_empty() {
-        open_group(&mut lines, &mut group, "assistant", None);
+        open_group(&mut lines, &mut group, "assistant", None, None);
         for (call, folded) in shown {
             let version = if call.version > 0 {
                 format!(" v{}", call.version)
@@ -16947,7 +17362,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         ));
     }
     if !app.streaming.is_empty() || app.running() {
-        open_group(&mut lines, &mut group, "assistant", None);
+        open_group(&mut lines, &mut group, "assistant", None, None);
         app.streaming_markdown(width)
             .append_to(&mut lines, &mut markdown_links);
         if app.streaming.is_empty() {
@@ -20295,19 +20710,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                 .update(&mut stdout(), frame.buffer, found)
                 .is_ok();
             // Defer new thumbnails when a link repaint will retry on their cells.
-            if let Some(proto) = app.image_proto.filter(|_| links_ready) {
-                if app.image_placed != app.painted_images {
-                    if app.painted_images.is_empty() {
-                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
-                        app.painted_images = app.image_placed.clone();
-                    } else {
-                        // Old thumbnails stay on screen until cleared:
-                        // redraw from scratch, then paint the new ones.
-                        app.painted_images.clear();
-                        app.force_redraw = true;
-                    }
-                }
-            }
+            paint_inline_images(&mut app, &mut stdout(), links_ready);
             // Handle everything queued before the next draw, so a burst of
             // scroll events costs one frame, not one frame each.
             let mut wait = Duration::from_millis(50);
@@ -20471,6 +20874,11 @@ mod tests {
             inbox: None,
             clipboard_write: Default::default(),
             sessions: Vec::new(),
+            topic: topic::State::default(),
+            topic_main_generation: 0,
+            topic_list_generation: 0,
+            topic_epoch: 0,
+            pending_topic_actions: HashSet::new(),
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
@@ -20560,6 +20968,7 @@ mod tests {
             conn: None,
             others: Vec::new(),
             questions: Vec::new(),
+            questions_awaiting_close: HashMap::new(),
             run_usage: HashMap::new(),
             context_fill: HashMap::new(),
             session_runs: Vec::new(),
@@ -20578,6 +20987,7 @@ mod tests {
             chat_markdown_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
+            kitty_images_suppressed: false,
             pane_widths: (22, 26),
             input_focus: false,
             approval_explain: false,
@@ -22015,10 +22425,10 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str(&line).unwrap())
             .collect();
-        assert_eq!(retried.len(), 2);
+        assert_eq!(retried.len(), 3);
         assert!(retried.iter().all(|request| matches!(
             request.request,
-            Request::Subscribe { .. } | Request::GetSession { .. }
+            Request::Subscribe { .. } | Request::PendingApprovals | Request::GetSession { .. }
         )));
         let (next, _) = app.reconnect_request.clone().unwrap();
         assert_ne!(next, id);
@@ -22507,6 +22917,85 @@ mod tests {
         assert!(!app.running());
         assert!(app.activity_text().is_none());
         assert!(app.thinking.is_empty(), "thinking is ephemeral per Run");
+    }
+
+    #[test]
+    fn awaiting_answer_footer_tracks_submitted_questions_until_their_close() {
+        let question = |question_id: &str, session_id: &str| Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: question_id.into(),
+            session_id: session_id.into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: format!("Question {question_id}?"),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Done".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        };
+        let close = |question_id: &str| Event::UserQuestionClosed {
+            question_id: question_id.into(),
+            answered_by: None,
+        };
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.on_event(question("q1", "s1"));
+        app.on_event(question("q2", "s1"));
+        app.on_event(question("other-session", "s2"));
+
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.current_question().is_none(),
+            "submitted prompts are not active"
+        );
+        assert!(app
+            .questions
+            .iter()
+            .any(|question| question.id == "other-session"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+
+        let answered_ids = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .filter_map(|envelope| match envelope.request {
+                Request::AnswerQuestion { question_id, .. } => Some(question_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered_ids, ["q1", "q2"]);
+
+        app.on_event(close("unknown"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+        app.on_event(close("q1"));
+        assert!(render(&mut app, 120, 30).contains("awaiting your answer"));
+
+        app.on_event(close("q2"));
+        assert!(app.activity_text().is_none());
+        let screen = render(&mut app, 120, 30);
+        assert!(!screen.contains("awaiting your answer"), "{screen}");
+        assert!(app
+            .questions
+            .iter()
+            .any(|question| question.id == "other-session"));
+
+        app.on_event(question("q3", "s1"));
+        app.key(key(KeyCode::Enter));
+        app.set_activity("working");
+        app.on_event(close("q3"));
+        assert!(app
+            .activity_text()
+            .as_deref()
+            .is_some_and(|activity| activity.contains("working")));
     }
 
     #[test]
@@ -23790,6 +24279,13 @@ mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             meta: None,
         }
+    }
+
+    fn workflow_kickoff_content() -> String {
+        format!(
+            "Run each selected feature in an isolated harness.\n{}\nFinal instruction \u{1b}[31m",
+            "Detailed workflow instruction. ".repeat(100)
+        )
     }
 
     #[test]
@@ -25082,6 +25578,297 @@ mod tests {
     }
 
     #[test]
+    fn active_question_owns_enter_and_hides_kickoff_focus_hint() {
+        let mut app = test_app();
+        let mut kickoff = msg("user", "raw workflow instructions");
+        kickoff.id = "kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        app.messages = vec![kickoff];
+        app.call_focus = Some("msg:kickoff".into());
+        app.on_event(Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Which approach?".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Continue".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+
+        let chat = chat_lines(&app, 120, 24);
+        let chat_text = chat
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(chat_text.contains("Workflow kickoff for this topic."));
+        assert!(!chat_text.contains("Enter view raw instructions"));
+        assert!(!app.call_focus_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Which approach?"), "{screen}");
+        assert!(!screen.contains("Enter view raw instructions"), "{screen}");
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pager.is_none());
+        assert!(app.questions.is_empty());
+        assert!(requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .any(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. })));
+    }
+
+    #[test]
+    fn rejected_free_text_answer_restores_the_question_prompt() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (client, requests) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.on_event(Event::UserQuestion {
+            user_only: true,
+            topic_id: Some("topic".into()),
+            attempt_id: Some("attempt".into()),
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Choose an offered option".into(),
+                header: None,
+                options: vec![
+                    QuestionOption {
+                        label: "Allow".into(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "Deny".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+            }],
+        });
+
+        for c in "please allow this".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+
+        assert!(app.questions.is_empty());
+        assert!(app.questions_awaiting_close.contains_key("q1"));
+        let request = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .find(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. }))
+            .expect("answer request");
+        assert!(matches!(
+            &request.request,
+            Request::AnswerQuestion { answers, .. }
+                if answers[0].text.as_deref() == Some("please allow this")
+        ));
+
+        incoming_tx
+            .send(ServerMessage::Response {
+                id: request.id,
+                ok: false,
+                result: None,
+                error: Some("select one offered option".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+
+        let open = &app.questions[app.current_question().unwrap()];
+        assert_eq!(
+            open.questions[open.answers.len()].question,
+            "Choose an offered option"
+        );
+        assert!(app.questions[0].answers.is_empty());
+        assert!(!app.questions_awaiting_close.contains_key("q1"));
+        assert!(app.input.is_empty());
+        assert!(render(&mut app, 100, 30).contains("Choose an offered option"));
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note == "daemon: select one offered option"));
+    }
+
+    #[test]
+    fn rejected_answer_does_not_restore_a_prompt_closed_before_the_reply() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (client, requests) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.on_event(Event::UserQuestion {
+            user_only: true,
+            topic_id: Some("topic".into()),
+            attempt_id: Some("attempt".into()),
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Choose an offered option".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Allow".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+        for c in "free answer".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        let request_id = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .find_map(|envelope| {
+                matches!(envelope.request, Request::AnswerQuestion { .. }).then_some(envelope.id)
+            })
+            .expect("answer request");
+
+        app.on_event(Event::UserQuestionClosed {
+            question_id: "q1".into(),
+            answered_by: None,
+        });
+        incoming_tx
+            .send(ServerMessage::Response {
+                id: request_id,
+                ok: false,
+                result: None,
+                error: Some("select one offered option".into()),
+            })
+            .unwrap();
+        app.drain_daemon();
+
+        assert!(app.questions.is_empty());
+        assert!(!app.questions_awaiting_close.contains_key("q1"));
+        assert!(app.activity_text().is_none());
+    }
+
+    #[test]
+    fn escape_leaves_chat_focus_without_interrupting_during_question() {
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        let mut assistant = msg("assistant", "The run is waiting for your answer.");
+        assistant.id = "assistant".into();
+        app.messages = vec![assistant];
+        app.call_focus = Some("msg:assistant".into());
+        app.on_event(Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Continue?".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Yes".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+
+        app.key(key(KeyCode::Esc));
+
+        assert!(app.call_focus.is_none());
+        assert!(app.current_question().is_some());
+        assert!(app.running());
+        assert!(!requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .any(|envelope| matches!(&envelope.request, Request::InterruptRun { .. })));
+    }
+
+    #[test]
+    fn vim_normal_escape_leaves_chat_focus_without_interrupting_during_question() {
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.vim_mode = true;
+        app.vim_input.mode = vim::Mode::Normal;
+        app.on_event(Event::RunStarted {
+            session_id: "s1".into(),
+            run_id: "r1".into(),
+        });
+        app.call_focus = Some("msg:assistant".into());
+        app.on_event(Event::UserQuestion {
+            user_only: false,
+            topic_id: None,
+            attempt_id: None,
+            question_id: "q1".into(),
+            session_id: "s1".into(),
+            question: String::new(),
+            options: Vec::new(),
+            questions: vec![Question {
+                question: "Continue?".into(),
+                header: None,
+                options: vec![QuestionOption {
+                    label: "Yes".into(),
+                    description: None,
+                }],
+                multi_select: false,
+            }],
+        });
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+
+        app.key(key(KeyCode::Esc));
+
+        assert!(app.call_focus.is_none());
+        assert!(app.current_question().is_some());
+        assert!(app.running());
+        assert!(requests.try_recv().is_err());
+
+        app.key(key(KeyCode::Enter));
+
+        assert!(app.current_question().is_none());
+        assert!(app.questions_awaiting_close.contains_key("q1"));
+        let requests = requests
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(requests
+            .iter()
+            .any(|envelope| matches!(&envelope.request, Request::AnswerQuestion { .. })));
+        assert!(!requests
+            .iter()
+            .any(|envelope| matches!(&envelope.request, Request::InterruptRun { .. })));
+    }
+
+    #[test]
     fn notifies_only_while_unfocused_and_after_long_runs() {
         let mut app = test_app();
         let started = |app: &mut App, sid: &str| {
@@ -26085,7 +26872,7 @@ mod tests {
             created_at: String::new(),
             meta: None,
         };
-        app.messages = (0..6)
+        let mut messages: Vec<_> = (0..6)
             .map(|i| {
                 if i % 2 == 0 {
                     msg(i, "user", format!("question {}", i / 2 + 1))
@@ -26094,6 +26881,10 @@ mod tests {
                 }
             })
             .collect();
+        let mut kickoff = msg(6, "user", "Generated kickoff".into());
+        kickoff.generated_by = Some("topic_kickoff".into());
+        messages.insert(1, kickoff);
+        app.messages = messages;
         render(&mut app, 80, 20);
         assert_eq!(app.user_rows.len(), 3);
         // From the live bottom, { goes to the last question, then earlier.
@@ -26804,6 +27595,470 @@ mod tests {
             .contains("message 3 from the bottom"));
         app.slash("copy 9");
         assert_eq!(app.notes.last().unwrap(), "there are 4 messages to copy");
+    }
+
+    #[test]
+    fn generated_workflow_kickoff_is_summarized_and_opens_raw_instructions() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = workflow_kickoff_content();
+        let mut kickoff = msg("user", &raw);
+        kickoff.id = "kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        let mut other_generated = msg("user", "Other generated text stays visible.");
+        other_generated.generated_by = Some("other_marker".into());
+        let mut assistant = msg("assistant", "Assistant text stays visible.");
+        assistant.generated_by = Some("topic_kickoff".into());
+
+        let mut app = test_app();
+        app.messages = vec![kickoff.clone(), other_generated, assistant];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Formless · workflow kickoff"), "{screen}");
+        assert!(
+            screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("[ ] select · Enter view raw instructions"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Run each selected feature"), "{screen}");
+        assert!(
+            screen.contains("Other generated text stays visible."),
+            "{screen}"
+        );
+        assert!(screen.contains("Assistant text stays visible."), "{screen}");
+        assert!(app.focus_items().contains(&"msg:kickoff".into()));
+
+        app.call_focus = Some("msg:kickoff".into());
+        let focused = render(&mut app, 120, 30);
+        assert!(focused.contains("Enter view raw instructions"), "{focused}");
+        assert!(focused.contains("C copy as Markdown"), "{focused}");
+        assert!(!focused.contains("e edit & re-run"), "{focused}");
+        assert!(!focused.contains("f fork from here"), "{focused}");
+        assert!(app.focused_user_message().is_none());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**Formless · workflow kickoff:**\n\n{raw}")
+        );
+
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Char('e')));
+        assert!(app.editing_id.is_none() && app.input.is_empty());
+        app.key(key(KeyCode::Char('f')));
+        assert!(app.fork_prefill.is_none());
+        assert!(requests.try_recv().is_err());
+
+        app.key(key(KeyCode::Enter));
+        let pager = app.pager.as_ref().expect("kickoff instruction pager");
+        assert_eq!(pager.title, "Workflow kickoff instructions");
+        assert_eq!(
+            pager.lines,
+            raw.split('\n')
+                .map(text::escape_terminal_line)
+                .collect::<Vec<_>>()
+        );
+        assert!(pager.lines[1].len() > 2000);
+        assert_eq!(app.messages[0].content, raw);
+    }
+
+    #[test]
+    fn empty_workflow_kickoff_opens_an_empty_raw_pager() {
+        let mut kickoff = msg("user", "");
+        kickoff.id = "empty-kickoff".into();
+        kickoff.generated_by = Some("topic_kickoff".into());
+        let mut app = test_app();
+        app.messages = vec![kickoff];
+        app.call_focus = Some("msg:empty-kickoff".into());
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let pager = app.pager.as_ref().expect("empty kickoff instruction pager");
+        assert_eq!(pager.title, "Workflow kickoff instructions");
+        assert_eq!(pager.lines, [""]);
+        assert!(app.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn generated_topic_attempt_instructions_are_summarized_and_open_raw() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = "Topic: Checkout\nFeature: inspect safely\nAccess: ReadOnly\nUse scoped Formless MCP for questions.";
+        let mut generated = msg("user", raw);
+        generated.id = "generated-attempt".into();
+        generated.generated_by = Some("topic_attempt_instructions".into());
+        let mut app = test_app();
+        app.messages = vec![generated];
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Formless · topic attempt instructions"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Topic: Checkout"), "{screen}");
+        assert!(app.focus_items().contains(&"msg:generated-attempt".into()));
+
+        app.call_focus = Some("msg:generated-attempt".into());
+        let focused = render(&mut app, 120, 30);
+        assert!(focused.contains("Enter view raw instructions"), "{focused}");
+        assert!(focused.contains("C copy as Markdown"), "{focused}");
+        assert!(!focused.contains("e edit & re-run"), "{focused}");
+        assert!(!focused.contains("f fork from here"), "{focused}");
+        assert!(app.focused_user_message().is_none());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**Formless · topic attempt instructions:**\n\n{raw}")
+        );
+
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Char('e')));
+        assert!(app.editing_id.is_none() && app.input.is_empty());
+        app.key(key(KeyCode::Char('f')));
+        assert!(app.fork_prefill.is_none());
+        assert!(requests.try_recv().is_err());
+        app.key(key(KeyCode::Enter));
+
+        let pager = app.pager.as_ref().expect("attempt instruction pager");
+        assert_eq!(pager.title, "Topic attempt instructions");
+        assert_eq!(
+            pager.lines,
+            raw.split('\n')
+                .map(text::escape_terminal_line)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.messages[0].content, raw);
+
+        let mut genuine = msg("user", raw);
+        genuine.id = "genuine-identical".into();
+        let mut genuine_app = test_app();
+        genuine_app.messages = vec![genuine.clone()];
+        let screen = render(&mut genuine_app, 120, 30);
+        assert!(screen.contains("You"), "{screen}");
+        assert!(screen.contains("Topic: Checkout"), "{screen}");
+        assert!(
+            !screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        genuine_app.call_focus = Some("msg:genuine-identical".into());
+        assert_eq!(genuine_app.focused_user_message().unwrap().id, genuine.id);
+        assert_eq!(
+            genuine_app.focused_text(true).unwrap().0,
+            format!("**You:**\n\n{raw}")
+        );
+
+        let mut edit_app = test_app();
+        edit_app.messages = vec![genuine.clone()];
+        edit_app.call_focus = Some("msg:genuine-identical".into());
+        edit_app.key(key(KeyCode::Char('e')));
+        assert_eq!(edit_app.editing_id.as_deref(), Some("genuine-identical"));
+
+        let mut fork_app = test_app();
+        fork_app.current = Some("s1".into());
+        fork_app.messages = vec![genuine];
+        fork_app.call_focus = Some("msg:genuine-identical".into());
+        fork_app.key(key(KeyCode::Char('f')));
+        assert_eq!(fork_app.fork_prefill.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn empty_topic_attempt_instructions_open_an_empty_raw_pager() {
+        let mut instructions = msg("user", "");
+        instructions.id = "empty-attempt".into();
+        instructions.generated_by = Some("topic_attempt_instructions".into());
+        let mut app = test_app();
+        app.messages = vec![instructions];
+        app.call_focus = Some("msg:empty-attempt".into());
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let pager = app.pager.as_ref().expect("empty attempt instruction pager");
+        assert_eq!(pager.title, "Topic attempt instructions");
+        assert_eq!(pager.lines, [""]);
+        assert!(app.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn pending_harness_permissions_restore_from_snapshot_without_resurrecting_closed_requests() {
+        let event = Event::HarnessPermissionRequested {
+            permission_id: "c0ac0268-db77-4a49-b669-bac028f35207".into(),
+            session_id: "52593398-66c0-4f10-9cd0-bdc5ebac9f28".into(),
+            topic_id: "f6156346-5a5b-4861-8c72-fc170c69a920".into(),
+            attempt_id: "f543861a-b7bd-4945-94af-bfc5ab256318".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Fixture simulated write".into(),
+            kind: "write".into(),
+            raw_input: Some(serde_json::json!({
+                "operation": "simulated_write",
+                "path": "fixture.txt"
+            })),
+            options: vec![
+                HarnessPermissionOption {
+                    option_id: "allow".into(),
+                    name: "Allow once".into(),
+                    kind: HarnessPermissionOptionKind::AllowOnce,
+                },
+                HarnessPermissionOption {
+                    option_id: "deny".into(),
+                    name: "Deny".into(),
+                    kind: HarnessPermissionOptionKind::RejectOnce,
+                },
+            ],
+        };
+        let (client, outbound) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("52593398-66c0-4f10-9cd0-bdc5ebac9f28".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+
+        let send_wire = |message: ServerMessage| {
+            let encoded = serde_json::to_string(&message).unwrap();
+            let decoded = serde_json::from_str::<ServerMessage>(&encoded).unwrap();
+            incoming_tx.send(decoded).unwrap();
+        };
+        let pending_request_id = |lines: Vec<String>| {
+            lines
+                .into_iter()
+                .map(|line| {
+                    serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap()
+                })
+                .find_map(|envelope| {
+                    matches!(envelope.request, Request::PendingApprovals).then_some(envelope.id)
+                })
+                .expect("PendingApprovals request")
+        };
+
+        app.switch_session("52593398-66c0-4f10-9cd0-bdc5ebac9f28".into());
+        let initial_lines = outbound.try_iter().collect::<Vec<_>>();
+        let initial_requests = initial_lines
+            .iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(line).unwrap())
+            .collect::<Vec<_>>();
+        let subscribe_at = initial_requests
+            .iter()
+            .position(|request| matches!(&request.request, Request::Subscribe { .. }))
+            .expect("current-session subscription");
+        let pending_at = initial_requests
+            .iter()
+            .position(|request| matches!(&request.request, Request::PendingApprovals))
+            .expect("pending-permissions snapshot request");
+        assert!(subscribe_at < pending_at);
+        let initial_query = pending_request_id(initial_lines);
+
+        send_wire(ServerMessage::Event(event.clone()));
+        app.drain_daemon();
+        assert!(
+            app.topic.has_permission(),
+            "live wire event reaches the queue"
+        );
+
+        send_wire(ServerMessage::Response {
+            id: initial_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(
+            app.topic.has_permission(),
+            "snapshot response keeps prompt visible"
+        );
+
+        app.clear_attention();
+        assert!(!app.topic.has_permission());
+        app.offline = Some((Instant::now(), Instant::now()));
+        app.begin_reconnect_snapshot();
+        let reconnect_query = pending_request_id(outbound.try_iter().collect());
+        send_wire(ServerMessage::Response {
+            id: reconnect_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+
+        assert!(
+            app.topic.has_permission(),
+            "pending prompt restored after reconnect"
+        );
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("Fixture simulated write"), "{screen}");
+        assert!(screen.contains("1. Allow once"), "{screen}");
+
+        app.clear_attention();
+        app.begin_reconnect_snapshot();
+        let close_race_query = pending_request_id(outbound.try_iter().collect());
+        send_wire(ServerMessage::Event(Event::HarnessPermissionClosed {
+            permission_id: "c0ac0268-db77-4a49-b669-bac028f35207".into(),
+            option_id: None,
+            by: None,
+        }));
+        app.drain_daemon();
+        send_wire(ServerMessage::Response {
+            id: close_race_query,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(
+            !app.topic.has_permission(),
+            "a closed permission from an older snapshot is not restored"
+        );
+    }
+
+    #[test]
+    fn reconnecting_permission_waits_for_snapshot_before_accepting_decisions() {
+        let event = Event::HarnessPermissionRequested {
+            permission_id: "permission-reconnect".into(),
+            session_id: "session-reconnect".into(),
+            topic_id: "topic-reconnect".into(),
+            attempt_id: "attempt-reconnect".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Fixture permission".into(),
+            kind: "write".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        };
+        let (client, outbound) = DaemonClient::recording();
+        let (incoming_tx, incoming_rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.current = Some("session-reconnect".into());
+        app.client = Some(client);
+        app.inbox = Some(incoming_rx);
+        app.offline = Some((Instant::now(), Instant::now()));
+        let send_wire = |message: ServerMessage| {
+            let encoded = serde_json::to_string(&message).unwrap();
+            incoming_tx
+                .send(serde_json::from_str::<ServerMessage>(&encoded).unwrap())
+                .unwrap();
+        };
+
+        app.begin_reconnect_snapshot();
+        let requests = outbound
+            .try_iter()
+            .map(|line| serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap())
+            .collect::<Vec<_>>();
+        let pending_id = requests
+            .iter()
+            .find_map(|envelope| {
+                matches!(&envelope.request, Request::PendingApprovals).then_some(envelope.id)
+            })
+            .expect("PendingApprovals request");
+        let session_id = requests
+            .iter()
+            .find_map(|envelope| {
+                matches!(
+                    &envelope.request,
+                    Request::GetSession { id } if id == "session-reconnect"
+                )
+                .then_some(envelope.id)
+            })
+            .expect("reconnect GetSession request");
+
+        send_wire(ServerMessage::Response {
+            id: pending_id,
+            ok: true,
+            result: Some(serde_json::to_value(vec![event.clone()]).unwrap()),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(app.offline.is_some());
+        assert!(app.topic.has_permission());
+        assert!(render(&mut app, 100, 40).contains("1. Allow once"));
+
+        app.key(key(KeyCode::Esc));
+        assert!(app.topic.has_permission(), "offline denial stays pending");
+        app.key(key(KeyCode::Char('1')));
+        assert!(app.topic.has_permission(), "offline decision stays pending");
+        assert!(!outbound.try_iter().any(|line| {
+            let envelope =
+                serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap();
+            matches!(envelope.request, Request::HarnessPermissionDecision { .. })
+        }));
+
+        send_wire(ServerMessage::Response {
+            id: session_id,
+            ok: true,
+            result: Some(reconnect_snapshot(false, vec![event.clone()])),
+            error: None,
+        });
+        app.drain_daemon();
+        assert!(
+            app.offline.is_none(),
+            "the authoritative snapshot completed"
+        );
+        assert!(app.topic.has_permission());
+        render(&mut app, 100, 40);
+
+        app.key(key(KeyCode::Char('1')));
+        assert!(!app.topic.has_permission());
+        assert!(outbound.try_iter().any(|line| {
+            let envelope =
+                serde_json::from_str::<formless_protocol::RequestEnvelope>(&line).unwrap();
+            matches!(
+                envelope.request,
+                Request::HarnessPermissionDecision {
+                    permission_id,
+                    option_id: Some(option_id),
+                } if permission_id == "permission-reconnect" && option_id == "allow"
+            )
+        }));
+    }
+
+    #[test]
+    fn matching_genuine_user_text_stays_raw_and_editable_and_forkable() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = workflow_kickoff_content();
+        let mut genuine = msg("user", &raw);
+        genuine.id = "genuine".into();
+        let mut app = test_app();
+        app.messages = vec![genuine.clone()];
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("You"), "{screen}");
+        assert!(screen.contains("Run each selected feature"), "{screen}");
+        assert!(
+            !screen.contains("Workflow kickoff for this topic."),
+            "{screen}"
+        );
+        app.call_focus = Some("msg:genuine".into());
+        assert!(app.focused_user_message().is_some());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**You:**\n\n{raw}")
+        );
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.editing_id.as_deref(), Some("genuine"));
+        assert_eq!(&*app.input, raw);
+
+        let mut fork_app = test_app();
+        fork_app.messages = vec![genuine];
+        fork_app.call_focus = Some("msg:genuine".into());
+        let (client, requests) = DaemonClient::recording();
+        fork_app.client = Some(client);
+        fork_app.key(key(KeyCode::Char('f')));
+        assert_eq!(fork_app.fork_prefill.as_deref(), Some(raw.as_str()));
+        assert!(requests.try_recv().is_ok());
     }
 
     #[test]
@@ -27616,6 +28871,200 @@ mod tests {
             render(&mut app, 100, 12);
             assert!(app.image_placed.is_empty());
         }
+    }
+
+    #[test]
+    fn kitty_thumbnails_are_cleared_while_permission_prompt_is_visible() {
+        let mut app = test_app();
+        app.image_proto = Some(images::Protocol::Kitty);
+        app.topic.push_permission(topic::HarnessPermission {
+            permission_id: "p1".into(),
+            session_id: "harness-session".into(),
+            topic_id: "t1".into(),
+            attempt_id: "a1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run a command".into(),
+            kind: "execute".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        });
+
+        let screen = render(&mut app, 30, 16);
+        assert!(screen.contains("1. Allow once"), "{screen}");
+        let thumbnail = images::Placed {
+            x: 4,
+            y: 5,
+            cols: 20,
+            path: "/missing/thumbnail.png".into(),
+        };
+        app.image_placed = vec![thumbnail.clone()];
+        app.painted_images = vec![thumbnail];
+
+        let mut output = Vec::new();
+        paint_inline_images(&mut app, &mut output, false);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(app.painted_images.is_empty());
+        assert!(app.kitty_images_suppressed);
+
+        let mut repeated = Vec::new();
+        paint_inline_images(&mut app, &mut repeated, false);
+        assert!(repeated.is_empty(), "don't resend deletes every frame");
+        assert_eq!(
+            app.topic
+                .key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            topic::Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: Some("allow".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn kitty_placements_follow_chat_after_permission_closes_over_settings() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let png = app.paths.data_dir.join("shot.png");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
+        app.image_proto = Some(images::Protocol::Kitty);
+        app.messages = vec![MessageInfo {
+            generated_by: None,
+            id: "u1".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "image".into(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"attachments": [{
+                    "name": "shot.png",
+                    "mime": "image/png",
+                    "path": png.to_string_lossy(),
+                }]})
+                .to_string(),
+            ),
+        }];
+
+        let chat = render(&mut app, 100, 40);
+        assert!(chat.contains("🖼 shot.png"), "{chat}");
+        assert_eq!(app.image_placed.len(), 1);
+        let placed = app.image_placed.clone();
+        let mut initial_paint = Vec::new();
+        paint_inline_images(&mut app, &mut initial_paint, true);
+        assert!(String::from_utf8(initial_paint)
+            .unwrap()
+            .contains("\x1b_Ga=T"));
+
+        app.topic.push_permission(topic::HarnessPermission {
+            permission_id: "p1".into(),
+            session_id: "harness-session".into(),
+            topic_id: "t1".into(),
+            attempt_id: "a1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run a command".into(),
+            kind: "execute".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        });
+        app.view = View::Settings;
+        let settings = render(&mut app, 100, 40);
+        assert!(settings.contains("1. Allow once"), "{settings}");
+        assert!(app.image_placed.is_empty());
+        let mut hidden = Vec::new();
+        paint_inline_images(&mut app, &mut hidden, false);
+        assert!(String::from_utf8(hidden)
+            .unwrap()
+            .contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(app.painted_images.is_empty());
+
+        assert_eq!(
+            app.topic
+                .key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            topic::Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: Some("allow".into()),
+            }
+        );
+        render(&mut app, 100, 40);
+        assert!(app.image_placed.is_empty());
+        let mut dismissed = Vec::new();
+        paint_inline_images(&mut app, &mut dismissed, true);
+        assert!(!String::from_utf8(dismissed).unwrap().contains("\x1b_Ga=T"));
+        assert!(app.painted_images.is_empty());
+
+        app.view = View::Chat;
+        let chat = render(&mut app, 100, 40);
+        assert!(chat.contains("🖼 shot.png"), "{chat}");
+        assert_eq!(app.image_placed, placed);
+        let mut restored = Vec::new();
+        paint_inline_images(&mut app, &mut restored, true);
+        assert!(String::from_utf8(restored).unwrap().contains("\x1b_Ga=T"));
+        assert_eq!(app.painted_images, placed);
+    }
+
+    #[test]
+    fn kitty_inline_images_are_suppressed_until_raw_pager_closes() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let png = app.paths.data_dir.join("pager-shot.png");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
+        app.image_proto = Some(images::Protocol::Kitty);
+        let mut image_message = msg("user", "image");
+        image_message.meta = Some(
+            serde_json::json!({"attachments": [{
+                "name": "pager-shot.png",
+                "mime": "image/png",
+                "path": png.to_string_lossy(),
+            }]})
+            .to_string(),
+        );
+        app.messages = vec![image_message];
+
+        render(&mut app, 100, 40);
+        let placed = app.image_placed.clone();
+        assert_eq!(placed.len(), 1);
+        let mut initial = Vec::new();
+        paint_inline_images(&mut app, &mut initial, true);
+        assert!(String::from_utf8(initial).unwrap().contains("\x1b_Ga=T"));
+
+        app.pager = Some(Pager {
+            title: "Workflow kickoff instructions".into(),
+            lines: vec!["raw instructions".into()],
+            top: 0,
+            left: 0,
+            viewport: Default::default(),
+            styled: Vec::new(),
+        });
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("Workflow kickoff instructions"), "{screen}");
+        assert_eq!(app.image_placed, placed);
+        let mut hidden = Vec::new();
+        paint_inline_images(&mut app, &mut hidden, true);
+        let hidden = String::from_utf8(hidden).unwrap();
+        assert!(hidden.contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(!hidden.contains("\x1b_Ga=T"));
+        assert!(app.painted_images.is_empty());
+
+        app.pager = None;
+        render(&mut app, 100, 40);
+        let mut restored = Vec::new();
+        paint_inline_images(&mut app, &mut restored, true);
+        assert!(String::from_utf8(restored).unwrap().contains("\x1b_Ga=T"));
+        assert_eq!(app.painted_images, placed);
     }
 
     #[test]
@@ -32664,7 +34113,7 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str(&line).unwrap())
             .collect();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         for request in requests {
             match request.request {
                 Request::Subscribe {
@@ -32676,6 +34125,7 @@ mod tests {
                     session_id: Some(id),
                     ..
                 } => assert_eq!(id, "source"),
+                Request::PendingApprovals => {}
                 other => panic!("switching must not commit, send or generate: {other:?}"),
             }
         }

@@ -1,8 +1,8 @@
 use super::*;
 use anyhow::{anyhow, bail, Context};
 use formless_protocol::{
-    HarnessKind, StepAccess, TopicArtifact, TopicAttemptStatus, TopicFeatureProposal,
-    TopicProposalRequest, WorkspaceKind,
+    HarnessKind, Question, QuestionAnswer, StepAccess, TopicArtifact, TopicAttemptStatus,
+    TopicFeatureProposal, TopicProposalRequest, WorkspaceKind,
 };
 use rusqlite::params;
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,54 @@ pub(crate) struct TopicSuggestionCandidate {
     pub workspace: Option<std::path::PathBuf>,
     pub workspace_kind: String,
     pub source_message_ids: HashSet<String>,
+}
+
+const TOPIC_GROUNDING_CONTEXT_MARKER: &str = "topic_grounding_context";
+const TOPIC_HUMAN_ANSWER_MARKER: &str = "topic_human_answer";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TopicHumanAnswerReceipt {
+    pub version: u8,
+    pub source_question_id: String,
+    pub topic_id: String,
+    pub feature_id: String,
+    pub attempt_id: String,
+    pub questions: Vec<Question>,
+    pub answers: Vec<QuestionAnswer>,
+    pub context_fingerprint: String,
+}
+
+fn topic_human_answer_receipt_content(receipt: &TopicHumanAnswerReceipt) -> Result<String> {
+    Ok(format!(
+        "Human answer for harness question {} (attempt {})\nQuestions: {}\nAnswers: {}",
+        receipt.source_question_id,
+        receipt.attempt_id,
+        serde_json::to_string(&receipt.questions)?,
+        serde_json::to_string(&receipt.answers)?
+    ))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ResolvedTopicAnswerEvidence {
+    pub message_id: String,
+    pub quote: String,
+    pub source: String,
+    pub topic_id: String,
+    pub feature_id: String,
+    pub attempt_id: String,
+    pub context_fingerprint: String,
+}
+
+#[derive(serde::Serialize)]
+struct TopicHumanContextEntry<'a> {
+    id: &'a str,
+    session_id: &'a str,
+    seq: i64,
+    role: &'a str,
+    content: &'a str,
+    meta: &'a Option<String>,
+    generated_by: &'a Option<String>,
 }
 
 impl Store {
@@ -151,6 +199,398 @@ impl Store {
         )?;
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn delete_topic_message_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_session_kind_for_test(&self, session_id: &str, kind: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET session_kind=?2 WHERE id=?1",
+            params![session_id, kind],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_topic_message_generated_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        generated_by: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET generated_by=?3 WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id, generated_by],
+        )?;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn set_topic_message_role_for_test(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        role: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET role=?3 WHERE session_id=?1 AND id=?2",
+            params![session_id, message_id, role],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn topic_grounding_context_messages(
+        &self,
+        topic_id: &str,
+        excluded_message_id: Option<&str>,
+    ) -> Result<Vec<MessageInfo>> {
+        if self.get_topic(topic_id)?.is_none() {
+            bail!("topic not found");
+        }
+        let sessions = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE ancestors(id,parent_topic_id,topic_session_id,source_session_id) AS (
+                   SELECT id,parent_topic_id,topic_session_id,source_session_id FROM topics WHERE id=?1
+                   UNION
+                   SELECT parent.id,parent.parent_topic_id,parent.topic_session_id,parent.source_session_id
+                   FROM topics parent JOIN ancestors child ON child.parent_topic_id=parent.id
+                 ), candidates(session_id) AS (
+                   SELECT topic_session_id FROM ancestors WHERE topic_session_id IS NOT NULL
+                   UNION SELECT source_session_id FROM ancestors
+                 )
+                 SELECT DISTINCT s.id FROM sessions s JOIN candidates c ON c.session_id=s.id
+                 WHERE s.deleted_at IS NULL AND s.session_kind IN ('main','topic','chat') ORDER BY s.id",
+            )?
+            .query_map([topic_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut messages = Vec::new();
+        for session_id in sessions {
+            messages.extend(
+                self.list_messages(&session_id)?
+                    .into_iter()
+                    .filter(|message| {
+                        message.id.as_str() != excluded_message_id.unwrap_or_default()
+                            && ((message.role == "user" && message.generated_by.is_none())
+                                || message.generated_by.as_deref()
+                                    == Some(TOPIC_HUMAN_ANSWER_MARKER))
+                    }),
+            );
+        }
+        messages.sort_by(|left, right| {
+            (&left.session_id, left.seq, &left.id).cmp(&(&right.session_id, right.seq, &right.id))
+        });
+        Ok(messages)
+    }
+    pub(crate) fn topic_grounding_context_fingerprint(
+        &self,
+        topic_id: &str,
+        excluded_message_id: Option<&str>,
+    ) -> Result<String> {
+        let messages = self.topic_grounding_context_messages(topic_id, excluded_message_id)?;
+        fingerprint_topic_human_context(&messages)
+    }
+    pub(crate) fn append_topic_human_answer_receipt(
+        &self,
+        topic_id: &str,
+        attempt_id: &str,
+        question_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+    ) -> Result<MessageInfo> {
+        let topic = self.get_topic(topic_id)?.context("topic not found")?;
+        let attempt = self
+            .get_topic_attempt(attempt_id)?
+            .context("harness attempt not found")?;
+        let session_id = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        if attempt.topic_id != topic_id {
+            bail!("harness attempt belongs to another topic");
+        }
+        let Some(feature) = topic
+            .features
+            .iter()
+            .find(|feature| feature.id == attempt.feature_id)
+        else {
+            bail!("harness attempt feature not found");
+        };
+        let context_fingerprint = self.topic_grounding_context_fingerprint(topic_id, None)?;
+        let receipt = TopicHumanAnswerReceipt {
+            version: 1,
+            source_question_id: question_id.into(),
+            topic_id: topic_id.into(),
+            feature_id: feature.id.clone(),
+            attempt_id: attempt_id.into(),
+            questions: questions.to_vec(),
+            answers: answers.to_vec(),
+            context_fingerprint,
+        };
+        let content = topic_human_answer_receipt_content(&receipt)?;
+        let meta = json!({"topic_human_answer": receipt}).to_string();
+        self.append_message_generated(
+            session_id,
+            "system-note",
+            &content,
+            Some(meta),
+            Some(TOPIC_HUMAN_ANSWER_MARKER),
+        )
+    }
+    pub(crate) fn resolve_topic_answer_evidence(
+        &self,
+        session_id: &str,
+        topic_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let topic = self.get_topic(topic_id)?.context("topic not found")?;
+        if topic.topic_session_id.as_deref() != Some(session_id) {
+            bail!("answer evidence must be resolved in this topic's canonical conversation");
+        }
+        let attempt = self
+            .get_topic_attempt(attempt_id)?
+            .context("harness attempt not found")?;
+        if attempt.topic_id != topic_id {
+            bail!("answer evidence is outside the pending attempt's topic");
+        }
+        let feature = topic
+            .features
+            .iter()
+            .find(|feature| feature.id == attempt.feature_id)
+            .context("pending attempt feature not found")?;
+        if evidence_message_id == feature.source_message_id {
+            return self.resolve_approved_request_evidence(
+                &topic,
+                &attempt.feature_id,
+                attempt_id,
+                questions,
+                answers,
+                evidence_message_id,
+                quote,
+            );
+        }
+        self.resolve_human_answer_evidence(
+            &topic,
+            &attempt.feature_id,
+            attempt_id,
+            questions,
+            answers,
+            evidence_message_id,
+            quote,
+        )
+    }
+    fn resolve_approved_request_evidence(
+        &self,
+        topic: &TopicInfo,
+        feature_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let topic_session = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        let snapshots = {
+            let mut statement = self.conn.prepare(
+                "SELECT message_id,source_content,source_content_hash,moved_at
+                 FROM topic_source_messages WHERE topic_id=?1 ORDER BY source_seq,message_id",
+            )?;
+            let rows = statement
+                .query_map([&topic.id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        if snapshots.is_empty() {
+            bail!("topic has no approved request snapshots");
+        }
+        let mut selected_content = None;
+        for (message_id, source_content, source_hash, moved_at) in &snapshots {
+            if moved_at.is_none() || hash_token(source_content) != *source_hash {
+                bail!("an approved request snapshot is missing or invalid; ask the user");
+            }
+            let live = self.get_message(topic_session, message_id)?.context(
+                "an approved request is missing from the topic conversation; ask the user",
+            )?;
+            if live.role != "user"
+                || live.generated_by.is_some()
+                || live.content != *source_content
+                || hash_token(&live.content) != *source_hash
+            {
+                bail!("an approved request changed or is not a live human message; ask the user");
+            }
+            if message_id == evidence_message_id {
+                selected_content = Some(source_content.as_str());
+            }
+        }
+        let source_content =
+            selected_content.context("evidence is not the active feature's approved request")?;
+        if snapshots.iter().any(|(message_id, content, _, _)| {
+            message_id != evidence_message_id && content != source_content
+        }) {
+            bail!("other approved requests make this choice ambiguous; ask the user");
+        }
+        if quote.trim() != source_content.trim() {
+            bail!("evidence quote must be the complete approved request");
+        }
+        let (stem, selected_label) = explicit_single_choice(questions, answers)?;
+        let options = questions[0]
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<HashSet<_>>();
+        let matching_labels = parse_choice_directives(source_content)
+            .into_iter()
+            .filter(|(source_stem, source_label)| {
+                source_stem == &stem && options.contains(source_label.as_str())
+            })
+            .map(|(_, source_label)| source_label)
+            .collect::<HashSet<_>>();
+        if matching_labels.len() != 1 {
+            bail!("approved request is not one unambiguous choice for this question; ask the user");
+        }
+        let source_label = matching_labels.into_iter().next().unwrap();
+        if source_label != selected_label {
+            bail!("selected answer does not match the approved request; ask the user");
+        }
+        let baseline = self.topic_approval_context_fingerprint(&topic.id, topic_session)?;
+        let current_messages = self.topic_grounding_context_messages(&topic.id, None)?;
+        let current = fingerprint_topic_human_context(&current_messages)?;
+        if current != baseline {
+            bail!("in-scope human context changed since topic approval; ask the user");
+        }
+        for message in &current_messages {
+            if message.id == evidence_message_id || !message.content.contains(&stem) {
+                continue;
+            }
+            let matching = parse_choice_directives(&message.content)
+                .into_iter()
+                .filter(|(other_stem, _)| other_stem == &stem)
+                .map(|(_, other_label)| other_label)
+                .collect::<HashSet<_>>();
+            if matching.len() != 1 || !matching.contains(&selected_label) {
+                bail!("surrounding human context makes this choice ambiguous; ask the user");
+            }
+        }
+        Ok(ResolvedTopicAnswerEvidence {
+            message_id: evidence_message_id.into(),
+            quote: quote.trim().into(),
+            source: "approved_request".into(),
+            topic_id: topic.id.clone(),
+            feature_id: feature_id.into(),
+            attempt_id: attempt_id.into(),
+            context_fingerprint: baseline,
+        })
+    }
+    fn resolve_human_answer_evidence(
+        &self,
+        topic: &TopicInfo,
+        feature_id: &str,
+        attempt_id: &str,
+        questions: &[Question],
+        answers: &[QuestionAnswer],
+        evidence_message_id: &str,
+        quote: &str,
+    ) -> Result<ResolvedTopicAnswerEvidence> {
+        let session_id = topic
+            .topic_session_id
+            .as_deref()
+            .context("topic has no canonical conversation")?;
+        let message = self
+            .get_message(session_id, evidence_message_id)?
+            .context("evidence is not a message in this topic conversation")?;
+        if message.role != "system-note"
+            || message.generated_by.as_deref() != Some(TOPIC_HUMAN_ANSWER_MARKER)
+            || quote.trim() != message.content.trim()
+        {
+            bail!("evidence is not a complete trusted human-answer receipt");
+        }
+        let metadata: serde_json::Value = serde_json::from_str(
+            message
+                .meta
+                .as_deref()
+                .context("human-answer receipt metadata is missing")?,
+        )?;
+        let receipt: TopicHumanAnswerReceipt =
+            serde_json::from_value(metadata["topic_human_answer"].clone())?;
+        if message.content != topic_human_answer_receipt_content(&receipt)? {
+            bail!("human-answer receipt content does not match its typed metadata");
+        }
+        if receipt.version != 1
+            || receipt.topic_id != topic.id
+            || receipt.feature_id != feature_id
+            || receipt.attempt_id != attempt_id
+            || receipt.questions != questions
+            || receipt.answers != answers
+        {
+            bail!("human answer does not match this attempt's exact question and answers");
+        }
+        let current =
+            self.topic_grounding_context_fingerprint(&topic.id, Some(evidence_message_id))?;
+        if current != receipt.context_fingerprint {
+            bail!("in-scope human context changed after this answer; ask the user");
+        }
+        Ok(ResolvedTopicAnswerEvidence {
+            message_id: evidence_message_id.into(),
+            quote: quote.trim().into(),
+            source: "human_answer".into(),
+            topic_id: topic.id.clone(),
+            feature_id: feature_id.into(),
+            attempt_id: attempt_id.into(),
+            context_fingerprint: current,
+        })
+    }
+    fn topic_approval_context_fingerprint(
+        &self,
+        topic_id: &str,
+        topic_session_id: &str,
+    ) -> Result<String> {
+        let receipts = self
+            .list_messages(topic_session_id)?
+            .into_iter()
+            .filter(|message| {
+                message.generated_by.as_deref() == Some(TOPIC_GROUNDING_CONTEXT_MARKER)
+            })
+            .collect::<Vec<_>>();
+        if receipts.len() != 1 || receipts[0].role != "system-note" {
+            bail!("approved human-context snapshot is unavailable; ask the user");
+        }
+        let meta: serde_json::Value = serde_json::from_str(
+            receipts[0]
+                .meta
+                .as_deref()
+                .context("approved human-context snapshot metadata is missing")?,
+        )?;
+        if meta["topic_grounding_context"]["version"] != 1
+            || meta["topic_grounding_context"]["topic_id"] != topic_id
+        {
+            bail!("approved human-context snapshot metadata is invalid; ask the user");
+        }
+        meta["topic_grounding_context"]["fingerprint"]
+            .as_str()
+            .map(str::to_owned)
+            .context("approved human-context fingerprint is missing")
+    }
+
     pub(crate) fn topic_for_session(&self, session: &str) -> Result<Option<TopicInfo>> {
         let id: Option<String> = self
             .conn
@@ -636,6 +1076,22 @@ impl Store {
             st.conn.execute(
                 "UPDATE topics SET topic_session_id=?2,status='approved',updated_at=?3 WHERE id=?1",
                 params![topic_id, session.id, timestamp],
+            )?;
+            let context_fingerprint = st.topic_grounding_context_fingerprint(topic_id, None)?;
+            let context_meta = json!({
+                "topic_grounding_context": {
+                    "version": 1,
+                    "topic_id": topic_id,
+                    "fingerprint": context_fingerprint,
+                }
+            })
+            .to_string();
+            st.append_message_generated(
+                &session.id,
+                "system-note",
+                "Approved requests recorded. You will be asked about choices they do not settle.",
+                Some(context_meta),
+                Some(TOPIC_GROUNDING_CONTEXT_MARKER),
             )?;
             let redirect = st.append_message(
                 &topic.source_session_id,
@@ -1201,6 +1657,151 @@ fn enum_text<T: serde::Serialize>(value: T) -> Result<String> {
 fn hash_token(token: &str) -> String {
     hash_bytes(token.as_bytes())
 }
+
+fn fingerprint_topic_human_context(messages: &[MessageInfo]) -> Result<String> {
+    let snapshot = messages
+        .iter()
+        .map(|message| TopicHumanContextEntry {
+            id: &message.id,
+            session_id: &message.session_id,
+            seq: message.seq,
+            role: &message.role,
+            content: &message.content,
+            meta: &message.meta,
+            generated_by: &message.generated_by,
+        })
+        .collect::<Vec<_>>();
+    Ok(hash_token(&serde_json::to_string(&snapshot)?))
+}
+
+fn explicit_single_choice(
+    questions: &[Question],
+    answers: &[QuestionAnswer],
+) -> Result<(String, String)> {
+    if questions.len() != 1 || answers.len() != 1 {
+        bail!("approved request evidence supports only one complete choice question");
+    }
+    let question = &questions[0];
+    let text = question.question.trim();
+    if question.header.is_some()
+        || question.multi_select
+        || text != question.question
+        || text.matches('?').count() != 1
+        || has_ambiguous_choice_clause(text)
+    {
+        bail!("question is not an exact single-choice form settled by a request directive");
+    }
+    let stem = text
+        .strip_suffix('?')
+        .filter(|stem| !stem.is_empty() && stem.trim() == *stem)
+        .context("question must end with one exact stem and a question mark")?;
+    if !is_choice_atom(stem) {
+        bail!("question stem must contain only letters, digits, spaces, hyphens, or underscores");
+    }
+    let mut labels = HashSet::new();
+    if question.options.is_empty()
+        || question.options.iter().any(|option| {
+            !is_choice_atom(&option.label)
+                || option.label.trim() != option.label
+                || option
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !description.trim().is_empty())
+                || !labels.insert(option.label.as_str())
+        })
+    {
+        bail!("question options must have unique, nonempty labels");
+    }
+    let answer = &answers[0];
+    if answer.selected.len() != 1
+        || answer
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || !labels.contains(answer.selected[0].as_str())
+    {
+        bail!("approved request evidence requires exactly one offered selection and no free text");
+    }
+    Ok((stem.to_owned(), answer.selected[0].clone()))
+}
+
+fn parse_choice_directives(content: &str) -> Vec<(String, String)> {
+    let content = content.trim();
+    if content.is_empty() || content.contains('\n') || content.contains('\r') {
+        return Vec::new();
+    }
+    let mut variants = vec![content];
+    if let Some(without_period) = content.strip_suffix('.') {
+        if !without_period.ends_with('.') {
+            variants.push(without_period);
+        }
+    }
+    let mut directives = Vec::new();
+    for variant in variants {
+        if variant.matches(':').count() != 1 {
+            continue;
+        }
+        let Some((stem, label)) = variant.split_once(": ") else {
+            continue;
+        };
+        if stem.is_empty()
+            || stem.trim() != stem
+            || !is_choice_atom(stem)
+            || label.is_empty()
+            || label.trim() != label
+            || !is_choice_atom(label)
+            || has_ambiguous_choice_clause(stem)
+            || has_ambiguous_choice_clause(label)
+        {
+            continue;
+        }
+        let directive = (stem.to_owned(), label.to_owned());
+        if !directives.contains(&directive) {
+            directives.push(directive);
+        }
+    }
+    directives
+}
+
+fn is_choice_atom(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+}
+
+fn has_ambiguous_choice_clause(text: &str) -> bool {
+    text.split(|character: char| !character.is_alphanumeric())
+        .any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "not"
+                    | "no"
+                    | "nor"
+                    | "never"
+                    | "without"
+                    | "if"
+                    | "when"
+                    | "unless"
+                    | "until"
+                    | "provided"
+                    | "assuming"
+                    | "or"
+                    | "and"
+                    | "but"
+                    | "except"
+                    | "otherwise"
+                    | "instead"
+                    | "maybe"
+                    | "perhaps"
+                    | "might"
+                    | "could"
+                    | "possibly"
+                    | "probably"
+            )
+        })
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
