@@ -25777,6 +25777,9 @@ mod tests {
             session_id: "s1".into(),
             run_id: "r1".into(),
         });
+        let mut assistant = msg("assistant", "The run is waiting for your answer.");
+        assistant.id = "assistant".into();
+        app.messages = vec![assistant];
         app.call_focus = Some("msg:assistant".into());
         app.on_event(Event::UserQuestion {
             user_only: false,
