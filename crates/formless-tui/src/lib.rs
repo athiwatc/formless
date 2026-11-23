@@ -12344,6 +12344,7 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.image_placed.clear();
     draw_app_frame(f, app);
     // Permission keys are handled before every view, so the prompt is drawn
     // over every view, including ones that return early.
@@ -27871,6 +27872,95 @@ mod tests {
                 option_id: Some("allow".into()),
             }
         );
+    }
+
+    #[test]
+    fn kitty_placements_follow_chat_after_permission_closes_over_settings() {
+        let mut app = test_app();
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let png = app.paths.data_dir.join("shot.png");
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
+        app.image_proto = Some(images::Protocol::Kitty);
+        app.messages = vec![MessageInfo {
+            generated_by: None,
+            id: "u1".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: "user".into(),
+            content: "image".into(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"attachments": [{
+                    "name": "shot.png",
+                    "mime": "image/png",
+                    "path": png.to_string_lossy(),
+                }]})
+                .to_string(),
+            ),
+        }];
+
+        let chat = render(&mut app, 100, 40);
+        assert!(chat.contains("🖼 shot.png"), "{chat}");
+        assert_eq!(app.image_placed.len(), 1);
+        let placed = app.image_placed.clone();
+        let mut initial_paint = Vec::new();
+        paint_inline_images(&mut app, &mut initial_paint, true);
+        assert!(String::from_utf8(initial_paint)
+            .unwrap()
+            .contains("\x1b_Ga=T"));
+
+        app.topic.push_permission(topic::HarnessPermission {
+            permission_id: "p1".into(),
+            session_id: "harness-session".into(),
+            topic_id: "t1".into(),
+            attempt_id: "a1".into(),
+            harness: HarnessKind::Claude,
+            acp_agent: None,
+            title: "Run a command".into(),
+            kind: "execute".into(),
+            raw_input: None,
+            options: vec![HarnessPermissionOption {
+                option_id: "allow".into(),
+                name: "Allow once".into(),
+                kind: HarnessPermissionOptionKind::AllowOnce,
+            }],
+        });
+        app.view = View::Settings;
+        let settings = render(&mut app, 100, 40);
+        assert!(settings.contains("1. Allow once"), "{settings}");
+        assert!(app.image_placed.is_empty());
+        let mut hidden = Vec::new();
+        paint_inline_images(&mut app, &mut hidden, false);
+        assert!(String::from_utf8(hidden)
+            .unwrap()
+            .contains("\x1b_Ga=d,d=a,q=2\x1b\\"));
+        assert!(app.painted_images.is_empty());
+
+        assert_eq!(
+            app.topic
+                .key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            topic::Action::PermissionDecision {
+                permission_id: "p1".into(),
+                option_id: Some("allow".into()),
+            }
+        );
+        render(&mut app, 100, 40);
+        assert!(app.image_placed.is_empty());
+        let mut dismissed = Vec::new();
+        paint_inline_images(&mut app, &mut dismissed, true);
+        assert!(!String::from_utf8(dismissed).unwrap().contains("\x1b_Ga=T"));
+        assert!(app.painted_images.is_empty());
+
+        app.view = View::Chat;
+        let chat = render(&mut app, 100, 40);
+        assert!(chat.contains("🖼 shot.png"), "{chat}");
+        assert_eq!(app.image_placed, placed);
+        let mut restored = Vec::new();
+        paint_inline_images(&mut app, &mut restored, true);
+        assert!(String::from_utf8(restored).unwrap().contains("\x1b_Ga=T"));
+        assert_eq!(app.painted_images, placed);
     }
 
     #[test]
