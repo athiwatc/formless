@@ -689,7 +689,7 @@ async fn topic_async_wait_concurrent_completions_empty_errors_and_cancel() {
 }
 
 #[tokio::test]
-async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_permission() {
+async fn topic_async_wait_surfaces_live_question_human_answer_and_informational_permission() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.set("TOPIC_FIXTURE_MODE", "question");
     let f = Fixture::new(&env);
@@ -728,7 +728,18 @@ async fn topic_async_wait_surfaces_live_question_model_answer_and_informational_
     assert_eq!(question["event"], "question");
     assert_eq!(question["user_only"], false);
     assert_eq!(f.daemon().topic_steps.locked().len(), 1);
-    let answered=f.daemon().answer_topic_question_tool(&session,&json!({"question_id":question["question_id"],"answers":[{"selected":["Yes"]}],"basis":"The user's moved request says: Account for X and Y."})).unwrap();
+    let answered = f
+        .daemon()
+        .handle(Request::AnswerQuestion {
+            question_id: question["question_id"].as_str().unwrap().into(),
+            answer: "Yes".into(),
+            answers: vec![QuestionAnswer {
+                selected: vec!["Yes".into()],
+                text: None,
+            }],
+        })
+        .await
+        .unwrap();
     assert_eq!(answered["answered"], true);
     assert_eq!(
         f.daemon()

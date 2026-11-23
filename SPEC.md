@@ -1006,8 +1006,9 @@ Chat defaults under that topic; a proposal from Main defaults directly under
 Main. Attempt sessions and nested agents do not get suggestion tools.
 Topic Chat suggestions see the current topic, its ancestors and descendants,
 unless the user enables external context. Main sees the whole tree. The
-Topic Chat assistant may answer a harness question only with a basis in a user
-request or decision, and never answers user-only questions or permissions.
+Topic Chat assistant may answer a harness question only with verified exact
+evidence from an approved request or typed same-attempt human answer receipt;
+it never answers user-only questions or permissions.
 Approval, rejection, cancellation, permission rules, limits and external
 context access are user actions, not assistant tools.
 Suggesting or declining never moves a message or starts a
@@ -7155,10 +7156,42 @@ persisted. Adapters consume the adapter-agnostic local_harness InteractionHandle
 permission/question/update hooks; updates append structured canonical messages.
 
 The topic orchestrator may answer a pending harness question using
-`topic_answer_question {question_id, answers, basis}`. The nonempty basis quotes
-or references the user's settling message/decision. Every model answer is
-visible in Topic Chat with the harness, attempt, questions, answers and basis.
-User-only questions cannot be answered by this tool. First answer wins.
+`topic_answer_question {question_id, answers, basis, evidence:{message_id,quote}}`.
+The nonempty `basis` is explanatory only; authority comes from storage-verified
+evidence and an exact whole-message quote. Deterministic request grounding is
+limited to one non-multi-select question ending in `?`, with a stem and unique,
+nonempty offered labels containing only ASCII letters, digits, spaces, hyphens,
+or underscores, and no nonempty option descriptions. The approved original
+request must contain only `<same case-sensitive stem>: <one offered label>`;
+the source may have one terminal period, but punctuation or quotes are not
+allowed within either atom. The complete quote must match the approved source snapshot;
+the exact feature source must still be live, ungenerated and moved into this
+topic. Distinct approved source requests, conflicting or ambiguous context,
+changed human context, paraphrases, conditional/prose requests, multiple
+questions and free-text/multi-select choices remain pending for the user. The
+narrow form rejects conditional, negation and conjunction tokens, as well as
+`maybe`, `perhaps`, `might`, `could`, `possibly` and `probably`, in either
+atom. These deterministic token and character checks are conservative syntax
+filters, not semantic interpretation.
+
+A second deterministic path accepts a `topic_human_answer` receipt only for
+the same attempt and feature when the full question list (including headers,
+options and multi-select flags) and normalized answers exactly match. Receipts
+are appended as visible system notes only after a successful explicit user
+answer to a pending harness question; they are not created for permissions or
+user-only decisions. Both paths reject changed/deleted evidence and newer
+in-scope human messages or answer receipts. Topic approval records a generated
+`topic_grounding_context` fingerprint over canonical human messages in the
+topic and ancestor contexts; attempt transcripts and generated nonhuman
+messages are excluded, and external-context permission does not expand evidence
+scope. Old topics without this approval receipt cannot use original-request
+grounding. This is deterministic identity and explicit-choice matching, not
+general NLP semantic proof; when the form does not settle the choice, the model
+must leave the existing harness question pending for direct user response and
+must not issue a duplicate `ask_user` prompt. Every model answer is visible in Topic
+Chat with the harness, attempt, questions, answers, basis, resolved source ID,
+quote and scope. User-only questions cannot be answered by this tool. First
+answer wins.
 UserQuestionClosed.answered_by is "user" or "model" for delivered answers and
 absent/null for cancellation or expiry.
 
@@ -7172,6 +7205,12 @@ Attempt instruction messages are inserted with
 generated_by="topic_attempt_instructions" without changing the exact prompt
 sent to the harness. This marker applies only to new messages; historical null
 values remain unknown and are not backfilled.
+
+Topic approval records a generated `topic_grounding_context` system-note with
+a fingerprint of the in-scope canonical human context. Successful explicit
+human answers to pending harness questions create visible `topic_human_answer`
+system-note receipts containing the exact question, normalized answer, scope
+and context fingerprint. Neither marker is inferred or backfilled for history.
 
 Pending harness permissions and user-only questions also send a best-effort
 desktop notification through spawn_blocking. Notifications include the topic

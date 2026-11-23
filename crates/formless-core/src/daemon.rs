@@ -4211,6 +4211,30 @@ impl Daemon {
                 if self.topic_decisions.locked().contains_key(&question_id) {
                     return self.answer_topic_decision(&question_id, &answer, &answers);
                 }
+                let pending_event = self
+                    .pending_attention
+                    .locked()
+                    .iter()
+                    .find(|event| {
+                        matches!(event, Event::UserQuestion { question_id: id, .. } if id == &question_id)
+                    })
+                    .cloned();
+                let topic_answer_context = pending_event
+                    .as_ref()
+                    .and_then(|event| self.topic_human_answer_context(&question_id, event));
+                if let Some(context) = topic_answer_context {
+                    let receipt =
+                        self.answer_topic_human_question(context, &question_id, &answer, answers)?;
+                    let answered = receipt.is_some();
+                    if let Some(message) = receipt {
+                        self.broadcast(Event::MessageAppended {
+                            session_id: message.session_id.clone(),
+                            message,
+                        });
+                    }
+                    self.remove_attention(&question_id);
+                    return Ok(json!({"answered": answered}));
+                }
                 // First answer wins; the others find it gone.
                 let answered = {
                     let mut waiters = self.questions.locked();
