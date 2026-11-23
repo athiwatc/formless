@@ -466,6 +466,44 @@ test('proposal request binds selected messages and workflow without moving or st
   assert.deepEqual(calls, [{ type: 'propose_topic', proposal: { source_session_id: 'main', message_ids: ['x'], name: 'Accounts', parent_topic_id: null, workspace: null, outline: [] } }]);
 });
 
+test('proposal picker excludes every generated marker and defaults to an actual user request after retries', async () => {
+  for (const selectedId of [undefined, 'retry']) {
+    const fields = new Map();
+    let request;
+    const c = setup(['proposeTopic', 'recordValue', 'harnessLabel', 'topicPath', 'topicOutlineEditor'], {
+      currentTopicAttempt: () => null, prefs: { get: () => ({}), set() {} },
+      h: (...args) => { const n = element(...args); if (n.props?.['aria-label']) fields.set(n.props['aria-label'], n); return n; },
+      ask: async opts => {
+        const choices = descendants(opts.body).filter(n => n.props?.type === 'checkbox');
+        assert.equal(choices.length, 1);
+        assert.equal(choices[0].props.checked, true);
+        const picker = descendants(opts.body).find(n => n.tag === 'fieldset');
+        assert.doesNotMatch(JSON.stringify(picker), /internal kickoff|internal retry|future generated/);
+        fields.get('Topic name').value = 'Original request';
+        request = json(opts.saveRequest());
+        return false;
+      } });
+    c.S.messages = [
+      { id: 'x', role: 'user', generated_by: null, content: 'User request' },
+      { id: 'kickoff', role: 'user', generated_by: 'topic_kickoff', content: 'internal kickoff' },
+      { id: 'retry', role: 'user', generated_by: 'topic_kickoff', content: 'internal retry' },
+      { id: 'future', role: 'user', generated_by: '', content: 'future generated' },
+    ];
+    await c.proposeTopic(selectedId);
+    assert.deepEqual(request.proposal.message_ids, ['x']);
+  }
+});
+
+test('generated-only conversations cannot create a topic proposal', async () => {
+  const notices = [];
+  const c = setup(['proposeTopic'], {
+    currentTopicAttempt: () => null, toast: notice => notices.push(notice),
+    ask: () => assert.fail('generated prompts must not open the picker') });
+  c.S.messages = [{ id: 'kickoff', role: 'user', generated_by: 'topic_kickoff', content: 'internal kickoff' }];
+  await c.proposeTopic();
+  assert.equal(notices.length, 1);
+});
+
 test('existing topic chats surface proposals and preview independent features from one source message', () => {
   let nodes;
   const c = setup(['topicForSession', 'currentTopicAttempt', 'topicStatusLabel', 'harnessLabel', 'topicBadge', 'topicWorkflowLabel', 'topicPath', 'topicArtifacts', 'renderTopicContext'], {

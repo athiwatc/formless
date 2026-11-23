@@ -2177,7 +2177,7 @@
     if (!S.topicsAvailable || !S.current || currentTopicAttempt()) return;
     if (S.sessionLoad?.status !== "loaded" || S.sessionLoad.id !== S.current) return toast("Wait for this conversation to load first.", true);
     const source = S.current, channel = S.channel;
-    const messages = S.messages.filter(message => message.role === "user" && message.content?.trim());
+    const messages = S.messages.filter(message => message.role === "user" && message.generated_by == null && message.content?.trim());
     if (!messages.length) return toast("Send your requests in this chat first, then move them to a topic.", true);
     const defaults = prefs.get("topicWorkflowV2", {}) || {};
     const field = (label, input) => h("label", { class: "topic-form-field" }, h("span", null, label), input);
@@ -2189,7 +2189,7 @@
       S.topics.filter(item => !["pending_approval", "rejected"].includes(item.status)).map(item => h("option", { value: item.id }, topicPath(item))));
     parent.value = sourceTopic?.id || "";
     const outline = topicOutlineEditor(defaults.outline || []);
-    const selected = new Set([selectedMessageId || messages[messages.length - 1].id]);
+    const selected = new Set([messages.some(message => message.id === selectedMessageId) ? selectedMessageId : messages[messages.length - 1].id]);
     const body = h("div", { class: "topic-proposal-form" }, field("Topic name", name), field("Parent topic", parent), field("Workspace (optional)", workspace),
       h("fieldset", { class: "topic-request-picker" }, h("legend", null, "Requests to move · one work item per message"), messages.map(message =>
         h("label", null, h("input", { type: "checkbox", checked: selected.has(message.id), onchange: event => {
@@ -4002,7 +4002,7 @@
       node = h("div", { class: "msg", "data-message-id": m.id });
       rendered.set(m.id, node);
     }
-    const signature = [m.role, m.content, m.meta, m.seq, m.role === "user" ? sentElsewhere(m) : null];
+    const signature = [m.role, m.generated_by, m.content, m.meta, m.seq, m.role === "user" && m.generated_by == null ? sentElsewhere(m) : null];
     const changed = !node.messageSignature || signature.some((part, i) => part !== node.messageSignature[i]);
     node.currentMessage = m;
     if (changed) {
@@ -4056,11 +4056,11 @@
       const f = c.function || {};
       items.push(item("Copy " + (f.name || "tool") + " input", () => copy(f.arguments || "", "the input")));
     }
-    if (m.role === "user" && S.topicsAvailable && !currentTopicAttempt()) {
+    if (m.role === "user" && m.generated_by == null && S.topicsAvailable && !currentTopicAttempt()) {
       items.push(item("Move to topic…", () => proposeTopic(m.id)));
     }
-    if (m.role === "user" && !isRunning() && !currentTopicAttempt()) {
-      const last = [...S.messages].reverse().find((x) => x.role === "user") === m;
+    if (m.role === "user" && m.generated_by == null && !isRunning() && !currentTopicAttempt()) {
+      const last = [...S.messages].reverse().find((x) => x.role === "user" && x.generated_by == null) === m;
       items.push(item(last ? "Edit & re-run" : "Edit & re-run (drops the later turns)", () => beginEdit(m)));
     }
     if (!currentTopicAttempt()) items.push(item("Fork from here", async () => {
@@ -4143,7 +4143,7 @@
         if (!historyRender.banner) historyRender.banner = h("div", { class: "banner" }, "The daemon is offline. Start formless on your machine; this page reconnects automatically.");
         wanted.push(historyRender.banner);
       }
-      const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
+      const lastUser = [...S.messages].reverse().find((m) => m.role === "user" && m.generated_by == null);
       const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
       const active = new Set(), messageIds = new Set();
       // Recompute the display context on normal renders, including local
@@ -4189,7 +4189,7 @@
       for (const m of S.messages) {
         currentMessage = m;
         messageIds.add(m.id);
-        if (m.role === "user") {
+        if (m.role === "user" && m.generated_by == null) {
           // Each user message starts a fresh turn so its Edit button is exact.
           group = null;
           const from = sentElsewhere(m);
@@ -8226,7 +8226,7 @@
   }
 
   function beginEdit(msg) {
-    if (S.topicsAvailable && currentTopicAttempt()) return;
+    if (msg.generated_by != null || (S.topicsAvailable && currentTopicAttempt())) return;
     S.editMessageId = msg.id;
     $("input").value = msg.content;
     autosize();
@@ -8303,7 +8303,7 @@
     { name: "fork", group: "Session", desc: "fork the current Session", run: () => forkSession(S.current) },
     { name: "search", args: "[QUERY]", group: "Session", desc: "search all Sessions", run: (arg) => { setView("chat"); openSidebar(); $("search").value = arg; return arg ? search(arg) : $("search").focus(); } },
     { name: "edit", group: "Session", desc: "edit your last message and retry from there", run: () => {
-      const m = [...S.messages].reverse().find((x) => x.role === "user");
+      const m = [...S.messages].reverse().find((x) => x.role === "user" && x.generated_by == null);
       return m ? beginEdit(m) : toast("No user message to edit.", true);
     } },
     { name: "usage", group: "Session", desc: "tokens and cost of this Session", run: async () => {
