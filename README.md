@@ -64,16 +64,9 @@ Formless uses each harness's official local interface and gives it a private,
 per-step MCP bridge back to the topic. Install and sign in to a harness the
 usual way; Formless does not ship or log in to them for you.
 
-| Harness | Integration |
-|---|---|
-| Claude Code | official non-interactive CLI |
-| Codex | official non-interactive CLI |
-| Pi | Pi CLI with a Formless extension |
-| OpenCode | `opencode acp` |
-| Antigravity | `agy acp` |
-| Grok Build | `grok agent stdio` (ACP) |
-| Muse Code | `muse serve` |
-| ACP agents | any agent with an official ACP server, e.g. Gemini CLI, GitHub Copilot, Cursor, Goose, Kiro |
+Current topic-step adapters are Claude Code and Codex, using their official
+non-interactive CLIs. Pi, OpenCode, Antigravity, Grok Build, Muse Code and
+additional ACP agents are still in progress.
 
 Any harness can take any step, including the same harness on both sides of a
 hand-off. A harness's own permission modes are not an OS sandbox; the isolated
