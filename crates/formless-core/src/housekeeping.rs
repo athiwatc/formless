@@ -966,6 +966,35 @@ mod tests {
 
     #[test]
     fn restore_retention_is_seven_and_independent_of_daily_backups_and_gc() {
+        // A parallel sibling can fork while restore holds its launcher lock;
+        // CLOEXEC closes the inherited descriptor at exec, not at fork. Run
+        // this fixture in a single-test child after exec to avoid contention.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "housekeeping::tests::restore_retention_child_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated restore retention fixture failed: {}\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for the restore retention test"]
+    fn restore_retention_child_fixture() {
+        restore_retention_assertions();
+    }
+
+    fn restore_retention_assertions() {
         let (fixture, paths) = Fixture::new();
         let current = Store::open(&paths.db_file()).unwrap();
         current.create_session(Some("original".into())).unwrap();
