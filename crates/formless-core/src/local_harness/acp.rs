@@ -616,14 +616,21 @@ fn find_executable_with_platform(
         .cloned()
         .or_else(|| std::env::var_os("PATH"))?;
     let suffixes: Vec<_> = if windows {
-        let extensions = environment
-            .get(OsStr::new("PATHEXT"))
-            .cloned()
-            .or_else(|| std::env::var_os("PATHEXT"))
-            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-        std::iter::once(String::new())
-            .chain(extensions.to_string_lossy().split(';').map(str::to_owned))
-            .collect()
+        if Path::new(program).extension().is_some() {
+            vec![String::new()]
+        } else {
+            let extensions = environment
+                .get(OsStr::new("PATHEXT"))
+                .cloned()
+                .or_else(|| std::env::var_os("PATHEXT"))
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            extensions
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }
     } else {
         vec![String::new()]
     };
@@ -1311,7 +1318,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn agent_launch_resolves_windows_pathext_shims_and_preserves_override() {
+    fn windows_pathext_skips_extensionless_shims_and_preserves_precedence_and_override() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -1319,18 +1326,29 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ));
-        std::fs::create_dir_all(&root).unwrap();
-        let shim = root.join("gemini.CMD");
-        std::fs::write(&shim, "fixture").unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let extensionless = first.join("gemini");
+        std::fs::write(&extensionless, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&extensionless, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cmd_shim = first.join("gemini.CMD");
+        std::fs::write(&cmd_shim, "fixture").unwrap();
+        std::fs::set_permissions(&cmd_shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exe = second.join("gemini.EXE");
+        std::fs::write(&exe, "fixture").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let mut request = request(StepAccess::Write);
         request.environment.insert(
             "PATH".into(),
-            std::env::join_paths([root.as_os_str()]).unwrap(),
+            std::env::join_paths([first.as_os_str(), second.as_os_str()]).unwrap(),
         );
-        request.environment.insert("PATHEXT".into(), ".CMD".into());
-        let expected = std::path::absolute(&shim).unwrap();
+        request
+            .environment
+            .insert("PATHEXT".into(), ".EXE;.CMD".into());
+        let expected = std::path::absolute(&cmd_shim).unwrap();
         let process_environment = BTreeMap::new();
         assert_eq!(
             find_executable_with_platform("gemini", &request.environment, true),
