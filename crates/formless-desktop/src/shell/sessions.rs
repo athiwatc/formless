@@ -77,6 +77,29 @@ impl Shell {
             panel.slash_prefill = Some((field, text));
         }
     }
+
+    fn session_edit_display_value(&self, cx: &App) -> String {
+        let Some(panel) = &self.session_editor else {
+            return String::new();
+        };
+        // A newly discovered attempt may already have an ordinary editor draft.
+        // Inspection must show/copy the persisted value, not that old draft.
+        if self.topic_ui.state.attempt_for(&panel.id).is_some()
+            || matches!(panel.field, Field::Pin | Field::Archive)
+        {
+            panel
+                .metadata
+                .as_ref()
+                .map(|m| panel.field.value(m))
+                .unwrap_or_default()
+        } else {
+            panel
+                .input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+        }
+    }
     pub(super) fn retire_session_editor_attachment(
         &mut self,
         instance: uuid::Uuid,
@@ -196,7 +219,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.session_editor.is_some() || !self.client_connected {
+        if self.session_editor.is_some()
+            || !self.client_connected
+            || !self.topic_session_inspect_allowed()
+            || (!matches!(start, SessionEditorStart::Details) && !self.topic_session_edit_allowed())
+        {
             return;
         }
         if self.destination == Destination::Sessions
@@ -436,6 +463,16 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .session_editor
+            .as_ref()
+            .is_some_and(|panel| !self.topic_session_mutation_allowed(&panel.id))
+        {
+            self.session_editor.as_mut().unwrap().notice =
+                "Session settings are read only; no change was sent.".into();
+            cx.notify();
+            return;
+        }
         if let Some(client) = &self.client {
             client.cancel_unsent_reference();
         }
@@ -534,6 +571,7 @@ impl Shell {
         {
             return;
         }
+        let can_mutate = self.topic_session_mutation_allowed(id);
         let Some(panel) = &mut self.session_editor else {
             return;
         };
@@ -560,7 +598,7 @@ impl Shell {
                         Arguments::Pin => Field::Pin,
                         _ => Field::Name,
                     };
-                    if !text.is_empty() {
+                    if can_mutate && !text.is_empty() {
                         match field {
                             Arguments::Name => panel.name = text,
                             Arguments::Tags => {
@@ -1046,7 +1084,9 @@ impl Shell {
         let viewport = window.viewport_size();
         let margin = px(16.);
         let busy = panel.waiting.is_some();
+        let read_only = !self.topic_session_mutation_allowed(&panel.id);
         let ready = self.client_connected
+            && !read_only
             && !busy
             && !panel.retired
             && panel.metadata.is_some()
@@ -1068,7 +1108,7 @@ impl Shell {
         let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
             .when(panel.files_first, |body| body.child(self.render_pending_files(cx)))
-            .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."));
+            .child(readable("session-edit-help",if read_only {"This Session is read only. Inspect or export its persisted history; Session settings cannot be changed here."} else {"Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."}));
         let mut tabs = h_flex().flex_wrap().gap_2();
         for (index, field) in [
             (0, Field::Name),
@@ -1154,7 +1194,17 @@ impl Shell {
                         .test_support()
                         .pt_1()
                         .anchor_scroll(Some(panel.input_anchor.clone()))
-                        .child(Textarea::new(input).aria_label("Session standing instructions")),
+                        .child(if read_only {
+                            readable(
+                                "session-edit-read-only-value",
+                                self.session_edit_display_value(cx),
+                            )
+                            .into_any_element()
+                        } else {
+                            Textarea::new(input)
+                                .aria_label("Session standing instructions")
+                                .into_any_element()
+                        }),
                 );
             }
         } else if panel.field == Field::Pin {
@@ -1191,7 +1241,15 @@ impl Shell {
                         .test_support()
                         .pt_1()
                         .anchor_scroll(Some(panel.input_anchor.clone()))
-                        .child(Textarea::new(input).aria_label(aria)),
+                        .child(if read_only {
+                            readable(
+                                "session-edit-read-only-value",
+                                self.session_edit_display_value(cx),
+                            )
+                            .into_any_element()
+                        } else {
+                            Textarea::new(input).aria_label(aria).into_any_element()
+                        }),
                 );
         }
         body = body
@@ -1206,7 +1264,7 @@ impl Shell {
                             .anchor_scroll(Some(panel.controls[5].1.clone()))
                             .child(
                                 Button::new("session-edit-copy")
-                                    .label("Copy edit")
+                                    .label(if read_only { "Copy value" } else { "Copy edit" })
                                     .disabled(
                                         panel.field == Field::Instructions && panel.input.is_none(),
                                     )
@@ -1218,22 +1276,7 @@ impl Shell {
                                             {
                                                 return;
                                             }
-                                            let text = if matches!(
-                                                panel.field,
-                                                Field::Pin | Field::Archive
-                                            ) {
-                                                panel
-                                                    .metadata
-                                                    .as_ref()
-                                                    .map(|metadata| panel.field.value(metadata))
-                                                    .unwrap_or_default()
-                                            } else {
-                                                panel
-                                                    .input
-                                                    .as_ref()
-                                                    .map(|input| input.read(cx).value().to_string())
-                                                    .unwrap_or_default()
-                                            };
+                                            let text = this.session_edit_display_value(cx);
                                             cx.write_to_clipboard(ClipboardItem::new_string(text));
                                         }
                                     })),
