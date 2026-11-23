@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -12,6 +13,15 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 GUIDES = ("docs/usage.md", "docs/cli.md", "docs/architecture.md")
+REQUIRED_ARCHIVE_FILES = {
+    "docs/usage.md",
+    "docs/cli.md",
+    "docs/architecture.md",
+    "GLOSSARY.md",
+    "packaging/README.md",
+    "relay/README.md",
+    "crates/formless-desktop/README.md",
+}
 
 
 def relative_file_links(source):
@@ -35,6 +45,14 @@ def relative_file_links(source):
 
 
 class ReleaseDocArchive(unittest.TestCase):
+    def archive_members(self, names, root_name):
+        prefix = f"{root_name}/"
+        return {
+            name[len(prefix):] if name.startswith(prefix) else name
+            for name in (name.replace("\\", "/") for name in names)
+            if name and not name.endswith("/")
+        }
+
     def stage_reference_docs(self, destination):
         if os.name == "nt":
             script = r'''
@@ -84,10 +102,9 @@ cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
                     resolved = (source.parent / target).resolve()
                     self.assertTrue(resolved.is_file(), f"{source.relative_to(package)} -> {target}")
 
-    def test_tar_and_zip_layout_keeps_readme_link_targets(self):
-        required = {"docs/usage.md", "docs/cli.md", "docs/architecture.md",
-                    "GLOSSARY.md", "packaging/README.md", "relay/README.md",
-                    "crates/formless-desktop/README.md"}
+    def test_linux_python_tar_and_zip_fixtures_keep_readme_link_targets(self):
+        if not sys.platform.startswith("linux"):
+            self.skipTest("Python-created archives are Linux layout fixtures, not native packaging")
         with tempfile.TemporaryDirectory(prefix="release archive ") as directory:
             root = Path(directory)
             package = root / "formless-test"
@@ -100,14 +117,36 @@ cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
                 for source in package.rglob("*"):
                     if source.is_file():
                         archive.write(source, Path(package.name) / source.relative_to(package))
-            for archive_path, open_archive, members in (
-                (tar_path, tarfile.open, lambda archive: {Path(member.name).relative_to(package.name).as_posix()
-                                                          for member in archive.getmembers() if member.isfile()}),
-                (zip_path, zipfile.ZipFile, lambda archive: {Path(name).relative_to(package.name).as_posix()
-                                                            for name in archive.namelist()}),
-            ):
-                with open_archive(archive_path) as archive:
-                    self.assertTrue(required.issubset(members(archive)), str(archive_path))
+            with tarfile.open(tar_path) as archive:
+                members = self.archive_members(
+                    [member.name for member in archive.getmembers() if member.isfile()], package.name
+                )
+                self.assertTrue(REQUIRED_ARCHIVE_FILES.issubset(members), str(tar_path))
+            with zipfile.ZipFile(zip_path) as archive:
+                members = self.archive_members(archive.namelist(), package.name)
+                self.assertTrue(REQUIRED_ARCHIVE_FILES.issubset(members), str(zip_path))
+
+    def test_windows_powershell_zip_keeps_readme_link_targets(self):
+        if os.name != "nt":
+            self.skipTest("native PowerShell ZIP packaging is Windows-only")
+        with tempfile.TemporaryDirectory(prefix="release archive ") as directory:
+            package = Path(directory) / "formless-test"
+            self.stage_reference_docs(package)
+            zip_path = Path(f"{package}.zip")
+            script = r'''
+$name = $env:FORMLESS_RELEASE_TEST_PACKAGE
+Compress-Archive -Path $name -DestinationPath "$name.zip"
+'''
+            subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+                cwd=ROOT,
+                env={**os.environ, "FORMLESS_RELEASE_TEST_PACKAGE": str(package)},
+                check=True,
+                timeout=30,
+            )
+            with zipfile.ZipFile(zip_path) as archive:
+                members = self.archive_members(archive.namelist(), package.name)
+                self.assertTrue(REQUIRED_ARCHIVE_FILES.issubset(members), str(zip_path))
 
     def test_each_archive_workflow_stages_the_same_reference_layout(self):
         for workflow_name in ("release.yml", "release-baseline.yml"):
@@ -129,6 +168,12 @@ cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
                     'Copy-Item crates/formless-desktop/README.md "$name/crates/formless-desktop"',
                 ):
                     self.assertEqual(workflow.count(command), 1, command)
+                compress_command = (
+                    'Compress-Archive -Path $name -DestinationPath "$name.zip"'
+                    if workflow_name == "release.yml"
+                    else 'Compress-Archive -Path $name -DestinationPath "dist/$name.zip"'
+                )
+                self.assertEqual(workflow.count(compress_command), 1, compress_command)
 
 
 if __name__ == "__main__":
