@@ -7142,6 +7142,11 @@ in NeedsUser and resume them when answered, without reviving terminal work.
 HarnessPermissionRequested/Closed and the user-only HarnessPermissionDecision
 request handle permissions. Only offered option IDs are accepted; None rejects.
 PendingApprovals and subscription attention replay include open permissions.
+In flattened ServerMessage::Event messages, HarnessPermissionRequested
+serializes its permission kind as `permission_kind` to avoid the outer `kind`
+discriminator. Nested PendingApprovals event lists retain `kind` for older
+clients, and readers accept either name. Old full envelopes with duplicate
+`kind` keys remain ambiguous to JSON clients.
 No model tool or scoped MCP operation can decide a permission. Cancellation,
 attempt termination, shutdown and dropped interaction futures close undecided
 requests as rejected. AllowAlways/RejectAlways decisions are held only in daemon
