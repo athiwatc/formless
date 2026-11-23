@@ -7808,7 +7808,7 @@
     } },
     { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: gallery, capabilities, approvals, keys, troubleshooting", run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
-      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", docker: "docs/docker.md", mcp: "docs/mcp.md", skills: "docs/skills.md", jobs: "docs/jobs.md", spec: "SPEC.md" };
+      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", docker: "docs/docker.md", mcp: "docs/mcp.md", skills: "docs/skills.md", jobs: "docs/jobs.md", spec: "SPEC.md", usage: "docs/usage.md", cli: "docs/cli.md", architecture: "docs/architecture.md" };
       const t = (arg || "").trim().toLowerCase();
       const key = !t ? "gallery" : Object.keys(topics).find((k) => k === t) || Object.keys(topics).find((k) => k.startsWith(t));
       if (!key) return note("docs topics: " + Object.keys(topics).join(", "), true);

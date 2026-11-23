@@ -33,6 +33,22 @@ fn every_topic_has_build_matched_bundled_content_including_docker() {
 }
 
 #[test]
+fn extracted_guides_have_named_bundled_topics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (name, path) in [
+        ("usage", "docs/usage.md"),
+        ("cli", "docs/cli.md"),
+        ("architecture", "docs/architecture.md"),
+    ] {
+        assert!(TOPICS.iter().any(|(topic, _, _)| *topic == name), "{name}");
+        assert_eq!(
+            text(Some(name)).unwrap(),
+            std::fs::read_to_string(root.join(path)).unwrap()
+        );
+    }
+}
+
+#[test]
 fn sections_follow_parsed_heading_structure_and_original_utf8_offsets() {
     let source="# Intro\n```md\n## Target guide\n```\n\n## Target [guide](relative.md)\nไทย body\n### Child\ncontent\n> # quoted example\n\n    # indented example\n\n## Next\nother\n";
     let expected="## Target [guide](relative.md)\nไทย body\n### Child\ncontent\n> # quoted example\n\n    # indented example\n\n";

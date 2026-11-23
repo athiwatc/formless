@@ -100,6 +100,12 @@ jobs:
             mkdir "$name" dist
             cp "target/$TARGET/release/formless" "$name/"
             cp README.md SPEC.md LICENSE "$name/"
+            mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
+            cp GLOSSARY.md "$name/"
+            cp -R docs "$name/"
+            cp packaging/*.md "$name/packaging/"
+            cp relay/*.md "$name/relay/"
+            cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
             "target/$TARGET/release/formless" man > "$name/formless.1" \
               || cargo run -q --release --locked --bin formless -- man > "$name/formless.1"
             tar -czf "dist/$name.tar.gz" "$name"
@@ -122,6 +128,12 @@ jobs:
             New-Item -ItemType Directory $name,dist | Out-Null
             Copy-Item "target/$env:TARGET/release/formless.exe" $name
             Copy-Item README.md,SPEC.md,LICENSE $name
+            New-Item -ItemType Directory -Path "$name/packaging","$name/relay","$name/crates/formless-desktop" -Force | Out-Null
+            Copy-Item GLOSSARY.md "$name"
+            Copy-Item -Path docs -Destination "$name" -Recurse
+            Copy-Item -Path packaging/*.md -Destination "$name/packaging"
+            Copy-Item -Path relay/*.md -Destination "$name/relay"
+            Copy-Item crates/formless-desktop/README.md "$name/crates/formless-desktop"
             Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
             $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
             "$hash  $name.zip" | Out-File "dist/$name.zip.sha256" -Encoding ascii
@@ -220,6 +232,12 @@ jobs:
             name="formless-baseline-x86_64-unknown-linux-gnu"
             mkdir -p dist "$name"
             cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
+            mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
+            cp GLOSSARY.md "$name/"
+            cp -R docs "$name/"
+            cp packaging/*.md "$name/packaging/"
+            cp relay/*.md "$name/relay/"
+            cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
             tar -czf "dist/$name.tar.gz" "$name"
           }
       - name: Install package-building tools into private Cargo home
