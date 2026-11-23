@@ -7063,7 +7063,7 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi, OpenCode, Antigravity, ACP and Muse currently return
+another harness. OpenCode, Antigravity, ACP and Muse currently return
 actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
