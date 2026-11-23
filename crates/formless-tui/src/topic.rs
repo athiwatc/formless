@@ -518,6 +518,7 @@ impl ProposalForm {
                 KeyCode::Esc => Action::Close,
                 KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.step = ProposalStep::Messages;
+                    self.scroll = 0;
                     Action::None
                 }
                 KeyCode::Backspace => {
@@ -2699,6 +2700,23 @@ mod tests {
             .join("\n")
     }
 
+    fn proposal_screen(state: &State, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| state.draw_proposal(frame, frame.area(), false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn proposal_defaults_latest_request_and_contains_only_explicit_selections() {
         let source = session("main");
@@ -2748,6 +2766,54 @@ mod tests {
         assert_eq!(form.step, ProposalStep::Messages);
         assert_eq!(form.name.expanded(), "Keep this name");
         assert_eq!(form.selected, HashSet::from(["u1".into()]));
+    }
+
+    #[test]
+    fn returning_to_requests_resets_review_scroll_after_deselecting_long_request() {
+        let source = session("main");
+        let long_request = "Long request detail.\n".repeat(80);
+        let messages = [
+            message("short", 1, "user", "Short request"),
+            message("long", 2, "user", &long_request),
+        ];
+        let mut form = ProposalForm::new(&source, &messages, "/repo", "Work", vec![], None);
+        form.name.set("Topic");
+        form.step = ProposalStep::Review;
+        for _ in 0..20 {
+            form.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(form.scroll > 0);
+
+        form.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(form.step, ProposalStep::Messages);
+        assert_eq!(form.scroll, 0);
+        form.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        form.field_index = form.field_count() - 1;
+        form.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(form.step, ProposalStep::Review);
+        assert_eq!(form.request().unwrap().message_ids, ["short"]);
+
+        let mut state = State::default();
+        state.proposal = Some(form);
+        let screen = proposal_screen(&state, 80, 20);
+        assert!(
+            screen.contains("Review before creating the proposal"),
+            "{screen}"
+        );
+        assert!(screen.contains("Short request"), "{screen}");
+        assert!(!screen.contains("Long request detail"), "{screen}");
+        let action = state
+            .proposal
+            .as_mut()
+            .unwrap()
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Action::Propose(request) = action else {
+            panic!("expected proposal action");
+        };
+        assert_eq!(request.message_ids, ["short"]);
     }
 
     #[test]
