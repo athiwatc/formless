@@ -11693,10 +11693,12 @@ impl App {
             .find(|m| m.id == id && m.role == "user" && m.generated_by.is_none())
     }
 
-    fn focused_workflow_kickoff(&self) -> Option<&MessageInfo> {
+    fn focused_topic_instructions(&self) -> Option<&MessageInfo> {
         let id = self.call_focus.as_deref()?.strip_prefix("msg:")?;
         self.messages.iter().find(|m| {
-            m.id == id && m.role == "user" && m.generated_by.as_deref() == Some("topic_kickoff")
+            m.id == id
+                && m.role == "user"
+                && generated_topic_instructions(m.generated_by.as_deref()).is_some()
         })
     }
 
@@ -11723,11 +11725,13 @@ impl App {
             } else {
                 m.content.clone()
             };
-            let what = match (m.role.as_str(), m.generated_by.as_deref()) {
-                ("user", Some("topic_kickoff")) => "the workflow kickoff",
-                ("user", Some(_)) => "the generated message",
-                ("user", None) => "your message",
-                _ => "the answer",
+            let what = if m.role == "user" {
+                generated_topic_instructions(m.generated_by.as_deref())
+                    .map(|instructions| instructions.copy_label)
+                    .or_else(|| m.generated_by.is_some().then_some("the generated message"))
+                    .unwrap_or("your message")
+            } else {
+                "the answer"
             };
             return Some((text, what.into()));
         }
@@ -11856,7 +11860,7 @@ impl App {
     }
 
     /// Chat focus (SPEC §10.2): `[`/`]` on an empty input move it; Enter
-    /// toggles a call or opens kickoff instructions, and Esc leaves focus.
+    /// toggles a call or opens generated topic instructions, and Esc leaves focus.
     fn call_focus_key(&mut self, key: &KeyEvent) -> bool {
         if key.code == KeyCode::Esc
             && self.call_focus.is_some()
@@ -11891,13 +11895,17 @@ impl App {
             KeyCode::Enter => {
                 let id = self.call_focus.clone().unwrap();
                 if id.starts_with("msg:") {
-                    if let Some(content) = self
-                        .focused_workflow_kickoff()
-                        .map(|message| message.content.clone())
-                    {
+                    if let Some((content, title)) = self.focused_topic_instructions().map(|m| {
+                        (
+                            m.content.clone(),
+                            generated_topic_instructions(m.generated_by.as_deref())
+                                .expect("focused topic instructions have a display")
+                                .pager_title,
+                        )
+                    }) {
                         self.reviewing = None;
                         self.pager = Some(Pager {
-                            title: "Workflow kickoff instructions".into(),
+                            title: title.into(),
                             lines: content
                                 .split('\n')
                                 .map(text::escape_terminal_line)
@@ -15069,13 +15077,45 @@ fn others_text(others: &[AttachedClient]) -> String {
         .join(", ")
 }
 
+#[derive(Clone, Copy)]
+struct GeneratedTopicInstructions {
+    summary: &'static str,
+    pager_title: &'static str,
+    attribution: &'static str,
+    copy_label: &'static str,
+}
+
+fn generated_topic_instructions(marker: Option<&str>) -> Option<GeneratedTopicInstructions> {
+    match marker {
+        Some("topic_kickoff") => Some(GeneratedTopicInstructions {
+            summary: "Workflow kickoff for this topic.",
+            pager_title: "Workflow kickoff instructions",
+            attribution: "Formless · workflow kickoff",
+            copy_label: "the workflow kickoff",
+        }),
+        Some("topic_attempt_instructions") => Some(GeneratedTopicInstructions {
+            summary: "Instructions for this topic attempt.",
+            pager_title: "Topic attempt instructions",
+            attribution: "Formless · topic attempt instructions",
+            copy_label: "the topic attempt instructions",
+        }),
+        _ => None,
+    }
+}
+
 fn message_attribution(role: &str, generated_by: Option<&str>) -> (&'static str, &'static str) {
-    match (role, generated_by) {
-        ("user", Some("topic_kickoff")) => ("Formless · workflow kickoff", "assistant"),
-        ("user", Some(_)) => ("Formless · generated", "assistant"),
-        ("user", None) => ("You", "user"),
-        ("system-note", _) => ("System", "system-note"),
-        _ => ("Formless", "assistant"),
+    if role == "user" {
+        if let Some(instructions) = generated_topic_instructions(generated_by) {
+            (instructions.attribution, "assistant")
+        } else if generated_by.is_some() {
+            ("Formless · generated", "assistant")
+        } else {
+            ("You", "user")
+        }
+    } else if role == "system-note" {
+        ("System", "system-note")
+    } else {
+        ("Formless", "assistant")
     }
 }
 
@@ -16688,11 +16728,11 @@ fn welcome_lines(color: bool, height: usize) -> Vec<Line<'static>> {
 }
 
 /// The keys for a focused message, under it.
-fn focus_hint(color: bool, user: bool, workflow_kickoff: bool) -> Line<'static> {
+fn focus_hint(color: bool, user: bool, generated_instructions: bool) -> Line<'static> {
     Line::styled(
         if user {
             "  ▲ e edit & re-run from here · f fork from here · c copy · C Markdown · [ ] move · Esc"
-        } else if workflow_kickoff {
+        } else if generated_instructions {
             "  ▲ Enter view raw instructions · c copy · C copy as Markdown · [ ] move · Esc"
         } else {
             "  ▲ c copy · C copy as Markdown · [ ] move · Esc"
@@ -17033,9 +17073,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 if focused {
                     focus_line = Some(lines.len());
                 }
-                let workflow_kickoff = m.generated_by.as_deref() == Some("topic_kickoff");
-                if workflow_kickoff {
-                    lines.push(mention_line("Workflow kickoff for this topic.", app.color));
+                if let Some(instructions) = generated_topic_instructions(m.generated_by.as_deref())
+                {
+                    lines.push(mention_line(instructions.summary, app.color));
                     if !focused && app.current_question().is_none() {
                         lines.push(Line::styled(
                             "  [ ] select · Enter view raw instructions",
@@ -17073,7 +17113,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                     lines.push(focus_hint(
                         app.color,
                         m.generated_by.is_none(),
-                        workflow_kickoff,
+                        generated_topic_instructions(m.generated_by.as_deref()).is_some(),
                     ));
                 }
             }
@@ -27408,6 +27448,113 @@ mod tests {
 
         let pager = app.pager.as_ref().expect("empty kickoff instruction pager");
         assert_eq!(pager.title, "Workflow kickoff instructions");
+        assert_eq!(pager.lines, [""]);
+        assert!(app.messages[0].content.is_empty());
+    }
+
+    #[test]
+    fn generated_topic_attempt_instructions_are_summarized_and_open_raw() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let raw = "Topic: Checkout\nFeature: inspect safely\nAccess: ReadOnly\nUse scoped Formless MCP for questions.";
+        let mut generated = msg("user", raw);
+        generated.id = "generated-attempt".into();
+        generated.generated_by = Some("topic_attempt_instructions".into());
+        let mut app = test_app();
+        app.messages = vec![generated];
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Formless · topic attempt instructions"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        assert!(!screen.contains("Topic: Checkout"), "{screen}");
+        assert!(app.focus_items().contains(&"msg:generated-attempt".into()));
+
+        app.call_focus = Some("msg:generated-attempt".into());
+        let focused = render(&mut app, 120, 30);
+        assert!(focused.contains("Enter view raw instructions"), "{focused}");
+        assert!(focused.contains("C copy as Markdown"), "{focused}");
+        assert!(!focused.contains("e edit & re-run"), "{focused}");
+        assert!(!focused.contains("f fork from here"), "{focused}");
+        assert!(app.focused_user_message().is_none());
+        assert_eq!(
+            app.focused_text(true).unwrap().0,
+            format!("**Formless · topic attempt instructions:**\n\n{raw}")
+        );
+
+        let (client, requests) = DaemonClient::recording();
+        app.client = Some(client);
+        app.key(key(KeyCode::Char('e')));
+        assert!(app.editing_id.is_none() && app.input.is_empty());
+        app.key(key(KeyCode::Char('f')));
+        assert!(app.fork_prefill.is_none());
+        assert!(requests.try_recv().is_err());
+        app.key(key(KeyCode::Enter));
+
+        let pager = app.pager.as_ref().expect("attempt instruction pager");
+        assert_eq!(pager.title, "Topic attempt instructions");
+        assert_eq!(
+            pager.lines,
+            raw.split('\n')
+                .map(text::escape_terminal_line)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.messages[0].content, raw);
+
+        let mut genuine = msg("user", raw);
+        genuine.id = "genuine-identical".into();
+        let mut genuine_app = test_app();
+        genuine_app.messages = vec![genuine.clone()];
+        let screen = render(&mut genuine_app, 120, 30);
+        assert!(screen.contains("You"), "{screen}");
+        assert!(screen.contains("Topic: Checkout"), "{screen}");
+        assert!(
+            !screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        genuine_app.call_focus = Some("msg:genuine-identical".into());
+        assert_eq!(genuine_app.focused_user_message().unwrap().id, genuine.id);
+        assert_eq!(
+            genuine_app.focused_text(true).unwrap().0,
+            format!("**You:**\n\n{raw}")
+        );
+
+        let mut edit_app = test_app();
+        edit_app.messages = vec![genuine.clone()];
+        edit_app.call_focus = Some("msg:genuine-identical".into());
+        edit_app.key(key(KeyCode::Char('e')));
+        assert_eq!(edit_app.editing_id.as_deref(), Some("genuine-identical"));
+
+        let mut fork_app = test_app();
+        fork_app.current = Some("s1".into());
+        fork_app.messages = vec![genuine];
+        fork_app.call_focus = Some("msg:genuine-identical".into());
+        fork_app.key(key(KeyCode::Char('f')));
+        assert_eq!(fork_app.fork_prefill.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn empty_topic_attempt_instructions_open_an_empty_raw_pager() {
+        let mut instructions = msg("user", "");
+        instructions.id = "empty-attempt".into();
+        instructions.generated_by = Some("topic_attempt_instructions".into());
+        let mut app = test_app();
+        app.messages = vec![instructions];
+        app.call_focus = Some("msg:empty-attempt".into());
+
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Instructions for this topic attempt."),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let pager = app.pager.as_ref().expect("empty attempt instruction pager");
+        assert_eq!(pager.title, "Topic attempt instructions");
         assert_eq!(pager.lines, [""]);
         assert!(app.messages[0].content.is_empty());
     }
