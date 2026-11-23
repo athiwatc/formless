@@ -66,14 +66,14 @@ pub fn availability(
     environment: &BTreeMap<OsString, OsString>,
 ) -> HarnessAvailability {
     let probe = acp::probe(&SPEC, executable.clone(), environment);
-    let signed_in = probe
-        .compatible
+    let installed = probe.installed && probe.compatible;
+    let signed_in = installed
         .then(|| models_signed_in(executable, environment))
         .flatten();
     HarnessAvailability {
         kind: HarnessKind::Antigravity,
         acp_agent: None,
-        installed: probe.installed,
+        installed,
         signed_in,
         version: probe.version,
         detail: probe
@@ -406,6 +406,81 @@ sleep 5
         ffi::OsString,
         path::{Path, PathBuf},
     };
+
+    #[cfg(unix)]
+    fn fake_agy(dir: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let agy = dir.join("agy");
+        std::fs::write(&agy, script).unwrap();
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o700)).unwrap();
+        agy
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_incompatible_agent_is_unavailable_before_models() {
+        let dir = std::env::temp_dir().join(format!(
+            "formless-agy-incompatible-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agy = fake_agy(
+            &dir,
+            r#"#!/bin/sh
+if [ "$1" = models ]; then
+  : > "$AGY_TEST_MODELS_MARKER"
+  exit 0
+fi
+read line
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"}}}'
+sleep 5
+"#,
+        );
+        let models_marker = dir.join("models-called");
+        let environment = BTreeMap::from([(
+            OsString::from("AGY_TEST_MODELS_MARKER"),
+            models_marker.as_os_str().to_owned(),
+        )]);
+
+        let availability = super::availability(Some(agy), &environment);
+
+        assert!(!availability.installed);
+        assert_eq!(availability.signed_in, None);
+        assert!(availability
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("does not speak ACP v1")));
+        assert!(!models_marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_compatible_agent_with_unknown_auth_remains_available() {
+        let dir = std::env::temp_dir().join(format!(
+            "formless-agy-unknown-auth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let agy = fake_agy(
+            &dir,
+            r#"#!/bin/sh
+if [ "$1" = models ]; then
+  echo "network unreachable" >&2
+  exit 1
+fi
+read line
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"Antigravity ACP Server","version":"1.5.14"}}}'
+sleep 5
+"#,
+        );
+
+        let availability = super::availability(Some(agy), &BTreeMap::new());
+
+        assert!(availability.installed);
+        assert_eq!(availability.signed_in, None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     // Excerpt from https://antigravity.google/docs/cli/headless/ JSON output example.
     const OFFICIAL_DOCS_JSON_ENVELOPE: &str = r#"{

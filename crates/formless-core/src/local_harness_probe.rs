@@ -85,6 +85,12 @@ fn kind_name(kind: HarnessKind) -> &'static str {
         HarnessKind::Muse => "muse",
     }
 }
+fn executable_name(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Antigravity => "agy",
+        _ => kind_name(kind),
+    }
+}
 fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
     let override_key = format!(
         "FORMLESS_TOPIC_{}_EXE",
@@ -102,7 +108,7 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
         if !directory.is_absolute() {
             continue;
         }
-        let candidate = directory.join(kind_name(kind));
+        let candidate = directory.join(executable_name(kind));
         if executable_file(&candidate) {
             return Some(candidate);
         }
@@ -353,7 +359,7 @@ async fn probe_environment(
         } else {
             format!(
                 "CLI executable not found; install {} or configure FORMLESS_TOPIC_{}_EXE",
-                kind_name(kind),
+                executable_name(kind),
                 kind_name(kind).to_ascii_uppercase()
             )
         });
