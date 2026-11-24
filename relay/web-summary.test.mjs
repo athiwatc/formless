@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
+const styles = readFileSync(new URL('./web/app.css', import.meta.url), 'utf8');
 function fn(name) {
   const start = source.indexOf('  function ' + name + '(');
   assert.ok(start >= 0, name);
@@ -107,6 +108,12 @@ test('tool call summary exposes the tool name as content rather than a generic s
   assert.equal(name.attrs['aria-label'], undefined);
   assert.equal(accessibleText(name), 'read_file');
   assert.ok(accessibleText(summary).startsWith('read_file'));
+});
+test('tool result summaries wrap long labels on narrow widths', () => {
+  assert.match(styles, /\.chip\.result > summary \{ flex-wrap: wrap; \}/);
+  assert.match(styles, /\.chip\.result > summary::before \{ flex: 0 0 1em; \}/);
+  assert.match(styles, /\.chip\.result > summary \.tname \{ min-width: 0; max-width: calc\(100% - 1em - 0\.5rem\); white-space: normal; overflow-wrap: anywhere; \}/);
+  assert.match(styles, /\.chip\.result > summary \.targs \{ flex: 1 1 auto; max-width: 100%; \}/);
 });
 test('approval expiration shows whole hours and remaining minutes without rounding up', () => {
   const now = Date.parse('2026-11-20T04:00:00Z');
