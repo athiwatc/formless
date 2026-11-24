@@ -34,6 +34,42 @@ fn find_tools_call(body: &Value, query: &str) -> bool {
     }) && body["messages"].to_string().contains(query)
 }
 
+fn assert_invalid_json_tool_feedback(body: &Value, case: &str) {
+    let message = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .expect("invalid arguments are returned as tool-role feedback");
+    let contains_text = |expected: &str| {
+        let mut pending = message["content"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect::<Vec<_>>();
+        while let Some(content) = pending.pop() {
+            if content.contains(expected) {
+                return true;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&content) {
+                for key in ["content", "error", "message", "note"] {
+                    if let Some(inner) = value[key].as_str() {
+                        pending.push(inner.to_owned());
+                    }
+                }
+            }
+        }
+        false
+    };
+    assert!(
+        contains_text("invalid JSON arguments for find_tools")
+            && contains_text("Retry with valid JSON."),
+        "{case} error was not fed back in the last tool message: {}",
+        serde_json::to_string_pretty(message).unwrap()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
     let mut scenario = Scenario::new(0).await;
@@ -162,12 +198,10 @@ async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments(
     malformed.malformed_tool_call("find_tools", "{");
 
     let correction = scenario.next_call().await;
-    assert!(correction.body["messages"]
-        .to_string()
-        .contains("find_tools"));
-    assert!(correction.body["messages"].to_string().contains("JSON"));
+    assert_invalid_json_tool_feedback(&correction.body, "malformed argument");
     correction.truncated_tool_call("find_tools", "{\"query\":");
     let repair = scenario.next_call().await;
+    assert_invalid_json_tool_feedback(&repair.body, "truncated argument");
     repair.tool_call(
         "find_tools",
         json!({"query":"no matching offline scenario Tool"}),
