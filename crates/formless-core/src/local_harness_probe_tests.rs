@@ -300,14 +300,24 @@ printf '%s\n' "$ACP_SESSION"
     assert!(result.installed);
     assert_eq!(result.signed_in, Some(false));
     assert_eq!(result.version.as_deref(), Some("0.70.0"));
-    assert_eq!(
-        result.detail.as_deref(),
-        Some(
-            super::super::acp_agents::spec("gemini")
-                .unwrap()
-                .not_signed_in
-        )
+    let detail = result.detail.as_deref().unwrap();
+    assert!(detail.contains(
+        super::super::acp_agents::spec("gemini")
+            .unwrap()
+            .not_signed_in
+    ));
+    assert!(
+        detail.contains("ACP readiness reported authentication required (JSON-RPC error -32000)")
     );
+    assert!(detail.contains("Formless did not perform ACP authentication"));
+    assert!(detail.contains("this readiness result is not launchable"));
+    assert!(detail.contains("Advertised ACP authentication methods"));
+    for method in captured["gemini"]["initialize"]["result"]["authMethods"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(detail.contains(method["id"].as_str().unwrap()));
+    }
 
     let result = dispatch(HarnessKind::Acp, &ctx, None).await;
     assert!(!result.installed);

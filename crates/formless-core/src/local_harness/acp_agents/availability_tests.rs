@@ -43,7 +43,16 @@ while IFS= read -r request; do
             response=$PROBE_INITIALIZE ;;
         *'"method":"session/new"'*)
             method=session/new
-            case "$request" in *'"cwd":"'"$PWD"'"'*) ;; *) exit 1 ;; esac
+            case "$request" in
+                *'"cwd":"'*)
+                    request_cwd=${request#*'"cwd":"'}
+                    request_cwd=${request_cwd%%'"'*} ;;
+                *) exit 1 ;;
+            esac
+            [ -n "$request_cwd" ] || exit 1
+            request_physical=$(CDPATH= cd "$request_cwd" && pwd -P)
+            current_physical=$(pwd -P)
+            [ "$request_physical" = "$current_physical" ] || exit 1
             case "$request" in *'"mcpServers":[]'*) ;; *) exit 1 ;; esac
             response=$PROBE_SESSION ;;
         *) exit 1 ;;
@@ -110,6 +119,21 @@ done
         self.environment
             .insert("PROBE_SESSION".into(), value.to_string().into());
     }
+}
+
+#[test]
+fn selected_executable_path_is_retained_as_argv0_without_spawning() {
+    let root = ProbeDir::new().unwrap();
+    let target = root.0.join("native-target");
+    let selected = root.0.join("gemini");
+    fs::write(&target, b"not executed").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&target, &selected).unwrap();
+
+    let (canonical, argv0) = resolve_executable_identity(selected.clone()).unwrap();
+
+    assert_eq!(canonical, fs::canonicalize(target).unwrap());
+    assert_eq!(argv0, selected.as_os_str());
 }
 
 #[test]
