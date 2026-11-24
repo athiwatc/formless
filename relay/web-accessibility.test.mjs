@@ -358,7 +358,7 @@ test('pointer-transparent toast hover pauses timers and removes listeners on eve
   c.toast('Persistent error', true);
   const error = root.children.at(-1);
   assert.equal(listenerCount(document) + listenerCount(window), 0, 'persistent errors need no timer pointer listeners');
-  error.children[1].children[1].props.onclick();
+  error.children[1].children[0].props.onclick();
   assert.equal(listenerCount(document) + listenerCount(window), 0, 'dismiss removes the error toast');
 
   c.toast('Hover pause', false, { ms: 1000 });
