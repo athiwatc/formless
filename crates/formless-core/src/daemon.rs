@@ -4005,13 +4005,22 @@ impl Daemon {
                     .collect();
                 let sessions = self.with_reader(|st| st.list_sessions())?;
                 let recent = recent_session_models(&sessions);
-                for model in models.iter().chain(&recent) {
-                    let model_meta = meta
-                        .entry(model.clone())
-                        .or_insert_with(|| crate::provider::known_model_meta(model));
-                    if let Some(override_cfg) = cfg.provider.model_meta.get(model) {
-                        crate::provider::apply_model_meta_override(model_meta, override_cfg);
+                for model in models
+                    .iter()
+                    .chain(&recent)
+                    .chain(cfg.provider.aliases.keys())
+                    .chain(cfg.provider.model_meta.keys())
+                {
+                    let resolved = cfg.provider.resolve_alias(model);
+                    let mut model_meta = meta
+                        .get(&resolved)
+                        .or_else(|| meta.get(model))
+                        .cloned()
+                        .unwrap_or_else(|| crate::provider::known_model_meta(&resolved));
+                    if let Some(override_cfg) = cfg.provider.model_meta.get(&resolved) {
+                        crate::provider::apply_model_meta_override(&mut model_meta, override_cfg);
                     }
+                    meta.insert(model.clone(), model_meta);
                 }
                 Ok(json!({
                     "models": models,

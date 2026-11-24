@@ -62,6 +62,22 @@ async fn list_models_returns_provider_models_roles_and_recent() {
             efforts: Some(vec!["ultra".into()]),
         },
     );
+    cfg.provider.aliases.insert("gpt5-custom".into(), "openai/gpt-5-mini".into());
+    cfg.provider.model_meta.insert(
+        "openai/gpt-5-mini".into(),
+        ModelMetaCfg {
+            vision: Some(false),
+            ..Default::default()
+        },
+    );
+    cfg.provider.model_meta.insert(
+        "unused-custom".into(),
+        ModelMetaCfg {
+            vision: Some(true),
+            tools: Some(false),
+            efforts: Some(vec!["xhigh".into()]),
+        },
+    );
     cfg.naming.enabled = false;
     cfg.roles.insert(
         "explorer".into(),
@@ -95,6 +111,7 @@ async fn list_models_returns_provider_models_roles_and_recent() {
     );
     assert_eq!(r["roles"][0]["name"], "explorer");
     assert_eq!(r["roles"][0]["model"], "small");
+    assert_eq!(r["aliases"]["gpt5-custom"], "openai/gpt-5-mini");
     assert_eq!(
         r["recent"],
         serde_json::json!(["my-gemini-embed", "openai/gpt-4o"])
@@ -111,9 +128,31 @@ async fn list_models_returns_provider_models_roles_and_recent() {
         serde_json::json!(["vision", "tools", "efforts"])
     );
     assert_eq!(r["meta"]["openai/gpt-5-mini"]["source"], "mixed");
+    assert_eq!(r["meta"]["openai/gpt-5-mini"]["vision"], false);
+    assert_eq!(
+        r["meta"]["openai/gpt-5-mini"]["overridden"],
+        serde_json::json!(["vision"])
+    );
     assert_eq!(
         r["meta"]["openai/gpt-5-mini"]["efforts"],
         serde_json::json!(["minimal", "low", "medium", "high"])
+    );
+    assert_eq!(r["meta"]["gpt5-custom"]["vision"], false);
+    assert_eq!(r["meta"]["gpt5-custom"]["source"], "mixed");
+    assert_eq!(
+        r["meta"]["gpt5-custom"]["overridden"],
+        serde_json::json!(["vision"])
+    );
+    assert_eq!(r["meta"]["unused-custom"]["vision"], true);
+    assert_eq!(r["meta"]["unused-custom"]["tools"], false);
+    assert_eq!(
+        r["meta"]["unused-custom"]["efforts"],
+        serde_json::json!(["xhigh"])
+    );
+    assert!(r["meta"]["unused-custom"].get("source").is_none());
+    assert_eq!(
+        r["meta"]["unused-custom"]["overridden"],
+        serde_json::json!(["vision", "tools", "efforts"])
     );
     assert_eq!(r["meta"]["my-gemini-embed"]["vision"], true);
     assert_eq!(r["meta"]["my-gemini-embed"]["tools"], false);
