@@ -167,7 +167,11 @@ async fn review_comment_steering_uses_context_sequence_and_refuses_closing_run()
             cache.build(st, &s.session, "private prompt", 100_000, 0.8)?;
             Ok((
                 cache.last_included_seq(),
-                cache.included_steer_message_ids().to_vec(),
+                crate::storage::steer_message_ids_for_run(
+                    cache.included_steer_candidates(),
+                    &active,
+                    None,
+                ),
             ))
         })
         .unwrap();

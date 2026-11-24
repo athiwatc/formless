@@ -802,7 +802,7 @@ struct RunAdmission {
             Vec<Value>,
             String,
             Arc<crate::provider::FrozenAttachments>,
-            Vec<String>,
+            Vec<crate::storage::SteerCandidate>,
         )>,
     >,
 }
@@ -6390,7 +6390,7 @@ impl Daemon {
             )?
             .0;
         let first_message_seq = cache.last_included_seq();
-        let first_steer_message_ids = cache.included_steer_message_ids().to_vec();
+        let first_steer_candidates = cache.included_steer_candidates().to_vec();
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .resolved_dispatch(&forecast.basis.model)
@@ -6411,7 +6411,7 @@ impl Daemon {
                 defs,
                 checkpoint,
                 sources,
-                first_steer_message_ids,
+                first_steer_candidates,
             ))),
         }))
     }
@@ -7609,35 +7609,45 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources, consumed_seq, included_steer_message_ids) =
-                if let Some((mut ctx, defs, _, sources, included_steer_message_ids)) = first.take()
-                {
-                    if let Some(policy) = &pipeline {
-                        policy.options.project_context(&mut ctx)?;
-                    }
-                    (
-                        ctx,
-                        defs,
-                        Some(sources),
-                        first_message_seq,
-                        included_steer_message_ids,
-                    )
-                } else {
-                    let (built, consumed_seq, included_steer_message_ids) = self
-                        .session_context_with_policy_tracked(
-                            session_id,
-                            &provider,
-                            &model,
-                            context_tokens,
-                            cfg.compaction.fraction(),
-                            pipeline.as_ref().map(|p| &p.options),
-                        )?;
-                    let ctx = built.0;
-                    let defs = self.with_store(|st| {
-                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                    })?;
-                    (ctx, defs, None, consumed_seq, included_steer_message_ids)
-                };
+            let (ctx, defs, sources, consumed_seq, included_steer_candidates) = if let Some((
+                mut ctx,
+                defs,
+                _,
+                sources,
+                included_steer_candidates,
+            )) = first.take()
+            {
+                if let Some(policy) = &pipeline {
+                    policy.options.project_context(&mut ctx)?;
+                }
+                (
+                    ctx,
+                    defs,
+                    Some(sources),
+                    first_message_seq,
+                    included_steer_candidates,
+                )
+            } else {
+                let (built, consumed_seq, included_steer_candidates) = self
+                    .session_context_with_policy_tracked(
+                        session_id,
+                        &provider,
+                        &model,
+                        context_tokens,
+                        cfg.compaction.fraction(),
+                        pipeline.as_ref().map(|p| &p.options),
+                    )?;
+                let ctx = built.0;
+                let defs = self.with_store(|st| {
+                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                })?;
+                (ctx, defs, None, consumed_seq, included_steer_candidates)
+            };
+            let included_steer_message_ids = crate::storage::steer_message_ids_for_run(
+                &included_steer_candidates,
+                run_id,
+                resumed_from.as_deref(),
+            );
             let call_provider = match sources {
                 Some(sources) => provider.clone().with_frozen_attachments(sources),
                 None => provider.clone(),
@@ -15640,7 +15650,11 @@ impl Daemon {
         context_tokens: u32,
         trigger_fraction: f64,
         policy: Option<&crate::pipeline::CompiledRunOptions>,
-    ) -> Result<(crate::storage::BuiltContext, i64, Vec<String>)> {
+    ) -> Result<(
+        crate::storage::BuiltContext,
+        i64,
+        Vec<crate::storage::SteerCandidate>,
+    )> {
         let prompt = self.session_prompt(session_id)?;
         let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
@@ -15655,7 +15669,7 @@ impl Daemon {
             if let Some(policy) = policy {
                 policy.project_context(&mut built.0)?;
             }
-            let included_steer_message_ids = cache.included_steer_message_ids().to_vec();
+            let included_steer_candidates = cache.included_steer_candidates().to_vec();
             let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
@@ -15666,7 +15680,7 @@ impl Daemon {
             Ok((
                 cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction),
                 included_seq,
-                included_steer_message_ids,
+                included_steer_candidates,
             ))
         });
         if built.is_ok() {

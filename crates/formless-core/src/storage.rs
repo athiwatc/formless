@@ -8092,6 +8092,26 @@ pub fn build_context(
 #[path = "plan_context.rs"]
 mod plan_context;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SteerCandidate {
+    pub(crate) id: String,
+    pub(crate) run_id: String,
+}
+
+pub(crate) fn steer_message_ids_for_run(
+    candidates: &[SteerCandidate],
+    run_id: &str,
+    resumed_from: Option<&str>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.run_id == run_id || resumed_from == Some(candidate.run_id.as_str())
+        })
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
 /// [`build_context`] for one Session, kept between agent steps: each build
 /// reads only messages newer than the last one seen and keeps a running
 /// token estimate. It starts over when the system prompt or checkpoint
@@ -8110,7 +8130,7 @@ pub struct ContextCache {
     /// Checkpoint summaries do not retain per-message IDs.
     included_user_message_ids: Vec<String>,
     /// Unconfirmed steering messages represented as individual provider messages.
-    included_steer_message_ids: Vec<String>,
+    included_steer_candidates: Vec<SteerCandidate>,
     /// Indexes into `live_seqs` where a user message starts a turn.
     turn_starts: Vec<usize>,
     /// Ids of stored tool calls left out for having no name (their
@@ -8134,8 +8154,15 @@ impl ContextCache {
         &self.included_user_message_ids
     }
 
-    pub(crate) fn included_steer_message_ids(&self) -> &[String] {
-        &self.included_steer_message_ids
+    pub(crate) fn included_steer_candidates(&self) -> &[SteerCandidate] {
+        &self.included_steer_candidates
+    }
+
+    pub(crate) fn included_steer_message_ids(&self) -> Vec<String> {
+        self.included_steer_candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect()
     }
 
     /// Use the provider's last real prompt size (when known) for the
@@ -8265,16 +8292,19 @@ impl ContextCache {
             self.push(msg);
             if m.role == "user" {
                 self.included_user_message_ids.push(m.id.clone());
-                let unconfirmed_steer = m
+                let steer_run_id = m
                     .meta
                     .as_deref()
                     .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
-                    .is_some_and(|meta| {
-                        meta["steer"]["run_id"].as_str().is_some()
-                            && meta["steer"]["context_included"].as_bool() != Some(true)
+                    .and_then(|meta| {
+                        if meta["steer"]["context_included"].as_bool() == Some(true) {
+                            return None;
+                        }
+                        meta["steer"]["run_id"].as_str().map(str::to_string)
                     });
-                if unconfirmed_steer {
-                    self.included_steer_message_ids.push(m.id);
+                if let Some(run_id) = steer_run_id {
+                    self.included_steer_candidates
+                        .push(SteerCandidate { id: m.id, run_id });
                 }
             }
         }
@@ -9102,7 +9132,7 @@ mod context_watermark_tests {
             .unwrap();
         let included_user_ids = cache.included_user_message_ids().to_vec();
         assert_eq!(included_user_ids, vec![current_steer.id.clone()]);
-        let included_steer_ids = cache.included_steer_message_ids().to_vec();
+        let included_steer_ids = cache.included_steer_message_ids();
         assert_eq!(included_steer_ids, vec![current_steer.id.clone()]);
         assert!(context.0[0]["content"]
             .as_str()
@@ -9198,7 +9228,7 @@ mod context_watermark_tests {
                 &session,
                 "run",
                 cache.last_included_seq(),
-                cache.included_steer_message_ids(),
+                &cache.included_steer_message_ids(),
                 None,
                 2,
             )
@@ -9229,18 +9259,23 @@ mod context_watermark_tests {
         cache
             .build(&store, &session, "private prompt", 100_000, 0.8)
             .unwrap();
-        let candidates = cache.included_steer_message_ids().to_vec();
+        let candidates = cache.included_steer_candidates().to_vec();
         assert_eq!(
-            candidates,
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.clone())
+                .collect::<Vec<_>>(),
             vec![resumed_steer.id.clone(), unrelated_steer.id.clone()]
         );
+        let eligible = steer_message_ids_for_run(&candidates, "resumed-run", Some("paused-run"));
+        assert_eq!(eligible, vec![resumed_steer.id.clone()]);
 
         assert!(store
             .mark_steering_context_included(
                 &session,
                 "resumed-run",
                 cache.last_included_seq(),
-                &candidates,
+                &eligible,
                 Some("paused-run"),
                 1,
             )
@@ -9297,7 +9332,7 @@ mod context_watermark_tests {
             .build(&store, &session, "private prompt", 100_000, 0.8)
             .unwrap();
         assert_eq!(cache.included_user_message_ids(), &[message.id.clone()]);
-        assert_eq!(cache.included_steer_message_ids(), &[message.id.clone()]);
+        assert_eq!(cache.included_steer_message_ids(), vec![message.id.clone()]);
 
         let edited = store
             .edit_message(&session, &message.id, "replacement content")
@@ -9312,6 +9347,45 @@ mod context_watermark_tests {
             .unwrap();
         assert_eq!(cache.included_user_message_ids(), &[message.id]);
         assert!(cache.included_steer_message_ids().is_empty());
+    }
+
+    #[test]
+    fn unrelated_unconfirmed_steers_are_not_stamp_candidates_for_this_run() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let old_steer = store
+            .append_message_meta(
+                &session,
+                "user",
+                "unconfirmed steer from another run",
+                Some(json!({"steer":{"run_id":"other-run"}}).to_string()),
+            )
+            .unwrap();
+        let mut cache = ContextCache::default();
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        let eligible =
+            steer_message_ids_for_run(cache.included_steer_candidates(), "current-run", None);
+        assert!(eligible.is_empty());
+        assert!(!store
+            .mark_steering_context_included(
+                &session,
+                "current-run",
+                cache.last_included_seq(),
+                &eligible,
+                None,
+                1,
+            )
+            .unwrap());
+        assert_eq!(
+            steer_message_ids_for_run(
+                cache.included_steer_candidates(),
+                "current-run",
+                Some("other-run"),
+            ),
+            vec![old_steer.id]
+        );
     }
 
     #[test]
