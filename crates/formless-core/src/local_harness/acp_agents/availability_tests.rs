@@ -118,12 +118,11 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
         );
         if matches!(*id, "junie" | "auggie" | "devin") {
             assert_eq!(result.signed_in, None, "{id}: {result:?}");
-            assert!(result
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("not verified by session creation"));
-            assert!(readiness.executable.is_some(), "{id}: {result:?}");
+            let detail = result.detail.as_deref().unwrap();
+            assert!(detail.contains("unavailable for execution"), "{id}: {detail}");
+            assert!(detail.contains("Signing in alone will not unblock"), "{id}: {detail}");
+            assert!(readiness.executable.is_none(), "{id}: {result:?}");
+            assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
         } else {
             assert_eq!(result.signed_in, Some(false), "{id}: {result:?}");
             let detail = result.detail.as_deref().unwrap();
@@ -133,6 +132,10 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
             );
             assert!(detail.contains("Formless did not perform ACP authentication"));
             assert!(detail.contains("not launchable"));
+            if session_auth_policy(id) == Some(SessionAuthPolicy::Unverifiable) {
+                assert_eq!(result.signed_in, Some(false), "{id}: {result:?}");
+                assert!(detail.contains("Signing in alone will not unblock"));
+            }
             if captured[id]["initialize"]["result"]["authMethods"]
                 .as_array()
                 .is_some_and(|methods| !methods.is_empty())
@@ -216,23 +219,28 @@ fn readiness_session_success_uses_profile_auth_policy_not_method_presence() {
                 assert_eq!(result.signed_in, Some(true), "{id}: {result:?}");
                 assert!(readiness.executable.is_some(), "{id}: {result:?}");
             }
-            SessionAuthPolicy::NotRequired => {
-                assert_eq!(result.signed_in, None, "{id}: {result:?}");
-                assert!(readiness.executable.is_some(), "{id}: {result:?}");
-            }
             SessionAuthPolicy::Unverifiable => {
                 assert_eq!(result.signed_in, None, "{id}: {result:?}");
                 let detail = result.detail.as_deref().unwrap();
-                assert!(
-                    detail.contains("sign-in remains unverified"),
-                    "{id}: {detail}"
-                );
-                assert!(detail.contains("not launchable"), "{id}: {detail}");
-                assert!(detail.contains("Advertised ACP authentication methods"));
+                assert!(detail.contains("unavailable for execution"), "{id}: {detail}");
+                assert!(detail.contains("Signing in alone will not unblock"), "{id}: {detail}");
                 assert!(readiness.executable.is_none(), "{id}: {result:?}");
                 assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
             }
         }
+    }
+}
+
+#[test]
+fn unverified_profile_successes_remain_unlaunchable() {
+    for id in ["cursor", "cline", "junie", "auggie", "devin"] {
+        let mut fixture = Fixture::new(id);
+        fixture.session(json!({"jsonrpc":"2.0", "id":2, "result":{"sessionId":"simulated"}}));
+        let readiness = fixture.probe_with_executable(id);
+        assert!(readiness.availability.installed, "{id}");
+        assert_eq!(readiness.availability.signed_in, None, "{id}");
+        assert!(readiness.executable.is_none(), "{id}");
+        assert!(readiness.executable_argv0.is_none(), "{id}");
     }
 }
 

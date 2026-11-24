@@ -7,7 +7,7 @@ pub(crate) use availability::availability_with_executable;
 
 use std::ffi::OsString;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,6 @@ impl std::error::Error for AgentCompatibilityError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SessionAuthPolicy {
     Required,
-    NotRequired,
     Unverifiable,
 }
 
@@ -147,7 +146,7 @@ agents! {
         name: "Junie", program: "junie", identity: Some("@jetbrains/junie"),
         args: ["--acp=true"], review_args: [],
         modes: &["plan"], fail_closed: true, write_modes: &["default"], auth_codes: &[-32000],
-        session_auth: SessionAuthPolicy::NotRequired,
+        session_auth: SessionAuthPolicy::Unverifiable,
         sign_in: "Run `junie` and sign in with your Junie Account in the browser."
     },
     "qwen" => QWEN {
@@ -175,7 +174,7 @@ agents! {
         name: "Auggie", program: "auggie", identity: Some("auggie"),
         args: ["--acp"], review_args: [],
         modes: &[], fail_closed: false, write_modes: &[], auth_codes: &[-32000],
-        session_auth: SessionAuthPolicy::NotRequired,
+        session_auth: SessionAuthPolicy::Unverifiable,
         sign_in: "Run `auggie auth login` to sign in."
     },
     "goose" => GOOSE {
@@ -196,7 +195,7 @@ agents! {
         name: "Devin", program: "devin", identity: Some("affogato"),
         args: ["acp"], review_args: [],
         modes: &["plan", "ask"], fail_closed: true, write_modes: &["accept-edits"], auth_codes: &[-32000],
-        session_auth: SessionAuthPolicy::NotRequired,
+        session_auth: SessionAuthPolicy::Unverifiable,
         sign_in: "Run `devin auth login` to sign in with your browser."
     },
 }
