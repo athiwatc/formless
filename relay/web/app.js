@@ -10353,10 +10353,23 @@
         else if (S.current !== selected.sessionId || S.storageScope !== selected.scope) {
           note("The selected Session changed while the share was loading; reload to apply it safely.", true);
         }
-        else if (await applyIncomingShare(shareToken, share, selected)) {
-          await deleteIncomingShare(shareToken);
-          clearPendingShareLaunch(shareToken);
-          stripLaunchParams(["share"]);
+        else {
+          const confirmed = share.requiresConfirmation === false || await ask({
+            title: "Confirm shared content",
+            text: "The browser did not provide enough request metadata to verify this share. Add its text and files to the Chat draft? Discarding removes it. Nothing is sent automatically.",
+            ok: "Add to draft",
+            cancelLabel: "Discard share",
+          });
+          if (!confirmed) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+            note("Shared content was discarded; no draft was changed.");
+          } else if (await applyIncomingShare(shareToken, share, selected)) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+          }
         }
       } catch (error) {
         note("Shared content couldn't be added to this draft: " + (error?.message || "storage is unavailable"), true);

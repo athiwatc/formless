@@ -41,18 +41,19 @@ function storeIncomingShare(share) {
   });
 }
 
-async function receiveShare(request) {
+function shareRequestMetadata(request) {
   const origin = request.headers?.get?.("Origin") ?? null;
   const fetchSite = request.headers?.get?.("Sec-Fetch-Site") ?? null;
-  const trustedMetadata = origin === "null"
-    ? fetchSite === "none"
-    : (origin == null || origin === location.origin)
-      && fetchSite !== "cross-site"
-      && fetchSite !== "same-site"
-      && (origin != null || fetchSite === "none" || fetchSite === "same-origin");
-  if (!trustedMetadata) {
-    return new Response("Share request lacks trusted browser metadata; update your browser or add the content manually.", { status: 403 });
-  }
+  if ((origin != null && origin !== location.origin && origin !== "null")
+    || fetchSite === "cross-site" || fetchSite === "same-site") return null;
+  return {
+    requiresConfirmation: !(origin === location.origin || fetchSite === "none" || origin == null && fetchSite === "same-origin"),
+  };
+}
+
+async function receiveShare(request) {
+  const metadata = shareRequestMetadata(request);
+  if (!metadata) return new Response("Untrusted share request", { status: 403 });
   try {
     const form = await request.formData();
     const text = form.get("text");
@@ -65,6 +66,7 @@ async function receiveShare(request) {
       title: typeof title === "string" ? title : "",
       url: typeof url === "string" ? url : "",
       files,
+      requiresConfirmation: metadata.requiresConfirmation,
       draftApplied: false,
     };
     if (!share.text && !share.title && !share.url && !files.length) {

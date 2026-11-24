@@ -188,12 +188,10 @@ test("share target rejects explicit cross-site request metadata before reading o
   for (const headers of [
     new Headers({ Origin: "https://attacker.example" }),
     new Headers({ Origin: "https://attacker.example", "Sec-Fetch-Site": "none" }),
-    new Headers({ Origin: "null" }),
     new Headers({ Origin: "null", "Sec-Fetch-Site": "cross-site" }),
     new Headers({ Origin: "null", "Sec-Fetch-Site": "same-site" }),
     new Headers({ "Sec-Fetch-Site": "cross-site" }),
     new Headers({ "Sec-Fetch-Site": "same-site" }),
-    new Headers(),
   ]) {
     const records = new Map();
     let formReads = 0;
@@ -213,6 +211,37 @@ test("share target rejects explicit cross-site request metadata before reading o
     assert.equal((await event.response).status, 403);
     assert.equal(formReads, 0);
     assert.equal(records.size, 0);
+  }
+});
+
+test("ambiguous or missing share metadata is stored for explicit confirmation", async () => {
+  const cases = [
+    {},
+    { headers: null },
+    { headers: { get: () => null } },
+    { headers: new Headers({ Origin: "null" }) },
+  ];
+  for (const requestMetadata of cases) {
+    const records = new Map();
+    const form = new FormData();
+    form.set("text", "shared text");
+    const request = {
+      url: "https://formless.example/share",
+      method: "POST",
+      mode: "navigate",
+      formData: async () => form,
+      ...requestMetadata,
+    };
+    const { event } = fetchEvent({
+      request,
+      fetch: async () => new Response("unexpected"),
+      caches: {},
+      globals: { indexedDB: shareDatabase(records), crypto: webcrypto },
+    });
+    const response = await event.response;
+    assert.equal(response.status, 303);
+    const token = new URL(response.headers.get("location")).searchParams.get("share");
+    assert.equal(records.get(token).requiresConfirmation, true);
   }
 });
 
@@ -247,5 +276,6 @@ test("share target accepts native opaque Origin:null with Sec-Fetch-Site:none", 
   assert.equal(records.get(token).text, "Look at this");
   assert.equal(records.get(token).url, "https://example.test/page");
   assert.equal(records.get(token).files[0].name, "photo.png");
+  assert.equal(records.get(token).requiresConfirmation, false);
   assert.equal(records.get(token).draftApplied, false);
 });

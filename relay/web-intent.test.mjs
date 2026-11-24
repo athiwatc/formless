@@ -331,7 +331,7 @@ test('share inbox read does not apply to a Session selected while IndexedDB is r
   c.S.current = 'A';
   const pending = c.handleLaunchRoute();
   c.S.current = 'B';
-  gate.resolve({ text: 'shared content', files: [] });
+  gate.resolve({ requiresConfirmation: false, text: 'shared content', files: [] });
   await pending;
   assert.equal(applied, 0);
   assert.equal(deleted, 0);
@@ -350,7 +350,7 @@ test('pending share token survives URL replacement and is recoverable only in it
     'pendingShareLaunchForScope', 'clearPendingShareLaunch',
   ], {
     sessionStorage, launchRouteHandled: false, launchAction: null, launchShareError: false,
-    launchShareToken: null, launchView: null, readIncomingShare: async token => { readToken = token; return { files: [] }; },
+    launchShareToken: null, launchView: null, readIncomingShare: async token => { readToken = token; return { requiresConfirmation: false, files: [] }; },
     applyIncomingShare: async () => { applied++; return true; },
     deleteIncomingShare: async () => { deleted++; },
     stripLaunchParams() {},
@@ -637,7 +637,7 @@ test('incoming share overrides a restored Approvals view and opens Chat', async 
   ], {
     launchRouteHandled: false, launchAction: null, launchShareError: false,
     launchShareToken: 'share-token', launchView: 'approvals',
-    readIncomingShare: async () => ({ files: [] }),
+    readIncomingShare: async () => ({ requiresConfirmation: false, files: [] }),
     applyIncomingShare: async () => true,
     deleteIncomingShare: async () => {},
     setView: view => views.push(view),
@@ -645,6 +645,61 @@ test('incoming share overrides a restored Approvals view and opens Chat', async 
   });
   await c.handleLaunchRoute();
   assert.deepEqual(views, ['chat']);
+});
+
+test('ambiguous share is applied only after explicit Add to draft confirmation', async () => {
+  let c, applyCalls = 0;
+  const events = [];
+  c = setup([
+    'handleLaunchRoute', 'readPendingShareLaunch', 'rememberPendingShareLaunch',
+    'pendingShareLaunchForScope', 'clearPendingShareLaunch',
+  ], {
+    launchRouteHandled: false, launchAction: null, launchShareError: false,
+    launchShareToken: 'share-token', launchView: null,
+    readIncomingShare: async () => ({ requiresConfirmation: true, text: 'shared text', files: [{ name: 'photo.png' }] }),
+    ask: async options => {
+      events.push('ask');
+      assert.equal(options.ok, 'Add to draft');
+      assert.equal(options.cancelLabel, 'Discard share');
+      assert.equal(c.$('input').value, 'existing draft');
+      assert.equal(applyCalls, 0);
+      return true;
+    },
+    applyIncomingShare: async () => { events.push('apply'); applyCalls++; c.$('input').value = 'changed after accept'; return true; },
+    deleteIncomingShare: async () => events.push('delete'),
+    stripLaunchParams: () => events.push('strip'),
+  });
+  c.$('input').value = 'existing draft';
+  await c.handleLaunchRoute();
+  assert.deepEqual(events, ['ask', 'apply', 'delete', 'strip']);
+  assert.equal(c.$('input').value, 'changed after accept');
+});
+
+test('declining ambiguous share discards it without draft or file mutation', async () => {
+  let applyCalls = 0, deleted = 0, c;
+  c = setup([
+    'handleLaunchRoute', 'readPendingShareLaunch', 'rememberPendingShareLaunch',
+    'pendingShareLaunchForScope', 'clearPendingShareLaunch',
+  ], {
+    launchRouteHandled: false, launchAction: null, launchShareError: false,
+    launchShareToken: 'share-token', launchView: null,
+    readIncomingShare: async () => ({ requiresConfirmation: true, text: 'shared text', files: [{ name: 'photo.png' }] }),
+    ask: async options => {
+      assert.equal(options.ok, 'Add to draft');
+      assert.equal(options.cancelLabel, 'Discard share');
+      assert.equal(c.$('input').value, 'existing draft');
+      assert.equal(applyCalls, 0);
+      return null;
+    },
+    applyIncomingShare: async () => { applyCalls++; return true; },
+    deleteIncomingShare: async () => { deleted++; },
+    stripLaunchParams() {},
+  });
+  c.$('input').value = 'existing draft';
+  await c.handleLaunchRoute();
+  assert.equal(c.$('input').value, 'existing draft');
+  assert.equal(applyCalls, 0);
+  assert.equal(deleted, 1);
 });
 
 test('Main Chat shortcut resolves or creates Main Chat through the existing Main Chat path', async () => {
