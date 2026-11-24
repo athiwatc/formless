@@ -99,7 +99,8 @@ No administrator or machine-wide PATH change is needed.
 ## Manual updates
 
 WinGet-installed binaries get the `winget upgrade` command, and Cargo
-installations and build outputs get the Cargo upgrade command. Manual ZIP
+installations get the Cargo upgrade command. Build outputs are directed to
+update their source checkout and rebuild with `cargo run`. Manual ZIP
 installations are directed to the verified ZIP procedure below.
 
 `formless update check` reports releases; it does not replace the installed
