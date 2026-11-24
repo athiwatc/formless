@@ -234,6 +234,45 @@ fn set_key_validates_types_keys_and_the_allow_list() {
     }
 }
 
+#[test]
+fn provider_model_meta_default_setter_and_validation() {
+    use serde_json::json;
+
+    let mut cfg = Config::default();
+    assert!(cfg.provider.model_meta.is_empty());
+
+    let configured = json!({
+        "gpt-5-custom": {"vision":true,"tools":false,"efforts":["xhigh"]}
+    });
+    cfg.set_key("provider.model_meta", configured.clone())
+        .unwrap();
+    assert_eq!(
+        cfg.setting_value("provider.model_meta").unwrap(),
+        Some(configured)
+    );
+
+    let before = cfg.provider.model_meta.clone();
+    assert!(cfg
+        .set_key(
+            "provider.model_meta.gpt-5-custom",
+            json!({"vision":"true"})
+        )
+        .is_err());
+    assert_eq!(cfg.provider.model_meta, before);
+
+    let entry = json!({"vision":false,"tools":true,"efforts":["ultra"]});
+    cfg.set_key("provider.model_meta.vendor/qwen2.5", entry.clone())
+        .unwrap();
+    assert_eq!(
+        cfg.setting_value("provider.model_meta.vendor/qwen2.5")
+            .unwrap(),
+        Some(entry)
+    );
+    assert!(formless_core::config::is_model_setting(
+        "provider.model_meta.vendor/qwen2.5"
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_daemon_writes_the_file_without_env_overrides() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
