@@ -5,16 +5,21 @@ use formless_core::{
 };
 use formless_protocol::SessionInfo;
 
+fn reserved_command_names() -> Vec<String> {
+    crate::builtin_command_names()
+        .into_iter()
+        .filter(|name| !matches!(name.as_str(), "main" | "topic" | "topics"))
+        .chain(["exit".into(), "switch".into()])
+        .collect()
+}
+
 pub(super) fn load(paths: &Paths, session: &SessionInfo) -> Snapshot {
     let cwd = session
         .cwd
         .as_ref()
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
-    let mut reserved = crate::builtin_command_names();
-    // Plain-only aliases have the same precedence as canonical builtins.
-    reserved.extend(["exit".into(), "switch".into()]);
-    user_commands::load(&paths.config_dir, cwd.as_deref(), &reserved)
+    user_commands::load(&paths.config_dir, cwd.as_deref(), &reserved_command_names())
 }
 
 pub(super) fn expand(snapshot: &Snapshot, input: &str) -> Result<Option<String>, String> {
@@ -28,10 +33,9 @@ pub(super) fn expand(snapshot: &Snapshot, input: &str) -> Result<Option<String>,
         .find(char::is_whitespace)
         .unwrap_or(invocation.len());
     let name = &invocation[..end];
-    if ["exit", "switch"].contains(&name)
-        || crate::builtin_command_names()
-            .iter()
-            .any(|builtin| builtin == name)
+    if reserved_command_names()
+        .iter()
+        .any(|builtin| builtin == name)
     {
         return Ok(None);
     }
@@ -112,5 +116,33 @@ mod tests {
             expand(&snapshot, "/required one two").unwrap(),
             Some("one then two".into())
         );
+    }
+
+    #[test]
+    fn plain_templates_can_use_tui_only_command_names() {
+        let app = crate::tests::test_app();
+        let directory = app.paths.config_dir.join("commands");
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in ["main", "topic", "topics"] {
+            std::fs::write(
+                directory.join(format!("{name}.md")),
+                format!("{name} $ARGUMENTS"),
+            )
+            .unwrap();
+        }
+        let session: SessionInfo = serde_json::from_value(serde_json::json!({
+            "id":"s", "name":"Plain", "created_at":"", "updated_at":""
+        }))
+        .unwrap();
+        let snapshot = load(&app.paths, &session);
+        for name in ["main", "topic", "topics"] {
+            assert_eq!(
+                expand(&snapshot, &format!("/{name} request")).unwrap(),
+                Some(format!("{name} request"))
+            );
+        }
+        for builtin in ["/help", "/quit", "/exit", "/switch 1"] {
+            assert_eq!(expand(&snapshot, builtin).unwrap(), None);
+        }
     }
 }

@@ -10,6 +10,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 pub use formless_protocol::{HarnessKind, StepAccess};
+pub(crate) const TOPIC_CAPABILITY_ENV: &str = "FORMLESS_TOPIC_CAPABILITY";
+pub mod pi;
 
 pub mod muse;
 
@@ -168,7 +170,7 @@ fn validate_request(request: &HarnessRequest) -> Result<()> {
     if request.kind == HarnessKind::Antigravity {
         return Ok(());
     }
-    if matches!(request.kind, HarnessKind::Pi | HarnessKind::Acp) {
+    if request.kind == HarnessKind::Acp {
         bail!(
             "{:?} adapter not integrated yet; use Claude or Codex for now",
             request.kind
@@ -209,6 +211,9 @@ pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
         return antigravity::command_spec(request);
     }
     validate_request(request)?;
+    if request.kind == HarnessKind::Pi {
+        return pi::command_spec(request);
+    }
     if request.kind == HarnessKind::Muse {
         bail!("Muse Code requires the interactive harness runner");
     }
@@ -333,6 +338,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
         HarnessKind::Antigravity => antigravity::parse_output(stdout),
+        HarnessKind::Pi => pi::parse_output(stdout),
         HarnessKind::OpenCode => bail!("OpenCode uses ACP; run/JSONL output is unsupported."),
         HarnessKind::Muse => bail!("Muse Code requires the interactive harness runner"),
         _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
@@ -596,7 +602,7 @@ mod tests {
 mod access_tests {
     use super::*;
     #[test]
-    fn topic_access_restrictions_and_unintegrated_adapters() {
+    fn topic_access_restrictions_and_adapter_command_contracts() {
         for kind in [
             HarnessKind::Claude,
             HarnessKind::Codex,
@@ -626,6 +632,15 @@ mod access_tests {
                 } else {
                     assert!(args.windows(2).any(|p| p == ["--sandbox", "read-only"]));
                 }
+            } else if kind == HarnessKind::Pi {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("attempt-private staged extension"));
+                assert!(parse_output(kind, "{}")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("bridge registration"));
             } else if kind == HarnessKind::OpenCode {
                 assert!(command_spec(&request)
                     .unwrap_err()
