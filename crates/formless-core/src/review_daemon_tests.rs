@@ -155,6 +155,48 @@ async fn review_comment_steering_uses_context_sequence_and_refuses_closing_run()
         serde_json::from_value(s.daemon.handle(request("active redirect")).await.unwrap()).unwrap();
     assert!(comment.steered);
     assert_eq!(wakeups.try_recv().unwrap(), comment.message.seq);
+    let arrival_meta: Value =
+        serde_json::from_str(comment.message.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(arrival_meta["steer"]["run_id"], active);
+    assert!(arrival_meta["steer"].get("step").is_none());
+    assert!(arrival_meta["steer"].get("context_included").is_none());
+    let (through_seq, candidates) = s
+        .daemon
+        .with_store(|st| {
+            let mut cache = crate::storage::ContextCache::default();
+            cache.build(st, &s.session, "private prompt", 100_000, 0.8)?;
+            Ok((
+                cache.last_included_seq(),
+                crate::storage::steer_message_ids_for_run(
+                    cache.included_steer_candidates(),
+                    &active,
+                    None,
+                ),
+            ))
+        })
+        .unwrap();
+    assert_eq!(candidates, vec![comment.message.id.clone()]);
+    assert!(s
+        .daemon
+        .with_store(|st| {
+            st.mark_steering_context_included(
+                &s.session,
+                &active,
+                through_seq,
+                &candidates,
+                None,
+                1,
+            )
+        })
+        .unwrap());
+    let included = s
+        .daemon
+        .with_reader(|st| st.get_message(&s.session, &comment.message.id))
+        .unwrap()
+        .unwrap();
+    let included_meta: Value = serde_json::from_str(included.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(included_meta["steer"]["step"], 1);
+    assert_eq!(included_meta["steer"]["context_included"], true);
     assert!(
         s.daemon
             .extend_or_close_steering(&s.session, &active, false)

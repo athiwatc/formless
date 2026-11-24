@@ -612,6 +612,7 @@ mod tests {
             appended(3, "user", "foreign"),
             Event::MessagesEdited {
                 session_id: "s1".into(),
+                metadata_only: None,
             },
             Event::StreamRestarted {
                 session_id: "s1".into(),
@@ -636,6 +637,7 @@ mod tests {
             (
                 Event::MessagesEdited {
                     session_id: "s1".into(),
+                    metadata_only: None,
                 },
                 ReloadReason::MessagesEdited,
             ),
@@ -704,6 +706,7 @@ mod tests {
         for failure in [
             Event::MessagesEdited {
                 session_id: "s1".into(),
+                metadata_only: None,
             },
             Event::StreamRestarted {
                 session_id: "s1".into(),
@@ -729,6 +732,7 @@ mod tests {
                 complete("r1", 3, "untrusted complete"),
                 Event::MessagesEdited {
                     session_id: "s1".into(),
+                    metadata_only: None,
                 },
                 Event::StreamRestarted {
                     session_id: "s1".into(),

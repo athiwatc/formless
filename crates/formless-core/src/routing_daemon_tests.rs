@@ -396,6 +396,7 @@ async fn selection_keeps_one_pass_aliases_and_admitted_role_identity_without_htt
             resolved_model: "served".into(),
             effort: None,
             recovery_messages: vec![],
+            resumed_from: None,
             first_message_seq: 0,
             first: StdMutex::new(None),
         }),

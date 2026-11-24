@@ -3930,9 +3930,12 @@ pub enum Event {
     SessionDeleted {
         id: String,
     },
-    /// Transcript was edited/truncated; clients should reload the session.
+    /// Transcript or message metadata changed.
     MessagesEdited {
         session_id: String,
+        /// Only message metadata changed; the transcript can be refreshed in place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata_only: Option<bool>,
     },
     ToolCallStarted {
         #[serde(default)]
