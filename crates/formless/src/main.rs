@@ -6855,9 +6855,15 @@ fn config_edit(paths: &Paths) -> Result<()> {
         }
         let edited =
             std::fs::read_to_string(&draft).with_context(|| format!("read {}", draft.display()));
-        match edited.and_then(|text| Config::load_from_text(&text, &draft).map(|_| text)) {
-            Ok(text) => {
+        match edited.and_then(|text| {
+            Config::load_from_text_with_unmarked_download(&text, &draft)
+                .map(|(_, unmarked_auto_download)| (text, unmarked_auto_download))
+        }) {
+            Ok((text, unmarked_auto_download)) => {
                 formless_core::config::write_atomic(&file, text.as_bytes())?;
+                if unmarked_auto_download {
+                    eprintln!("warning: unmarked naming.auto_download = true is treated as false; use `formless config set naming.auto_download true` to opt in");
+                }
                 if let Err(error) = std::fs::remove_file(&draft) {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         eprintln!(

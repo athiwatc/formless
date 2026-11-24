@@ -2174,11 +2174,18 @@ impl Config {
 
     /// Validate an in-memory copy so callers can commit the exact text read.
     pub fn load_from_text(text: &str, file: &Path) -> Result<Self> {
+        Self::load_from_text_with_unmarked_download(text, file).map(|(cfg, _)| cfg)
+    }
+
+    /// Validate text and report whether auto-download was enabled without its consent marker.
+    pub fn load_from_text_with_unmarked_download(text: &str, file: &Path) -> Result<(Self, bool)> {
         let mut cfg: Self =
             toml::from_str(text).with_context(|| format!("parse {}", file.display()))?;
+        let unmarked_auto_download =
+            cfg.naming.auto_download && !cfg.naming.auto_download_migration_done;
         cfg.naming.migrate_auto_download();
         cfg.apply_env()?;
-        Ok(cfg)
+        Ok((cfg, unmarked_auto_download))
     }
     /// The config file alone, without `FORMLESS_*` environment overrides.
     /// This read-only load never persists the in-memory naming migration.
