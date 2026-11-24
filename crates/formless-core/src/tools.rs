@@ -203,6 +203,15 @@ fn schema_can_describe_object(
             let Some(branches) = branches.as_array() else {
                 return false;
             };
+            if key == "oneOf"
+                && branches
+                    .iter()
+                    .filter(|branch| schema_matches_every_object(branch))
+                    .count()
+                    > 1
+            {
+                return false;
+            }
             if !branches
                 .iter()
                 .any(|branch| schema_can_describe_object(root, branch, active_refs))
@@ -1633,6 +1642,7 @@ mod tests {
             json!({"type": "string"}),
             json!({"type": "array", "items": {"type": "string"}}),
             json!({"anyOf": [{"type": "string"}, {"type": "array"}]}),
+            json!({"oneOf": [{"type": "object"}, {"type": "object"}]}),
             json!({"$defs": {"String": {"type": "string"}}, "$ref": "#/$defs/String"}),
             json!({"not": {"type": "object"}}),
         ];
