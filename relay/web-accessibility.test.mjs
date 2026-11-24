@@ -161,7 +161,6 @@ function liveRendererFixture(tools) {
     const row = createLiveToolRow(tool);
     row.node.style = {};
     row.node.dataset = {};
-    row.summary.firstChild = row.summary.children[0];
     const depthMarker = row.summary.firstChild;
     depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
     depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
