@@ -117,10 +117,8 @@ fn detached_daemon_reopens_its_log_after_rotation() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(profile
-        .run(&["daemon", "status", "--json"])
-        .status
-        .success());
+    let status = profile.run(&["daemon", "status", "--check"]);
+    assert!(status.status.success(), "{status:?}");
 }
 
 #[test]
@@ -129,10 +127,8 @@ fn long_windows_profile_works_or_doctor_names_the_path_limit() {
     assert!(profile.data.as_os_str().encode_wide().count() > 260);
     if profile.start().success() {
         assert!(profile.data.join("formless.db").is_file());
-        assert!(profile
-            .run(&["daemon", "status", "--json"])
-            .status
-            .success());
+        let status = profile.run(&["daemon", "status", "--check"]);
+        assert!(status.status.success(), "{status:?}");
     } else {
         let doctor = profile.run(&["doctor", "--json"]);
         let output = format!(
