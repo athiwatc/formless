@@ -191,6 +191,7 @@ mod tests {
                 assert_ne!(AllocConsole(), 0, "allocate native test console");
             }
             let console_output = std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .open("CONOUT$")
                 .unwrap();
