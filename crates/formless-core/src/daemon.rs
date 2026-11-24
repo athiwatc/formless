@@ -721,14 +721,21 @@ fn same_ollama_model(left: &str, right: &str) -> bool {
     ollama_model_parts(left) == ollama_model_parts(right)
 }
 
+fn is_loopback_ollama_host(host: &str) -> bool {
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 fn ollama_disk_warning(base: &str, expected_size: Option<u64>) -> Option<String> {
     let url = reqwest::Url::parse(base).ok()?;
     let host = url.host_str()?;
-    let local = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    if !local {
+    if !is_loopback_ollama_host(host) {
         return None;
     }
     let models_dir = std::env::var_os("OLLAMA_MODELS")
@@ -22028,5 +22035,10 @@ mod ollama_pull_tests {
             "registry/llama3:8b"
         ));
         assert!(!same_ollama_model("llama3:8b", "llama3:70b"));
+        let ipv6 = reqwest::Url::parse("http://[::1]:11434").unwrap();
+        let host = ipv6.host_str().unwrap();
+        assert_eq!(host, "[::1]");
+        assert!(host.parse::<std::net::IpAddr>().is_err());
+        assert!(is_loopback_ollama_host(host));
     }
 }
