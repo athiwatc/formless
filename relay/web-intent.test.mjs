@@ -127,6 +127,46 @@ test('pull progress preserves another active pull and reports provider-aware res
   assert.equal(c.S.pullId, null);
   assert.match(notices.pop().text, /\/pull llama3 --provider remote/);
 });
+test('idle status shows pull progress and clears it on the matching terminal event', () => {
+  let context;
+  const c = setup(['renderStatus', 'handlePullProgress'], {
+    document: { activeElement: null, createTextNode: () => ({ textContent: '' }) },
+    statusRender: { root: null, spinner: null, text: null },
+    h: () => ({ hidden: false }),
+    updateText: (node, value) => { node.textContent = value; },
+    isRunning: () => false,
+    activityText: activity => activity.label,
+    storedSessionModel: () => null,
+    setActivity: label => {
+      context.S.activity = label ? { label, since: 0 } : null;
+      context.renderStatus();
+    },
+  });
+  context = c;
+  Object.assign(c.S, {
+    activity: null,
+    approvals: [],
+    contextFill: {},
+    notes: [],
+    others: [],
+    pendingQuestion: null,
+    questionOpen: false,
+    sessions: [],
+    unread: 0,
+    usage: {},
+  });
+
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false,
+    pull_id: 'pull-1', completed: 1, total: 2, expected_size: 100, warning: 'low disk',
+  });
+  assert.match(c.statusRender.text.textContent, /pulling llama3.*50%.*expected 100 bytes.*low disk/);
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
+    pull_id: 'pull-1',
+  });
+  assert.equal(c.statusRender.text.textContent, '● ready');
+});
 test('queued edits submit the revision opened by the editor', () => {
   const notices = [];
   let rendered, dialog, input;

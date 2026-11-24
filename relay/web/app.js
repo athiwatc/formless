@@ -5994,7 +5994,7 @@
     const stateClass = running ? "state busy" : "state";
     if (state.className !== stateClass) state.className = stateClass;
     if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
-    updateText(statusRender.text, running ? S.activity ? activityText(S.activity) : "running" : "● ready");
+    updateText(statusRender.text, S.activity ? activityText(S.activity) : running ? "running" : "● ready");
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
@@ -9832,7 +9832,10 @@
 
   function handlePullProgress(ev) {
     if (ev.done) {
-      if (S.pullId === ev.pull_id) S.pullId = null;
+      if (S.pullId === ev.pull_id) {
+        S.pullId = null;
+        setActivity(null);
+      }
       if (ev.error) {
         if (ev.status === "incomplete") {
           const provider = ev.provider && ev.provider !== "default" ? " --provider " + ev.provider : "";
