@@ -114,11 +114,9 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
     let lookup = scenario.next_call().await;
     assert!(find_tools_call(&lookup.body, "greet"));
     assert!(
-        lookup.body["tools"].as_array().is_some_and(|tools| {
-            tools
-                .iter()
-                .any(|tool| tool["function"]["name"] == "greet")
-        }),
+        lookup.body["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.iter().any(|tool| tool["function"]["name"] == "greet") }),
         "the initial small-registry listing already advertises the stored Tool"
     );
     lookup.tool_call("find_tools", json!({"query":"greet"}));
@@ -164,7 +162,10 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
     let transcript = serde_json::to_string(&messages).unwrap();
     assert!(transcript.contains("Hello, Ada!"));
     let reused = scenario.store.get_tool_by_name("greet").unwrap().unwrap().0;
-    assert_eq!(reused.id, created.id, "the fresh Session reused the same Tool");
+    assert_eq!(
+        reused.id, created.id,
+        "the fresh Session reused the same Tool"
+    );
     assert_summary(
         "tool-create-fresh-session-reuse",
         scenario.provider.summary(),

@@ -18,8 +18,7 @@ use scripted_provider::{ProviderCall, ScriptedProvider};
 type EventTransport = tokio::net::UnixStream;
 #[cfg(windows)]
 type EventTransport = tokio::net::windows::named_pipe::NamedPipeClient;
-type EventReader =
-    tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<EventTransport>>>;
+type EventReader = tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<EventTransport>>>;
 
 pub struct EventWatcher {
     reader: EventReader,
@@ -82,10 +81,7 @@ impl EventWatcher {
             match self.message().await {
                 ServerMessage::Event(_) => {}
                 ServerMessage::Response {
-                    id: 1,
-                    ok,
-                    error,
-                    ..
+                    id: 1, ok, error, ..
                 } => {
                     assert!(ok, "event subscription rejected: {error:?}");
                     return;

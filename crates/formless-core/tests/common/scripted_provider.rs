@@ -268,10 +268,7 @@ fn dropped_response(delta: Value, release: oneshot::Receiver<()>) -> Response<Bo
                 match step {
                     0 => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
-                        Some((
-                            Ok::<_, std::io::Error>(line.unwrap()),
-                            (1, None, release),
-                        ))
+                        Some((Ok::<_, std::io::Error>(line.unwrap()), (1, None, release)))
                     }
                     1 => {
                         let _ = release.unwrap().await;
