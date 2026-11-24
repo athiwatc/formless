@@ -2699,6 +2699,7 @@ impl Store {
             let removed = meta.as_object_mut()?.remove("steer").is_some();
             removed.then(|| meta.to_string())
         });
+        let meta_changed = replacement_meta.is_some();
         if let Some(metadata) = replacement_meta {
             msg.meta = Some(metadata);
         }
@@ -2707,10 +2708,17 @@ impl Store {
         // four WAL commits) for a single user action.
         self.transaction(|st| {
             let tx = &st.conn;
-            tx.execute(
-                "UPDATE messages SET content=?3, meta=?4 WHERE session_id=?1 AND id=?2",
-                params![session_id, message_id, content, msg.meta.as_deref()],
-            )?;
+            if meta_changed {
+                tx.execute(
+                    "UPDATE messages SET content=?3, meta=?4 WHERE session_id=?1 AND id=?2",
+                    params![session_id, message_id, content, msg.meta.as_deref()],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
+                    params![session_id, message_id, content],
+                )?;
+            }
             tx.execute(
                 "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
                 params![session_id, msg.seq],
