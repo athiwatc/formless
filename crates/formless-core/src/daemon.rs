@@ -10452,6 +10452,39 @@ impl Daemon {
         Ok(s)
     }
 
+    fn import_session_identity(bundle: &Value) -> Value {
+        let messages = bundle["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|message| {
+                json!({
+                    "role": message["role"].as_str().unwrap_or("user"),
+                    "content": message["content"].as_str().unwrap_or_default(),
+                    "meta": message["meta"].as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let checkpoints = bundle["checkpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|checkpoint| {
+                json!({
+                    "summary": checkpoint["summary"].as_str().unwrap_or_default(),
+                    "up_to_seq": checkpoint["up_to_seq"].as_i64().unwrap_or(0),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "name": bundle["name"].as_str().unwrap_or("Imported"),
+            "model": bundle.get("model").cloned().unwrap_or(Value::Null),
+            "reasoning_effort": bundle.get("reasoning_effort").cloned().unwrap_or(Value::Null),
+            "messages": messages,
+            "checkpoints": checkpoints,
+        })
+    }
+
     /// `ExportAll` (SPEC §15): one bundle for a new machine.
     fn export_all(&self, sessions: bool) -> Result<Value> {
         let mut tools = Vec::new();
@@ -10525,22 +10558,44 @@ impl Daemon {
         }
         let list = |k: &str| bundle[k].as_array().cloned().unwrap_or_default();
         let mut failed: Vec<String> = Vec::new();
+        let kinds = [
+            "providers",
+            "roles",
+            "mcp_servers",
+            "modules",
+            "tools",
+            "skills",
+            "memories",
+            "jobs",
+            "sessions",
+        ];
+        let mut added = kinds
+            .iter()
+            .map(|kind| ((*kind).to_string(), 0usize))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut skipped_existing = added.clone();
+        let count = |counts: &mut std::collections::BTreeMap<String, usize>, kind: &str| {
+            *counts.entry(kind.to_string()).or_default() += 1;
+        };
         // Config first (providers and Roles the Tools may name), then
         // modules (Tools load them), then the rest.
         let incoming: Config = serde_json::from_value(bundle["config"].clone()).unwrap_or_default();
-        let (mut providers, mut roles, mut servers) = (0, 0, 0);
         let mut server_review = Vec::new();
         self.with_config_edit(|cfg| {
             for (k, v) in incoming.providers {
                 if !cfg.providers.contains_key(&k) {
                     cfg.providers.insert(k, v);
-                    providers += 1;
+                    count(&mut added, "providers");
+                } else {
+                    count(&mut skipped_existing, "providers");
                 }
             }
             for (k, v) in incoming.roles {
                 if !cfg.roles.contains_key(&k) {
                     cfg.roles.insert(k, v);
-                    roles += 1;
+                    count(&mut added, "roles");
+                } else {
+                    count(&mut skipped_existing, "roles");
                 }
             }
             for (k, mut v) in incoming.mcp.servers {
@@ -10549,15 +10604,16 @@ impl Daemon {
                     v.trusted = false;
                     server_review.push(json!({"name":k, "target":crate::mcp_catalog::safe_target(&v), "disabled":true, "trusted":false}));
                     cfg.mcp.servers.insert(k, v);
-                    servers += 1;
+                    count(&mut added, "mcp_servers");
+                } else {
+                    count(&mut skipped_existing, "mcp_servers");
                 }
             }
-            Ok(providers + roles + servers > 0)
+            Ok(added["providers"] + added["roles"] + added["mcp_servers"] > 0)
         })?;
-        if providers + roles + servers > 0 {
+        if added["providers"] + added["roles"] + added["mcp_servers"] > 0 {
             self.broadcast(Event::McpServersChanged);
         }
-        let mut modules = 0;
         for m in list("modules") {
             let (Some(name), Some(code)) = (m["name"].as_str(), m["code"].as_str()) else {
                 continue;
@@ -10566,6 +10622,7 @@ impl Daemon {
                 .with_reader(|st| st.get_module_by_name(name))?
                 .is_some()
             {
+                count(&mut skipped_existing, "modules");
                 continue;
             }
             match self.with_store(|st| {
@@ -10576,17 +10633,25 @@ impl Daemon {
                     "import",
                 )
             }) {
-                Ok(_) => modules += 1,
+                Ok(_) => count(&mut added, "modules"),
                 Err(e) => failed.push(format!("module {name}: {e}")),
             }
         }
         let cfg = self.config()?;
-        let mut tools = 0;
         let mut capability_families = std::collections::BTreeMap::<String, usize>::new();
         for t in list("tools") {
+            if let Some(name) = t["name"].as_str() {
+                if self
+                    .with_reader(|st| st.get_tool_by_name(name))?
+                    .is_some()
+                {
+                    count(&mut skipped_existing, "tools");
+                    continue;
+                }
+            }
             match self.import_one_tool(&t, &cfg).await {
                 Ok(_) => {
-                    tools += 1;
+                    count(&mut added, "tools");
                     for cap in t["capabilities"]
                         .as_array()
                         .into_iter()
@@ -10601,31 +10666,89 @@ impl Daemon {
                 Err(e) => failed.push(format!("tool {}: {e}", t["name"].as_str().unwrap_or("?"))),
             }
         }
-        let mut skills = 0;
         for b in list("skills") {
+            if b["format"].as_str() == Some("formless.skill/1") {
+                if let Some(name) = b["name"].as_str() {
+                    if self.with_reader(|st| st.get_skill(name))?.is_some() {
+                        count(&mut skipped_existing, "skills");
+                        continue;
+                    }
+                }
+            }
             let res = crate::skills::prepare_bundle(&self.paths, &b).and_then(|staged| {
                 self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "import"))
             });
             match res {
-                Ok(_) => skills += 1,
+                Ok(_) => count(&mut added, "skills"),
                 Err(e) => failed.push(format!("skill {}: {e}", b["name"].as_str().unwrap_or("?"))),
             }
         }
-        let mut memories = 0;
+        let mut memory_keys = self.with_reader(|st| {
+            Ok(st
+                .list_memories()?
+                .into_iter()
+                .map(|memory| {
+                    (
+                        memory.scope,
+                        crate::memory::dedup_key(&memory.text),
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>())
+        })?;
         for m in list("memories") {
             let text = m["text"].as_str().unwrap_or_default();
             let scope = m["scope"].as_str().unwrap_or("global");
+            let key = (scope.to_string(), crate::memory::dedup_key(text));
+            if !memory_keys.insert(key.clone()) {
+                count(&mut skipped_existing, "memories");
+                continue;
+            }
             match self.with_store(|st| st.add_memory(text, scope, "import", None)) {
-                Ok((_, true)) => memories += 1,
-                Ok(_) => {}
-                Err(e) => failed.push(format!("memory: {e}")),
+                Ok((_, true)) => count(&mut added, "memories"),
+                Ok(_) => count(&mut skipped_existing, "memories"),
+                Err(e) => {
+                    memory_keys.remove(&key);
+                    failed.push(format!("memory: {e}"));
+                }
             }
         }
-        let mut jobs = 0;
+        let delivery_identity = |deliver: Option<&Value>| {
+            deliver
+                .filter(|value| {
+                    !value.is_null()
+                        && !value.as_object().is_some_and(|object| object.is_empty())
+                })
+                .map(Value::to_string)
+                .unwrap_or_default()
+        };
+        let mut job_identities = self.with_reader(|st| {
+            let mut identities = std::collections::BTreeSet::new();
+            for job in st.list_jobs()? {
+                if let Some(cron) = job.cron {
+                    identities.insert((
+                        job.prompt,
+                        cron,
+                        job.overlap,
+                        delivery_identity(job.deliver.as_ref()),
+                    ));
+                }
+            }
+            Ok(identities)
+        })?;
         for j in list("jobs") {
             let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
                 continue;
             };
+            let identity = (
+                prompt.to_string(),
+                cron.to_string(),
+                j["overlap"].as_str().unwrap_or("skip").to_string(),
+                delivery_identity(j.get("deliver")),
+            );
+            if job_identities.contains(&identity) {
+                count(&mut skipped_existing, "jobs");
+                continue;
+            }
             let next = crate::jobs::first_run(Some(cron), None, chrono::Local::now())
                 .ok()
                 .map(|t| t.to_rfc3339());
@@ -10645,14 +10768,32 @@ impl Daemon {
                 Ok(())
             });
             match made {
-                Ok(()) => jobs += 1,
+                Ok(()) => {
+                    count(&mut added, "jobs");
+                    job_identities.insert(identity);
+                }
                 Err(e) => failed.push(format!("job {cron}: {e}")),
             }
         }
-        let mut sessions = 0;
+        let mut session_identities = std::collections::BTreeSet::new();
+        for session in self.with_reader(|st| st.list_sessions())? {
+            let exported = self.session_bundle(&session.id)?;
+            session_identities.insert(serde_json::to_string(&Self::import_session_identity(&exported))?);
+        }
         for b in list("sessions") {
+            let identity = serde_json::to_string(&Self::import_session_identity(&b))?;
+            if session_identities.contains(&identity) {
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
             match self.import_session_bundle(&b) {
-                Ok(_) => sessions += 1,
+                Ok(session) => {
+                    count(&mut added, "sessions");
+                    let exported = self.session_bundle(&session.id)?;
+                    session_identities.insert(
+                        serde_json::to_string(&Self::import_session_identity(&exported))?,
+                    );
+                }
                 Err(e) => failed.push(format!(
                     "session {}: {e}",
                     b["name"].as_str().unwrap_or("?")
@@ -10663,16 +10804,17 @@ impl Daemon {
             st.audit(
                 "user",
                 "import_all",
-                &format!("{tools} tools, {skills} skills"),
+                &format!("{} tools, {} skills", added["tools"], added["skills"]),
             )
         });
         self.broadcast(Event::SkillsChanged);
         self.broadcast(Event::MemoryUpdated);
         self.broadcast(Event::JobsChanged);
         Ok(json!({
-            "tools": tools, "modules": modules, "skills": skills, "memories": memories,
-            "jobs": jobs, "sessions": sessions, "providers": providers, "roles": roles,
-            "mcp_servers": servers, "blanked": bundle["blanked"], "failed": failed,
+            "tools": added["tools"], "modules": added["modules"], "skills": added["skills"], "memories": added["memories"],
+            "jobs": added["jobs"], "sessions": added["sessions"], "providers": added["providers"], "roles": added["roles"],
+            "mcp_servers": added["mcp_servers"], "added": added, "skipped_existing": skipped_existing,
+            "blanked": bundle["blanked"], "failed": failed,
             "mcp_review": server_review, "tool_capability_families": capability_families,
             "review_notice": "MCP servers are disabled and untrusted; inspect each command before enabling. Jobs are paused and Skills disabled.",
         }))

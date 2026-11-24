@@ -57,6 +57,14 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         store
             .add_memory("Uses pnpm, not npm", "global", "user", None)
             .unwrap();
+        formless_core::skills::install_text(
+            &from,
+            &store,
+            "---\nname: travel-guide\ndescription: Plan a trip.\n---\n# Travel guide\n",
+            "local",
+            "user",
+        )
+        .unwrap();
         let s = store.create_session(Some("History".into())).unwrap();
         store.append_message(&s.id, "user", "hello there").unwrap();
         store
@@ -98,7 +106,12 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
     fresh.naming.enabled = false;
     fresh.save(&to).unwrap();
     let b = Arc::new(formless_core::daemon::Daemon::new(to.clone()).unwrap());
-    let r = b.handle(Request::ImportAll { bundle }).await.unwrap();
+    let r = b
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
     assert_eq!(r["failed"], json!([]), "{r}");
     assert_eq!(
         (
@@ -123,6 +136,22 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         (Some(1), Some(1), Some(1)),
         "{r}"
     );
+    assert_eq!(
+        r["added"],
+        json!({
+            "providers": 1,
+            "roles": 1,
+            "mcp_servers": 1,
+            "modules": 1,
+            "tools": 1,
+            "skills": 1,
+            "memories": 1,
+            "jobs": 1,
+            "sessions": 1,
+        }),
+        "{r}"
+    );
+    assert_eq!(r["skipped_existing"]["skills"], 0);
     let store = Store::open(&to.db_file()).unwrap();
     assert!(store.get_tool_by_name("shout").unwrap().is_some());
     assert!(store.get_module_by_name("strutil").unwrap().is_some());
@@ -140,21 +169,79 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         cfg.mcp.servers["files"].env["TOKEN"], "",
         "blank, to fill in"
     );
-    // A second import adds no duplicate modules or config entries.
+    let skill_path = store.skill_path("travel-guide").unwrap().unwrap();
+    store
+        .add_skill_version(
+            "travel-guide",
+            "Updated trip planner.",
+            2,
+            &skill_path,
+            "local",
+            "user",
+            false,
+        )
+        .unwrap();
+    store.set_skill_enabled("travel-guide", true).unwrap();
+    let memory = store.list_memories().unwrap().remove(0);
+    store
+        .update_memory(&memory.id, None, None, Some(false))
+        .unwrap();
+
+    // Re-import skips existing entries without changing their current state.
     let again = b
-        .handle(Request::ImportAll {
-            bundle: a
-                .handle(Request::ExportAll { sessions: false })
-                .await
-                .unwrap(),
-        })
+        .handle(Request::ImportAll { bundle })
         .await
         .unwrap();
     assert_eq!(
-        (again["modules"].as_i64(), again["providers"].as_i64()),
-        (Some(0), Some(0)),
+        (
+            again["tools"].as_i64(),
+            again["modules"].as_i64(),
+            again["skills"].as_i64(),
+            again["memories"].as_i64(),
+            again["jobs"].as_i64(),
+            again["sessions"].as_i64(),
+            again["providers"].as_i64(),
+            again["roles"].as_i64(),
+            again["mcp_servers"].as_i64(),
+        ),
+        (Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)),
         "{again}"
     );
+    assert_eq!(
+        again["added"],
+        json!({
+            "providers": 0,
+            "roles": 0,
+            "mcp_servers": 0,
+            "modules": 0,
+            "tools": 0,
+            "skills": 0,
+            "memories": 0,
+            "jobs": 0,
+            "sessions": 0,
+        }),
+        "{again}"
+    );
+    assert_eq!(
+        again["skipped_existing"],
+        json!({
+            "providers": 1,
+            "roles": 1,
+            "mcp_servers": 1,
+            "modules": 1,
+            "tools": 1,
+            "skills": 1,
+            "memories": 1,
+            "jobs": 1,
+            "sessions": 1,
+        }),
+        "{again}"
+    );
+    let skill = store.get_skill("travel-guide").unwrap().unwrap();
+    assert_eq!((skill.version, skill.enabled), (2, true));
+    assert!(!store.get_memory(&memory.id).unwrap().unwrap().enabled);
+    assert_eq!(store.list_jobs().unwrap().len(), 1);
+    assert_eq!(store.list_sessions().unwrap().len(), 1);
 }
 
 /// A provider key whose provider was removed from the config by hand is

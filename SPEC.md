@@ -6471,10 +6471,15 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   `headers`); API keys never leave the keychain. `--sessions` adds every
   Session's transcript. `formless import-all FILE` (`ImportAll`) only
   adds: providers, Roles and MCP servers this machine lacks; modules
-  before Tools; Tools as imports (renamed on collision, §7.8); Skills
-  disabled for review; memories (duplicates skipped); jobs paused; and
-  Sessions as new ones. It reports counts, the values to fill in and
-  anything that failed.
+  before Tools; Tools as imports (renamed on collision for individual
+  imports, §7.8; import-all skips existing names); Skills disabled for
+  review unless their names already exist; memories (duplicates skipped);
+  jobs paused; and Sessions. Re-importing the same setup skips existing
+  entries, including jobs with the same prompt, schedule, overlap policy
+  and delivery target, and Sessions with the same name, model, reasoning
+  effort, transcript and checkpoints.
+  The result reports added and skipped-existing counts per kind, the values
+  to fill in and anything that failed.
 - **Deletion:** Session delete removes transcripts + Invocation payloads but
   keeps anonymised per-Tool tallies (payloads gone, counts stay). Tool purge
   removes everything incl. tallies. **Full reset** (Settings or
