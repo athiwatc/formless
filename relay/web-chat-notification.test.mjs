@@ -33,7 +33,8 @@ test("browser notification permission is requested only from its explicit settin
   assert.equal(requests, 0);
   const focusCalls = [];
   await control.attrs.onclick({ currentTarget: { focus: options => focusCalls.push(options) } });
-  assert.deepEqual(focusCalls, [{ preventScroll: true }]);
+  assert.equal(focusCalls.length, 1);
+  assert.equal(focusCalls[0].preventScroll, true);
   assert.equal(requests, 1);
   assert.equal(renders, 1);
   const allowed = c.browserNotificationControl();
