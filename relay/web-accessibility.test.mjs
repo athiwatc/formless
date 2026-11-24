@@ -208,24 +208,28 @@ test('artifact Load more retry reopens its viewer when the original dialog has c
   assert.deepEqual(requests.map(request => request.offset), [0, 5, 0]);
 });
 
-test('live tool disclosure separates status, duration, and name in every state', () => {
+test('live tool disclosure labels arguments and subagent progress separately in every state', () => {
   const { c } = fixture();
   c.document = { createTextNode: data => ({ data }) };
   c.liveRender = { rows: new Map() };
   vm.runInContext(fn('liveToolRow'), c);
   vm.runInContext(fn('updateLiveTool'), c);
+  function prepareRow(tool) {
+    const row = c.liveToolRow(tool);
+    row.node.style = {};
+    row.node.dataset = {};
+    row.summary.firstChild = row.summary.children[0];
+    const depthMarker = row.summary.firstChild;
+    depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
+    depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
+    row.mark.style = {};
+    row.payloadInitialized = true;
+    row.payloadArgs = tool.arguments;
+    row.payloadSubagent = tool.subagent;
+    return row;
+  }
   const tool = { status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
-  const row = c.liveToolRow(tool);
-  row.node.style = {};
-  row.node.dataset = {};
-  row.summary.firstChild = row.summary.children[0];
-  const depthMarker = row.summary.firstChild;
-  depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
-  depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
-  row.mark.style = {};
-  row.payloadInitialized = true;
-  row.payloadArgs = tool.arguments;
-  row.payloadSubagent = undefined;
+  const row = prepareRow(tool);
 
   for (const [status, elapsedMs, expected] of [
     ['running', null, 'Running · 2s'],
@@ -237,6 +241,7 @@ test('live tool disclosure separates status, duration, and name in every state',
     c.updateLiveTool(row, 0);
     const name = accessibleText(row.summary);
     assert.ok(name.startsWith(expected + ', tool: check_timer, arguments: args'), name);
+    assert.doesNotMatch(name, /progress:/);
     assert.doesNotMatch(name, /(?:2s|1\.2s|5\.6s)check_timer/);
     assert.equal((name.match(/(?:2s|1\.2s|5\.6s)/g) || []).length, 1, name);
   }
@@ -245,6 +250,13 @@ test('live tool disclosure separates status, duration, and name in every state',
   tool.elapsedMs = null;
   c.updateLiveTool(row, 0);
   assert.doesNotMatch(accessibleText(row.summary), /arguments:/);
+
+  const subagent = { status: 'running', name: 'sub-agent: worker', version: 0, arguments: '', depth: 0, started: 0, subagent: 'child', step: 'step 2: answering' };
+  const subagentRow = prepareRow(subagent);
+  c.updateLiveTool(subagentRow, 0);
+  const subagentName = accessibleText(subagentRow.summary);
+  assert.ok(subagentName.startsWith('Running · 2s, tool: sub-agent: worker, progress: step 2: answering'), subagentName);
+  assert.doesNotMatch(subagentName, /arguments:/);
 });
 
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {

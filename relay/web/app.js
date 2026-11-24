@@ -5116,8 +5116,9 @@
     const args = document.createTextNode("");
     const statusText = document.createTextNode("");
     const status = h("span", { class: "sr-only", "data-live-status": "" }, statusText);
-    const argsLabel = h("span", { class: "sr-only" }, ", arguments: ");
-    argsLabel.hidden = true;
+    const detailLabelText = document.createTextNode(", arguments: ");
+    const detailLabel = h("span", { class: "sr-only" }, detailLabelText);
+    detailLabel.hidden = true;
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -5127,9 +5128,9 @@
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
     const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
-      h("span", { class: "sr-only" }, ", tool: "), h("span", { class: "tname" }, name), argsLabel, h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
+      h("span", { class: "sr-only" }, ", tool: "), h("span", { class: "tname" }, name), detailLabel, h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, argsLabel, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, detailLabel, detailLabelText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
@@ -5162,7 +5163,8 @@
     updateText(row.status, status + " · " + duration);
     const args = t.subagent ? t.step || "" : summarizeArgs(t.arguments || "");
     updateText(row.args, args);
-    if (row.argsLabel.hidden !== !args) row.argsLabel.hidden = !args;
+    updateText(row.detailLabelText, t.subagent ? ", progress: " : ", arguments: ");
+    if (row.detailLabel.hidden !== !args) row.detailLabel.hidden = !args;
     if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
     if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
     const hideProgress = !running || !t.progress;
