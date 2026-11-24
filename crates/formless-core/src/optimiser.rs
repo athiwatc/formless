@@ -334,50 +334,25 @@ impl Daemon {
 
     async fn generate_proposal_inner(self: &Arc<Self>, cfg: &Config) -> Result<()> {
         // Signals: per-Tool metrics + recent recorded failure patterns.
-        let mut tool_signals = String::from("Recent signals:\n");
-        let mut narrow = Vec::new();
         let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
         let ranked = top_tool_signals(&tools);
+        let mut replay_examples = Vec::new();
         for tool in &ranked {
-            tool_signals.push_str(&format!(
-                "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
-                tool.name,
-                tool.invocations,
-                tool.success,
-                tool.success_rate,
-                tool.failure,
-                tool.validation_failures,
-                tool.denied,
-                tool.sessions
-            ));
             if tool.failure > 0 {
                 if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
-                    for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
-                        tool_signals.push_str(&format!(
-                            "  failure tag={} error={}\n",
-                            f.tag,
-                            f.error.chars().take(300).collect::<String>()
-                        ));
-                    }
+                    replay_examples.push((
+                        tool.id.clone(),
+                        replay
+                            .iter()
+                            .filter(|item| !item.recorded_success)
+                            .take(4)
+                            .map(|item| (item.tag.clone(), item.error.clone()))
+                            .collect(),
+                    ));
                 }
             }
         }
-        for tool in &ranked {
-            if tool.sessions == 1 && tool.invocations >= 3 {
-                narrow.push(tool.name.clone());
-            }
-        }
-        if !narrow.is_empty() {
-            tool_signals.push_str(&format!(
-                "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
-                 likely hardcoded paths/hosts/names instead of input parameters): {}\n",
-                narrow.join(", ")
-            ));
-        }
-        if tool_signals.lines().count() <= 1 {
-            tool_signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
-        }
-        let mut signals = capped_tool_signals(tool_signals);
+        let mut signals = assemble_tool_signal_section(&ranked, &replay_examples);
         // Scripts run again and again but never saved (§7.12).
         let recurring = self
             .with_store(|st| st.recurring_scripts(cfg.scripts.recurrence_threshold, 5))
@@ -2001,6 +1976,53 @@ fn capped_tool_signals(text: String) -> String {
     cap_signal_chars(text, MAX_PROPOSAL_TOOL_SIGNAL_CHARS)
 }
 
+fn assemble_tool_signal_section(
+    ranked: &[&crate::storage::RegistryToolSummary],
+    replay_examples: &[(String, Vec<(String, String)>)],
+) -> String {
+    let mut signals = String::from("Recent signals:\n");
+    for tool in ranked {
+        signals.push_str(&format!(
+            "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
+            tool.name,
+            tool.invocations,
+            tool.success,
+            tool.success_rate,
+            tool.failure,
+            tool.validation_failures,
+            tool.denied,
+            tool.sessions
+        ));
+    }
+    let narrow: Vec<_> = ranked
+        .iter()
+        .filter(|tool| tool.sessions == 1 && tool.invocations >= 3)
+        .map(|tool| tool.name.as_str())
+        .collect();
+    if !narrow.is_empty() {
+        signals.push_str(&format!(
+            "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
+             likely hardcoded paths/hosts/names instead of input parameters): {}\n",
+            narrow.join(", ")
+        ));
+    }
+    for tool in ranked {
+        if let Some((_, examples)) = replay_examples.iter().find(|(id, _)| id == &tool.id) {
+            for (tag, error) in examples.iter().take(4) {
+                signals.push_str(&format!(
+                    "  failure tag={} error={}\n",
+                    tag,
+                    error.chars().take(300).collect::<String>()
+                ));
+            }
+        }
+    }
+    if ranked.is_empty() {
+        signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
+    }
+    capped_tool_signals(signals)
+}
+
 /// Prompt-proposal promotion bar: the candidate eval score must beat the
 /// baseline by `margin_points` (scores are 0..1), or match a perfect
 /// baseline with a perfect score.
@@ -2251,6 +2273,36 @@ mod registry_signal_tests {
         let capped = cap_signal_chars("界".repeat(100), 16);
         assert_eq!(capped.chars().count(), 16);
         assert!(capped.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn proposal_tool_assembly_keeps_warnings_before_verbose_replay_examples() {
+        let tools: Vec<_> = (0..16)
+            .map(|index| {
+                let mut tool = tool(&format!("narrow-{index:02}"), 4, 4);
+                tool.id = format!("tool-id-{index:02}");
+                tool.sessions = 1;
+                tool
+            })
+            .collect();
+        let ranked = top_tool_signals(&tools);
+        let replay_examples: Vec<_> = ranked
+            .iter()
+            .map(|tool| {
+                (
+                    tool.id.clone(),
+                    vec![("failure-tag".into(), "x".repeat(300)); 4],
+                )
+            })
+            .collect();
+
+        let signals = assemble_tool_signal_section(&ranked, &replay_examples);
+
+        let warning = signals.find("Possibly over-specific Tools").unwrap();
+        let failure = signals.find("failure tag=").unwrap();
+        assert!(warning < failure);
+        assert!(signals.contains("narrow-00"));
+        assert!(signals.chars().count() <= MAX_PROPOSAL_TOOL_SIGNAL_CHARS);
     }
 
     #[test]
