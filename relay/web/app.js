@@ -1733,7 +1733,7 @@
     }, { newContent: false, geometryChanged });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
-    if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor();
+    if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor() || reading.anchor;
   }
   function scheduleViewportSync() {
     if (!viewportFrame) viewportFrame = requestAnimationFrame(syncViewport);
@@ -5499,7 +5499,7 @@
         const whole = Math.trunc(adjustment);
         setReadingAdjustment(adjustment - whole);
         if (whole) writeReadingTop(box.scrollTop - whole);
-      } else if (Math.abs(residual) >= 1) reading.anchor = captureReadingAnchor();
+      } else if (Math.abs(residual) >= 1) reading.anchor = captureReadingAnchor() || reading.anchor;
       return true;
     }
     // During a Session snapshot load, retain the anchor until its message exists.
@@ -5726,11 +5726,11 @@
     if (now < reading.intentUntil) {
       if (!bottom) S.follow = false;
       else if (reading.direction >= 0) resumeReadingFollow();
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
       updateReadingPill();
     } else if (S.follow && !bottom) {
       S.follow = false;
-      reading.anchor = captureReadingAnchor();
+      reading.anchor = captureReadingAnchor() || reading.anchor;
     } else settleReadingLayout();
   });
   printMedia.addEventListener("change", () => { if (!printMedia.matches) requestAnimationFrame(settleReadingLayout); });

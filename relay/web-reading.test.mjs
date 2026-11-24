@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 const source=readFileSync(new URL('./web/app.js',import.meta.url),'utf8');
 function fn(name){const start=source.indexOf('  function '+name+'(');assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);}
 function asyncFn(name){const start=source.indexOf('  async function '+name+'(');assert.ok(start>=0,name);return source.slice(start,source.indexOf('\n  }',start)+4);}
+function transcriptScrollHandler(){const marker='  $("transcript").addEventListener("scroll", () => {';const start=source.indexOf(marker);assert.ok(start>=0);const end=source.indexOf('\n  });',start);assert.ok(end>=0);return source.slice(start,end+'\n  });'.length);}
 const text='A distinct streamed paragraph. '.repeat(20);
 const stamp=()=>({block:1,length:text.length,head:text.slice(0,128),tail:text.slice(-128),afterSeq:10});
 function fixture(){const roots=[],live={querySelectorAll:()=>[]};const box={contains:n=>roots.some(r=>r===n||r.blocks.includes(n)),querySelector:()=>live,querySelectorAll:()=>roots};
@@ -102,7 +103,8 @@ function captureFixture(rows, bounds, visible = true) {
     "readingStreamMatches", "remapReadingStream", "resolveReadingBlock", "writeReadingTop", "restoreReadingAnchor",
     "readingInput",
     "observeReadingNodes", "readingDiagramLoaded", "readingDetailsWillToggle", "watchReadingDetails", "readingResizeChanged",
-    "setReadingAdjustment", "resetReadingSession", "withTranscriptLayout", "scheduleViewportGeometrySync"].map(fn).join("\n"), c);
+    "setReadingAdjustment", "resetReadingSession", "withTranscriptLayout", "scheduleViewportGeometrySync", "syncViewport"].map(fn).join("\n"), c);
+  vm.runInContext(transcriptScrollHandler(), c);
   c.watchReadingDetails(box);
   return {
     capture(nextBounds, scrollTop) {
@@ -132,6 +134,22 @@ function captureFixture(rows, bounds, visible = true) {
     setScrollTop(value) { box.scrollTop = value; },
     input(direction) { c.readingInput(direction); },
     flushFrames() { while (frames.size) { const [id, callback] = frames.entries().next().value; frames.delete(id); callback(); } },
+    runSyncViewport() {
+      const root = { clientWidth: 800, setAttribute() {}, toggleAttribute() {} };
+      const composer = { contains: () => false, getBoundingClientRect: () => ({ top: 550, bottom: 600, height: 50, width: 800 }),
+        style: { removeProperty() {} } };
+      const chat = { getClientRects: () => [], getBoundingClientRect: () => ({ top: 0, bottom: 600 }) };
+      const input = { getBoundingClientRect: () => ({ width: 800 }) };
+      c.document = { hidden: false, documentElement: root, activeElement: null };
+      c.matchMedia = () => ({ matches: false });
+      c.viewportFrame = 1; c.viewportPrinting = false; c.viewportGeometryPending = false;
+      c.viewportBounds = () => ({ left: 0, top: 0, right: 800, bottom: 600, width: 800, height: 600, scale: 1 });
+      c.safeViewportBounds = () => ({ left: 0, top: 0, right: 800, bottom: 600, width: 800, height: 600 });
+      c.getComputedStyle = () => ({ fontSize: "16px" });
+      c.viewportVariable = () => false; c.positionPopover = () => {}; c.activeDialog = () => null;
+      c.$ = id => ({ transcript: box, composer, "view-chat": chat, input })[id] || box;
+      c.syncViewport();
+    },
     saveAnchor() { reading.anchor = c.captureReadingAnchor(); return reading.anchor; },
     restoreAnchor() { return c.restoreReadingAnchor(); },
     savedAnchor(id) {
@@ -233,7 +251,7 @@ function sessionLifecycleFixture(rowsBySession, bounds) {
     fixture.replaceRows(ids.map(id => rowById.get(id)).filter(Boolean));
     if (!ids.length && c.S.current === "long" && c.S.sessionLoad?.status === "pending") {
       box.scrollTop = 0;
-      c.readingInput(-1);
+      fixture.replaceRows([{ ...rect(0, 24), live: true }]);
     }
     mutationRecords.push({ type: "childList", target: box, addedNodes: [], removedNodes: [] });
   };
@@ -486,7 +504,7 @@ test("real openSession and renderHistory preserve Long and Short bookmarks acros
   const longLoad = c.openSession("long");
   assert.equal(c.S.current, "long");
   assert.equal(c.S.messages.length, 0);
-  fixture.flushFrames();
+  assert.equal(fixture.rootCount, 1);
   assertBookmark(fixture.savedAnchor("short").candidates[0], "short-065", 27.05);
   const pendingLong = trace.findLast(entry => entry.phase === "get_session:long");
   assert.equal(pendingLong.status, "pending");
@@ -499,6 +517,19 @@ test("real openSession and renderHistory preserve Long and Short bookmarks acros
   assert.equal(c.reading.inputFrame, 0);
   assert.equal(c.reading.intentUntil, 0);
   assert.equal(c.captureReadingAnchor(), null);
+  fixture.runSyncViewport();
+  assertBookmark(c.reading.anchor.candidates[0], "long-006", 24.34);
+  assert.equal(c.S.follow, false);
+  const box = c.$("transcript");
+  box.clientHeight = 300;
+  box.scrollHeight = 30000;
+  c.reading.intentUntil = 100;
+  c.reading.direction = -1;
+  fixture.dispatch("scroll", {});
+  assertBookmark(c.reading.anchor.candidates[0], "long-006", 24.34);
+  assert.equal(c.S.follow, false);
+  assert.equal(c.reading.intentUntil, 100);
+  c.performance.now = () => 200;
   app.resolve("long");
   await longLoad;
   assert.equal(fixture.capture().top, 600, JSON.stringify({ anchor: { top: c.reading.anchor?.top,
