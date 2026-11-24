@@ -9944,6 +9944,17 @@ impl App {
                 editor.vim.cancel_pending_argument();
             }
         }
+        if self.view == View::Settings && self.settings_download_armed {
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                self.settings_download_armed = false;
+            } else {
+                self.settings_key(key);
+                return;
+            }
+        }
         if self.topic.has_permission()
             && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
@@ -25630,6 +25641,58 @@ mod tests {
         app.key(key(KeyCode::Char('y')));
         assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
         assert!(!app.settings_download_armed);
+    }
+
+    #[test]
+    fn naming_auto_download_confirmation_precedes_pending_approval_decision() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.on_event(Event::ApprovalRequested {
+            context: None,
+            approval_id: "pending-approval".into(),
+            session_id: "s1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+            capabilities: Vec::new(),
+            memory_mb: 256,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
+            tool_id: Some("tool-1".into()),
+            batch: None,
+            path_options: Vec::new(),
+        });
+        assert_eq!(app.view, View::Settings);
+        assert!(app.settings_download_armed);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
+        assert_eq!(
+            app.approvals.front().unwrap().approval_id,
+            "pending-approval"
+        );
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            request.request,
+            Request::SetSetting { key, value }
+                if key == "naming.auto_download" && value == serde_json::json!(true)
+        ));
+        assert!(sent.try_recv().is_err());
     }
 
     #[test]
