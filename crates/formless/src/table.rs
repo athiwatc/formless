@@ -67,14 +67,14 @@ impl Tone {
 }
 
 pub struct Table {
-    headers: Vec<String>,
+    headers: Vec<&'static str>,
     rows: Vec<Vec<(String, Tone)>>,
 }
 
 impl Table {
-    pub fn new(headers: &[&str]) -> Self {
+    pub fn new(headers: &[&'static str]) -> Self {
         Self {
-            headers: headers.iter().map(|header| (*header).to_owned()).collect(),
+            headers: headers.to_vec(),
             rows: Vec::new(),
         }
     }
