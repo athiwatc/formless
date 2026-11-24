@@ -205,7 +205,10 @@ mod tests {
             assert_eq!(unsafe { GetConsoleCP() }, 65001);
             assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
             let mut enabled_mode = 0;
-            assert_ne!(unsafe { GetConsoleMode(output_handle, &mut enabled_mode) }, 0);
+            assert_ne!(
+                unsafe { GetConsoleMode(output_handle, &mut enabled_mode) },
+                0
+            );
             assert_ne!(enabled_mode & ENABLE_PROCESSED_OUTPUT, 0);
             assert_ne!(enabled_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
 
@@ -234,7 +237,10 @@ mod tests {
             assert_eq!(unsafe { GetConsoleCP() }, page);
             assert_eq!(unsafe { GetConsoleOutputCP() }, page);
             let mut restored_mode = 0;
-            assert_ne!(unsafe { GetConsoleMode(output_handle, &mut restored_mode) }, 0);
+            assert_ne!(
+                unsafe { GetConsoleMode(output_handle, &mut restored_mode) },
+                0
+            );
             assert_eq!(restored_mode, original_mode);
         }
     }
