@@ -5297,11 +5297,43 @@
     reading.rootTree = null;
     reading.rootTreeSize = 0;
   }
+  function setReadingRootMaximum(index, value) {
+    let position = reading.rootTreeSize + index;
+    reading.rootTree[position] = value;
+    for (position >>= 1; position > 0; position >>= 1) {
+      reading.rootTree[position] = Math.max(reading.rootTree[position * 2], reading.rootTree[position * 2 + 1]);
+    }
+  }
+  function markReadingRootDirty(index) {
+    if (!reading.roots?.[index] || !reading.rootTree) return false;
+    reading.roots[index].dirty = true;
+    // Unknown geometry stays searchable; traversal refreshes this leaf only
+    // if it could be one of the next four candidates.
+    setReadingRootMaximum(index, Infinity);
+    return true;
+  }
+  function markLiveReadingRootDirty(records) {
+    if (!reading.roots?.length || !reading.rootTree || !records.length) return false;
+    const index = reading.roots.length - 1, root = reading.roots[index].node;
+    if (!root.hasAttribute("data-live-root")) return false;
+    const selector = "[data-message-id], [data-live-root]";
+    const local = records.every(record => {
+      const target = record.type === "characterData" ? record.target.parentElement : record.target;
+      if (!["attributes", "characterData", "childList"].includes(record.type)
+        || !target?.closest?.(selector) || target.closest(selector) !== root) return false;
+      if (record.type === "attributes" && ["data-message-id", "data-live-root"].includes(record.attributeName)) return false;
+      if (record.type === "childList" && [...record.addedNodes, ...record.removedNodes].some(node =>
+        node.matches?.(selector) || node.querySelector?.(selector))) return false;
+      return true;
+    });
+    return local && markReadingRootDirty(index);
+  }
   function readingGeometryChanged(records) {
     const box = $("transcript");
-    const changed = records.some(record => record.type !== "attributes" || record.target !== box || record.attributeName !== "style");
-    if (changed) invalidateReadingRoots();
-    return changed;
+    const changed = records.filter(record => record.type !== "attributes" || record.target !== box || record.attributeName !== "style");
+    if (!changed.length) return false;
+    if (!markLiveReadingRootDirty(changed)) invalidateReadingRoots();
+    return true;
   }
   function readingDiagramLoaded(img, isCurrent) {
     if (!isCurrent() || !$("transcript").contains(img)) return;
@@ -5324,13 +5356,14 @@
       // reading-offset translation only change the query threshold.
       reading.roots = [...box.querySelectorAll("[data-message-id], [data-live-root]")].map(node => {
         const rect = node.getBoundingClientRect();
-        return { node, height: rect.height, bottom: rect.bottom - origin + scrollTop - adjustment };
+        return { node, height: rect.height, bottom: rect.bottom - origin + scrollTop - adjustment, dirty: false };
       });
       reading.rootTreeSize = 1;
       while (reading.rootTreeSize < reading.roots.length) reading.rootTreeSize *= 2;
       reading.rootTree = Array(reading.rootTreeSize * 2).fill(-Infinity);
       for (let index = 0; index < reading.roots.length; index++) {
-        if (reading.roots[index].height > 0) reading.rootTree[reading.rootTreeSize + index] = reading.roots[index].bottom;
+        if (reading.roots[index].dirty) reading.rootTree[reading.rootTreeSize + index] = Infinity;
+        else if (reading.roots[index].height > 0) reading.rootTree[reading.rootTreeSize + index] = reading.roots[index].bottom;
       }
       // Range maxima preserve selector order without assuming DOM order is
       // geometric order, and skip whole ranges that cannot qualify.
@@ -5339,6 +5372,13 @@
       }
     }
     return reading.roots;
+  }
+  function refreshReadingRoot(index, box, origin) {
+    const root = reading.roots[index], rect = root.node.getBoundingClientRect();
+    root.height = rect.height;
+    root.bottom = rect.bottom - origin + box.scrollTop - reading.adjustment;
+    root.dirty = false;
+    setReadingRootMaximum(index, root.height > 0 ? root.bottom : -Infinity);
   }
   function firstReadingRoot(start, threshold, left, right, index) {
     if (right <= start || reading.rootTree[index] <= threshold) return -1;
@@ -5360,6 +5400,10 @@
     for (let start = 0; messages.length < 4;) {
       const index = firstReadingRoot(start, threshold, 0, reading.rootTreeSize, 1);
       if (index < 0) break;
+      if (roots[index].dirty) {
+        refreshReadingRoot(index, box, origin);
+        continue;
+      }
       messages.push(roots[index].node);
       start = index + 1;
     }
@@ -5612,8 +5656,11 @@
     attributeFilter: ["open", "class", "style", "hidden", "data-message-id", "data-live-root"] };
   readingChanges.observe($("transcript"), readingMutationOptions);
   readingRootChanges.observe($("transcript"), readingMutationOptions);
-  function readingResizeChanged() {
-    invalidateReadingRoots();
+  function readingResizeChanged(entries = []) {
+    const last = reading.roots?.at(-1);
+    if (entries.length && last?.node.hasAttribute("data-live-root") && entries.every(entry => entry.target === last.node)) {
+      markReadingRootDirty(reading.roots.length - 1);
+    } else invalidateReadingRoots();
     settleReadingLayout();
   }
   const readingResize = new ResizeObserver(readingResizeChanged);

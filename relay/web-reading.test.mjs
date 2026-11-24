@@ -55,12 +55,16 @@ function captureFixture(rows, bounds, visible = true) {
     const rect = () => ({ top: row.top + reading.adjustment, bottom: row.bottom + reading.adjustment, height: row.height });
     const inner = { getBoundingClientRect: () => ({ ...rect(), top: rect().top + 2 }), contains: () => false };
     const block = { getBoundingClientRect: rect, contains: child => child === inner };
-    return {
+    let root;
+    const streamText = { nodeType: 3, parentElement: { closest: selector => selector === "[data-message-id], [data-live-root]" ? root : null } };
+    root = {
       dataset: row.live ? {} : { messageId: String(index) },
       hasAttribute: attr => row.live && attr === "data-live-root",
       getBoundingClientRect: () => { reads.push(index); return rect(); },
       querySelectorAll: () => [block, inner],
     };
+    if (row.live) root.streamText = streamText;
+    return root;
   };
   rows.forEach((row, index) => roots.push(makeRoot(row, index)));
   const reading = { session: "A", saved: new Map(), anchor: null, unseen: new Map(), unseenIds: new Set(), deferred: new Map(),
@@ -84,7 +88,8 @@ function captureFixture(rows, bounds, visible = true) {
     restoreReadingAnchor() {}, markNewOutput() {}, updateReadingPill() {}, settleReadingLayout() { settles++; },
     performance: { now: () => 0 }, Node: { TEXT_NODE: 3 }, cancelAnimationFrame() {},
   });
-  vm.runInContext(["invalidateReadingRoots", "readingGeometryChanged", "readingRoots", "firstReadingRoot", "captureReadingAnchor",
+  vm.runInContext(["invalidateReadingRoots", "setReadingRootMaximum", "markReadingRootDirty", "markLiveReadingRootDirty",
+    "readingGeometryChanged", "readingRoots", "refreshReadingRoot", "firstReadingRoot", "captureReadingAnchor",
     "observeReadingNodes", "readingDiagramLoaded", "readingDetailsWillToggle", "watchReadingDetails", "readingResizeChanged",
     "setReadingAdjustment", "resetReadingSession", "withTranscriptLayout", "scheduleViewportGeometrySync"].map(fn).join("\n"), c);
   c.watchReadingDetails(box);
@@ -114,6 +119,8 @@ function captureFixture(rows, bounds, visible = true) {
     addContained(node) { contained.add(node); },
     loadDiagram(image, isCurrent = () => true) { c.readingDiagramLoaded(image, isCurrent); },
     resizeChanged() { c.readingResizeChanged(); },
+    streamMutation() { pendingGeometry.push({ type: "characterData", target: roots.at(-1).streamText }); },
+    streamResize() { c.readingResizeChanged([{ target: roots.at(-1) }]); },
     dispatch(type, event) { for (const { listener } of listeners.get(type) || []) listener(event); },
     summaryTarget() {
       const details = {};
@@ -156,6 +163,25 @@ test("anchor capture reuses indexed geometry for nearby and large jumps, preserv
   assert.deepEqual(appended.candidates.map(({ id }) => id), [String(appendedIndex)]);
   assert.equal(fixture.queries, 2);
   assert.equal(fixture.reads.length, rows.length * 2 + 1, "capture drains undelivered structural records before using cached geometry");
+});
+
+test("live stream invalidations do not remeasure roots past the cached history prefix", () => {
+  const rows = [rect(0, 100), rect(10, 200), rect(20, 300), rect(30, 400),
+    ...Array(1000).fill(rect(500, 600, 0)), rect(1000, 1200, 200, true)];
+  const fixture = captureFixture(rows, { top: 40, bottom: 100 });
+  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+  const measured = fixture.reads.length;
+  for (let update = 0; update < 4; update++) {
+    fixture.setRow(rows.length - 1, rect(1000, 2300 + update * 100, 1300 + update * 100, true));
+    fixture.streamMutation();
+    assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+    fixture.streamResize();
+    assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
+  }
+  assert.equal(fixture.queries, 1);
+  assert.equal(fixture.reads.length, measured, "stream mutations and live-root resizes do not trigger a full geometry scan");
+  assert.deepEqual(fixture.capture({ top: 1200, bottom: 1260 }).candidates.map(({ id }) => id), [null]);
+  assert.equal(fixture.reads.length, measured + 1, "the dirty live root is refreshed only when selection reaches it");
 });
 
 test("viewport layout invalidates synchronously when ResizeObserver has not delivered", () => {
