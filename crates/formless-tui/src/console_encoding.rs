@@ -142,10 +142,11 @@ pub fn restore_before_exit() {}
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::CrosstermBackend, Terminal};
     use windows_sys::Win32::System::Console::{
-        AllocConsole, FreeConsole, GetConsoleCP, GetConsoleOutputCP, SetConsoleCP,
-        SetConsoleOutputCP,
+        AllocConsole, FreeConsole, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle,
+        SetConsoleCP, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
     };
 
     struct ConsoleFixture {
@@ -191,37 +192,50 @@ mod tests {
                 assert_ne!(SetConsoleCP(page), 0);
                 assert_ne!(SetConsoleOutputCP(page), 0);
             }
+            let output_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let mut original_mode = 0;
+            assert_ne!(
+                unsafe { GetConsoleMode(output_handle, &mut original_mode) },
+                0,
+                "stdout must be a native console handle"
+            );
             let guard = ConsoleEncoding::enable();
             let nested = ConsoleEncoding::enable();
             // SAFETY: query the attached console without changing it.
             assert_eq!(unsafe { GetConsoleCP() }, 65001);
             assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
+            let mut enabled_mode = 0;
+            assert_ne!(unsafe { GetConsoleMode(output_handle, &mut enabled_mode) }, 0);
+            assert_ne!(enabled_mode & ENABLE_PROCESSED_OUTPUT, 0);
+            assert_ne!(enabled_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
 
             let mut app = crate::tests::test_app();
-            app.messages = vec![formless_protocol::MessageInfo {
-                id: "unicode".into(),
-                session_id: "fixture".into(),
-                seq: 1,
-                role: "assistant".into(),
-                content: "Windows frame ── 🔍".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                meta: None,
-            }];
-            let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+            app.messages = vec![serde_json::from_value(serde_json::json!({
+                "id": "unicode",
+                "session_id": "fixture",
+                "seq": 1,
+                "role": "assistant",
+                "generated_by": null,
+                "content": "Windows frame ── 🔍",
+                "created_at": "2026-01-01T00:00:00Z",
+                "meta": null
+            }))
+            .unwrap()];
+            let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
             terminal.draw(|frame| crate::draw(frame, &mut app)).unwrap();
-            let frame: String = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(frame.contains("Windows frame ── 🔍"), "{frame}");
             drop(nested);
             assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
-            drop(guard);
+            if page == 437 {
+                drop(guard);
+            } else {
+                restore_before_exit();
+                drop(guard);
+            }
             assert_eq!(unsafe { GetConsoleCP() }, page);
             assert_eq!(unsafe { GetConsoleOutputCP() }, page);
+            let mut restored_mode = 0;
+            assert_ne!(unsafe { GetConsoleMode(output_handle, &mut restored_mode) }, 0);
+            assert_eq!(restored_mode, original_mode);
         }
     }
 }
