@@ -3454,36 +3454,15 @@ impl Provider {
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();
                             let line = String::from_utf8_lossy(&raw);
-                            let line = line.trim();
-                            if line.is_empty() {
-                                // End of an event: a split field that never
-                                // became JSON is dropped, and said so.
-                                if !pending.is_empty() {
-                                    tracing::warn!("dropped an SSE event that is not JSON ({} bytes)", pending.len());
-                                    pending.clear();
-                                }
-                                continue;
-                            }
-                            if let Some(data) = line.strip_prefix("data:") {
-                                let data = data.trim();
-                                if data == "[DONE]" {if !self.cfg.responses(){chat_terminal.done=true;}continue;}
-                                // Several `data:` lines make one field (SSE): a
-                                // line that isn't JSON alone waits for the next.
-                                let joined = if pending.is_empty() {
-                                    data.to_string()
-                                } else {
-                                    format!("{pending}\n{data}")
-                                };
-                                let parsed = serde_json::from_str::<Value>(&joined);
-                                if parsed.is_err() {
-                                    if joined.len() > MAX_SSE_LINE {
-                                        return Err(anyhow!("provider stream event over {} MB", MAX_SSE_LINE / (1024 * 1024)));
+                            match parse_sse_data_line(&mut pending, &line)? {
+                                SseDataLine::Ignore => continue,
+                                SseDataLine::Done => {
+                                    if !self.cfg.responses() {
+                                        chat_terminal.done = true;
                                     }
-                                    pending = joined;
                                     continue;
                                 }
-                                pending.clear();
-                                if let Ok(v) = parsed {
+                                SseDataLine::Json(v) => {
                                     self.observe_probe_model(&v);
                                     // Error/incomplete events can carry usage too. Observe
                                     // before branches that retry or return, not just success.
@@ -4761,6 +4740,84 @@ pub fn known_model_meta(id: &str) -> Value {
 
 /// Longest stream line (or split event) accepted before failing (#614).
 const MAX_SSE_LINE: usize = 16 * 1024 * 1024;
+
+/// The result of parsing one data line in a provider's server-sent event stream.
+#[derive(Debug, PartialEq)]
+pub enum SseDataLine {
+    Ignore,
+    Done,
+    Json(Value),
+}
+
+/// Parse one server-sent event data line, retaining incomplete JSON in `pending`.
+pub fn parse_sse_data_line(pending: &mut String, line: &str) -> Result<SseDataLine> {
+    let line = line.trim();
+    if line.is_empty() {
+        if !pending.is_empty() {
+            tracing::warn!(
+                "dropped an SSE event that is not JSON ({} bytes)",
+                pending.len()
+            );
+            pending.clear();
+        }
+        return Ok(SseDataLine::Ignore);
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(SseDataLine::Ignore);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(SseDataLine::Done);
+    }
+    let joined = if pending.is_empty() {
+        data.to_string()
+    } else {
+        format!("{pending}\n{data}")
+    };
+    match serde_json::from_str::<Value>(&joined) {
+        Ok(value) => {
+            pending.clear();
+            Ok(SseDataLine::Json(value))
+        }
+        Err(_) if joined.len() > MAX_SSE_LINE => Err(anyhow!(
+            "provider stream event over {} MB",
+            MAX_SSE_LINE / (1024 * 1024)
+        )),
+        Err(_) => {
+            *pending = joined;
+            Ok(SseDataLine::Ignore)
+        }
+    }
+}
+
+#[cfg(test)]
+mod sse_parser_tests {
+    use super::{parse_sse_data_line, SseDataLine};
+
+    #[test]
+    fn parses_split_json_and_discards_incomplete_events() {
+        let mut pending = String::new();
+        assert_eq!(
+            parse_sse_data_line(&mut pending, "data: {\"choices\":").unwrap(),
+            SseDataLine::Ignore
+        );
+        assert!(matches!(
+            parse_sse_data_line(&mut pending, "data: [{\"delta\":{\"content\":\"ok\"}}]}").unwrap(),
+            SseDataLine::Json(_)
+        ));
+        assert_eq!(pending, "");
+        assert_eq!(
+            parse_sse_data_line(&mut pending, "data: [DONE]").unwrap(),
+            SseDataLine::Done
+        );
+        pending.push_str("partial");
+        assert_eq!(
+            parse_sse_data_line(&mut pending, "").unwrap(),
+            SseDataLine::Ignore
+        );
+        assert_eq!(pending, "");
+    }
+}
 
 /// Most resends of one request after fixing what the provider rejected
 /// (optional parameters, effort, Anthropic strips, an OAuth refresh).

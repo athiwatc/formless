@@ -36,3 +36,10 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 # Reuse the daemon's current-user/SYSTEM security descriptor for private drafts.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "markdown"
+harness = false
