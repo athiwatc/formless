@@ -63,7 +63,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
   const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
@@ -886,23 +886,25 @@ test('per-session drafts survive reload without clobbering another pairing or Se
 
 test('storage events preserve a focused composer and an active edit', () => {
   const c = setup(['onStorage','restoreDraft']);
-  c.S.draftsScope = 'test-room';
   c.S.drafts.A = 'saved draft';
   c.$('input').value = 'unsaved composer text';
   c.document.activeElement = c.$('input');
   const key = 'formless.draft:test-room:A';
+  c.prefs.set('draft:test-room:A', 'other tab draft');
   c.onStorage({ key, newValue: JSON.stringify('other tab draft') });
   assert.equal(c.$('input').value, 'unsaved composer text');
-  assert.equal(c.S.drafts.A, 'saved draft');
+  assert.equal(c.S.drafts.A, 'other tab draft');
 
   c.document.activeElement = null;
   c.S.editMessageId = 'message-being-edited';
   c.$('input').value = 'edited message content';
+  c.prefs.set('draft:test-room:A', 'another tab draft');
   c.onStorage({ key, newValue: JSON.stringify('another tab draft') });
   assert.equal(c.$('input').value, 'edited message content');
+  assert.equal(c.S.drafts.A, 'another tab draft');
   c.S.editMessageId = null;
   c.restoreDraft('A');
-  assert.equal(c.$('input').value, 'saved draft');
+  assert.equal(c.$('input').value, 'another tab draft');
 });
 
 test('declined edits and mention completion preserve the pre-edit draft', async () => {
@@ -928,7 +930,7 @@ test('declined edits and mention completion preserve the pre-edit draft', async 
 
 test('a second tab recovers a sending outbox item under the shared lock', async () => {
   const prefs = memoryPrefs();
-  prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'A', content: 'message', mode: 'send', expected_attachments: [], client_msg_id: 'same-action', status: 'sending' }]);
+  prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'A', content: 'message', mode: 'send', expected_attachments: [], client_msg_id: 'same-action', attempted: true, dispatch_kind: 'durable', status: 'sending' }]);
   const calls = [];
   const c = setup(['loadOutbox','flushOutbox','canFlushOutbox'], { prefs, request: async request => { calls.push(request); return {}; }, renderOutbox() {} });
   assert.equal(c.loadOutbox('test-room')[0].status, 'sending');
@@ -938,36 +940,83 @@ test('a second tab recovers a sending outbox item under the shared lock', async 
   assert.deepEqual(prefs.get('outbox:test-room', []), []);
 });
 
-test('old daemons accept only untouched legacy sends and never downgrade an ambiguous retry', async () => {
-  const calls = []; let failLegacySend = false;
-  const c = setup(['enqueueOutbox','flushOutbox','loadOutbox','canFlushOutbox'], {
-    pingFeatures: [], crypto: { randomUUID: () => 'legacy-action' }, renderOutbox() {},
+test('old daemons never dispatch durable entries and upgraded daemons do not replay ambiguous legacy attempts', async () => {
+  const calls = [];
+  const old = setup(['enqueueOutbox','flushOutbox','canFlushOutbox'], {
+    pingFeatures: [], crypto: { randomUUID: () => 'old-action' }, renderOutbox() {},
+    request: async req => { calls.push(req); return {}; },
+  });
+  old.S.daemonOnline = false; old.S.channel = null;
+  await old.enqueueOutbox('A', 'deferred message', 'send', { expectedAttachments: [] });
+  old.S.daemonOnline = true; old.S.channel = {};
+  await old.flushOutbox();
+  assert.equal(old.S.outbox[0].status, 'failed');
+  assert.match(old.S.outbox[0].error, /[Uu]pgrade/);
+  assert.equal(calls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
+
+  const prefs = memoryPrefs();
+  prefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'A', content: 'possibly sent', mode: 'send', expected_attachments: [], client_msg_id: 'ambiguous-legacy', attempted: true, status: 'queued' }]);
+  const upgraded = setup(['loadOutbox','flushOutbox','canFlushOutbox'], { prefs, renderOutbox() {}, request: async req => { calls.push(req); return {}; } });
+  await upgraded.flushOutbox();
+  assert.equal(upgraded.S.outbox[0].status, 'failed');
+  assert.match(upgraded.S.outbox[0].error, /cannot be classified/);
+  assert.equal(calls.some(req => req.type === 'send_outbox_message'), false);
+});
+
+test('only a fresh idle text send retains direct legacy compatibility', async () => {
+  const calls = []; let nextId = 0;
+  const c = setup(['submit','loadOutbox'], {
+    pingFeatures: [], crypto: { randomUUID: () => 'legacy-' + (++nextId) },
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
     request: async req => {
       calls.push(req);
-      if (req.type === 'send_message' && failLegacySend) throw new Error('connection lost after dispatch');
-      return {};
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
     },
   });
-  c.S.daemonOnline = false; c.S.channel = null;
-  await c.enqueueOutbox('A', 'new legacy-compatible send', 'send', { expectedAttachments: [] });
-  c.S.daemonOnline = true; c.S.channel = {};
-  await c.flushOutbox();
-  assert.equal(calls.filter(req => req.type === 'send_message').length, 1);
+  c.S.settings = { limits: {} };
+  c.S.attachmentInventories.A = [];
+  c.$('input').value = 'fresh online text';
+  await c.submit(false);
+  assert.deepEqual(calls.filter(req => req.type === 'send_message').map(req => req.mode), ['send']);
+  assert.equal(calls.some(req => req.type === 'send_outbox_message'), false);
   assert.equal(c.S.outbox.length, 0);
+  assert.equal(c.$('input').value, '');
 
-  failLegacySend = true;
-  c.S.daemonOnline = false; c.S.channel = null;
-  await c.enqueueOutbox('A', 'ambiguous legacy send', 'send', { expectedAttachments: [] });
-  c.S.daemonOnline = true; c.S.channel = {};
-  await c.flushOutbox();
-  assert.equal(c.S.outbox[0].status, 'queued');
-  assert.equal(c.S.outbox[0].attempted, true);
-  assert.equal(calls.filter(req => req.type === 'send_message').length, 2);
-
-  await c.flushOutbox();
-  assert.equal(calls.filter(req => req.type === 'send_message').length, 2);
+  c.$('input').value = 'deferred queue action';
+  await c.submit(true);
   assert.equal(c.S.outbox[0].status, 'failed');
-  assert.match(c.S.outbox[0].error, /does not support durable retries/);
+  assert.match(c.S.outbox[0].error, /upgrade/);
+  assert.equal(calls.filter(req => req.type === 'send_message').length, 1);
+
+  const attachedCalls = [];
+  const attached = setup(['submit'], {
+    pingFeatures: [], askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    request: async req => {
+      attachedCalls.push(req);
+      return req.type === 'list_pending_attachments' ? { attachments: [{ id: 'file' }] } : {};
+    },
+  });
+  attached.S.settings = { limits: {} };
+  attached.$('input').value = 'text with pending attachment';
+  await attached.submit(false);
+  assert.equal(attachedCalls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
+  assert.equal(attached.$('input').value, 'text with pending attachment');
+
+  const duplicatePrefs = memoryPrefs();
+  duplicatePrefs.set('outbox:test-room', [{ scope: 'test-room', order: 1, session_id: 'A', content: 'already queued', mode: 'send', expected_attachments: [], client_msg_id: 'already-queued', attempted: true, dispatch_kind: 'durable', status: 'queued' }]);
+  const duplicateCalls = [];
+  const duplicate = setup(['submit'], {
+    prefs: duplicatePrefs, pingFeatures: [], askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [],
+    request: async req => {
+      duplicateCalls.push(req);
+      return req.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  });
+  duplicate.S.settings = { limits: {} };
+  duplicate.$('input').value = 'already queued';
+  await duplicate.submit(false);
+  assert.equal(duplicateCalls.some(req => req.type === 'send_message' || req.type === 'send_outbox_message'), false);
+  assert.equal(duplicate.$('input').value, 'already queued');
 });
 
 test('cross-tab outbox flushes serialize and draft keys do not clobber each other', async () => {
@@ -1136,6 +1185,26 @@ test('queued forecast cannot approve attachments added after its compose-time in
   assert.equal(c.S.outbox[0].status, 'failed');
   assert.match(c.S.outbox[0].error, /attachments changed/);
   assert.equal(calls.some(req => req.type === 'forecast_run' || req.type === 'send_outbox_message'), false);
+});
+
+test('forecast inventory failures are visible and only transport failures remain queued', async () => {
+  for (const daemonResponse of [true, false]) {
+    const failure = new Error(daemonResponse ? 'inventory rejected' : 'connection lost');
+    if (daemonResponse) failure.daemonResponse = true;
+    const c = setup(['enqueueOutbox','flushOutbox','canFlushOutbox'], {
+      renderOutbox() {}, confirmForecast: async () => true, crypto: { randomUUID: () => 'forecast-error' },
+      request: async req => {
+        if (req.type === 'list_pending_attachments') throw failure;
+        return {};
+      },
+    });
+    c.S.daemonOnline = false; c.S.channel = null;
+    await c.enqueueOutbox('A', 'forecast message', 'send', { expectedAttachments: [], forecastPending: true });
+    c.S.daemonOnline = true; c.S.channel = {};
+    await c.flushOutbox();
+    assert.equal(c.S.outbox[0].status, daemonResponse ? 'failed' : 'queued');
+    assert.match(c.S.outbox[0].error, /Pending attachment inventory/);
+  }
 });
 
 test('same draft cannot be submitted twice while async work outlives a Session switch', async () => {

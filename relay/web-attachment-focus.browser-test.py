@@ -35,13 +35,14 @@ parser.add_argument('--app',type=Path)
 args=parser.parse_args()
 hook=r"""
  const pendingRemovals=[];
+ request=async req=>req.type==='list_pending_attachments'?{attachments:S.chips[req.session_id]||[]}:null;
  act=async req=>req.type==='detach_file'?new Promise(resolve=>pendingRemovals.push({req,resolve})):null;
  window.__fixture={
-  setup(count){$('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='chat';S.current='fixture';S.daemonOnline=true;
-    S.chips.fixture=Array.from({length:count},(_,i)=>({id:'chip-'+i,name:'file '+i,mime:'text/plain',bytes:10}));renderChrome();renderChips();},
+  setup(count){$('pair').classList.add('hidden');$('app').classList.remove('hidden');S.view='chat';S.current='fixture';S.storageScope='fixture';S.channel={};S.daemonOnline=true;
+    S.chips.fixture=Array.from({length:count},(_,i)=>({id:'chip-'+i,name:'file '+i,mime:'text/plain',bytes:10}));S.attachmentInventories.fixture=S.chips.fixture;renderChrome();renderChips();},
   pending(){return pendingRemovals.map(x=>x.req);},
   reference(){S.chips.fixture=[{path:"/fixture/reference.txt",name:"reference",mime:"text/plain",bytes:1}];renderChips();},
-  resolve(ok){const pending=pendingRemovals.shift();if(!pending)throw new Error('no pending removal');pending.resolve(ok);},
+  resolve(ok){const pending=pendingRemovals.shift();if(!pending)throw new Error('no pending removal');if(ok){S.chips.fixture=S.chips.fixture.filter(a=>(a.id||a.path)!==pending.req.id);S.attachmentInventories.fixture=S.chips.fixture;}pending.resolve(ok);},
   ids(){return (S.chips.fixture||[]).map(x=>x.id);},
  };
 """

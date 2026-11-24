@@ -105,6 +105,7 @@
           forecast_pending: item.forecast_pending === true,
           client_msg_id: item.client_msg_id,
           attempted: item.attempted !== false,
+          dispatch_kind: item.dispatch_kind === "durable" ? "durable" : null,
           status,
           error,
         };
@@ -181,7 +182,6 @@
     follow: true,
     editMessageId: null,
     storageScope: null,
-    draftsScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     submitting: new Set(),
     pending: new Map(),
@@ -192,7 +192,6 @@
     if (!sessionId) return true;
     S.drafts = S.drafts || {};
     if (scope === S.storageScope) {
-      S.draftsScope = scope;
       if (value) S.drafts[sessionId] = value;
       else delete S.drafts[sessionId];
     }
@@ -201,9 +200,8 @@
     return value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
   }
   function restoreDraft(sessionId) {
-    const value = S.draftsScope === S.storageScope && Object.prototype.hasOwnProperty.call(S.drafts, sessionId) ? S.drafts[sessionId] : loadDraft(S.storageScope, sessionId);
+    const value = loadDraft(S.storageScope, sessionId);
     S.drafts[sessionId] = value;
-    S.draftsScope = S.storageScope;
     $("input").value = value;
     autosize();
   }
@@ -233,7 +231,6 @@
     if (S.current) saveDraft(S.current, $("input").value);
     S.storageScope = scope;
     S.drafts = {};
-    S.draftsScope = scope;
     S.attachmentInventories = {};
     S.chips = {};
     S.outbox = loadOutbox(scope);
@@ -280,6 +277,20 @@
     }
     return cached;
   }
+  async function fetchFreshAttachmentInventory(sessionId, scope = S.storageScope) {
+    if (!scope || !sessionId) return null;
+    const result = await request({ type: "list_pending_attachments", session_id: sessionId });
+    if (scope !== S.storageScope) return null;
+    if (!Array.isArray(result && result.attachments)) {
+      const error = new Error("The daemon did not return a pending attachment inventory.");
+      error.daemonResponse = true;
+      throw error;
+    }
+    const attachments = result.attachments;
+    saveAttachmentInventory(scope, sessionId, attachments);
+    if (S.current === sessionId) renderChips();
+    return attachments;
+  }
   function renderOutbox() {
     const box = $("outbox");
     if (!box) return;
@@ -295,7 +306,7 @@
           h("button", { type: "button", class: "btn ghost", "aria-label": "Discard " + status.toLowerCase() + " message", onclick: () => discardOutbox(item) }, "Discard"));
     }));
   }
-  async function enqueueOutbox(sessionId, content, mode, { expectedAttachments, expectedRunId, forecastPending = false, blockedReason = "", storageScope = S.storageScope } = {}) {
+  async function enqueueOutbox(sessionId, content, mode, { expectedAttachments, expectedRunId, forecastPending = false, blockedReason = "", queuedReason = "", storageScope = S.storageScope } = {}) {
     if (!sessionId || !content || !["send", "steer", "queue"].includes(mode) || !storageScope || !hasOutboxLock()) return null;
     const scope = storageScope;
     const clientMsgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
@@ -308,8 +319,9 @@
       forecast_pending: !!forecastPending,
       client_msg_id: clientMsgId,
       attempted: false,
+      dispatch_kind: null,
       status: error ? "failed" : "queued",
-      error,
+      error: error || queuedReason,
     };
     let saved = false;
     await withOutboxLock(scope, async () => {
@@ -362,15 +374,27 @@
           entries = loadOutbox(scope);
           const item = entries[0];
           if (!item || item.status === "failed") break;
+          if (item.attempted && item.dispatch_kind !== "durable") {
+            item.status = "failed";
+            item.error = "A previous send attempt cannot be classified as durably protected. Check the Session before resending to avoid a duplicate.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
           if (durableOutboxSupported === null) {
             try {
               const ping = await request({ type: "ping" });
               durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
-            } catch (_) { break; }
+            } catch (error) {
+              if (scope !== S.storageScope) break;
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = "Could not verify durable outbox support: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
           }
-          if (!durableOutboxSupported && item.attempted) {
+          if (!durableOutboxSupported) {
             item.status = "failed";
-            item.error = "This daemon does not support durable retries; this previously attempted message was not sent again.";
+            item.error = item.attempted
+              ? "This daemon does not support durable retries. The message may already have been sent; check the Session before resending."
+              : "This daemon does not support the durable outbox. Upgrade it before sending this saved message; it was not sent.";
             persistOutbox(scope, entries); refreshOutbox(scope); break;
           }
           if (item.forecast_pending) {
@@ -378,7 +402,18 @@
               item.error = "Open this Session to review and approve its forecast before sending.";
               persistOutbox(scope, entries); refreshOutbox(scope); break;
             }
-            const currentAttachments = await refreshAttachmentInventory(item.session_id, scope, true);
+            let currentAttachments;
+            try {
+              currentAttachments = await fetchFreshAttachmentInventory(item.session_id, scope);
+            } catch (error) {
+              if (scope !== S.storageScope) break;
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = error.daemonResponse
+                ? "Pending attachment inventory failed; this message was not sent: " + error.message
+                : "Pending attachment inventory is unavailable; this message remains queued: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            if (scope !== S.storageScope) break;
             if (!Array.isArray(currentAttachments)) break;
             if (JSON.stringify(currentAttachments) !== JSON.stringify(item.expected_attachments)) {
               item.status = "failed";
@@ -408,15 +443,17 @@
           item.status = "sending";
           item.error = "";
           item.attempted = true;
+          item.dispatch_kind = "durable";
           if (!persistOutbox(scope, entries)) break;
           refreshOutbox(scope);
           try {
             await request({
-              type: durableOutboxSupported ? "send_outbox_message" : "send_message",
+              type: "send_outbox_message",
               session_id: item.session_id,
               content: item.content,
               mode: item.mode,
-              ...(durableOutboxSupported ? { expected_attachments: item.expected_attachments, expected_run_id: item.expected_run_id } : {}),
+              expected_attachments: item.expected_attachments,
+              expected_run_id: item.expected_run_id,
               client_msg_id: item.client_msg_id,
             });
           } catch (error) {
@@ -467,7 +504,7 @@
       const composer = $("input");
       const localDraft = S.drafts[sessionId];
       const preserveComposer = S.current === sessionId && (S.editMessageId || composer.value !== (localDraft || ""));
-      if (typeof value === "string" && !preserveComposer) { S.drafts[sessionId] = value; S.draftsScope = scope; }
+      if (typeof value === "string") S.drafts[sessionId] = value;
       if (S.current === sessionId && !preserveComposer && typeof value === "string") { composer.value = value; autosize(); }
     }
   }
@@ -9098,14 +9135,81 @@
       if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
       const inventory = await refreshAttachmentInventory(sid, scope);
       if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      let durableOutboxSupported = null;
+      let capabilityError = null;
+      if (S.daemonOnline && S.channel) {
+        try {
+          const ping = await request({ type: "ping" });
+          durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
+        } catch (error) { capabilityError = error; }
+      }
+      if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+      if (durableOutboxSupported === false && mode === "send") {
+        if (loadOutbox(scope).some((item) => item.session_id === sid && item.content === text)) {
+          saveDraft(sid, input.value, scope);
+          note("A matching saved outbox action exists; check or discard it before sending this message again.", true);
+          return;
+        }
+        if (!Array.isArray(inventory) || inventory.length) {
+          saveDraft(sid, input.value, scope);
+          note("This daemon cannot safely send a message with pending attachments; upgrade it before sending.", true);
+          return;
+        }
+        if (S.running.has(sid)) {
+          saveDraft(sid, input.value, scope);
+          note("The Session started a Run while this message was being prepared; choose a send mode again.", true);
+          return;
+        }
+        saveDraft(sid, input.value, scope);
+        let currentAttachments;
+        try { currentAttachments = await fetchFreshAttachmentInventory(sid, scope); }
+        catch (error) {
+          note("Could not verify pending attachments for the legacy send: " + error.message, true);
+          return;
+        }
+        if (scope !== S.storageScope || S.current !== sid) { saveDraft(sid, text, scope); return; }
+        if (!Array.isArray(currentAttachments) || currentAttachments.length || JSON.stringify(currentAttachments) !== JSON.stringify(inventory)) {
+          note("Pending attachments changed while preparing this message; review it before sending.", true);
+          return;
+        }
+        if (S.running.has(sid) || input.value.trim() !== text) {
+          saveDraft(sid, input.value, scope);
+          note("The message or Session state changed while preparing it; review before sending.", true);
+          return;
+        }
+        try {
+          await request({
+            type: "send_message",
+            session_id: sid,
+            content: text,
+            mode: "send",
+            client_msg_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2),
+          });
+        } catch (error) {
+          note(error.daemonResponse
+            ? "Legacy send failed: " + error.message
+            : "Legacy send outcome is unknown; check the Session before retrying: " + error.message, true);
+          return;
+        }
+        if (scope === S.storageScope && S.current === sid) {
+          if (input.value.trim() === text) { input.value = ""; saveDraft(sid, "", scope); autosize(); }
+          else saveDraft(sid, input.value, scope);
+        }
+        return;
+      }
       let blockedReason = attachmentError;
       if (mode === "steer" && !expectedRunId) blockedReason = "The active Run could not be identified; this Steer was not sent.";
       if (mode === "queue" && inventory && inventory.length) blockedReason = "Queue mode cannot preserve pending attachments; this message was not sent.";
+      if (durableOutboxSupported === false) blockedReason = "This daemon does not support the durable outbox; upgrade it before sending this deferred message.";
+      if (capabilityError && capabilityError.daemonResponse) blockedReason = "Could not verify durable outbox support: " + capabilityError.message;
       const item = await enqueueOutbox(sid, text, mode, {
         expectedAttachments: inventory,
         expectedRunId,
         forecastPending,
         blockedReason,
+        queuedReason: capabilityError && !capabilityError.daemonResponse
+          ? "Could not verify durable outbox support; this message will wait until the daemon can be checked."
+          : "",
         storageScope: scope,
       });
       if (!item) {
@@ -9116,7 +9220,7 @@
         if (input.value.trim() === text) { input.value = ""; saveDraft(sid, "", scope); autosize(); }
         else saveDraft(sid, input.value, scope);
       } else saveDraft(sid, "", scope);
-      if (item.status === "failed") note(item.error, true);
+      if (item.status === "failed") { note(item.error, true); return; }
       return scope === S.storageScope ? flushOutbox() : undefined;
     } finally {
       S.submitting.delete(submitKey);
