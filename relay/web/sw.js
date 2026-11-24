@@ -42,10 +42,16 @@ function storeIncomingShare(share) {
 }
 
 async function receiveShare(request) {
-  const origin = request.headers?.get?.("Origin");
-  const fetchSite = request.headers?.get?.("Sec-Fetch-Site");
-  if (origin != null && origin !== location.origin || fetchSite === "cross-site" || fetchSite === "same-site") {
-    return new Response("Untrusted share request", { status: 403 });
+  const origin = request.headers?.get?.("Origin") ?? null;
+  const fetchSite = request.headers?.get?.("Sec-Fetch-Site") ?? null;
+  const trustedMetadata = origin === "null"
+    ? fetchSite === "none"
+    : (origin == null || origin === location.origin)
+      && fetchSite !== "cross-site"
+      && fetchSite !== "same-site"
+      && (origin != null || fetchSite === "none" || fetchSite === "same-origin");
+  if (!trustedMetadata) {
+    return new Response("Share request lacks trusted browser metadata; update your browser or add the content manually.", { status: 403 });
   }
   try {
     const form = await request.formData();

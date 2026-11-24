@@ -187,9 +187,13 @@ test("Session-specific notification clicks still open their Session", async () =
 test("share target rejects explicit cross-site request metadata before reading or storing the body", async () => {
   for (const headers of [
     new Headers({ Origin: "https://attacker.example" }),
+    new Headers({ Origin: "https://attacker.example", "Sec-Fetch-Site": "none" }),
     new Headers({ Origin: "null" }),
+    new Headers({ Origin: "null", "Sec-Fetch-Site": "cross-site" }),
+    new Headers({ Origin: "null", "Sec-Fetch-Site": "same-site" }),
     new Headers({ "Sec-Fetch-Site": "cross-site" }),
     new Headers({ "Sec-Fetch-Site": "same-site" }),
+    new Headers(),
   ]) {
     const records = new Map();
     let formReads = 0;
@@ -212,7 +216,7 @@ test("share target rejects explicit cross-site request metadata before reading o
   }
 });
 
-test("share target stores shared text, URL, and files before redirecting to the app", async () => {
+test("share target accepts native opaque Origin:null with Sec-Fetch-Site:none", async () => {
   const records = new Map();
   const file = new File(["photo"], "photo.png", { type: "image/png" });
   const form = new FormData();
@@ -224,6 +228,7 @@ test("share target stores shared text, URL, and files before redirecting to the 
     url: "https://formless.example/share",
     method: "POST",
     mode: "navigate",
+    headers: new Headers({ Origin: "null", "Sec-Fetch-Site": "none" }),
     formData: async () => form,
   };
   const { event } = fetchEvent({

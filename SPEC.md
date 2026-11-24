@@ -6076,6 +6076,12 @@ during its snapshot fetch, deduplicated by message id.
   Installed browsers that implement Web Share Target can share a title,
   text, URL, image, text file or PDF to Formless. The service worker stores
   the incoming content in the browser's IndexedDB until the client connects.
+  Share POSTs require trusted browser metadata: same-origin requests or a
+  directly user-initiated `Sec-Fetch-Site: none` launch are accepted; an opaque
+  `Origin: null` is accepted only with `Sec-Fetch-Site: none`. Foreign origins,
+  cross-/same-site requests, and requests with neither Origin nor Fetch
+  Metadata are rejected. Older share-target browsers that omit both metadata
+  headers are unsupported; update the browser or add the content manually.
   The share uses the app's existing launch selection: linked Session, current
   Session, saved per-scope Session, Main Chat, then the first Session. If there
   is no writable selection, it opens or creates Main Chat through the existing
