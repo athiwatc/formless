@@ -180,6 +180,7 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
 async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments() {
     let mut scenario = Scenario::new(3).await;
     let session = scenario.session.clone();
+    let mut events = scenario.watch_events(&session).await;
     let run_id = scenario
         .send(
             &session,
@@ -192,7 +193,13 @@ async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments(
     first_attempt.too_many_requests();
     let dropped_attempt = scenario.next_call().await;
     let initial_messages = dropped_attempt.body["messages"].clone();
-    dropped_attempt.drop_after(json!({"content":"uncommitted partial answer"}));
+    let release_drop = dropped_attempt.drop_after(json!({"content":"uncommitted partial answer"}));
+    events
+        .wait_for_message_delta(&session, &run_id, "uncommitted partial answer")
+        .await;
+    release_drop
+        .send(())
+        .expect("scripted stream is waiting for the emitted partial delta");
     let malformed = scenario.next_call().await;
     assert_eq!(malformed.body["messages"], initial_messages);
     malformed.malformed_tool_call("find_tools", "{");
@@ -227,6 +234,7 @@ async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments(
     assert_eq!(actual_tool_result["note"], "No matching Tool; create one.");
     final_step.text("Recovered and found no matching Tool.");
     scenario.finish(&session, &run_id).await;
+    events.shutdown().await;
 
     let messages = scenario.store.list_messages(&session).unwrap();
     let transcript = serde_json::to_string(&messages).unwrap();

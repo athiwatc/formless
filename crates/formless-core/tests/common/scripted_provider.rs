@@ -42,7 +42,10 @@ pub struct ProviderCall {
 enum ScriptedReply {
     Completion(Value),
     Truncated(Value),
-    Dropped(Value),
+    Dropped {
+        delta: Value,
+        release: oneshot::Receiver<()>,
+    },
     RateLimited,
 }
 
@@ -113,7 +116,9 @@ impl ScriptedProvider {
                                     completion_response(delta, "length", usage)
                                 }
                             }
-                            ScriptedReply::Dropped(delta) => dropped_response(delta),
+                            ScriptedReply::Dropped { delta, release } => {
+                                dropped_response(delta, release)
+                            }
                             ScriptedReply::RateLimited => Response::builder()
                                 .status(StatusCode::TOO_MANY_REQUESTS)
                                 .header(CONTENT_TYPE, "application/json")
@@ -207,10 +212,15 @@ impl ProviderCall {
             .expect("provider request cancelled before its scripted response");
     }
 
-    pub fn drop_after(self, delta: Value) {
+    pub fn drop_after(self, delta: Value) -> oneshot::Sender<()> {
+        let (release, wait_for_release) = oneshot::channel();
         self.reply
-            .send(ScriptedReply::Dropped(delta))
+            .send(ScriptedReply::Dropped {
+                delta,
+                release: wait_for_release,
+            })
             .expect("provider request cancelled before its scripted response");
+        release
     }
 
     pub fn too_many_requests(self) {
@@ -247,21 +257,31 @@ fn completion_response(delta: Value, finish_reason: &str, usage: Value) -> Respo
         .unwrap()
 }
 
-fn dropped_response(delta: Value) -> Response<Body> {
+fn dropped_response(delta: Value, release: oneshot::Receiver<()>) -> Response<Body> {
     let event = json!({"choices":[{"delta":delta}]});
     let line = format!("data: {event}\n\n");
-    let chunks = vec![
-        Ok::<_, std::io::Error>(line),
-        Err(std::io::Error::other("scripted stream dropped")),
-    ];
     Response::builder()
         .header(CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(futures_util::stream::unfold(
-            chunks.into_iter(),
-            |mut chunks| async move {
-                let next = chunks.next()?;
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                Some((next, chunks))
+            (0, Some(line), Some(release)),
+            |(step, line, release)| async move {
+                match step {
+                    0 => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Some((
+                            Ok::<_, std::io::Error>(line.unwrap()),
+                            (1, None, release),
+                        ))
+                    }
+                    1 => {
+                        let _ = release.unwrap().await;
+                        Some((
+                            Err(std::io::Error::other("scripted stream dropped")),
+                            (2, None, None),
+                        ))
+                    }
+                    _ => None,
+                }
             },
         )))
         .unwrap()
