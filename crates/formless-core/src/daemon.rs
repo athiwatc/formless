@@ -13822,6 +13822,7 @@ impl Daemon {
                 memory_mb: ver.memory_mb,
             }
         };
+        toolreg::validate_object_input_schema(&d.input_schema)?;
         let mut input = input;
         let coerced = toolreg::coerce_json_strings(&d.input_schema, &mut input);
         self.note_coerced(&d.name, &coerced);
@@ -16907,6 +16908,7 @@ impl ToolDraft {
             }
         };
         let input_schema = schema("input_schema", json!({"type": "object"}))?;
+        toolreg::validate_object_input_schema(&input_schema)?;
         let output_schema = schema("output_schema", json!({}))?;
         let code = args["implementation_js"]
             .as_str()

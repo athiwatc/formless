@@ -128,6 +128,141 @@ pub fn compile_schema(schema: &Value) -> Result<jsonschema::Validator> {
     jsonschema::validator_for(schema).map_err(|e| anyhow!("invalid JSON Schema: {e}"))
 }
 
+pub fn validate_object_input_schema(schema: &Value) -> Result<()> {
+    if schema.is_object()
+        && schema_can_describe_object(schema, schema, &mut std::collections::HashSet::new())
+    {
+        Ok(())
+    } else {
+        Err(anyhow!("input_schema must describe object inputs; provider function parameters must accept object inputs"))
+    }
+}
+
+fn schema_can_describe_object(
+    root: &Value,
+    schema: &Value,
+    active_refs: &mut std::collections::HashSet<String>,
+) -> bool {
+    let schema = match schema {
+        Value::Bool(allowed) => return *allowed,
+        Value::Object(schema) => schema,
+        _ => return false,
+    };
+
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let target = if reference == "#" {
+            Some(root)
+        } else {
+            reference
+                .strip_prefix('#')
+                .filter(|pointer| pointer.starts_with('/'))
+                .and_then(|pointer| root.pointer(pointer))
+        };
+        if let Some(target) = target {
+            if active_refs.insert(reference.to_string()) {
+                let allows_objects = schema_can_describe_object(root, target, active_refs);
+                active_refs.remove(reference);
+                if !allows_objects {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if let Some(instance_type) = schema.get("type") {
+        let includes_object = match instance_type {
+            Value::String(instance_type) => instance_type == "object",
+            Value::Array(instance_types) => instance_types
+                .iter()
+                .any(|instance_type| instance_type.as_str() == Some("object")),
+            _ => false,
+        };
+        if !includes_object {
+            return false;
+        }
+    }
+    if schema
+        .get("const")
+        .is_some_and(|constant| !constant.is_object())
+    {
+        return false;
+    }
+    if schema.get("enum").is_some_and(|values| {
+        !values
+            .as_array()
+            .is_some_and(|values| values.iter().any(Value::is_object))
+    }) {
+        return false;
+    }
+    if schema.get("not").is_some_and(schema_matches_every_object) {
+        return false;
+    }
+
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(key) {
+            let Some(branches) = branches.as_array() else {
+                return false;
+            };
+            if !branches
+                .iter()
+                .any(|branch| schema_can_describe_object(root, branch, active_refs))
+            {
+                return false;
+            }
+        }
+    }
+    if let Some(branches) = schema.get("allOf") {
+        let Some(branches) = branches.as_array() else {
+            return false;
+        };
+        if branches
+            .iter()
+            .any(|branch| !schema_can_describe_object(root, branch, active_refs))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn schema_matches_every_object(schema: &Value) -> bool {
+    match schema {
+        Value::Bool(allowed) => *allowed,
+        Value::Object(schema) => {
+            let includes_object = match schema.get("type") {
+                None => true,
+                Some(Value::String(instance_type)) => instance_type == "object",
+                Some(Value::Array(instance_types)) => instance_types
+                    .iter()
+                    .any(|instance_type| instance_type.as_str() == Some("object")),
+                Some(_) => false,
+            };
+            includes_object
+                && schema.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "type"
+                            | "$schema"
+                            | "$id"
+                            | "$anchor"
+                            | "$dynamicAnchor"
+                            | "$comment"
+                            | "$defs"
+                            | "definitions"
+                            | "title"
+                            | "description"
+                            | "default"
+                            | "examples"
+                            | "deprecated"
+                            | "readOnly"
+                            | "writeOnly"
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
 pub fn validate_against(
     validator: &jsonschema::Validator,
     value: &Value,
@@ -955,6 +1090,28 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
     })
 }
 
+fn validate_stored_input_schema(input_schema: &str) -> Result<()> {
+    let schema: Value = serde_json::from_str(input_schema)
+        .map_err(|error| anyhow!("invalid stored input_schema JSON: {error}"))?;
+    validate_object_input_schema(&schema)
+}
+
+fn validate_definition_input_schema(definition: &Value) -> Result<()> {
+    let schema = definition
+        .pointer("/function/parameters")
+        .ok_or_else(|| anyhow!("Tool definition has no input schema"))?;
+    validate_object_input_schema(schema)
+}
+
+fn warn_omitted_tool_schema(tool_id: &str, tool_name: &str, error: &anyhow::Error) {
+    tracing::warn!(
+        tool_id = %tool_id,
+        tool_name = %tool_name,
+        error = %error,
+        "omitting Tool with provider-incompatible input schema"
+    );
+}
+
 /// The built-in tools' definitions, as listed to the model.
 fn topic_step_definition() -> Value {
     json!({"type":"function","function":{"name":TOPIC_RUN_STEP,"description":"Launch one isolated harness step asynchronously; returns attempt_id and conversation_session_id immediately. Use topic_wait for results and pending interactions. One step per feature may run at a time, with concurrent writes in separate workspaces. Inputs must be exact artifacts from finalized outputs of any feature in this topic. All selected inputs are supplied, allowing an explicitly requested combining step. Never push or change the source workspace or its branch.","parameters":{
@@ -1312,12 +1469,20 @@ fn definitions(
             };
             if let Some((_, def)) = pinned {
                 if let Ok(def) = serde_json::from_str(&def) {
+                    if let Err(error) = validate_definition_input_schema(&def) {
+                        warn_omitted_tool_schema(&info.id, &info.name, &error);
+                        continue;
+                    }
                     defs.push(def);
                     continue;
                 }
             }
         }
         if let Some((_i, v)) = store.get_tool_current(&info.id)? {
+            if let Err(error) = validate_stored_input_schema(&v.input_schema) {
+                warn_omitted_tool_schema(&info.id, &info.name, &error);
+                continue;
+            }
             let def = registry_definition(&info, &v);
             if let Some(s) = session_id.filter(|_| persist) {
                 store.pin_definition(s, &info.id, v.version, &def.to_string())?;
@@ -1335,11 +1500,17 @@ fn definitions(
     // prefix. Calling it reports that it is retired.
     if let Some(s) = session_id {
         let mut registry: Vec<Value> = defs.split_off(trusted_builtins);
-        for (_, def) in store.pinned_inactive(s)? {
+        for (tool_id, def) in store.pinned_inactive(s)? {
             if let Ok(def) = serde_json::from_str::<Value>(&def) {
-                if !main_topic_suggestions::is_topic_tool(&fn_name(&def).to_ascii_lowercase()) {
-                    registry.push(def);
+                let name = fn_name(&def);
+                if main_topic_suggestions::is_topic_tool(&name.to_ascii_lowercase()) {
+                    continue;
                 }
+                if let Err(error) = validate_definition_input_schema(&def) {
+                    warn_omitted_tool_schema(&tool_id, name, &error);
+                    continue;
+                }
+                registry.push(def);
             }
         }
         // Same order as the listing itself: pinned first, then by name.
@@ -1438,6 +1609,42 @@ mod skeleton_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_input_schema_semantics_follow_instance_types_and_combinators() {
+        let accepted = [
+            json!({"type": "object"}),
+            json!({"properties": {"name": {"type": "string"}}}),
+            json!({
+                "allOf": [{
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                }]
+            }),
+            json!({"$defs": {"Object": {"type": "object"}}, "$ref": "#/$defs/Object"}),
+            json!({"not": {"type": "string"}}),
+        ];
+        for schema in accepted {
+            compile_schema(&schema).unwrap();
+            validate_object_input_schema(&schema).unwrap();
+        }
+
+        let rejected = [
+            json!({"type": "string"}),
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!({"anyOf": [{"type": "string"}, {"type": "array"}]}),
+            json!({"$defs": {"String": {"type": "string"}}, "$ref": "#/$defs/String"}),
+            json!({"not": {"type": "object"}}),
+        ];
+        for schema in rejected {
+            compile_schema(&schema).unwrap();
+            let error = validate_object_input_schema(&schema)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("input_schema"), "{error}");
+            assert!(error.contains("provider function parameters"), "{error}");
+        }
+    }
 
     #[test]
     fn json_string_arguments_are_parsed_where_objects_are_expected() {

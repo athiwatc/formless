@@ -2,6 +2,247 @@
 use super::*;
 
 #[tokio::test]
+async fn create_and_test_tool_reject_non_object_input_schemas() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_BASE_URL");
+    env.remove("FORMLESS_MODEL");
+    env.remove("FORMLESS_SECURE");
+    let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    http.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", http.local_addr().unwrap());
+    let root = std::env::temp_dir().join(format!("formless-schema-shape-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut config = Config::default();
+    config.provider.base_url = endpoint.clone();
+    config.provider.model = "private-no-provider".into();
+    config.provider.auto_test_models = false;
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = Arc::new(Daemon::new(paths).unwrap());
+    let cfg = daemon.config().unwrap();
+    assert_eq!(cfg.provider.base_url, endpoint);
+    let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    for (name, schema) in [
+        ("schema_string", json!({"type": "string"})),
+        (
+            "schema_array",
+            json!({"type": "array", "items": {"type": "string"}}),
+        ),
+        (
+            "schema_any_of_scalars",
+            json!({"anyOf": [{"type": "string"}, {"type": "array"}]}),
+        ),
+    ] {
+        let args = json!({
+            "name": name,
+            "description": "private schema fixture",
+            "input_schema": schema,
+            "output_schema": {},
+            "implementation_js": "function run(input){return input;}",
+            "capabilities": [],
+            "memory_mb": 64,
+        });
+        let create_error = daemon
+            .create_tool_impl(&args, &cfg, &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            create_error
+                .to_string()
+                .contains("must describe object inputs"),
+            "{create_error:#}"
+        );
+        assert!(
+            create_error
+                .to_string()
+                .contains("provider function parameters"),
+            "{create_error:#}"
+        );
+        let test_error = daemon
+            .test_tool_impl(
+                &session,
+                "private-schema-run",
+                &args,
+                &cfg,
+                &cancel,
+                &tokio_util::sync::CancellationToken::new(),
+                0,
+                Arc::new(crate::invocation_progress::InvocationProgress::default()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            test_error
+                .to_string()
+                .contains("must describe object inputs"),
+            "{test_error:#}"
+        );
+        assert!(
+            test_error
+                .to_string()
+                .contains("provider function parameters"),
+            "{test_error:#}"
+        );
+        assert!(daemon
+            .with_store(|st| st.get_tool_by_name(name))
+            .unwrap()
+            .is_none());
+    }
+
+    daemon
+        .with_store(|st| {
+            st.create_tool_version(
+                "stored_schema_string_tool",
+                "private legacy schema fixture",
+                r#"{"type":"string"}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let stored_error = daemon
+        .test_tool_impl(
+            &session,
+            "private-schema-run",
+            &json!({"name": "stored_schema_string_tool", "input": {}}),
+            &cfg,
+            &cancel,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+            Arc::new(crate::invocation_progress::InvocationProgress::default()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        stored_error
+            .to_string()
+            .contains("provider function parameters"),
+        "{stored_error:#}"
+    );
+    assert_eq!(
+        http.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "schema rejection must not contact a provider"
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_object_input_schemas_are_omitted_from_provider_definitions() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root =
+        std::env::temp_dir().join(format!("formless-legacy-schema-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:9/v1".into();
+    config.provider.model = "private-unused".into();
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = Daemon::new(paths).unwrap();
+    let (fresh_session, pinned_session, inactive_session) = daemon
+        .with_store(|st| {
+            let fresh_session = st.create_session(None)?.id;
+            let pinned_session = st.create_session(None)?.id;
+            let inactive_session = st.create_session(None)?.id;
+            let (tool, version) = st.create_tool_version(
+                "legacy_string_input",
+                "private invalid schema fixture",
+                r#"{"type":"string"}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            let (_valid_tool, _) = st.create_tool_version(
+                "legacy_object_input",
+                "private valid schema fixture",
+                r#"{"type":"object","properties":{"value":{"type":"string"}}}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            let (inactive_tool, inactive_version) = st.create_tool_version(
+                "legacy_inactive_array_input",
+                "private invalid inactive schema fixture",
+                r#"{"type":"array","items":{"type":"string"}}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            let definition = json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": "private invalid schema fixture",
+                    "parameters": {"type": "string"}
+                }
+            });
+            let inactive_definition = json!({
+                "type": "function",
+                "function": {
+                    "name": inactive_tool.name,
+                    "description": "private invalid inactive schema fixture",
+                    "parameters": {"type": "array", "items": {"type": "string"}}
+                }
+            });
+            st.load_session_tools(&pinned_session, std::slice::from_ref(&tool.id), "found")?;
+            st.pin_definition(&pinned_session, &tool.id, version, &definition.to_string())?;
+            st.load_session_tools(
+                &inactive_session,
+                std::slice::from_ref(&inactive_tool.id),
+                "found",
+            )?;
+            st.pin_definition(
+                &inactive_session,
+                &inactive_tool.id,
+                inactive_version,
+                &inactive_definition.to_string(),
+            )?;
+            st.set_tool_retired(&inactive_tool.id, true)?;
+            Ok((fresh_session, pinned_session, inactive_session))
+        })
+        .unwrap();
+
+    for session in [fresh_session, pinned_session, inactive_session] {
+        let definitions = daemon
+            .with_store(|st| toolreg::tool_definitions(st, Some(&session), 100))
+            .unwrap();
+        assert!(
+            definitions.iter().all(|definition| {
+                definition["function"]["name"].as_str() != Some("legacy_string_input")
+            }),
+            "invalid legacy Tool was listed: {definitions:?}"
+        );
+        assert!(
+            definitions.iter().any(|definition| {
+                definition["function"]["name"].as_str() == Some("legacy_object_input")
+            }),
+            "valid legacy Tool was omitted: {definitions:?}"
+        );
+        assert!(
+            definitions.iter().all(|definition| {
+                definition["function"]["name"].as_str() != Some("legacy_inactive_array_input")
+            }),
+            "invalid inactive pinned Tool was listed: {definitions:?}"
+        );
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn schema_save_flag_is_required_despite_forged_author_and_reports_reach_reads() {
     let env = crate::credential_env::EnvGuard::isolated();
     env.remove("FORMLESS_BASE_URL");
