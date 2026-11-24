@@ -77,27 +77,66 @@ function findElement(element, predicate) {
 
 function liveRendererFixture(tools) {
   const { c, announcer, node } = fixture();
-  const live = node('div', {}, []);
   const outside = node('button', {}, []);
   const fallback = node('div', {}, []);
-  c.document = { activeElement: outside, createTextNode: data => ({ data }) };
+  const movedFocusedNodes = [];
+  c.document = { activeElement: outside, body: fallback, createTextNode: data => ({ data }) };
+  const domNode = (tag, props, children) => {
+    const element = node(tag, props, children);
+    const listeners = new Map();
+    for (const child of element.children) if (child && typeof child === 'object') child.parent = element;
+    Object.defineProperties(element, {
+      firstChild: { get() { return this.children[0] || null; } },
+      nextSibling: { get() {
+        const index = this.parent?.children.indexOf(this) ?? -1;
+        return index < 0 ? null : this.parent.children[index + 1] || null;
+      } },
+    });
+    element.insertBefore = function (child, reference) {
+      if (child === reference) return child;
+      if (child.parent) {
+        if (child.contains?.(c.document.activeElement)) movedFocusedNodes.push(child);
+        child.remove();
+      }
+      const index = reference == null ? this.children.length : this.children.indexOf(reference);
+      if (index < 0) throw new Error('reference is not a child');
+      this.children.splice(index, 0, child);
+      child.parent = this;
+      return child;
+    };
+    element.remove = function () {
+      if (!this.parent) return;
+      if (this.contains?.(c.document.activeElement)) c.document.activeElement = c.document.body;
+      const siblings = this.parent.children;
+      const index = siblings.indexOf(this);
+      if (index >= 0) siblings.splice(index, 1);
+      this.parent = null;
+    };
+    element.addEventListener = (type, listener) => {
+      const registered = listeners.get(type) || [];
+      registered.push(listener);
+      listeners.set(type, registered);
+    };
+    element.dispatchEvent = event => {
+      for (const listener of listeners.get(event.type) || []) listener.call(element, event);
+    };
+    return element;
+  };
+  const live = domNode('div', {}, []);
+  c.h = (tag, props, ...children) => domNode(tag, props, children);
   c.S = {
     current: 'session', messages: [], running: new Set(['session']), liveTools: tools,
     liveRun: { id: 'run', ended: false }, streaming: '', thinking: '', showThinking: false, activity: null,
     sessionSnapshot: null, invocations: [], planState: null, unfinished: null,
   };
   c.$ = id => id === 'live' ? live : id === 'chat-announcer' ? announcer : null;
-  c.liveRender = { session: 'session', root: live, who: node('div', {}, ['Formless']), rows: new Map() };
+  c.liveRender = { session: 'session', root: live, who: domNode('div', {}, ['Formless']), rows: new Map() };
   c.currentLiveText = () => ({ expanded: false });
   c.isRunning = () => c.S.running.has(c.S.current);
   c.withTranscriptLayout = render => render();
-  c.reconcileChildren = (parent, wanted) => {
-    for (const child of parent.children) {
-      if (!wanted.includes(child) && child.contains?.(c.document.activeElement)) c.document.activeElement = fallback;
-    }
-    parent.children = wanted;
-    for (const child of wanted) child.parent = parent;
-  };
+  const animationFrames = [];
+  c.requestAnimationFrame = callback => { animationFrames.push(callback); return animationFrames.length; };
+  c.flushAnimationFrames = () => { for (const callback of animationFrames.splice(0)) callback(0); };
   c.payload = () => null;
   c.renderSessions = () => {};
   c.note = () => {};
@@ -116,7 +155,7 @@ function liveRendererFixture(tools) {
   c.announcedRun = null;
   c.lastAnnouncedFinishedRun = null;
   c.completedRunAnswer = () => '';
-  vm.runInContext(fn('liveToolRow') + fn('updateLiveTool') + fn('focusedLiveTools') + fn('liveTree') + fn('renderLive') + fn('onEvent'), c);
+  vm.runInContext(fn('reconcileChildren') + fn('liveToolRow') + fn('updateLiveTool') + fn('focusedLiveTools') + fn('liveTree') + fn('renderLive') + fn('onEvent'), c);
   const createLiveToolRow = c.liveToolRow;
   c.liveToolRow = tool => {
     const row = createLiveToolRow(tool);
@@ -129,7 +168,7 @@ function liveRendererFixture(tools) {
     row.mark.style = {};
     return row;
   };
-  return { c, live, outside, announcements };
+  return { c, live, outside, announcements, movedFocusedNodes };
 }
 
 test('transcript is not live and chat has a separate polite status announcer', () => {
@@ -383,6 +422,26 @@ test('nested terminal rows remain readable and completion does not steal focus e
   c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: tool.invocationId, tool_name: tool.name, ok: true, elapsed_ms: 1234 });
   assert.equal(live.children.includes(row.node), false, 'an unfocused top-level terminal row is not retained');
   assert.equal(c.document.activeElement, outside, 'completion does not steal focus from another control');
+});
+
+test('parallel completion removes an obsolete earlier row without moving the focused terminal sibling', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const later = { invocationId: 'later', status: 'running', name: 'second_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const { c, live, announcements, movedFocusedNodes } = liveRendererFixture([earlier, later]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const laterRow = c.liveRender.rows.get(later);
+  c.document.activeElement = laterRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: later.invocationId, tool_name: later.name, ok: true, elapsed_ms: 1234 });
+  assert.equal(c.document.activeElement, laterRow.summary, 'the already-completed focused row remains focused');
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: earlier.invocationId, tool_name: earlier.name, ok: true, elapsed_ms: 1234 });
+
+  assert.ok(live.children.includes(laterRow.node));
+  assert.equal(live.children.includes(earlierRow.node), false);
+  assert.equal(c.document.activeElement, laterRow.summary, 'removing the earlier sibling does not blur the focused row');
+  assert.deepEqual(movedFocusedNodes, [], 'reconciliation removes stale siblings before considering moves');
+  assert.deepEqual(announcements, [], 'parallel completion adds no live-region announcements');
 });
 
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {

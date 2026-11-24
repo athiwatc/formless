@@ -4528,6 +4528,13 @@
   const rendered = new Map();
   const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };
   function reconcileChildren(parent, wanted) {
+    const wantedSet = new Set(wanted);
+    let child = parent.firstChild;
+    while (child) {
+      const next = child.nextSibling;
+      if (!wantedSet.has(child)) child.remove();
+      child = next;
+    }
     let cursor = parent.firstChild;
     for (const node of wanted) {
       if (node === cursor) cursor = cursor.nextSibling;
