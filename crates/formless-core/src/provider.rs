@@ -2419,15 +2419,7 @@ impl Provider {
     /// a vision model on Chat Completions; otherwise only the reference
     /// line in the text remains. The marker never reaches the endpoint.
     pub fn sends_images(&self, model: &str) -> bool {
-        let model = self.cfg.resolve_alias(model);
-        (!self.cfg.prompt_tools() || self.cfg.anthropic())
-            && self
-                .cfg
-                .model_meta
-                .get(&model)
-                .and_then(|meta| meta.vision)
-                .or(self.cfg.vision)
-                .unwrap_or_else(|| is_vision_model(&model))
+        model_sends_images(&self.cfg, model)
     }
 
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
@@ -4100,6 +4092,18 @@ impl Provider {
         }
         Ok(summary)
     }
+}
+
+/// Whether the configured provider can send image content for `model`.
+pub fn model_sends_images(cfg: &ProviderCfg, model: &str) -> bool {
+    let model = cfg.resolve_alias(model);
+    (!cfg.prompt_tools() || cfg.anthropic())
+        && cfg
+            .model_meta
+            .get(&model)
+            .and_then(|meta| meta.vision)
+            .or(cfg.vision)
+            .unwrap_or_else(|| is_vision_model(&model))
 }
 
 /// `messages` with the prompt-based tool instruction appended to the

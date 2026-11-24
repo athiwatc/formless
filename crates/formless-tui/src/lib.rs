@@ -7582,14 +7582,8 @@ impl App {
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
             .and_then(|s| s.model.clone())
-            .unwrap_or(cfg.provider.model);
-        let model = cfg.provider.resolve_alias(&model);
-        cfg.provider
-            .model_meta
-            .get(&model)
-            .and_then(|meta| meta.vision)
-            .or(cfg.provider.vision)
-            .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
+            .unwrap_or_else(|| cfg.provider.model.clone());
+        formless_core::provider::model_sends_images(&cfg.provider, &model)
     }
 
     /// `/compact [focus]`: summarise the Session now (SPEC §11).
@@ -26376,6 +26370,29 @@ mod tests {
                     .any(|note| note.contains("may not read images")),
                 warns,
                 "per-model vision override for {model}"
+            );
+        }
+        for (api_style, warns) in [("chat", true), ("anthropic", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = "gpt-5".into();
+            cfg.provider.vision = Some(true);
+            cfg.provider.tool_mode = "prompt".into();
+            cfg.provider.api_style = api_style.into();
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::model_sends_images(&cfg.provider, "gpt-5"),
+                !warns,
+                "provider image gate for {api_style} prompt tools"
+            );
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "TUI attachment warning for {api_style} prompt tools"
             );
         }
     }
