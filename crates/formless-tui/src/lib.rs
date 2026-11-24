@@ -22,7 +22,7 @@ mod keys;
 mod links;
 mod list_paging;
 mod lists;
-mod markdown;
+pub mod markdown;
 mod mermaid;
 mod metrics_tools;
 mod notify;

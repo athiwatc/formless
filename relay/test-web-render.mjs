@@ -5,6 +5,11 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 
 export function installEventRenderFixture(context, fn) {
+  context.announceChat ??= () => {};
+  context.completedRunAnswer ??= () => '';
+  context.announcedRun ??= null;
+  context.lastAnnouncedFinishedRun ??= null;
+  if (context.S) context.S.messages ??= [];
   // Event/session reducers use the production incremental live-text helpers.
   // Keep their state scoped to this VM, rather than stubbing cache resets.
   vm.runInContext('const liveText = { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false };\n'
@@ -25,6 +30,9 @@ export function installEventRenderFixture(context, fn) {
   context.withTranscriptLayout ??= update => update();
   context.resetReadingSession ??= () => {};
   context.renderSessions ??= () => {};
+  if (context.S && !context.S.drafts) context.S.drafts = {};
+  context.saveDraft ??= () => true;
+  context.autosize ??= () => {};
   context.reading ??= { session: null, anchor: null, saved: new Map() };
   vm.runInContext(['readingStreamMatches', 'remapReadingStream', 'commitReadingStream'].map(fn).join('\n'), context);
   context.flushEventRender = () => {
@@ -49,4 +57,3 @@ export function installHistoryFixture(context, fn) {
   vm.runInContext('const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };\n'
     + ['reconcileChildren', 'updateText', 'sessionLoadNotice', 'turnTimestamp'].map(fn).join('\n'), context);
 }
-

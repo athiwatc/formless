@@ -631,6 +631,7 @@ async fn late_pending_model_input_retains_failed_audit_evidence_until_handle_con
                 "later-call",
                 "await_invocation",
                 false,
+                None,
             )
         })
         .unwrap();

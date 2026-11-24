@@ -1090,7 +1090,8 @@ async fn exact_32mib_ipc_request_crosses_the_native_relay_wire() {
         let frame = ws.next().await.unwrap().unwrap();
         let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_ne!(
-            frame["relay"], "disconnect",
+            frame["relay"],
+            "disconnect",
             "native relay closed the max-size request client before Ping response: code={}",
             frame["code"].as_u64().unwrap_or_default()
         );
