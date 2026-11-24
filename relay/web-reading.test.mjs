@@ -50,10 +50,12 @@ function captureFixture(rows, bounds, visible = true) {
   const listeners = new Map();
   let settles = 0;
   let box;
+  const transcriptTop = 10;
   const makeRoot = (row, index) => {
     rowData.push(row);
-    const rect = () => ({ top: row.top + reading.adjustment, bottom: row.bottom + reading.adjustment, height: row.height });
-    const inner = { getBoundingClientRect: () => ({ ...rect(), top: rect().top + 2 }), contains: () => false };
+    const rect = () => ({ top: transcriptTop + row.top - box.scrollTop + reading.adjustment,
+      bottom: transcriptTop + row.bottom - box.scrollTop + reading.adjustment, height: row.height });
+    const inner = { getBoundingClientRect: () => { const r = rect(); return { ...r, top: r.top + 2 }; }, contains: () => false };
     const block = { getBoundingClientRect: rect, contains: child => child === inner };
     let root;
     const streamText = { nodeType: 3, parentElement: { closest: selector => selector === "[data-message-id], [data-live-root]" ? root : null } };
@@ -71,7 +73,7 @@ function captureFixture(rows, bounds, visible = true) {
     pendingContent: false, pendingLive: false, afterSeq: -1, depth: 0, changed: false, adjustment: 0,
     intentUntil: 0, inputFrame: 0, observed: new Set(), roots: null, rootTree: null, rootTreeSize: 0 };
   box = {
-    scrollTop: 500, getBoundingClientRect: () => ({ top: 10 }),
+    scrollTop: 500, getBoundingClientRect: () => ({ top: transcriptTop }),
     querySelectorAll: () => { queries++; return roots; },
     contains: node => roots.includes(node) || contained.has(node),
     addEventListener: (type, listener, options) => { listeners.set(type, [...(listeners.get(type) || []), { listener, options }]); },
@@ -136,37 +138,42 @@ function captureFixture(rows, bounds, visible = true) {
 const rect = (top, bottom, height = bottom - top, live = false) => ({ top, bottom, height, live });
 
 test("anchor capture reuses indexed geometry for nearby and large jumps, preserving ordered lower-bound candidates", () => {
-  const rows = [rect(0, 41), rect(40, 140, 0), rect(300, 330), rect(45, 140),
-    rect(1000, 1100, 100, true), rect(65, 85), ...Array(1000).fill(rect(100, 120))];
+  const rows = [rect(0, 541), rect(40, 140, 0), rect(300, 700), rect(45, 560),
+    rect(1000, 1100, 100, true), rect(65, 545), ...Array(1000).fill(rect(100, 700))];
   const fixture = captureFixture(rows, { top: 40, bottom: 100 });
   const result = fixture.capture();
   assert.deepEqual(result.candidates, [
-    { id: "2", block: 1, offset: 292, stream: null },
-    { id: "3", block: 1, offset: 37, stream: null },
-    { id: null, block: 1, offset: 992, stream: "live" },
-    { id: "5", block: 1, offset: 57, stream: null },
+    { id: "0", block: 1, offset: -498, stream: null },
+    { id: "2", block: 1, offset: -198, stream: null },
+    { id: "3", block: 1, offset: -453, stream: null },
+    { id: null, block: 1, offset: 502, stream: "live" },
   ]);
   assert.equal(result.top, 500);
   assert.equal(fixture.queries, 1);
   assert.deepEqual(fixture.reads, Array.from({ length: rows.length }, (_, index) => index));
 
   const nearby = fixture.capture(null, 560);
-  assert.deepEqual(nearby.candidates.map(({ id }) => id), ["2", "3", null, "6"]);
-  const jump = fixture.capture(null, 660);
-  assert.deepEqual(jump.candidates.map(({ id }) => id), ["2", null]);
+  assert.deepEqual(nearby.candidates, [
+    { id: "2", block: 1, offset: -258, stream: null },
+    { id: null, block: 1, offset: 442, stream: "live" },
+    { id: "6", block: 1, offset: -458, stream: null },
+    { id: "7", block: 1, offset: -458, stream: null },
+  ]);
+  const jump = fixture.capture(null, 720);
+  assert.deepEqual(jump.candidates, [{ id: null, block: 1, offset: 282, stream: "live" }]);
   assert.equal(fixture.queries, 1);
   assert.equal(fixture.reads.length, rows.length, "unchanged roots are not remeasured while scrolling");
 
   const appendedIndex = fixture.rootCount;
   fixture.append(rect(1400, 1600));
-  const appended = fixture.capture({ top: 1200, bottom: 1260 });
-  assert.deepEqual(appended.candidates.map(({ id }) => id), [String(appendedIndex)]);
+  const appended = fixture.capture({ top: 1200, bottom: 1260 }, 300);
+  assert.deepEqual(appended.candidates, [{ id: String(appendedIndex), block: 1, offset: 1102, stream: null }]);
   assert.equal(fixture.queries, 2);
   assert.equal(fixture.reads.length, rows.length * 2 + 1, "capture drains undelivered structural records before using cached geometry");
 });
 
 test("live stream invalidations do not remeasure roots past the cached history prefix", () => {
-  const rows = [rect(0, 100), rect(10, 200), rect(20, 300), rect(30, 400),
+  const rows = [rect(0, 600), rect(10, 610), rect(20, 620), rect(30, 630),
     ...Array(1000).fill(rect(500, 600, 0)), rect(1000, 1200, 200, true)];
   const fixture = captureFixture(rows, { top: 40, bottom: 100 });
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1", "2", "3"]);
@@ -185,14 +192,14 @@ test("live stream invalidations do not remeasure roots past the cached history p
 });
 
 test("viewport layout invalidates synchronously when ResizeObserver has not delivered", () => {
-  const rows = [rect(0, 41), rect(100, 140)];
+  const rows = [rect(0, 520), rect(100, 620)];
   const fixture = captureFixture(rows, { top: 40, bottom: 100 });
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
-  fixture.setRow(0, rect(0, 80));
+  fixture.setRow(0, rect(0, 540));
   fixture.viewportResize();
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1"]);
   assert.equal(fixture.queries, 2);
-  fixture.setRow(0, rect(0, 41));
+  fixture.setRow(0, rect(0, 520));
   fixture.layout(() => {}, { newContent: false, geometryChanged: true });
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   assert.equal(fixture.queries, 3);
@@ -202,40 +209,40 @@ test("viewport layout invalidates synchronously when ResizeObserver has not deli
 });
 
 test("session switch and return cannot reuse the prior Session's root cache", () => {
-  const fixture = captureFixture([rect(0, 41), rect(100, 140)], { top: 40, bottom: 100 });
+  const fixture = captureFixture([rect(0, 520), rect(100, 620)], { top: 40, bottom: 100 });
   fixture.capture();
   fixture.switchSession("B");
   fixture.replaceRows([rect(300, 650)]);
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0"]);
   fixture.switchSession("A");
-  fixture.replaceRows([rect(0, 41), rect(100, 140)]);
+  fixture.replaceRows([rect(0, 520), rect(100, 620)]);
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   assert.equal(fixture.queries, 3);
 });
 
 test("details click and keyboard expansion invalidate before synchronous anchor capture", () => {
-  const fixture = captureFixture([rect(0, 41), rect(100, 140)], { top: 40, bottom: 100 });
+  const fixture = captureFixture([rect(0, 520), rect(100, 620)], { top: 40, bottom: 100 });
   const target = fixture.summaryTarget();
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   fixture.dispatch("click", { target });
-  fixture.setRow(0, rect(0, 80));
+  fixture.setRow(0, rect(0, 540));
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1"]);
   fixture.dispatch("keydown", { target, key: " " });
-  fixture.setRow(0, rect(0, 41));
+  fixture.setRow(0, rect(0, 520));
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   assert.equal(fixture.queries, 3);
 });
 
 test("diagram load and root resize callbacks invalidate changed heights", () => {
-  const fixture = captureFixture([rect(0, 41), rect(100, 140)], { top: 40, bottom: 100 });
+  const fixture = captureFixture([rect(0, 520), rect(100, 620)], { top: 40, bottom: 100 });
   const image = {};
   fixture.addContained(image);
   fixture.capture();
-  fixture.setRow(0, rect(0, 80));
+  fixture.setRow(0, rect(0, 540));
   fixture.loadDiagram(image);
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1"]);
   assert.equal(fixture.settles, 1);
-  fixture.setRow(0, rect(0, 41));
+  fixture.setRow(0, rect(0, 520));
   fixture.resizeChanged();
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   assert.equal(fixture.settles, 2);
@@ -243,10 +250,13 @@ test("diagram load and root resize callbacks invalidate changed heights", () => 
 });
 
 test("reading adjustment transforms update thresholds without remeasuring content-space roots", () => {
-  const fixture = captureFixture([rect(0, 41), rect(100, 140)], { top: 40, bottom: 100 });
+  const fixture = captureFixture([rect(0, 531), rect(100, 620)], { top: 40, bottom: 100 });
   assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["1"]);
   fixture.setAdjustment(15);
-  assert.deepEqual(fixture.capture().candidates.map(({ id }) => id), ["0", "1"]);
+  assert.deepEqual(fixture.capture().candidates, [
+    { id: "0", block: 1, offset: -483, stream: null },
+    { id: "1", block: 1, offset: -383, stream: null },
+  ]);
   assert.equal(fixture.queries, 1);
   assert.equal(fixture.reads.length, 2);
 });
