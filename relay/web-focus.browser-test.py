@@ -220,7 +220,8 @@ def feedback_checks(page, cdp):
     check(keyboard_action.evaluate('(e)=>document.activeElement===e'),'Tab from toast dismissal reaches feedback action')
     page.keyboard.press('Enter');check(page.evaluate('__focus817.feedbackActions')==2,'feedback action supports keyboard activation')
     check(page.evaluate('__focus817.calls.length')==0,'feedback fixtures never dispatch approval or Tool requests')
-    page.evaluate("""()=>{const d=__focus817;d.closeDialog(d.activeDialog().node);d.S.approvals=[];d.renderApproval();document.querySelector('#toasts').replaceChildren();}""")
+    page.evaluate("""()=>{const d=__focus817;d.closeDialog(d.activeDialog().node);d.S.approvals=[];d.renderApproval();
+      document.querySelectorAll('#toasts .toast .toast-dismiss').forEach(button=>button.click());}""")
     check(not page.locator('#app').evaluate('(e)=>e.inert'),'closing dialogs restores normal app interactivity')
 
 
@@ -245,7 +246,9 @@ def click_away_checks(page):
     page.evaluate("""()=>{const e=document.createElement('button');e.id='focus-removed-fixture';e.textContent='Temporary recovery fixture';document.querySelector('#view-chat').append(e);e.focus();e.remove();}""")
     page.wait_for_timeout(80)
     check(page.evaluate('document.activeElement.matches(\'#tabs button[aria-current="page"]\')'),'actual removed invoker still recovers to active view control')
-    page.evaluate("""()=>{const d=__focus817;d.S.running.delete(d.S.current);d.S.streaming='';d.S.view='tools';d.renderChrome();d.renderHistory();document.querySelector('#focus-click-away').remove();document.querySelector('#toasts').replaceChildren();}""")
+    page.evaluate("""()=>{const d=__focus817;d.S.running.delete(d.S.current);d.S.streaming='';d.S.view='tools';d.renderChrome();d.renderHistory();
+      document.querySelector('#focus-click-away').remove();
+      document.querySelectorAll('#toasts .toast .toast-dismiss').forEach(button=>button.click());document.querySelector('#toasts').replaceChildren();}""")
 
 
 def artifact_download_checks(page):
@@ -536,7 +539,22 @@ def run():
             page.get_by_role('menuitem',name='Copy link',exact=False).click()
             check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile copy action leaves sidebar open')
             check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'mobile copy action restores visible menu trigger')
-            page.evaluate("document.querySelector('#toasts').replaceChildren()")
+            page.wait_for_function("document.querySelector('#toasts .toast-message')?.textContent")
+            page.evaluate('''() => {
+              const host=document.querySelector('#toasts'),trigger=document.querySelector('#sessions .session.active .menu');
+              const rect=trigger.getBoundingClientRect();
+              Object.assign(host.style,{left:(rect.left+rect.width/2-16)+'px',top:(rect.top+rect.height/2-18)+'px',
+                right:'auto',bottom:'auto',width:'180px',maxHeight:'none',overflow:'visible'});
+            }''')
+            check(not ax_ignored(cdp,'#toasts .toast'),'copy notification remains in the accessibility tree')
+            check(page.evaluate('''() => {const button=document.querySelector('#sessions .session.active .menu'),r=button.getBoundingClientRect();
+              return document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)===button;}'''),'notification leaves an overlapped Session menu pointer target available')
+            page.locator(session_trigger).click()
+            check(page.locator(session_trigger).get_attribute('aria-expanded')=='true','Session menu opens by pointer through notification')
+            check(page.locator('.popover [role=menuitem]').first.evaluate('(e)=>e===document.activeElement'),'pointer-opened Session menu retains keyboard focus')
+            page.keyboard.press('Escape')
+            check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'Session menu Escape restores focus after notification click-through')
+            page.evaluate("document.querySelector('#toasts').removeAttribute('style')")
             # Pointer dismissal of an overlay is not an outside click on the
             # drawer behind it, including when a close button removes the modal.
             page.locator(session_trigger).click()
@@ -590,6 +608,15 @@ def run():
                         return target===document.activeElement && overlap>=Math.min(button.height,bounds.height-2)-1;
                     }''',arg=trigger)
                     check(page.locator(trigger).evaluate('e=>e===document.activeElement'),'closing drawer reveals restored toolbar focus '+trigger)
+            page.evaluate("""()=>{document.querySelectorAll('#toasts .toast .toast-dismiss').forEach(button=>button.click());
+              __focus817.toast('Hover timer fixture',false,{label:'Hover action',ms:500,run:()=>{}});} """)
+            page.wait_for_function("document.querySelector('#toasts .toast-message')?.textContent==='Hover timer fixture'")
+            message=page.locator('#toasts .toast-message').last.bounding_box()
+            page.mouse.move(message['x']+message['width']/2,message['y']+message['height']/2)
+            page.wait_for_timeout(600)
+            check(page.locator('#toasts .toast').count()==1,'hovering notification text pauses its dismissal timer')
+            page.mouse.move(0,0);page.wait_for_timeout(600)
+            check(page.locator('#toasts .toast').count()==0,'leaving notification text resumes its dismissal timer')
             check(not errors,'no browser page errors: '+repr(errors))
             page.screenshot(path=str(OUT/'final-state.png'))
             context.close();browser.close()
