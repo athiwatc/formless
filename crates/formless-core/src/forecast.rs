@@ -154,7 +154,7 @@ pub(crate) fn dangling_messages(st: &Store, session: &str) -> Result<Vec<Message
         generated_by: None,
         id: String::new(), session_id:session.into(),seq:0,role:"tool".into(),
         content:"error: the run stopped before this call finished; it was not retried. Run it again if it is still needed.".into(),
-        created_at:String::new(),meta:Some(crate::daemon::tool_result_meta(&id,&name,true)),
+        created_at:String::new(),meta:Some(crate::daemon::tool_result_meta(&id,&name,true,None)),
     }).collect())
 }
 

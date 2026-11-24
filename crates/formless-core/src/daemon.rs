@@ -7945,7 +7945,7 @@ impl Daemon {
                             session_id,
                             "tool",
                             &truncated_call_message(&tc.name),
-                            Some(tool_result_meta(&tc.id, &tc.name, true)),
+                            Some(tool_result_meta(&tc.id, &tc.name, true, None)),
                         )
                     })?;
                     self.broadcast(Event::MessageAppended {
@@ -7986,6 +7986,7 @@ impl Daemon {
                 let denied = denied.clone();
                 let skip = skipped.contains(&tc.id);
                 futs.push(async move {
+                    let started = std::time::Instant::now();
                     let (text, is_error, correction) = if skip {
                         (
                             "skipped: the user chose not to run this call (step mode). \
@@ -8000,7 +8001,8 @@ impl Daemon {
                         )
                         .await
                     };
-                    (tc, text, is_error, correction)
+                    let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    (tc, text, is_error, correction, elapsed_ms)
                 });
             }
             let results = futures_util::future::join_all(futs).await;
@@ -8014,7 +8016,7 @@ impl Daemon {
             let mut warned = std::collections::HashSet::new();
             let mut stuck = None;
             let mut correction_batch = CorrectionBatch::default();
-            for (tc, text, is_error, correction) in results {
+            for (tc, text, is_error, correction, elapsed_ms) in results {
                 // A result that holds a secret is still sent (blocking would
                 // break the task), but the user hears about it once per Tool
                 // and kind in this Run (#709).
@@ -8035,7 +8037,13 @@ impl Daemon {
                         "tool",
                         &text,
                         Some(Self::data_meta(
-                            st, session_id, run_id, &tc.id, &tc.name, is_error,
+                            st,
+                            session_id,
+                            run_id,
+                            &tc.id,
+                            &tc.name,
+                            is_error,
+                            Some(elapsed_ms),
                         )?),
                     )
                 })?;
@@ -14897,8 +14905,10 @@ impl Daemon {
         call: &str,
         name: &str,
         error: bool,
+        elapsed_ms: Option<u64>,
     ) -> Result<String> {
-        let mut meta: Value = serde_json::from_str(&tool_result_meta(call, name, error))?;
+        let mut meta: Value =
+            serde_json::from_str(&tool_result_meta(call, name, error, elapsed_ms))?;
         let (source, origins) = Self::result_sources(st, session, run, call, name)?;
         meta["data_source_tool"] = json!(source);
         meta["data_origins"] = json!(origins);
@@ -17857,8 +17867,17 @@ fn call_failed(text: String) -> String {
 }
 
 /// A stored tool message's meta: call identity and explicit outcome.
-pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+pub(crate) fn tool_result_meta(
+    call_id: &str,
+    name: &str,
+    is_error: bool,
+    elapsed_ms: Option<u64>,
+) -> String {
+    let mut meta = json!({"tool_call_id": call_id, "name": name, "is_error": is_error});
+    if let Some(elapsed_ms) = elapsed_ms {
+        meta["elapsed_ms"] = json!(elapsed_ms);
+    }
+    meta.to_string()
 }
 
 #[cfg(test)]
@@ -17876,7 +17895,7 @@ fn stored_tool_result_outcome_preserves_provider_projection() {
     };
     let legacy_projection = crate::storage::provider_message(&message);
     for is_error in [false, true] {
-        let meta = tool_result_meta("call", "tool_name", is_error);
+        let meta = tool_result_meta("call", "tool_name", is_error, None);
         let parsed: Value = serde_json::from_str(&meta).unwrap();
         assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
         message.meta = Some(meta);
@@ -17887,6 +17906,14 @@ fn stored_tool_result_outcome_preserves_provider_projection() {
         }
         assert_eq!(crate::storage::provider_message(&message), expected);
     }
+    let timed_meta = tool_result_meta("call", "tool_name", false, Some(1234));
+    let timed: Value = serde_json::from_str(&timed_meta).unwrap();
+    assert_eq!(timed["elapsed_ms"].as_u64(), Some(1234));
+    message.meta = Some(timed_meta);
+    assert_eq!(
+        crate::storage::provider_message(&message),
+        legacy_projection
+    );
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):

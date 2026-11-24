@@ -279,13 +279,13 @@
     });
   }
   /** Request that reports failures as a toast; resolves null on error. */
-  async function act(req, okText, timeoutMs) {
+  async function act(req, okText, timeoutMs, retry) {
     try {
       const r = await request(req, timeoutMs);
       if (okText) toast(okText);
       return r;
     } catch (e) {
-      toast(e.message, true);
+      toast(e.message, true, retry ? { label: "Retry", run: retry } : null);
       note(e.message, true);
       return null;
     }
@@ -638,19 +638,82 @@
     renderNotes();
     renderStatus();
   }
-  /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
+  /** A toast; `action` ({label, run, ms}) adds a button; `ms` defaults to 3500. */
   function toast(text, err, action) {
+    let timer = null, deadline = 0, hovered = false, focused = false;
+    let remaining = err ? null : Number.isFinite(action?.ms) && action.ms >= 0 ? action.ms : 3500;
+    const remove = () => { clearTimeout(timer); timer = null; remaining = null; t.remove(); };
+    const pauseTimer = () => {
+      if (remaining == null || timer == null) return;
+      clearTimeout(timer);
+      timer = null;
+      remaining = Math.max(0, deadline - Date.now());
+    };
+    const resumeTimer = () => {
+      if (remaining == null || timer != null) return;
+      deadline = Date.now() + remaining;
+      timer = setTimeout(remove, remaining);
+    };
+    const updatePause = (source, active) => {
+      const wasPaused = hovered || focused;
+      if (source === "hover") hovered = active;
+      else focused = active;
+      const isPaused = hovered || focused;
+      if (!wasPaused && isPaused) pauseTimer();
+      else if (wasPaused && !isPaused) resumeTimer();
+    };
     const button = action && h("button", { class: "btn small", type: "button", onclick: () => {
       if (button.disabled) return;
       button.disabled = true;
-      t.remove();
+      remove();
       action.run();
     } }, action.label);
-    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
-      button);
+    const dismiss = h("button", { class: "btn ghost small toast-dismiss", type: "button", "aria-label": "Dismiss notification", onclick: remove }, "×");
+    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status",
+      onmouseenter: () => updatePause("hover", true), onmouseleave: () => updatePause("hover", false),
+      onfocusin: () => updatePause("focus", true),
+      onfocusout: (event) => { if (!t.contains(event.relatedTarget)) updatePause("focus", false); } },
+    h("span", { class: "toast-message" }, text), h("span", { class: "toast-actions" }, button, dismiss));
     $("toasts").append(t);
-    setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
+    if (remaining != null) {
+      deadline = Date.now() + remaining;
+      timer = setTimeout(remove, remaining);
+    }
   }
+
+  const chatAnnouncement = { last: 0, timer: null, pending: null };
+  function announceChat(text, session = S.current, immediate = false) {
+    const announcer = $("chat-announcer");
+    if (!announcer || !text || session !== S.current) return;
+    if (immediate) {
+      clearTimeout(chatAnnouncement.timer);
+      chatAnnouncement.timer = null;
+      chatAnnouncement.pending = null;
+      announcer.textContent = text;
+      chatAnnouncement.last = Date.now();
+      return;
+    }
+    chatAnnouncement.pending = { text, session };
+    if (chatAnnouncement.timer) return;
+    chatAnnouncement.timer = setTimeout(() => {
+      chatAnnouncement.timer = null;
+      const next = chatAnnouncement.pending;
+      chatAnnouncement.pending = null;
+      if (!next || next.session !== S.current) return;
+      announcer.textContent = next.text;
+      chatAnnouncement.last = Date.now();
+    }, Math.max(0, 500 - (Date.now() - chatAnnouncement.last)));
+  }
+  function completedRunAnswer(messages, afterSeq) {
+    const message = [...messages].reverse().find((item) =>
+      item.role === "assistant" && typeof item.content === "string" && item.seq > afterSeq);
+    if (!message) return "";
+    let meta = {};
+    try { meta = JSON.parse(message.meta || "{}"); } catch (_) {}
+    return Array.isArray(meta?.tool_calls) && meta.tool_calls.length ? "" : message.content;
+  }
+  let announcedRun = null;
+  let lastAnnouncedFinishedRun = null;
 
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
@@ -3486,20 +3549,32 @@
 
   function toolCallChip(call) {
     const f = call.function || {};
+    const name = f.name || "tool";
     return h("details", { class: "chip tool-call" },
-      h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
+      h("summary", null, h("span", { class: "tname" }, h("span", { "aria-hidden": "true" }, "⚙ "), name), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
   function toolResultChip(content, meta) {
     // The daemon stores the error outcome separately from arbitrary output.
     // Older or incomplete transcripts may not carry a recorded failure.
     let failed = false;
-    try { failed = JSON.parse(meta || "{}")?.is_error === true; } catch (_) {}
+    let resultMeta = {};
+    try {
+      const parsed = JSON.parse(meta || "{}");
+      if (parsed && typeof parsed === "object") resultMeta = parsed;
+      failed = resultMeta.is_error === true;
+    } catch (_) {}
+    const name = typeof resultMeta.name === "string" ? resultMeta.name : "";
+    const duration = Number.isFinite(resultMeta.elapsed_ms) && resultMeta.elapsed_ms >= 0
+      ? recordedDuration(resultMeta.elapsed_ms) : "";
+    const status = failed ? "failed" : "done";
+    const label = [name || "Tool", status, duration && "duration " + duration].filter(Boolean).join(" · ");
     const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
-        h("span", { class: "tname" }, failed ? "↳ failed" : "↳ result"),
+        h("span", { class: "tname" },
+          h("span", { "aria-hidden": "true" }, "↳ "), label),
         h("span", { class: "targs" }, truncate(content, 160)),
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
@@ -3518,7 +3593,7 @@
   // Stored outputs open over the protocol (GetArtifact), never by path.
   async function openArtifact(id) {
     const trigger = document.activeElement;
-    const first = await act({ type: "get_artifact", id, offset: 0 });
+    const first = await act({ type: "get_artifact", id, offset: 0 }, null, undefined, () => openArtifact(id));
     if (!first) return;
     let text = first.text;
     let end = first.end;
@@ -3529,14 +3604,15 @@
       status.textContent = end + " of " + first.total_chars + " characters";
       more.hidden = end >= first.total_chars;
     };
-    more.onclick = async () => {
-      const r = await act({ type: "get_artifact", id, offset: end });
+    const loadMore = async () => {
+      const r = await act({ type: "get_artifact", id, offset: end }, null, undefined, loadMore);
       if (!r) return;
       text += r.text;
       end = r.end;
       pre.textContent = text;
       sync();
     };
+    more.onclick = loadMore;
     const download = h("button", { class: "btn small", type: "button" }, "Download");
     download.onclick = async () => {
       download.disabled = true;
@@ -3544,7 +3620,7 @@
         const chunks = [text];
         let offset = end;
         while (offset < first.total_chars) {
-          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 }, null, undefined, () => download.onclick());
           if (!r) return;
           chunks.push(r.text);
           offset = r.end;
@@ -4570,9 +4646,10 @@
       liveRender.rows.set(tool, row);
       return row;
     }
-    const mark = h("span");
+    const mark = h("span", { "aria-hidden": "true" });
     const name = document.createTextNode("");
     const args = document.createTextNode("");
+    const status = h("span", { class: "sr-only", "data-live-status": "" });
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -4581,10 +4658,10 @@
     const cancel = h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(row.tool.handle); } }, "Cancel");
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
-    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark,
+    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
       h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
-      h("span", { class: "tstat", "data-live-timer": "" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+      h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
@@ -4612,6 +4689,9 @@
       row.mark.textContent = running ? "" : t.status === "ok" ? "✓" : "✗";
     }
     updateText(row.name, t.name + (t.version > 0 ? " v" + t.version : ""));
+    const status = running ? "Running" : t.status === "ok" ? "Done" : "Failed";
+    const duration = t.elapsedMs != null ? recordedDuration(t.elapsedMs) : elapsed(t.started);
+    updateText(row.status, status + " · " + duration);
     updateText(row.args, t.subagent ? t.step || "" : summarizeArgs(t.arguments || ""));
     if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
     if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
@@ -4653,7 +4733,7 @@
         } }, liveRender.thinkingToggleText);
         liveRender.thinkingBox = h("div", { class: "live-thinking" }, liveRender.thinkingToggle, liveRender.thinking);
         liveRender.activityText = document.createTextNode("");
-        liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
+        liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
         liveRender.rows.clear();
       }
       const running = isRunning();
@@ -7839,7 +7919,7 @@
     S.toolDetailError = null;
     renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
-    const d = await act({ type: "get_tool", id });
+    const d = await act({ type: "get_tool", id }, null, undefined, () => selectTool(id, true));
     if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
     else S.toolDetailError = id;
@@ -8917,7 +8997,11 @@
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; S.recapRunId = null; }
-        if (here) { clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
+        if (here) {
+          announcedRun = { session: ev.session_id, id: ev.run_id, afterSeq: Math.max(-1, ...S.messages.map((message) => message.seq ?? -1)) };
+          clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model");
+          announceChat("Run started", ev.session_id, true);
+        }
         break;
       case "run_recap":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
@@ -9010,6 +9094,13 @@
           renderRunBanner();
         }
         if (here) {
+          if (ev.type === "run_finished" && ev.status === "completed" && lastAnnouncedFinishedRun !== ev.run_id) {
+            const answer = announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id
+              ? completedRunAnswer(S.messages, announcedRun.afterSeq) : "";
+            announceChat("Answer finished" + (answer ? ". " + answer : ""), ev.session_id, true);
+            lastAnnouncedFinishedRun = ev.run_id;
+          }
+          if (announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id) announcedRun = null;
           clearLiveText();
           S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
@@ -9032,6 +9123,7 @@
           } catch (_) {}
         }
         if (here) {
+          announceChat("Running " + ev.tool_name, ev.session_id);
           const existing = ev.invocation_id != null && S.liveTools.find(t => t.invocationId === ev.invocation_id);
           if (existing) {
             if (existing.status === "running" && existing.metadataPending) Object.assign(existing, { metadataPending: false, name: ev.tool_name, version: ev.version, arguments: ev.arguments, depth: ev.depth || 0 });
@@ -9102,6 +9194,7 @@
         break;
       case "harness_permission_requested":
         addApproval(ev);
+        if (here) announceChat("Approval needed", ev.session_id, true);
         renderApproval(); scheduleEventRender({ status: true });
         break;
       case "approval_summary": {
@@ -9111,11 +9204,12 @@
       }
       case "approval_requested":
         addApproval(ev);
-        if (here) setActivity("awaiting your approval");
+        if (here) { setActivity("awaiting your approval"); announceChat("Approval needed", ev.session_id, true); }
         renderApproval();
         break;
       case "promotion_approval_requested":
         addApproval(ev);
+        if (here) announceChat("Approval needed", ev.session_id, true);
         renderApproval();
         break;
       case "promotion_approval_resolved":
