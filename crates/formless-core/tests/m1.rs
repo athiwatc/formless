@@ -65,6 +65,487 @@ fn storage_resume_is_byte_identical_and_compaction_flags() {
     assert!(!needs2);
 }
 
+#[test]
+fn session_search_handles_multilingual_substrings_and_preserves_english_prefixes() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store
+        .create_session(Some("multilingual search".into()))
+        .unwrap();
+    let chinese = store
+        .append_message(&session.id, "user", "我喜欢这个文件，请帮我总结")
+        .unwrap();
+    let thai_news = store.append_message(&session.id, "user", "ข่าววันนี้").unwrap();
+    let thai_white = store
+        .append_message(&session.id, "user", "เสื้อสีขาว")
+        .unwrap();
+    let cafe = store
+        .append_message(&session.id, "user", "CAFÉ menu")
+        .unwrap();
+    let fixing = store
+        .append_message(&session.id, "user", "fixing the bug")
+        .unwrap();
+
+    for (query, expected) in [
+        ("文件", &chinese.id),
+        ("总结", &chinese.id),
+        ("ข่าว", &thai_news.id),
+        ("café", &cafe.id),
+        ("fix", &fixing.id),
+    ] {
+        let hits = store.search_sessions(query, 20).unwrap();
+        assert_eq!(hits.len(), 1, "query {query:?}: {hits:?}");
+        assert_eq!(&hits[0].message_id, expected, "query {query:?}");
+    }
+    assert!(store
+        .search_sessions("ข่าว", 20)
+        .unwrap()
+        .iter()
+        .all(|hit| hit.message_id != thai_white.id));
+
+    let canonical = store.search_sessions("cafe\u{301}", 20).unwrap();
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(canonical[0].message_id, cafe.id);
+
+    let accented_mixed = store
+        .append_message(&session.id, "user", "cafe 我喜欢这个文件")
+        .unwrap();
+    let accented_mixed_hits = store.search_sessions("café 文件", 20).unwrap();
+    assert_eq!(accented_mixed_hits.len(), 1);
+    assert_eq!(accented_mixed_hits[0].message_id, accented_mixed.id);
+
+    let mixed = store
+        .append_message(&session.id, "user", "fixing notes about 文件")
+        .unwrap();
+    let mixed_hits = store.search_sessions("fi 文件", 20).unwrap();
+    assert_eq!(mixed_hits.len(), 1);
+    assert_eq!(mixed_hits[0].message_id, mixed.id);
+}
+
+#[test]
+fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("emoji search".into())).unwrap();
+    store.append_message(&session.id, "user", "sun ☀️").unwrap();
+    let heart = store
+        .append_message(&session.id, "user", "heart ❤️")
+        .unwrap();
+
+    let hits = store.search_sessions("❤️", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, heart.id);
+}
+
+#[test]
+fn warning_search_ignores_leading_orphan_variation_selector() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("warning search".into())).unwrap();
+    let warning = store
+        .append_message(&session.id, "user", "⚠️Warning")
+        .unwrap();
+
+    let hits = store.search_sessions("⚠️Warning", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, warning.id);
+}
+
+#[test]
+fn thai_search_does_not_end_before_a_combining_tone_mark() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("Thai search".into())).unwrap();
+    store.append_message(&session.id, "user", "ที่").unwrap();
+    let unmarked = store.append_message(&session.id, "user", "ที").unwrap();
+
+    let hits = store.search_sessions("ที", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, unmarked.id);
+}
+
+#[test]
+fn thai_search_allows_substrings_after_completed_combining_marks() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store
+        .create_session(Some("Thai substring search".into()))
+        .unwrap();
+    let message = store.append_message(&session.id, "user", "มีขาว").unwrap();
+    let marked_message = store.append_message(&session.id, "user", "ที่นี่").unwrap();
+
+    let hits = store.search_sessions("ขาว", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, message.id);
+
+    let hits = store.search_sessions("นี่", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, marked_message.id);
+}
+
+#[test]
+fn mixed_accented_latin_unicode_terms_preserve_non_latin_marks() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store
+        .create_session(Some("mixed Unicode search".into()))
+        .unwrap();
+    let chinese = store
+        .append_message(&session.id, "user", "cafe文件")
+        .unwrap();
+    store.append_message(&session.id, "user", "cafeที่").unwrap();
+    let thai_unmarked = store.append_message(&session.id, "user", "cafeที").unwrap();
+
+    let chinese_hits = store.search_sessions("café文件", 20).unwrap();
+    assert_eq!(chinese_hits.len(), 1, "{chinese_hits:?}");
+    assert_eq!(chinese_hits[0].message_id, chinese.id);
+
+    let thai_hits = store.search_sessions("caféที", 20).unwrap();
+    assert_eq!(thai_hits.len(), 1, "{thai_hits:?}");
+    assert_eq!(thai_hits[0].message_id, thai_unmarked.id);
+}
+
+#[test]
+fn schema_v79_tool_summary_and_v80_unicode_index_backfill_existing_data() {
+    #[derive(Debug, PartialEq)]
+    struct InvocationSnapshot {
+        id: String,
+        tool_id: String,
+        version: i64,
+        session_id: Option<String>,
+        run_id: Option<String>,
+        parent_id: Option<String>,
+        status: String,
+        tag: String,
+        input: String,
+        output: String,
+        error: String,
+        duration_ms: i64,
+        created_at: String,
+    }
+
+    let paths = temp_paths("unicode-index-backfill");
+    let session_id;
+    let message_id;
+    let tool_id;
+    {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap();
+        session_id = session.id;
+        let message = store
+            .append_message(&session_id, "user", "historical 文件")
+            .unwrap();
+        message_id = message.id;
+        let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+        let (tool, version) = store
+            .create_tool_version(
+                "migration_tool_summary_fixture",
+                "migration tool summary fixture",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &caps,
+                64,
+                "migration fixture",
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session_id),
+                None,
+                None,
+                "success",
+                "",
+                "{}",
+                "",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+        tool_id = tool.id;
+    }
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE messages_unicode_fts;
+             DROP TRIGGER tool_invocation_summary_insert;
+             DROP TRIGGER tool_invocation_summary_update;
+             DROP TRIGGER tool_invocation_summary_delete;
+             DROP TRIGGER tool_invocation_sessions_insert;
+             DROP TRIGGER tool_invocation_sessions_delete;
+             DROP TABLE tool_invocation_sessions;
+             DROP TABLE tool_invocation_summary;
+             DROP INDEX idx_inv_tool_created;
+             PRAGMA user_version=78;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    let hits = store.search_sessions("文件", 20).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, session_id);
+    assert_eq!(hits[0].message_id, message_id);
+    drop(store);
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let summary: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT total,success,failure,sessions FROM tool_invocation_summary WHERE tool_id=?1",
+            [&tool_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(summary, (1, 1, 0, 1));
+    let session_invocations: i64 = connection
+        .query_row(
+            "SELECT invocation_count FROM tool_invocation_sessions WHERE tool_id=?1 AND session_id=?2",
+            rusqlite::params![tool_id, session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_invocations, 1);
+
+    let read_invocation = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at
+                 FROM invocations WHERE tool_id=?1",
+                [&tool_id],
+                |row| {
+                    Ok(InvocationSnapshot {
+                        id: row.get(0)?,
+                        tool_id: row.get(1)?,
+                        version: row.get(2)?,
+                        session_id: row.get(3)?,
+                        run_id: row.get(4)?,
+                        parent_id: row.get(5)?,
+                        status: row.get(6)?,
+                        tag: row.get(7)?,
+                        input: row.get(8)?,
+                        output: row.get(9)?,
+                        error: row.get(10)?,
+                        duration_ms: row.get(11)?,
+                        created_at: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap()
+    };
+    let read_summary = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT total,success,failure,validation_failures,denied,sessions,last_used_at
+                 FROM tool_invocation_summary WHERE tool_id=?1",
+                [&tool_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let read_session = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT session_id,invocation_count FROM tool_invocation_sessions
+                 WHERE tool_id=?1 AND session_id=?2",
+                rusqlite::params![tool_id, session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let read_invocation_count = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT count(*) FROM invocations WHERE tool_id=?1",
+                [&tool_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let invocation_before = read_invocation(&connection);
+    let summary_before = read_summary(&connection);
+    let session_before = read_session(&connection);
+    let invocation_count_before = read_invocation_count(&connection);
+    assert_eq!(invocation_count_before, 1);
+
+    connection
+        .execute_batch("DROP TABLE messages_unicode_fts; PRAGMA user_version=79;")
+        .unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 79);
+    drop(connection);
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    let hits = store.search_sessions("文件", 20).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, session_id);
+    assert_eq!(hits[0].message_id, message_id);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    assert_eq!(read_invocation_count(&connection), invocation_count_before);
+    assert_eq!(read_invocation(&connection), invocation_before);
+    assert_eq!(read_summary(&connection), summary_before);
+    assert_eq!(read_session(&connection), session_before);
+}
+
+#[test]
+fn unicode_search_index_tracks_edits_deletions_order_and_limits() {
+    let paths = temp_paths("unicode-index-order");
+    let (session_id, first, second, third) = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap();
+        let first = store
+            .append_message(&session.id, "user", "文件 旧标记")
+            .unwrap();
+        let second = store
+            .append_message(&session.id, "user", "文件 删除标记")
+            .unwrap();
+        let third = store
+            .append_message(&session.id, "user", "文件 最新标记")
+            .unwrap();
+        (session.id, first, second, third)
+    };
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    connection
+        .execute(
+            "UPDATE messages SET created_at='2025-01-01T00:00:00Z' WHERE session_id=?1",
+            [&session_id],
+        )
+        .unwrap();
+    drop(connection);
+    let store = Store::open(&paths.db_file()).unwrap();
+
+    let limited = store.search_sessions("文件", 2).unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].message_id, third.id);
+    assert_eq!(limited[1].message_id, second.id);
+
+    store
+        .edit_message(&session_id, &first.id, "文件 新标记")
+        .unwrap();
+    for query in ["旧标记", "删除标记", "最新标记"] {
+        assert!(
+            store.search_sessions(query, 20).unwrap().is_empty(),
+            "{query}"
+        );
+    }
+    let updated = store.search_sessions("新标记", 20).unwrap();
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0].message_id, first.id);
+}
+
+#[test]
+fn unicode_search_index_clears_session_deletion_cascades() {
+    let paths = temp_paths("unicode-index-session-delete");
+    let (session_id, rowid) = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap();
+        store
+            .append_message(&session.id, "user", "session 文件 content")
+            .unwrap();
+        let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+        let rowid = connection
+            .query_row(
+                "SELECT rowid FROM messages WHERE session_id=?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(store.delete_session(&session.id).unwrap());
+        (session.id, rowid)
+    };
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(store.search_sessions("文件", 20).unwrap().is_empty());
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let indexed_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages_unicode_fts WHERE rowid=?1",
+            [rowid],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_rows, 0, "session {session_id}");
+}
+
+#[test]
+fn unicode_search_index_fork_writes_are_transactional() {
+    let paths = temp_paths("unicode-index-fork");
+    let (source_id, fork_id, source_messages, fork_messages) = {
+        let store = Store::open(&paths.db_file()).unwrap();
+        let source = store.create_session(None).unwrap();
+        let first = store
+            .append_message(&source.id, "user", "first 文件")
+            .unwrap();
+        let second = store
+            .append_message(&source.id, "assistant", "second 文件")
+            .unwrap();
+        let fork = store.fork_session(&source.id, None, None).unwrap().unwrap();
+        let hits = store.search_sessions("文件", 20).unwrap();
+        assert_eq!(hits.len(), 4);
+        let fork_messages = hits
+            .iter()
+            .filter(|hit| hit.session_id == fork.id)
+            .map(|hit| hit.message_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(fork_messages.len(), 2);
+        (source.id, fork.id, vec![first.id, second.id], fork_messages)
+    };
+
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_partial_fork BEFORE INSERT ON messages
+             WHEN NEW.seq=2 AND NEW.session_id NOT IN ('{source_id}','{fork_id}')
+             BEGIN SELECT RAISE(ABORT,'controlled fork failure'); END;"
+        ))
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    assert!(store.fork_session(&source_id, None, None).is_err());
+    let hits = store.search_sessions("文件", 20).unwrap();
+    assert_eq!(hits.len(), 4);
+    for message_id in source_messages.into_iter().chain(fork_messages) {
+        assert!(hits.iter().any(|hit| hit.message_id == message_id));
+    }
+
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let orphaned_index_rows = connection
+        .query_row(
+            "SELECT COUNT(*) FROM messages_unicode_fts u
+             WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.rowid=u.rowid)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(orphaned_index_rows, 0);
+}
+
+#[test]
+fn audit_search_matches_unicode_case_without_dropping_marks() {
+    let store = Store::open_in_memory().unwrap();
+    store.audit("user", "search.note", "CAFÉ menu").unwrap();
+    store.audit("user", "search.note", "เสื้อสีขาว").unwrap();
+
+    let cafe = store.list_audit(Some("café"), None, 20).unwrap();
+    assert_eq!(cafe.len(), 1);
+    assert_eq!(cafe[0].detail, "CAFÉ menu");
+
+    let thai = store.list_audit(Some("ข่าว"), None, 20).unwrap();
+    assert!(thai.is_empty());
+}
+
 /// A nameless tool call stored before #540 was fixed is left out of the
 /// context with its result, so strict endpoints accept the Session again (#541).
 #[test]

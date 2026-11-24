@@ -63,6 +63,7 @@ fn opening_a_v67_database_adds_query_indexes_once_without_changing_checkpoint_ro
     raw.execute_batch(
         "DROP INDEX idx_checkpoints_session;
          DROP INDEX idx_run_usage_created;
+         DROP TABLE messages_unicode_fts;
          PRAGMA user_version=67;",
     )
     .unwrap();
@@ -455,7 +456,7 @@ fn registry_rollup_migration_backfills_existing_invocations() {
 
     let connection = Connection::open(&db).unwrap();
     connection
-        .execute_batch(&format!(
+        .execute_batch(
             "DROP TRIGGER tool_invocation_summary_insert;
              DROP TRIGGER tool_invocation_summary_update;
              DROP TRIGGER tool_invocation_summary_delete;
@@ -464,9 +465,9 @@ fn registry_rollup_migration_backfills_existing_invocations() {
              DROP TABLE tool_invocation_sessions;
              DROP TABLE tool_invocation_summary;
              DROP INDEX idx_inv_tool_created;
-             PRAGMA user_version={};",
-            SCHEMA_VERSION - 1
-        ))
+             DROP TABLE messages_unicode_fts;
+             PRAGMA user_version=78;",
+        )
         .unwrap();
     drop(connection);
 
