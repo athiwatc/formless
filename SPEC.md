@@ -4618,8 +4618,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   {since}`). Model outcomes in a range come from the `model_events` log
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
-- **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
+- **Token and cost chart.** `UsageByDay {since, by, utc_offset_minutes}` sums
+  provider token use (prompt, completion, cached, cache write) per UTC day,
+  shifted by the optional caller UTC offset in minutes, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -6861,12 +6862,16 @@ is exposed by these commands.
 
 `usage [--by day|model|provider|purpose|role|session] [--since DURATION] [--json]`
 reads the existing full-range UsageByDay aggregation once, independently of
-the bounded recent Run list. Default/explicit day sends no group key and keeps
-the daemon's oldest-first day order; other groups keep its descending total-token
-order. No since means all history; durations use the shared checked parser
-and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables show cache writes, total tokens (prompt plus completion), and a
-final total row. Cached and cache-write tokens are included in prompt tokens.
+the bounded recent Run list. Default/explicit day sends no group key and the
+caller's current local UTC offset in minutes; its oldest-first buckets and JSON
+keys are local dates. Other groups omit the offset and keep their descending
+total-token order. Requests without an offset, including existing TUI clients,
+keep UTC day grouping. The offset is fixed for the entire query, including
+history across daylight-saving changes. No since means all history; durations
+use the shared checked parser and one UTC RFC3339 cutoff matching the existing
+stored TEXT representation. Human tables show the local UTC offset, cache writes,
+total tokens (prompt plus completion), and a final total row. Cached and
+cache-write tokens are included in prompt tokens.
 Unknown costs and unavailable cache-write counts display as `-`, including in
 totals that contain an unknown value. JSON preserves the complete row array,
 including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a

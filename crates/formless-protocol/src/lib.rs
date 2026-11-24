@@ -3080,14 +3080,19 @@ pub enum Request {
         since: Option<String>,
     },
     /// Provider token use (and cost, when priced) since `since`, per day
-    /// or, with `by` = "model", "role" or "session", per that key over the
-    /// range (SPEC §10.4): `[{key, prompt_tokens, completion_tokens,
+    /// (shifted by `utc_offset_minutes` when supplied) or, with `by` = "model",
+    /// "role" or "session", per that key over the range (SPEC §10.4):
+    /// `[{key, prompt_tokens, completion_tokens,
     /// cached_tokens, cost}]`, days oldest first or keys biggest first.
     UsageByDay {
         #[serde(default)]
         since: Option<String>,
         #[serde(default)]
         by: Option<String>,
+        /// Shift daily buckets by this caller's UTC offset in minutes.
+        /// Omitted offsets keep the historical UTC grouping.
+        #[serde(default)]
+        utc_offset_minutes: Option<i32>,
     },
     /// Per-Tool calls and success rate in a range:
     /// `[{tool_id, invocations, success_rate}]`.

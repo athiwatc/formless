@@ -55,6 +55,7 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
     let by = |by: Option<&str>| Request::UsageByDay {
         since: None,
         by: by.map(Into::into),
+        utc_offset_minutes: None,
     };
     let days = daemon.handle(by(None)).await.unwrap();
     let days = days.as_array().unwrap();
@@ -85,11 +86,50 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
         .handle(Request::UsageByDay {
             since: Some("2999-01-01T00:00:00Z".into()),
             by: None,
+            utc_offset_minutes: None,
         })
         .await
         .unwrap();
     assert!(none.as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn daily_usage_shifts_by_the_request_offset_and_defaults_to_utc() {
+    let root = std::env::temp_dir().join(format!("fl-usage-offset-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session_id = store.create_session(Some("offset fixture".into())).unwrap().id;
+    let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+    conn.execute(
+        "INSERT INTO run_usage (session_id, run_id, model, prompt_tokens, completion_tokens,
+                                reasoning_tokens, cached_tokens, created_at)
+         VALUES (?1, 'offset-run', 'fixture', 5, 0, 0, 0, '2026-11-16T20:00:00Z')",
+        [&session_id],
+    )
+    .unwrap();
+    drop(conn);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let request = |utc_offset_minutes| Request::UsageByDay {
+        since: None,
+        by: None,
+        utc_offset_minutes,
+    };
+
+    let local = daemon.handle(request(Some(420))).await.unwrap();
+    assert_eq!(local[0]["key"], "2026-11-17");
+    assert_eq!(local[0]["prompt_tokens"], 5);
+
+    let utc = daemon.handle(request(None)).await.unwrap();
+    assert_eq!(utc[0]["key"], "2026-11-16");
+    assert_eq!(utc[0]["prompt_tokens"], 5);
+
+    drop(daemon);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -139,6 +179,7 @@ async fn session_usage_groups_keep_identity_when_names_match_or_disappear() {
     let request = || Request::UsageByDay {
         since: None,
         by: Some("session".into()),
+        utc_offset_minutes: None,
     };
     let expected = |id: &str, key: &str, prompt_tokens, completion_tokens, cost: Value| {
         json!({
@@ -260,6 +301,7 @@ async fn each_provider_prices_its_own_usage() {
         .handle(Request::UsageByDay {
             since: None,
             by: Some("provider".into()),
+            utc_offset_minutes: None,
         })
         .await
         .unwrap();

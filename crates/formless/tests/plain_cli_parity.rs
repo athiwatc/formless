@@ -2571,7 +2571,7 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
             } else {
                 let text = String::from_utf8(out.stdout).unwrap();
                 assert_eq!(
-                    text.contains("DAY (UTC)"),
+                    text.contains("DAY (LOCAL, UTC"),
                     group.is_none() || group == Some("day")
                 );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
@@ -2596,11 +2596,22 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 );
             }
             let requests = fixture.requests.lock().unwrap();
-            let [Request::UsageByDay { since, by }] = &requests[..] else {
+            let [Request::UsageByDay {
+                since,
+                by,
+                utc_offset_minutes,
+            }] = &requests[..]
+            else {
                 panic!("{requests:?}")
             };
             assert!(since.is_none());
             assert_eq!(by.as_deref(), group.filter(|value| *value != "day"));
+            assert_eq!(
+                *utc_offset_minutes,
+                (group.is_none() || group == Some("day")).then(|| {
+                    chrono::Local::now().offset().local_minus_utc() / 60
+                })
+            );
         }
     }
     fixture.requests.lock().unwrap().clear();
@@ -2612,6 +2623,7 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
     let [Request::UsageByDay {
         since: Some(since),
         by: None,
+        utc_offset_minutes: Some(offset),
     }] = &requests[..]
     else {
         panic!("{requests:?}")
@@ -2621,6 +2633,10 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
         .with_timezone(&chrono::Utc);
     assert!(cutoff >= earliest && cutoff <= latest);
     assert_eq!(since, &cutoff.to_rfc3339());
+    assert_eq!(
+        *offset,
+        chrono::Local::now().offset().local_minus_utc() / 60
+    );
 }
 #[test]
 fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_contact() {

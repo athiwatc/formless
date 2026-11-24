@@ -664,7 +664,10 @@ fn usage_by_model_sql(bounded: bool) -> String {
     )
 }
 
-fn grouped_usage_sql(by: &str, bounded: bool) -> String {
+fn grouped_usage_sql(by: &str, bounded: bool, utc_offset_minutes: Option<i32>) -> String {
+    let shifted_day = utc_offset_minutes
+        .filter(|offset| (-1439..=1439).contains(offset))
+        .map(|offset| format!("date(u.created_at, '{offset:+} minutes')"));
     let key = match by {
         "model" => "u.model",
         "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
@@ -673,7 +676,7 @@ fn grouped_usage_sql(by: &str, bounded: bool) -> String {
         "role" => {
             "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')"
         }
-        _ => "substr(u.created_at, 1, 10)",
+        _ => shifted_day.as_deref().unwrap_or("substr(u.created_at, 1, 10)"),
     };
     let (label, order) = if by == "session" {
         (
@@ -6984,24 +6987,26 @@ impl Store {
     /// "purpose", "role", the immutable "session" ID, else the UTC day),
     /// then by provider and model for pricing.
     pub fn usage_grouped(&self, since: Option<&str>, by: &str) -> Result<Vec<GroupedUsage>> {
-        self.query_usage_groups(since, by, |usage, _| usage)
+        self.query_usage_groups(since, by, None, |usage, _| usage)
     }
 
     pub(crate) fn usage_grouped_with_labels(
         &self,
         since: Option<&str>,
         by: &str,
+        utc_offset_minutes: Option<i32>,
     ) -> Result<Vec<(GroupedUsage, Option<String>)>> {
-        self.query_usage_groups(since, by, |usage, label| (usage, label))
+        self.query_usage_groups(since, by, utc_offset_minutes, |usage, label| (usage, label))
     }
 
     fn query_usage_groups<T>(
         &self,
         since: Option<&str>,
         by: &str,
+        utc_offset_minutes: Option<i32>,
         project: impl Fn(GroupedUsage, Option<String>) -> T,
     ) -> Result<Vec<T>> {
-        let mut stmt = self.ps(&grouped_usage_sql(by, since.is_some()))?;
+        let mut stmt = self.ps(&grouped_usage_sql(by, since.is_some(), utc_offset_minutes))?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(since), |r| {
                 let usage = (
