@@ -2259,6 +2259,63 @@ impl Store {
         })
     }
 
+    pub(crate) fn mark_steering_context_included(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        through_seq: i64,
+        included_user_message_ids: &[String],
+        step: i64,
+    ) -> Result<bool> {
+        let included_user_message_ids: std::collections::HashSet<&str> = included_user_message_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if included_user_message_ids.is_empty() {
+            return Ok(false);
+        }
+        self.transaction(|st| {
+            let messages = {
+                let mut statement = st.conn.prepare(
+                    "SELECT id, meta FROM messages WHERE session_id=?1 AND seq<=?2 AND role='user' AND meta IS NOT NULL ORDER BY seq",
+                )?;
+                let rows = statement
+                    .query_map(params![session_id, through_seq], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            let mut changed = false;
+            for (id, metadata) in messages {
+                if !included_user_message_ids.contains(id.as_str()) {
+                    continue;
+                }
+                let Ok(mut meta) = serde_json::from_str::<Value>(&metadata) else {
+                    continue;
+                };
+                let Some(steer) = meta.get_mut("steer").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if steer.get("run_id").and_then(Value::as_str) != Some(run_id)
+                    || steer.get("context_included").and_then(Value::as_bool) == Some(true)
+                {
+                    continue;
+                }
+                steer.insert("step".into(), json!(step));
+                steer.insert("context_included".into(), json!(true));
+                changed |= st.ex(
+                    "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
+                    params![session_id, id, meta.to_string()],
+                )? > 0;
+            }
+            if changed {
+                st.note_rewrite();
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn list_messages(&self, session_id: &str) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
             .conn
@@ -8029,6 +8086,9 @@ pub struct ContextCache {
     tokens: Vec<usize>,
     /// Seqs of the post-checkpoint messages, in order.
     live_seqs: Vec<i64>,
+    /// User-message IDs represented as individual messages in the provider context.
+    /// Checkpoint summaries do not retain per-message IDs.
+    included_user_message_ids: Vec<String>,
     /// Indexes into `live_seqs` where a user message starts a turn.
     turn_starts: Vec<usize>,
     /// Ids of stored tool calls left out for having no name (their
@@ -8038,15 +8098,18 @@ pub struct ContextCache {
 
 impl ContextCache {
     /// Transcript boundary read by the most recent successful context build.
-    /// Filtered legacy Tool/assistant rows can advance this boundary, but user
-    /// rows are retained; it never credits user messages appended afterward.
-    /// Capture it together with the returned context under the same Store lock.
+    /// It can include checkpoint or filtered-row boundaries; use
+    /// `included_user_message_ids` for per-message context inclusion.
     pub(crate) fn last_included_seq(&self) -> i64 {
         self.live_seqs
             .last()
             .copied()
             .or_else(|| self.key.as_ref().map(|key| key.2))
             .unwrap_or(0)
+    }
+
+    pub(crate) fn included_user_message_ids(&self) -> &[String] {
+        &self.included_user_message_ids
     }
 
     /// Use the provider's last real prompt size (when known) for the
@@ -8174,6 +8237,9 @@ impl ContextCache {
                 }
             }
             self.push(msg);
+            if m.role == "user" {
+                self.included_user_message_ids.push(m.id);
+            }
         }
         // Plan state is read on every projection, outside the cached base and
         // persisted prompt. Forecasts, compaction and dispatch share this path.
@@ -8968,6 +9034,74 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+
+    #[test]
+    fn steering_stamp_only_updates_user_messages_represented_in_provider_context() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let old_steer = store
+            .append_message_meta(
+                &session,
+                "user",
+                "steer summarized by checkpoint",
+                Some(json!({"steer":{"run_id":"run"}}).to_string()),
+            )
+            .unwrap();
+        store
+            .save_checkpoint(&session, "earlier conversation summary", old_steer.seq)
+            .unwrap();
+        let current_steer = store
+            .append_message_meta(
+                &session,
+                "user",
+                "steer present as a provider message",
+                Some(json!({"steer":{"run_id":"run"}}).to_string()),
+            )
+            .unwrap();
+        let mut cache = ContextCache::default();
+        let context = cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        let included_ids = cache.included_user_message_ids().to_vec();
+        assert_eq!(included_ids, vec![current_steer.id.clone()]);
+        assert!(context.0[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("earlier conversation summary"));
+        let through_seq = cache.last_included_seq();
+        assert!(through_seq >= old_steer.seq);
+
+        assert!(store
+            .mark_steering_context_included(&session, "run", through_seq, &included_ids, 2)
+            .unwrap());
+        assert!(!store
+            .mark_steering_context_included(&session, "run", through_seq, &included_ids, 3)
+            .unwrap());
+
+        let messages = store.list_messages(&session).unwrap();
+        let old_meta: Value = serde_json::from_str(
+            messages
+                .iter()
+                .find(|message| message.id == old_steer.id)
+                .unwrap()
+                .meta
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let current_meta: Value = serde_json::from_str(
+            messages
+                .iter()
+                .find(|message| message.id == current_steer.id)
+                .unwrap()
+                .meta
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_meta["steer"]["step"], Value::Null);
+        assert_eq!(current_meta["steer"]["step"], 2);
     }
 }
 

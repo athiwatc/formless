@@ -242,7 +242,7 @@ async fn unrelated_admission_and_resume_freeze_the_quoted_plan_snapshot_then_pub
             .unwrap();
         assert_ne!(new_run, fixture.run);
         let first = admission.first.locked();
-        let (context, defs, _, _) = first.as_ref().unwrap();
+        let (context, defs, _, _, _) = first.as_ref().unwrap();
         let payload = plan_payload(context);
         assert_eq!(payload["state"]["run_id"], fixture.run);
         assert_eq!(payload["state"]["run_status"],if resume{"resumed"}else{"completed"},"the frozen snapshot must explicitly describe its recorded owner, not an active new-task checklist");

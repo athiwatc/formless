@@ -1135,8 +1135,12 @@ automatically.
   `--max-usd` retain precedence over the corresponding profile limit;
   the daily profile limit remains live with `--max-usd`.
 - **Steering is marked.** A message sent while a Run is active is stored
-  with `meta.steer = {step, run_id}` (the Run's step count when it arrived),
-  and clients show it as `↳ steer at step N` under the message.
+  with `meta.steer.run_id`; when the first provider request context includes
+  it, the daemon records that 1-based provider turn in `meta.steer.step` and
+  sets `meta.steer.context_included`. Clients show `↳ steer sent during a
+  Run` when inclusion is unrecorded, and `↳ steer joined at step N` when it is
+  recorded. Forks preserve this mark as source-transcript provenance; it
+  refers to the source Run.
 
 ### 5.5 Asking the user mid-Run
 

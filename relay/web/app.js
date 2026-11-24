@@ -4727,10 +4727,16 @@
           // Each user message starts a fresh turn so its Edit button is exact.
           group = null;
           const from = sentElsewhere(m);
-          open("user", m.created_at, m).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
-            ...attachmentTags(m),
-            ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
-            ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
+          open("user", m.created_at, m).push(messageBody(m, (n) => {
+            const steer = steerStep(m);
+            n.append(h("div", { class: "bubble" }, withMentions(m.content)),
+              ...attachmentTags(m),
+              ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
+              ...(steer === null ? [] : [h("div", {
+                class: "steer-mark",
+                title: steer === "unrecorded" ? "Provider-context inclusion was not recorded" : "First provider request context that included this steer",
+              }, steer === "unrecorded" ? "↳ steer sent during a Run" : "↳ steer joined at step " + steer)]));
+          }));
         } else if (m.role === "user" && m.generated_by != null) {
           const kickoff = m.generated_by === "topic_kickoff";
           open("assistant", m.created_at).push(messageBody(m, (n) => n.append(
@@ -8588,9 +8594,13 @@
   }
   /** The client a user message came from, when it wasn't this one: another
    * kind of client, or another one still attached. */
-  // The step a steering message (sent mid-Run) arrived at, or null.
+  // The first provider turn that included a steer, "unrecorded", or null.
   function steerStep(m) {
-    try { const s = JSON.parse(m.meta || "{}").steer; return s && typeof s.step === "number" ? s.step : null; } catch { return null; }
+    try {
+      const s = JSON.parse(m.meta || "{}").steer;
+      if (!s || typeof s.run_id !== "string") return null;
+      return s.context_included === true && Number.isInteger(s.step) && s.step > 0 ? s.step : "unrecorded";
+    } catch { return null; }
   }
   function sentElsewhere(m) {
     let c;

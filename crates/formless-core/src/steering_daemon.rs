@@ -36,6 +36,24 @@ impl RunSteering {
 }
 
 impl Daemon {
+    pub(super) fn mark_steering_context_included(
+        &self,
+        session: &str,
+        run: &str,
+        seq: i64,
+        included_user_message_ids: &[String],
+        step: i64,
+    ) -> Result<()> {
+        if self.with_store(|st| {
+            st.mark_steering_context_included(session, run, seq, included_user_message_ids, step)
+        })? {
+            self.broadcast(Event::MessagesEdited {
+                session_id: session.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn mark_context_consumed(&self, session: &str, run: &str, seq: i64) {
         if let Some(control) = self
             .runs

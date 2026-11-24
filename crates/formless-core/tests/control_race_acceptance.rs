@@ -325,9 +325,34 @@ async fn steer_during_real_tool_execution_produces_exactly_one_final_answer() {
         .await;
     assert_eq!(ack["steered"], true);
     assert_eq!(ack["run_id"], run);
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "STEER_DURING_TOOL_964")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(steer.meta.as_deref().unwrap()).unwrap()["steer"]["step"],
+        Value::Null,
+        "arrival metadata does not claim a provider turn before context inclusion"
+    );
     release.send(()).unwrap();
     let final_call = fixture.next_call().await;
     assert!(contains(&final_call.body, "STEER_DURING_TOOL_964"));
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "STEER_DURING_TOOL_964")
+        .unwrap();
+    let steer_meta = serde_json::from_str::<Value>(steer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(steer_meta["steer"]["step"], 2);
+    assert_eq!(steer_meta["steer"]["context_included"], true);
+    client
+        .event(|event| matches!(event, Event::MessagesEdited { session_id } if session_id == &fixture.session))
+        .await;
     final_call.answer(json!({"content":"single final answer including steer"}));
     client.finished(&run, "completed").await;
     assert_eq!(
@@ -344,6 +369,99 @@ async fn steer_during_real_tool_execution_produces_exactly_one_final_answer() {
         .collect();
     assert_eq!(finals.len(), 1);
     assert_eq!(finals[0].content, "single final answer including steer");
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn steer_during_first_provider_request_keeps_its_first_joined_step() {
+    let env = credential_env::EnvGuard::isolated();
+    let (mut fixture, mut client) = Fixture::new(&env, false, false).await;
+    fixture.tool(
+        "race_gate",
+        &["net:127.0.0.1".into()],
+        &format!(
+            "function run(){{ return fetch('{}/gate').body; }}",
+            fixture.base
+        ),
+    );
+    let run = fixture.start(&mut client).await;
+    let first_call = fixture.next_call().await;
+    assert!(!contains(
+        &first_call.body,
+        "STEER_DURING_FIRST_PROVIDER_TURN_965"
+    ));
+    let ack = client
+        .rpc(Request::SendMessage {
+            session_id: fixture.session.clone(),
+            content: "STEER_DURING_FIRST_PROVIDER_TURN_965".into(),
+            mode: SendMode::Steer,
+            client_msg_id: None,
+        })
+        .await;
+    assert_eq!(ack["steered"], true);
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "STEER_DURING_FIRST_PROVIDER_TURN_965")
+        .unwrap();
+    let steer_meta: Value = serde_json::from_str(steer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(steer_meta["steer"]["step"], Value::Null);
+    assert_eq!(steer_meta["steer"]["context_included"], Value::Null);
+    first_call.answer(calls(&[("race_gate", json!({}))]));
+    let first_gate = tokio::time::timeout(Duration::from_secs(10), fixture.gates.recv())
+        .await
+        .expect("first tool did not enter actual HTTP gate")
+        .unwrap();
+    first_gate.send(()).unwrap();
+
+    let second_call = fixture.next_call().await;
+    assert!(contains(
+        &second_call.body,
+        "STEER_DURING_FIRST_PROVIDER_TURN_965"
+    ));
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "STEER_DURING_FIRST_PROVIDER_TURN_965")
+        .unwrap();
+    let steer_meta: Value = serde_json::from_str(steer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(steer_meta["steer"]["step"], 2);
+    assert_eq!(steer_meta["steer"]["context_included"], true);
+    client
+        .event(|event| matches!(event, Event::MessagesEdited { session_id } if session_id == &fixture.session))
+        .await;
+
+    let mut next_batch = calls(&[("race_gate", json!({}))]);
+    next_batch["tool_calls"][0]["id"] = json!("call-later-turn");
+    second_call.answer(next_batch);
+    let later_gate = tokio::time::timeout(Duration::from_secs(10), fixture.gates.recv())
+        .await
+        .expect("later tool did not enter actual HTTP gate")
+        .unwrap();
+    later_gate.send(()).unwrap();
+
+    let third_call = fixture.next_call().await;
+    assert!(contains(
+        &third_call.body,
+        "STEER_DURING_FIRST_PROVIDER_TURN_965"
+    ));
+    let steer = fixture
+        .store
+        .list_messages(&fixture.session)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "STEER_DURING_FIRST_PROVIDER_TURN_965")
+        .unwrap();
+    let steer_meta: Value = serde_json::from_str(steer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(steer_meta["steer"]["step"], 2);
+    assert_eq!(steer_meta["steer"]["context_included"], true);
+    third_call.answer(json!({"content":"final answer after later turn"}));
+    client.finished(&run, "completed").await;
+    assert_eq!(fixture.provider_count.load(Ordering::SeqCst), 3);
     fixture.shutdown().await;
 }
 

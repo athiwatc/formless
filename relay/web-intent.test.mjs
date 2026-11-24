@@ -436,6 +436,34 @@ function node(tag, attrs, ...children) {
 }
 const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] : [];
 const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
+test('steering marks distinguish unrecorded inclusion from joined steps', () => {
+  const transcript = node('div');
+  const c = setup(['renderHistory', 'messageBody', 'messageMenu', 'beginEdit', 'assistantStopNote', 'steerStep'], {
+    h: node, isRunning: () => false, markdown: text => node('p', null, text),
+    speaker: role => role === 'user' ? 'user' : 'assistant',
+    sentElsewhere: () => null, withMentions: text => text, attachmentTags: () => [],
+    renderLive() {}, renderComposer() {}, closePopover() {}, placePopover() {}, messageCopyText: () => 'message',
+  });
+  const lookup = c.$;
+  c.$ = id => id === 'transcript' ? transcript : lookup(id);
+  vm.runInContext('const rendered = new Map(); const WHO = { user: "You", assistant: "Formless" }; let popover;', c);
+  c.S.daemonOnline = true;
+  c.S.messages = [
+    { id: 'pending', role: 'user', content: 'pending', meta: JSON.stringify({ steer: { run_id: 'run' } }) },
+    { id: 'joined', role: 'user', content: 'joined', meta: JSON.stringify({ steer: { run_id: 'run', step: 2, context_included: true } }) },
+    { id: 'legacy-zero', role: 'user', content: 'legacy', meta: JSON.stringify({ steer: { run_id: 'old-run', step: 0 } }) },
+    { id: 'ordinary', role: 'user', content: 'ordinary', meta: '{}' },
+  ];
+  c.renderHistory();
+  const marks = all(transcript).filter(n => n.attrs.class === 'steer-mark');
+  assert.deepEqual(marks.map(plainText), [
+    '↳ steer sent during a Run',
+    '↳ steer joined at step 2',
+    '↳ steer sent during a Run',
+  ]);
+  assert.equal(marks[0].attrs.title, 'Provider-context inclusion was not recorded');
+  assert.equal(marks[1].attrs.title, 'First provider request context that included this steer');
+});
 test('generated user-role messages render as Formless and cannot be moved or edited as user requests', () => {
   const transcript = node('div');
   const copied = [];
