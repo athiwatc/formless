@@ -6872,6 +6872,13 @@ No history means prompt size only; missing prices mean no dollar range. Cache
 fractions and compaction probabilities describe comparable history, not guarantees.
 A draft already above the local compaction trigger is flagged immediately.
 
+The optional `RunForecast.routing_pick` wire field names the model selected when
+the effective forecast selector was automatically routed. It is omitted when no
+automatic route occurred, rather than serialized as `null`. This records the
+forecast's selection, not a provider attempt or a guarantee of the response's
+served model; response attribution records the model that actually served the
+response, including fallback.
+
 TUI/web composer hints debounce and discard stale results after draft, Session,
 model, attachment, persisted context, Tool or settings changes. Retry, edit and
 resume use prospective inputs and preserve the existing transcript, paused status,
