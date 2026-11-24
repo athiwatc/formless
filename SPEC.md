@@ -6070,6 +6070,9 @@ during its snapshot fetch, deduplicated by message id.
   · daemon unreachable" and the transcript says the daemon is offline. The
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
   **Notifications (Web Push, opt-in per device):**
+  - Browser permission is requested only by an explicit Settings → This
+    browser action, never by sending a chat message; existing granted and
+    denied browser decisions are respected.
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
     room in the clear; a subscription is not Session data. "Turn off"

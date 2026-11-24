@@ -7441,7 +7441,8 @@
         h("dt", null, "density"), h("dd", null, h("span", { class: "read-controls" },
           ["comfortable", "compact"].map((d) => h("button", { class: "btn small" + (S.density === d ? " primary" : ""), type: "button", "aria-pressed": String(S.density === d), onclick: () => setReading(null, d) }, d)))),
         h("dt", null, "encryption"), h("dd", null, "AES-256-GCM, key held only in this tab"),
-        S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
+        h("dt", null, "notifications"), h("dd", null, browserNotificationControl(),
+          S.local ? null : pushControl())),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
@@ -7554,6 +7555,16 @@
     filterSettings();
   });
 
+  function browserNotificationControl() {
+    if (!("Notification" in window)) return h("span", { class: "muted" }, "not supported in this browser");
+    if (Notification.permission === "granted") return h("span", { class: "muted" }, "allowed by this browser");
+    if (Notification.permission === "denied") return h("span", { class: "muted" }, "blocked; change this site's browser permissions");
+    return h("button", { class: "btn small", type: "button", onclick: async () => {
+      try { await Notification.requestPermission(); }
+      catch (_) { note("Couldn't request browser notification permission.", true); }
+      renderView();
+    } }, "Allow browser notifications");
+  }
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
    * a push with no content; nothing about the Session leaves the daemon. */
@@ -9254,7 +9265,6 @@
         await act({ type: "edit_message", session_id: sid, message_id: editMessageId, content: text });
         return;
       }
-      askNotifyPermission();
       closeMentions();
       const toolNames = new Set((S.tools || []).map((tool) => tool.name));
       const sessionKey = sessionCacheKey(scope, sid);
@@ -9539,12 +9549,6 @@
     syncRunningExposure();
     if (!document.hidden) { unseen = 0; document.title = baseTitle; }
   });
-  /** Ask once, from a user gesture (sending a message). */
-  function askNotifyPermission() {
-    if (notifyMode() === "desktop" && "Notification" in window && Notification.permission === "default") {
-      Notification.requestPermission().catch(() => {});
-    }
-  }
   function sessionName(id) {
     const s = S.sessions.find((x) => x.id === id);
     return (s && s.name) || "Session";
