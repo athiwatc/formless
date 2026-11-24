@@ -16364,6 +16364,7 @@ impl App {
                 since: since.clone(),
                 by: Some(USAGE_BY[self.usage_by % USAGE_BY.len()].to_string())
                     .filter(|b| b != "day"),
+                utc_offset_minutes: None,
             },
         );
         if since.is_some() {
