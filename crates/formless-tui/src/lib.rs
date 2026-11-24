@@ -11550,6 +11550,17 @@ impl App {
                 }
                 settings::Kind::Bool => {
                     if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if !model_supported {
+                            self.settings_download_armed = false;
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                            return;
+                        }
                         if key.kind != KeyEventKind::Press {
                             return;
                         }
@@ -25613,6 +25624,46 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
         assert!(!app.settings_download_armed);
+    }
+
+    #[test]
+    fn naming_auto_download_cannot_be_enabled_without_a_supported_model() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.naming.model = "not-in-catalog".into();
+        cfg.save(&app.paths).unwrap();
+        app.open_view(View::Settings);
+
+        let rows = app.settings_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "naming.model_size")
+                .unwrap()
+                .value,
+            "—"
+        );
+        let row = rows
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("downloads are unavailable")));
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
     }
 
     #[test]

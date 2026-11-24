@@ -117,17 +117,17 @@ test('enabling naming auto-download asks consent before saving', async () => {
   assert.deepEqual(c.calls, [{ type: 'set_setting', key: 'naming.auto_download', value: true }]);
 });
 
-test('unsupported naming models show heuristic-only consent without a fabricated size', async () => {
+test('unsupported naming models show information without granting download permission', async () => {
   for (const naming of [
     { model: '', model_size: '—', status: 'heuristic only' },
     { model: 'not-in-catalog', model_size: '—', status: 'unknown model not-in-catalog; titles use a heuristic' },
   ]) {
     const c = fixture();
     let prompt;
-    c.ask = async options => { prompt = options; return false; };
+    c.ask = async options => { prompt = options; return true; };
     await c.editSetting('naming.auto_download', false, 'bool', [], { naming });
     assert.equal(prompt.title, 'No supported session-naming model');
-    assert.equal(prompt.ok, 'Save setting');
+    assert.equal(prompt.ok, 'Close');
     assert.match(prompt.text, /heuristic/);
     assert.doesNotMatch(prompt.text, /will download|about |409 MiB/i);
     const info = c.namingDownloadInfo(naming);

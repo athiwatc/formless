@@ -7806,10 +7806,18 @@
     if (key === "naming.auto_download" && value === true) {
       const naming = (settings && settings.naming) || {};
       const download = namingDownloadInfo(naming);
+      if (!download.supported) {
+        await ask({
+          title: "No supported session-naming model",
+          text: download.consent,
+          ok: "Close",
+        });
+        return;
+      }
       const accepted = await ask({
-        title: download.supported ? "Allow session-naming model download?" : "No supported session-naming model",
+        title: "Allow session-naming model download?",
         text: download.consent,
-        ok: download.supported ? "Allow download" : "Save setting",
+        ok: "Allow download",
       });
       if (!accepted) return;
     }

@@ -71,7 +71,7 @@ impl Row {
         match &self.kind {
             Kind::ReadOnly(why) => why,
             Kind::Bool if self.key == "naming.auto_download" => {
-                "Enter/Space toggles; enabling asks for consent"
+                "Enter/Space toggles; a supported naming model is required"
             }
             Kind::Bool | Kind::Thinking => "Enter toggles",
             Kind::Choice(_) => "Enter cycles",
@@ -474,7 +474,7 @@ pub fn rows(
         row.help = help(&row.key, &current);
         if row.key == "naming.auto_download" {
             let notice = naming_spec.map_or_else(
-                || "No supported model is configured; titles use a heuristic.".into(),
+                || "No supported model is configured; titles use a heuristic. Automatic model downloads are unavailable.".into(),
                 |spec| {
                     format!(
                         "Allow first-use download of {} (about {}). Without it, titles use a heuristic.",
