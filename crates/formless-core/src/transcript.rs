@@ -172,7 +172,7 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
                 append_markdown_turn(&mut out, "## Assistant\n\n", &t);
                 if let Some(served) = served {
                     out.push_str(&format!(
-                        "> via {} ({})\n",
+                        "\n*via {} ({})*\n",
                         escape_markdown_inline(&served.name),
                         escape_markdown_inline(&served.via)
                     ));
@@ -560,7 +560,7 @@ mod tests {
         .to_string();
         let messages = [msg("assistant", "", Some(&meta))];
         let markdown = markdown("fixture", &messages);
-        assert!(markdown.contains("> via served (fallback)"), "{markdown}");
+        assert!(markdown.contains("*via served (fallback)*"), "{markdown}");
         assert!(
             markdown.contains("<summary>Tool: grep</summary>"),
             "{markdown}"
@@ -571,6 +571,27 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("<summary>Tool: grep</summary>"), "{html}");
+    }
+
+    #[test]
+    fn markdown_served_model_is_not_inside_answer_blockquote() {
+        let meta = serde_json::json!({
+            "model": {"name": "served", "via": "fallback", "requested": "requested"}
+        })
+        .to_string();
+        let markdown = markdown(
+            "fixture",
+            &[msg("assistant", "> quoted answer", Some(&meta))],
+        );
+        assert!(
+            markdown.contains("> quoted answer\n\n*via served (fallback)*\n"),
+            "{markdown}"
+        );
+
+        let html = md_html(&markdown);
+        let quote_end = html.find("</blockquote>").unwrap();
+        let attribution = html.find("<em>via served (fallback)</em>").unwrap();
+        assert!(attribution > quote_end, "{html}");
     }
 
     /// Tool output is attacker-controlled: an exported page must not fetch
