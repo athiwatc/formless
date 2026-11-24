@@ -850,6 +850,11 @@ async fn persistence_failure_poisoning_prevents_followup_paid_requests() {
         1,
         "failed usage commit reopened budget headroom"
     );
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        1,
+        "failed usage commit allowed a follow-up dispatch"
+    );
     drop(db);
     drop(provider);
     teardown(daemon, server).await;
