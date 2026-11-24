@@ -7666,15 +7666,29 @@ impl Daemon {
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
                 let step = self.with_reader(|st| st.run_steps(run_id))? + 1;
-                self.mark_steering_context_included(
-                    session_id,
-                    run_id,
-                    consumed_seq,
-                    &included_steer_message_ids,
-                    resumed_from.as_deref(),
-                    step,
-                )?;
-                self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let dispatch_daemon = self.clone();
+                let dispatch_session = session_id.to_string();
+                let dispatch_run = run_id.to_string();
+                let dispatch_steer_ids = included_steer_message_ids.clone();
+                let dispatch_resumed_from = resumed_from.clone();
+                let request_provider = call_provider
+                    .clone()
+                    .with_request_dispatch_hook(Arc::new(move || {
+                        dispatch_daemon.mark_steering_context_included(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                            &dispatch_steer_ids,
+                            dispatch_resumed_from.as_deref(),
+                            step,
+                        )?;
+                        dispatch_daemon.mark_context_consumed(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                        );
+                        Ok(())
+                    }));
                 let mut correlated = transcript_attempts::Attempt::start(
                     self.transcript_attempts.clone(), self.subs.clone(),
                     session_id, run_id, &transcript_turn, consumed_seq, !hide_candidate,
@@ -7685,7 +7699,7 @@ impl Daemon {
                     "run",
                     session_id,
                     run_id,
-                    call_provider.chat_stream(
+                    request_provider.chat_stream(
                         &ctx,
                         &defs,
                         &model,

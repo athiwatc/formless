@@ -822,7 +822,16 @@ async fn persistence_failure_poisoning_prevents_followup_paid_requests() {
     let (_root, paths, cfg, daemon, server) = setup(&env, mock.clone(), Some(5.0), true).await;
     let db = rusqlite::Connection::open(paths.db_file()).unwrap();
     db.execute_batch("CREATE TRIGGER reject_budget_usage BEFORE INSERT ON run_usage BEGIN SELECT RAISE(FAIL,'injected accounting failure'); END;").unwrap();
-    let provider = daemon.provider(&cfg).await.unwrap();
+    let dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatched = dispatches.clone();
+    let provider = daemon
+        .provider(&cfg)
+        .await
+        .unwrap()
+        .with_request_dispatch_hook(std::sync::Arc::new(move || {
+            dispatched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
     let messages = [json!({"role":"user","content":"work"})];
     let first = provider
         .complete_result(&messages, "primary", None)
@@ -1703,6 +1712,11 @@ async fn strict_dollar_limits_refuse_unknown_native_input_before_http_or_admissi
     );
     assert!(error.to_string().contains("cannot be bounded locally"));
     assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        0,
+        "strict native PDF request policy rejects before dispatch hooks"
+    );
     assert_eq!(
         daemon.budget_admission.entered.load(Ordering::SeqCst),
         0,
