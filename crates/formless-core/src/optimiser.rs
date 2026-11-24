@@ -20,6 +20,8 @@ const PROPOSAL_PROMPT: &str = "You improve the Formless agent's learned guidance
 Reply with ONLY a JSON object: {\"kind\": \"prompt\", \"content\": one short imperative guidance line (max 400 chars), \"rationale\": why the signals justify it}. \
 Propose exactly one concrete, generalisable lesson from the failure signals. User preferences are not guidance: the agent keeps those in its user memory. \
 No secrets, no user data, no instructions to ignore safety or approvals.";
+const MAX_PROPOSAL_TOOL_SIGNALS: usize = 20;
+const MAX_PROPOSAL_SIGNAL_CHARS: usize = 12_000;
 
 const OPTIMISER_PROMPT: &str = concat!(
     "You improve a failing JavaScript Tool for the Formless harness. \
@@ -251,12 +253,13 @@ impl Daemon {
 
     fn scan_triggers(&self, cfg: &Config) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        for tool in self.with_store(|st| st.list_tools(false))? {
+        let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
+        let windowed = self.with_store(|st| st.windowed_successes(cfg.metrics.success_window))?;
+        for tool in tools {
             if tool.needs_attention {
                 continue;
             }
-            let (sample, rate) =
-                self.with_store(|st| st.windowed_success(&tool.id, cfg.metrics.success_window))?;
+            let (sample, rate) = windowed.get(&tool.id).copied().unwrap_or((0, None));
             if sample >= cfg.metrics.trigger_min_invocations as i64
                 && rate
                     .map(|r| r < cfg.metrics.trigger_success_below)
@@ -328,29 +331,35 @@ impl Daemon {
         // Signals: per-Tool metrics + recent recorded failure patterns.
         let mut signals = String::from("Recent signals:\n");
         let mut narrow = Vec::new();
-        for tool in self.with_store(|st| st.list_tools(false))? {
-            let metrics = self.with_store(|st| st.tool_metrics(&tool.id, None))?;
-            if metrics.total == 0 {
-                continue;
-            }
+        let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
+        let ranked = top_tool_signals(&tools);
+        for tool in &ranked {
             signals.push_str(&format!(
                 "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
                 tool.name,
-                metrics.total,
-                metrics.success,
-                metrics.success_rate,
-                metrics.failure,
-                metrics.validation_failures,
-                metrics.denied,
-                metrics.sessions
+                tool.invocations,
+                tool.success,
+                tool.success_rate,
+                tool.failure,
+                tool.validation_failures,
+                tool.denied,
+                tool.sessions
             ));
-            if is_narrow(&metrics) {
-                narrow.push(tool.name.clone());
-            }
-            if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
-                for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
-                    signals.push_str(&format!("  failure tag={} error={}\n", f.tag, f.error));
+            if tool.failure > 0 {
+                if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
+                    for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
+                        signals.push_str(&format!(
+                            "  failure tag={} error={}\n",
+                            f.tag,
+                            f.error.chars().take(300).collect::<String>()
+                        ));
+                    }
                 }
+            }
+        }
+        for tool in &ranked {
+            if tool.sessions == 1 && tool.invocations >= 3 {
+                narrow.push(tool.name.clone());
             }
         }
         if !narrow.is_empty() {
@@ -398,6 +407,7 @@ impl Daemon {
                 signals.push_str(&format!("- [{}] {}\n", p.status, p.content));
             }
         }
+        let signals = cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS);
         let provider = self.provider(cfg).await?;
         let model = cfg
             .optimiser
@@ -1961,6 +1971,26 @@ pub fn is_narrow(m: &ToolMetricsInfo) -> bool {
     m.sessions == 1 && m.total >= 3
 }
 
+fn top_tool_signals(
+    tools: &[crate::storage::RegistryToolSummary],
+) -> Vec<&crate::storage::RegistryToolSummary> {
+    let mut ranked: Vec<_> = tools.iter().filter(|tool| tool.invocations > 0).collect();
+    ranked.sort_by(|a, b| b.failure.cmp(&a.failure).then_with(|| a.name.cmp(&b.name)));
+    ranked.truncate(MAX_PROPOSAL_TOOL_SIGNALS);
+    ranked
+}
+
+fn cap_signal_chars(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let suffix = " [truncated]";
+    let keep = max_chars.saturating_sub(suffix.chars().count());
+    let mut output: String = text.chars().take(keep).collect();
+    output.extend(suffix.chars().take(max_chars - keep));
+    output
+}
+
 /// Prompt-proposal promotion bar: the candidate eval score must beat the
 /// baseline by `margin_points` (scores are 0..1), or match a perfect
 /// baseline with a perfect score.
@@ -2174,5 +2204,42 @@ mod race_tests {
             "{audit:?}"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod registry_signal_tests {
+    use super::*;
+    use crate::storage::RegistryToolSummary;
+
+    fn tool(name: &str, invocations: i64, failure: i64) -> RegistryToolSummary {
+        RegistryToolSummary {
+            name: name.into(),
+            invocations,
+            failure,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proposal_signals_keep_the_highest_failure_volumes() {
+        let mut tools: Vec<_> = (0..22)
+            .map(|failure| tool(&format!("tool-{failure:02}"), 1, failure))
+            .collect();
+        tools.push(tool("unused", 0, 100));
+
+        let ranked = top_tool_signals(&tools);
+
+        assert_eq!(ranked.len(), MAX_PROPOSAL_TOOL_SIGNALS);
+        assert_eq!(ranked[0].failure, 21);
+        assert_eq!(ranked.last().unwrap().failure, 2);
+        assert!(!ranked.iter().any(|tool| tool.name == "unused"));
+    }
+
+    #[test]
+    fn proposal_signal_character_cap_is_unicode_safe() {
+        let capped = cap_signal_chars("界".repeat(100), 16);
+        assert_eq!(capped.chars().count(), 16);
+        assert!(capped.ends_with(" [truncated]"));
     }
 }

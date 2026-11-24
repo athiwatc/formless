@@ -8525,7 +8525,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
             show_pinned,
         } => {
             let v = request_once(&paths, Request::ListTools)?;
-            let mut tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
+            let mut tools: Vec<formless_protocol::ToolSummary> = serde_json::from_value(v)?;
             let original_count = tools.len();
             cli_tool_filters::select(&mut tools, filter, tag.as_deref());
             if json {
@@ -8592,7 +8592,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                 let name = name.ok_or_else(|| usage("give a tool name/id or --all"))?;
                 // Resolve name -> id via the list.
                 let v = request_once(&paths, Request::ListTools)?;
-                let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
+                let tools: Vec<formless_protocol::ToolSummary> = serde_json::from_value(v)?;
                 let tool = cli_tool_lookup::resolve(&tools, &name)?;
                 request_once(
                     &paths,
@@ -8654,11 +8654,12 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
         ToolsAction::Unpin { name } => set_tool_pinned(&paths, &name, false),
         ToolsAction::Tag { name, tags, clear } => {
             let tool = find_tool(&paths, &name)?;
-            let tool = if clear || !tags.is_empty() {
-                serde_json::from_value(request_once(
+            let tool: formless_protocol::ToolSummary = if clear || !tags.is_empty() {
+                let updated: formless_protocol::ToolInfo = serde_json::from_value(request_once(
                     &paths,
                     Request::SetToolTags { id: tool.id, tags },
-                )?)?
+                )?)?;
+                updated.into()
             } else {
                 tool
             };
@@ -9048,8 +9049,8 @@ fn logs_cmd(
 }
 
 /// The Tool with this name or id.
-fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
-    let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(
+fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolSummary> {
+    let tools: Vec<formless_protocol::ToolSummary> = serde_json::from_value(
         formless_tui::client::request_once(paths, Request::ListTools)?,
     )?;
     cli_tool_lookup::resolve(&tools, name).cloned()
@@ -9158,7 +9159,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
 /// or denied call.
 fn tool_run(
     paths: &Paths,
-    tool: formless_protocol::ToolInfo,
+    tool: formless_protocol::ToolSummary,
     input: serde_json::Value,
     yes: bool,
     session: Option<String>,

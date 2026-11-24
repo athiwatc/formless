@@ -607,7 +607,7 @@ async fn unfinished_last_run_comes_with_the_session() {
 }
 
 #[test]
-fn tools_list_their_recent_outcomes_oldest_first() {
+fn tool_lists_omit_recent_metrics_and_details_list_recent_outcomes() {
     let store = Store::open_in_memory().unwrap();
     let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
     let (t, v) = store
@@ -638,7 +638,7 @@ fn tools_list_their_recent_outcomes_oldest_first() {
             .unwrap();
     }
     let listed = store.list_tools(false).unwrap();
-    assert_eq!(listed[0].recent, "sffs");
+    assert!(listed[0].recent.is_empty());
     // The detail lists every call, newest first.
     let d = store.tool_detail(&t.id).unwrap().unwrap();
     let statuses: Vec<&str> = d.recent_calls.iter().map(|c| c.status.as_str()).collect();
