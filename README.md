@@ -72,8 +72,9 @@ its ACP integration, and Muse Code via its `muse serve` protocol. OpenCode,
 Grok Build, and additional ACP profiles are still in progress.
 This list describes implemented integrations, not authenticated end-to-end validation.
 
-Antigravity's `FORMLESS_AGY_BIN` override and opt-in `FORMLESS_LIVE_AGY` live
-check are documented in [its adapter guide](docs/antigravity.md).
+For topic runs with `agy` not on PATH, set `FORMLESS_TOPIC_ANTIGRAVITY_EXE`
+to its absolute path. `FORMLESS_AGY_BIN` applies only to the opt-in
+`FORMLESS_LIVE_AGY` live check in [the adapter guide](docs/antigravity.md).
 
 Any integrated harness can take any step, including the same harness on
 both sides of a hand-off. A harness's own permission modes are not an OS
