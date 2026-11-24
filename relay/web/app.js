@@ -5216,7 +5216,6 @@
         requestAnimationFrame(() => {
           if (liveRender.root !== live || liveRender.session !== S.current || !S.liveTools.includes(row.tool)
             || row.tool.status === "running" || row.node.contains(document.activeElement)) return;
-          S.liveTools = S.liveTools.filter((tool) => tool !== row.tool);
           renderLive();
         });
       });

@@ -443,7 +443,7 @@ test('parallel completion removes an obsolete earlier row without moving the foc
   assert.deepEqual(announcements, [], 'parallel completion adds no live-region announcements');
 });
 
-test('a retained terminal row is cleaned up after focus leaves without stealing focus or announcing', () => {
+test('an unfocused retained terminal row is hidden without stealing focus or announcing', () => {
   const tool = { invocationId: 'terminal', status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
   const { c, live, outside, announcements } = liveRendererFixture([tool]);
   c.renderLive();
@@ -460,10 +460,37 @@ test('a retained terminal row is cleaned up after focus leaves without stealing 
   assert.ok(c.S.liveTools.includes(tool), 'cleanup waits for the focus transition to settle');
   c.flushAnimationFrames();
 
-  assert.equal(c.S.liveTools.includes(tool), false, 'the terminal row is removed from live state');
+  assert.ok(c.S.liveTools.includes(tool), 'normal run lifecycle retains ownership of state pruning');
   assert.equal(live.children.includes(row.node), false, 'the row is no longer visible or tabbable');
   assert.equal(c.document.activeElement, outside, 'cleanup does not move focus');
   assert.equal(announcements.length, announcementsBeforeFocusout, 'focus cleanup adds no live-region announcement');
+});
+
+test('leaving a completed top-level tool does not reparent its child under an earlier running tool', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const parent = { invocationId: 'parent', status: 'running', name: 'parent_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const child = { invocationId: 'child', status: 'ok', name: 'nested_task', version: 0, arguments: '{}', depth: 1, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([earlier, parent, child]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const parentRow = c.liveRender.rows.get(parent);
+  const childRow = c.liveRender.rows.get(child);
+  c.document.activeElement = parentRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: parent.invocationId, tool_name: parent.name, ok: true, elapsed_ms: 1234 });
+  assert.ok(live.children.includes(parentRow.node), 'the focused completed parent remains available');
+  const announcementsBeforeFocusout = announcements.length;
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: parentRow.summary, relatedTarget: outside });
+  c.flushAnimationFrames();
+
+  assert.ok(live.children.includes(earlierRow.node), 'the earlier running tool remains visible');
+  assert.equal(live.children.includes(parentRow.node), false, 'the unfocused completed parent is hidden');
+  assert.equal(live.children.includes(childRow.node), false, 'the completed parent’s child does not reappear under the earlier tool');
+  assert.ok(c.S.liveTools.includes(parent), 'the parent remains in structural state');
+  assert.ok(c.S.liveTools.includes(child), 'the child remains owned by its parent in structural state');
+  assert.equal(c.document.activeElement, outside, 'focus remains where the user moved it');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focusout redraw adds no live-region announcement');
 });
 
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {
