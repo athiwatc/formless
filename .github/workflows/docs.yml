@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - README.md
+      - CONTRIBUTING.md
       - SPEC.md
       - GLOSSARY.md
       - CHANGELOG.md
@@ -66,5 +67,5 @@ jobs:
           test -x "$binary"
           env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version
           python3 scripts/test-doc-links.py
-          python3 scripts/check-doc-links.py "$binary" README.md SPEC.md GLOSSARY.md CHANGELOG.md \
+          python3 scripts/check-doc-links.py "$binary" README.md CONTRIBUTING.md SPEC.md GLOSSARY.md CHANGELOG.md \
             'docs/**/*.md' packaging/README.md 'relay/*.md'
