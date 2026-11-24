@@ -8995,19 +8995,32 @@ fn logs_cmd(
     }
     // Follow: print what's appended; a smaller file means it was rotated.
     let mut pos = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let len = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
-        if len < pos {
-            pos = 0;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            tokio::select! {
+                result = &mut ctrl_c => {
+                    result?;
+                    exit_cli(130);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+            let len = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
+            if len < pos {
+                pos = 0;
+            }
+            if len > pos {
+                let summary =
+                    log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
+                pos = len;
+                log_truncation_notice(&summary);
+            }
         }
-        if len > pos {
-            let summary =
-                log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
-            pos = len;
-            log_truncation_notice(&summary);
-        }
-    }
+    })
 }
 
 /// The Tool with this name or id.
