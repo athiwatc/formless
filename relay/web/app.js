@@ -9876,7 +9876,7 @@
       renderLive();
     }
     if (kinds.has("invocation_activity")) refreshRunning();
-    if (kinds.has("model_pull_progress")) setActivity("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
+    if (kinds.has("model_pull_progress")) note("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
   }
 
   function handlePullProgress(ev) {
@@ -9897,10 +9897,8 @@
     if (ev.done) {
       completePull(ev.pull_id);
       if (S.pullActivity && S.pullActivity.pull_id === ev.pull_id) {
-        const label = S.pullActivity.label;
         S.pullActivity = null;
-        if (S.activity && S.activity.label === label) setActivity(null);
-        else renderStatus();
+        renderStatus();
       }
       if (ev.error) {
         if (ev.status === "incomplete") {
@@ -9914,7 +9912,7 @@
       const progress = ev.total ? " · " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
       const label = (ev.status || "pulling") + " " + (ev.model || "model") + progress;
       S.pullActivity = { pull_id: ev.pull_id, label, since: Date.now() };
-      setActivity(label);
+      renderStatus();
     }
   }
 

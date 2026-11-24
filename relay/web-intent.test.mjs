@@ -125,7 +125,7 @@ test('terminal progress before pull response does not restore its cancel ID', as
       pullRequested.resolve();
       return pullResponse.promise;
     },
-    note() {}, setActivity() {}, renderStatus() {},
+    note() {}, renderStatus() {},
   });
   const request = c.requestPull({ type: 'ollama_pull', model: 'A' });
   await pullRequested.promise;
@@ -136,10 +136,9 @@ test('terminal progress before pull response does not restore its cancel ID', as
 });
 
 test('pull cancellation follows initiation order and resumes the requested alias', () => {
-  const notices = [], activities = [];
+  const notices = [];
   const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
     note: (text, error) => notices.push({ text, error }),
-    setActivity: text => activities.push(text),
     renderStatus() {},
   });
   const earlier = c.beginPullRequest();
@@ -148,7 +147,8 @@ test('pull cancellation follows initiation order and resumes the requested alias
   c.acknowledgePull(earlier, 'pull-earlier');
   assert.equal(c.S.pullId, 'pull-latest');
   c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'pulling', done: false, pull_id: 'pull-earlier', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
-  assert.equal(activities.pop(), 'pulling B · 50%');
+  assert.equal(c.S.pullActivity.label, 'pulling B · 50%');
+  assert.equal(c.S.activity, undefined);
   assert.ok(notices.some(notice => /expected size 20 bytes; advisory/.test(notice.text)));
   c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'incomplete', done: true, pull_id: 'pull-latest', provider: 'remote', error: 'stream ended' });
   assert.equal(c.S.pullId, 'pull-earlier');
@@ -156,11 +156,12 @@ test('pull cancellation follows initiation order and resumes the requested alias
   c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'success', done: true, pull_id: 'pull-earlier', provider: 'remote' });
   assert.equal(c.S.pullId, null);
   assert.equal(c.S.pullActivity, null);
+  assert.equal(c.S.activity, undefined);
 });
 
 test('terminal progress and acknowledgement are idempotent in either order', () => {
   const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
-    note() {}, setActivity() {}, renderStatus() {},
+    note() {}, renderStatus() {},
   });
   const ackFirst = c.beginPullRequest();
   c.acknowledgePull(ackFirst, 'pull-ack-first');
@@ -175,7 +176,7 @@ test('terminal progress and acknowledgement are idempotent in either order', () 
 
 test('new browser connection clears pull state and invalidates old acknowledgements', () => {
   const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull', 'clearPullTracking'], {
-    note() {}, setActivity() {}, renderStatus() {},
+    note() {}, renderStatus() {},
   });
   const oldRequest = c.beginPullRequest();
   c.acknowledgePull(oldRequest, 'pull-old');
@@ -190,7 +191,6 @@ test('new browser connection clears pull state and invalidates old acknowledgeme
   assert.match(fn('connectLocal'), /clearPullTracking\(\)/);
 });
 test('pull status stays compact, details are noted once per pull, and matching terminal clears it', () => {
-  let context;
   let running = false;
   const notices = [];
   const c = setup(['renderStatus', 'handlePullProgress', 'pullTracking', 'completePull'], {
@@ -202,12 +202,7 @@ test('pull status stays compact, details are noted once per pull, and matching t
     activityText: activity => activity.label,
     note: (text, err) => notices.push({ text, err }),
     storedSessionModel: () => null,
-    setActivity: label => {
-      context.S.activity = label ? { label, since: 0 } : null;
-      context.renderStatus();
-    },
   });
-  context = c;
   c.S.pullId = 'pull-1';
   Object.assign(c.S, {
     activity: null,
@@ -228,6 +223,7 @@ test('pull status stays compact, details are noted once per pull, and matching t
   });
   assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 50%');
   assert.equal(c.$('state').className, 'state pulling');
+  assert.equal(c.S.activity, null);
   assert.equal(notices.length, 1);
   assert.match(notices[0].text, /expected size 100 bytes.*low disk/);
   c.handlePullProgress({
@@ -237,29 +233,35 @@ test('pull status stays compact, details are noted once per pull, and matching t
   assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 75%');
   assert.equal(notices.length, 1);
   c.S.pullId = 'pull-2';
+  running = true;
+  const runActivity = { label: 'rate limited · retrying in 8s (2/5) · Esc to stop', since: 0 };
+  c.S.activity = runActivity;
+  c.renderStatus();
   c.handlePullProgress({
     type: 'model_pull_progress', model: 'another-model', status: 'pulling', done: false,
     pull_id: 'pull-2', completed: 1, total: 4, expected_size: 200, warning: 'low disk',
   });
-  assert.equal(c.statusRender.text.textContent, 'pulling another-model · 25%');
-  assert.equal(c.$('state').className, 'state pulling');
+  assert.equal(c.statusRender.text.textContent, runActivity.label);
+  assert.equal(c.$('state').className, 'state busy');
+  assert.equal(c.S.activity.label, runActivity.label);
+  assert.equal(c.S.pullActivity.label, 'pulling another-model · 25%');
   assert.equal(notices.length, 2);
   c.handlePullProgress({
     type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
     pull_id: 'pull-2',
   });
-  assert.equal(c.statusRender.text.textContent, '● ready');
-  assert.equal(c.$('state').className, 'state');
+  assert.equal(c.statusRender.text.textContent, runActivity.label);
+  assert.equal(c.$('state').className, 'state busy');
+  assert.equal(c.S.activity.label, runActivity.label);
+  assert.equal(c.S.pullActivity, null);
+  assert.match(cssSource, /\.state\.pulling \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.doesNotMatch(cssSource, /\.state \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.doesNotMatch(cssSource, /\.state\.busy \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  running = false;
   c.S.activity = { label: 'stale unrelated activity', since: 0 };
   c.renderStatus();
   assert.equal(c.statusRender.text.textContent, '● ready');
-  running = true;
-  c.S.activity = { label: 'rate limited · retrying in 8s (2/5) · Esc to stop', since: 0 };
-  c.renderStatus();
-  assert.equal(c.$('state').className, 'state busy');
-  assert.equal(c.statusRender.text.textContent, 'rate limited · retrying in 8s (2/5) · Esc to stop');
-  assert.match(cssSource, /\.state\.pulling \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
-  assert.doesNotMatch(cssSource, /\.state \[data-status-activity\] \{[^}]*text-overflow: ellipsis;/s);
+  assert.equal(c.$('state').className, 'state');
 });
 test('queued edits submit the revision opened by the editor', () => {
   const notices = [];
@@ -1730,9 +1732,12 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   const replies = [], notes = [];
   let running = 0;
   const c = setup(['reconcileDropped'], {
-    S: { current: 'A', usage: { A: { steps: 1 } }, liveTools: [{ status: 'running', progress: { fraction: 0.9, label: 'stale' } }] },
+    S: {
+      current: 'A', activity: { label: 'active run', since: 0 }, pullActivity: null,
+      usage: { A: { steps: 1 } }, liveTools: [{ status: 'running', progress: { fraction: 0.9, label: 'stale' } }],
+    },
     note: s => notes.push(s), sessionName: id => id, renderStatus() {}, renderLive() {},
-    refreshRunning() { running++; }, setActivity(s) { notes.push(s); },
+    refreshRunning() { running++; },
     request(r) { const d = deferred(); replies.push({ r, d }); return d.promise; },
   });
   const gap = { session_id: 'A', run_id: 'run', kinds: ['run_usage', 'tool_progress', 'invocation_activity'] };
@@ -1754,6 +1759,8 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   c.reconcileDropped({ session_id: '', run_id: '', kinds: ['model_pull_progress'], model: 'model' });
   assert.ok(notes.some(n => /download progress unavailable for model/.test(n)));
   assert.ok(notes.some(n => /live text, reasoning or progress updates were skipped/.test(n)));
+  assert.equal(c.S.activity.label, 'active run');
+  assert.equal(c.S.pullActivity, null);
 });
 
 function forecastContext(names, extras = {}) {
