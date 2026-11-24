@@ -5507,10 +5507,10 @@
   }
   function resetReadingSession(id) {
     if (reading.session === id) return;
-    invalidateReadingRoots();
     if (reading.session != null) {
-      // Snapshot the old Session before canceling a pending scroll-input frame.
-      const anchor = !S.follow ? captureReadingAnchor() || reading.anchor : reading.anchor;
+      const refreshAnchor = !S.follow && (reading.inputFrame || !reading.anchor);
+      if (refreshAnchor) invalidateReadingRoots();
+      const anchor = refreshAnchor ? captureReadingAnchor() || reading.anchor : reading.anchor;
       const unseenIds = [...reading.unseenIds, ...[...reading.unseen.keys(), ...reading.deferred.keys()].map(node =>
         (node.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest("[data-message-id]")?.dataset.messageId).filter(Boolean)];
       const unseenLive = reading.pendingLive || [...reading.unseen.keys(), ...reading.deferred.keys()].some(node =>
@@ -8652,14 +8652,14 @@
     resetReadingSession(id);
     const seq = ++sessionSeq;
     closeSidebar();
-    if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
-    renderSessions();
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
     clearLiveText();
     S.liveTools = []; S.liveRun = null;
+    if (!stay && S.view !== "chat") setView("chat");
+    renderSessions();
     renderHistory();
     S.runTools = null;
     renderRunTools();
