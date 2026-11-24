@@ -11550,6 +11550,9 @@ impl App {
                 }
                 settings::Kind::Bool => {
                     if row.key == "naming.auto_download" && row.value != "on" {
+                        if key.kind != KeyEventKind::Press {
+                            return;
+                        }
                         if self.settings_download_armed {
                             self.settings_download_armed = false;
                             self.save_setting(&row.key, serde_json::json!(true));
@@ -25563,6 +25566,16 @@ mod tests {
         assert!(screen.contains("409 MiB"), "{screen}");
         assert!(screen.contains("heuristic"), "{screen}");
         assert!(screen.contains("Enter or Space again to allow"), "{screen}");
+
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            app.key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ));
+            assert!(app.settings_download_armed);
+            assert!(app.settings_saving.is_none());
+        }
 
         app.key(key(KeyCode::Esc));
         assert!(!app.settings_download_armed);
