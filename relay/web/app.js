@@ -4931,6 +4931,14 @@
    * descendants it folds away: a node shows while it or an ancestor runs,
    * and under a node that finished successfully its descendants fold. */
   function liveTree(calls, retained = new Set()) {
+    const retainedAncestors = new Set();
+    const ancestors = [];
+    for (const call of calls) {
+      const depth = call.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (retained.has(call)) for (const [, ancestor] of ancestors) retainedAncestors.add(ancestor);
+      ancestors.push([depth, call]);
+    }
     const out = [];
     const stack = []; // [depth, running, open] of the current ancestors
     for (const c of calls) {
@@ -4940,7 +4948,7 @@
       const ancestorRunning = stack.some((s) => s[1]);
       const running = c.status === "running";
       const visible = parentOpen && (running || ancestorRunning || retained.has(c));
-      const open = visible && c.status !== "ok";
+      const open = visible && (c.status !== "ok" || retainedAncestors.has(c));
       if (visible) out.push([c, 0]);
       else if (ancestorRunning && !parentOpen) {
         for (let i = out.length - 1; i >= 0; i--) {
@@ -4954,14 +4962,23 @@
   function focusedLiveTools(tools) {
     if (typeof document === "undefined" || typeof liveRender === "undefined" || !liveRender.rows) return new Set();
     const active = document.activeElement;
-    return new Set(tools.filter((tool) => {
-      if ((tool.depth || 0) !== 0 || tool.status === "running") return false;
+    const focused = new Set(tools.filter((tool) => {
+      if (tool.status === "running") return false;
       const row = liveRender.rows.get(tool) || [...liveRender.rows.values()].find((candidate) =>
         (tool.invocationId != null && candidate.tool.invocationId === tool.invocationId)
         || (tool.handle && candidate.tool.handle === tool.handle)
         || (tool.subagent && candidate.tool.subagent === tool.subagent));
       return row?.node.contains?.(active) === true;
     }));
+    const retained = new Set(focused);
+    const ancestors = [];
+    for (const tool of tools) {
+      const depth = tool.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (focused.has(tool)) for (const [, ancestor] of ancestors) retained.add(ancestor);
+      ancestors.push([depth, tool]);
+    }
+    return retained;
   }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
@@ -5212,7 +5229,7 @@
       liveRender.focusoutRoot = live;
       live.addEventListener("focusout", (event) => {
         const row = [...liveRender.rows.values()].find((candidate) => candidate.node.contains(event.target));
-        if (!row || (row.tool.depth || 0) !== 0 || row.tool.status === "running") return;
+        if (!row || row.tool.status === "running") return;
         requestAnimationFrame(() => {
           if (liveRender.root !== live || liveRender.session !== S.current || !S.liveTools.includes(row.tool)
             || row.tool.status === "running" || row.node.contains(document.activeElement)) return;

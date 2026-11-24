@@ -423,6 +423,47 @@ test('nested terminal rows remain readable and completion does not steal focus e
   assert.equal(c.document.activeElement, outside, 'completion does not steal focus from another control');
 });
 
+test('a focused nested Done row survives owner completion while another tool keeps the run active', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0, handle: 'earlier-handle' };
+  const owner = { invocationId: 'owner', status: 'running', name: 'parent_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const child = { invocationId: 'child', status: 'running', name: 'nested_task', version: 0, arguments: '{}', depth: 1, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([earlier, owner, child]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const ownerRow = c.liveRender.rows.get(owner);
+  const childRow = c.liveRender.rows.get(child);
+  c.document.activeElement = childRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: child.invocationId, tool_name: child.name, ok: true, elapsed_ms: 1234 });
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: owner.invocationId, tool_name: owner.name, ok: true, elapsed_ms: 1234 });
+
+  assert.ok(c.S.running.has('session'), 'the run remains active after the owner completes');
+  assert.ok(live.children.includes(ownerRow.node));
+  assert.ok(live.children.includes(childRow.node));
+  assert.equal(c.document.activeElement, childRow.summary, 'the focused nested result survives owner completion');
+  assert.deepEqual(announcements, [], 'nested tool completion remains silent');
+
+  c.onEvent({ type: 'run_finished', session_id: 'session', run_id: 'run', status: 'completed' });
+  c.renderLive();
+  assert.ok(c.S.liveTools.includes(owner), 'run end retains the focused result owner');
+  assert.ok(c.S.liveTools.includes(child), 'run end retains the focused nested result');
+  assert.ok(live.children.includes(childRow.node));
+  assert.equal(c.document.activeElement, childRow.summary);
+  const announcementsBeforeFocusout = announcements.length;
+
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: childRow.summary, relatedTarget: outside });
+  c.flushAnimationFrames();
+
+  assert.ok(live.children.includes(earlierRow.node), 'the unrelated running tool remains visible');
+  assert.equal(live.children.includes(ownerRow.node), false, 'the unfocused completed owner is hidden');
+  assert.equal(live.children.includes(childRow.node), false, 'the child is hidden with its completed owner');
+  assert.ok(c.S.liveTools.includes(owner), 'focusout redraw leaves pruning to the run lifecycle');
+  assert.ok(c.S.liveTools.includes(child), 'focusout redraw preserves nested ownership');
+  assert.equal(c.document.activeElement, outside, 'focus remains where the user moved it');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focusout redraw adds no announcement');
+});
+
 test('parallel completion removes an obsolete earlier row without moving the focused terminal sibling', () => {
   const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0 };
   const later = { invocationId: 'later', status: 'running', name: 'second_task', version: 0, arguments: '{}', depth: 0, started: 0 };
