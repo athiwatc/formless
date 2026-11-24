@@ -126,7 +126,9 @@ fn retention_reductions_apply_under_cap_and_when_live_rotation_is_disabled() {
         .unwrap()
         .is_empty());
     std::fs::write(f.paths.log_file(), "x".repeat(200)).unwrap();
-    assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert!(!rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert!(f.paths.log_file().exists());
+    assert_eq!(std::fs::metadata(f.paths.log_file()).unwrap().len(), 0);
     assert_eq!(log_usage(&f.paths), 0);
 }
 
