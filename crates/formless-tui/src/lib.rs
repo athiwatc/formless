@@ -3769,8 +3769,8 @@ impl App {
                             }
                         }
                         Pending::ListTools => {
-                            if let Ok(v) = serde_json::from_value::<Vec<ToolInfo>>(result) {
-                                self.tools = v;
+                            if let Ok(v) = serde_json::from_value::<Vec<ToolSummary>>(result) {
+                                self.tools = v.into_iter().map(ToolInfo::from).collect();
                             }
                         }
                         Pending::RunToolInput => {
@@ -18431,44 +18431,6 @@ fn tool_cells(t: &ToolInfo, color: bool) -> Vec<Cell<'static>> {
     ]
 }
 
-/// Success trend: the last 20 finished calls against the 20 before, when
-/// both have at least 5 (↑/↓ for a 10-point change or more).
-fn tool_trend(recent: &str) -> Option<char> {
-    let outcomes: Vec<bool> = recent.chars().map(|c| c == 's').collect();
-    let split = outcomes.len().saturating_sub(20);
-    let (before, now) = outcomes.split_at(split);
-    if before.len() < 5 || now.len() < 5 {
-        return None;
-    }
-    let rate = |w: &[bool]| w.iter().filter(|s| **s).count() as f64 / w.len() as f64;
-    match rate(now) - rate(before) {
-        d if d >= 0.1 => Some('↑'),
-        d if d <= -0.1 => Some('↓'),
-        _ => None,
-    }
-}
-
-/// The last 20 finished calls, one bar each (tall green success, short
-/// red failure), then the trend arrow.
-fn tool_spark(t: &ToolInfo, color: bool) -> Line<'static> {
-    let skip = t.recent.chars().count().saturating_sub(20);
-    let mut spans: Vec<Span> = t
-        .recent
-        .chars()
-        .skip(skip)
-        .map(|c| match c {
-            's' => Span::styled("▆", fg(color, Color::Green)),
-            _ => Span::styled("▂", bold_fg(color, Color::Red)),
-        })
-        .collect();
-    match tool_trend(&t.recent) {
-        Some('↑') => spans.push(Span::styled(" ↑", bold_fg(color, Color::Green))),
-        Some(_) => spans.push(Span::styled(" ↓", bold_fg(color, Color::Red))),
-        None => {}
-    }
-    Line::from(spans)
-}
-
 fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
     Row::new(cols.iter().map(|c| Cell::from(*c))).style(ui::dim(color).add_modifier(Modifier::BOLD))
 }
@@ -19418,7 +19380,6 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                 let t = &app.tools[visible[*p]];
                 {
                     let mut cells = tool_cells(t, app.color);
-                    cells.push(Cell::from(tool_spark(t, app.color)));
                     cells.push(Cell::from(tool_status(t, app.color)));
                     cells.push(Cell::from(Span::styled(
                         if t.capabilities.is_empty() {
@@ -19440,21 +19401,12 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
                     Constraint::Length(5),
                     Constraint::Length(7),
                     Constraint::Length(ui::rate_width(app.color)),
-                    Constraint::Length(22),
                     Constraint::Length(if theme::redundant(app.color) { 16 } else { 9 }),
                     Constraint::Min(10),
                 ],
             )
             .header(table_header(
-                &[
-                    "TOOL",
-                    "VER",
-                    "CALLS",
-                    "SUCCESS",
-                    "LAST 20 (▆ok ▂fail)",
-                    "STATUS",
-                    "CAPABILITIES",
-                ],
+                &["TOOL", "VER", "CALLS", "SUCCESS", "STATUS", "CAPABILITIES"],
                 app.color,
             ))
             .column_spacing(2)
@@ -31422,12 +31374,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_show_recent_calls_and_their_trend() {
-        // 20 good, then 20 mostly failing: trending down.
-        let falling = format!("{}{}", "s".repeat(20), "sfff".repeat(5));
-        assert_eq!(tool_trend(&falling), Some('↓'));
-        assert_eq!(tool_trend(&"s".repeat(40)), None);
-        assert_eq!(tool_trend("ffffff"), None, "no earlier window");
+    fn tools_list_omits_recent_outcome_metrics() {
         let mut app = test_app();
         app.tools = vec![ToolInfo {
             id: "t".into(),
@@ -31447,14 +31394,14 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             last_used_at: None,
-            recent: falling,
+            recent: "s".repeat(40),
             author: "agent".into(),
         }];
         app.view = View::Tools;
         let screen = render(&mut app, 140, 20);
-        assert!(screen.contains("LAST 20"), "{screen}");
-        assert!(screen.contains("▆▂▂▂▆▂▂▂"), "{screen}");
-        assert!(screen.contains("↓"), "{screen}");
+        assert!(screen.contains("SUCCESS"), "{screen}");
+        assert!(!screen.contains("LAST 20"), "{screen}");
+        assert!(!screen.contains("▆"), "{screen}");
     }
 
     #[test]

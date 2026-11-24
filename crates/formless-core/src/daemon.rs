@@ -4923,7 +4923,7 @@ impl Daemon {
                 }
             }
             Request::ListTools => Ok(serde_json::to_value(
-                self.with_reader(|s| s.list_tools(true))?,
+                self.with_reader(|s| s.list_tool_summaries(true))?,
             )?),
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,

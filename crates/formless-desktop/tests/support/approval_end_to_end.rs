@@ -1,7 +1,7 @@
 //! Real private daemon/Tool/fake provider into the TestPlatform approval modal.
 use super::*;
 use axum::response::IntoResponse;
-use formless_desktop::approvals::{Outcome, Status};
+use formless_desktop::approvals::{Action, Inventory, Outcome, Status};
 use formless_desktop::client::Endpoint;
 use formless_protocol::{Request, SendMode};
 use serde_json::{json, Value};
@@ -186,7 +186,32 @@ fn until(
     handle: WindowHandle<Root>,
     shell: &Entity<Shell>,
     label: &str,
+    test: impl FnMut(&Shell) -> bool,
+) {
+    until_with_failure_category(cx, handle, shell, label, test, |_| None);
+}
+fn until_with_approval_diagnostic(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+    label: &str,
+    selected_approval_id: &str,
+    test: impl FnMut(&Shell) -> bool,
+) {
+    until_with_failure_category(cx, handle, shell, label, test, |s| {
+        Some(approval_status_category(
+            &s.approval_review_status(),
+            selected_approval_id,
+        ))
+    });
+}
+fn until_with_failure_category(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+    label: &str,
     mut test: impl FnMut(&Shell) -> bool,
+    mut failure_category: impl FnMut(&Shell) -> Option<String>,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -194,8 +219,120 @@ fn until(
         if step(cx, handle, |_, cx| test(shell.read(cx))) {
             break;
         }
-        assert!(Instant::now() < deadline, "{label}");
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            step(cx, handle, |_, cx| match failure_category(shell.read(cx)) {
+                Some(category) => format!("{label}; approval status category: {category}"),
+                None => label.to_owned(),
+            })
+        );
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn approval_status_category(status: &Status, selected_approval_id: &str) -> String {
+    let action_category = |action: &Action| {
+        let selection = if action.prompt.id() == selected_approval_id {
+            "selected"
+        } else {
+            "other"
+        };
+        let decision = if action.allow { "allow" } else { "deny" };
+        format!("{selection}-{decision}")
+    };
+    match status {
+        Status::Idle => "idle".into(),
+        Status::Reserved(action) => format!("reserved-{}", action_category(action)),
+        Status::Sent(action) => format!("sent-{}", action_category(action)),
+        Status::Finished { action, outcome } => {
+            let outcome = match outcome {
+                Outcome::Accepted {
+                    audit_recorded: true,
+                } => "accepted-audited",
+                Outcome::Accepted {
+                    audit_recorded: false,
+                } => "accepted-audit-not-recorded",
+                Outcome::Rejected(_) => "rejected",
+                Outcome::Unknown => "unknown",
+            };
+            format!("finished-{}-{outcome}", action_category(action))
+        }
+    }
+}
+#[test]
+fn approval_status_diagnostic_exposes_only_state_categories() {
+    let inventory = Inventory::from_list(&formless_desktop::approvals::fixture_multiple()).unwrap();
+    let selected_prompt = inventory.prompts()[0].clone();
+    let other_prompt = inventory.prompts()[1].clone();
+    let selected_id = selected_prompt.id().to_owned();
+    let other_id = other_prompt.id().to_owned();
+    let action = |prompt, allow| Action {
+        client: uuid::Uuid::new_v4(),
+        connection: 1,
+        epoch: 1,
+        operation: uuid::Uuid::new_v4(),
+        prompt,
+        allow,
+    };
+    let selected_allow = action(selected_prompt.clone(), true);
+    let selected_deny = action(selected_prompt, false);
+    let other_allow = action(other_prompt.clone(), true);
+    let other_deny = action(other_prompt, false);
+    let statuses = [
+        (Status::Idle, "idle"),
+        (
+            Status::Reserved(selected_allow.clone()),
+            "reserved-selected-allow",
+        ),
+        (Status::Sent(other_deny.clone()), "sent-other-deny"),
+        (
+            Status::Finished {
+                action: selected_allow.clone(),
+                outcome: Outcome::Accepted {
+                    audit_recorded: true,
+                },
+            },
+            "finished-selected-allow-accepted-audited",
+        ),
+        (
+            Status::Finished {
+                action: selected_deny.clone(),
+                outcome: Outcome::Accepted {
+                    audit_recorded: false,
+                },
+            },
+            "finished-selected-deny-accepted-audit-not-recorded",
+        ),
+        (
+            Status::Finished {
+                action: selected_allow,
+                outcome: Outcome::Rejected("private rejection detail".into()),
+            },
+            "finished-selected-allow-rejected",
+        ),
+        (
+            Status::Finished {
+                action: other_deny,
+                outcome: Outcome::Unknown,
+            },
+            "finished-other-deny-unknown",
+        ),
+        (
+            Status::Finished {
+                action: other_allow,
+                outcome: Outcome::Accepted {
+                    audit_recorded: true,
+                },
+            },
+            "finished-other-allow-accepted-audited",
+        ),
+    ];
+    for (status, expected) in statuses {
+        let category = approval_status_category(&status, &selected_id);
+        assert_eq!(category, expected);
+        assert!(!category.contains(selected_id.as_str()));
+        assert!(!category.contains(other_id.as_str()));
+        assert!(!category.contains("private rejection detail"));
     }
 }
 #[gpui_kit::test]
@@ -483,11 +620,12 @@ fn native_multiple_security_approvals_decide_only_the_selected_session_and_never
         activate(w, cx, "approval-allow-once");
         chosen
     });
-    until(
+    until_with_approval_diagnostic(
         cx,
         h,
         &s,
         "selected allow receipt",
+        &chosen.0,
         |s| matches!(s.approval_review_status(),Status::Finished{action,outcome:Outcome::Accepted{audit_recorded:true}}if action.allow&&action.prompt.id()==chosen.0),
     );
     f.wait(cx, h, &s, "selected Run completed only", || {
