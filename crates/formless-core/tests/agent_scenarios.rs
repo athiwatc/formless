@@ -34,7 +34,7 @@ fn find_tools_call(body: &Value, query: &str) -> bool {
     }) && body["messages"].to_string().contains(query)
 }
 
-fn assert_tool_feedback(body: &Value, case: &str, expected: &[&str]) {
+fn assert_tool_feedback(body: &Value, case: &str, tool_call_id: &str, expected: &[&str]) {
     let message = body["messages"]
         .as_array()
         .unwrap()
@@ -42,6 +42,12 @@ fn assert_tool_feedback(body: &Value, case: &str, expected: &[&str]) {
         .rev()
         .find(|message| message["role"] == "tool")
         .expect("invalid arguments are returned as tool-role feedback");
+    assert_eq!(
+        message["tool_call_id"].as_str(),
+        Some(tool_call_id),
+        "{case} feedback referenced the wrong tool call: {}",
+        serde_json::to_string_pretty(message).unwrap()
+    );
     let contains_text = |expected: &str| {
         let mut pending = message["content"]
             .as_str()
@@ -202,22 +208,26 @@ async fn retries_rate_limit_and_dropped_stream_then_repairs_malformed_arguments(
         .expect("scripted stream is waiting for the emitted partial delta");
     let malformed = scenario.next_call().await;
     assert_eq!(malformed.body["messages"], initial_messages);
+    let malformed_tool_call_id = malformed.tool_call_id();
     malformed.malformed_tool_call("find_tools", "{");
 
     let correction = scenario.next_call().await;
     assert_tool_feedback(
         &correction.body,
         "malformed argument",
+        &malformed_tool_call_id,
         &[
             "invalid JSON arguments for find_tools",
             "Retry with valid JSON.",
         ],
     );
+    let truncated_tool_call_id = correction.tool_call_id();
     correction.truncated_tool_call("find_tools", "{\"query\":");
     let repair = scenario.next_call().await;
     assert_tool_feedback(
         &repair.body,
         "truncated argument",
+        &truncated_tool_call_id,
         &[
             "find_tools call was cut off at the output token limit",
             "arguments are incomplete and it was not run",

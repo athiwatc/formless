@@ -170,6 +170,10 @@ impl ScriptedProvider {
 }
 
 impl ProviderCall {
+    pub fn tool_call_id(&self) -> String {
+        format!("call-{}", self.request_id)
+    }
+
     pub fn text(self, content: &str) {
         self.reply
             .send(ScriptedReply::Completion(json!({"content":content})))
@@ -177,9 +181,10 @@ impl ProviderCall {
     }
 
     pub fn tool_call(self, name: &str, arguments: Value) {
+        let tool_call_id = self.tool_call_id();
         let delta = json!({"tool_calls":[{
             "index":0,
-            "id":format!("call-{}", self.request_id),
+            "id":tool_call_id,
             "type":"function",
             "function":{"name":name,"arguments":arguments.to_string()}
         }]});
@@ -189,9 +194,10 @@ impl ProviderCall {
     }
 
     pub fn malformed_tool_call(self, name: &str, arguments: &str) {
+        let tool_call_id = self.tool_call_id();
         let delta = json!({"tool_calls":[{
             "index":0,
-            "id":format!("call-{}", self.request_id),
+            "id":tool_call_id,
             "type":"function",
             "function":{"name":name,"arguments":arguments}
         }]});
@@ -201,9 +207,10 @@ impl ProviderCall {
     }
 
     pub fn truncated_tool_call(self, name: &str, arguments: &str) {
+        let tool_call_id = self.tool_call_id();
         let delta = json!({"tool_calls":[{
             "index":0,
-            "id":format!("call-{}", self.request_id),
+            "id":tool_call_id,
             "type":"function",
             "function":{"name":name,"arguments":arguments}
         }]});
