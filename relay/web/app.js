@@ -10290,12 +10290,13 @@
       const sharedText = incomingShareText(record);
       if (sharedText) {
         const input = $("input");
+        const wasLiteralSlashDraft = isSharedSlashDraft(destination.scope, destination.sessionId, input.value);
         input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
         if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
           note("Shared text couldn't be saved to this draft; reload to retry.", true);
           return false;
         }
-        if (sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
+        if (wasLiteralSlashDraft || sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
           rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
         }
         autosize();

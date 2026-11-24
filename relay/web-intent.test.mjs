@@ -226,6 +226,24 @@ test('leading-slash shared text submits literally until the user edits it', asyn
   assert.equal(c.isSharedSlashDraft('test-room', 'A', '/tmp/notes --edited'), false);
 });
 
+test('a later ordinary share carries literal-slash intent into the combined draft', async () => {
+  let commands = 0;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'submit'], {
+    attachFiles: async () => [],
+    storeIncomingShare: async () => {},
+    slash: () => { commands++; },
+  });
+  c.S.current = 'A';
+  assert.equal(await c.applyIncomingShare('slash-share', { text: '/tmp/notes', files: [], draftApplied: false }), true);
+  assert.equal(await c.applyIncomingShare('ordinary-share', { text: 'follow-up context', files: [], draftApplied: false }), true);
+  const combined = '/tmp/notes\n\nfollow-up context';
+  assert.equal(c.$('input').value, combined);
+  assert.equal(c.isSharedSlashDraft('test-room', 'A', combined), true);
+  c.S.submitting.add('test-room\u0000' + combined);
+  await c.submit(false);
+  assert.equal(commands, 0);
+});
+
 test('a shared caption cannot submit while its files are still uploading', async () => {
   const gate = deferred(), attachStarted = deferred();
   const photo = new File(['photo'], 'photo.png', { type: 'image/png' });
