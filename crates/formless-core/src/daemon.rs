@@ -8701,11 +8701,16 @@ impl Daemon {
         model: &str,
     ) -> std::result::Result<Option<u64>, String> {
         let version_url = format!("{base}/api/version");
+        let mut auth_failed = false;
         let version = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let response = endpoint
                 .endpoint_request(reqwest::Method::GET, &version_url, None)
                 .await
                 .ok()?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                auth_failed = true;
+                return None;
+            }
             if !response.status().is_success() {
                 return None;
             }
@@ -8722,6 +8727,10 @@ impl Daemon {
                 .endpoint_request(reqwest::Method::GET, &tags_url, None)
                 .await
                 .ok()?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                auth_failed = true;
+                return None;
+            }
             if !response.status().is_success() {
                 return None;
             }
@@ -8732,6 +8741,11 @@ impl Daemon {
         .flatten();
         let models = tags.as_ref().and_then(|value| value["models"].as_array());
         if !version_ok && models.is_none() {
+            if auth_failed {
+                return Err(format!(
+                    "The selected provider '{provider}' rejected authentication during Ollama preflight (HTTP 401); check its credentials."
+                ));
+            }
             return Err(format!(
                 "The selected provider '{provider}' is not an Ollama endpoint; choose an Ollama provider with `/pull MODEL --provider NAME`."
             ));
@@ -21670,6 +21684,35 @@ mod ollama_pull_tests {
                 ..
             }) if status == "incomplete" && error.contains("`/pull test-model --provider local`")
         ));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_ollama_preflight_reports_credentials_instead_of_endpoint_type() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/api/version",
+                axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+            )
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base = format!("http://{address}");
+        let mut settings = ProviderCfg::default();
+        settings.base_url = base.clone();
+        let endpoint = Provider::new(settings, "test-credential".into()).unwrap();
+
+        let error = Daemon::ollama_preflight(&endpoint, &base, "remote", "test-model")
+            .await
+            .unwrap_err();
+        assert!(error.contains("rejected authentication"));
+        assert!(error.contains("HTTP 401"));
+        assert!(!error.contains("not an Ollama endpoint"));
+        server.abort();
     }
 
     #[tokio::test]
