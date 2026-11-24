@@ -84,7 +84,41 @@
   function normalizeTextareaValue(value) {
     return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
   }
+  function sharedSlashDraftKey(scope, sessionId) {
+    return scope && sessionId ? "shared-slash-draft:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId) : null;
+  }
+  function sharedSlashDraftValue(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return null;
+    if (S.sharedSlashDrafts?.has(key)) return S.sharedSlashDrafts.get(key);
+    const value = prefs.get(key, null);
+    return typeof value === "string" ? value : null;
+  }
+  function rememberSharedSlashDraft(scope, sessionId, value) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    const normalized = normalizeTextareaValue(value);
+    (S.sharedSlashDrafts || (S.sharedSlashDrafts = new Map())).set(key, normalized);
+    return prefs.set(key, normalized);
+  }
+  function clearSharedSlashDraft(scope, sessionId) {
+    const key = sharedSlashDraftKey(scope, sessionId);
+    if (!key) return false;
+    if (S.sharedSlashDrafts) S.sharedSlashDrafts.delete(key);
+    return prefs.remove(key);
+  }
+  function clearEditedSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    if (marked !== null && normalizeTextareaValue(marked) !== normalizeTextareaValue(value)) {
+      clearSharedSlashDraft(scope, sessionId);
+    }
+  }
+  function isSharedSlashDraft(scope, sessionId, value) {
+    const marked = sharedSlashDraftValue(scope, sessionId);
+    return marked !== null && normalizeTextareaValue(marked) === normalizeTextareaValue(value);
+  }
   function clearSubmittedDraft(scope, sessionId, snapshot) {
+    clearSharedSlashDraft(scope, sessionId);
     const fallbackKey = sessionCacheKey(scope, sessionId);
     const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
     const sharedValues = S.unpersistedDraftSharedValues || (S.unpersistedDraftSharedValues = new Map());
@@ -223,6 +257,7 @@
     storageScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     submitting: new Set(),
+    shareApplyPending: false,
     pending: new Map(),
     subagents: [], // last /agents listing
   };
@@ -1439,13 +1474,16 @@
   }
 
   // Installable app shell (SPEC §12): the page opens offline and says so.
+  function handleServiceWorkerMessage(event) {
+    if (event.data?.type === "formless-open-notification-session") {
+      openNotificationSession(event.data.session).catch(() => {});
+    } else if (event.data?.type === "formless-focus-pending") {
+      focusPending();
+    }
+  }
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type === "formless-open-notification-session") {
-        openNotificationSession(event.data.session).catch(() => {});
-      }
-    });
+    navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
   }
   window.addEventListener("offline", () => renderAll());
   window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
@@ -5868,6 +5906,36 @@
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }
 
+  function shareSendBlocked() {
+    return !!S.shareApplyPending || !!(S.current && S.storageScope
+      && S.shareAttachmentFailures?.has(sessionCacheKey(S.storageScope, S.current)));
+  }
+  function clearShareAttachmentFailure(token, scope, sessionId) {
+    const key = sessionCacheKey(scope, sessionId);
+    const failure = S.shareAttachmentFailures?.get(key);
+    if (failure?.token === token) S.shareAttachmentFailures.delete(key);
+  }
+  async function resolveFailedSharedFiles(token, record, destination, failedFiles, reason) {
+    const failures = S.shareAttachmentFailures || (S.shareAttachmentFailures = new Map());
+    failures.set(sessionCacheKey(destination.scope, destination.sessionId), { token, files: failedFiles });
+    const names = failedFiles.map(file => file?.name || "unnamed file").join(", ");
+    const discard = await ask({
+      title: "Shared files couldn't be attached",
+      text: reason + ": " + names + ". Keep them to retry, or discard them? The caption remains a draft and will not be sent.",
+      ok: "Discard failed files",
+      cancelLabel: "Keep files",
+      danger: true,
+    });
+    if (!discard) {
+      note("Failed shared files are retained; Send stays disabled until you retry or discard them.", true);
+      return false;
+    }
+    record.files = [];
+    await storeIncomingShare(record);
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
+    note("Discarded failed shared files. The caption remains a draft; nothing was sent.");
+    return true;
+  }
   function renderComposer() {
     scheduleForecast();
     const running = isRunning();
@@ -5899,7 +5967,7 @@
     $("session-title").textContent = attempt ? (attempt.step_title || "Step") + " · " + harnessLabel(attempt.harness)
       : topic ? topic.name : S.current === S.mainChat?.id ? "Main Chat" : s ? s.name : "No session";
     $("input").disabled = !!attempt;
-    $("send-btn").disabled = !!attempt;
+    $("send-btn").disabled = !!attempt || shareSendBlocked();
     $("attach-btn").disabled = !!attempt;
     $("fork-btn").disabled = !!attempt;
     $("status-model").disabled = !!attempt;
@@ -8701,6 +8769,15 @@
     await openSession(s.id);
     $("input").focus();
   }
+  async function openMainChat(expectedSelection) {
+    if (!S.mainChat?.id) await refreshTopics(true);
+    if (expectedSelection && (S.current !== expectedSelection.sessionId || S.storageScope !== expectedSelection.scope)) return false;
+    const main = S.mainChat;
+    if (!main?.id) return false;
+    await openSession(main.id);
+    return S.current === main.id && (!expectedSelection || S.storageScope === expectedSelection.scope)
+      && !(S.sessionLoad?.id === main.id && S.sessionLoad.status === "failed");
+  }
   /** What this client is called to others on the same Session (§10.4). */
   const CLIENT_LABEL = document.querySelector('meta[name="formless-local"]') ? "web" : "web (relay)";
   /** "TUI, web ×2" for the other clients on this Session. */
@@ -9330,11 +9407,15 @@
   const attachmentDrafts = {};
   async function submit(queued) {
     if (currentTopicAttempt()) return;
+    if (shareSendBlocked()) {
+      note("Wait for shared files to finish attaching or resolve the failed files before sending.", true);
+      return;
+    }
     const input = $("input");
     const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
     if (!text) return;
-    if (text.startsWith("/") && !S.editMessageId) {
+    if (text.startsWith("/") && !S.editMessageId && !isSharedSlashDraft(S.storageScope, S.current, input.value)) {
       input.value = "";
       saveDraft(S.current, "");
       autosize();
@@ -10122,6 +10203,286 @@
   }
 
   // =========================================================== connection
+  const launchParams = new URLSearchParams(location.search);
+  const launchShareToken = launchParams.get("share");
+  const launchShareError = launchParams.has("share-error");
+  const launchAction = launchParams.get("action");
+  const launchView = launchParams.get("view");
+  let launchRouteHandled = false;
+  function readPendingShareLaunch() {
+    try {
+      const pending = JSON.parse(sessionStorage.getItem("formless_pending_share_launch") || "null");
+      return pending && typeof pending.token === "string" && pending.token
+        && (pending.scope == null || typeof pending.scope === "string") ? pending : null;
+    } catch (_) { return null; }
+  }
+  function rememberPendingShareLaunch(token, scope = S.storageScope) {
+    if (typeof token !== "string" || !token) return false;
+    const previous = readPendingShareLaunch();
+    const boundScope = previous?.token === token && previous.scope ? previous.scope : scope || null;
+    try {
+      sessionStorage.setItem("formless_pending_share_launch", JSON.stringify({ token, scope: boundScope }));
+      return true;
+    } catch (_) { return false; }
+  }
+  function pendingShareLaunchForScope(scope) {
+    const pending = readPendingShareLaunch();
+    return pending ? { ...pending, scopeMismatch: !!pending.scope && pending.scope !== scope } : null;
+  }
+  function clearPendingShareLaunch(token) {
+    const pending = readPendingShareLaunch();
+    if (!pending || pending.token !== token) return false;
+    try { sessionStorage.removeItem("formless_pending_share_launch"); return true; } catch (_) { return false; }
+  }
+  if (launchShareToken) rememberPendingShareLaunch(launchShareToken, S.storageScope);
+
+  function openShareInbox() {
+    return new Promise((resolve, reject) => {
+      const open = indexedDB.open("formless-share-inbox", 1);
+      open.onupgradeneeded = () => {
+        if (!open.result.objectStoreNames.contains("shares")) open.result.createObjectStore("shares", { keyPath: "token" });
+      };
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => resolve(open.result);
+    });
+  }
+  async function readIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction("shares", "readonly").objectStore("shares").get(token);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { db.close(); }
+  }
+  async function storeIncomingShare(share) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").put(share);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share storage aborted"));
+      });
+    } finally { db.close(); }
+  }
+  async function deleteIncomingShare(token) {
+    const db = await openShareInbox();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction("shares", "readwrite");
+        tx.objectStore("shares").delete(token);
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("share cleanup aborted"));
+      });
+    } finally { db.close(); }
+  }
+  function incomingShareText(share) {
+    const text = typeof share.text === "string" ? share.text : "";
+    const title = typeof share.title === "string" ? share.title : "";
+    const url = typeof share.url === "string" ? share.url : "";
+    const parts = [title, text].filter((part, index, values) => part && values.indexOf(part) === index);
+    if (url && !parts.includes(url) && !text.includes(url)) parts.push(url);
+    return parts.join("\n");
+  }
+  function incomingShareFile(value) {
+    if (typeof File !== "undefined" && value instanceof File) return value;
+    if (typeof File !== "undefined" && typeof Blob !== "undefined" && value instanceof Blob && typeof value.name === "string") {
+      return new File([value], value.name, { type: value.type });
+    }
+    return null;
+  }
+  async function applyIncomingShare(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
+    const hasFiles = Array.isArray(share.files) && share.files.length > 0;
+    const alreadyPending = S.shareApplyPending;
+    if (hasFiles) {
+      S.shareApplyPending = true;
+      renderComposer();
+    }
+    try { return await applyIncomingShareRecord(token, share, selected); }
+    finally {
+      if (hasFiles) {
+        S.shareApplyPending = alreadyPending;
+        renderComposer();
+      }
+    }
+  }
+  async function applyIncomingShareRecord(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
+    const record = { ...share, token, files: Array.isArray(share.files) ? share.files : [] };
+    const selectionIsCurrent = () => S.current === selected.sessionId && S.storageScope === selected.scope;
+    if (record.draftApplied && !record.draftSessionId) {
+      if (record.files.length) {
+        note("This shared item needs to be shared again because its original draft cannot be identified.", true);
+        return false;
+      }
+      return true;
+    }
+    if (record.draftSessionId) {
+      if (record.draftScope !== S.storageScope) {
+        note("This shared item belongs to a different Formless space; reopen that space to continue.", true);
+        return false;
+      }
+      if (S.current !== record.draftSessionId) {
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) await refreshSessions();
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) {
+          note("The Session for this shared draft is no longer available.", true);
+          return false;
+        }
+        await openSession(record.draftSessionId);
+      }
+    } else {
+      if (!selectionIsCurrent()) {
+        note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        return false;
+      }
+      if (currentTopicAttempt()) {
+        const parent = topicForSession()?.topic_session_id;
+        if (parent) {
+          await openSession(parent);
+          if (S.current !== parent || S.storageScope !== selected.scope) {
+            note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+            return false;
+          }
+          if (S.sessionLoad?.id === parent && S.sessionLoad.status === "failed"
+            && !await openMainChat({ sessionId: parent, scope: selected.scope })) {
+            note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+            return false;
+          }
+        }
+      }
+      if (!S.current || currentTopicAttempt() || S.sessionLoad?.status === "failed") {
+        if (!await openMainChat({ sessionId: S.current, scope: S.storageScope })) {
+          note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+          return false;
+        }
+      }
+      if (!S.current || !S.storageScope || currentTopicAttempt() || S.sessionLoad?.status === "failed") return false;
+      record.draftSessionId = S.current;
+      record.draftScope = S.storageScope;
+      await storeIncomingShare(record);
+      if (S.current !== record.draftSessionId || S.storageScope !== record.draftScope) {
+        note("The selected Session changed while the share was being saved; reload to apply it safely.", true);
+        return false;
+      }
+    }
+    const destination = { sessionId: record.draftSessionId, scope: record.draftScope };
+    const destinationIsCurrent = () => S.current === destination.sessionId && S.storageScope === destination.scope;
+    if (!destinationIsCurrent()
+      || S.sessionLoad?.id === record.draftSessionId && S.sessionLoad.status === "failed") {
+      note("The destination Session for this share couldn't be opened; the share is still waiting.", true);
+      return false;
+    }
+    if (!record.draftApplied) {
+      const sharedText = incomingShareText(record);
+      if (sharedText) {
+        const input = $("input");
+        const wasLiteralSlashDraft = isSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+        input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
+        if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
+          note("Shared text couldn't be saved to this draft; reload to retry.", true);
+          return false;
+        }
+        if (wasLiteralSlashDraft || sharedText.trimStart().startsWith("/") && input.value.trimStart().startsWith("/")) {
+          rememberSharedSlashDraft(destination.scope, destination.sessionId, input.value);
+        }
+        autosize();
+        scheduleForecast();
+      }
+      record.draftApplied = true;
+      await storeIncomingShare(record);
+      if (!destinationIsCurrent()) {
+        note("The selected Session changed while the share was being saved; reload to finish safely.", true);
+        return false;
+      }
+    }
+    const files = record.files.map(incomingShareFile);
+    if (files.some((file) => !file)) {
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be restored");
+    }
+    record.files = await attachFiles(files, destination.sessionId, destination.scope);
+    await storeIncomingShare(record);
+    if (record.files.length) {
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be attached");
+    }
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
+    return true;
+  }
+  function stripLaunchParams(keys) {
+    const url = new URL(location.href);
+    for (const key of keys) url.searchParams.delete(key);
+    history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+  }
+  async function handleLaunchRoute() {
+    if (launchRouteHandled) return;
+    launchRouteHandled = true;
+    if (launchAction === "main-chat" && await openMainChat()) stripLaunchParams(["action"]);
+    if (launchShareError) {
+      note("Shared content couldn't be saved. Please share it again.", true);
+      stripLaunchParams(["share-error"]);
+    }
+    const pendingShare = pendingShareLaunchForScope(S.storageScope);
+    const shareToken = launchShareToken || (pendingShare && !pendingShare.scopeMismatch ? pendingShare.token : null);
+    const shareBlockedByScope = !!(pendingShare?.scopeMismatch && (!launchShareToken || pendingShare.token === launchShareToken));
+    const shareLaunchActive = !!shareToken && !shareBlockedByScope;
+    if (shareBlockedByScope) {
+      note("This pending share belongs to a different Formless space; reopen that space to continue.", true);
+    } else if (shareToken) {
+      rememberPendingShareLaunch(shareToken, S.storageScope);
+      const selected = { sessionId: S.current, scope: S.storageScope };
+      try {
+        const share = await readIncomingShare(shareToken);
+        if (!share) {
+          note("This shared content is no longer available. Share it again.", true);
+          clearPendingShareLaunch(shareToken);
+          stripLaunchParams(["share"]);
+        }
+        else if (S.current !== selected.sessionId || S.storageScope !== selected.scope) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        }
+        else {
+          const confirmed = share.requiresConfirmation === false || await ask({
+            title: "Confirm shared content",
+            text: "The browser did not provide enough request metadata to verify this share. Add its text and files to the Chat draft? Discarding removes it. Nothing is sent automatically.",
+            ok: "Add to draft",
+            cancelLabel: "Discard share",
+          });
+          if (!confirmed) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+            note("Shared content was discarded; no draft was changed.");
+          } else if (await applyIncomingShare(shareToken, share, selected)) {
+            await deleteIncomingShare(shareToken);
+            clearPendingShareLaunch(shareToken);
+            stripLaunchParams(["share"]);
+          }
+        }
+      } catch (error) {
+        note("Shared content couldn't be added to this draft: " + (error?.message || "storage is unavailable"), true);
+      }
+    }
+    if (launchView === "approvals") {
+      if (!shareLaunchActive) setView("approvals");
+      stripLaunchParams(["view"]);
+    }
+    if (shareLaunchActive) setView("chat");
+    if (launchAction === "focus-pending") {
+      focusPending();
+      stripLaunchParams(["action"]);
+    }
+  }
+
   async function loadAll() {
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
@@ -10139,6 +10500,7 @@
     refreshProposals();
     refreshModelStats();
     refreshSettings();
+    await handleLaunchRoute();
   }
 
   /** The page can hold the pairing secret only over HTTPS or on this
@@ -10566,18 +10928,20 @@
       return null;
     }
   }
-  async function attachFiles(files) {
-    if (currentTopicAttempt()) return;
-    const sid = S.current;
-    if (!sid) { note("Open a session first", true); return; }
+  async function attachFiles(files, sessionId = S.current, storageScope = S.storageScope) {
+    if (sessionId === S.current && currentTopicAttempt()) return files;
+    const sid = sessionId;
+    if (!sid) { note("Open a session first", true); return files; }
+    const failed = [];
     for (const file of files) {
       const r = await uploadFile(sid, file);
       if (r) {
         (S.chips[sid] = S.chips[sid] || []).push(r);
         if (S.current === sid) renderChips();
-      }
+      } else failed.push(file);
     }
-    await refreshAttachmentInventory(sid);
+    await refreshAttachmentInventory(sid, storageScope);
+    return failed;
   }
   /** A sent message's attachments by name; one retention removed says
    * so instead of vanishing (#858). */
@@ -10642,7 +11006,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { if (!S.editMessageId) saveDraft(S.current, $("input").value); palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
+  $("input").addEventListener("input", () => { if (!S.editMessageId) { clearEditedSharedSlashDraft(S.storageScope, S.current, $("input").value); saveDraft(S.current, $("input").value); } palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;

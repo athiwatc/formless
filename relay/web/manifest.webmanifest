@@ -7,6 +7,33 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
+  "shortcuts": [
+    {
+      "name": "Main Chat",
+      "short_name": "Main Chat",
+      "description": "Open Main Chat in Formless.",
+      "url": "/?action=main-chat",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    },
+    {
+      "name": "Approvals",
+      "short_name": "Approvals",
+      "description": "Manage tool grants in Formless.",
+      "url": "/?view=approvals",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [{ "name": "files", "accept": ["image/*", "text/*", "application/pdf"] }]
+    }
+  },
   "background_color": "#0f1211",
   "theme_color": "#0f1211",
   "icons": [

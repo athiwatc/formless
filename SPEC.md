@@ -6078,6 +6078,35 @@ during its snapshot fetch, deduplicated by message id.
   and URL fragments never reach it. Offline, the status pill says "offline
   · daemon unreachable" and the transcript says the daemon is offline. The
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
+  Installed browsers that implement Web Share Target can share a title,
+  text, URL, image, text file or PDF to Formless. The service worker stores
+  the incoming content in the browser's IndexedDB until the client connects.
+  Share POSTs reject explicit foreign origins and `Sec-Fetch-Site` values of
+  `cross-site` or `same-site`. Same-origin requests and directly user-initiated
+  `Sec-Fetch-Site: none` launches can be applied immediately. Ambiguous
+  opaque/missing-origin ingress without trusted Fetch Metadata is stored in
+  the local inbox and requires the user to choose Add to draft or discard
+  before any draft or attachment changes. Native Android share-sheet delivery
+  has not been verified; legacy browsers may also require this confirmation.
+  The share uses the app's existing launch selection: linked Session, current
+  Session, saved per-scope Session, Main Chat, then the first Session. If there
+  is no writable selection, it opens or creates Main Chat through the existing
+  `get_main_chat` path. The saved selection is the existing `sessionStorageKey`
+  preference, not a share-specific choice. A share to a Topic Chat attempt
+  opens its writable parent Topic Chat, or Main Chat if no parent is writable.
+  An unfinished share records its storage scope and destination Session so a retry cannot redirect
+  text or files after the user switches chats. Formless adds text to that
+  Session's draft and stages files through the pending-attachment flow; the
+  pending attachment inventory restores chips when the Session is reopened.
+  Existing draft text is preserved, and nothing is sent until the user submits
+  it. The Main Chat shortcut opens Main Chat through the existing route, not a
+  newly created regular Session. The manifest also offers an Approvals shortcut
+  to the existing tool-grants view, with the platform-supported browser features. These manifest
+  features are supported by installed Chromium-based Android browsers;
+  Safari on iOS does not implement Web Share Target or manifest shortcuts,
+  and unsupported browsers ignore them. The relay's pairing key remains
+  governed by the existing "Stay paired after reloading this tab" choice;
+  sharing does not persist a new key.
   **Notifications (Web Push, opt-in per device):**
   - Settings → This browser subscribes with the relay's VAPID key
     (`GET /push/key`) and sends `{"relay":"push_subscribe","sub"}` to the
@@ -6099,8 +6128,14 @@ during its snapshot fetch, deduplicated by message id.
     and a push service refusing our signature (400/401/403) shows there
     and in the log.
   - The service worker shows "An approval or a question is waiting for
-    you", and clicking it focuses the app. No Session content reaches the
-    relay or the push service.
+    you". A generic push click focuses an approval from the app-wide approval
+    queue, or the app-wide pending question if there is no approval; this
+    pending work is not filtered by the selected Session. If the app is closed,
+    it opens the saved Session and asks it to focus pending work. Pushes carry
+    no Session identifier, so they cannot select a waiting item in another
+    Session. Notifications raised by the connected page carry the relevant
+    Session locally and open it on click. No Session content reaches the relay
+    or the push service.
 
 ## 13. Configuration (complete settings table)
 
