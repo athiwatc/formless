@@ -550,7 +550,11 @@ mod tests {
         )
         .await;
 
-        assert!(availability.installed);
+        assert!(
+            availability.installed,
+            "Antigravity availability failed: {}",
+            availability.detail.as_deref().unwrap_or("<no detail>")
+        );
         let expected = selected.to_string_lossy();
         assert_eq!(availability.version.as_deref(), Some(expected.as_ref()));
         assert_eq!(executable.as_deref(), Some(selected.as_path()));
