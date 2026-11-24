@@ -143,16 +143,22 @@ pub fn restore_before_exit() {}
 mod tests {
     use super::*;
     use ratatui::{backend::CrosstermBackend, Terminal};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetStdHandle,
-        SetConsoleCP, SetConsoleOutputCP, ENABLE_PROCESSED_OUTPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        SetConsoleCP, SetConsoleOutputCP, SetStdHandle, ENABLE_PROCESSED_OUTPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
     };
 
     struct ConsoleFixture {
         owned: bool,
         input: u32,
         output: u32,
+        stdout: HANDLE,
+        stderr: HANDLE,
+        console_output: Option<std::fs::File>,
+        console_error: Option<std::fs::File>,
     }
 
     impl Drop for ConsoleFixture {
@@ -162,6 +168,10 @@ mod tests {
             unsafe {
                 SetConsoleCP(self.input);
                 SetConsoleOutputCP(self.output);
+                SetStdHandle(STD_OUTPUT_HANDLE, self.stdout);
+                SetStdHandle(STD_ERROR_HANDLE, self.stderr);
+                drop(self.console_error.take());
+                drop(self.console_output.take());
                 if self.owned {
                     FreeConsole();
                 }
@@ -174,14 +184,33 @@ mod tests {
         // SAFETY: this native test owns its process and saves any inherited
         // console settings before exercising both legacy code pages.
         let fixture = unsafe {
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            let stderr = GetStdHandle(STD_ERROR_HANDLE);
             let owned = GetConsoleOutputCP() == 0;
             if owned {
                 assert_ne!(AllocConsole(), 0, "allocate native test console");
             }
+            let console_output = std::fs::OpenOptions::new()
+                .write(true)
+                .open("CONOUT$")
+                .unwrap();
+            let console_error = console_output.try_clone().unwrap();
+            assert_ne!(
+                SetStdHandle(STD_OUTPUT_HANDLE, console_output.as_raw_handle()),
+                0
+            );
+            assert_ne!(
+                SetStdHandle(STD_ERROR_HANDLE, console_error.as_raw_handle()),
+                0
+            );
             ConsoleFixture {
                 owned,
                 input: GetConsoleCP(),
                 output: GetConsoleOutputCP(),
+                stdout,
+                stderr,
+                console_output: Some(console_output),
+                console_error: Some(console_error),
             }
         };
         assert_ne!(fixture.input, 0);
@@ -224,8 +253,15 @@ mod tests {
                 "meta": null
             }))
             .unwrap()];
-            let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).unwrap();
+            let output = fixture
+                .console_output
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            let mut terminal = Terminal::new(CrosstermBackend::new(output)).unwrap();
             terminal.draw(|frame| crate::draw(frame, &mut app)).unwrap();
+            drop(terminal);
             drop(nested);
             assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
             if page == 437 {
