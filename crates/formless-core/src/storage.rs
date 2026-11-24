@@ -290,6 +290,40 @@ fn tool_list_reports_the_latest_retained_start_independently_of_metadata() {
     assert_eq!(pruned.last_used_at, None);
 }
 
+#[cfg(test)]
+#[test]
+fn invocation_served_models_are_exposed_in_tool_detail() {
+    let store = Store::open_in_memory().unwrap();
+    let caps = Capabilities::parse(&[]).unwrap();
+    let (tool, version) = store
+        .create_tool_version(
+            "served_model_fixture",
+            "served model fixture",
+            "{}",
+            "{}",
+            "",
+            &caps,
+            64,
+            "user",
+        )
+        .unwrap();
+    let invocation = store
+        .record_invocation(
+            &tool.id, version, None, None, None, "success", "", "{}", "answer", "", 1, 20,
+        )
+        .unwrap();
+    let served = formless_protocol::ServedModelInfo {
+        name: "actual-model".into(),
+        via: "fallback".into(),
+        requested: "requested-model".into(),
+    };
+    store
+        .add_invocation_served_model(&invocation, &served)
+        .unwrap();
+    let detail = store.tool_detail(&tool.id).unwrap().unwrap();
+    assert_eq!(detail.recent_calls[0].served_models, vec![served]);
+}
+
 const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
     start_message_seq,end_message_seq,
     (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id)
@@ -964,7 +998,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 80;
+pub const SCHEMA_VERSION: i64 = 81;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -1255,7 +1289,7 @@ fn migrate_v80(conn: &Connection) -> Result<()> {
 }
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 78] = [
+const MIGRATIONS: [(i64, MigrationStep); 79] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1622,6 +1656,9 @@ const MIGRATIONS: [(i64, MigrationStep); 78] = [
     }),
     (79, |c| Ok(c.execute_batch(SCHEMA_V79)?)),
     (80, migrate_v80),
+    (81, |c| {
+        add_column(c, "invocations", "served_models TEXT NOT NULL DEFAULT '[]'")
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -3534,6 +3571,35 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_invocation_served_model(
+        &self,
+        inv_id: &str,
+        served_model: &formless_protocol::ServedModelInfo,
+    ) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT served_models FROM invocations WHERE id=?1",
+                params![inv_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(());
+        };
+        let mut models: Vec<formless_protocol::ServedModelInfo> =
+            serde_json::from_str(&stored).unwrap_or_default();
+        if !models.contains(served_model) {
+            models.push(served_model.clone());
+            self.ex(
+                "UPDATE invocations SET served_models=?2 WHERE id=?1",
+                params![inv_id, serde_json::to_string(&models)?],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn add_invocation_tokens(&self, inv_id: &str, tokens: i64) -> Result<()> {
         self.ex(
             "UPDATE invocations SET tokens=tokens+?2 WHERE id=?1",
@@ -4223,7 +4289,7 @@ impl Store {
         };
         Ok(serde_json::json!({
             "messages": sum("SELECT SUM(length(content) + COALESCE(length(meta),0)) FROM messages")?,
-            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error)) FROM invocations")?,
+            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error) + length(served_models)) FROM invocations")?,
             "tool_versions": sum("SELECT SUM(length(code) + length(input_schema) + length(output_schema)) FROM tool_versions")?,
             "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
         }))
@@ -4652,10 +4718,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn finish_subagent(&self, id: &str, status: &str, result: &str) -> Result<SubagentInfo> {
+    pub fn finish_subagent(
+        &self,
+        id: &str,
+        status: &str,
+        result: &str,
+        model: &str,
+    ) -> Result<SubagentInfo> {
         self.ex(
-            "UPDATE subagents SET status=?2, result=?3, updated_at=?4 WHERE id=?1",
-            params![id, status, result, now()],
+            "UPDATE subagents SET status=?2, result=?3, updated_at=?4, model=?5 WHERE id=?1",
+            params![id, status, result, now(), model],
         )?;
         self.get_subagent(id)?.context("sub-agent vanished")
     }
@@ -6018,7 +6090,7 @@ impl Store {
         };
         let recent_calls = {
             let mut stmt = self.ps(
-                "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at
+                "SELECT id, version, session_id, status, input, output, error, duration_ms, created_at, served_models
                  FROM invocations WHERE tool_id=?1 ORDER BY created_at DESC, rowid DESC LIMIT 20",
             )?;
             let rows = stmt
@@ -6033,6 +6105,8 @@ impl Store {
                         error: cap(r.get(6)?),
                         duration_ms: r.get(7)?,
                         created_at: r.get(8)?,
+                        served_models: serde_json::from_str(&r.get::<_, String>(9)?)
+                            .unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

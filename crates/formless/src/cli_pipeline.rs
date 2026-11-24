@@ -85,11 +85,16 @@ pub(super) fn render_result(
     answer: Option<&str>,
     result: Option<&Value>,
     error: Option<&str>,
+    served_model: Option<&formless_protocol::ServedModelInfo>,
 ) -> Result<Vec<u8>> {
     let mut bytes = match output {
-        RunOutput::Json => serde_json::to_vec(
-            &serde_json::json!({"session_id":session,"status":status,"answer":answer,"result":result,"error":error}),
-        )?,
+        RunOutput::Json => {
+            let mut value = serde_json::json!({"session_id":session,"status":status,"answer":answer,"result":result,"error":error});
+            if let Some(served_model) = served_model {
+                value["served_model"] = serde_json::to_value(served_model)?;
+            }
+            serde_json::to_vec(&value)?
+        }
         RunOutput::Text | RunOutput::Final => answer.unwrap_or_default().as_bytes().to_vec(),
         RunOutput::JsonlEvents => anyhow::bail!("event output must use its bounded event buffer"),
     };
@@ -118,18 +123,27 @@ mod tests {
                 ("", "\n"),
             ] {
                 assert_eq!(
-                    render_result(output, "s", "completed", Some(answer), None, None).unwrap(),
+                    render_result(output, "s", "completed", Some(answer), None, None, None)
+                        .unwrap(),
                     expected.as_bytes()
                 );
             }
             assert_eq!(
-                render_result(output, "s", "completed", None, None, None).unwrap(),
+                render_result(output, "s", "completed", None, None, None, None).unwrap(),
                 b"\n"
             );
             let oversized = " ".repeat(formless_core::pipeline::MAX_RESULT_FILE_BYTES);
-            assert!(render_result(output, "s", "completed", Some(&oversized), None, None).is_err());
+            assert!(
+                render_result(output, "s", "completed", Some(&oversized), None, None, None)
+                    .is_err()
+            );
         }
         let answer = "hello  \n\n";
+        let served_model = formless_protocol::ServedModelInfo {
+            name: "served".into(),
+            via: "fallback".into(),
+            requested: "requested".into(),
+        };
         let json = render_result(
             RunOutput::Json,
             "s",
@@ -137,11 +151,15 @@ mod tests {
             Some(answer),
             Some(&serde_json::json!({"n": 2})),
             None,
+            Some(&served_model),
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(value["answer"], answer);
         assert_eq!(value["result"], serde_json::json!({"n": 2}));
+        assert_eq!(value["served_model"]["name"], "served");
+        assert_eq!(value["served_model"]["via"], "fallback");
+        assert_eq!(value["served_model"]["requested"], "requested");
     }
 
     #[test]
@@ -231,6 +249,7 @@ mod tests {
             None,
             None,
             Some("schema: mismatch"),
+            None,
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -244,7 +263,8 @@ mod tests {
                 "completed",
                 Some("{\"n\":2}"),
                 None,
-                None
+                None,
+                None,
             )
             .unwrap(),
             b"{\"n\":2}\n"

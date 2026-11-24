@@ -5227,6 +5227,13 @@ fn run_headless(
                                     }
                                 }
                             }
+                            summary.served_model = message
+                                .meta
+                                .as_deref()
+                                .and_then(|meta| serde_json::from_str::<Value>(meta).ok())
+                                .and_then(|meta| {
+                                    serde_json::from_value(meta["model"].clone()).ok()
+                                });
                             final_answer = Some(message.content);
                         }
                     }
@@ -5414,6 +5421,11 @@ fn run_headless(
             summary.line(&status.replace('_', " "), started.elapsed())
         );
     }
+    if !matches!(output, RunOutput::Json | RunOutput::JsonlEvents) {
+        if let Some(served) = &summary.served_model {
+            eprintln!("via {} ({})", served.name, served.via);
+        }
+    }
     if policy.has_schema() && code != 0 {
         final_answer = None;
         validated_result = None;
@@ -5479,6 +5491,7 @@ fn run_headless(
                     final_answer.as_deref(),
                     validated_result.as_ref(),
                     run_error.as_deref(),
+                    summary.served_model.as_ref(),
                 )?
             };
             let receipt = formless_core::pipeline::write_result_file(&path, &bytes)?;
@@ -5498,6 +5511,7 @@ fn run_headless(
                 final_answer.as_deref(),
                 validated_result.as_ref(),
                 run_error.as_deref(),
+                summary.served_model.as_ref(),
             )?;
             std::io::stdout().write_all(&bytes)?;
         }
@@ -5542,6 +5556,7 @@ fn headless_preview_request(
 #[derive(Default)]
 struct RunSummary {
     usage: formless_protocol::UsageInfo,
+    served_model: Option<formless_protocol::ServedModelInfo>,
     tools_created: usize,
     tools_used: std::collections::BTreeSet<String>,
 }

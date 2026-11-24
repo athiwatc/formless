@@ -2654,6 +2654,33 @@ function storedComparisonFixture() {
   return {left:{session:{id:'left',name:'Left'},usage},right:{session:{id:'right',name:'Right'},usage},common_ancestor:'parent',fork_point_seq:3,diff_from_seq:0,prefix_changed:true,warnings:['Prefix edited'],messages:[{kind:'left_only',left:{id:'m1',seq:4,role:'assistant',content:'private answer\n<script>data only</script>'},right:null}]};
 }
 
+test('invocation served-model details use the actual mechanism label', () => {
+  const context = vm.createContext({});
+  vm.runInContext(fn('servedModelText'), context);
+  assert.equal(context.servedModelText({ name: 'actual-model', via: 'fallback' }), 'via actual-model (fallback)');
+  assert.equal(context.servedModelText({ name: 'picked-model', via: 'routing:picked-model' }), 'via picked-model (routing:picked-model)');
+});
+
+test('model comparison event labels a fork with its served model', () => {
+  const shown = [];
+  const c = setup(['onEvent'], {
+    h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+    modal: (title, body) => shown.push({ title, body }),
+    markdown: content => content,
+    branchSummaryEvent() {},
+    notifyFor() {},
+  });
+  c.onEvent({
+    type: 'comparison_ready', session_id: 'A', results: [
+      { model: 'requested', served_model: { name: 'served', via: 'fallback' }, status: 'completed', duration_ms: 1000, tokens: 2, steps: 1, cost: null, answer: 'answer', session_id: 'fork' },
+      { model: 'unchanged', status: 'completed', duration_ms: 1000, tokens: 2, steps: 1, cost: null, answer: 'answer', session_id: 'other' },
+    ],
+  });
+  assert.equal(shown[0].title, 'Compare: requested → served (via fallback) vs unchanged');
+  assert.ok(plainText(shown[0].body.children[0][0]).includes('requested → served (via fallback)'));
+  assert.ok(plainText(shown[0].body.children[0][1]).includes('unchanged'));
+});
+
 test('Session comparison is strict local read-only data, with honest costs and stale-reply guards', async () => {
   const pending=[],calls=[],shown=[],notes=[];
   const c=setup(['compareSessionsCommand','resolveSessionRef','sessionComparisonText'],{h:node,showBidi(){},modal:(title,body)=>shown.push({title,body}),note:(text)=>notes.push(text),act:req=>{calls.push(req);const d=deferred();pending.push(d);return d.promise;}});
