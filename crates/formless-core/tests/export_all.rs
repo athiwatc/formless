@@ -188,10 +188,7 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         .unwrap();
 
     // Re-import skips existing entries without changing their current state.
-    let again = b
-        .handle(Request::ImportAll { bundle })
-        .await
-        .unwrap();
+    let again = b.handle(Request::ImportAll { bundle }).await.unwrap();
     assert_eq!(
         (
             again["tools"].as_i64(),
@@ -204,7 +201,17 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
             again["roles"].as_i64(),
             again["mcp_servers"].as_i64(),
         ),
-        (Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)),
+        (
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0)
+        ),
         "{again}"
     );
     assert_eq!(

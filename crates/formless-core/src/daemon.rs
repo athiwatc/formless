@@ -10641,10 +10641,7 @@ impl Daemon {
         let mut capability_families = std::collections::BTreeMap::<String, usize>::new();
         for t in list("tools") {
             if let Some(name) = t["name"].as_str() {
-                if self
-                    .with_reader(|st| st.get_tool_by_name(name))?
-                    .is_some()
-                {
+                if self.with_reader(|st| st.get_tool_by_name(name))?.is_some() {
                     count(&mut skipped_existing, "tools");
                     continue;
                 }
@@ -10687,12 +10684,7 @@ impl Daemon {
             Ok(st
                 .list_memories()?
                 .into_iter()
-                .map(|memory| {
-                    (
-                        memory.scope,
-                        crate::memory::dedup_key(&memory.text),
-                    )
-                })
+                .map(|memory| (memory.scope, crate::memory::dedup_key(&memory.text)))
                 .collect::<std::collections::BTreeSet<_>>())
         })?;
         for m in list("memories") {
@@ -10715,8 +10707,7 @@ impl Daemon {
         let delivery_identity = |deliver: Option<&Value>| {
             deliver
                 .filter(|value| {
-                    !value.is_null()
-                        && !value.as_object().is_some_and(|object| object.is_empty())
+                    !value.is_null() && !value.as_object().is_some_and(|object| object.is_empty())
                 })
                 .map(Value::to_string)
                 .unwrap_or_default()
@@ -10778,7 +10769,9 @@ impl Daemon {
         let mut session_identities = std::collections::BTreeSet::new();
         for session in self.with_reader(|st| st.list_sessions())? {
             let exported = self.session_bundle(&session.id)?;
-            session_identities.insert(serde_json::to_string(&Self::import_session_identity(&exported))?);
+            session_identities.insert(serde_json::to_string(&Self::import_session_identity(
+                &exported,
+            ))?);
         }
         for b in list("sessions") {
             let identity = serde_json::to_string(&Self::import_session_identity(&b))?;
@@ -10790,9 +10783,9 @@ impl Daemon {
                 Ok(session) => {
                     count(&mut added, "sessions");
                     let exported = self.session_bundle(&session.id)?;
-                    session_identities.insert(
-                        serde_json::to_string(&Self::import_session_identity(&exported))?,
-                    );
+                    session_identities.insert(serde_json::to_string(
+                        &Self::import_session_identity(&exported),
+                    )?);
                 }
                 Err(e) => failed.push(format!(
                     "session {}: {e}",
