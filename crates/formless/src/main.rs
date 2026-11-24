@@ -10292,8 +10292,18 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("private manager fixture rejected reject"),
+            "expected the injected preparation failure, got: {error:#}"
+        );
         assert!(erased.borrow().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(base.config_dir.join("operations")).unwrap(),
+            "reject\n"
+        );
         assert_eq!(
             std::fs::read_to_string(named.db_file()).unwrap(),
             "child sentinel"
