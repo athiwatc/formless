@@ -5840,8 +5840,8 @@ impl Daemon {
         bail!("run for deleted session {session_id} did not stop; retry deletion")
     }
 
-    /// Share the existing per-connection send receipt and detached execution
-    /// semantics with the explicit attachment-review operation.
+    /// Share send receipts and detached execution semantics with the explicit
+    /// attachment-review operation.
     async fn send_message_once(
         self: &Arc<Self>,
         session_id: String,
@@ -5857,9 +5857,18 @@ impl Daemon {
         };
         let who = current_client();
         let steer_run_id = review.as_ref().and_then(|review| review.run_id.as_deref());
-        // Legacy and reviewed operations must never replay one another's ACK.
+        // Legacy sends use their Session-scoped action id across reconnects;
+        // reviewed operations remain bound to the connection that approved them.
         let key = (
-            (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key),
+            (
+                if review.is_some() {
+                    who.as_ref().map(|(conn, _)| *conn)
+                } else {
+                    None
+                },
+                session_id.clone(),
+                key,
+            ),
             match &review {
                 Some(review) if review.run_id.is_some() => SendReceiptKind::ReviewedSteer,
                 Some(_) => SendReceiptKind::Reviewed,

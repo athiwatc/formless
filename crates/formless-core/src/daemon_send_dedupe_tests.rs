@@ -184,7 +184,7 @@ async fn framed_client(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_framed_connections_with_same_key_each_append_once() {
+async fn reconnect_reuses_the_same_framed_send_receipt() {
     let env = crate::credential_env::EnvGuard::isolated();
     let (daemon, sid, base) = fixture(&env);
     let (left, right) = tokio::join!(
@@ -193,24 +193,17 @@ async fn two_framed_connections_with_same_key_each_append_once() {
     );
     assert_eq!(left.0, left.1);
     assert_eq!(right.0, right.1);
+    assert_eq!(left.0, right.0);
     let messages = daemon.with_reader(|st| st.list_messages(&sid)).unwrap();
     assert_eq!(
         messages.len(),
-        2,
-        "the second connection's message was suppressed"
+        1,
+        "the reconnect appended the same action twice"
     );
-    let clients: std::collections::HashSet<_> = messages
-        .iter()
-        .map(|m| {
-            serde_json::from_str::<Value>(m.meta.as_ref().unwrap()).unwrap()["client"]["conn"]
-                .as_u64()
-                .unwrap()
-        })
-        .collect();
-    assert_eq!(clients.len(), 2, "each client should append exactly once");
-    assert!(
-        daemon.sent_keys.locked().is_empty(),
-        "closed clients' dedupe state was retained"
+    assert_eq!(
+        daemon.sent_keys.locked().len(),
+        1,
+        "the retry receipt must survive connection close"
     );
     release_fixture(&env, daemon).await;
     let _ = std::fs::remove_dir_all(base);

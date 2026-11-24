@@ -36,7 +36,7 @@ test('authenticated browser requests reach the daemon send path within the plain
 const deferred=()=>{let resolve;const promise=new Promise(r=>{resolve=r;});return{promise,resolve};};
 async function until(predicate){const end=Date.now()+2000;while(!predicate()){assert.ok(Date.now()<end,'bounded browser fixture');await new Promise(r=>setTimeout(r,2));}}
 async function browser(keyGate=null,decryptGate=null){
-  const sent=[],closes=[],readyAcks=[],messages=[],elements=new Map();let loaded=0;
+  const sent=[],closes=[],readyAcks=[],messages=[],elements=new Map();let loaded=0,flushed=0;
   const S={ws:null,channel:null,daemonOnline:false,room:'room',pending:new Map(),sendChain:Promise.resolve(),nextId:1,relayModule:transport,relayMemory:new transport.MemoryBudget(512*1024*1024),userClosed:false};
   class Socket{
     constructor(){this.readyState=1;}
@@ -47,7 +47,7 @@ async function browser(keyGate=null,decryptGate=null){
   const c=vm.createContext({S,WebSocket:Socket,location:{protocol:'https:',host:'fixture.invalid'},crypto,Uint8Array,TextEncoder,TextDecoder,btoa,atob,
     enc:s=>new TextEncoder().encode(s),aad:(direction,seq)=>new TextEncoder().encode('formless-relay/2 '+direction+' '+seq),FRAME_VERSION:2,HANDSHAKE_MS:8000,HANDSHAKE_TRIES:3,
     $:id=>{if(!elements.has(id))elements.set(id,{textContent:'',classList:{add(){},remove(){},contains(){return true;}}});return elements.get(id);},
-    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},onMessage(message){messages.push(message);},
+    setTimeout(){return 1;},clearTimeout(){},renderAll(){},renderChrome(){},renderHistory(){},clearLiveState(){},scheduleReconnect(){},note(){},markStable(){},restorePushSubscription(){},loadAll(){loaded++;},flushOutbox(){flushed++;},onMessage(message){messages.push(message);},
   });
   vm.runInContext(['openRelay','finishRelayReady','startHandshake','sendHello','confirmTag','finishHandshake','bytesToB64','b64ToBytes','decrypt','pushRefused'].map(fn).join('\n'),c);
   S.key=await webcrypto.subtle.importKey('raw',new Uint8Array(32).fill(7),'HKDF',false,['deriveBits','deriveKey']);
@@ -55,7 +55,7 @@ async function browser(keyGate=null,decryptGate=null){
   const control=(body,receipt)=>ws.onmessage({data:JSON.stringify({relay:'control',g:generation,receipt,f:JSON.stringify(body)})});
   control({relay:'transport',v:1,g:generation,cid:'private-client'},'A'.repeat(22));
   await until(()=>sent.length===1);
-  return{c,S,ws,sent,closes,readyAcks,messages,control,loaded:()=>loaded};
+  return{c,S,ws,sent,closes,readyAcks,messages,control,loaded:()=>loaded,flushed:()=>flushed};
 }
 test('shipped browser waits for local E2E proof and consumed room readiness before bulk/grants',async()=>{
   const b=await browser();b.control({relay:'daemon_online'},'B'.repeat(22));
@@ -66,7 +66,7 @@ test('shipped browser waits for local E2E proof and consumed room readiness befo
   b.control({relay:'ready',g:generation},'D'.repeat(22));
   assert.equal(b.S.relayReady,false,'ready cannot overtake async key verification');
   await until(()=>b.S.relayReady&&b.readyAcks.length===1);
-  assert.deepEqual(b.readyAcks,[true]);assert.equal(b.loaded(),1);assert.equal(b.S.relayLink.endpoint.ready,true);
+  assert.deepEqual(b.readyAcks,[true]);assert.equal(b.loaded(),1);assert.equal(b.flushed(),1);assert.equal(b.S.relayLink.endpoint.ready,true);
   assert.deepEqual(b.closes,[]);await until(()=>b.S.relayMemory.used===0);
   b.ws.close(1000);
 });
@@ -143,7 +143,7 @@ test('duplicate handshake replies around readiness never send a late confirm or 
   b.control(reply,'F'.repeat(22));
   await until(()=>b.sent.some(frame=>frame.receipt==='F'.repeat(22)));
   assert.equal(b.sent.filter(frame=>frame.v===2&&frame.confirm).length,1,'one browser proof, no post-ready raw handshake');
-  assert.equal(b.S.channel,channel);assert.equal(b.loaded(),1);
+  assert.equal(b.S.channel,channel);assert.equal(b.loaded(),1);assert.equal(b.flushed(),1);
   // A genuine authenticated next frame still opens on exactly that channel.
   const iv=new Uint8Array(12).fill(3),message={type:'response',id:7,result:{pong:true}};
   const ciphertext=await webcrypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:new TextEncoder().encode('formless-relay/2 d2b 1')},channel.key,new TextEncoder().encode(JSON.stringify(message)));

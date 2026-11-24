@@ -59,9 +59,35 @@
       }
     },
     set(k, v) {
-      try { localStorage.setItem("formless." + k, JSON.stringify(v)); } catch (_) {}
+      try { localStorage.setItem("formless." + k, JSON.stringify(v)); return true; } catch (_) { return false; }
     },
   };
+
+  function loadDrafts() {
+    const drafts = prefs.get("drafts", {});
+    return drafts && typeof drafts === "object" && !Array.isArray(drafts)
+      ? Object.fromEntries(Object.entries(drafts).filter(([, value]) => typeof value === "string"))
+      : {};
+  }
+  function loadOutbox() {
+    const saved = prefs.get("outbox", []);
+    if (!Array.isArray(saved)) return [];
+    const outbox = saved.filter((item) => item && typeof item.session_id === "string"
+      && typeof item.content === "string" && typeof item.client_msg_id === "string"
+      && item.client_msg_id && ["send", "steer", "queue"].includes(item.mode))
+      .map((item) => ({
+        session_id: item.session_id,
+        content: item.content,
+        mode: item.mode,
+        client_msg_id: item.client_msg_id,
+        status: item.status === "failed" ? "failed" : "queued",
+        error: typeof item.error === "string" ? item.error : "",
+      }));
+    if (outbox.length !== saved.length || saved.some((item, index) => item.status === "sending" || item.status !== outbox[index]?.status)) {
+      prefs.set("outbox", outbox);
+    }
+    return outbox;
+  }
 
   // While an IME is composing (Japanese, Chinese, Korean…), Enter and
   // other keys confirm candidates: no shortcut, palette, mention or form
@@ -100,6 +126,9 @@
     topicRevision: 0,
     topicFocus: null,
     current: null,
+    drafts: loadDrafts(),
+    outbox: loadOutbox(),
+    outboxFlushing: false,
     messages: [],
     sessionLoad: null, // { id, status: pending | failed | loaded }
     streaming: "",
@@ -130,6 +159,102 @@
     pending: new Map(),
     subagents: [], // last /agents listing
   };
+
+  function saveDraft(sessionId, value) {
+    if (!sessionId) return true;
+    S.drafts = S.drafts || {};
+    if (value) S.drafts[sessionId] = value;
+    else delete S.drafts[sessionId];
+    return prefs.set("drafts", S.drafts);
+  }
+  function restoreDraft(sessionId) {
+    $("input").value = (S.drafts && S.drafts[sessionId]) || "";
+    autosize();
+  }
+  function persistOutbox() {
+    return prefs.set("outbox", S.outbox || []);
+  }
+  function renderOutbox() {
+    const box = $("outbox");
+    if (!box) return;
+    const entries = S.outbox || [];
+    box.hidden = entries.length === 0;
+    box.replaceChildren(...entries.map((item) => {
+      const status = item.status === "sending" ? "Sending" : item.status === "failed" ? "Failed" : "Queued";
+      return h("div", { class: "outbox-item", "data-status": item.status },
+        h("div", { class: "outbox-entry" },
+          h("strong", { class: "outbox-status" }, status),
+          h("div", { class: "outbox-content" }, item.content),
+          item.error ? h("div", { class: "outbox-error" }, item.error) : null),
+        h("button", { type: "button", class: "btn ghost", "aria-label": "Discard " + status.toLowerCase() + " message", onclick: () => discardOutbox(item) }, "Discard"));
+    }));
+  }
+  function enqueueOutbox(sessionId, content, mode) {
+    if (!sessionId || !content || !["send", "steer", "queue"].includes(mode)) return null;
+    const clientMsgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
+    const item = { session_id: sessionId, content, mode, client_msg_id: clientMsgId, status: "queued", error: "" };
+    S.outbox = S.outbox || [];
+    S.outbox.push(item);
+    if (!persistOutbox()) {
+      S.outbox.pop();
+      return null;
+    }
+    renderOutbox();
+    return item;
+  }
+  function canFlushOutbox() {
+    return !!(S.daemonOnline && S.channel && (S.local || S.relayReady));
+  }
+  function discardOutbox(item) {
+    const previous = S.outbox || [];
+    if (!previous.includes(item)) return false;
+    S.outbox = previous.filter((entry) => entry !== item);
+    if (!persistOutbox()) {
+      S.outbox = previous;
+      renderOutbox();
+      note("Could not save the outbox change; the message was not discarded.", true);
+      return false;
+    }
+    renderOutbox();
+    void flushOutbox();
+    return true;
+  }
+  async function flushOutbox() {
+    if (S.outboxFlushing || !canFlushOutbox()) return;
+    S.outboxFlushing = true;
+    try {
+      while (canFlushOutbox() && S.outbox && S.outbox.length) {
+        const item = S.outbox[0];
+        if (item.status === "failed") break;
+        item.status = "sending";
+        item.error = "";
+        persistOutbox();
+        renderOutbox();
+        try {
+          await request({ type: "send_message", session_id: item.session_id, content: item.content, mode: item.mode, client_msg_id: item.client_msg_id });
+        } catch (error) {
+          if (!S.outbox.includes(item)) continue;
+          item.status = error.daemonResponse ? "failed" : "queued";
+          item.error = error.message;
+          persistOutbox();
+          renderOutbox();
+          if (error.daemonResponse) { toast(error.message, true); note(error.message, true); }
+          break;
+        }
+        const index = S.outbox.indexOf(item);
+        if (index < 0) continue;
+        S.outbox.splice(index, 1);
+        persistOutbox();
+        renderOutbox();
+        delete S.chips[item.session_id];
+        delete mentionAttached[item.session_id];
+        if (S.current === item.session_id) renderChips();
+        if (item.mode === "steer") note("steering the current run");
+      }
+    } finally {
+      S.outboxFlushing = false;
+    }
+  }
 
   // --------------------------------------------------------------- crypto
   function b64ToBytes(s) {
@@ -878,6 +1003,7 @@
       renderChrome();
       renderSessions();
       renderHistory();
+      renderOutbox();
       renderComposer();
       renderView();
       renderStatus();
@@ -4329,7 +4455,7 @@
     return h("div", { class: "welcome" },
       h("h2", null, h("span", { class: "mark" }, "◇ "), "Formless"),
       h("p", { class: "muted" }, "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it."),
-      h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; $("input").focus(); autosize(); } }, ex))),
+      h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; saveDraft(S.current, ex); $("input").focus(); autosize(); } }, ex))),
       h("p", { class: "muted" }, h("span", { class: "welcome-enter-hint" }, welcomeEnterHint(composerEnterSends())),
         " · /help commands · /model switch model · @ reference a file"));
   }
@@ -7949,6 +8075,7 @@
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
   async function openSession(id, stay) {
+    if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
     cancelEventRender();
@@ -7977,7 +8104,11 @@
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     renderChips();
-    if (attachmentDrafts[id]) { $("input").value = attachmentDrafts[id]; delete attachmentDrafts[id]; autosize(); }
+    const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, id) ? attachmentDrafts[id] : (S.drafts[id] || "");
+    delete attachmentDrafts[id];
+    $("input").value = draft;
+    saveDraft(id, draft);
+    autosize();
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -8126,7 +8257,7 @@
     if (!r || !r.session) return;
     S.sessions = [r.session, ...S.sessions.filter((x) => x.id !== r.session.id)];
     await openSession(r.session.id);
-    if (r.first_message) $("input").value = r.first_message;
+    if (r.first_message) { $("input").value = r.first_message; saveDraft(S.current, r.first_message); }
     $("input").focus();
   }
   async function templateCommand(arg) {
@@ -8245,6 +8376,7 @@
 
   function beginEdit(msg) {
     if (msg.generated_by != null || (S.topicsAvailable && currentTopicAttempt())) return;
+    if (!S.editMessageId) saveDraft(S.current, $("input").value);
     S.editMessageId = msg.id;
     $("input").value = msg.content;
     autosize();
@@ -8253,8 +8385,7 @@
   }
   function cancelEdit() {
     S.editMessageId = null;
-    $("input").value = "";
-    autosize();
+    restoreDraft(S.current);
     renderComposer();
   }
 
@@ -8479,7 +8610,7 @@
       const [server, name] = (target || "").split(":");
       if (!server || !name) return note("usage: /prompt SERVER:NAME [key=value …] (see /prompts)", true);
       const r = await act({ type: "get_mcp_prompt", server, name, arguments: Object.fromEntries(pairs.filter((p) => p.includes("=")).map((p) => p.split(/=(.*)/s).slice(0, 2))) });
-      if (r) { $("input").value = r.text; autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
+      if (r) { $("input").value = r.text; saveDraft(S.current, r.text); autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
     } },
     { name: "help", group: "App", desc: "all commands and keys (also ? on an empty input)", run: () => showHelp() },
     { name: "quit", group: "App", desc: "disconnect from the daemon", run: () => forget() },
@@ -8634,7 +8765,7 @@
         if (eq) args[eq[1]] = eq[2]; else positional.push(w);
       }
       const r = await act({ type: "get_mcp_prompt", server: mp[1], name: mp[2], arguments: args, positional }, null, 60000);
-      if (r && r.text && r.text.trim()) { $("input").value = r.text; autosize(); return submit(false); }
+      if (r && r.text && r.text.trim()) { $("input").value = r.text; saveDraft(S.current, r.text); autosize(); return submit(false); }
       return;
     }
     const [first, ...rest] = cmd.split(/\s+/);
@@ -8655,6 +8786,7 @@
     if (!text) return;
     if (text.startsWith("/") && !S.editMessageId) {
       input.value = "";
+      saveDraft(S.current, "");
       autosize();
       return slash(text.slice(1).trim());
     }
@@ -8666,11 +8798,10 @@
       catch (e) { note("forecast: " + e.message, true); return; }
     }
     const mode = queued ? "queue" : isRunning() ? "steer" : "send";
-    input.value = "";
-    autosize();
     if (S.editMessageId) {
       const id = S.editMessageId;
       S.editMessageId = null;
+      restoreDraft(sid);
       renderComposer();
       await act({ type: "edit_message", session_id: sid, message_id: id, content: text });
       return;
@@ -8699,39 +8830,32 @@
       }
     }
     if (fresh.length) {
-      if (S.current === sid) { input.value = text; autosize(); renderChips(); }
-      else attachmentDrafts[sid] = text;
+      if (S.current === sid) { saveDraft(sid, input.value); autosize(); renderChips(); }
+      else { attachmentDrafts[sid] = text; saveDraft(sid, text); }
       note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
       return;
     }
     if (!isRunning() && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
       try {
         if (!(await confirmForecast(sid,text))) {
-          if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
+          if (S.current !== sid) { attachmentDrafts[sid]=text; saveDraft(sid, text); }
           autosize();return;
         }
       } catch (error) {
-        if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
+        if (S.current !== sid) { attachmentDrafts[sid]=text; saveDraft(sid, text); }
         autosize();note("Forecast was not confirmed: "+error.message,true);return;
       }
     }
-    // One key per user action (#891): pressing Send again after a reply
-    // was lost reuses it, so the daemon doesn't send the message twice.
-    const same = S.unsent && S.unsent.session === sid && S.unsent.text === text;
-    const key = same ? S.unsent.key
-      : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
-    S.unsent = { session: sid, text, key };
-    let r = null;
-    try { r = await request({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key }); }
-    catch (error) {
-      if (error.daemonResponse && S.unsent && S.unsent.key === key) S.unsent = null;
-      if (S.current === sid && !input.value) { input.value = text; autosize(); } else attachmentDrafts[sid] = text;
-      toast(error.message,true);note(error.message,true);
+    if (!enqueueOutbox(sid, text, mode)) {
+      note("Could not save this message to the outbox; it is still in the composer.", true);
+      return;
     }
-    if (r && S.unsent && S.unsent.key === key) S.unsent = null;
-    // The attachments went with it.
-    if (r) { delete S.chips[sid]; delete mentionAttached[sid]; renderChips(); }
-    if (r && mode === "steer") note("steering the current run");
+    if (S.current === sid && input.value.trim() === text) {
+      input.value = "";
+      saveDraft(sid, "");
+      autosize();
+    }
+    return flushOutbox();
   }
   function stop() {
     if (S.topicsAvailable && currentTopicAttempt()) return;
@@ -9361,6 +9485,7 @@
     restorePushSubscription(ws);
     markStable();
     note("daemon online");
+    void flushOutbox();
     loadAll();
   }
   function openRelay() {
@@ -9551,6 +9676,7 @@
       $("app").classList.remove("hidden");
       renderAll();
       note("connected to the local daemon");
+      void flushOutbox();
       loadAll();
     };
     ws.onmessage = (e) => {
@@ -9796,7 +9922,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
+  $("input").addEventListener("input", () => { if (!S.editMessageId) saveDraft(S.current, $("input").value); palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;

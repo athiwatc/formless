@@ -3415,13 +3415,12 @@ such as `read_file`, `read_text_file` and `file_read`.
   per-connection queue; an interrupt cancels a `SendMessage` for that
   Session still queued behind a slow request (it fails with "interrupted
   before it started"). `SendMessage.client_msg_id` makes a retried send
-  on the same connection and Session return the first outcome instead of sending
-  twice (kept 10 minutes, removed when that connection closes). A different
-  connection using the same key performs its own send. A key is claimed before
-  execution; concurrent retries wait for the in-flight outcome, including errors.
+  in the same Session return the first outcome instead of sending twice,
+  including across connections (kept 10 minutes after completion, or until
+  daemon restart). A different Session using the same key performs its own send.
+  A key is claimed before execution; concurrent retries wait for the in-flight outcome, including errors.
   Losing a response/waiter does not cancel the claimed send or lose its outcome.
-  After reconnecting, retrying an unacknowledged send can repeat an uncertain
-  prior send: action ids deduplicate only within the original connection.
+  After reconnecting, retrying an unacknowledged send returns its cached outcome.
   Cached failures preserve the same machine-readable error code and message.
   TUI, plain mode and headless sends carry a fresh UUID per user action.
   Until a response arrives, retrying the same text in that Session reuses

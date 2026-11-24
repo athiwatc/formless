@@ -19,11 +19,16 @@ const fn = (name) => {
 const deferred = () => { let resolve, reject; const promise = new Promise((r, e) => { resolve = r; reject = e; }); return { promise, resolve, reject }; };
 function setup(names, extras = {}) {
   const elements = new Map();
+  const stored = new Map();
+  const prefs = {
+    get(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
+    set(key, value) { stored.set(key, structuredClone(value)); return true; },
+  };
   const $ = id => {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, S: { approvalHelpSeen: true, current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, tr: text => text, prefs, mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', chips: {}, drafts: {}, outbox: [], outboxFlushing: false, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -222,7 +227,7 @@ test('file upload remains in original Session after switching', async () => {
 });
 test('slow mention attachment does not cross-post or overwrite new Session composer', async () => {
   const wait = deferred(), calls = [];
-  const c = setup(['submit'], { isRunning: () => true, askNotifyPermission() {}, closeMentions() {},
+  const c = setup(['submit','saveDraft'], { isRunning: () => true, askNotifyPermission() {}, closeMentions() {},
     mentionsIn: () => ['file'], request: async x => { calls.push(x); await wait.promise; return { name: 'file' }; },
     act: async x => { calls.push(x); return {}; } });
   vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
@@ -239,7 +244,7 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
 });
 test('line citations queue files for review and report missing citations', async () => {
   const notes = [], calls = [];
-  const c = setup(['submit', 'mentionMatches', 'mentionsIn'], {
+  const c = setup(['submit', 'saveDraft', 'mentionMatches', 'mentionsIn'], {
     isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
     note: (message, failed) => notes.push({ message, failed }),
     request: async (request) => {
@@ -262,8 +267,8 @@ test('line citations queue files for review and report missing citations', async
 
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
-  const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
-    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, request: async x => { calls.push(x); await wait.promise; return {}; } });
+  const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
+    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, renderOutbox() {}, request: async x => { calls.push(x); await wait.promise; return {}; } });
   vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
   c.$('input').value = 'hello'; c.S.chips.A = [{}]; c.S.chips.B = [{}];
   const pending = c.submit(false); c.S.current = 'B'; wait.resolve(); await pending;
@@ -296,7 +301,7 @@ test('clearing search invalidates an in-flight reply', async () => {
 test('opening Session clears old messages and merges live appended messages into snapshot', async () => {
   const wait = deferred();
   const noop = () => {};
-  const c = setup(['openSession', 'onEvent'], { applySessionLiveState: noop, notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: { set() {} },
+  const c = setup(['openSession','saveDraft', 'onEvent'], { applySessionLiveState: noop, notifyFor: noop, renderComposer: noop, act: () => wait.promise, request: async () => ({}), prefs: { set() {} },
     rendered: new Map(), closeSidebar: noop, renderHistory: noop, renderRunTools: noop, renderStatus: noop,
     renderQueue: noop, renderPlan: noop, renderStep: noop, renderRunBanner: noop, renderAll: noop, isRunning: () => false });
   vm.runInContext('let sessionSeq = 0; const CLIENT_LABEL = "test"; const attachmentDrafts = {};', c);
@@ -459,7 +464,7 @@ test('generated user-role messages render as Formless and cannot be moved or edi
 
 test('edit mode warns before truncating any later history, including generated kickoffs', () => {
   const elements = new Map();
-  const c = setup(['beginEdit', 'cancelEdit', 'renderComposer'], {
+  const c = setup(['beginEdit', 'cancelEdit', 'renderComposer', 'saveDraft', 'restoreDraft'], {
     h: node, isRunning: () => false, composerEnterSends: () => true, enterModeHint: () => 'Enter sends',
     topicForSession: () => null, renderTopicContext() {},
     $: id => {
@@ -483,6 +488,28 @@ test('edit mode warns before truncating any later history, including generated k
   assert.match(plainText(c.$('compose-mode')), /sending deletes all later messages/);
   assert.equal(c.S.editMessageId, request.id);
   assert.equal(c.$('input').value, request.content);
+});
+
+test('editing a message preserves the draft in that Session', async () => {
+  const edits = [];
+  const c = setup(['beginEdit', 'cancelEdit', 'submit', 'saveDraft', 'restoreDraft'], {
+    isRunning: () => false, renderComposer() {}, act: async request => { edits.push(request); return {}; },
+  });
+  c.$('input').value = 'my unsent draft';
+  c.saveDraft('A', c.$('input').value);
+  const message = { id: 'message', content: 'old message' };
+  c.beginEdit(message);
+  assert.equal(c.$('input').value, 'old message');
+  c.cancelEdit();
+  assert.equal(c.$('input').value, 'my unsent draft');
+
+  c.beginEdit(message);
+  c.$('input').value = 'edited message';
+  await c.submit(false);
+  assert.deepEqual(edits.map(request => ({ ...request })), [{ type: 'edit_message', session_id: 'A', message_id: 'message', content: 'edited message' }]);
+  assert.equal(c.S.editMessageId, null);
+  assert.equal(c.$('input').value, 'my unsent draft');
+  assert.equal(c.S.drafts.A, 'my unsent draft');
 });
 
 test('hostile persisted Markdown has bounded nesting and preserves readable text', () => {
@@ -814,20 +841,128 @@ test('declined consent retains composer and allocates no send intent', async () 
   c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
   assert.equal(c.$('input').value,'task');assert.deepEqual(calls.map(c=>c.type),['forecast_run']);
 });
-test('a definite gate rejection retries after consent with a fresh intent; uncertain sends keep their key', async () => {
+test('per-session drafts survive storage reload and restore independently', () => {
+  const stored = new Map();
+  const prefs = {
+    get(key, fallback) { return stored.has(key) ? stored.get(key) : fallback; },
+    set(key, value) { stored.set(key, structuredClone(value)); return true; },
+  };
+  const first = setup(['loadDrafts','saveDraft'], { prefs });
+  first.S.drafts = first.loadDrafts();
+  first.saveDraft('A', 'draft for A'); first.saveDraft('B', 'draft for B');
+  const reloaded = setup(['loadDrafts','restoreDraft'], { prefs });
+  reloaded.S.drafts = reloaded.loadDrafts();
+  reloaded.restoreDraft('A'); assert.equal(reloaded.$('input').value, 'draft for A');
+  reloaded.restoreDraft('B'); assert.equal(reloaded.$('input').value, 'draft for B');
+});
+
+test('a tab discard recovers a sending outbox item as queued', () => {
+  let saved;
+  const c = setup(['loadOutbox'], { prefs: { get: () => [{ session_id: 'A', content: 'message', mode: 'send', client_msg_id: 'same-action', status: 'sending' }],
+    set: (key, value) => { if (key === 'outbox') saved = structuredClone(value); return true; } } });
+  const outbox = c.loadOutbox();
+  assert.equal(outbox[0].status, 'queued');
+  assert.equal(saved[0].status, 'queued');
+  assert.equal(outbox[0].client_msg_id, 'same-action');
+});
+
+test('outbox rendering exposes each message state, content and discard action', () => {
+  const c = setup(['renderOutbox','discardOutbox','persistOutbox','flushOutbox','canFlushOutbox'], {
+    S: { outbox: [{ session_id: 'A', content: 'message text', mode: 'send', client_msg_id: 'id', status: 'failed', error: 'daemon rejected it' }] },
+    h: (tag, attrs, ...children) => ({ tag, attrs, children }),
+  });
+  const box = c.$('outbox'); let rendered;
+  box.replaceChildren = (...children) => { rendered = children; };
+  c.renderOutbox();
+  assert.equal(box.hidden, false);
+  assert.match(plainText(rendered[0]), /Failed/);
+  assert.match(plainText(rendered[0]), /message text/);
+  assert.match(plainText(rendered[0]), /daemon rejected it/);
+  assert.match(plainText(rendered[0]), /Discard/);
+  assert.equal(rendered[0].children[1].attrs.onclick(), true);
+  assert.equal(c.S.outbox.length, 0);
+  assert.equal(box.hidden, true);
+});
+
+test('offline submissions persist the selected mode per Session without sending', async () => {
+  const calls = [];
+  const c = setup(['submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], {
+    daemonOnline: false, closeMentions() {}, askNotifyPermission() {}, mentionsIn: () => [],
+    isRunning: () => true, request: async req => { calls.push(req); return {}; },
+    crypto: { randomUUID: () => 'steer-action' }, renderOutbox() {},
+  });
+  c.S.daemonOnline = false; c.S.channel = null;
+  c.$('input').value = 'keep this queued';
+  await c.submit(false);
+  assert.equal(c.$('input').value, '');
+  assert.deepEqual(calls, []);
+  assert.equal(c.S.outbox.length, 1);
+  assert.equal(c.S.outbox[0].session_id, 'A');
+  assert.equal(c.S.outbox[0].mode, 'steer');
+  assert.equal(c.S.outbox[0].status, 'queued');
+});
+
+test('outbox retries ambiguous sends in order with the same client IDs and modes', async () => {
+  const calls = []; let attempt = 0, nextId = 0;
+  const c = setup(['enqueueOutbox','persistOutbox','loadOutbox','flushOutbox','canFlushOutbox'], {
+    request: async req => {
+      calls.push({ ...req });
+      if (attempt++ === 0) throw new Error('relay connection closed');
+      return { accepted: true };
+    },
+    crypto: { randomUUID: () => 'outbox-' + (++nextId) }, renderOutbox() {},
+  });
+  const first = c.enqueueOutbox('A', 'one', 'steer');
+  const second = c.enqueueOutbox('B', 'two', 'queue');
+  assert.equal(first.status, 'queued'); assert.equal(second.status, 'queued');
+  assert.equal(c.loadOutbox().length, 2, 'outbox is persisted before dispatch');
+  await c.flushOutbox();
+  assert.equal(first.status, 'queued', 'ambiguous failure remains retryable');
+  await c.flushOutbox();
+  assert.deepEqual(calls.map(req => [req.session_id, req.content, req.mode]), [
+    ['A', 'one', 'steer'], ['A', 'one', 'steer'], ['B', 'two', 'queue'],
+  ]);
+  assert.equal(calls[0].client_msg_id, calls[1].client_msg_id);
+  assert.notEqual(calls[1].client_msg_id, calls[2].client_msg_id);
+  assert.equal(c.S.outbox.length, 0);
+});
+
+test('definite daemon rejection remains visible as failed and blocks later sends', async () => {
+  const calls = []; let nextId = 0;
+  const c = setup(['enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], {
+    request: async req => { calls.push(req); const error = new Error('stale forecast'); error.daemonResponse = true; throw error; },
+    crypto: { randomUUID: () => 'failed-action-' + (++nextId) }, renderOutbox() {}, toast() {}, note() {},
+  });
+  const failed = c.enqueueOutbox('A', 'message', 'send');
+  c.enqueueOutbox('A', 'later message', 'send');
+  await c.flushOutbox();
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.error, 'stale forecast');
+  assert.equal(c.S.outbox.length, 2);
+  assert.equal(calls.length, 1);
+});
+
+test('a definite gate rejection is not retried automatically; uncertain sends reuse their action ID', async () => {
   for (const definite of [false,true]) {
     const calls = [];let intent = 0, sends = 0;
-    const c = forecastContext(['forecastStamp','confirmForecast','submit'], { ask:async()=>true, request:async req=>{
+    const c = forecastContext(['forecastStamp','confirmForecast','submit','saveDraft','enqueueOutbox','persistOutbox','flushOutbox','canFlushOutbox'], { ask:async()=>true, request:async req=>{
       calls.push(req);if(req.type==='forecast_run')return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};
       if(req.type==='confirm_forecast')return {confirmed:true};
       if(req.type==='send_message' && ++sends===1){const error=new Error(definite?'stale forecast':'lost response');error.daemonResponse=definite;throw error;}
       return {started:true};
-    }, toast(){},askNotifyPermission(){},closeMentions(){},mentionsIn:()=>[],crypto:{randomUUID:()=>`intent-${++intent}`} });
+    }, toast(){},askNotifyPermission(){},closeMentions(){},mentionsIn:()=>[],renderOutbox(){},crypto:{randomUUID:()=>`intent-${++intent}`} });
     vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
-    c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);assert.equal(c.$('input').value,'task');
-    await c.submit(false);const sent=calls.filter(c=>c.type==='send_message');assert.equal(sent.length,2);
-    assert.equal(sent[0].client_msg_id===sent[1].client_msg_id,!definite);
-    assert.equal(c.S.unsent,null);assert.equal(c.$('input').value,'');
+    c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
+    const sent=calls.filter(c=>c.type==='send_message');assert.equal(sent.length,1);
+    assert.equal(c.$('input').value,'');
+    assert.equal(c.S.outbox[0].status,definite?'failed':'queued');
+    assert.equal(c.S.outbox[0].mode,'send');
+    if (!definite) {
+      await c.flushOutbox();
+      assert.equal(calls.filter(c=>c.type==='send_message').length,2);
+      assert.equal(sent[0].client_msg_id,calls.filter(c=>c.type==='send_message')[1].client_msg_id);
+      assert.equal(c.S.outbox.length,0);
+    }
   }
 });
 

@@ -2699,7 +2699,7 @@ pub enum Request {
         content: String,
         mode: SendMode,
         expected_attachments: Vec<serde_json::Value>,
-        /// Required per-action key; same connection-local retention as SendMessage.
+        /// Required per-action key; reviewed sends remain connection-local.
         client_msg_id: String,
     },
     /// Steer one exact Run using the complete ordered inventory from its review.
