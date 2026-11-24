@@ -8,7 +8,7 @@
 Talk in Main Chat, organize work into Topic Chats, and let Formless drive the harnesses you already use.</p>
 
 <p>
-  <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/athiwatc/formless/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/athiwatc/formless/releases"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Releases"></a>
   <a href="#install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
   <a href="#security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
@@ -67,7 +67,7 @@ distinguishes installation from sign-in: an unknown sign-in status is not proof
 that a harness is signed in or authenticated.
 
 Current topic-step adapters are Claude Code and Codex via their official
-non-interactive CLIs, Pi via its attempt-private extension, OpenCode and
+non-interactive CLIs, Pi via its attempt-private RPC adapter, OpenCode and
 Antigravity through their ACP integrations, and Muse Code via its `muse serve`
 protocol. Grok Build and additional ACP profiles are still in progress.
 This list describes implemented integrations, not authenticated end-to-end validation.
@@ -148,7 +148,7 @@ More: [docs/capabilities.md](docs/capabilities.md) · [docs/troubleshooting.md](
 | [Architecture](docs/architecture.md) | Daemon, Tools, Sessions and Runs, self-optimisation, development |
 | [Keys and commands](docs/keys.md) | Generated keyboard reference |
 | [MCP](docs/mcp.md) · [Skills](docs/skills.md) · [Jobs](docs/jobs.md) | Extending Formless |
-| [Pi adapter](docs/pi-adapter.md) · [Antigravity](docs/antigravity.md) | Topic-step adapter details |
+| [Pi adapter](docs/pi-adapter.md) · [Antigravity](docs/antigravity.md) · [Muse Code](docs/muse-code.md) | Topic-step adapter details |
 | [Gallery](docs/gallery.md) | Example tasks |
 | [SPEC.md](SPEC.md) | The specification |
 
