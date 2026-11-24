@@ -201,6 +201,23 @@ fn mixed_accented_latin_unicode_terms_preserve_non_latin_marks() {
 
 #[test]
 fn schema_v79_tool_summary_and_v80_unicode_index_backfill_existing_data() {
+    #[derive(Debug, PartialEq)]
+    struct InvocationSnapshot {
+        id: String,
+        tool_id: String,
+        version: i64,
+        session_id: Option<String>,
+        run_id: Option<String>,
+        parent_id: Option<String>,
+        status: String,
+        tag: String,
+        input: String,
+        output: String,
+        error: String,
+        duration_ms: i64,
+        created_at: String,
+    }
+
     let paths = temp_paths("unicode-index-backfill");
     let session_id;
     let message_id;
@@ -284,6 +301,99 @@ fn schema_v79_tool_summary_and_v80_unicode_index_backfill_existing_data() {
         )
         .unwrap();
     assert_eq!(session_invocations, 1);
+
+    let read_invocation = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at
+                 FROM invocations WHERE tool_id=?1",
+                [&tool_id],
+                |row| {
+                    Ok(InvocationSnapshot {
+                        id: row.get(0)?,
+                        tool_id: row.get(1)?,
+                        version: row.get(2)?,
+                        session_id: row.get(3)?,
+                        run_id: row.get(4)?,
+                        parent_id: row.get(5)?,
+                        status: row.get(6)?,
+                        tag: row.get(7)?,
+                        input: row.get(8)?,
+                        output: row.get(9)?,
+                        error: row.get(10)?,
+                        duration_ms: row.get(11)?,
+                        created_at: row.get(12)?,
+                    })
+                },
+            )
+            .unwrap()
+    };
+    let read_summary = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT total,success,failure,validation_failures,denied,sessions,last_used_at
+                 FROM tool_invocation_summary WHERE tool_id=?1",
+                [&tool_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let read_session = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT session_id,invocation_count FROM tool_invocation_sessions
+                 WHERE tool_id=?1 AND session_id=?2",
+                rusqlite::params![tool_id, session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let read_invocation_count = |connection: &rusqlite::Connection| {
+        connection
+            .query_row(
+                "SELECT count(*) FROM invocations WHERE tool_id=?1",
+                [&tool_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let invocation_before = read_invocation(&connection);
+    let summary_before = read_summary(&connection);
+    let session_before = read_session(&connection);
+    let invocation_count_before = read_invocation_count(&connection);
+    assert_eq!(invocation_count_before, 1);
+
+    connection
+        .execute_batch("DROP TABLE messages_unicode_fts; PRAGMA user_version=79;")
+        .unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 79);
+    drop(connection);
+
+    let store = Store::open(&paths.db_file()).unwrap();
+    let hits = store.search_sessions("文件", 20).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, session_id);
+    assert_eq!(hits[0].message_id, message_id);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    assert_eq!(read_invocation_count(&connection), invocation_count_before);
+    assert_eq!(read_invocation(&connection), invocation_before);
+    assert_eq!(read_summary(&connection), summary_before);
+    assert_eq!(read_session(&connection), session_before);
 }
 
 #[test]
