@@ -9367,7 +9367,7 @@ mod context_watermark_tests {
             .build(&store, &session, "private prompt", 100_000, 0.8)
             .unwrap();
         assert_eq!(cache.included_user_message_ids(), &[message.id.clone()]);
-        assert_eq!(cache.included_steer_message_ids(), vec![message.id.clone()]);
+        assert!(cache.included_steer_message_ids().is_empty());
 
         let edited = store
             .edit_message(&session, &message.id, "replacement content")
