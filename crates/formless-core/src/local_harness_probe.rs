@@ -85,7 +85,16 @@ fn kind_name(kind: HarnessKind) -> &'static str {
         HarnessKind::Muse => "muse",
     }
 }
-fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Option<PathBuf> {
+fn executable_name(kind: HarnessKind) -> &'static str {
+    match kind {
+        HarnessKind::Antigravity => "agy",
+        _ => kind_name(kind),
+    }
+}
+pub(super) fn lookup(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
     let override_key = format!(
         "FORMLESS_TOPIC_{}_EXE",
         kind_name(kind).to_ascii_uppercase()
@@ -102,7 +111,7 @@ fn lookup(kind: HarnessKind, environment: &BTreeMap<OsString, OsString>) -> Opti
         if !directory.is_absolute() {
             continue;
         }
-        let candidate = directory.join(kind_name(kind));
+        let candidate = directory.join(executable_name(kind));
         if executable_file(&candidate) {
             return Some(candidate);
         }
@@ -294,7 +303,15 @@ async fn dispatch(
         HarnessKind::Codex => codex_probe(ctx).await,
         HarnessKind::Pi => super::pi::availability(Some(&ctx.executable)).await,
         HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
-        HarnessKind::Antigravity => fallback_probe(kind, ctx).await,
+        HarnessKind::Antigravity => {
+            blocking_probe(
+                kind,
+                Some(ctx.executable.clone()),
+                ctx.environment.clone(),
+                crate::local_harness::antigravity::availability,
+            )
+            .await
+        }
         HarnessKind::Acp => {
             let mut value = availability(kind, Some(&ctx.executable));
             value.acp_agent = agent.map(str::to_owned);
@@ -329,7 +346,7 @@ async fn probe_environment(
         } else {
             format!(
                 "CLI executable not found; install {} or configure FORMLESS_TOPIC_{}_EXE",
-                kind_name(kind),
+                executable_name(kind),
                 kind_name(kind).to_ascii_uppercase()
             )
         });

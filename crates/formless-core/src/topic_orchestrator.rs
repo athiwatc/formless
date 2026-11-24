@@ -469,7 +469,7 @@ impl Daemon {
             concat!(
                 "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
                 "Features, workspace and advisory outline:\n{}\n",
-                "Available harness kinds: claude, codex, pi, muse; opencode, antigravity and acp currently return adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
+                "Available harness kinds: claude, codex, antigravity, pi, muse; opencode and acp currently return adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
             ),
             serde_json::to_string_pretty(&topic)?
         );
@@ -666,10 +666,37 @@ impl Daemon {
             step.acp_agent = approval.substitute.acp_agent.clone();
             step.model = approval.substitute.model.clone();
         }
-        let availability =
-            local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await;
-        if !availability.installed || availability.signed_in == Some(false) {
-            bail!("{:?} is not ready: {}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness,availability.detail.as_deref().unwrap_or("not signed in"));
+        let (availability, resolved_antigravity_executable) = if step.harness
+            == HarnessKind::Antigravity
+        {
+            local_harness::antigravity::topic_readiness().await
+        } else {
+            (
+                local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await,
+                None,
+            )
+        };
+        let missing_antigravity_identity =
+            step.harness == HarnessKind::Antigravity && resolved_antigravity_executable.is_none();
+        if !availability.installed
+            || availability.signed_in == Some(false)
+            || missing_antigravity_identity
+        {
+            let detail =
+                availability
+                    .detail
+                    .as_deref()
+                    .unwrap_or(if missing_antigravity_identity {
+                        "Antigravity executable identity could not be resolved"
+                    } else {
+                        "not signed in"
+                    });
+            bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+        }
+        if step.harness == HarnessKind::Antigravity {
+            local_harness::antigravity::require_selected_executable(
+                resolved_antigravity_executable.as_deref(),
+            )?;
         }
         if step.inputs.iter().any(|input| {
             !topic
@@ -793,6 +820,7 @@ impl Daemon {
                 inputs,
                 step_cancel,
                 run_cancel,
+                resolved_antigravity_executable,
             ))
             .catch_unwind()
             .await;
@@ -829,6 +857,7 @@ impl Daemon {
         inputs: Vec<TopicArtifact>,
         step_cancel: CancellationToken,
         cancel: CancellationToken,
+        resolved_antigravity_executable: Option<PathBuf>,
     ) -> Result<()> {
         let feature = topic
             .features
@@ -848,6 +877,7 @@ impl Daemon {
                 &inputs,
                 handler.as_ref(),
                 &step_cancel,
+                resolved_antigravity_executable.as_deref(),
             );
             tokio::pin!(execution);
             let execution = tokio::select! {
@@ -954,6 +984,7 @@ impl Daemon {
         inputs: &[TopicArtifact],
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
+        resolved_antigravity_executable: Option<&Path>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
         let mut extra_worktrees = Vec::new();
@@ -1148,6 +1179,9 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::Antigravity => Some(local_harness::antigravity::topic_executable(
+                    resolved_antigravity_executable,
+                )?),
                 HarnessKind::Pi => executable("FORMLESS_TOPIC_PI_EXE")?,
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
@@ -1300,11 +1334,52 @@ impl Daemon {
                 bail!("OpenCode adapter not integrated yet; choose Claude or Codex")
             }
             HarnessKind::Antigravity => {
-                bail!("Antigravity adapter not integrated yet; choose Claude or Codex")
+                self.run_topic_acp(
+                    attempt,
+                    token,
+                    local_harness::antigravity::run,
+                    request,
+                    handler,
+                    cancel,
+                )
+                .await
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
             HarnessKind::Muse => local_harness::muse::run(request, handler, cancel).await,
         }
+    }
+
+    async fn run_topic_acp(
+        self: &Arc<Self>,
+        attempt: &TopicAttemptInfo,
+        token: &str,
+        adapter: local_harness::acp::Adapter,
+        request: &HarnessRequest,
+        handler: &dyn InteractionHandler,
+        cancel: &CancellationToken,
+    ) -> Result<HarnessResult> {
+        {
+            let _launch = self.topic_launch.locked();
+            self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
+            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
+                bail!("step cancelled before launch");
+            }
+        }
+        let run_cancel = cancel.child_token();
+        let stop = run_cancel.clone();
+        let shutdown = self.shutdown.clone();
+        let watcher = tokio::spawn(async move {
+            shutdown.cancelled().await;
+            stop.cancel();
+        });
+        let result =
+            local_harness::acp::run_interactive(adapter, request.clone(), handler, &run_cancel)
+                .await;
+        watcher.abort();
+        if self.shutdown.is_cancelled() {
+            bail!("daemon is shutting down");
+        }
+        result
     }
 
     async fn run_topic_cli(

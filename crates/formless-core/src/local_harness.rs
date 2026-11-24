@@ -1,5 +1,8 @@
 //! Safe, testable command construction for supported local coding CLIs.
 
+pub mod acp;
+pub mod antigravity;
+
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +56,7 @@ pub trait InteractionHandler: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct HarnessRequest {
     pub kind: HarnessKind,
     pub acp_agent: Option<String>,
@@ -175,6 +179,10 @@ fn validate_request(request: &HarnessRequest) -> Result<()> {
 }
 
 pub fn command_spec(request: &HarnessRequest) -> Result<CommandSpec> {
+    if request.kind == HarnessKind::Antigravity {
+        validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+        return antigravity::command_spec(request);
+    }
     validate_request(request)?;
     if request.kind == HarnessKind::Pi {
         return pi::command_spec(request);
@@ -302,6 +310,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
     match kind {
         HarnessKind::Claude => parse_claude(stdout),
         HarnessKind::Codex => parse_codex(stdout),
+        HarnessKind::Antigravity => antigravity::parse_output(stdout),
         HarnessKind::Pi => pi::parse_output(stdout),
         HarnessKind::Muse => bail!("Muse Code requires the interactive harness runner"),
         _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
@@ -571,7 +580,6 @@ mod access_tests {
             HarnessKind::Codex,
             HarnessKind::Pi,
             HarnessKind::OpenCode,
-            HarnessKind::Antigravity,
             HarnessKind::Acp,
             HarnessKind::Muse,
         ] {
@@ -621,5 +629,22 @@ mod access_tests {
                     .contains(expected));
             }
         }
+        let antigravity = HarnessRequest {
+            kind: HarnessKind::Antigravity,
+            acp_agent: None,
+            model: None,
+            cwd: std::env::current_dir().unwrap(),
+            prompt: "prompt".into(),
+            access: StepAccess::ReadOnly,
+            mcp_command: PathBuf::from("formless"),
+            mcp_args: vec![],
+            mcp_env_vars: vec![],
+            executable: None,
+            environment: BTreeMap::new(),
+        };
+        assert!(command_spec(&antigravity)
+            .unwrap_err()
+            .to_string()
+            .contains("local_harness::antigravity::run"));
     }
 }

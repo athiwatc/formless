@@ -67,9 +67,14 @@ distinguishes installation from sign-in: an unknown sign-in status is not proof
 that a harness is signed in or authenticated.
 
 Current topic-step adapters are Claude Code and Codex via their official
-non-interactive CLIs, and Muse Code via its `muse serve` protocol. Pi, OpenCode,
-Antigravity, Grok Build, and additional ACP profiles are still in progress.
+non-interactive CLIs, Pi via its attempt-private extension, Antigravity through
+its ACP integration, and Muse Code via its `muse serve` protocol. OpenCode,
+Grok Build, and additional ACP profiles are still in progress.
 This list describes implemented integrations, not authenticated end-to-end validation.
+
+For topic runs with `agy` not on PATH, set `FORMLESS_TOPIC_ANTIGRAVITY_EXE`
+to its absolute path. `FORMLESS_AGY_BIN` applies only to the opt-in
+`FORMLESS_LIVE_AGY` live check in [the adapter guide](docs/antigravity.md).
 
 Any integrated harness can take any step, including the same harness on
 both sides of a hand-off. A harness's own permission modes are not an OS
@@ -119,7 +124,7 @@ scheduled Jobs plug into the same registry.
                                                          ├─ Main Chat · Topics · Runs (SQLite)
                                                          ├─ Tool registry ─▶ QuickJS sandbox
                                                          ├─ Providers: Chat Completions · Responses · Anthropic
-                                                         └─ Harness steps ─▶ Claude Code · Codex · Muse Code
+                                                         └─ Harness steps ─▶ Claude Code · Codex · Pi · Antigravity · Muse Code
 ```
 
 Architecture, the Tool system and self-optimisation: [docs/architecture.md](docs/architecture.md).
@@ -143,6 +148,7 @@ More: [docs/capabilities.md](docs/capabilities.md) · [docs/troubleshooting.md](
 | [Architecture](docs/architecture.md) | Daemon, Tools, Sessions and Runs, self-optimisation, development |
 | [Keys and commands](docs/keys.md) | Generated keyboard reference |
 | [MCP](docs/mcp.md) · [Skills](docs/skills.md) · [Jobs](docs/jobs.md) | Extending Formless |
+| [Pi adapter](docs/pi-adapter.md) · [Antigravity](docs/antigravity.md) | Topic-step adapter details |
 | [Gallery](docs/gallery.md) | Example tasks |
 | [SPEC.md](SPEC.md) | The specification |
 

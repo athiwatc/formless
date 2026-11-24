@@ -101,6 +101,74 @@ impl Drop for SupervisedChild {
     }
 }
 
+/// A blocking child whose whole process group belongs to the caller.
+/// Dropping it terminates the group, then collects the direct child.
+pub struct SupervisedProcess {
+    child: Child,
+    group: Option<Group>,
+}
+
+impl SupervisedProcess {
+    pub fn spawn(mut command: Command) -> Result<Self, String> {
+        prepare(&mut command)?;
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        match attach(&child) {
+            Ok(group) => Ok(Self {
+                child,
+                group: Some(group),
+            }),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn take_pipes(
+        &mut self,
+    ) -> (
+        Option<std::process::ChildStdin>,
+        Option<std::process::ChildStdout>,
+        Option<std::process::ChildStderr>,
+    ) {
+        (
+            self.child.stdin.take(),
+            self.child.stdout.take(),
+            self.child.stderr.take(),
+        )
+    }
+
+    /// Polls the leader without reaping it, so the group stays killable.
+    pub fn has_exited(&mut self) -> std::io::Result<bool> {
+        platform::has_exited(&mut self.child)
+    }
+
+    /// Kills any remaining descendants, then reaps the leader.
+    pub fn finish(mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(group) = self.group.take() {
+            group.kill();
+        }
+        self.child.wait()
+    }
+}
+
+impl Drop for SupervisedProcess {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.take() {
+            #[cfg(unix)]
+            let live = platform::leader_exited(group.0).is_ok();
+            #[cfg(not(unix))]
+            let live = true;
+            if live {
+                group.kill();
+                let _ = self.child.kill();
+            }
+        }
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use super::*;
@@ -258,6 +326,42 @@ mod platform {
             unsafe {
                 TerminateJobObject(self.0.as_raw_handle(), 1);
             }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn dropping_a_supervised_process_kills_its_descendants() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        let mut process = SupervisedProcess::spawn(command).unwrap();
+        let mut line = String::new();
+        BufReader::new(process.take_pipes().1.unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: libc::pid_t = line.trim().parse().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(descendant, 0) },
+            0,
+            "descendant not started"
+        );
+        drop(process);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let alive = |pid: libc::pid_t| {
+            (unsafe { libc::kill(pid, 0) }) == 0
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map_or(true, |stat| !stat.contains(") Z "))
+        };
+        while alive(descendant) {
+            assert!(std::time::Instant::now() < deadline, "descendant survived");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 }

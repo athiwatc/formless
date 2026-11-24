@@ -60,6 +60,20 @@ for line in sys.stdin:
     (root, ctx)
 }
 
+#[test]
+fn antigravity_resolves_agy_from_path_without_override() {
+    let root = ProbeDirectory::new().unwrap();
+    let executable = root.0.join("agy");
+    std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let environment = BTreeMap::from([("PATH".into(), root.0.clone().into_os_string())]);
+
+    assert_eq!(
+        lookup(HarnessKind::Antigravity, &environment),
+        Some(executable)
+    );
+}
+
 #[tokio::test]
 async fn official_probes_report_version_and_explicit_auth_status() {
     let (_root, mut ctx) = fixture();
@@ -101,7 +115,10 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
     assert_eq!(values.len(), 6);
     assert!(!values.iter().any(|value| value.kind == HarnessKind::Acp));
-    assert!(values.iter().all(|value| value.installed));
+    assert!(values
+        .iter()
+        .filter(|value| value.kind != HarnessKind::Antigravity)
+        .all(|value| value.installed));
     assert!(values[..2]
         .iter()
         .all(|value| value.version.as_deref() == Some("fixture 1.0")
@@ -118,7 +135,17 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     assert_eq!(values[4].kind, HarnessKind::Antigravity);
     assert!(values[3..5]
         .iter()
+        .filter(|value| value.kind != HarnessKind::Antigravity)
         .all(|value| value.signed_in.is_none() && value.version.as_deref() == Some("fixture 1.0")));
+    let antigravity = &values[4];
+    assert_eq!(antigravity.kind, HarnessKind::Antigravity);
+    assert!(!antigravity.installed);
+    assert_eq!(antigravity.version, None);
+    assert_eq!(antigravity.signed_in, None);
+    assert!(antigravity
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("does not speak ACP v1")));
     assert_eq!(values[5].kind, HarnessKind::Muse);
     assert_eq!(values[5].version.as_deref(), Some("1.4.24"));
     assert_eq!(values[5].signed_in, Some(true));

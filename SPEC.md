@@ -7091,9 +7091,9 @@ Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
 another harness. Muse Code uses its interactive session protocol and requires
-one-run workspace trust from the user. Pi uses its integrated RPC adapter.
-OpenCode, Antigravity and ACP currently return actionable adapter-not-integrated
-step results.
+one-run workspace trust from the user. Pi uses its integrated RPC adapter, and
+Antigravity uses its ACP adapter. OpenCode and generic ACP currently return
+actionable adapter-not-integrated step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7103,8 +7103,9 @@ topics become NeedsUser, with durable detail and no automatic restart.
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
 CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
-`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
-`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, `FORMLESS_TOPIC_PI_EXE`,
+`FORMLESS_TOPIC_MUSE_EXE`, and `FORMLESS_TOPIC_MCP_EXE` must be absolute
+paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
 must never be included in prompts, argv or transcripts. The bridge exposes
@@ -7285,14 +7286,18 @@ or copy raw auth output into detail or logs.
 
 Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
 or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
-its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
-`FORMLESS_TOPIC_MUSE_EXE`. Pi has adapter-specific availability and an
-attempt-private RPC runner. OpenCode and Antigravity have availability-only
-fallback probes that run --version in a private cwd under the probe deadline,
-with kill-on-drop and process-group cleanup; their auth remains unknown,
-including version failures. ACP reports lookup-only availability and preserves
-its configured agent. Adapter owners can replace these fallbacks with async
-probes or the bounded spawn_blocking probe hook. The reusable ACP
+its version probe and the `FORMLESS_TOPIC_PI_EXE`,
+`FORMLESS_TOPIC_MUSE_EXE`, and `FORMLESS_TOPIC_ANTIGRAVITY_EXE` overrides.
+Pi has adapter-specific availability and an attempt-private RPC runner. OpenCode has
+an availability-only fallback probe that runs --version in a private cwd under
+the probe deadline, with kill-on-drop and process-group cleanup; its auth
+remains unknown, including version failures. Antigravity uses a bounded
+adapter-specific probe: ACP initialization checks installation/version and
+`agy models` checks existing sign-in. Topic steps carry the selected executable
+identity from readiness through launch and fail closed if it is unavailable.
+Generic ACP reports lookup-only availability and preserves its configured
+agent. Adapter owners can replace fallbacks with async probes or the bounded
+spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.
