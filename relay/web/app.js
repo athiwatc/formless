@@ -7556,10 +7556,13 @@
   });
 
   function browserNotificationControl() {
-    if (!("Notification" in window)) return h("span", { class: "muted" }, "not supported in this browser");
-    if (Notification.permission === "granted") return h("span", { class: "muted" }, "allowed by this browser");
-    if (Notification.permission === "denied") return h("span", { class: "muted" }, "blocked; change this site's browser permissions");
-    return h("button", { class: "btn small", type: "button", onclick: async () => {
+    const controlKey = "browser-notifications";
+    const status = (message) => h("span", { class: "muted", "data-setting-control": controlKey, tabindex: -1 }, message);
+    if (!("Notification" in window)) return status("not supported in this browser");
+    if (Notification.permission === "granted") return status("allowed by this browser");
+    if (Notification.permission === "denied") return status("blocked; change this site's browser permissions");
+    return h("button", { class: "btn small", type: "button", "data-setting-control": controlKey, onclick: async (event) => {
+      event.currentTarget.focus({ preventScroll: true });
       try { await Notification.requestPermission(); }
       catch (_) { note("Couldn't request browser notification permission.", true); }
       renderView();

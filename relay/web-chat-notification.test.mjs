@@ -29,14 +29,23 @@ test("browser notification permission is requested only from its explicit settin
   runInNewContext(appFunction("browserNotificationControl"), c);
   const control = c.browserNotificationControl();
   assert.equal(control.children[0], "Allow browser notifications");
+  assert.equal(control.attrs["data-setting-control"], "browser-notifications");
   assert.equal(requests, 0);
-  await control.attrs.onclick();
+  const focusCalls = [];
+  await control.attrs.onclick({ currentTarget: { focus: options => focusCalls.push(options) } });
+  assert.deepEqual(focusCalls, [{ preventScroll: true }]);
   assert.equal(requests, 1);
   assert.equal(renders, 1);
-  assert.equal(c.browserNotificationControl().children[0], "allowed by this browser");
+  const allowed = c.browserNotificationControl();
+  assert.equal(allowed.children[0], "allowed by this browser");
+  assert.equal(allowed.attrs["data-setting-control"], "browser-notifications");
+  assert.equal(allowed.attrs.tabindex, -1);
 
   Notification.permission = "denied";
-  assert.equal(c.browserNotificationControl().children[0], "blocked; change this site's browser permissions");
+  const denied = c.browserNotificationControl();
+  assert.equal(denied.children[0], "blocked; change this site's browser permissions");
+  assert.equal(denied.attrs["data-setting-control"], "browser-notifications");
+  assert.equal(denied.attrs.tabindex, -1);
   assert.equal(requests, 1);
 });
 
