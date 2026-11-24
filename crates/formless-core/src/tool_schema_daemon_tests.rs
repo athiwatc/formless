@@ -296,13 +296,140 @@ fn invalid_legacy_schema_does_not_consume_provider_filler_slots() {
             "filler",
         )
         .unwrap();
-    let refilled = toolreg::tool_definitions(&store, Some(&pre_frozen_session.id), 1).unwrap();
+    let membership_before = store.session_tool_ids(&pre_frozen_session.id).unwrap();
+    let omitted = toolreg::tool_definitions(&store, Some(&pre_frozen_session.id), 1).unwrap();
+    let membership_after_first = store.session_tool_ids(&pre_frozen_session.id).unwrap();
+    let repeated = toolreg::tool_definitions(&store, Some(&pre_frozen_session.id), 1).unwrap();
+    let membership_after_second = store.session_tool_ids(&pre_frozen_session.id).unwrap();
     assert!(
-        refilled.iter().any(|definition| {
-            definition["function"]["name"].as_str() == Some("z_legacy_object_input")
+        omitted.iter().all(|definition| {
+            definition["function"]["name"].as_str() != Some("a_legacy_string_input")
+                && definition["function"]["name"].as_str() != Some("z_legacy_object_input")
         }),
-        "existing frozen filler was not replaced after invalid Tool omission: {refilled:?}"
+        "frozen membership was backfilled after omission: {omitted:?}"
     );
+    assert!(repeated.iter().all(|definition| {
+        definition["function"]["name"].as_str() != Some("z_legacy_object_input")
+    }));
+    assert_eq!(membership_after_first, membership_before);
+    assert_eq!(membership_after_second, membership_before);
+}
+
+#[test]
+fn valid_frozen_snapshot_survives_incompatible_current_version() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let (tool, _) = store
+        .create_tool_version(
+            "a_snapshot_object_input",
+            "snapshot fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+        )
+        .unwrap();
+    let first = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    assert!(first
+        .iter()
+        .any(|definition| { definition["function"]["name"].as_str() == Some(&tool.name) }));
+
+    store
+        .create_tool_version_with_schema_policy(
+            &tool.name,
+            "snapshot fixture",
+            r#"{"type":"string"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+            crate::tool_compatibility::SchemaWritePolicy::Agent {
+                allow_breaking: true,
+            },
+        )
+        .unwrap();
+
+    let after_change = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    let pinned = after_change
+        .iter()
+        .find(|definition| definition["function"]["name"].as_str() == Some(&tool.name));
+    assert!(
+        pinned.is_some(),
+        "valid pinned snapshot was dropped: {after_change:?}"
+    );
+    assert_eq!(pinned.unwrap()["function"]["parameters"]["type"], "object");
+}
+
+#[test]
+fn repaired_current_schema_does_not_replace_invalid_frozen_snapshot() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let (tool, version) = store
+        .create_tool_version(
+            "a_frozen_invalid_snapshot",
+            "snapshot fixture",
+            r#"{"type":"string"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+        )
+        .unwrap();
+    store
+        .create_tool_version(
+            "z_frozen_valid_candidate",
+            "snapshot fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+        )
+        .unwrap();
+    store
+        .load_session_tools(&session.id, std::slice::from_ref(&tool.id), "filler")
+        .unwrap();
+    let invalid_definition = json!({
+        "type": "function",
+        "function": {"name": tool.name, "description": "snapshot fixture", "parameters": {"type": "string"}}
+    });
+    store
+        .pin_definition(
+            &session.id,
+            &tool.id,
+            version,
+            &invalid_definition.to_string(),
+        )
+        .unwrap();
+    store
+        .create_tool_version_with_schema_policy(
+            "a_frozen_invalid_snapshot",
+            "snapshot fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+            crate::tool_compatibility::SchemaWritePolicy::Agent {
+                allow_breaking: true,
+            },
+        )
+        .unwrap();
+
+    let membership = store.session_tool_ids(&session.id).unwrap();
+    let first = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    let second = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    assert!(first.iter().chain(&second).all(|definition| {
+        definition["function"]["name"].as_str() != Some("a_frozen_invalid_snapshot")
+            && definition["function"]["name"].as_str() != Some("z_frozen_valid_candidate")
+    }));
+    assert_eq!(store.session_tool_ids(&session.id).unwrap(), membership);
 }
 
 #[test]

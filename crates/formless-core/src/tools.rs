@@ -1430,18 +1430,48 @@ fn definitions(
     inline_limit: usize,
     persist: bool,
 ) -> Result<Vec<Value>> {
-    let mut invalid_tool_ids = std::collections::HashSet::new();
+    let all_tools = agent_tools(store)?;
+    let loaded_tool_ids = match session_id {
+        Some(session) => store.session_tool_ids(session)?,
+        None => Default::default(),
+    };
+    let mut cached_pins = session_id.and_then(|session| {
+        let ids: Vec<&str> = all_tools
+            .iter()
+            .filter(|tool| loaded_tool_ids.contains(&tool.id))
+            .map(|tool| tool.id.as_str())
+            .collect();
+        store.pinned_definitions_for(session, &ids).ok()
+    });
     let mut tools = Vec::new();
-    for info in agent_tools(store)? {
-        let Some((_, version)) = store.get_tool_current(&info.id)? else {
-            continue;
-        };
-        if let Err(error) = validate_stored_input_schema(&version.input_schema) {
-            warn_omitted_tool_schema(&info.id, &info.name, &error);
-            invalid_tool_ids.insert(info.id);
+    for info in all_tools {
+        let pinned = if loaded_tool_ids.contains(&info.id) {
+            match cached_pins.as_mut().and_then(|pins| pins.remove(&info.id)) {
+                Some(pinned) => Some(pinned),
+                None => match session_id {
+                    Some(session) => store.pinned_definition(session, &info.id)?,
+                    None => None,
+                },
+            }
         } else {
-            tools.push(info);
+            None
+        };
+        let pinned_check = pinned
+            .as_ref()
+            .and_then(|(_, definition)| serde_json::from_str::<Value>(definition).ok())
+            .map(|definition| validate_definition_input_schema(&definition));
+        let validation = match pinned_check {
+            Some(validation) => validation,
+            None => match store.get_tool_current(&info.id)? {
+                Some((_, version)) => validate_stored_input_schema(&version.input_schema),
+                None => continue,
+            },
+        };
+        if let Err(error) = validation {
+            warn_omitted_tool_schema(&info.id, &info.name, &error);
+            continue;
         }
+        tools.push(info);
     }
     // Every Session's listing is frozen at its first step (in small and
     // large registries alike): Tool definitions are part of the cached
@@ -1449,29 +1479,10 @@ fn definitions(
     // change this one's. A Session's own creations and `find_tools` results
     // are added to it; everything else is reached through `find_tools`.
     let shown: Vec<ToolInfo> = {
-        let mut loaded: std::collections::HashSet<String> = match session_id {
-            Some(s) => store.session_tool_ids(s)?,
-            None => Default::default(),
-        };
-        if let Some(s) = session_id {
-            for info in tools.iter().filter(|tool| loaded.contains(&tool.id)) {
-                if let Some((_, definition)) = store.pinned_definition(s, &info.id)? {
-                    if let Ok(definition) = serde_json::from_str::<Value>(&definition) {
-                        if let Err(error) = validate_definition_input_schema(&definition) {
-                            warn_omitted_tool_schema(&info.id, &info.name, &error);
-                            invalid_tool_ids.insert(info.id.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let invalid_loaded_count = loaded
-            .iter()
-            .filter(|id| invalid_tool_ids.contains(*id))
-            .count();
+        let mut loaded = loaded_tool_ids.clone();
         let active_ids: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.id.as_str()).collect();
-        loaded.retain(|id| active_ids.contains(id.as_str()) && !invalid_tool_ids.contains(id));
+        loaded.retain(|id| active_ids.contains(id.as_str()));
         let frozen = match session_id {
             Some(s) => store.session_has_filler(s)?,
             None => false,
@@ -1495,25 +1506,6 @@ fn definitions(
                 .into_iter()
                 .take(inline_limit.saturating_sub(loaded.len()))
                 .map(|t| t.id.clone())
-                .collect();
-            if let Some(s) = session_id.filter(|_| persist) {
-                store.load_session_tools(s, &filler, "filler")?;
-            }
-            loaded.extend(filler);
-        } else if invalid_loaded_count > 0 {
-            let mut rest: Vec<&ToolInfo> = tools
-                .iter()
-                .filter(|tool| !tool.pinned && !loaded.contains(&tool.id))
-                .collect();
-            rest.sort_by_key(|tool| std::cmp::Reverse(tool.invocations));
-            let filler: Vec<String> = rest
-                .into_iter()
-                .take(
-                    inline_limit
-                        .saturating_sub(loaded.len())
-                        .min(invalid_loaded_count),
-                )
-                .map(|tool| tool.id.clone())
                 .collect();
             if let Some(s) = session_id.filter(|_| persist) {
                 store.load_session_tools(s, &filler, "filler")?;
