@@ -173,8 +173,8 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
                 if let Some(served) = served {
                     out.push_str(&format!(
                         "> via {} ({})\n",
-                        escape(&served.name),
-                        escape(&served.via)
+                        escape_markdown_inline(&served.name),
+                        escape_markdown_inline(&served.via)
                     ));
                 }
             }
@@ -210,6 +210,21 @@ fn escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn escape_markdown_inline(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        if character.is_control() {
+            escaped.push(' ');
+        } else {
+            if character.is_ascii_punctuation() {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 /// Markdown to HTML with any raw HTML in it shown as text, so a message
@@ -419,6 +434,30 @@ mod tests {
             md.contains("Result:\n\n````\na.rs: 3\n```b```\n````"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn markdown_model_labels_cannot_inject_links_images_or_blocks() {
+        let name = "![pixel](https://evil.example/pixel.png)\n\n[click](https://evil.example)";
+        let message = MessageInfo {
+            id: "assistant".into(),
+            session_id: "session".into(),
+            seq: 1,
+            role: "assistant".into(),
+            generated_by: None,
+            content: "answer".into(),
+            created_at: String::new(),
+            meta: Some(
+                serde_json::json!({"model":{"name":name,"via":"fallback","requested":"requested"}})
+                    .to_string(),
+            ),
+        };
+        let rendered = markdown("fixture", &[message]);
+        assert!(!rendered.contains("![pixel]"), "{rendered}");
+        assert!(!rendered.contains("[click]("), "{rendered}");
+        let html = md_html(&rendered);
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("<a href"), "{html}");
     }
 
     #[test]
