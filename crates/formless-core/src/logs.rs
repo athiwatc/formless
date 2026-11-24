@@ -204,6 +204,10 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
         return Ok(false);
     }
     if keep == 0 {
+        if std::fs::symlink_metadata(&log)?.file_type().is_symlink() {
+            std::fs::remove_file(&log)?;
+            return Ok(true);
+        }
         std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)

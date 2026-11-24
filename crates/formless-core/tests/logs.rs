@@ -41,6 +41,25 @@ fn logs_rotate_past_the_size_cap_and_keep_a_bounded_history() {
     assert_eq!(std::fs::read(&log).unwrap(), b"after truncation");
 }
 
+#[cfg(unix)]
+#[test]
+fn zero_retention_unlinks_live_symlink_without_truncating_target() {
+    let f = Fixture::new();
+    let target = f.root.join("external.log");
+    let contents = "y".repeat(300);
+    std::fs::write(&target, &contents).unwrap();
+    std::os::unix::fs::symlink(&target, f.paths.log_file()).unwrap();
+
+    assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert_eq!(
+        std::fs::symlink_metadata(f.paths.log_file())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(std::fs::read_to_string(target).unwrap(), contents);
+}
+
 struct Fixture {
     paths: Paths,
     root: std::path::PathBuf,
