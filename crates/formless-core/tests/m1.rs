@@ -200,10 +200,11 @@ fn mixed_accented_latin_unicode_terms_preserve_non_latin_marks() {
 }
 
 #[test]
-fn unicode_search_index_backfills_existing_messages() {
+fn schema_v79_tool_summary_and_v80_unicode_index_backfill_existing_data() {
     let paths = temp_paths("unicode-index-backfill");
     let session_id;
     let message_id;
+    let tool_id;
     {
         let store = Store::open(&paths.db_file()).unwrap();
         let session = store.create_session(None).unwrap();
@@ -212,10 +213,51 @@ fn unicode_search_index_backfills_existing_messages() {
             .append_message(&session_id, "user", "historical 文件")
             .unwrap();
         message_id = message.id;
+        let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+        let (tool, version) = store
+            .create_tool_version(
+                "migration_tool_summary_fixture",
+                "migration tool summary fixture",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &caps,
+                64,
+                "migration fixture",
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session_id),
+                None,
+                None,
+                "success",
+                "",
+                "{}",
+                "",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+        tool_id = tool.id;
     }
     let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
     connection
-        .execute_batch("DROP TABLE messages_unicode_fts; PRAGMA user_version=78;")
+        .execute_batch(
+            "DROP TABLE messages_unicode_fts;
+             DROP TRIGGER tool_invocation_summary_insert;
+             DROP TRIGGER tool_invocation_summary_update;
+             DROP TRIGGER tool_invocation_summary_delete;
+             DROP TRIGGER tool_invocation_sessions_insert;
+             DROP TRIGGER tool_invocation_sessions_delete;
+             DROP TABLE tool_invocation_sessions;
+             DROP TABLE tool_invocation_summary;
+             DROP INDEX idx_inv_tool_created;
+             PRAGMA user_version=78;",
+        )
         .unwrap();
     drop(connection);
 
@@ -224,6 +266,24 @@ fn unicode_search_index_backfills_existing_messages() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].session_id, session_id);
     assert_eq!(hits[0].message_id, message_id);
+    drop(store);
+    let connection = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let summary: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT total,success,failure,sessions FROM tool_invocation_summary WHERE tool_id=?1",
+            [&tool_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(summary, (1, 1, 0, 1));
+    let session_invocations: i64 = connection
+        .query_row(
+            "SELECT invocation_count FROM tool_invocation_sessions WHERE tool_id=?1 AND session_id=?2",
+            rusqlite::params![tool_id, session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_invocations, 1);
 }
 
 #[test]

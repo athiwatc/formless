@@ -803,7 +803,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 79;
+pub const SCHEMA_VERSION: i64 = 80;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -946,7 +946,132 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
-fn migrate_v79(conn: &Connection) -> Result<()> {
+const SCHEMA_V79: &str = r#"
+CREATE TABLE IF NOT EXISTS tool_invocation_summary (
+  tool_id TEXT PRIMARY KEY REFERENCES tools(id) ON DELETE CASCADE,
+  total INTEGER NOT NULL DEFAULT 0,
+  success INTEGER NOT NULL DEFAULT 0,
+  failure INTEGER NOT NULL DEFAULT 0,
+  validation_failures INTEGER NOT NULL DEFAULT 0,
+  denied INTEGER NOT NULL DEFAULT 0,
+  sessions INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS tool_invocation_sessions (
+  tool_id TEXT NOT NULL REFERENCES tools(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL,
+  invocation_count INTEGER NOT NULL,
+  PRIMARY KEY(tool_id, session_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_inv_tool_created ON invocations(tool_id, created_at);
+
+DROP TRIGGER IF EXISTS tool_invocation_summary_insert;
+DROP TRIGGER IF EXISTS tool_invocation_summary_update;
+DROP TRIGGER IF EXISTS tool_invocation_summary_delete;
+DROP TRIGGER IF EXISTS tool_invocation_sessions_insert;
+DROP TRIGGER IF EXISTS tool_invocation_sessions_delete;
+DELETE FROM tool_invocation_sessions;
+DELETE FROM tool_invocation_summary;
+
+INSERT INTO tool_invocation_summary
+    (tool_id, total, success, failure, validation_failures, denied, sessions, last_used_at)
+SELECT tool_id, COUNT(*), COALESCE(SUM(status='success'), 0),
+       COALESCE(SUM(status='failure'), 0), COALESCE(SUM(tag='validation'), 0),
+       COALESCE(SUM(status='denied'), 0), COUNT(DISTINCT session_id), MAX(created_at)
+FROM invocations GROUP BY tool_id;
+INSERT INTO tool_invocation_sessions(tool_id, session_id, invocation_count)
+SELECT tool_id, session_id, COUNT(*) FROM invocations
+WHERE session_id IS NOT NULL GROUP BY tool_id, session_id;
+
+CREATE TRIGGER tool_invocation_sessions_insert AFTER INSERT ON tool_invocation_sessions
+BEGIN
+  UPDATE tool_invocation_summary SET sessions=sessions+1 WHERE tool_id=NEW.tool_id;
+END;
+CREATE TRIGGER tool_invocation_sessions_delete AFTER DELETE ON tool_invocation_sessions
+BEGIN
+  UPDATE tool_invocation_summary SET sessions=sessions-1 WHERE tool_id=OLD.tool_id;
+END;
+
+CREATE TRIGGER tool_invocation_summary_insert AFTER INSERT ON invocations
+BEGIN
+  INSERT INTO tool_invocation_summary
+      (tool_id, total, success, failure, validation_failures, denied, sessions, last_used_at)
+  VALUES (NEW.tool_id, 1, NEW.status='success', NEW.status='failure',
+          NEW.tag='validation', NEW.status='denied', 0, NEW.created_at)
+  ON CONFLICT(tool_id) DO UPDATE SET
+      total=total+1,
+      success=success+excluded.success,
+      failure=failure+excluded.failure,
+      validation_failures=validation_failures+excluded.validation_failures,
+      denied=denied+excluded.denied,
+      last_used_at=CASE WHEN last_used_at IS NULL OR last_used_at<excluded.last_used_at
+                        THEN excluded.last_used_at ELSE last_used_at END;
+  INSERT INTO tool_invocation_sessions(tool_id, session_id, invocation_count)
+  SELECT NEW.tool_id, NEW.session_id, 1 WHERE NEW.session_id IS NOT NULL
+  ON CONFLICT(tool_id, session_id) DO UPDATE SET invocation_count=invocation_count+1;
+END;
+
+CREATE TRIGGER tool_invocation_summary_update
+AFTER UPDATE OF tool_id, session_id, status, tag, created_at ON invocations
+WHEN OLD.tool_id IS NOT NEW.tool_id OR OLD.session_id IS NOT NEW.session_id
+  OR OLD.status IS NOT NEW.status OR OLD.tag IS NOT NEW.tag
+  OR OLD.created_at IS NOT NEW.created_at
+BEGIN
+  UPDATE tool_invocation_summary
+  SET total=total-1,
+      success=success-(OLD.status='success'),
+      failure=failure-(OLD.status='failure'),
+      validation_failures=validation_failures-(OLD.tag='validation'),
+      denied=denied-(OLD.status='denied'),
+      last_used_at=CASE WHEN last_used_at=OLD.created_at
+                        THEN (SELECT MAX(created_at) FROM invocations WHERE tool_id=OLD.tool_id)
+                        ELSE last_used_at END
+  WHERE tool_id=OLD.tool_id;
+  INSERT INTO tool_invocation_summary
+      (tool_id, total, success, failure, validation_failures, denied, sessions, last_used_at)
+  VALUES (NEW.tool_id, 1, NEW.status='success', NEW.status='failure',
+          NEW.tag='validation', NEW.status='denied', 0, NEW.created_at)
+  ON CONFLICT(tool_id) DO UPDATE SET
+      total=total+1,
+      success=success+excluded.success,
+      failure=failure+excluded.failure,
+      validation_failures=validation_failures+excluded.validation_failures,
+      denied=denied+excluded.denied,
+      last_used_at=CASE WHEN last_used_at IS NULL OR last_used_at<excluded.last_used_at
+                        THEN excluded.last_used_at ELSE last_used_at END;
+  UPDATE tool_invocation_sessions
+  SET invocation_count=invocation_count-1
+  WHERE (OLD.tool_id IS NOT NEW.tool_id OR OLD.session_id IS NOT NEW.session_id)
+    AND tool_id=OLD.tool_id AND session_id=OLD.session_id;
+  DELETE FROM tool_invocation_sessions
+  WHERE tool_id=OLD.tool_id AND session_id=OLD.session_id AND invocation_count<=0;
+  INSERT INTO tool_invocation_sessions(tool_id, session_id, invocation_count)
+  SELECT NEW.tool_id, NEW.session_id, 1
+  WHERE NEW.session_id IS NOT NULL
+    AND (OLD.tool_id IS NOT NEW.tool_id OR OLD.session_id IS NOT NEW.session_id)
+  ON CONFLICT(tool_id, session_id) DO UPDATE SET invocation_count=invocation_count+1;
+END;
+
+CREATE TRIGGER tool_invocation_summary_delete AFTER DELETE ON invocations
+BEGIN
+  UPDATE tool_invocation_summary
+  SET total=total-1,
+      success=success-(OLD.status='success'),
+      failure=failure-(OLD.status='failure'),
+      validation_failures=validation_failures-(OLD.tag='validation'),
+      denied=denied-(OLD.status='denied'),
+      last_used_at=CASE WHEN last_used_at=OLD.created_at
+                        THEN (SELECT MAX(created_at) FROM invocations WHERE tool_id=OLD.tool_id)
+                        ELSE last_used_at END
+  WHERE tool_id=OLD.tool_id;
+  UPDATE tool_invocation_sessions SET invocation_count=invocation_count-1
+  WHERE tool_id=OLD.tool_id AND session_id=OLD.session_id;
+  DELETE FROM tool_invocation_sessions
+  WHERE tool_id=OLD.tool_id AND session_id=OLD.session_id AND invocation_count<=0;
+END;
+"#;
+
+fn migrate_v80(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE VIRTUAL TABLE messages_unicode_fts USING fts5(
            grams, content='', tokenize='unicode61 remove_diacritics 0'
@@ -969,7 +1094,7 @@ fn migrate_v79(conn: &Connection) -> Result<()> {
 }
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 77] = [
+const MIGRATIONS: [(i64, MigrationStep); 78] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1334,7 +1459,8 @@ const MIGRATIONS: [(i64, MigrationStep); 77] = [
             "no_pending_attachments INTEGER NOT NULL DEFAULT 0 CHECK(no_pending_attachments IN (0,1))",
         )
     }),
-    (79, migrate_v79),
+    (79, |c| Ok(c.execute_batch(SCHEMA_V79)?)),
+    (80, migrate_v80),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
