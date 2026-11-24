@@ -58,6 +58,30 @@ fn search_snippets_prefer_nearby_word_prefixes_and_keep_the_original_text() {
 }
 
 #[test]
+fn multi_term_han_snippets_center_on_the_matching_passage() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let message = format!(
+        "{}这里的目标内容说明了实际匹配段落{}",
+        "前置背景".repeat(40),
+        "后续材料".repeat(40)
+    );
+    store.append_message(&session.id, "user", &message).unwrap();
+
+    let hits = store.search_sessions("目标 内容", 1).unwrap();
+    let snippet = &hits[0].snippet;
+    assert!(snippet.contains("目标内容"), "{snippet}");
+    assert!(snippet.starts_with('…') && snippet.ends_with('…'));
+    assert!(snippet.chars().count() <= 102);
+    let before_match = snippet
+        .split("目标内容")
+        .next()
+        .unwrap()
+        .trim_start_matches('…');
+    assert_eq!(before_match.chars().count(), 40, "{snippet}");
+}
+
+#[test]
 fn search_snippet_ties_choose_the_shortest_then_earliest_span() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();

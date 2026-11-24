@@ -283,12 +283,62 @@ fn make_snippet(content: &str, needle_lower: &str) -> String {
 
 /// For multi-term searches, fit as many distinct word-prefix matches as
 /// possible into 100 original characters, plus ellipses. Match from the
-/// start of alphanumeric words with the app's accent-insensitive folding.
-/// Combining marks stay with the preceding word. SQLite still decides which
-/// rows match, using its own tokenizer.
+/// start of alphanumeric words with the app's accent-insensitive folding;
+/// Han terms also match substrings within long runs.
+fn is_han_char(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x323af
+    )
+}
+
+fn record_multi_term_snippet_matches(
+    window: &mut VecDeque<(usize, usize, Vec<usize>)>,
+    counts: &mut [usize],
+    covered: &mut usize,
+    best: &mut ((usize, Reverse<usize>, Reverse<usize>), usize, usize, usize),
+    budget: usize,
+    start_char: usize,
+    start_byte: usize,
+    end_char: usize,
+    end_byte: usize,
+    matched: Vec<usize>,
+) {
+    for &id in &matched {
+        *covered += usize::from(counts[id] == 0);
+        counts[id] += 1;
+    }
+    window.push_back((start_char, start_byte, matched));
+    while window.front().is_some_and(|(start, _, ids)| {
+        end_char - *start > budget || ids.iter().all(|&id| counts[id] > 1)
+    }) {
+        let (_, _, ids) = window.pop_front().unwrap();
+        for id in ids {
+            counts[id] -= 1;
+            *covered -= usize::from(counts[id] == 0);
+        }
+    }
+    if let Some(&(start, from, _)) = window.front() {
+        let width = end_char - start;
+        let score = (*covered, Reverse(width), Reverse(start));
+        if score > best.0 {
+            *best = (score, from, end_byte, width);
+        }
+    }
+}
+
 fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
     const BUDGET: usize = 100;
     let max_term_bytes = terms.keys().map(String::len).max().unwrap_or(0);
+    let mut han_terms_by_last_char = HashMap::<char, Vec<(&str, usize, usize)>>::new();
+    for (term, &id) in terms {
+        if !term.is_empty() && term.chars().all(is_han_char) {
+            han_terms_by_last_char
+                .entry(term.chars().next_back().unwrap())
+                .or_default()
+                .push((term, id, term.chars().count()));
+        }
+    }
     let mut counts = vec![0; terms.len()];
     let mut covered = 0;
     let mut window: VecDeque<(usize, usize, Vec<usize>)> = VecDeque::new();
@@ -297,6 +347,33 @@ fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
     let mut word_start = None;
     let chars = content.char_indices().chain([(content.len(), '\0')]);
     for (end_char, (end_byte, ch)) in chars.enumerate() {
+        if !unicode_normalization::char::is_combining_mark(ch) {
+            if let Some(last_char) = content[..end_byte].chars().next_back() {
+                if let Some(candidates) = han_terms_by_last_char.get(&last_char) {
+                    for &(term, id, term_chars) in candidates {
+                        if end_byte >= term.len() {
+                            let start_byte = end_byte - term.len();
+                            if content.get(start_byte..end_byte) == Some(term) {
+                                if let Some(start_char) = end_char.checked_sub(term_chars) {
+                                    record_multi_term_snippet_matches(
+                                        &mut window,
+                                        &mut counts,
+                                        &mut covered,
+                                        &mut best,
+                                        BUDGET,
+                                        start_char,
+                                        start_byte,
+                                        end_char,
+                                        end_byte,
+                                        vec![id],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if ch.is_alphanumeric() {
             word_start.get_or_insert((end_char, end_byte));
             continue;
@@ -319,32 +396,23 @@ fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
             folded.push(key);
             if let Some(&id) = terms.get(&folded) {
                 matched.push(id);
-                covered += usize::from(counts[id] == 0);
-                counts[id] += 1;
             }
         }
         if matched.is_empty() {
             continue;
         }
-        window.push_back((start_char, start_byte, matched));
-        // Remove out-of-budget words and any redundant leading matches to
-        // find the shortest span with this coverage ending at this word.
-        while window.front().is_some_and(|(start, _, ids)| {
-            end_char - start > BUDGET || ids.iter().all(|&id| counts[id] > 1)
-        }) {
-            let (_, _, ids) = window.pop_front().unwrap();
-            for id in ids {
-                counts[id] -= 1;
-                covered -= usize::from(counts[id] == 0);
-            }
-        }
-        if let Some(&(start, from, _)) = window.front() {
-            let width = end_char - start;
-            let score = (covered, Reverse(width), Reverse(start));
-            if score > best.0 {
-                best = (score, from, end_byte, width);
-            }
-        }
+        record_multi_term_snippet_matches(
+            &mut window,
+            &mut counts,
+            &mut covered,
+            &mut best,
+            BUDGET,
+            start_char,
+            start_byte,
+            end_char,
+            end_byte,
+            matched,
+        );
     }
     let (_, from, to, width) = best;
     let mut start = from;
