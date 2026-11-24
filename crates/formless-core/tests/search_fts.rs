@@ -82,6 +82,20 @@ fn multi_term_han_snippets_center_on_the_matching_passage() {
 }
 
 #[test]
+fn overlapping_han_terms_keep_the_complete_matching_passage() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let long_term = format!("{}乙", "甲".repeat(50));
+    let message = format!("{}，{}丙丁", "背景".repeat(60), long_term);
+    store.append_message(&session.id, "user", &message).unwrap();
+
+    let query = format!("{long_term} 乙");
+    let hits = store.search_sessions(&query, 1).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains(&long_term), "{}", hits[0].snippet);
+}
+
+#[test]
 fn search_snippet_ties_choose_the_shortest_then_earliest_span() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();

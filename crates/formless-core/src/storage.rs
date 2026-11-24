@@ -8,7 +8,7 @@ use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -292,8 +292,11 @@ fn is_han_char(character: char) -> bool {
     )
 }
 
+type MultiTermSnippetMatch = (usize, usize, usize, usize, Vec<usize>);
+
 fn record_multi_term_snippet_matches(
-    window: &mut VecDeque<(usize, usize, Vec<usize>)>,
+    window: &mut VecDeque<MultiTermSnippetMatch>,
+    end_counts: &mut BTreeMap<usize, (usize, usize)>,
     counts: &mut [usize],
     covered: &mut usize,
     best: &mut ((usize, Reverse<usize>, Reverse<usize>), usize, usize, usize),
@@ -308,17 +311,46 @@ fn record_multi_term_snippet_matches(
         *covered += usize::from(counts[id] == 0);
         counts[id] += 1;
     }
-    window.push_back((start_char, start_byte, matched));
-    while window.front().is_some_and(|(start, _, ids)| {
-        end_char - *start > budget || ids.iter().all(|&id| counts[id] > 1)
-    }) {
-        let (_, _, ids) = window.pop_front().unwrap();
+    let position = window
+        .iter()
+        .position(|(start, _, _, _, _)| *start > start_char)
+        .unwrap_or(window.len());
+    window.insert(
+        position,
+        (start_char, start_byte, end_char, end_byte, matched),
+    );
+    end_counts
+        .entry(end_char)
+        .and_modify(|(_, count)| *count += 1)
+        .or_insert((end_byte, 1));
+    loop {
+        let Some((start, _, _, _, ids)) = window.front() else {
+            break;
+        };
+        let Some((&right_char, _)) = end_counts.last_key_value() else {
+            break;
+        };
+        if right_char - *start <= budget && !ids.iter().all(|&id| counts[id] > 1) {
+            break;
+        }
+        let (_, _, removed_end, _, ids) = window.pop_front().unwrap();
         for id in ids {
             counts[id] -= 1;
             *covered -= usize::from(counts[id] == 0);
         }
+        let remove_end = if let Some((_, count)) = end_counts.get_mut(&removed_end) {
+            *count -= 1;
+            *count == 0
+        } else {
+            false
+        };
+        if remove_end {
+            end_counts.remove(&removed_end);
+        }
     }
-    if let Some(&(start, from, _)) = window.front() {
+    if let (Some(&(start, from, _, _, _)), Some((&end_char, &(end_byte, _)))) =
+        (window.front(), end_counts.last_key_value())
+    {
         let width = end_char - start;
         let score = (*covered, Reverse(width), Reverse(start));
         if score > best.0 {
@@ -341,7 +373,8 @@ fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
     }
     let mut counts = vec![0; terms.len()];
     let mut covered = 0;
-    let mut window: VecDeque<(usize, usize, Vec<usize>)> = VecDeque::new();
+    let mut window: VecDeque<MultiTermSnippetMatch> = VecDeque::new();
+    let mut end_counts = BTreeMap::new();
     let mut folded = String::new();
     let mut best = ((0, Reverse(0), Reverse(0)), 0, 0, 0);
     let mut word_start = None;
@@ -357,6 +390,7 @@ fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
                                 if let Some(start_char) = end_char.checked_sub(term_chars) {
                                     record_multi_term_snippet_matches(
                                         &mut window,
+                                        &mut end_counts,
                                         &mut counts,
                                         &mut covered,
                                         &mut best,
@@ -403,6 +437,7 @@ fn multi_term_snippet(content: &str, terms: &HashMap<String, usize>) -> String {
         }
         record_multi_term_snippet_matches(
             &mut window,
+            &mut end_counts,
             &mut counts,
             &mut covered,
             &mut best,
