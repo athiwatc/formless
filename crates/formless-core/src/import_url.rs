@@ -498,12 +498,19 @@ mod fetch_tests {
         .await;
         peer.abort();
         let error = result.unwrap_err();
-        assert!(
-            error.chain().any(|source| source
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout)),
-            "{error:#}"
-        );
+        let last = format!("http://{address}/last");
+        let message = error.to_string();
+        // The shared budget can expire before the second request starts or
+        // while reqwest is waiting for that hop.
+        let expired_before_send = message == format!("timed out fetching {last}");
+        let timed_out_during_request = (message == format!("fetch {last}")
+            || message == format!("read {last}"))
+            && error.chain().any(|source| {
+                source
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+            });
+        assert!(expired_before_send || timed_out_during_request, "{error:#}");
     }
 
     #[test]
