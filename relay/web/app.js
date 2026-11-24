@@ -669,12 +669,14 @@
       action.run();
     } }, action.label);
     const dismiss = h("button", { class: "btn ghost small toast-dismiss", type: "button", "aria-label": "Dismiss notification", onclick: remove }, "×");
+    const message = h("span", { class: "toast-message" });
     const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status",
       onmouseenter: () => updatePause("hover", true), onmouseleave: () => updatePause("hover", false),
       onfocusin: () => updatePause("focus", true),
       onfocusout: (event) => { if (!t.contains(event.relatedTarget)) updatePause("focus", false); } },
-    h("span", { class: "toast-message" }, text), h("span", { class: "toast-actions" }, button, dismiss));
+    message, h("span", { class: "toast-actions" }, button, dismiss));
     $("toasts").append(t);
+    setTimeout(() => { if (t.isConnected) message.textContent = text; }, 0);
     if (remaining != null) {
       deadline = Date.now() + remaining;
       timer = setTimeout(remove, remaining);

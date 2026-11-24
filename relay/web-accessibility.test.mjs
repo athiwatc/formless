@@ -188,6 +188,8 @@ test('toast dismissal, timer pause, and retry actions are accessible', async () 
   c.toast('offline', true, { label: 'Retry', run: () => {} });
   const error = root.children.at(-1);
   assert.equal(error.props.role, 'alert');
+  assert.equal(timers.size, 1, 'errors only schedule their delayed message insertion');
+  advance(0);
   assert.equal(timers.size, 0, 'errors persist until a user dismisses them');
   const actions = error.children[1].children;
   assert.equal(actions[0].children[0], 'Retry');
@@ -262,4 +264,21 @@ test('toast dismissal, timer pause, and retry actions are accessible', async () 
   assert.equal(retryToast.children[1].children[0].children[0], 'Retry');
   retryToast.children[1].children[0].props.onclick();
   assert.equal(retries, 1);
+});
+
+test('toast live message is populated after its empty status node is mounted', () => {
+  const { c, root, advance } = fixture();
+  const mountedMessages = [];
+  const append = root.append.bind(root);
+  root.append = child => {
+    mountedMessages.push(child.children[0].children.length);
+    child.isConnected = true;
+    append(child);
+  };
+  c.toast('Saved', false);
+  const toast = root.children.at(-1);
+  assert.deepEqual(mountedMessages, [0]);
+  assert.equal(toast.children[0].children.length, 0);
+  advance(0);
+  assert.equal(toast.children[0].textContent, 'Saved');
 });
