@@ -3572,7 +3572,15 @@ such as `read_file`, `read_text_file` and `file_read`.
   (macOS), `$XDG_DATA_HOME/formless` (Linux), `%APPDATA%\formless`
   (Windows); config in the matching config dir (`config.toml` + keychain/
   fallback key file). Contents: SQLite DB, Tool version files, artifacts,
-  rotated daemon logs, audit log.
+  rotated daemon logs, audit log. With `log_keep > 0`, once `daemon.log`
+  exceeds `daemon.log_max_bytes`, the daemon shifts numbered history, renames
+  the live file to `.1`, then reopens stdout/stderr on a fresh `daemon.log`.
+  This rename-and-reopen behavior also works on Windows, so new output does
+  not remain in `.1`. With `log_keep = 0`, no history is kept: when the live
+  log exceeds its size cap, Unix unlinks it and reopens stdio, while Windows
+  truncates a regular live log in place. Symlink paths are unlinked rather
+  than followed. Setting `daemon.log_max_bytes = 0` disables size-triggered
+  rotation.
 - **SQLite** holds Sessions, Runs, Tool metadata/versions index,
   Invocations, metrics tallies, compaction checkpoints, approvals, audit
   events. Schema is versioned; the daemon auto-migrates on start and takes a
@@ -5603,7 +5611,8 @@ previous headless Run's Session.
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
-  keeps printing appended entries and follows rotation. Numeric rotations
+  keeps printing appended entries and restarts from byte zero when it observes
+  the live file shrink after rotation. Numeric rotations
   are discovered from the directory (including old suffixes above 64),
   rather than a fixed filename range. Bounded tails read newest first until
   enough matching entries are found; `-n 0` streams all history oldest first.
