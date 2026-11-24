@@ -2320,6 +2320,62 @@ impl Store {
         })
     }
 
+    pub(crate) fn rebind_pending_steers_for_resume(
+        &self,
+        session_id: &str,
+        previous_run_id: &str,
+        run_id: &str,
+        candidate_ids: &[String],
+    ) -> Result<bool> {
+        if candidate_ids.is_empty() || previous_run_id == run_id {
+            return Ok(false);
+        }
+        self.transaction(|st| {
+            let messages = {
+                let mut statement = st.conn.prepare(
+                    "SELECT meta FROM messages WHERE session_id=?1 AND id=?2 AND role='user' AND meta IS NOT NULL",
+                )?;
+                let mut messages = Vec::new();
+                for id in candidate_ids {
+                    if let Some(meta) = statement
+                        .query_row(params![session_id, id], |row| row.get::<_, String>(0))
+                        .optional()?
+                    {
+                        messages.push((id, meta));
+                    }
+                }
+                messages
+            };
+            let mut changed = false;
+            for (id, metadata) in messages {
+                let Ok(mut meta) = serde_json::from_str::<Value>(&metadata) else {
+                    continue;
+                };
+                let Some(steer) = meta.get_mut("steer").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if steer.get("run_id").and_then(Value::as_str) != Some(previous_run_id)
+                    || steer.get("context_included").and_then(Value::as_bool) == Some(true)
+                    || steer.get("step").is_some_and(|step| !step.is_null())
+                {
+                    continue;
+                }
+                if !steer.contains_key("origin_run_id") {
+                    steer.insert("origin_run_id".into(), json!(previous_run_id));
+                }
+                steer.insert("run_id".into(), json!(run_id));
+                changed |= st.ex(
+                    "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
+                    params![session_id, id, meta.to_string()],
+                )? > 0;
+            }
+            if changed {
+                st.note_rewrite();
+            }
+            Ok(changed)
+        })
+    }
+
     pub fn list_messages(&self, session_id: &str) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
             .conn

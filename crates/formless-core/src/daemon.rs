@@ -6288,10 +6288,23 @@ impl Daemon {
                     &forecast,
                     resumed_from.clone(),
                 )?;
+                let candidate_ids = admission
+                    .first
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(_, _, _, _, candidates)| {
+                        candidates
+                            .iter()
+                            .map(|candidate| candidate.id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let id = st.create_run(session_id)?;
                 st.record_forecast(&id, &forecast)?;
-                if let Some(previous) = resumed_from {
-                    st.resume_session_plan(session_id, &previous, &id)?;
+                if let Some(previous) = resumed_from.as_deref() {
+                    st.rebind_pending_steers_for_resume(session_id, previous, &id, &candidate_ids)?;
+                    st.resume_session_plan(session_id, previous, &id)?;
                 }
                 Ok((output, id, admission))
             })

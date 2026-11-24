@@ -505,6 +505,86 @@ async fn retry_run_preserves_steer_provenance_when_content_is_unchanged() {
     cancel_fixture_run(&d, &sid).await;
 }
 
+#[test]
+fn pending_steer_rebinds_through_repeated_resumes_before_dispatch() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    cfg.limits.forecast_confirm_usd = None;
+    cfg.save(&paths).unwrap();
+    let st = Store::open(&paths.db_file()).unwrap();
+    let original_run = st.last_run(&sid).unwrap().unwrap().0;
+    st.set_run_status(&original_run, "paused").unwrap();
+    let steer = st
+        .append_message_meta(
+            &sid,
+            "user",
+            "pending steer",
+            Some(json!({"steer":{"run_id":original_run.clone()}}).to_string()),
+        )
+        .unwrap();
+    let input = ForecastInput {
+        session_id: Some(sid.clone()),
+        resume: true,
+        ..Default::default()
+    };
+    let (_, first_resume, first_admission) = d
+        .admit_action(&sid, &cfg, &input, |store| {
+            store.set_run_status(&original_run, "resumed")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        first_admission.resumed_from.as_deref(),
+        Some(original_run.as_str())
+    );
+    st.set_run_status(&first_resume, "paused").unwrap();
+    let (_, second_resume, second_admission) = d
+        .admit_action(&sid, &cfg, &input, |store| {
+            store.set_run_status(&first_resume, "resumed")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        second_admission.resumed_from.as_deref(),
+        Some(first_resume.as_str())
+    );
+    let candidates = second_admission
+        .first
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .4
+        .clone();
+    assert_eq!(
+        crate::storage::steer_message_ids_for_run(
+            &candidates,
+            &second_resume,
+            second_admission.resumed_from.as_deref()
+        ),
+        vec![steer.id.clone()]
+    );
+    let meta: Value = serde_json::from_str(
+        st.get_message(&sid, &steer.id)
+            .unwrap()
+            .unwrap()
+            .meta
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        meta["steer"]["run_id"].as_str(),
+        Some(second_resume.as_str())
+    );
+    assert_eq!(
+        meta["steer"]["origin_run_id"].as_str(),
+        Some(original_run.as_str())
+    );
+    assert!(meta["steer"]["context_included"].is_null());
+    assert!(meta["steer"]["step"].is_null());
+}
+
 #[tokio::test]
 async fn retry_expected_run_rejects_a_stale_selection_without_editing_or_forking() {
     let env = crate::credential_env::EnvGuard::isolated();
