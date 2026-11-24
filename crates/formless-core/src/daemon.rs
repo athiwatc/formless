@@ -844,6 +844,8 @@ pub struct Daemon {
     run_publication_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     run_final_decision_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    model_download_test_spec: StdMutex<Option<ModelSpec>>,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -1143,6 +1145,8 @@ impl Daemon {
             run_publication_test: StdMutex::new(None),
             #[cfg(test)]
             run_final_decision_test: StdMutex::new(None),
+            #[cfg(test)]
+            model_download_test_spec: StdMutex::new(None),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -7132,6 +7136,14 @@ impl Daemon {
             return;
         };
         let spec = cfg.naming.spec();
+        #[cfg(test)]
+        let spec = {
+            let test_spec = *self
+                .model_download_test_spec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            test_spec.or(spec)
+        };
         if let Some(spec) = spec {
             if cfg.naming.auto_download
                 && namer::embedded_available()
@@ -20098,6 +20110,172 @@ mod model_download_tests {
             gaps: Default::default(),
         });
         rx
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn finish_first_run(daemon: &Arc<Daemon>) -> String {
+        let (session_id, run_id) = daemon
+            .with_store(|st| {
+                let session = st.create_session(None)?;
+                st.append_message(
+                    &session.id,
+                    "user",
+                    "Create a local-only fixture for first-run naming consent checks.",
+                )?;
+                let run_id = st.create_run(&session.id)?;
+                Ok((session.id, run_id))
+            })
+            .unwrap();
+        daemon
+            .finish_run(session_id.clone(), run_id, "completed")
+            .await;
+        session_id
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_session_update(events: &mut mpsc::Receiver<ServerMessage>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    ServerMessage::Event(Event::SessionUpdated { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("first-run heuristic title was not published");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_note(
+        events: &mut mpsc::Receiver<ServerMessage>,
+        session_id: &str,
+        expected_text: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ServerMessage::Event(Event::Note {
+                        session_id: Some(id),
+                        text,
+                    }) if id == session_id && text == expected_text => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("expected first-run model download status note");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn assert_no_model_fetch(requests: &AtomicU64, requested: &Notify, paths: &Paths) {
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(timeout(Duration::from_millis(100), requested.notified())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(!namer::models_dir(paths).exists());
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    #[tokio::test]
+    async fn first_run_consent_gates_local_model_fetch_and_reports_status() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base =
+            std::env::temp_dir().join(format!("fl-first-run-download-{}", uuid::Uuid::new_v4()));
+        let requests = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/tokenizer",
+            axum::routing::get({
+                let requests = requests.clone();
+                let requested = requested.clone();
+                move || {
+                    let (requests, requested) = (requests.clone(), requested.clone());
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        requested.notify_one();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let spec = ModelSpec {
+            id: "consent-fixture",
+            tokenizer_url: Box::leak(format!("{base_url}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"fixture tokenizer")).into_boxed_str(),
+            ),
+            gguf_url: Box::leak(format!("{base_url}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"not a model")).into_boxed_str(),
+            ),
+            gguf_bytes: 42,
+            ..namer::QWEN2_5_0_5B
+        };
+        let paths = Paths::from_dirs(base.join("data"), base.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let default_cfg = daemon.config().unwrap();
+        assert!(default_cfg.naming.enabled);
+        assert!(!default_cfg.naming.auto_download);
+        assert!(default_cfg.naming.spec().is_some());
+        assert!(!paths.config_file().exists());
+        *daemon.model_download_test_spec.lock().unwrap() = Some(spec);
+        let mut events = subscribe(&daemon);
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut declined_cfg = Config::default();
+        declined_cfg.naming.auto_download = false;
+        declined_cfg.naming.auto_download_migration_done = true;
+        declined_cfg.save(&paths).unwrap();
+        assert!(
+            !daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut enabled_cfg = Config::load(&paths).unwrap();
+        enabled_cfg.naming.auto_download = true;
+        enabled_cfg.naming.auto_download_migration_done = true;
+        enabled_cfg.save(&paths).unwrap();
+        assert!(
+            daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        let session_id = finish_first_run(&daemon).await;
+        wait_for_note(&mut events, &session_id, &model_download_notice(&spec)).await;
+        timeout(Duration::from_secs(5), requested.notified())
+            .await
+            .expect("enabled first run did not contact the local fetch fixture");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        wait_for_note(
+            &mut events,
+            &session_id,
+            "Session-naming model download failed; titles will continue using a heuristic.",
+        )
+        .await;
+        assert!(!spec.installed(&paths));
+        assert!(!spec.tokenizer_path(&paths).exists());
+        assert!(!spec.gguf_path(&paths).exists());
+        drop(daemon);
+        server.abort();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
