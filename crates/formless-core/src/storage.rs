@@ -8,8 +8,9 @@ use formless_runtime::Capabilities;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::cmp::Reverse;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 #[cfg(test)]
 #[path = "job_schedule_tests.rs"]
@@ -802,7 +803,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 76;
+pub const SCHEMA_VERSION: i64 = 77;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -945,8 +946,30 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 
 type MigrationStep = fn(&Connection) -> Result<()>;
 
+fn migrate_v77(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE messages_unicode_fts USING fts5(
+           grams, content='', tokenize='unicode61 remove_diacritics 0'
+         );",
+    )?;
+    let mut statement = conn.prepare("SELECT rowid,content FROM messages ORDER BY rowid")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let rowid: i64 = row.get(0)?;
+        let content: String = row.get(1)?;
+        let grams = unicode_search_tokens(&content);
+        if !grams.is_empty() {
+            conn.execute(
+                "INSERT INTO messages_unicode_fts(rowid,grams) VALUES(?1,?2)",
+                params![rowid, grams.join(" ")],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 74] = [
+const MIGRATIONS: [(i64, MigrationStep); 75] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1294,6 +1317,7 @@ const MIGRATIONS: [(i64, MigrationStep); 74] = [
             r#"limits TEXT NOT NULL DEFAULT '{"max_retries_per_step":3,"max_attempts_per_topic":20}'"#,
         )
     }),
+    (77, migrate_v77),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -2116,6 +2140,7 @@ impl Store {
                 st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![session_id])?;
                 st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![session_id])?;
                 st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![session_id])?;
+                st.remove_session_unicode_search_index(&session_id)?;
                 let changed=st.ex("DELETE FROM sessions WHERE id=?1",params![session_id])?>0;
                 deleted|=session_id==id && changed;
             }
@@ -2187,6 +2212,42 @@ impl Store {
         }
         Ok(copy)
     }
+    pub(crate) fn add_unicode_search_index(&self, rowid: i64, content: &str) -> Result<()> {
+        let grams = unicode_search_tokens(content);
+        if !grams.is_empty() {
+            self.conn.execute(
+                "INSERT INTO messages_unicode_fts(rowid,grams) VALUES(?1,?2)",
+                params![rowid, grams.join(" ")],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_unicode_search_index(&self, rowid: i64, content: &str) -> Result<()> {
+        let grams = unicode_search_tokens(content);
+        if !grams.is_empty() {
+            self.conn.execute(
+                "INSERT INTO messages_unicode_fts(messages_unicode_fts,rowid,grams)
+                 VALUES('delete',?1,?2)",
+                params![rowid, grams.join(" ")],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remove_session_unicode_search_index(&self, session_id: &str) -> Result<()> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT rowid,content FROM messages WHERE session_id=?1")?;
+        let mut rows = statement.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let content: String = row.get(1)?;
+            self.remove_unicode_search_index(rowid, &content)?;
+        }
+        Ok(())
+    }
+
     pub fn append_message(
         &self,
         session_id: &str,
@@ -2227,6 +2288,7 @@ impl Store {
                  RETURNING seq",
             )?
             .query_row(params![id, session_id, role, content, t, meta,generated_by], |r| r.get(0))?;
+        st.add_unicode_search_index(tx.last_insert_rowid(), content)?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
         Ok(MessageInfo {
@@ -2502,6 +2564,7 @@ impl Store {
         self.set_session_model(&fork.id, orig.model, orig.reasoning_effort)?;
         for message in messages {
             self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta,generated_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta,message.generated_by])?;
+            self.add_unicode_search_index(self.conn.last_insert_rowid(), &message.content)?;
         }
         let complete = up_to_seq.is_none()
             || !self.conn.query_row(
@@ -2533,43 +2596,147 @@ impl Store {
         }
     }
 
-    /// Case-insensitive substring search across all sessions' messages.
+    /// English word-prefix and Unicode substring search across session messages.
     pub fn search_sessions(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let limit = limit.clamp(1, 200) as i64;
-        // FTS5 (bm25, then newest): every word as a prefix term. A query
-        // with no word characters falls back to a substring scan.
-        let fts = fts_query(query);
-        let phrase = identifier_prefix_phrase(query);
-        let sql = if phrase.is_some() {
-            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
-             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
-             WHERE messages_fts MATCH ?1 \
-             ORDER BY CASE WHEN m.rowid IN \
-               (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3) \
-               THEN 0 ELSE 1 END, bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
-        } else if fts.is_some() {
-            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
-             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
-             WHERE messages_fts MATCH ?1 \
-             ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+        let limit = limit.clamp(1, 200);
+        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let (sql, verify_terms) = if query.is_ascii() {
+            let fts = fts_query(query);
+            let phrase = fts.as_ref().and_then(|_| identifier_prefix_phrase(query));
+            if let Some(fts) = fts {
+                if let Some(phrase) = phrase {
+                    args.push(fts.into());
+                    args.push((limit as i64).into());
+                    args.push(phrase.into());
+                    (
+                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                         FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+                         JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+                         WHERE messages_fts MATCH ?1 \
+                         ORDER BY CASE WHEN m.rowid IN \
+                           (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3) \
+                           THEN 0 ELSE 1 END, bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+                            .to_owned(),
+                        None,
+                    )
+                } else {
+                    args.push(fts.into());
+                    args.push((limit as i64).into());
+                    (
+                        "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                         FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+                         JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+                         WHERE messages_fts MATCH ?1 \
+                         ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+                            .to_owned(),
+                        None,
+                    )
+                }
+            } else {
+                args.push(query.to_owned().into());
+                args.push((limit as i64).into());
+                (
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                     FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+                     WHERE instr(lower(m.content),lower(?1))>0 \
+                     ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
+                        .to_owned(),
+                    None,
+                )
+            }
         } else {
-            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
-             FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
-             WHERE instr(lower(m.content), lower(?1)) > 0 \
-             ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
+            let normalized_query = search_normalize(query);
+            let normalized_terms: Vec<String> =
+                search_words(&normalized_query).map(str::to_owned).collect();
+            let ascii_terms: Vec<String> = normalized_terms
+                .iter()
+                .filter(|term| term.is_ascii())
+                .cloned()
+                .collect();
+            let unicode_terms: Vec<UnicodeSearchTerm> = normalized_terms
+                .into_iter()
+                .filter(|term| !term.is_ascii())
+                .map(|normalized| UnicodeSearchTerm {
+                    latin_folded: latin_folded_term(&normalized),
+                    normalized,
+                })
+                .collect();
+            let unicode_candidates = unicode_terms
+                .iter()
+                .filter_map(|term| {
+                    Some((
+                        unicode_search_query(std::slice::from_ref(term))?,
+                        fts_query(&term.normalized)?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let ascii_fts = fts_query(&ascii_terms.join(" "));
+            let unicode_phrase = identifier_prefix_phrase(&normalized_query);
+            if !unicode_candidates.is_empty() {
+                let mut conditions = Vec::new();
+                for (index_query, legacy_fts) in unicode_candidates {
+                    args.push(index_query.into());
+                    let index_position = args.len();
+                    args.push(legacy_fts.into());
+                    let legacy_position = args.len();
+                    conditions.push(format!(
+                        "(m.rowid IN (SELECT rowid FROM messages_unicode_fts WHERE messages_unicode_fts MATCH ?{index_position}) \
+                         OR m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?{legacy_position}))"
+                    ));
+                }
+                if let Some(ascii_fts) = ascii_fts {
+                    args.push(ascii_fts.into());
+                    conditions.push(format!(
+                        "m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?{})",
+                        args.len()
+                    ));
+                }
+                let sql = format!(
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                     FROM messages m JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
+                     WHERE {}",
+                    conditions.join(" AND ")
+                );
+                let order = if let Some(phrase) = unicode_phrase {
+                    args.push(phrase.into());
+                    format!(
+                        "CASE WHEN m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?{}) THEN 0 ELSE 1 END, m.created_at DESC, m.rowid DESC",
+                        args.len()
+                    )
+                } else {
+                    "m.created_at DESC, m.rowid DESC".to_owned()
+                };
+                (format!("{sql} ORDER BY {order}"), Some(unicode_terms))
+            } else if let Some(ascii_fts) = ascii_fts {
+                args.push(ascii_fts.into());
+                args.push((limit as i64).into());
+                (
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                     FROM messages_fts f JOIN messages m ON m.rowid=f.rowid \
+                     JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
+                     WHERE messages_fts MATCH ?1 \
+                     ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+                        .to_owned(),
+                    None,
+                )
+            } else {
+                args.push(normalized_query.into());
+                args.push((limit as i64).into());
+                (
+                    "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+                     FROM messages m JOIN sessions s ON s.id=m.session_id AND s.deleted_at IS NULL \
+                     WHERE instr(lower(m.content),lower(?1))>0 \
+                     ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
+                        .to_owned(),
+                    None,
+                )
+            }
         };
-        let mut stmt = self.ps(sql)?;
-        let arg = fts.unwrap_or_else(|| query.to_string());
-        let mut args = vec![rusqlite::types::Value::from(arg), limit.into()];
-        if let Some(phrase) = phrase {
-            args.push(phrase.into());
-        }
+        let mut stmt = self.ps(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(args))?;
         let needle = search_words(query).next().unwrap_or(query).to_lowercase();
         let mut terms = HashMap::new();
@@ -2582,6 +2749,12 @@ impl Store {
         let mut hits = Vec::new();
         while let Some(row) = rows.next()? {
             let content = row.get_ref(5)?.as_str()?;
+            if verify_terms
+                .as_ref()
+                .is_some_and(|terms| !session_search_matches(content, terms))
+            {
+                continue;
+            }
             hits.push(SearchHit {
                 session_id: row.get(0)?,
                 session_name: row.get(1)?,
@@ -2595,6 +2768,9 @@ impl Store {
                 },
                 created_at: row.get(6)?,
             });
+            if hits.len() >= limit {
+                break;
+            }
         }
         Ok(hits)
     }
@@ -2621,10 +2797,27 @@ impl Store {
         // four WAL commits) for a single user action.
         self.transaction(|st| {
             let tx = &st.conn;
+            let (rowid, previous_content): (i64, String) = tx.query_row(
+                "SELECT rowid,content FROM messages WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            st.remove_unicode_search_index(rowid, &previous_content)?;
             tx.execute(
                 "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
                 params![session_id, message_id, content],
             )?;
+            st.add_unicode_search_index(rowid, content)?;
+            {
+                let mut statement = tx
+                    .prepare("SELECT rowid,content FROM messages WHERE session_id=?1 AND seq>?2")?;
+                let mut rows = statement.query(params![session_id, msg.seq])?;
+                while let Some(row) = rows.next()? {
+                    let rowid: i64 = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    st.remove_unicode_search_index(rowid, &content)?;
+                }
+            }
             tx.execute(
                 "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
                 params![session_id, msg.seq],
@@ -7379,36 +7572,47 @@ impl Store {
                 None => (Some(f), None),
             },
         };
-        let mut stmt = self.ps(
-            "SELECT actor, action, detail, created_at, id FROM audit
-             WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
-               AND (?4 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?4)) = 0)
-               AND (?2 IS NULL OR created_at < ?2 OR (?5 IS NOT NULL AND created_at=?2 AND id < ?5))
-             ORDER BY created_at DESC, id DESC LIMIT ?3",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![
-                    include,
-                    before_time,
-                    limit.clamp(1, 500) as i64,
-                    exclude,
-                    before_id
-                ],
-                |r| {
-                    let created_at: String = r.get(3)?;
-                    let id: String = r.get(4)?;
-                    Ok(formless_protocol::AuditEntry {
-                        cursor: Some(crate::audit_cursor::encode(&created_at, &id)),
-                        actor: r.get(0)?,
-                        action: r.get(1)?,
-                        detail: r.get(2)?,
-                        created_at,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
+        let mut stmt = self.ps("SELECT actor, action, detail, created_at, id FROM audit
+             WHERE (?1 IS NULL OR created_at < ?1 OR (?2 IS NOT NULL AND created_at=?1 AND id < ?2))
+             ORDER BY created_at DESC, id DESC")?;
+        let rows = stmt.query_map(params![before_time, before_id], |r| {
+            let created_at: String = r.get(3)?;
+            let id: String = r.get(4)?;
+            Ok(formless_protocol::AuditEntry {
+                cursor: Some(crate::audit_cursor::encode(&created_at, &id)),
+                actor: r.get(0)?,
+                action: r.get(1)?,
+                detail: r.get(2)?,
+                created_at,
+            })
+        })?;
+        let include = include.map(search_normalize);
+        let exclude = exclude.map(search_normalize);
+        let filter_enabled = include.is_some() || exclude.is_some();
+        let mut entries = Vec::new();
+        for row in rows {
+            let entry = row?;
+            if filter_enabled {
+                let searchable = search_normalize(&format!(
+                    "{} {} {}",
+                    entry.actor, entry.action, entry.detail
+                ));
+                if include
+                    .as_ref()
+                    .is_some_and(|filter| !searchable.contains(filter))
+                    || exclude
+                        .as_ref()
+                        .is_some_and(|filter| searchable.contains(filter))
+                {
+                    continue;
+                }
+            }
+            entries.push(entry);
+            if entries.len() >= limit.clamp(1, 500) {
+                break;
+            }
+        }
+        Ok(entries)
     }
 
     /// Every active Tool with its current version.
@@ -8309,8 +8513,84 @@ fn identifier_prefix_phrase(text: &str) -> Option<String> {
 }
 
 fn search_words(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| !c.is_alphanumeric())
+    text.split(|c: char| !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c))
         .filter(|word| !word.is_empty())
+}
+
+fn search_normalize(text: &str) -> String {
+    text.nfc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .nfc()
+        .collect()
+}
+
+fn unicode_search_tokens(text: &str) -> Vec<String> {
+    let normalized = search_normalize(text);
+    unicode_search_tokens_normalized(&normalized)
+}
+
+fn unicode_search_tokens_normalized(text: &str) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    for word in search_words(text).filter(|word| !word.is_ascii()) {
+        let characters: Vec<char> = word.chars().collect();
+        for (index, character) in characters.iter().enumerate() {
+            if !character.is_ascii() {
+                tokens.insert(format!("u{:x}", *character as u32));
+            }
+            if let Some(next) = characters.get(index + 1) {
+                if !character.is_ascii() || !next.is_ascii() {
+                    tokens.insert(format!("u{:x}x{:x}", *character as u32, *next as u32));
+                }
+            }
+        }
+    }
+    tokens.into_iter().collect()
+}
+
+struct UnicodeSearchTerm {
+    normalized: String,
+    latin_folded: Option<String>,
+}
+
+fn fold_search_marks(text: &str) -> String {
+    text.nfkd()
+        .flat_map(char::to_lowercase)
+        .filter(|character| !unicode_normalization::char::is_combining_mark(*character))
+        .collect()
+}
+
+fn latin_folded_term(term: &str) -> Option<String> {
+    let folded = fold_search_marks(term);
+    (folded.is_ascii()
+        && folded
+            .chars()
+            .any(|character| character.is_ascii_alphabetic()))
+    .then_some(folded)
+}
+
+fn unicode_search_query(terms: &[UnicodeSearchTerm]) -> Option<String> {
+    let mut tokens = BTreeSet::new();
+    for term in terms {
+        tokens.extend(unicode_search_tokens_normalized(&term.normalized));
+    }
+    (!tokens.is_empty()).then(|| tokens.into_iter().collect::<Vec<_>>().join(" AND "))
+}
+
+fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) -> bool {
+    let content = search_normalize(content);
+    let folded_content = unicode_terms
+        .iter()
+        .any(|term| term.latin_folded.is_some())
+        .then(|| fold_search_marks(&content));
+    unicode_terms.iter().all(|term| {
+        content.contains(&term.normalized)
+            || term.latin_folded.as_ref().is_some_and(|folded_term| {
+                folded_content.as_ref().is_some_and(|folded_content| {
+                    search_words(folded_content).any(|word| word.starts_with(folded_term))
+                })
+            })
+    })
 }
 
 /// An FTS5 query from free text: each word quoted as a prefix term, all
