@@ -147,7 +147,8 @@ test('pull cancellation follows initiation order and resumes the requested alias
   c.acknowledgePull(earlier, 'pull-earlier');
   assert.equal(c.S.pullId, 'pull-latest');
   c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'pulling', done: false, pull_id: 'pull-earlier', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
-  assert.match(activities.pop(), /50%.*expected 20 bytes.*advisory/);
+  assert.equal(activities.pop(), 'pulling B · 50%');
+  assert.ok(notices.some(notice => /expected size 20 bytes; advisory/.test(notice.text)));
   c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'incomplete', done: true, pull_id: 'pull-latest', provider: 'remote', error: 'stream ended' });
   assert.equal(c.S.pullId, 'pull-earlier');
   assert.match(notices.pop().text, /\/pull A --provider remote/);
@@ -187,8 +188,9 @@ test('new browser connection clears pull state and invalidates old acknowledgeme
   assert.match(fn('openRelay'), /clearPullTracking\(\)/);
   assert.match(fn('connectLocal'), /clearPullTracking\(\)/);
 });
-test('idle status shows pull progress and clears it on the matching terminal event', () => {
+test('pull status stays compact, details are noted once per pull, and matching terminal clears it', () => {
   let context;
+  const notices = [];
   const c = setup(['renderStatus', 'handlePullProgress', 'pullTracking', 'completePull'], {
     document: { activeElement: null, createTextNode: () => ({ textContent: '' }) },
     statusRender: { root: null, spinner: null, text: null },
@@ -196,6 +198,7 @@ test('idle status shows pull progress and clears it on the matching terminal eve
     updateText: (node, value) => { node.textContent = value; },
     isRunning: () => false,
     activityText: activity => activity.label,
+    note: (text, err) => notices.push({ text, err }),
     storedSessionModel: () => null,
     setActivity: label => {
       context.S.activity = label ? { label, since: 0 } : null;
@@ -221,10 +224,25 @@ test('idle status shows pull progress and clears it on the matching terminal eve
     type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false,
     pull_id: 'pull-1', completed: 1, total: 2, expected_size: 100, warning: 'low disk',
   });
-  assert.match(c.statusRender.text.textContent, /pulling llama3.*50%.*expected 100 bytes.*low disk/);
+  assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 50%');
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].text, /expected size 100 bytes.*low disk/);
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false,
+    pull_id: 'pull-1', completed: 3, total: 4, expected_size: 100, warning: 'low disk',
+  });
+  assert.equal(c.statusRender.text.textContent, 'pulling llama3 · 75%');
+  assert.equal(notices.length, 1);
+  c.S.pullId = 'pull-2';
+  c.handlePullProgress({
+    type: 'model_pull_progress', model: 'another-model', status: 'pulling', done: false,
+    pull_id: 'pull-2', completed: 1, total: 4, expected_size: 200, warning: 'low disk',
+  });
+  assert.equal(c.statusRender.text.textContent, 'pulling another-model · 25%');
+  assert.equal(notices.length, 2);
   c.handlePullProgress({
     type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
-    pull_id: 'pull-1',
+    pull_id: 'pull-2',
   });
   assert.equal(c.statusRender.text.textContent, '● ready');
   c.S.activity = { label: 'stale unrelated activity', since: 0 };

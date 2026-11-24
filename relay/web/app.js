@@ -223,7 +223,7 @@
     current: null,
     pullId: null,
     pullActivity: null,
-    pullTracking: { generation: 0, order: 0, active: [], finished: [] },
+    pullTracking: { generation: 0, order: 0, active: [], finished: [], warningNotices: [], expectedSizeNotices: [] },
     drafts: {},
     unpersistedDrafts: new Map(),
     unpersistedDraftSharedValues: new Map(),
@@ -9437,6 +9437,8 @@
     tracking.order = 0;
     tracking.active = [];
     tracking.finished = [];
+    tracking.warningNotices = [];
+    tracking.expectedSizeNotices = [];
     S.pullId = null;
     S.pullActivity = null;
   }
@@ -9878,6 +9880,20 @@
   }
 
   function handlePullProgress(ev) {
+    const tracking = pullTracking();
+    const pullKey = ev.pull_id || ev.model || "unknown";
+    const warningNotices = tracking.warningNotices || (tracking.warningNotices = []);
+    const expectedSizeNotices = tracking.expectedSizeNotices || (tracking.expectedSizeNotices = []);
+    const details = [];
+    if (ev.expected_size != null && !expectedSizeNotices.includes(pullKey)) {
+      expectedSizeNotices.push(pullKey);
+      details.push("expected size " + ev.expected_size + " bytes");
+    }
+    if (ev.warning && !warningNotices.includes(pullKey)) {
+      warningNotices.push(pullKey);
+      details.push(ev.warning);
+    }
+    if (details.length) note("Ollama pull " + (ev.model || "model") + ": " + details.join("; "));
     if (ev.done) {
       completePull(ev.pull_id);
       if (S.pullActivity && S.pullActivity.pull_id === ev.pull_id) {
@@ -9895,10 +9911,8 @@
         } else note("could not pull " + ev.model + ": " + ev.error, true);
       } else if (ev.status === "success") note("pulled " + ev.model + "; pick it with /model");
     } else {
-      const progress = ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
-      const expected = ev.expected_size ? "; expected " + ev.expected_size + " bytes" : "";
-      const warning = ev.warning ? "; " + ev.warning : "";
-      const label = "pulling " + ev.model + ": " + ev.status + progress + expected + warning;
+      const progress = ev.total ? " · " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
+      const label = (ev.status || "pulling") + " " + (ev.model || "model") + progress;
       S.pullActivity = { pull_id: ev.pull_id, label, since: Date.now() };
       setActivity(label);
     }
