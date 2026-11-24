@@ -8665,20 +8665,28 @@ struct UnicodeSearchTerm {
     latin_folded: Option<String>,
 }
 
-fn fold_search_marks(text: &str) -> String {
-    text.nfkd()
-        .flat_map(char::to_lowercase)
-        .filter(|character| !unicode_normalization::char::is_combining_mark(*character))
-        .collect()
+fn fold_latin_marks(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    let mut follows_latin_letter = false;
+    for character in text.nfkd().flat_map(char::to_lowercase) {
+        if unicode_normalization::char::is_combining_mark(character) {
+            if !follows_latin_letter {
+                folded.push(character);
+            }
+        } else {
+            follows_latin_letter = character.is_ascii_alphabetic();
+            folded.push(character);
+        }
+    }
+    folded
 }
 
 fn latin_folded_term(term: &str) -> Option<String> {
-    let folded = fold_search_marks(term);
-    (folded.is_ascii()
-        && folded
-            .chars()
-            .any(|character| character.is_ascii_alphabetic()))
-    .then_some(folded)
+    let folded = fold_latin_marks(term);
+    folded
+        .chars()
+        .any(|character| character.is_ascii_alphabetic())
+        .then_some(folded)
 }
 
 fn unicode_search_query(terms: &[UnicodeSearchTerm]) -> Option<String> {
@@ -8690,17 +8698,18 @@ fn unicode_search_query(terms: &[UnicodeSearchTerm]) -> Option<String> {
 }
 
 fn contains_without_splitting_combining_marks(content: &str, term: &str) -> bool {
-    !term.is_empty() && content.match_indices(term).any(|(start, matched)| {
-        let end = start + matched.len();
-        !content[..start]
-            .chars()
-            .next_back()
-            .is_some_and(unicode_normalization::char::is_combining_mark)
-            && !content[end..]
+    !term.is_empty()
+        && content.match_indices(term).any(|(start, matched)| {
+            let end = start + matched.len();
+            !content[..start]
                 .chars()
-                .next()
+                .next_back()
                 .is_some_and(unicode_normalization::char::is_combining_mark)
-    })
+                && !content[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(unicode_normalization::char::is_combining_mark)
+        })
 }
 
 fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) -> bool {
@@ -8708,12 +8717,16 @@ fn session_search_matches(content: &str, unicode_terms: &[UnicodeSearchTerm]) ->
     let folded_content = unicode_terms
         .iter()
         .any(|term| term.latin_folded.is_some())
-        .then(|| fold_search_marks(&content));
+        .then(|| fold_latin_marks(&content));
     unicode_terms.iter().all(|term| {
         contains_without_splitting_combining_marks(&content, &term.normalized)
             || term.latin_folded.as_ref().is_some_and(|folded_term| {
                 folded_content.as_ref().is_some_and(|folded_content| {
-                    search_words(folded_content).any(|word| word.starts_with(folded_term))
+                    if folded_term.is_ascii() {
+                        search_words(folded_content).any(|word| word.starts_with(folded_term))
+                    } else {
+                        contains_without_splitting_combining_marks(folded_content, folded_term)
+                    }
                 })
             })
     })

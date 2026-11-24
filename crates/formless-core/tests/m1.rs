@@ -125,9 +125,7 @@ fn session_search_handles_multilingual_substrings_and_preserves_english_prefixes
 fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(Some("emoji search".into())).unwrap();
-    store
-        .append_message(&session.id, "user", "sun ☀️")
-        .unwrap();
+    store.append_message(&session.id, "user", "sun ☀️").unwrap();
     let heart = store
         .append_message(&session.id, "user", "heart ❤️")
         .unwrap();
@@ -141,16 +139,33 @@ fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
 fn thai_search_does_not_end_before_a_combining_tone_mark() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(Some("Thai search".into())).unwrap();
-    store
-        .append_message(&session.id, "user", "ที่")
-        .unwrap();
-    let unmarked = store
-        .append_message(&session.id, "user", "ที")
-        .unwrap();
+    store.append_message(&session.id, "user", "ที่").unwrap();
+    let unmarked = store.append_message(&session.id, "user", "ที").unwrap();
 
     let hits = store.search_sessions("ที", 20).unwrap();
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].message_id, unmarked.id);
+}
+
+#[test]
+fn mixed_accented_latin_unicode_terms_preserve_non_latin_marks() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store
+        .create_session(Some("mixed Unicode search".into()))
+        .unwrap();
+    let chinese = store
+        .append_message(&session.id, "user", "cafe文件")
+        .unwrap();
+    store.append_message(&session.id, "user", "cafeที่").unwrap();
+    let thai_unmarked = store.append_message(&session.id, "user", "cafeที").unwrap();
+
+    let chinese_hits = store.search_sessions("café文件", 20).unwrap();
+    assert_eq!(chinese_hits.len(), 1, "{chinese_hits:?}");
+    assert_eq!(chinese_hits[0].message_id, chinese.id);
+
+    let thai_hits = store.search_sessions("caféที", 20).unwrap();
+    assert_eq!(thai_hits.len(), 1, "{thai_hits:?}");
+    assert_eq!(thai_hits[0].message_id, thai_unmarked.id);
 }
 
 #[test]
