@@ -62,8 +62,7 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
     scenario.next_call().await.text("The greet Tool is ready.");
     scenario.finish(&first, &first_run).await;
 
-    let created = scenario.store.get_tool_by_name("greet").unwrap();
-    assert!(created.is_some(), "the first Session creates the Tool");
+    let created = scenario.store.get_tool_by_name("greet").unwrap().unwrap().0;
     let first_transcript =
         serde_json::to_string(&scenario.store.list_messages(&first).unwrap()).unwrap();
     assert!(first_transcript.contains("The greet Tool is ready."));
@@ -78,14 +77,46 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
         .await;
     let lookup = scenario.next_call().await;
     assert!(find_tools_call(&lookup.body, "greet"));
+    assert!(
+        lookup.body["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "greet")
+        }),
+        "the initial small-registry listing already advertises the stored Tool"
+    );
     lookup.tool_call("find_tools", json!({"query":"greet"}));
 
     let use_tool = scenario.next_call().await;
+    let find_tools_result_envelope = use_tool.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| serde_json::from_str::<Value>(message["content"].as_str()?).ok())
+        .find(|result| result["source_tool"] == "find_tools")
+        .expect("the next prompt includes the find_tools result");
+    let find_tools_result: Value =
+        serde_json::from_str(find_tools_result_envelope["content"].as_str().unwrap()).unwrap();
+    let returned_greet = find_tools_result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "greet")
+        .expect("find_tools returns the persisted greet Tool");
     assert!(
-        use_tool.body["tools"]
-            .as_array()
-            .is_some_and(|tools| { tools.iter().any(|tool| tool["function"]["name"] == "greet") }),
-        "find_tools loads the created Tool into the fresh Session"
+        returned_greet["description"]
+            .as_str()
+            .is_some_and(|description| description == created.description.as_str()),
+        "find_tools returns the stored Tool description"
+    );
+    assert!(
+        scenario
+            .store
+            .session_tool_ids(&fresh)
+            .unwrap()
+            .contains(&created.id),
+        "find_tools loads the persisted Tool identity into the fresh Session"
     );
     use_tool.tool_call("greet", json!({"name":"Ada"}));
     let finish = scenario.next_call().await;
@@ -96,6 +127,8 @@ async fn creates_a_tool_and_reuses_it_in_a_fresh_session() {
     let messages = scenario.store.list_messages(&fresh).unwrap();
     let transcript = serde_json::to_string(&messages).unwrap();
     assert!(transcript.contains("Hello, Ada!"));
+    let reused = scenario.store.get_tool_by_name("greet").unwrap().unwrap().0;
+    assert_eq!(reused.id, created.id, "the fresh Session reused the same Tool");
     assert_summary(
         "tool-create-fresh-session-reuse",
         scenario.provider.summary(),
