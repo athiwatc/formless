@@ -532,11 +532,22 @@ def run():
             page.set_viewport_size({'width':390,'height':844})
             page.evaluate('__focus817.S.readScale=2;document.documentElement.style.setProperty("--read-scale","2");__focus817.renderSessions();document.querySelector("#sidebar").classList.add("open")')
             page.wait_for_timeout(50)
+            # Keep the asynchronous clipboard result pending until after the
+            # menu has restored its trigger, even on a busy CI runner.
+            page.evaluate("""() => Object.defineProperty(navigator,'clipboard',{
+              value:{writeText:()=>new Promise(resolve=>__focus817.finishCopy=resolve)}
+            })""")
             page.locator(session_trigger).click()
             page.get_by_role('menuitem',name='Copy link',exact=False).click()
+            page.wait_for_function('typeof __focus817.finishCopy==="function"')
             check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile copy action leaves sidebar open')
             check(page.locator(session_trigger).evaluate('(e)=>e===document.activeElement'),'mobile copy action restores visible menu trigger')
-            page.evaluate("document.querySelector('#toasts').replaceChildren()")
+            page.evaluate('__focus817.finishCopy()')
+            copied = page.get_by_role('status').filter(has_text='Copied: opens')
+            copied.wait_for(state='visible')
+            copied.get_by_role('button', name='Dismiss notification').click()
+            copied.wait_for(state='detached')
+            check(page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'),'mobile toast dismissal preserves the Session drawer')
             # Pointer dismissal of an overlay is not an outside click on the
             # drawer behind it, including when a close button removes the modal.
             page.locator(session_trigger).click()
