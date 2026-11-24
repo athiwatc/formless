@@ -564,38 +564,36 @@ struct ModelOverlay {
 impl ModelOverlay {
     /// The efforts the highlighted model accepts (SPEC §4.2): its listed
     /// ones, none when effort has no effect, else all of them.
-    fn efforts(&self) -> Vec<Option<&'static str>> {
+    fn efforts(&self) -> Vec<Option<String>> {
         let id = self.picker.choice().unwrap_or_default();
         let listed = &self.meta[&id]["efforts"];
         match listed.as_array() {
             Some(a) if a.is_empty() => vec![None],
             Some(a) => {
-                let names: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
                 std::iter::once(None)
                     .chain(
-                        ALL_EFFORTS
-                            .iter()
-                            .copied()
-                            .filter(|e| names.contains(e))
-                            .map(Some),
+                        a.iter()
+                            .filter_map(|value| value.as_str())
+                            .filter(|effort| !effort.is_empty())
+                            .map(|effort| Some(effort.to_string())),
                     )
                     .collect()
             }
-            None => EFFORTS.to_vec(),
+            None => EFFORTS
+                .iter()
+                .map(|effort| effort.map(str::to_string))
+                .collect(),
         }
     }
 
     /// The chosen effort, if the highlighted model accepts it.
-    fn effort(&self) -> Option<&'static str> {
+    fn effort(&self) -> Option<String> {
         let all = self.efforts();
         all.get(self.effort_idx % all.len().max(1))
-            .copied()
+            .cloned()
             .flatten()
     }
 }
-
-/// Every effort level a model may accept, lowest first.
-const ALL_EFFORTS: [&str; 4] = ["minimal", "low", "medium", "high"];
 
 /// A Session's unsent input and attachments.
 #[derive(Default)]
@@ -9070,7 +9068,7 @@ impl App {
             let Some(model) = o.picker.choice() else {
                 return;
             };
-            let effort = o.effort().map(str::to_string);
+            let effort = o.effort();
             self.model_overlay = None;
             if global {
                 // Settings go through the daemon (principle 6).
@@ -13367,7 +13365,7 @@ fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     } else {
         Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
-            Span::raw(o.effort().unwrap_or("default (provider)")),
+            Span::raw(o.effort().unwrap_or_else(|| "default (provider)".into())),
             Span::styled("  (Tab to change)", ui::dim(color)),
         ])
     };
@@ -32738,6 +32736,29 @@ mod tests {
         assert!(render(&mut app, 80, 24).contains("Effort"));
         app.key(key(KeyCode::Esc));
         assert!(app.model_overlay.is_none());
+    }
+
+    #[test]
+    fn model_overlay_keeps_custom_effort_options() {
+        let mut picker = picker::ModelPicker::loading();
+        picker.set_items(
+            vec![picker::ModelItem {
+                id: "custom-model".into(),
+                source: None,
+                recent: false,
+                detail: None,
+            }],
+            "custom-model",
+        );
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({"custom-model":{"efforts":["ultra"]}}),
+            effort_idx: 1,
+            default_only: false,
+        };
+
+        assert_eq!(overlay.efforts(), vec![None, Some("ultra".into())]);
+        assert_eq!(overlay.effort().as_deref(), Some("ultra"));
     }
 
     #[test]
