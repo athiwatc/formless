@@ -2694,11 +2694,15 @@ impl Store {
         if msg.role != "user" {
             return Ok(None);
         }
-        let replacement_meta = msg.meta.as_deref().and_then(|metadata| {
-            let mut meta = serde_json::from_str::<Value>(metadata).ok()?;
-            let removed = meta.as_object_mut()?.remove("steer").is_some();
-            removed.then(|| meta.to_string())
-        });
+        let replacement_meta = if msg.content.as_str() != content {
+            msg.meta.as_deref().and_then(|metadata| {
+                let mut meta = serde_json::from_str::<Value>(metadata).ok()?;
+                let removed = meta.as_object_mut()?.remove("steer").is_some();
+                removed.then(|| meta.to_string())
+            })
+        } else {
+            None
+        };
         let meta_changed = replacement_meta.is_some();
         if let Some(metadata) = replacement_meta {
             msg.meta = Some(metadata);

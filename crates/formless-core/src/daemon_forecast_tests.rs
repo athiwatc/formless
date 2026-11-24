@@ -468,6 +468,44 @@ async fn retry_override_is_the_immutable_forecast_and_dispatch_model() {
 }
 
 #[tokio::test]
+async fn retry_run_preserves_steer_provenance_when_content_is_unchanged() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    cfg.limits.forecast_confirm_usd = None;
+    cfg.save(&paths).unwrap();
+    let st = Store::open(&paths.db_file()).unwrap();
+    let user = st
+        .append_message_meta(
+            &sid,
+            "user",
+            "original",
+            Some(
+                json!({
+                    "review_context":{"path":"fixture.rs"},
+                    "steer":{"run_id":"source-run","step":2,"context_included":true}
+                })
+                .to_string(),
+            ),
+        )
+        .unwrap();
+    d.handle(Request::RetryRun {
+        session_id: sid.clone(),
+        expected_run_id: None,
+        model: None,
+        keep_original: false,
+    })
+    .await
+    .unwrap();
+    let retried = st.get_message(&sid, &user.id).unwrap().unwrap();
+    let meta: Value = serde_json::from_str(retried.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["review_context"]["path"], "fixture.rs");
+    assert_eq!(meta["steer"]["run_id"], "source-run");
+    assert_eq!(meta["steer"]["step"], 2);
+    assert_eq!(meta["steer"]["context_included"], true);
+    cancel_fixture_run(&d, &sid).await;
+}
+
+#[tokio::test]
 async fn retry_expected_run_rejects_a_stale_selection_without_editing_or_forking() {
     let env = crate::credential_env::EnvGuard::isolated();
     let (_root, paths, d, sid, mut cfg) = setup(&env);
