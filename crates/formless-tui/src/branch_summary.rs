@@ -60,7 +60,7 @@ pub fn affects(event: &Event, source: &str, target: &str) -> bool {
     }
     let id = match event {
         Event::MessageAppended { session_id, .. }
-        | Event::MessagesEdited { session_id }
+        | Event::MessagesEdited { session_id, .. }
         | Event::RunStarted { session_id, .. }
         | Event::RunFinished { session_id, .. }
         | Event::RunPaused { session_id, .. }
@@ -216,14 +216,16 @@ mod tests {
         assert!(!state.current(0, "source", "target", Some("target")));
         assert!(affects(
             &Event::MessagesEdited {
-                session_id: "source".into()
+                session_id: "source".into(),
+                metadata_only: None,
             },
             "source",
             "target"
         ));
         assert!(!affects(
             &Event::MessagesEdited {
-                session_id: "other".into()
+                session_id: "other".into(),
+                metadata_only: None,
             },
             "source",
             "target"

@@ -794,6 +794,7 @@ struct RunAdmission {
     resolved_model: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
+    resumed_from: Option<String>,
     first_message_seq: i64,
     first: StdMutex<
         Option<(
@@ -801,6 +802,7 @@ struct RunAdmission {
             Vec<Value>,
             String,
             Arc<crate::provider::FrozenAttachments>,
+            Vec<crate::storage::SteerCandidate>,
         )>,
     >,
 }
@@ -2123,6 +2125,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: topic.source_session_id.clone(),
+                    metadata_only: None,
                 });
                 if let Some(session_id) = &topic.topic_session_id {
                     if let Some(session) = self.with_reader(|st| st.get_session(session_id))? {
@@ -2611,6 +2614,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(serde_json::to_value(msg)?)
@@ -3057,6 +3061,7 @@ impl Daemon {
                 }
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(json!({"model":model,"original_session":original.map(|s|s.id)}))
@@ -4283,11 +4288,22 @@ impl Daemon {
             Request::ListBuiltinStats { since } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.builtin_stats(since.as_deref()))?,
             )?),
-            Request::UsageByDay { since, by } => {
+            Request::UsageByDay {
+                since,
+                by,
+                utc_offset_minutes,
+            } => {
+                if let Some(offset) = utc_offset_minutes {
+                    anyhow::ensure!(
+                        (-1439..=1439).contains(&offset),
+                        "usage UTC offset must be between -1439 and 1439 minutes"
+                    );
+                }
                 let by = by.unwrap_or_default();
                 let cfg = self.config()?;
-                let rows =
-                    self.with_reader(|st| st.usage_grouped_with_labels(since.as_deref(), &by))?;
+                let rows = self.with_reader(|st| {
+                    st.usage_grouped_with_labels(since.as_deref(), &by, utc_offset_minutes)
+                })?;
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 struct UsageBucket {
@@ -6167,10 +6183,7 @@ impl Daemon {
         }
         match control {
             Some(control) => {
-                let step = self
-                    .with_reader(|st| st.run_steps(&control.run_id))
-                    .unwrap_or(0);
-                let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
+                let extra = Some(("steer", json!({"run_id":control.run_id})));
                 let run_id = control.run_id.clone();
                 let result = json!({"steered":true,"run_id":run_id});
                 let (message, outcome, inserted) = self.with_store(|st| {
@@ -6234,7 +6247,7 @@ impl Daemon {
                         }
                         let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
                         let admission =
-                            self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                            self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                         let run_id = st.create_run(&session_id)?;
                         st.record_forecast(&run_id, &forecast)?;
                         let outcome = json!({"started":true,"run_id":run_id});
@@ -6282,11 +6295,30 @@ impl Daemon {
                 };
                 let output = mutation(st)?;
                 // Freeze the same pre-Run request the forecast described.
-                let admission = self.prepare_run_admission(st, cfg, session_id, &forecast)?;
+                let admission = self.prepare_run_admission(
+                    st,
+                    cfg,
+                    session_id,
+                    &forecast,
+                    resumed_from.clone(),
+                )?;
+                let candidate_ids = admission
+                    .first
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(_, _, _, _, candidates)| {
+                        candidates
+                            .iter()
+                            .map(|candidate| candidate.id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let id = st.create_run(session_id)?;
                 st.record_forecast(&id, &forecast)?;
-                if let Some(previous) = resumed_from {
-                    st.resume_session_plan(session_id, &previous, &id)?;
+                if let Some(previous) = resumed_from.as_deref() {
+                    st.rebind_pending_steers_for_resume(session_id, previous, &id, &candidate_ids)?;
+                    st.resume_session_plan(session_id, previous, &id)?;
                 }
                 Ok((output, id, admission))
             })
@@ -6299,6 +6331,7 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         forecast: &RunForecast,
+        resumed_from: Option<String>,
     ) -> Result<Arc<RunAdmission>> {
         Self::ensure_session_description_trust(st, session_id)?;
         let session = st
@@ -6384,6 +6417,7 @@ impl Daemon {
             )?
             .0;
         let first_message_seq = cache.last_included_seq();
+        let first_steer_candidates = cache.included_steer_candidates().to_vec();
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .resolved_dispatch(&forecast.basis.model)
@@ -6397,8 +6431,15 @@ impl Daemon {
             resolved_model: forecast.basis.model.clone(),
             effort,
             recovery_messages,
+            resumed_from,
             first_message_seq,
-            first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
+            first: StdMutex::new(Some((
+                ctx,
+                defs,
+                checkpoint,
+                sources,
+                first_steer_candidates,
+            ))),
         }))
     }
 
@@ -6606,7 +6647,8 @@ impl Daemon {
                         },
                     )?,
                 };
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok((id, admission))
@@ -7076,7 +7118,8 @@ impl Daemon {
                     None,
                     !no_pending_attachments,
                 )?;
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok(Some((msg, id, admission)))
@@ -7401,6 +7444,9 @@ impl Daemon {
         let first_message_seq = admitted
             .as_ref()
             .map_or(0, |admission| admission.first_message_seq);
+        let resumed_from = admitted
+            .as_ref()
+            .and_then(|admission| admission.resumed_from.clone());
         let pipeline = admitted.as_ref().and_then(|a| a.pipeline.clone());
         if pipeline
             .as_ref()
@@ -7488,7 +7534,7 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let route_context = if let Some((ctx, _, _, _)) = &first {
+        let route_context = if let Some((ctx, _, _, _, _)) = &first {
             let mut ctx = ctx.clone();
             if let Some(policy) = &pipeline {
                 policy.options.project_context(&mut ctx)?;
@@ -7505,7 +7551,7 @@ impl Daemon {
             )?
             .0
         };
-        let route_defs = if let Some((_, defs, _, _)) = &first {
+        let route_defs = if let Some((_, defs, _, _, _)) = &first {
             defs.clone()
         } else {
             self.with_store(|st| {
@@ -7561,7 +7607,7 @@ impl Daemon {
         )
         .await?;
 
-        if let Some((_, _, checkpoint, _)) = &first {
+        if let Some((_, _, checkpoint, _, _)) = &first {
             if self.with_reader(|st| {
                 Ok(crate::forecast::hash(
                     &st.latest_checkpoint_record(session_id)?,
@@ -7590,14 +7636,27 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources, consumed_seq) =
-                if let Some((mut ctx, defs, _, sources)) = first.take() {
-                    if let Some(policy) = &pipeline {
-                        policy.options.project_context(&mut ctx)?;
-                    }
-                    (ctx, defs, Some(sources), first_message_seq)
-                } else {
-                    let (built, consumed_seq) = self.session_context_with_policy_tracked(
+            let (ctx, defs, sources, consumed_seq, included_steer_candidates) = if let Some((
+                mut ctx,
+                defs,
+                _,
+                sources,
+                included_steer_candidates,
+            )) = first.take()
+            {
+                if let Some(policy) = &pipeline {
+                    policy.options.project_context(&mut ctx)?;
+                }
+                (
+                    ctx,
+                    defs,
+                    Some(sources),
+                    first_message_seq,
+                    included_steer_candidates,
+                )
+            } else {
+                let (built, consumed_seq, included_steer_candidates) = self
+                    .session_context_with_policy_tracked(
                         session_id,
                         &provider,
                         &model,
@@ -7605,12 +7664,17 @@ impl Daemon {
                         cfg.compaction.fraction(),
                         pipeline.as_ref().map(|p| &p.options),
                     )?;
-                    let ctx = built.0;
-                    let defs = self.with_store(|st| {
-                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                    })?;
-                    (ctx, defs, None, consumed_seq)
-                };
+                let ctx = built.0;
+                let defs = self.with_store(|st| {
+                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                })?;
+                (ctx, defs, None, consumed_seq, included_steer_candidates)
+            };
+            let included_steer_message_ids = crate::storage::steer_message_ids_for_run(
+                &included_steer_candidates,
+                run_id,
+                resumed_from.as_deref(),
+            );
             let call_provider = match sources {
                 Some(sources) => provider.clone().with_frozen_attachments(sources),
                 None => provider.clone(),
@@ -7638,7 +7702,30 @@ impl Daemon {
                 last_byte.store(epoch_ms(), Ordering::SeqCst);
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
-                self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let step = self.with_reader(|st| st.run_steps(run_id))? + 1;
+                let dispatch_daemon = self.clone();
+                let dispatch_session = session_id.to_string();
+                let dispatch_run = run_id.to_string();
+                let dispatch_steer_ids = included_steer_message_ids.clone();
+                let dispatch_resumed_from = resumed_from.clone();
+                let request_provider = call_provider
+                    .clone()
+                    .with_request_dispatch_hook(Arc::new(move || {
+                        dispatch_daemon.mark_steering_context_included(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                            &dispatch_steer_ids,
+                            dispatch_resumed_from.as_deref(),
+                            step,
+                        )?;
+                        dispatch_daemon.mark_context_consumed(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                        );
+                        Ok(())
+                    }));
                 let mut correlated = transcript_attempts::Attempt::start(
                     self.transcript_attempts.clone(), self.subs.clone(),
                     session_id, run_id, &transcript_turn, consumed_seq, !hide_candidate,
@@ -7649,7 +7736,7 @@ impl Daemon {
                     "run",
                     session_id,
                     run_id,
-                    call_provider.chat_stream(
+                    request_provider.chat_stream(
                         &ctx,
                         &defs,
                         &model,
@@ -8143,7 +8230,7 @@ impl Daemon {
                             session_id,
                             "tool",
                             &truncated_call_message(&tc.name),
-                            Some(tool_result_meta(&tc.id, &tc.name, true)),
+                            Some(tool_result_meta(&tc.id, &tc.name, true, None)),
                         )
                     })?;
                     self.broadcast(Event::MessageAppended {
@@ -8184,6 +8271,7 @@ impl Daemon {
                 let denied = denied.clone();
                 let skip = skipped.contains(&tc.id);
                 futs.push(async move {
+                    let started = std::time::Instant::now();
                     let (text, is_error, correction) = if skip {
                         (
                             "skipped: the user chose not to run this call (step mode). \
@@ -8198,7 +8286,8 @@ impl Daemon {
                         )
                         .await
                     };
-                    (tc, text, is_error, correction)
+                    let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    (tc, text, is_error, correction, elapsed_ms)
                 });
             }
             let results = futures_util::future::join_all(futs).await;
@@ -8212,7 +8301,7 @@ impl Daemon {
             let mut warned = std::collections::HashSet::new();
             let mut stuck = None;
             let mut correction_batch = CorrectionBatch::default();
-            for (tc, text, is_error, correction) in results {
+            for (tc, text, is_error, correction, elapsed_ms) in results {
                 // A result that holds a secret is still sent (blocking would
                 // break the task), but the user hears about it once per Tool
                 // and kind in this Run (#709).
@@ -8233,7 +8322,13 @@ impl Daemon {
                         "tool",
                         &text,
                         Some(Self::data_meta(
-                            st, session_id, run_id, &tc.id, &tc.name, is_error,
+                            st,
+                            session_id,
+                            run_id,
+                            &tc.id,
+                            &tc.name,
+                            is_error,
+                            Some(elapsed_ms),
                         )?),
                     )
                 })?;
@@ -8381,7 +8476,7 @@ impl Daemon {
                     let selected=self.action_model(st,&cfg,&input)?;
                     let forecast=self.forecast_estimate_selected(st,&cfg,&input,Some(&selected))?;
                     if forecast.confirmation_required {return Err(refusal(&forecast));}
-                    let admission=self.prepare_run_admission(st,&cfg,&fork.id,&forecast)?;
+                    let admission = self.prepare_run_admission(st, &cfg, &fork.id, &forecast, None)?;
                     let run=st.create_run(&fork.id)?;st.record_forecast(&run,&forecast)?;
                     prepared.push((fork,message,run,admission,model.clone()));
                 }
@@ -15112,8 +15207,10 @@ impl Daemon {
         call: &str,
         name: &str,
         error: bool,
+        elapsed_ms: Option<u64>,
     ) -> Result<String> {
-        let mut meta: Value = serde_json::from_str(&tool_result_meta(call, name, error))?;
+        let mut meta: Value =
+            serde_json::from_str(&tool_result_meta(call, name, error, elapsed_ms))?;
         let (source, origins) = Self::result_sources(st, session, run, call, name)?;
         meta["data_source_tool"] = json!(source);
         meta["data_origins"] = json!(origins);
@@ -15569,7 +15666,7 @@ impl Daemon {
             trigger_fraction,
             policy,
         )
-        .map(|(built, _)| built)
+        .map(|(built, _, _)| built)
     }
     #[allow(clippy::too_many_arguments)]
     fn session_context_with_policy_tracked(
@@ -15580,7 +15677,11 @@ impl Daemon {
         context_tokens: u32,
         trigger_fraction: f64,
         policy: Option<&crate::pipeline::CompiledRunOptions>,
-    ) -> Result<(crate::storage::BuiltContext, i64)> {
+    ) -> Result<(
+        crate::storage::BuiltContext,
+        i64,
+        Vec<crate::storage::SteerCandidate>,
+    )> {
         let prompt = self.session_prompt(session_id)?;
         let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
@@ -15595,6 +15696,7 @@ impl Daemon {
             if let Some(policy) = policy {
                 policy.project_context(&mut built.0)?;
             }
+            let included_steer_candidates = cache.included_steer_candidates().to_vec();
             let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
@@ -15605,6 +15707,7 @@ impl Daemon {
             Ok((
                 cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction),
                 included_seq,
+                included_steer_candidates,
             ))
         });
         if built.is_ok() {
@@ -18075,8 +18178,17 @@ fn call_failed(text: String) -> String {
 }
 
 /// A stored tool message's meta: call identity and explicit outcome.
-pub(crate) fn tool_result_meta(call_id: &str, name: &str, is_error: bool) -> String {
-    json!({"tool_call_id": call_id, "name": name, "is_error": is_error}).to_string()
+pub(crate) fn tool_result_meta(
+    call_id: &str,
+    name: &str,
+    is_error: bool,
+    elapsed_ms: Option<u64>,
+) -> String {
+    let mut meta = json!({"tool_call_id": call_id, "name": name, "is_error": is_error});
+    if let Some(elapsed_ms) = elapsed_ms {
+        meta["elapsed_ms"] = json!(elapsed_ms);
+    }
+    meta.to_string()
 }
 
 #[cfg(test)]
@@ -18094,7 +18206,7 @@ fn stored_tool_result_outcome_preserves_provider_projection() {
     };
     let legacy_projection = crate::storage::provider_message(&message);
     for is_error in [false, true] {
-        let meta = tool_result_meta("call", "tool_name", is_error);
+        let meta = tool_result_meta("call", "tool_name", is_error, None);
         let parsed: Value = serde_json::from_str(&meta).unwrap();
         assert_eq!(parsed["is_error"].as_bool(), Some(is_error));
         message.meta = Some(meta);
@@ -18105,6 +18217,14 @@ fn stored_tool_result_outcome_preserves_provider_projection() {
         }
         assert_eq!(crate::storage::provider_message(&message), expected);
     }
+    let timed_meta = tool_result_meta("call", "tool_name", false, Some(1234));
+    let timed: Value = serde_json::from_str(&timed_meta).unwrap();
+    assert_eq!(timed["elapsed_ms"].as_u64(), Some(1234));
+    message.meta = Some(timed_meta);
+    assert_eq!(
+        crate::storage::provider_message(&message),
+        legacy_projection
+    );
 }
 
 /// Outcome of a built-in call from its result text (no payload kept):

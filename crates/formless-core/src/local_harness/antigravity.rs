@@ -25,6 +25,7 @@ pub const SPEC: AgentSpec = AgentSpec {
     args: agent_args,
     check_agent,
     not_signed_in: "Antigravity is not signed in. Run `agy` in a terminal and complete its sign-in, then retry. Formless does not handle Antigravity credentials.",
+    auth_error_codes: &[-32000],
     read_only_modes: &["plan"],
     read_only_fail_closed: true,
     write_modes: &[],
@@ -919,6 +920,7 @@ sleep 5
             mcp_args: vec!["mcp-argument-secret".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: Some(PathBuf::from("/secret/agy")),
+            executable_argv0: None,
             environment: BTreeMap::<OsString, OsString>::new(),
         }
     }

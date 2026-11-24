@@ -6777,6 +6777,7 @@ fn typed_transcript_gap_notices_stay_visible_until_a_trusted_snapshot_replaces_t
                 .apply_transcript_event(
                     &formless_protocol::Event::MessagesEdited {
                         session_id: id.clone(),
+                        metadata_only: None,
                     },
                     cx,
                 )

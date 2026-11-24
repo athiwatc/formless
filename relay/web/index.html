@@ -88,7 +88,8 @@
           </div>
         </div>
         <div id="topic-context" class="topic-context hidden" aria-label="Topic workflow"></div>
-        <div id="transcript" class="transcript" tabindex="0" aria-live="polite"></div>
+        <div id="transcript" class="transcript" tabindex="0"></div>
+        <div id="chat-announcer" class="sr-only" role="status" aria-atomic="true"></div>
         <button id="jump" class="jump hidden" type="button">↓ New output</button>
         <form id="composer" class="composer">
           <div id="run-banner" class="run-banner hidden"></div>
@@ -247,6 +248,6 @@
 </div>
 
 <input id="file-input" type="file" accept="application/json,.json" class="hidden">
-<div id="toasts" class="toasts" aria-live="assertive" data-dialog-keep></div>
+<div id="toasts" class="toasts" data-dialog-keep></div>
 </body>
 </html>

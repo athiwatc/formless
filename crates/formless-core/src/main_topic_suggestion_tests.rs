@@ -560,9 +560,9 @@ async fn main_topic_suggests_accounting_outline_without_workspace() {
         .unwrap();
     let outline = json!([
         {"title": "Scan receipts", "instructions": "Read and extract receipt details.",
-            "harness": "acp", "acp_agent": "fixture-agent", "access": "read_only"},
+            "harness": "acp", "acp_agent": "gemini", "access": "read_only"},
         {"title": "Do accounting", "instructions": "Reconcile entries against receipts.",
-            "harness": "acp", "acp_agent": "fixture-agent", "access": "write"},
+            "harness": "acp", "acp_agent": "gemini", "access": "write"},
         {"title": "Create reports", "instructions": "Summarize the reconciled entries.",
             "access": "write"},
     ]);
@@ -581,7 +581,7 @@ async fn main_topic_suggests_accounting_outline_without_workspace() {
     assert_eq!(topic.outline[0].title, "Scan receipts");
     assert!(topic.outline[0].harness.is_some());
     assert_eq!(topic.outline[0].harness, topic.outline[1].harness);
-    assert_eq!(topic.outline[0].acp_agent.as_deref(), Some("fixture-agent"));
+    assert_eq!(topic.outline[0].acp_agent.as_deref(), Some("gemini"));
     assert_eq!(topic.outline[1].title, "Do accounting");
     assert_eq!(topic.outline[2].title, "Create reports");
     assert!(topic.outline[2].harness.is_none());
@@ -824,6 +824,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "read-context-framed",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let raw = st.append_message_meta(
@@ -834,6 +835,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "read-context-raw",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let user_quote = st.append_message_meta(
@@ -844,6 +846,7 @@ async fn topic_suggestion_context_is_scoped_until_user_enables_external_access()
                         "quoted-read-context",
                         READ_TOPIC_CONTEXT,
                         false,
+                        None,
                     )),
                 )?;
                 let assistant_quote = st.append_message(story_chat, "assistant", &raw_context)?;

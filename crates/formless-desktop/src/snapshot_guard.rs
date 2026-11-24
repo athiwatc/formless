@@ -338,6 +338,7 @@ mod tests {
             dropped("s1", vec![DroppedEventKind::MessageDelta]),
             Event::MessagesEdited {
                 session_id: "s1".into(),
+                metadata_only: None,
             },
             Event::StreamRestarted {
                 session_id: "s1".into(),

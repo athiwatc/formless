@@ -74,7 +74,8 @@ try:
             assert name.text_content()=='⚙ read'
             metrics = name.evaluate('el=>[el.getBoundingClientRect().height,parseFloat(getComputedStyle(el).lineHeight)]')
             assert metrics[0] <= metrics[1]+1,metrics
-            assert page.locator('#result-control .tname').evaluate('el=>getComputedStyle(el).whiteSpace')=='nowrap'
+            assert page.locator('#result-control .tname').evaluate('el=>getComputedStyle(el).whiteSpace')=='normal'
+            assert page.locator('#result-control summary').evaluate('el=>getComputedStyle(el).flexWrap')=='wrap'
             assert page.locator('#live-control .tname').evaluate('el=>getComputedStyle(el).whiteSpace')=='normal'
             assert page.locator('#live-control summary').evaluate('el=>getComputedStyle(el).flexWrap')=='wrap'
             print(f'PASS historical names/argument clipping/disclosure/control styles {width}px / {font}px',flush=True)

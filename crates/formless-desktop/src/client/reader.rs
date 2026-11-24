@@ -907,6 +907,7 @@ mod overlap_tests {
             engine
                 .receive(ServerMessage::Event(Event::MessagesEdited {
                     session_id: "a".into(),
+                    metadata_only: None,
                 }))
                 .unwrap();
             engine.receive(ServerMessage::ok(request.id,json!({"snapshot":{"session":{"id":"a"},"messages":[],"running":false,"pending_events":[]},"barrier":{"epoch":"34c91207-90ec-47cf-99e4-9e080d96bc2c","cursor":1},"mode":"future_attempts_only_v1"}))).unwrap();
