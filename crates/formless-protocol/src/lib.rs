@@ -5933,10 +5933,15 @@ mod ollama_pull_wire_tests {
         let cancel = Request::CancelOllamaPull {
             pull_id: "pull-1".into(),
         };
+        let encoded_cancel = serde_json::to_value(cancel).unwrap();
         assert_eq!(
-            serde_json::to_value(cancel).unwrap(),
+            encoded_cancel,
             json!({"type":"cancel_ollama_pull","pull_id":"pull-1"})
         );
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded_cancel).unwrap(),
+            Request::CancelOllamaPull { pull_id } if pull_id == "pull-1"
+        ));
 
         let legacy_event: Event = serde_json::from_value(json!({
             "type": "model_pull_progress",
