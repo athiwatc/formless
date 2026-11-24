@@ -14,9 +14,28 @@ use tokio_util::sync::CancellationToken;
 use super::acp::{self, AgentSpec, PermissionHandler};
 use super::{HarnessRequest, HarnessResult, StepAccess};
 
+#[derive(Debug)]
+enum AgentCompatibilityError {
+    ProtocolVersion,
+    AgentName(String),
+}
+
+impl std::fmt::Display for AgentCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolVersion => formatter.write_str("The agent does not speak ACP v1."),
+            Self::AgentName(expected) => {
+                write!(formatter, "Expected ACP agentInfo.name `{expected}`.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentCompatibilityError {}
+
 fn check_identity(initialized: &Value, expected: Option<&str>) -> Result<()> {
     if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
-        bail!("The agent does not speak ACP v1.");
+        return Err(AgentCompatibilityError::ProtocolVersion.into());
     }
     if let Some(expected) = expected {
         if initialized
@@ -24,7 +43,7 @@ fn check_identity(initialized: &Value, expected: Option<&str>) -> Result<()> {
             .and_then(Value::as_str)
             != Some(expected)
         {
-            bail!("Expected ACP agentInfo.name `{expected}`.");
+            return Err(AgentCompatibilityError::AgentName(expected.into()).into());
         }
     }
     Ok(())

@@ -705,7 +705,12 @@ impl Daemon {
                 } else {
                     "not signed in"
                 });
-            bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+            let retry_guidance = if availability.installed && missing_acp_executable {
+                "Check the selected ACP executable/profile"
+            } else {
+                "Install/sign in"
+            };
+            bail!("{:?} is not ready: {detail}. {retry_guidance} and retry, or ask the user with topic_request_harness_substitute",step.harness);
         }
         if step.harness == HarnessKind::Antigravity {
             local_harness::antigravity::require_selected_executable(

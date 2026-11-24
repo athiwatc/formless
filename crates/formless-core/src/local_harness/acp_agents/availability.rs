@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, ffi::OsString, fs, path::PathBuf, time::Duratio
 
 use formless_protocol::{HarnessAvailability, HarnessKind};
 
-use super::{acp, require_spec, session_requires_auth, HarnessRequest, StepAccess};
+use super::{
+    acp, require_spec, session_requires_auth, AgentCompatibilityError, HarnessRequest, StepAccess,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const BRIDGE_ENV: &[&str] = &[
@@ -166,6 +168,14 @@ fn with_timeout_with_executable(
         Ok(Ok(_)) => result.detail = Some("ACP session/new returned no session id.".into()),
         Ok(Err(code)) => {
             result.detail = Some(format!("ACP readiness failed (JSON-RPC error {code})."))
+        }
+        Err(error) if error.downcast_ref::<AgentCompatibilityError>().is_some() => {
+            result.detail = Some(format!("ACP protocol or identity mismatch: {error:#}"));
+            return AvailabilityWithExecutable {
+                availability: result,
+                executable: None,
+                executable_argv0: None,
+            };
         }
         Err(error) => result.detail = Some(format!("ACP readiness is unknown: {error:#}")),
     }

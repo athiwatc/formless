@@ -79,13 +79,21 @@ done
         }
     }
 
-    fn probe(&self, id: &str) -> HarnessAvailability {
-        let result = availability(id, Some(self.executable.clone()), &self.environment);
+    fn probe_with_executable(&self, id: &str) -> AvailabilityWithExecutable {
+        let result =
+            availability_with_executable(id, Some(self.executable.clone()), &self.environment);
         let cwd = fs::read_to_string(self.root.0.join("cwd")).unwrap_or_else(|error| {
-            panic!("{id}: {result:?}; fixture did not record cwd: {error}")
+            panic!(
+                "{id}: {:?}; fixture did not record cwd: {error}",
+                result.availability
+            )
         });
         assert!(!Path::new(&cwd).exists(), "probe cwd must be removed");
         result
+    }
+
+    fn probe(&self, id: &str) -> HarnessAvailability {
+        self.probe_with_executable(id).availability
     }
 
     fn session(&mut self, value: Value) {
@@ -242,6 +250,27 @@ fn readiness_other_errors_and_empty_sessions_are_unknown() {
     assert!(result.installed);
     assert_eq!(result.signed_in, None);
     assert!(result.detail.unwrap().contains("ACP v1"));
+}
+
+#[test]
+fn readiness_identity_mismatch_is_not_launchable() {
+    let mut fixture = Fixture::new("cline");
+    let mut initialize: Value = serde_json::from_str(include_str!("captured.json")).unwrap();
+    initialize["cline"]["initialize"]["result"]["agentInfo"]["name"] = json!("other-agent");
+    fixture.environment.insert(
+        "PROBE_INITIALIZE".into(),
+        initialize["cline"]["initialize"].to_string().into(),
+    );
+
+    let readiness = fixture.probe_with_executable("cline");
+
+    assert!(readiness.availability.installed);
+    assert_eq!(readiness.availability.signed_in, None);
+    let detail = readiness.availability.detail.as_deref().unwrap();
+    assert!(detail.contains("ACP protocol or identity mismatch"));
+    assert!(detail.contains("Expected ACP agentInfo.name `cline`."));
+    assert!(readiness.executable.is_none());
+    assert!(readiness.executable_argv0.is_none());
 }
 
 #[test]
