@@ -2912,7 +2912,7 @@ fn is_cargo_build_executable(exe: &str) -> bool {
 
 fn is_winget_executable(exe: &str) -> bool {
     let normalized = exe.replace('\\', "/").to_ascii_lowercase();
-    normalized.contains("/winget/packages/")
+    normalized.contains("/winget/packages/") || normalized.contains("/winget/links/")
 }
 
 fn platform_upgrade_command(exe: &str, windows: bool) -> &'static str {
@@ -10579,6 +10579,13 @@ exit "$FORMLESS_FIXTURE_CURL_STATUS"
         assert_eq!(
             super::platform_upgrade_command(
                 r"C:\Users\person\AppData\Local\Microsoft\WinGet\Packages\athiwatc.formless\formless.exe",
+                true
+            ),
+            "winget upgrade --id athiwatc.formless --exact"
+        );
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Microsoft\WinGet\Links\formless.exe",
                 true
             ),
             "winget upgrade --id athiwatc.formless --exact"
