@@ -87,14 +87,27 @@
   function clearSubmittedDraft(scope, sessionId, snapshot) {
     const fallbackKey = sessionCacheKey(scope, sessionId);
     const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
+    const sharedValues = S.unpersistedDraftSharedValues || (S.unpersistedDraftSharedValues = new Map());
     const hasFallback = fallbacks.has(fallbackKey);
     const fallback = hasFallback ? fallbacks.get(fallbackKey) : null;
+    const fallbackIsSubmitted = hasFallback && normalizeTextareaValue(fallback) === snapshot;
+    const hasSharedBaseline = hasFallback && sharedValues.has(fallbackKey);
+    const sharedBaseline = hasSharedBaseline ? sharedValues.get(fallbackKey) : null;
     const key = draftStorageKey(scope, sessionId);
     const shared = prefs.get(key, null);
-    if (hasFallback && normalizeTextareaValue(fallback) === snapshot) fallbacks.delete(fallbackKey);
-    if (typeof shared === "string" && normalizeTextareaValue(shared) === snapshot) {
+    if (fallbackIsSubmitted) {
+      fallbacks.delete(fallbackKey);
+      sharedValues.delete(fallbackKey);
+    }
+    const sharedMatchesSnapshot = typeof shared === "string" && normalizeTextareaValue(shared) === snapshot;
+    const sharedIsUnchanged = hasSharedBaseline && typeof shared === "string" && Object.is(shared, sharedBaseline);
+    const shouldRemoveShared = typeof shared === "string" && (fallbackIsSubmitted && hasSharedBaseline ? sharedIsUnchanged : sharedMatchesSnapshot);
+    if (shouldRemoveShared) {
       const removed = typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
-      if (!removed && !fallbacks.has(fallbackKey)) fallbacks.set(fallbackKey, "");
+      if (!removed && !fallbacks.has(fallbackKey)) {
+        fallbacks.set(fallbackKey, "");
+        sharedValues.set(fallbackKey, shared);
+      }
     }
     const latest = loadDraft(scope, sessionId);
     if (scope === S.storageScope) {
@@ -176,6 +189,7 @@
     current: null,
     drafts: {},
     unpersistedDrafts: new Map(),
+    unpersistedDraftSharedValues: new Map(),
     attachmentInventories: {},
     outbox: [],
     outboxFlushing: false,
@@ -223,10 +237,17 @@
     if (!scope) return true;
     const key = draftStorageKey(scope, sessionId);
     S.unpersistedDrafts = S.unpersistedDrafts || new Map();
+    S.unpersistedDraftSharedValues = S.unpersistedDraftSharedValues || new Map();
     const fallbackKey = sessionCacheKey(scope, sessionId);
+    const sharedValue = prefs.get(key, null);
     const saved = value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
-    if (saved) S.unpersistedDrafts.delete(fallbackKey);
-    else S.unpersistedDrafts.set(fallbackKey, value);
+    if (saved) {
+      S.unpersistedDrafts.delete(fallbackKey);
+      S.unpersistedDraftSharedValues.delete(fallbackKey);
+    } else {
+      S.unpersistedDrafts.set(fallbackKey, value);
+      S.unpersistedDraftSharedValues.set(fallbackKey, sharedValue);
+    }
     return saved;
   }
   function restoreDraft(sessionId) {
@@ -538,7 +559,10 @@
       let value = storedValue;
       if (S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)) {
         const fallback = S.unpersistedDrafts.get(fallbackKey);
-        if (fallback === storedValue) S.unpersistedDrafts.delete(fallbackKey);
+        if (normalizeTextareaValue(fallback) === normalizeTextareaValue(storedValue)) {
+          S.unpersistedDrafts.delete(fallbackKey);
+          if (S.unpersistedDraftSharedValues) S.unpersistedDraftSharedValues.delete(fallbackKey);
+        }
         else value = fallback;
       }
       const composer = $("input");

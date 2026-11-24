@@ -1202,6 +1202,7 @@ test('deferred enqueue drops its submitted fallback without deleting a newer sha
   sharedSet(draftKey, 'newer shared draft');
   c.onStorage({ key: 'formless.' + draftKey, newValue: JSON.stringify('newer shared draft') });
   assert.equal(c.S.unpersistedDrafts.get(fallbackKey), 'submitted source draft');
+  assert.equal(c.S.unpersistedDraftSharedValues.get(fallbackKey), 'older shared draft');
   assert.equal(prefs.get(draftKey), 'newer shared draft');
   c.S.daemonOnline = false;
   c.S.channel = null;
@@ -1210,10 +1211,47 @@ test('deferred enqueue drops its submitted fallback without deleting a newer sha
   assert.equal(c.S.current, 'B');
   assert.equal(c.$('input').value, 'draft for Session B');
   assert.equal(c.S.unpersistedDrafts.has(fallbackKey), false);
+  assert.equal(c.S.unpersistedDraftSharedValues.has(fallbackKey), false);
   assert.equal(prefs.get(draftKey), 'newer shared draft');
   assert.equal(c.loadDraft('test-room', 'A'), 'newer shared draft');
   assert.equal(c.S.drafts.A, 'newer shared draft');
   assert.deepEqual(removed, []);
+});
+
+test('deferred enqueue removes an unchanged shared draft superseded by a failed local write', async () => {
+  const prefs = memoryPrefs(), draftKey = 'draft:test-room:A';
+  const sharedSet = prefs.set.bind(prefs);
+  sharedSet(draftKey, 'older shared draft');
+  prefs.set = (key, value) => key === draftKey ? false : sharedSet(key, value);
+  const enqueueStarted = deferred(), enqueueGate = deferred();
+  const c = setup(['submit'], {
+    prefs,
+    crypto: { randomUUID: () => 'remove-superseded-shared-draft' },
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+  });
+  c.S.settings = { limits: {} };
+  c.$('input').value = 'submitted source draft';
+  assert.equal(c.saveDraft('A', 'submitted source draft'), false);
+  const fallbackKey = c.sessionCacheKey('test-room', 'A');
+  assert.equal(c.S.unpersistedDraftSharedValues.get(fallbackKey), 'older shared draft');
+  const enqueue = c.enqueueOutbox;
+  c.enqueueOutbox = async (...args) => {
+    enqueueStarted.resolve();
+    await enqueueGate.promise;
+    return enqueue(...args);
+  };
+  const submitting = c.submit(false);
+  await enqueueStarted.promise;
+  assert.equal(prefs.get(draftKey), 'older shared draft');
+  c.S.daemonOnline = false;
+  c.S.channel = null;
+  enqueueGate.resolve();
+  await submitting;
+  assert.equal(prefs.get(draftKey, null), null);
+  assert.equal(c.S.unpersistedDrafts.has(fallbackKey), false);
+  assert.equal(c.S.unpersistedDraftSharedValues.has(fallbackKey), false);
+  assert.equal(c.loadDraft('test-room', 'A'), '');
+  assert.equal(c.$('input').value, '');
 });
 
 test('MCP CRLF prompts compare as textarea LF without losing meaningful whitespace', async () => {
