@@ -130,18 +130,21 @@ pub fn compile_schema(schema: &Value) -> Result<jsonschema::Validator> {
 
 pub fn validate_object_input_schema(schema: &Value) -> Result<()> {
     let ref_siblings_apply = draft_ref_siblings_apply(schema, true);
+    let mut state = SchemaCheckState::default();
     if schema.is_object()
-        && schema_can_describe_object(
-            schema,
-            schema,
-            ref_siblings_apply,
-            &mut std::collections::HashSet::new(),
-        )
+        && schema_can_describe_object(schema, schema, ref_siblings_apply, &mut state)
     {
         Ok(())
     } else {
         Err(anyhow!("input_schema must describe object inputs; provider function parameters must accept object inputs"))
     }
+}
+
+#[derive(Default)]
+struct SchemaCheckState {
+    active_refs: std::collections::HashSet<(usize, usize)>,
+    completed_refs: std::collections::HashMap<(usize, usize), bool>,
+    cycle_count: usize,
 }
 
 fn draft_ref_siblings_apply(schema: &Value, inherited: bool) -> bool {
@@ -158,7 +161,7 @@ fn schema_can_describe_object(
     resource_root: &Value,
     schema: &Value,
     ref_siblings_apply: bool,
-    active_refs: &mut std::collections::HashSet<(usize, usize)>,
+    state: &mut SchemaCheckState,
 ) -> bool {
     let (resource_root, ref_siblings_apply) = if schema.get("$id").and_then(Value::as_str).is_some()
     {
@@ -191,17 +194,25 @@ fn schema_can_describe_object(
                 resource_root as *const Value as usize,
                 target as *const Value as usize,
             );
-            if active_refs.insert(key) {
-                let allows_objects = schema_can_describe_object(
-                    resource_root,
-                    target,
-                    ref_siblings_apply,
-                    active_refs,
-                );
-                active_refs.remove(&key);
-                if !allows_objects {
-                    return false;
+            let allows_objects = if let Some(allows_objects) =
+                state.completed_refs.get(&key).copied()
+            {
+                allows_objects
+            } else if state.active_refs.insert(key) {
+                let cycle_count = state.cycle_count;
+                let allows_objects =
+                    schema_can_describe_object(resource_root, target, ref_siblings_apply, state);
+                state.active_refs.remove(&key);
+                if state.cycle_count == cycle_count {
+                    state.completed_refs.insert(key, allows_objects);
                 }
+                allows_objects
+            } else {
+                state.cycle_count += 1;
+                true
+            };
+            if !allows_objects {
+                return false;
             }
         }
         if !ref_siblings_apply {
@@ -253,7 +264,7 @@ fn schema_can_describe_object(
                 return false;
             }
             if !branches.iter().any(|branch| {
-                schema_can_describe_object(resource_root, branch, ref_siblings_apply, active_refs)
+                schema_can_describe_object(resource_root, branch, ref_siblings_apply, state)
             }) {
                 return false;
             }
@@ -264,7 +275,7 @@ fn schema_can_describe_object(
             return false;
         };
         if branches.iter().any(|branch| {
-            !schema_can_describe_object(resource_root, branch, ref_siblings_apply, active_refs)
+            !schema_can_describe_object(resource_root, branch, ref_siblings_apply, state)
         }) {
             return false;
         }
@@ -1822,6 +1833,35 @@ mod tests {
             "not": {"type": "object"}
         });
         assert!(validate_object_input_schema(&current).is_err());
+    }
+
+    #[test]
+    fn repeated_shared_schema_refs_use_completed_results() {
+        let depth = 16;
+        let mut definitions = serde_json::Map::new();
+        for index in (0..depth).rev() {
+            let schema = if index + 1 == depth {
+                json!({"type": "object"})
+            } else {
+                let reference = format!("#/$defs/node{}", index + 1);
+                json!({
+                    "type": "object",
+                    "allOf": [{"$ref": reference}, {"$ref": reference}]
+                })
+            };
+            definitions.insert(format!("node{index}"), schema);
+        }
+        let schema = json!({
+            "type": "object",
+            "$defs": definitions,
+            "allOf": [{"$ref": "#/$defs/node0"}]
+        });
+        let mut state = SchemaCheckState::default();
+        assert!(schema_can_describe_object(
+            &schema, &schema, true, &mut state
+        ));
+        assert_eq!(state.completed_refs.len(), depth);
+        assert_eq!(state.cycle_count, 0);
     }
 
     #[test]
