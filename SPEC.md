@@ -7114,9 +7114,11 @@ operations. RequestPermission only raises a user request; it cannot decide one.
 An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
 
-OpenCode readiness uses `FORMLESS_TOPIC_OPENCODE_EXE`, or resolves `opencode`
-from PATH when unset. Its private-cwd probe runs only `--version`; sign-in stays
-unknown because credential-list commands can write state and access the network.
+`FORMLESS_TOPIC_OPENCODE_EXE` must be an absolute executable path; when set, it
+selects the executable for both readiness probes and topic launches. When unset,
+Formless resolves `opencode` from an absolute PATH entry. The private-cwd
+readiness probe runs only `--version`; sign-in stays unknown because
+credential-list commands can write state and access the network.
 OpenCode can still use its free default model without credentials.
 
 The Pi adapter's availability probe accepts an absolute `FORMLESS_TOPIC_PI_EXE`
