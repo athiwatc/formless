@@ -24,8 +24,10 @@ fn session_and_audit_search_fold_greek_final_sigma() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(None).unwrap();
     let message = store.append_message(&session.id, "user", "ος").unwrap();
+    let longer_word = store.append_message(&session.id, "user", "λόγος").unwrap();
     let hits = store.search_sessions("ΟΣ", 10).unwrap();
     assert!(hits.iter().any(|hit| hit.message_id == message.id));
+    assert!(hits.iter().any(|hit| hit.message_id == longer_word.id));
 
     store.audit("tester", "greek_search", "ος").unwrap();
     let entries = store.list_audit(Some("ΟΣ"), None, 10).unwrap();
