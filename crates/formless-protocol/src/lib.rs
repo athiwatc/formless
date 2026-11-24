@@ -491,6 +491,7 @@ pub const FEATURES: &[&str] = &[
     USAGE_BY_DAY_UTC_OFFSET_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
+    "ollama_pull_jobs_v1",
 ];
 
 /// Explicit nullable pair; both keys must be present even when inheriting.
@@ -2997,6 +2998,12 @@ pub enum Request {
     /// `ModelPullProgress`.
     OllamaPull {
         model: String,
+        #[serde(default)]
+        provider: Option<String>,
+    },
+    /// Cancel an active or attached Ollama model pull.
+    CancelOllamaPull {
+        pull_id: String,
     },
     /// Run the same prompt on two or more models, each in a fork of the
     /// Session (`/compare A B [prompt]`, SPEC §5.10): `prompt`, or the
@@ -3935,6 +3942,14 @@ pub enum Event {
         done: bool,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pull_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_size: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
     },
     /// Every Run of a `CompareModels` finished: the answers side by side.
     ComparisonReady {
@@ -5896,5 +5911,52 @@ mod harness_permission_event_wire_tests {
         object.insert("permission_kind".into(), kind);
         let decoded: Vec<Event> = serde_json::from_value(permission_kind_nested).unwrap();
         assert_permission_event(decoded.into_iter().next().unwrap(), "write");
+    }
+}
+
+#[cfg(test)]
+mod ollama_pull_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tracked_pull_protocol_is_additive_and_advertised() {
+        let legacy: Request = serde_json::from_value(json!({
+            "type": "ollama_pull",
+            "model": "llama3"
+        }))
+        .unwrap();
+        assert!(matches!(legacy, Request::OllamaPull { provider: None, .. }));
+
+        let cancel = Request::CancelOllamaPull {
+            pull_id: "pull-1".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(cancel).unwrap(),
+            json!({"type":"cancel_ollama_pull","pull_id":"pull-1"})
+        );
+
+        let legacy_event: Event = serde_json::from_value(json!({
+            "type": "model_pull_progress",
+            "model": "llama3",
+            "status": "pulling",
+            "completed": 1,
+            "total": 2,
+            "done": false,
+            "error": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy_event,
+            Event::ModelPullProgress {
+                pull_id: None,
+                provider: None,
+                expected_size: None,
+                warning: None,
+                ..
+            }
+        ));
+        assert!(FEATURES.contains(&"ollama_pull_jobs_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

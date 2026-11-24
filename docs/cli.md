@@ -38,6 +38,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
 | `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
+| `formless pull` | `MODEL`; optional `--provider NAME` | Download an Ollama model and print line-oriented progress. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |

@@ -13,6 +13,7 @@ mod cli_price_import;
 mod cli_prices;
 mod cli_proposal_diff;
 mod cli_provider_test;
+mod cli_pull;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_run_memories;
@@ -346,6 +347,18 @@ enum Cmd {
     Providers {
         #[command(subcommand)]
         action: ProvidersAction,
+    },
+    /// Download an Ollama model and print line-oriented progress
+    #[command(
+        after_help = "Examples:\n  formless pull llama3.2\n  formless pull llama3.2 --provider local"
+    )]
+    Pull {
+        /// Ollama model name to download (for example, `llama3.2`)
+        #[arg(value_name = "MODEL")]
+        model: String,
+        /// Use a named provider (default: the default provider)
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Hosted relay + web frontend (SPEC §12, v2)
     #[command(
@@ -2530,6 +2543,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Cmd::Providers { action }) => providers_cmd(paths, action),
+        Some(Cmd::Pull { model, provider }) => cli_pull::run(&paths, &model, provider.as_deref()),
         Some(Cmd::Prices { action }) => match action {
             PricesAction::Import {
                 provider,

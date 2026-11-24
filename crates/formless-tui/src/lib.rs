@@ -2111,6 +2111,7 @@ struct App {
     mcp_import_pick: Option<String>,
     /// An Ollama download in progress (`/pull`), for the status bar.
     pull_status: Option<String>,
+    pull_id: Option<String>,
     /// One-time onboarding moments, persisted.
     seen: Seen,
     tour: Option<tour::Tour>,
@@ -2138,6 +2139,21 @@ struct App {
     last_click: Option<(Click, Instant)>,
     /// The streaming answer's settled prefix: (key, rendered lines).
     stream_cache: std::cell::RefCell<Option<(StreamKey, markdown::Rendered)>>,
+}
+
+fn pull_event_matches_active(active_pull_id: Option<&str>, event_pull_id: Option<&str>) -> bool {
+    active_pull_id == event_pull_id
+}
+
+#[cfg(test)]
+mod pull_tracking_tests {
+    use super::pull_event_matches_active;
+
+    #[test]
+    fn unrelated_terminal_pull_does_not_match_the_active_cancel_id() {
+        assert!(!pull_event_matches_active(Some("pull-2"), Some("pull-1")));
+        assert!(pull_event_matches_active(Some("pull-2"), Some("pull-2")));
+    }
 }
 
 impl App {
@@ -2400,6 +2416,7 @@ impl App {
             seen: Seen::default(),
             tour: None,
             pull_status: None,
+            pull_id: None,
             step_mode: false,
             step: None,
             editing_step: false,
@@ -6165,19 +6182,49 @@ impl App {
                 total,
                 done,
                 error,
+                pull_id,
+                provider,
+                expected_size,
+                warning,
+                ..
             } => {
                 if done {
-                    self.pull_status = None;
+                    if pull_event_matches_active(self.pull_id.as_deref(), pull_id.as_deref()) {
+                        self.pull_status = None;
+                        self.pull_id = None;
+                    }
                     self.notes.push(match error {
+                        Some(e) if status == "incomplete" => {
+                            let provider = provider
+                                .as_deref()
+                                .filter(|name| *name != formless_core::config::DEFAULT_PROVIDER)
+                                .map(|name| format!(" --provider {name}"))
+                                .unwrap_or_default();
+                            let resume = format!("/pull {model}{provider}");
+                            let guidance = if e.contains("partial download can resume with") {
+                                String::new()
+                            } else {
+                                format!("; rerun `{resume}` to resume")
+                            };
+                            format!("pull for {model} is incomplete: {e}{guidance}")
+                        }
                         Some(e) => format!("could not pull {model}: {e}"),
                         None => format!("pulled {model}; pick it with /model"),
                     });
                 } else {
+                    self.pull_id = pull_id;
                     let pct = match (completed, total) {
                         (Some(c), Some(t)) if t > 0 => format!(" {}%", c * 100 / t),
                         _ => String::new(),
                     };
-                    self.pull_status = Some(format!("pulling {model}: {status}{pct}"));
+                    let expected = expected_size
+                        .map(|size| format!("; expected size {size} bytes"))
+                        .unwrap_or_default();
+                    let warning = warning
+                        .map(|warning| format!("; {warning}"))
+                        .unwrap_or_default();
+                    self.pull_status =
+                        Some(format!("pulling {model}: {status}{pct}{expected}{warning}"));
                 }
             }
             Event::ComparisonReady {
@@ -6354,6 +6401,7 @@ impl App {
                 }
                 if kinds.contains(&K::ModelPullProgress) {
                     self.pull_status = None;
+                    self.pull_id = None;
                     self.notes.push(format!(
                         "download progress unavailable for {}; /models checks installed models",
                         model.as_deref().unwrap_or("model")
@@ -8786,12 +8834,47 @@ impl App {
                 self.request(Pending::TestModel, Request::TestModel { model, provider: None });
             }
             cmd if cmd == "pull" || cmd.starts_with("pull ") => {
-                let model = cmd["pull".len()..].trim().to_string();
-                if model.is_empty() {
-                    self.notes.push("usage: /pull MODEL (Ollama: download a model)".into());
+                let args = cmd["pull".len()..].split_whitespace().collect::<Vec<_>>();
+                if args.first() == Some(&"cancel") {
+                    let pull_id = args
+                        .get(1)
+                        .map(|id| (*id).to_string())
+                        .or_else(|| self.pull_id.clone());
+                    if let Some(pull_id) = pull_id {
+                        self.fire(Request::CancelOllamaPull { pull_id });
+                        self.notes.push("cancelling Ollama pull…".into());
+                    } else {
+                        self.notes.push("usage: /pull cancel [PULL_ID]".into());
+                    }
                 } else {
-                    self.fire(Request::OllamaPull { model: model.clone() });
-                    self.notes.push(format!("pulling {model} with Ollama…"));
+                    let Some(model) = args.first().copied() else {
+                        self.notes.push(
+                            "usage: /pull MODEL [--provider NAME] or /pull cancel [PULL_ID]".into(),
+                        );
+                        return;
+                    };
+                    let mut provider = None;
+                    let mut index = 1;
+                    while index < args.len() {
+                        if args[index] == "--provider" && index + 1 < args.len() {
+                            provider = Some(args[index + 1].to_string());
+                            index += 2;
+                        } else {
+                            self.notes.push(
+                                "usage: /pull MODEL [--provider NAME] or /pull cancel [PULL_ID]"
+                                    .into(),
+                            );
+                            return;
+                        }
+                    }
+                    self.fire(Request::OllamaPull {
+                        model: model.to_string(),
+                        provider: provider.clone(),
+                    });
+                    self.notes.push(match provider {
+                        Some(provider) => format!("checking Ollama provider {provider} for {model}…"),
+                        None => format!("checking the default provider for Ollama model {model}…"),
+                    });
                 }
             }
             cmd if cmd == "summarise-branch" || cmd.starts_with("summarise-branch ") => {
@@ -21092,6 +21175,7 @@ mod tests {
             seen: Seen::default(),
             tour: None,
             pull_status: None,
+            pull_id: None,
             step_mode: false,
             step: None,
             editing_step: false,

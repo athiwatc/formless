@@ -1,0 +1,191 @@
+use anyhow::{anyhow, Context, Result};
+use formless_core::paths::Paths;
+use formless_protocol::{Event, Request, ServerMessage};
+use formless_tui::client::DaemonClient;
+use std::time::Duration;
+
+pub fn run(paths: &Paths, model: &str, provider: Option<&str>) -> Result<()> {
+    formless_core::daemon::ensure_daemon(paths)?;
+    let (client, events) = DaemonClient::connect(paths)?;
+    let subscribe_id = client.send(Request::Subscribe {
+        sessions: None,
+        deltas: false,
+        client: Some("plain CLI pull".into()),
+    });
+    loop {
+        match events
+            .recv_timeout(Duration::from_secs(15))
+            .context("waiting for daemon subscription")?
+        {
+            ServerMessage::Response { id, ok, error, .. } if id == subscribe_id => {
+                if !ok {
+                    return Err(anyhow!(
+                        error.unwrap_or_else(|| "subscription failed".into())
+                    ));
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let request_id = client.send(Request::OllamaPull {
+        model: model.to_string(),
+        provider: provider.map(str::to_string),
+    });
+    let mut pending = Vec::new();
+    let pull_id = loop {
+        match events
+            .recv()
+            .context("daemon connection closed during model pull")?
+        {
+            ServerMessage::Response {
+                id,
+                ok,
+                result,
+                error,
+            } if id == request_id => {
+                if !ok {
+                    return Err(anyhow!(
+                        error.unwrap_or_else(|| "model pull could not start".into())
+                    ));
+                }
+                break result
+                    .and_then(|result| result["pull_id"].as_str().map(str::to_string))
+                    .context("daemon did not return a pull ID")?;
+            }
+            ServerMessage::Event(event) => pending.push(event),
+            _ => {}
+        }
+    };
+
+    for event in pending {
+        if let Some(success) = print_progress(&event, &pull_id) {
+            return terminal_result(success);
+        }
+    }
+    loop {
+        let message = events
+            .recv()
+            .context("daemon connection closed during model pull")?;
+        if let ServerMessage::Event(event) = message {
+            if let Some(success) = print_progress(&event, &pull_id) {
+                return terminal_result(success);
+            }
+        }
+    }
+}
+
+fn terminal_result(success: bool) -> Result<()> {
+    if success {
+        Ok(())
+    } else {
+        Err(anyhow!("model pull did not complete"))
+    }
+}
+
+fn resume_command(model: &str, provider: Option<&str>) -> String {
+    let provider = provider
+        .filter(|provider| *provider != formless_core::config::DEFAULT_PROVIDER)
+        .map(|provider| format!(" --provider {provider}"))
+        .unwrap_or_default();
+    format!("formless pull {model}{provider}")
+}
+
+fn print_progress(event: &Event, pull_id: &str) -> Option<bool> {
+    let Event::ModelPullProgress {
+        model,
+        status,
+        completed,
+        total,
+        done,
+        error,
+        pull_id: Some(event_id),
+        provider,
+        expected_size,
+        warning,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if event_id != pull_id {
+        return None;
+    }
+    let progress = match (completed, total) {
+        (Some(completed), Some(total)) if *total > 0 => {
+            format!(
+                " {}% ({} / {} bytes)",
+                completed * 100 / total,
+                completed,
+                total
+            )
+        }
+        _ => String::new(),
+    };
+    let expected = expected_size
+        .map(|size| format!("; expected size {size} bytes"))
+        .unwrap_or_default();
+    println!("pull {pull_id} {model}: {status}{progress}{expected}");
+    if let Some(warning) = warning {
+        println!("warning: {warning}");
+    }
+    if *done {
+        if let Some(error) = error {
+            println!("error: {error}");
+            if status == "incomplete" {
+                println!(
+                    "partial download can be resumed with `{}`",
+                    resume_command(model, provider.as_deref())
+                );
+            }
+        } else if status == "success" {
+            println!("pulled {model}; select it with `/model`");
+        }
+        Some(error.is_none() && status == "success")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terminal_event(status: &str, error: Option<&str>) -> Event {
+        Event::ModelPullProgress {
+            model: "llama3".into(),
+            status: status.into(),
+            completed: None,
+            total: None,
+            done: true,
+            error: error.map(str::to_string),
+            pull_id: Some("pull-1".into()),
+            provider: Some("remote".into()),
+            expected_size: None,
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn success_and_failure_events_map_to_cli_exit_codes() {
+        let cli_exit_code = |result: Result<()>| {
+            result
+                .map(|()| 0)
+                .unwrap_or_else(|error| crate::exit_code(&error))
+        };
+        let success = print_progress(&terminal_event("success", None), "pull-1").unwrap();
+        assert_eq!(cli_exit_code(terminal_result(success)), 0);
+
+        let failure = print_progress(
+            &terminal_event("incomplete", Some("stream ended")),
+            "pull-1",
+        )
+        .unwrap();
+        assert_eq!(cli_exit_code(terminal_result(failure)), 1);
+        assert_eq!(
+            resume_command("llama3", Some("remote")),
+            "formless pull llama3 --provider remote"
+        );
+    }
+}

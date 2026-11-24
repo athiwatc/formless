@@ -3,7 +3,7 @@ use formless_protocol::*;
 use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -613,9 +613,16 @@ pub(crate) struct PendingEntry {
 /// Never waits: a full queue drops live deltas, and disconnects the client
 /// for anything else (SPEC §9.3).
 fn send_all(subs: &Subs, ev: Event) {
+    send_selected(subs, ev, None);
+}
+
+fn send_selected(subs: &Subs, ev: Event, connections: Option<&BTreeSet<u64>>) {
     subs.lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain_mut(|sub| {
+            if connections.is_some_and(|ids| !ids.contains(&sub.conn)) {
+                return true;
+            }
             if !sub
                 .filter
                 .lock()
@@ -648,6 +655,133 @@ fn send_all(subs: &Subs, ev: Event) {
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
         });
+}
+
+struct OllamaPullRecord {
+    key: (String, String),
+    provider: String,
+    model: String,
+    state: String,
+    clients: BTreeSet<u64>,
+    cancel: CancellationToken,
+    last: Event,
+}
+
+#[derive(Default)]
+struct OllamaPulls {
+    active: HashMap<(String, String), String>,
+    records: HashMap<String, OllamaPullRecord>,
+    finished: VecDeque<String>,
+}
+
+fn ollama_model_parts(model: &str) -> (&str, &str) {
+    match model
+        .rfind(':')
+        .filter(|colon| *colon > model.rfind('/').unwrap_or(0))
+    {
+        Some(colon) => (&model[..colon], &model[colon + 1..]),
+        None => (model, "latest"),
+    }
+}
+
+fn canonical_ollama_model(model: &str) -> String {
+    let (name, tag) = ollama_model_parts(model);
+    if tag == "latest" {
+        name.to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+fn ollama_resume_command(provider: &str, model: &str) -> String {
+    if provider == crate::config::DEFAULT_PROVIDER {
+        format!("/pull {model}")
+    } else {
+        format!("/pull {model} --provider {provider}")
+    }
+}
+
+fn same_ollama_model(left: &str, right: &str) -> bool {
+    ollama_model_parts(left) == ollama_model_parts(right)
+}
+
+fn ollama_disk_warning(base: &str, expected_size: Option<u64>) -> Option<String> {
+    let url = reqwest::Url::parse(base).ok()?;
+    let host = url.host_str()?;
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !local {
+        return None;
+    }
+    let models_dir = std::env::var_os("OLLAMA_MODELS")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            directories::UserDirs::new().map(|user| user.home_dir().join(".ollama/models"))
+        })?;
+    let mut path = models_dir.as_path();
+    while !path.exists() {
+        path = path.parent()?;
+    }
+    let available = available_disk_bytes(path)?;
+    low_disk_warning(available, expected_size)
+}
+
+fn low_disk_warning(available: u64, expected_size: Option<u64>) -> Option<String> {
+    let required = expected_size
+        .map(|size| size.saturating_add(size / 10))
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    (available < required).then(|| match expected_size {
+        Some(size) => format!(
+            "Advisory only (daemon-local filesystem estimate): {} available for an expected {} model; the Ollama server's storage may differ.",
+            crate::namer::display_size(available),
+            crate::namer::display_size(size)
+        ),
+        None => format!(
+            "Advisory only (daemon-local filesystem estimate): {} available and model size is unknown; the Ollama server's storage may differ.",
+            crate::namer::display_size(available)
+        ),
+    })
+}
+
+#[cfg(unix)]
+fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available = 0u64;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            path.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn available_disk_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 /// The line a JS error points at (`eval_script:3:13`, `<eval>:3`, `line
@@ -840,6 +974,7 @@ pub struct Daemon {
     pending_attention: StdMutex<Vec<Event>>,
     /// Ids for client connections.
     next_conn: AtomicU64,
+    ollama_pulls: StdMutex<OllamaPulls>,
     #[cfg(test)]
     panic_in_finish_tail: AtomicBool,
     #[cfg(test)]
@@ -1220,6 +1355,7 @@ impl Daemon {
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
+            ollama_pulls: StdMutex::new(OllamaPulls::default()),
             transcript_attempts: Arc::new(transcript_attempts::Clock::default()),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
@@ -5346,18 +5482,52 @@ impl Daemon {
                 .cloned()
                 .collect::<Vec<_>>())),
             Request::RateLimits => Ok(json!(crate::provider::rate_limits())),
-            Request::OllamaPull { model } => {
+            Request::OllamaPull { model, provider } => {
                 let cfg = self.config()?;
-                let base = cfg
-                    .provider
-                    .base_url
-                    .trim_end_matches('/')
-                    .trim_end_matches("/v1")
-                    .to_string();
-                let this = self.clone();
-                let http = self.http.clone();
-                tokio::spawn(async move { this.ollama_pull(&http, &base, &model).await });
-                Ok(json!({"started": true}))
+                let endpoint = self.provider_named(&cfg, provider.as_deref()).await?;
+                let model = endpoint.settings().resolve_alias(&model);
+                if model.is_empty() {
+                    bail!("usage: /pull MODEL [--provider NAME]");
+                }
+                let provider_name = provider
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER.into());
+                let requester = current_client().map(|(conn, _)| conn);
+                let (pull_id, attached, event, cancel) =
+                    self.register_ollama_pull(&provider_name, &model, requester);
+                if attached {
+                    if let Some(conn) = requester {
+                        send_selected(&self.subs, event, Some(&BTreeSet::from([conn])));
+                    } else {
+                        self.broadcast(event);
+                    }
+                } else {
+                    self.publish_ollama_pull(event);
+                    let this = self.clone();
+                    let pull_id_for_task = pull_id.clone();
+                    let provider_for_task = provider_name.clone();
+                    let model_for_task = model.clone();
+                    tokio::spawn(async move {
+                        this.ollama_pull(
+                            &pull_id_for_task,
+                            &provider_for_task,
+                            &model_for_task,
+                            endpoint,
+                            cancel,
+                        )
+                        .await;
+                    });
+                }
+                Ok(json!({
+                    "started": true,
+                    "attached": attached,
+                    "pull_id": pull_id,
+                    "model": model,
+                    "provider": provider_name,
+                }))
+            }
+            Request::CancelOllamaPull { pull_id } => {
+                self.cancel_ollama_pull(&pull_id, current_client().map(|(conn, _)| conn))
             }
             Request::CompareModels {
                 session_id,
@@ -8386,67 +8556,329 @@ impl Daemon {
         }
     }
 
-    /// Stream an Ollama `/api/pull` as `ModelPullProgress` (SPEC §4.2).
-    async fn ollama_pull(&self, http: &reqwest::Client, base: &str, model: &str) {
+    fn register_ollama_pull(
+        &self,
+        provider: &str,
+        model: &str,
+        requester: Option<u64>,
+    ) -> (String, bool, Event, CancellationToken) {
+        let key = (provider.to_string(), canonical_ollama_model(model));
+        let mut pulls = self.ollama_pulls.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pull_id) = pulls.active.get(&key).cloned() {
+            if let Some(record) = pulls.records.get_mut(&pull_id) {
+                if let Some(conn) = requester {
+                    record.clients.insert(conn);
+                }
+                return (pull_id, true, record.last.clone(), record.cancel.clone());
+            }
+        }
+
+        let pull_id = uuid::Uuid::new_v4().to_string();
+        let cancel = CancellationToken::new();
+        let mut clients = BTreeSet::new();
+        if let Some(conn) = requester {
+            clients.insert(conn);
+        }
+        let event = Event::ModelPullProgress {
+            model: model.to_string(),
+            status: "checking".into(),
+            completed: None,
+            total: None,
+            done: false,
+            error: None,
+            pull_id: Some(pull_id.clone()),
+            provider: Some(provider.to_string()),
+            expected_size: None,
+            warning: None,
+        };
+        pulls.active.insert(key.clone(), pull_id.clone());
+        pulls.records.insert(
+            pull_id.clone(),
+            OllamaPullRecord {
+                key,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                state: "checking".into(),
+                clients,
+                cancel: cancel.clone(),
+                last: event.clone(),
+            },
+        );
+        (pull_id, false, event, cancel)
+    }
+
+    fn publish_ollama_pull(&self, event: Event) {
+        let Event::ModelPullProgress {
+            pull_id: Some(pull_id),
+            status,
+            done,
+            ..
+        } = &event
+        else {
+            self.broadcast(event);
+            return;
+        };
+        let clients = {
+            let mut pulls = self.ollama_pulls.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(record) = pulls.records.get_mut(pull_id) else {
+                self.broadcast(event);
+                return;
+            };
+            record.last = event.clone();
+            record.state = status.clone();
+            let key = record.key.clone();
+            let clients = record.clients.clone();
+            if *done {
+                pulls.active.remove(&key);
+                pulls.finished.push_back(pull_id.clone());
+                while pulls.finished.len() > 64 {
+                    if let Some(old) = pulls.finished.pop_front() {
+                        pulls.records.remove(&old);
+                    }
+                }
+            }
+            clients
+        };
+        if clients.is_empty() {
+            self.broadcast(event);
+        } else {
+            send_selected(&self.subs, event, Some(&clients));
+        }
+    }
+
+    fn cancel_ollama_pull(&self, pull_id: &str, requester: Option<u64>) -> Result<Value> {
+        let pulls = self.ollama_pulls.lock().unwrap_or_else(|e| e.into_inner());
+        let record = pulls
+            .records
+            .get(pull_id)
+            .with_context(|| format!("unknown Ollama pull '{pull_id}'"))?;
+        if record.state == "success" || record.state == "failed" || record.state == "incomplete" {
+            bail!("Ollama pull is already {}", record.state);
+        }
+        if requester
+            .is_some_and(|conn| !record.clients.is_empty() && !record.clients.contains(&conn))
+        {
+            bail!("this connection is not attached to that Ollama pull");
+        }
+        record.cancel.cancel();
+        Ok(json!({
+            "cancel_requested": true,
+            "pull_id": pull_id,
+            "provider": record.provider.clone(),
+            "model": record.model.clone(),
+            "state": record.state.clone(),
+        }))
+    }
+
+    /// Check that the selected provider speaks Ollama before starting a pull.
+    async fn ollama_preflight(
+        endpoint: &Provider,
+        base: &str,
+        provider: &str,
+        model: &str,
+    ) -> std::result::Result<Option<u64>, String> {
+        let version_url = format!("{base}/api/version");
+        let version = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let response = endpoint
+                .endpoint_request(reqwest::Method::GET, &version_url, None)
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        let version_ok = version.is_some_and(|value| value["version"].as_str().is_some());
+
+        let tags_url = format!("{base}/api/tags");
+        let tags = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let response = endpoint
+                .endpoint_request(reqwest::Method::GET, &tags_url, None)
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        let models = tags.as_ref().and_then(|value| value["models"].as_array());
+        if !version_ok && models.is_none() {
+            return Err(format!(
+                "The selected provider '{provider}' is not an Ollama endpoint; choose an Ollama provider with `/pull MODEL --provider NAME`."
+            ));
+        }
+        Ok(models.and_then(|models| {
+            models
+                .iter()
+                .find(|entry| {
+                    entry["name"]
+                        .as_str()
+                        .is_some_and(|name| same_ollama_model(name, model))
+                })
+                .and_then(|entry| entry["size"].as_u64())
+        }))
+    }
+
+    /// Stream a tracked Ollama `/api/pull` (SPEC §4.2).
+    async fn ollama_pull(
+        self: Arc<Self>,
+        pull_id: &str,
+        provider_name: &str,
+        model: &str,
+        endpoint: Provider,
+        cancel: CancellationToken,
+    ) {
+        let base = endpoint
+            .settings()
+            .base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        let resume_command = ollama_resume_command(provider_name, model);
         let send = |status: String,
                     completed: Option<u64>,
                     total: Option<u64>,
                     done: bool,
-                    error: Option<String>| {
-            self.broadcast(Event::ModelPullProgress {
+                    error: Option<String>,
+                    expected_size: Option<u64>,
+                    warning: Option<String>| {
+            self.publish_ollama_pull(Event::ModelPullProgress {
                 model: model.to_string(),
                 status,
                 completed,
                 total,
                 done,
                 error,
+                pull_id: Some(pull_id.to_string()),
+                provider: Some(provider_name.to_string()),
+                expected_size,
+                warning,
             });
         };
-        let resp = http
-            .post(format!("{base}/api/pull"))
-            .json(&json!({"model": model, "stream": true}))
-            .send()
-            .await;
-        let resp = match resp {
-            Ok(r) if r.status().is_success() => r,
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
+        let incomplete = |message: String| {
+            send(
+                "incomplete".into(),
+                None,
+                None,
+                true,
+                Some(message),
+                None,
+                None,
+            );
+        };
+        let expected_size = tokio::select! {
+            _ = cancel.cancelled() => {
+                incomplete(format!("pull cancelled; partial download can resume with `{resume_command}`"));
+                return;
+            }
+            result = Self::ollama_preflight(&endpoint, &base, provider_name, model) => match result {
+                Ok(size) => size,
+                Err(error) => {
+                    send("failed".into(), None, None, true, Some(error), None, None);
+                    return;
+                }
+            }
+        };
+        let warning = ollama_disk_warning(&base, expected_size);
+        send(
+            "pulling".into(),
+            None,
+            None,
+            false,
+            None,
+            expected_size,
+            warning.clone(),
+        );
+        let payload = json!({"model": model, "stream": true});
+        let pull_url = format!("{base}/api/pull");
+        let response = tokio::select! {
+            _ = cancel.cancelled() => {
+                incomplete(format!("pull cancelled; partial download can resume with `{resume_command}`"));
+                return;
+            }
+            response = endpoint.endpoint_request(
+                reqwest::Method::POST,
+                &pull_url,
+                Some(&payload),
+            ) => response,
+        };
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
                 return send(
                     "failed".into(),
                     None,
                     None,
                     true,
-                    Some(format!("{status}: {text}")),
-                );
+                    Some(format!(
+                        "Ollama rejected the pull request (HTTP {})",
+                        response.status()
+                    )),
+                    expected_size,
+                    warning,
+                )
             }
-            Err(e) => return send("failed".into(), None, None, true, Some(format!("{e:#}"))),
+            Err(_) => {
+                return send(
+                    "failed".into(),
+                    None,
+                    None,
+                    true,
+                    Some("could not reach the Ollama endpoint".into()),
+                    expected_size,
+                    warning,
+                )
+            }
         };
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+
+        let mut stream = response.bytes_stream();
+        let mut buf = Vec::new();
         let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => {
+                    incomplete(format!("pull cancelled; partial download can resume with `{resume_command}`"));
+                    return;
+                }
+                next = futures_util::StreamExt::next(&mut stream) => next,
+            };
+            let Some(chunk) = next else { break };
             let Ok(chunk) = chunk else { break };
             buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            while let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+                let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                     continue;
                 };
-                if let Some(e) = v["error"].as_str() {
-                    return send("failed".into(), None, None, true, Some(e.to_string()));
+                if let Some(error) = value["error"].as_str() {
+                    return send(
+                        "failed".into(),
+                        None,
+                        None,
+                        true,
+                        Some(format!("Ollama pull failed: {error}")),
+                        expected_size,
+                        warning,
+                    );
                 }
-                let status = v["status"].as_str().unwrap_or_default().to_string();
+                let status = value["status"].as_str().unwrap_or_default().to_string();
                 let done = status == "success";
-                // At most 4 updates a second, plus every status change at the end.
                 if done || last.elapsed() >= std::time::Duration::from_millis(250) {
                     last = std::time::Instant::now();
                     send(
                         status,
-                        v["completed"].as_u64(),
-                        v["total"].as_u64(),
+                        value["completed"].as_u64(),
+                        value["total"].as_u64(),
                         done,
                         None,
+                        expected_size,
+                        warning.clone(),
                     );
                 }
                 if done {
@@ -8455,27 +8887,41 @@ impl Daemon {
             }
         }
         if !buf.is_empty() {
-            if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
-                if let Some(e) = v["error"].as_str() {
-                    return send("failed".into(), None, None, true, Some(e.to_string()));
+            if let Ok(value) = serde_json::from_slice::<Value>(&buf) {
+                if let Some(error) = value["error"].as_str() {
+                    return send(
+                        "failed".into(),
+                        None,
+                        None,
+                        true,
+                        Some(format!("Ollama pull failed: {error}")),
+                        expected_size,
+                        warning,
+                    );
                 }
-                if v["status"].as_str() == Some("success") {
+                if value["status"].as_str() == Some("success") {
                     return send(
                         "success".into(),
-                        v["completed"].as_u64(),
-                        v["total"].as_u64(),
+                        value["completed"].as_u64(),
+                        value["total"].as_u64(),
                         true,
                         None,
+                        expected_size,
+                        warning,
                     );
                 }
             }
         }
         send(
-            "failed".into(),
+            "incomplete".into(),
             None,
             None,
             true,
-            Some("pull ended before completing".into()),
+            Some(format!(
+                "pull ended before completing; partial download can resume with `{resume_command}`"
+            )),
+            expected_size,
+            warning,
         );
     }
 
@@ -19270,6 +19716,10 @@ mod backpressure_tests {
                 total: Some(2),
                 done: false,
                 error: None,
+                pull_id: None,
+                provider: None,
+                expected_size: None,
+                warning: None,
             },
         ];
         for _ in 0..10 {
@@ -21013,21 +21463,82 @@ mod session_selection_daemon_tests;
 mod ollama_pull_tests {
     use super::*;
 
-    async fn pull_events(body: &'static str) -> Vec<Event> {
+    async fn pull_events(
+        body: &'static str,
+        selected_provider: Option<&str>,
+    ) -> (Vec<Event>, Value) {
         let _env = crate::credential_env::EnvGuard::isolated();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = axum::Router::new().route(
-            "/api/pull",
-            axum::routing::post(move || async move { body }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/api/version",
+                axum::routing::get(|| async { axum::Json(json!({"version":"test"})) }),
+            )
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"models":[{"name":"test-model","size":512}] }))
+                }),
+            )
+            .route(
+                "/api/pull",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap,
+                          axum::extract::Query(query): axum::extract::Query<
+                        HashMap<String, String>,
+                    >,
+                          axum::Json(payload): axum::Json<Value>| async move {
+                        let configured = headers
+                            .get("x-pull-test")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("present")
+                            && headers
+                                .get("x-api-key")
+                                .and_then(|value| value.to_str().ok())
+                                == Some("pull-test-key")
+                            && query.get("pull-test").map(String::as_str) == Some("enabled")
+                            && payload["model"] == "test-model";
+                        if configured {
+                            (axum::http::StatusCode::OK, body)
+                        } else {
+                            (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "provider settings or alias missing",
+                            )
+                        }
+                    },
+                ),
+            );
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
         let root = std::env::temp_dir().join(format!("fl-ollama-pull-{}", uuid::Uuid::new_v4()));
         let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
-        let daemon = Daemon::new(paths).unwrap();
+        let mut config = Config::default();
+        let mut test_provider = config.provider.clone();
+        test_provider.base_url = format!("http://{address}/v1");
+        test_provider
+            .aliases
+            .insert("shortcut".into(), "test-model".into());
+        test_provider
+            .extra_headers
+            .insert("x-pull-test".into(), "present".into());
+        test_provider
+            .query_params
+            .insert("pull-test".into(), "enabled".into());
+        test_provider.api_key_header = Some("x-api-key".into());
+        if let Some(name) = selected_provider {
+            config.provider.base_url = "http://127.0.0.1:9/v1".into();
+            config.providers.insert(name.into(), test_provider);
+            crate::config::save_provider_key(&paths, name, "pull-test-key").unwrap();
+        } else {
+            config.provider = test_provider;
+            crate::config::save_api_key(&paths, "pull-test-key").unwrap();
+        }
+        config.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
         daemon.subs.locked().push(Subscriber {
             conn: 1,
@@ -21037,27 +21548,48 @@ mod ollama_pull_tests {
             gaps: BTreeMap::new(),
         });
 
-        daemon
-            .ollama_pull(
-                &reqwest::Client::new(),
-                &format!("http://{address}"),
-                "test-model",
+        let result = CLIENT
+            .scope(
+                (1, "pull test".into()),
+                daemon.handle(Request::OllamaPull {
+                    model: "shortcut".into(),
+                    provider: selected_provider.map(str::to_string),
+                }),
             )
-            .await;
-        server.abort();
+            .await
+            .unwrap();
+        let pull_id = result["pull_id"].as_str().unwrap();
+        assert_eq!(result["model"], "test-model");
+        assert_eq!(
+            result["provider"],
+            selected_provider.unwrap_or(crate::config::DEFAULT_PROVIDER)
+        );
 
         let mut events = Vec::new();
-        while let Ok(ServerMessage::Event(event)) = rx.try_recv() {
+        while let Some(ServerMessage::Event(event)) = rx.recv().await {
+            let done = matches!(&event, Event::ModelPullProgress { done: true, .. });
             events.push(event);
+            if done {
+                break;
+            }
         }
+        server.abort();
         drop(daemon);
         std::fs::remove_dir_all(root).unwrap();
-        events
+        assert!(events.iter().any(|event| matches!(event,
+            Event::ModelPullProgress { pull_id: Some(id), expected_size: Some(512), .. }
+                if id == pull_id
+        )));
+        (events, result)
     }
 
     #[tokio::test]
-    async fn stream_end_without_success_is_a_failure() {
-        let events = pull_events("{\"status\":\"pulling\",\"completed\":1,\"total\":2}\n").await;
+    async fn stream_end_without_success_is_incomplete_and_resumable() {
+        let (events, _) = pull_events(
+            "{\"status\":\"pulling\",\"completed\":1,\"total\":2}\n",
+            None,
+        )
+        .await;
         assert!(matches!(
             events.last(),
             Some(Event::ModelPullProgress {
@@ -21065,13 +21597,15 @@ mod ollama_pull_tests {
                 done: true,
                 error: Some(error),
                 ..
-            }) if status == "failed" && error == "pull ended before completing"
+            }) if status == "incomplete"
+                && error.starts_with("pull ended before completing")
+                && error.contains("`/pull test-model`")
         ));
     }
 
     #[tokio::test]
     async fn final_success_without_newline_is_still_success() {
-        let events = pull_events("{\"status\":\"success\"}").await;
+        let (events, _) = pull_events("{\"status\":\"success\"}", None).await;
         assert!(matches!(
             events.last(),
             Some(Event::ModelPullProgress {
@@ -21081,5 +21615,391 @@ mod ollama_pull_tests {
                 ..
             }) if status == "success"
         ));
+    }
+
+    #[tokio::test]
+    async fn named_provider_uses_its_alias_headers_and_query_parameters() {
+        let (events, result) = pull_events("{\"status\":\"success\"}", Some("local")).await;
+        assert_eq!(result["provider"], "local");
+        assert!(matches!(
+            events.last(),
+            Some(Event::ModelPullProgress {
+                provider: Some(provider),
+                status,
+                done: true,
+                ..
+            }) if provider == "local" && status == "success"
+        ));
+    }
+
+    #[tokio::test]
+    async fn incomplete_resume_hint_keeps_the_named_provider() {
+        let (events, _) = pull_events(
+            "{\"status\":\"pulling\",\"completed\":1,\"total\":2}\n",
+            Some("local"),
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(Event::ModelPullProgress {
+                status,
+                error: Some(error),
+                ..
+            }) if status == "incomplete" && error.contains("`/pull test-model --provider local`")
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_ollama_provider_before_posting_pull() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let post_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let post_count_route = post_count.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/version",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::NOT_FOUND, "not an Ollama endpoint")
+                }),
+            )
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::NOT_FOUND, "not an Ollama endpoint")
+                }),
+            )
+            .route(
+                "/api/pull",
+                axum::routing::post(move || {
+                    let post_count = post_count_route.clone();
+                    async move {
+                        post_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "{}"
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root =
+            std::env::temp_dir().join(format!("fl-ollama-preflight-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = format!("http://{address}/v1");
+        config.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: BTreeMap::new(),
+        });
+        CLIENT
+            .scope(
+                (1, "preflight test".into()),
+                daemon.handle(Request::OllamaPull {
+                    model: "test-model".into(),
+                    provider: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let terminal = loop {
+            if let Some(ServerMessage::Event(event)) = rx.recv().await {
+                if matches!(&event, Event::ModelPullProgress { done: true, .. }) {
+                    break event;
+                }
+            }
+        };
+        assert!(matches!(terminal, Event::ModelPullProgress {
+            status,
+            error: Some(error),
+            ..
+        } if status == "failed" && error.starts_with("The selected provider '") && error.ends_with(".")));
+        assert_eq!(post_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_aborts_preflight_and_reports_an_incomplete_pull() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started = Arc::new(StdMutex::new(Some(started_tx)));
+        let started_route = started.clone();
+        let app = axum::Router::new().route(
+            "/api/version",
+            axum::routing::get(move || {
+                let started = started_route.clone();
+                async move {
+                    if let Some(tx) = started.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    axum::Json(json!({"version":"test"}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!("fl-ollama-cancel-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = format!("http://{address}/v1");
+        config.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: BTreeMap::new(),
+        });
+        let result = CLIENT
+            .scope(
+                (1, "cancel test".into()),
+                daemon.handle(Request::OllamaPull {
+                    model: "test-model".into(),
+                    provider: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let pull_id = result["pull_id"].as_str().unwrap().to_string();
+        started_rx.await.unwrap();
+        let cancelled = CLIENT
+            .scope(
+                (1, "cancel test".into()),
+                daemon.handle(Request::CancelOllamaPull {
+                    pull_id: pull_id.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled["cancel_requested"], true);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(ServerMessage::Event(event)) = rx.recv().await {
+                    if matches!(&event, Event::ModelPullProgress {
+                        pull_id: Some(id), done: true, ..
+                    } if id == &pull_id)
+                    {
+                        break event;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(terminal, Event::ModelPullProgress {
+            status,
+            error: Some(error),
+            ..
+        } if status == "incomplete" && error.contains("cancelled")));
+        server.abort();
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_stream_body_begins_reports_incomplete() {
+        use futures_util::StreamExt;
+
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started = Arc::new(StdMutex::new(Some(started_tx)));
+        let started_route = started.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/version",
+                axum::routing::get(|| async { axum::Json(json!({"version":"test"})) }),
+            )
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async {
+                    axum::Json(json!({"models":[{"name":"test-model","size":512}]}))
+                }),
+            )
+            .route(
+                "/api/pull",
+                axum::routing::post(move || {
+                    let started = started_route.clone();
+                    async move {
+                        let started = started
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take();
+                        let first = futures_util::stream::once(async move {
+                            if let Some(started) = started {
+                                let _ = started.send(());
+                            }
+                            Ok::<_, std::io::Error>(tokio_util::bytes::Bytes::from_static(
+                                b"{\"status\":\"pulling\",\"completed\":1,\"total\":2}\n",
+                            ))
+                        });
+                        let body = first.chain(futures_util::stream::pending::<
+                            std::result::Result<tokio_util::bytes::Bytes, std::io::Error>,
+                        >());
+                        axum::response::Response::new(axum::body::Body::from_stream(body))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root =
+            std::env::temp_dir().join(format!("fl-ollama-stream-cancel-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = format!("http://{address}/v1");
+        config.save(&paths).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: BTreeMap::new(),
+        });
+        let result = CLIENT
+            .scope(
+                (1, "stream cancel test".into()),
+                daemon.handle(Request::OllamaPull {
+                    model: "test-model".into(),
+                    provider: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let pull_id = result["pull_id"].as_str().unwrap().to_string();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(ServerMessage::Event(Event::ModelPullProgress {
+                    pull_id: Some(id),
+                    status,
+                    completed: Some(1),
+                    done: false,
+                    ..
+                })) = rx.recv().await
+                {
+                    if id == pull_id && status == "pulling" {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let cancelled = CLIENT
+            .scope(
+                (1, "stream cancel test".into()),
+                daemon.handle(Request::CancelOllamaPull {
+                    pull_id: pull_id.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled["cancel_requested"], true);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(ServerMessage::Event(event)) = rx.recv().await {
+                    if matches!(&event, Event::ModelPullProgress {
+                        pull_id: Some(id), done: true, ..
+                    } if id == &pull_id)
+                    {
+                        break event;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(terminal, Event::ModelPullProgress {
+            status,
+            error: Some(error),
+            ..
+        } if status == "incomplete" && error.contains("cancelled")));
+        server.abort();
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deduplicates_attaches_and_scopes_progress_to_requesting_connections() {
+        let root = std::env::temp_dir().join(format!("fl-ollama-track-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let daemon = Daemon::new(paths.clone()).unwrap();
+        let (tx1, mut rx1) = mpsc::channel::<ServerMessage>(8);
+        let (tx2, mut rx2) = mpsc::channel::<ServerMessage>(8);
+        let (tx3, mut rx3) = mpsc::channel::<ServerMessage>(8);
+        for (conn, tx) in [(1, tx1), (2, tx2), (3, tx3)] {
+            daemon.subs.locked().push(Subscriber {
+                conn,
+                tx: tx.into(),
+                filter: Arc::new(StdMutex::new(EventFilter::default())),
+                kick: CancellationToken::new(),
+                gaps: BTreeMap::new(),
+            });
+        }
+        let (pull_id, attached, event, cancel) =
+            daemon.register_ollama_pull("local", "model", Some(1));
+        assert!(!attached);
+        daemon.publish_ollama_pull(event);
+        let (same_id, attached, event, _) =
+            daemon.register_ollama_pull("local", "model:latest", Some(2));
+        assert!(attached);
+        assert_eq!(same_id, pull_id);
+        send_selected(&daemon.subs, event, Some(&BTreeSet::from([2])));
+        let update = Event::ModelPullProgress {
+            model: "model".into(),
+            status: "pulling".into(),
+            completed: Some(1),
+            total: Some(2),
+            done: false,
+            error: None,
+            pull_id: Some(pull_id.clone()),
+            provider: Some("local".into()),
+            expected_size: Some(2),
+            warning: None,
+        };
+        daemon.publish_ollama_pull(update);
+        assert!(matches!(
+            rx1.try_recv(),
+            Ok(ServerMessage::Event(Event::ModelPullProgress { .. }))
+        ));
+        assert!(matches!(
+            rx2.try_recv(),
+            Ok(ServerMessage::Event(Event::ModelPullProgress { .. }))
+        ));
+        assert!(rx3.try_recv().is_err());
+        assert!(daemon.cancel_ollama_pull(&pull_id, Some(3)).is_err());
+        daemon.cancel_ollama_pull(&pull_id, Some(2)).unwrap();
+        assert!(cancel.is_cancelled());
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_disk_warning_uses_expected_size_and_remote_endpoints_are_not_guessed() {
+        assert!(low_disk_warning(100, Some(200))
+            .is_some_and(|warning| warning.contains("daemon-local filesystem estimate")));
+        assert!(low_disk_warning(3 * 1024 * 1024 * 1024, None).is_none());
+        assert!(ollama_disk_warning("http://192.0.2.2:11434", Some(1)).is_none());
+        assert!(same_ollama_model("llama3", "llama3:latest"));
+        assert_eq!(canonical_ollama_model("llama3:latest"), "llama3");
+        assert!(same_ollama_model(
+            "registry/llama3:8b",
+            "registry/llama3:8b"
+        ));
+        assert!(!same_ollama_model("llama3:8b", "llama3:70b"));
     }
 }

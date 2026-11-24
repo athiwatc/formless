@@ -221,6 +221,7 @@
     topicRevision: 0,
     topicFocus: null,
     current: null,
+    pullId: null,
     drafts: {},
     unpersistedDrafts: new Map(),
     unpersistedDraftSharedValues: new Map(),
@@ -9159,10 +9160,10 @@
           h("td", { class: "num" }, c.avg_ms != null ? uiFixed(c.avg_ms / 1000, 1) + "s" : ""),
           h("td", null, c.qualified === false ? "below the quality gate" : "")))))))), { trigger });
     } },
-    { name: "pull", args: "MODEL", group: "Settings", desc: "Ollama: download a model", run: async (arg) => {
-      const model = (arg || "").trim();
-      if (!model) return note("usage: /pull MODEL", true);
-      if (await act({ type: "ollama_pull", model })) note("pulling " + model + " with Ollama…");
+    { name: "pull", args: "MODEL [--provider NAME] | cancel [PULL_ID]", group: "Settings", desc: "Ollama: download, attach to, or cancel a model pull", run: async (arg) => {
+      const request = parsePullCommand(arg, S.pullId);
+      if (request.error) return note(request.error, true);
+      if (await act(request)) note(request.type === "ollama_pull" ? "checking Ollama endpoint for " + request.model + "…" : "cancelling Ollama pull…");
     } },
     { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: " + Object.keys(topics).join(", "), run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
@@ -9379,6 +9380,23 @@
     note("context: " + r.used_tokens + " of " + r.context_tokens + " tokens (" + pct + "%" + (r.measured ? "" : ", estimated") + ") on " + r.model + " · window " + source);
     note("≈ system prompt " + b.system_prompt + " · Tool schemas " + b.tool_schemas + " · history " + b.history + " tokens · " + b.attachments + " attachment(s)");
   }
+  function parsePullCommand(arg, activePullId) {
+    const parts = (arg || "").trim().split(/\s+/).filter(Boolean);
+    if (parts[0] === "cancel") {
+      const pull_id = parts[1] || activePullId;
+      if (parts.length > 2 || !pull_id) return { error: "usage: /pull cancel [PULL_ID]" };
+      return { type: "cancel_ollama_pull", pull_id };
+    }
+    const model = parts[0];
+    if (!model) return { error: "usage: /pull MODEL [--provider NAME]" };
+    let provider;
+    if (parts.length > 1) {
+      if (parts.length !== 3 || parts[1] !== "--provider") return { error: "usage: /pull MODEL [--provider NAME]" };
+      provider = parts[2];
+    }
+    return { type: "ollama_pull", model, provider };
+  }
+
   async function slash(cmd) {
     // `/mcp:SERVER:PROMPT [ARGS]`: send the rendered MCP prompt (SPEC §7.9).
     const mp = /^mcp:([^:\s]+):(\S+)\s*(.*)$/s.exec(cmd);
@@ -9798,6 +9816,26 @@
     if (kinds.has("model_pull_progress")) setActivity("download progress unavailable for " + (ev.model || "model") + "; /models checks installed models");
   }
 
+  function handlePullProgress(ev) {
+    if (ev.done) {
+      if (S.pullId === ev.pull_id) S.pullId = null;
+      if (ev.error) {
+        if (ev.status === "incomplete") {
+          const provider = ev.provider && ev.provider !== "default" ? " --provider " + ev.provider : "";
+          const resume = "/pull " + ev.model + provider;
+          const error = ev.error.includes("partial download can resume with") ? ev.error : ev.error + "; rerun `" + resume + "` to resume";
+          note("pull incomplete: " + error, true);
+        } else note("could not pull " + ev.model + ": " + ev.error, true);
+      } else if (ev.status === "success") note("pulled " + ev.model + "; pick it with /model");
+    } else {
+      S.pullId = ev.pull_id || S.pullId;
+      const progress = ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
+      const expected = ev.expected_size ? "; expected " + ev.expected_size + " bytes" : "";
+      const warning = ev.warning ? "; " + ev.warning : "";
+      setActivity("pulling " + ev.model + ": " + ev.status + progress + expected + warning);
+    }
+  }
+
   function onEvent(ev) {
     branchSummaryEvent(ev);
     if (["settings_changed", "registry_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
@@ -9855,8 +9893,7 @@
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
         break;
       case "model_pull_progress":
-        if (ev.done) note(ev.error ? "could not pull " + ev.model + ": " + ev.error : "pulled " + ev.model + "; pick it with /model", !!ev.error);
-        else setActivity("pulling " + ev.model + ": " + ev.status + (ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : ""));
+        handlePullProgress(ev);
         return;
       case "comparison_ready":
         if (here) {

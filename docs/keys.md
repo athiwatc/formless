@@ -164,7 +164,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/harness undo [ID]` | undo a harness change (default: the last) |
 | `/test [MODEL]` | test a model: latency, streaming, reasoning, tool calls |
 | `/routing` | why routing picked each model lately |
-| `/pull MODEL` | Ollama: download a model |
+| `/pull MODEL [--provider NAME] \| cancel [PULL_ID]` | Ollama: download, attach to, or cancel a model pull |
 
 ### Integrations
 

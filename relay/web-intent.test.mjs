@@ -76,6 +76,35 @@ function setup(names, extras = {}) {
   vm.runInContext([...new Set([...dependencies, ...implementations])].map(fn).join('\n'), context);
   return context;
 }
+test('pull commands preserve provider selection and resolve explicit or implicit cancellation', () => {
+  const c = setup(['parsePullCommand']);
+  const parsed = value => JSON.parse(JSON.stringify(value));
+  assert.deepEqual(parsed(c.parsePullCommand('llama3 --provider remote', null)), {
+    type: 'ollama_pull', model: 'llama3', provider: 'remote',
+  });
+  assert.deepEqual(parsed(c.parsePullCommand('cancel', 'pull-active')), {
+    type: 'cancel_ollama_pull', pull_id: 'pull-active',
+  });
+  assert.deepEqual(parsed(c.parsePullCommand('cancel pull-explicit', null)), {
+    type: 'cancel_ollama_pull', pull_id: 'pull-explicit',
+  });
+});
+test('pull progress preserves another active pull and reports provider-aware resume guidance', () => {
+  const notices = [], activities = [];
+  const c = setup(['handlePullProgress'], {
+    note: (text, error) => notices.push({ text, error }),
+    setActivity: text => activities.push(text),
+  });
+  c.S.pullId = 'pull-active';
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'other', status: 'success', done: true, pull_id: 'pull-other' });
+  assert.equal(c.S.pullId, 'pull-active');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false, pull_id: 'pull-next', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
+  assert.equal(c.S.pullId, 'pull-next');
+  assert.match(activities.pop(), /50%.*expected 20 bytes.*advisory/);
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'incomplete', done: true, pull_id: 'pull-next', provider: 'remote', error: 'stream ended' });
+  assert.equal(c.S.pullId, null);
+  assert.match(notices.pop().text, /\/pull llama3 --provider remote/);
+});
 test('queued edits submit the revision opened by the editor', () => {
   const notices = [];
   let rendered, dialog, input;
