@@ -5994,7 +5994,8 @@
     const stateClass = running ? "state busy" : "state";
     if (state.className !== stateClass) state.className = stateClass;
     if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
-    updateText(statusRender.text, S.activity ? activityText(S.activity) : running ? "running" : "● ready");
+    const activity = running ? S.activity : S.pullActivity || S.activity;
+    updateText(statusRender.text, activity ? activityText(activity) : running ? "running" : "● ready");
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
@@ -9408,7 +9409,9 @@
       note("the running daemon does not support tracked Ollama pulls; restart it with this version", true);
       return null;
     }
-    return act(pullRequest);
+    const response = await act(pullRequest);
+    if (pullRequest.type === "ollama_pull" && response && response.pull_id) S.pullId = response.pull_id;
+    return response;
   }
 
   async function slash(cmd) {
@@ -9832,9 +9835,12 @@
 
   function handlePullProgress(ev) {
     if (ev.done) {
-      if (S.pullId === ev.pull_id) {
-        S.pullId = null;
-        setActivity(null);
+      if (S.pullId === ev.pull_id) S.pullId = null;
+      if (S.pullActivity && S.pullActivity.pull_id === ev.pull_id) {
+        const label = S.pullActivity.label;
+        S.pullActivity = null;
+        if (S.activity && S.activity.label === label) setActivity(null);
+        else renderStatus();
       }
       if (ev.error) {
         if (ev.status === "incomplete") {
@@ -9845,11 +9851,12 @@
         } else note("could not pull " + ev.model + ": " + ev.error, true);
       } else if (ev.status === "success") note("pulled " + ev.model + "; pick it with /model");
     } else {
-      S.pullId = ev.pull_id || S.pullId;
       const progress = ev.total ? " " + Math.floor((ev.completed || 0) * 100 / ev.total) + "%" : "";
       const expected = ev.expected_size ? "; expected " + ev.expected_size + " bytes" : "";
       const warning = ev.warning ? "; " + ev.warning : "";
-      setActivity("pulling " + ev.model + ": " + ev.status + progress + expected + warning);
+      const label = "pulling " + ev.model + ": " + ev.status + progress + expected + warning;
+      S.pullActivity = { pull_id: ev.pull_id, label, since: Date.now() };
+      setActivity(label);
     }
   }
 

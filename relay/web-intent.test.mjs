@@ -109,22 +109,25 @@ test('pull requests check tracked-pull support before dispatch', async () => {
     return request.type === 'ping' ? { features: ['ollama_pull_jobs_v1'] } : { pull_id: 'pull-1' };
   };
   assert.deepEqual(JSON.parse(JSON.stringify(await c.requestPull({ type: 'ollama_pull', model: 'llama3' }))), { pull_id: 'pull-1' });
+  assert.equal(c.S.pullId, 'pull-1');
   assert.deepEqual(parsed(requests), [{ type: 'ping' }, { type: 'ollama_pull', model: 'llama3' }]);
 });
-test('pull progress preserves another active pull and reports provider-aware resume guidance', () => {
+test('pull progress does not retarget the active cancel ID and reports provider-aware resume guidance', () => {
   const notices = [], activities = [];
   const c = setup(['handlePullProgress'], {
     note: (text, error) => notices.push({ text, error }),
     setActivity: text => activities.push(text),
+    renderStatus() {},
   });
   c.S.pullId = 'pull-active';
   c.handlePullProgress({ type: 'model_pull_progress', model: 'other', status: 'success', done: true, pull_id: 'pull-other' });
   assert.equal(c.S.pullId, 'pull-active');
   c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false, pull_id: 'pull-next', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
-  assert.equal(c.S.pullId, 'pull-next');
+  assert.equal(c.S.pullId, 'pull-active');
   assert.match(activities.pop(), /50%.*expected 20 bytes.*advisory/);
   c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'incomplete', done: true, pull_id: 'pull-next', provider: 'remote', error: 'stream ended' });
-  assert.equal(c.S.pullId, null);
+  assert.equal(c.S.pullId, 'pull-active');
+  assert.equal(c.S.pullActivity, null);
   assert.match(notices.pop().text, /\/pull llama3 --provider remote/);
 });
 test('idle status shows pull progress and clears it on the matching terminal event', () => {
@@ -143,6 +146,7 @@ test('idle status shows pull progress and clears it on the matching terminal eve
     },
   });
   context = c;
+  c.S.pullId = 'pull-1';
   Object.assign(c.S, {
     activity: null,
     approvals: [],

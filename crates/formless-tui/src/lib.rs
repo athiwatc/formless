@@ -269,6 +269,7 @@ enum Pending {
         model: String,
         provider: Option<String>,
     },
+    OllamaPullStarted,
     SendMessage,
     TourSession,
     TourRun {
@@ -3561,10 +3562,13 @@ impl App {
                         }
                         Pending::OllamaPullFeatureCheck { model, provider } => {
                             if daemon_supports_ollama_pull_jobs(&result) {
-                                self.fire(Request::OllamaPull {
-                                    model: model.clone(),
-                                    provider: provider.clone(),
-                                });
+                                self.request(
+                                    Pending::OllamaPullStarted,
+                                    Request::OllamaPull {
+                                        model: model.clone(),
+                                        provider: provider.clone(),
+                                    },
+                                );
                                 self.notes.push(match provider {
                                     Some(provider) => {
                                         format!("checking Ollama provider {provider} for {model}…")
@@ -3575,6 +3579,11 @@ impl App {
                                 });
                             } else {
                                 self.notes.push("the running daemon does not support tracked Ollama pulls; restart it with this version".into());
+                            }
+                        }
+                        Pending::OllamaPullStarted => {
+                            if let Some(pull_id) = result["pull_id"].as_str() {
+                                self.pull_id = Some(pull_id.to_string());
                             }
                         }
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
@@ -6242,7 +6251,6 @@ impl App {
                         None => format!("pulled {model}; pick it with /model"),
                     });
                 } else {
-                    self.pull_id = pull_id;
                     let pct = match (completed, total) {
                         (Some(c), Some(t)) if t > 0 => format!(" {}%", c * 100 / t),
                         _ => String::new(),
@@ -6431,7 +6439,6 @@ impl App {
                 }
                 if kinds.contains(&K::ModelPullProgress) {
                     self.pull_status = None;
-                    self.pull_id = None;
                     self.notes.push(format!(
                         "download progress unavailable for {}; /models checks installed models",
                         model.as_deref().unwrap_or("model")
@@ -21258,11 +21265,46 @@ mod tests {
         .unwrap();
         app.drain_daemon();
         let pull: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let pull_request_id = pull.id;
         assert!(matches!(
             pull.request,
             Request::OllamaPull { model, provider: Some(provider) }
                 if model == "llama3" && provider == "remote"
         ));
+        tx.send(ServerMessage::Response {
+            id: pull_request_id,
+            ok: true,
+            result: Some(serde_json::json!({"pull_id":"pull-1"})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+
+        let pull_event = |pull_id: &str, done: bool| Event::ModelPullProgress {
+            model: "llama3".into(),
+            status: if done { "success" } else { "pulling" }.into(),
+            completed: None,
+            total: None,
+            done,
+            error: None,
+            pull_id: Some(pull_id.into()),
+            provider: Some("remote".into()),
+            expected_size: None,
+            warning: None,
+        };
+        tx.send(ServerMessage::Event(pull_event("pull-other", false)))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+        tx.send(ServerMessage::Event(pull_event("pull-other", true)))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+        tx.send(ServerMessage::Event(pull_event("pull-1", true)))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pull_id, None);
     }
 
     #[test]

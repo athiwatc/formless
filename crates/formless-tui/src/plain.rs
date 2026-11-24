@@ -986,6 +986,12 @@ fn plain_pull_jobs_supported(result: &serde_json::Value) -> bool {
     })
 }
 
+fn update_plain_pull_target(active_pull_id: &mut Option<String>, event_pull_id: &str, done: bool) {
+    if done && active_pull_id.as_deref() == Some(event_pull_id) {
+        *active_pull_id = None;
+    }
+}
+
 fn dispatch_plain_pull<T>(
     arguments: &str,
     active_pull_id: Option<&str>,
@@ -1178,13 +1184,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 ..
             } = &ev
             {
-                if *done {
-                    if pull_id.as_deref() == Some(event_pull_id) {
-                        pull_id = None;
-                    }
-                } else {
-                    pull_id = Some(event_pull_id.clone());
-                }
+                update_plain_pull_target(&mut pull_id, event_pull_id, *done);
             }
             for (kind, request) in gap_requests(&ev) {
                 if !gap_refreshes.values().any(|pending| *pending == kind) {
@@ -2043,6 +2043,19 @@ mod pull_command_tests {
             Some(Request::OllamaPull { model, provider: Some(provider) })
                 if model == "llama3" && provider == "remote"
         ));
+    }
+
+    #[test]
+    fn interleaved_progress_does_not_retarget_plain_cancel_id() {
+        let mut active_pull_id = Some("pull-latest".to_string());
+        update_plain_pull_target(&mut active_pull_id, "pull-other", false);
+        update_plain_pull_target(&mut active_pull_id, "pull-other", true);
+        assert!(matches!(
+            plain_pull_request("cancel", active_pull_id.as_deref()),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-latest"
+        ));
+        update_plain_pull_target(&mut active_pull_id, "pull-latest", true);
+        assert_eq!(active_pull_id, None);
     }
 
     #[test]
