@@ -28,6 +28,13 @@ Install each vendor's CLI separately and put its executable on PATH, or supply
 or passes credentials in argv. Sign in using the vendor CLI or configure its
 environment outside Formless. Agent names and ACP v1 are checked, without minimum
 version requirements; Cursor does not report agentInfo and is protocol-checked only.
+Readiness sends `initialize` and `session/new` only; it does not inspect advertised
+`authMethods`, send ACP `authenticate`, or launch a terminal-login helper. The
+[ACP v1 authentication flow](https://agentclientprotocol.com/protocol/v1/authentication)
+defines agent-managed and terminal authentication. Cursor's [ACP guide](https://cursor.com/docs/cli/acp)
+documents `cursor_login`, while Cline's [ACP guide](https://docs.cline.bot/usage/acp)
+documents reuse of credentials saved by `cline auth`. Use the vendor CLI
+login/configuration before retrying; no authenticated model turn is verified.
 
 ## Commands, access, and live evidence
 
