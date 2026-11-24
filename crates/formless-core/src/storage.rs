@@ -965,7 +965,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 81;
+pub const SCHEMA_VERSION: i64 = 82;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -1267,8 +1267,13 @@ fn migrate_v81(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v82(conn: &Connection) -> Result<()> {
+    add_column(conn, "jobs", "source_session_id TEXT")?;
+    Ok(())
+}
+
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 79] = [
+const MIGRATIONS: [(i64, MigrationStep); 80] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1636,6 +1641,7 @@ const MIGRATIONS: [(i64, MigrationStep); 79] = [
     (79, |c| Ok(c.execute_batch(SCHEMA_V79)?)),
     (80, migrate_v80),
     (81, migrate_v81),
+    (82, migrate_v82),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -3587,6 +3593,7 @@ impl Store {
             id: r.get("id")?,
             prompt: r.get("prompt")?,
             session_id: r.get("session_id")?,
+            source_session_id: r.get("source_session_id")?,
             cron: r.get("cron")?,
             next_run: r.get("next_run")?,
             last_run: r.get("last_run")?,
@@ -3618,6 +3625,14 @@ impl Store {
             let d = (!empty).then(|| d.to_string());
             self.ex("UPDATE jobs SET deliver=?2 WHERE id=?1", params![id, d])?;
         }
+        Ok(())
+    }
+
+    pub fn set_job_source_session_id(&self, id: &str, source_session_id: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET source_session_id=?2 WHERE id=?1",
+            params![id, source_session_id],
+        )?;
         Ok(())
     }
 

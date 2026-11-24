@@ -10618,7 +10618,7 @@ impl Daemon {
             .with_reader(|st| st.list_jobs())?
             .into_iter()
             .filter(|j| j.cron.is_some())
-            .map(|j| json!({"prompt": j.prompt, "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
+            .map(|j| json!({"prompt": j.prompt, "session_id": j.source_session_id.as_ref().or(j.session_id.as_ref()), "cron": j.cron, "overlap": j.overlap, "deliver": j.deliver, "enabled": j.enabled}))
             .collect();
         let (config, blanked) = self.config()?.portable();
         let mut out = json!({
@@ -10819,7 +10819,7 @@ impl Daemon {
             for job in st.list_jobs()? {
                 if let Some(cron) = job.cron {
                     identities.insert((
-                        job.session_id,
+                        job.source_session_id.or(job.session_id),
                         job.prompt,
                         cron,
                         job.overlap,
@@ -10833,12 +10833,15 @@ impl Daemon {
             let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
                 continue;
             };
+            let session_id = j["session_id"].as_str().map(str::to_string);
+            let overlap = j["overlap"].as_str().unwrap_or("skip").to_string();
+            let delivery = delivery_identity(j.get("deliver"));
             let identity = (
-                None,
+                session_id.clone(),
                 prompt.to_string(),
                 cron.to_string(),
-                j["overlap"].as_str().unwrap_or("skip").to_string(),
-                delivery_identity(j.get("deliver")),
+                overlap.clone(),
+                delivery.clone(),
             );
             if job_identities.contains(&identity) {
                 count(&mut skipped_existing, "jobs");
@@ -10852,15 +10855,20 @@ impl Daemon {
                 continue;
             };
             let made = self.with_store(|st| {
-                let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
-                st.set_job_options(
-                    &job.id,
-                    j["overlap"].as_str(),
-                    (!j["deliver"].is_null()).then_some(&j["deliver"]),
-                )?;
-                // Paused: review, then enable on this machine.
-                st.set_job_enabled(&job.id, false)?;
-                Ok(())
+                st.transaction(|st| {
+                    let job = st.create_job(prompt, None, Some(cron), &next, true, "import")?;
+                    if let Some(source_session_id) = session_id.as_deref() {
+                        st.set_job_source_session_id(&job.id, source_session_id)?;
+                    }
+                    st.set_job_options(
+                        &job.id,
+                        j["overlap"].as_str(),
+                        (!j["deliver"].is_null()).then_some(&j["deliver"]),
+                    )?;
+                    // Paused: review, then enable on this machine.
+                    st.set_job_enabled(&job.id, false)?;
+                    Ok(())
+                })
             });
             match made {
                 Ok(()) => {
@@ -10874,8 +10882,12 @@ impl Daemon {
         let mut session_identities = BTreeMap::new();
         if !sessions.is_empty() {
             for session in self.with_reader(|st| st.list_sessions())? {
-                let exported = self.session_bundle(&session.id)?;
-                let identity = Self::import_session_identity(&exported)?;
+                let Ok(exported) = self.session_bundle(&session.id) else {
+                    continue;
+                };
+                let Ok(identity) = Self::import_session_identity(&exported) else {
+                    continue;
+                };
                 session_identities
                     .entry(serde_json::to_string(&identity)?)
                     .or_insert(session.id);
@@ -10883,6 +10895,13 @@ impl Daemon {
         }
         let mut seen_session_fingerprints = BTreeSet::new();
         for b in sessions {
+            if b["format"].as_str() != Some("formless.session/1") {
+                failed.push(format!(
+                    "session {}: unsupported session bundle format",
+                    b["name"].as_str().unwrap_or("?")
+                ));
+                continue;
+            }
             let identity = match Self::import_session_identity(&b) {
                 Ok(identity) => identity,
                 Err(e) => {
@@ -10894,7 +10913,7 @@ impl Daemon {
                 }
             };
             let fingerprint = Self::import_session_fingerprint(&identity)?;
-            if !seen_session_fingerprints.insert(fingerprint.clone()) {
+            if seen_session_fingerprints.contains(&fingerprint) {
                 count(&mut skipped_existing, "sessions");
                 continue;
             }
@@ -10902,6 +10921,7 @@ impl Daemon {
                 .with_reader(|st| st.imported_session_for_fingerprint(&fingerprint))?
                 .is_some()
             {
+                seen_session_fingerprints.insert(fingerprint);
                 count(&mut skipped_existing, "sessions");
                 continue;
             }
@@ -10913,15 +10933,18 @@ impl Daemon {
                         st.remember_imported_session_fingerprint(&fingerprint, &session_id)
                     })
                 })?;
+                seen_session_fingerprints.insert(fingerprint);
                 count(&mut skipped_existing, "sessions");
                 continue;
             }
             match self.import_session_bundle_with_fingerprint(&b, Some(&fingerprint)) {
                 Ok((session, true)) => {
+                    seen_session_fingerprints.insert(fingerprint);
                     count(&mut added, "sessions");
                     session_identities.insert(identity_key, session.id);
                 }
                 Ok((_, false)) => {
+                    seen_session_fingerprints.insert(fingerprint);
                     count(&mut skipped_existing, "sessions");
                 }
                 Err(e) => failed.push(format!(

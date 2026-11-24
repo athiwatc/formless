@@ -6475,11 +6475,14 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   imports, §7.8; import-all skips existing names); Skills disabled for
   review unless their names already exist; memories (duplicates skipped);
   jobs paused; and Sessions. Re-importing the same setup skips existing
-  entries, including jobs with the same prompt, schedule, overlap policy
+  entries, including jobs with the same prompt, optional source Session
+  binding, schedule, overlap policy
   and delivery target, and Sessions with the same normalized name, model,
   reasoning effort, transcript metadata, checkpoints and portable plan history.
   An imported Session retains its source identity so re-import remains a skip
   after the local Session evolves; local Run provenance is not portable identity.
+  A job's source Session ID is carried only for deduplication; imported jobs
+  remain standalone when no matching local Session-bound job exists.
   Recurring job schedules use the destination machine's local time; bundles do
   not carry a separate timezone.
   The result reports added and skipped-existing counts per kind, the values

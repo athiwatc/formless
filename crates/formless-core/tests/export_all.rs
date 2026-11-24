@@ -503,6 +503,49 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
     let skill = store.get_skill("travel-guide").unwrap().unwrap();
     assert_eq!((skill.version, skill.enabled), (2, true));
     assert!(!store.get_memory(&memory.id).unwrap().unwrap().enabled);
+
+    store.delete_session(&imported_session.id).unwrap();
+    let after_delete = b
+        .handle(Request::ImportAll {
+            bundle: normalized.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_delete["added"]["sessions"], 1, "{after_delete}");
+
+    let to = temp_paths("invalid-session-first");
+    let mut fresh = Config::default();
+    fresh.naming.enabled = false;
+    fresh.save(&to).unwrap();
+    let c = Arc::new(formless_core::daemon::Daemon::new(to.clone()).unwrap());
+    let mut malformed_first = bundle.clone();
+    let valid_session = malformed_first["sessions"][0].clone();
+    let mut invalid_session = valid_session.clone();
+    invalid_session["format"] = json!("formless.session/2");
+    malformed_first["sessions"] = json!([invalid_session, valid_session]);
+    let malformed_result = c
+        .handle(Request::ImportAll {
+            bundle: malformed_first,
+        })
+        .await
+        .unwrap();
+    assert_eq!(malformed_result["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        malformed_result["added"]["sessions"], 1,
+        "{malformed_result}"
+    );
+    assert_eq!(
+        malformed_result["skipped_existing"]["sessions"], 0,
+        "{malformed_result}"
+    );
+    assert_eq!(
+        Store::open(&to.db_file())
+            .unwrap()
+            .list_sessions()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// A provider key whose provider was removed from the config by hand is
@@ -580,4 +623,149 @@ fn key_files_are_trimmed_named_and_work_for_named_providers() {
         Some("sk-file-key")
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_nonportable_local_plan_does_not_block_session_import() {
+    let paths = temp_paths("legacy-plan");
+    let mut config = Config::default();
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let store = Store::open(&paths.db_file()).unwrap();
+    let legacy = store
+        .create_session(Some("Legacy checklist".into()))
+        .unwrap();
+    store
+        .import_session_plan_bundle(
+            &legacy.id,
+            &json!({"plan":[{"content":"first step","status":"in_progress"}]}),
+            &[],
+        )
+        .unwrap();
+    let db = rusqlite::Connection::open(paths.db_file()).unwrap();
+    let legacy_items = json!([
+        {"content":"first step","status":"in_progress"},
+        {"content":"second step","status":"in_progress"},
+    ]);
+    assert_eq!(
+        db.execute(
+            "UPDATE session_plan_revisions SET items=?1 WHERE session_id=?2",
+            rusqlite::params![legacy_items.to_string(), legacy.id],
+        )
+        .unwrap(),
+        1
+    );
+    let result = daemon
+        .handle(Request::ImportAll {
+            bundle: json!({
+                "format":"formless.all/1",
+                "config":{},
+                "sessions":[{
+                    "format":"formless.session/1",
+                    "name":"Incoming",
+                    "messages":[],
+                    "checkpoints":[],
+                }],
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result["failed"], json!([]), "{result}");
+    assert_eq!(result["added"]["sessions"], 1, "{result}");
+    assert_eq!(store.list_sessions().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_bound_jobs_reimport_without_duplicates() {
+    let source_paths = temp_paths("bound-job-source");
+    let mut config = Config::default();
+    config.naming.enabled = false;
+    config.save(&source_paths).unwrap();
+    let source = Arc::new(formless_core::daemon::Daemon::new(source_paths.clone()).unwrap());
+    let source_store = Store::open(&source_paths.db_file()).unwrap();
+    let session = source_store
+        .create_session(Some("Daily briefing".into()))
+        .unwrap();
+    source_store
+        .create_job(
+            "summarize the briefing",
+            Some(&session.id),
+            Some("0 9 * * 1-5"),
+            "2030-01-01T09:00:00+00:00",
+            true,
+            "user",
+        )
+        .unwrap();
+    let second_session = source_store
+        .create_session(Some("Another briefing".into()))
+        .unwrap();
+    source_store
+        .create_job(
+            "summarize the briefing",
+            Some(&second_session.id),
+            Some("0 9 * * 1-5"),
+            "2030-01-01T09:00:00+00:00",
+            true,
+            "user",
+        )
+        .unwrap();
+    let bundle = source
+        .handle(Request::ExportAll { sessions: false })
+        .await
+        .unwrap();
+    assert_eq!(bundle["jobs"].as_array().unwrap().len(), 2);
+    assert!(bundle["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["session_id"] == json!(session.id)));
+    assert!(bundle["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["session_id"] == json!(second_session.id)));
+
+    let same_machine = source
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(same_machine["added"]["jobs"], 0, "{same_machine}");
+    assert_eq!(
+        same_machine["skipped_existing"]["jobs"], 2,
+        "{same_machine}"
+    );
+    assert_eq!(source_store.list_jobs().unwrap().len(), 2);
+
+    let target_paths = temp_paths("bound-job-target");
+    let mut target_config = Config::default();
+    target_config.naming.enabled = false;
+    target_config.save(&target_paths).unwrap();
+    let target = Arc::new(formless_core::daemon::Daemon::new(target_paths.clone()).unwrap());
+    let first = target
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first["added"]["jobs"], 2, "{first}");
+    let second = target.handle(Request::ImportAll { bundle }).await.unwrap();
+    assert_eq!(second["added"]["jobs"], 0, "{second}");
+    assert_eq!(second["skipped_existing"]["jobs"], 2, "{second}");
+    let imported_jobs = Store::open(&target_paths.db_file())
+        .unwrap()
+        .list_jobs()
+        .unwrap();
+    assert_eq!(imported_jobs.len(), 2);
+    assert!(imported_jobs
+        .iter()
+        .all(|job| job.session_id.is_none() && job.author == "import" && !job.enabled));
+    assert!(imported_jobs
+        .iter()
+        .any(|job| job.source_session_id.as_deref() == Some(session.id.as_str())));
+    assert!(imported_jobs
+        .iter()
+        .any(|job| job.source_session_id.as_deref() == Some(second_session.id.as_str())));
 }
