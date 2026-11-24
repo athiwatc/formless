@@ -297,7 +297,7 @@ fn contains(body: &Value, text: &str) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn resumed_run_marks_pending_steer_from_previous_run() {
     let env = credential_env::EnvGuard::isolated();
-    let (fixture, mut client) = Fixture::new(&env, false, false).await;
+    let (mut fixture, mut client) = Fixture::new(&env, false, false).await;
     let previous_run = fixture.store.create_run(&fixture.session).unwrap();
     fixture
         .store
