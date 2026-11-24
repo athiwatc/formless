@@ -6810,6 +6810,11 @@ fn config_edit(paths: &Paths) -> Result<()> {
     let file = paths.config_file();
     if !file.exists() {
         Config::default().save(paths)?;
+    } else if let Err(error) = Config::load_file_only(paths) {
+        eprintln!(
+            "warning: {} could not be loaded before editing: {error:#}",
+            file.display()
+        );
     }
     let draft = file.with_extension("toml.edit");
     #[cfg(unix)]
@@ -6850,9 +6855,15 @@ fn config_edit(paths: &Paths) -> Result<()> {
         }
         let edited =
             std::fs::read_to_string(&draft).with_context(|| format!("read {}", draft.display()));
-        match edited.and_then(|text| Config::load_from_text(&text, &draft).map(|_| text)) {
-            Ok(text) => {
+        match edited.and_then(|text| {
+            Config::load_from_text_with_unmarked_download(&text, &draft)
+                .map(|(_, unmarked_auto_download)| (text, unmarked_auto_download))
+        }) {
+            Ok((text, unmarked_auto_download)) => {
                 formless_core::config::write_atomic(&file, text.as_bytes())?;
+                if unmarked_auto_download {
+                    eprintln!("warning: unmarked naming.auto_download = true is treated as false; use `formless config set naming.auto_download true` to opt in");
+                }
                 if let Err(error) = std::fs::remove_file(&draft) {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         eprintln!(
@@ -8446,12 +8457,35 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
 
 fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
     match cfg.naming.spec() {
-        _ if !formless_core::namer::embedded_available() => {
-            "heuristic (built without embedded-llm)".into()
+        Some(spec) => {
+            let installed = spec.installed(paths);
+            let download = if !formless_core::namer::embedded_available() {
+                "auto-download unavailable in this build"
+            } else if installed {
+                "auto-download not needed"
+            } else if !cfg.naming.enabled {
+                "auto-download will not happen (auto-naming disabled)"
+            } else if cfg.naming.auto_download {
+                "auto-download on first use"
+            } else {
+                "auto-download disabled"
+            };
+            format!(
+                "{} ({}; {}; {}; install with `formless naming pull`)",
+                spec.id,
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                },
+                download,
+                formless_core::namer::display_size(spec.gguf_bytes)
+            )
         }
-        Some(spec) if spec.installed(paths) => format!("{} (installed)", spec.id),
-        Some(spec) => format!("{} (not installed: `formless naming pull`)", spec.id),
-        None => format!("heuristic (unknown model '{}')", cfg.naming.model),
+        None => format!(
+            "heuristic (unknown model '{}'; auto-download unavailable; size unknown)",
+            cfg.naming.model
+        ),
     }
 }
 

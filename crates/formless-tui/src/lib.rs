@@ -1928,6 +1928,7 @@ struct App {
     /// (key, text), the key being saved and the last error by key.
     settings_sel: usize,
     settings_edit: Option<(String, input::InputLine)>,
+    settings_download_armed: bool,
     settings_saving: Option<String>,
     settings_error: Option<(String, String)>,
     settings_form: Option<settings::Form>,
@@ -2293,6 +2294,7 @@ impl App {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -7935,6 +7937,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.settings_download_armed = false;
         self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
@@ -9941,6 +9944,17 @@ impl App {
                 editor.vim.cancel_pending_argument();
             }
         }
+        if self.view == View::Settings && self.settings_download_armed {
+            if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+            {
+                self.settings_download_armed = false;
+            } else {
+                self.settings_key(key);
+                return;
+            }
+        }
         if self.topic.has_permission()
             && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
@@ -11416,6 +11430,29 @@ impl App {
 
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
+        if self.settings_download_armed {
+            self.settings_download_armed = false;
+            if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                let rows = self.settings_rows();
+                let selected = self.settings_sel.min(rows.len().saturating_sub(1));
+                if let Some(row) = rows.get(selected) {
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if model_supported {
+                            self.save_setting(&row.key, serde_json::json!(true));
+                        } else {
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if let Some(form) = &mut self.settings_form {
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
                 form.viewport.get_mut().page(key.code == KeyCode::PageDown);
@@ -11543,7 +11580,23 @@ impl App {
                     }
                 }
                 settings::Kind::Bool => {
-                    self.save_setting(&row.key, serde_json::json!(row.value != "on"))
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if !model_supported {
+                            self.settings_download_armed = false;
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                            return;
+                        }
+                        self.settings_download_armed = true;
+                    } else {
+                        self.settings_download_armed = false;
+                        self.save_setting(&row.key, serde_json::json!(row.value != "on"));
+                    }
                 }
                 settings::Kind::Choice(choices) => {
                     self.save_setting(&row.key, settings::next_choice(choices, &row.value))
@@ -17925,8 +17978,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
+            let confirmation = (row.key == "naming.auto_download" && app.settings_download_armed)
+                .then(|| "Type y to allow; Enter/Space cannot confirm.".to_string());
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
                 .chain(row.help.clone())
+                .chain(confirmation)
             {
                 for line in wrap_rows(&text, width) {
                     lines.push(Line::styled(format!("    {line}"), ui::dim(app.color)));
@@ -20635,6 +20691,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
+    let _ = Config::persist_naming_download_migration(&paths);
     let mut app = App::new(paths)?;
     if let Some(s) = start {
         app.on_start = s.to_string();
@@ -20976,6 +21033,7 @@ mod tests {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -25564,6 +25622,164 @@ mod tests {
         }
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn naming_auto_download_requires_tui_confirmation() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        assert_eq!(app.settings_rows()[row].value, "off");
+
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("409 MiB"), "{screen}");
+        assert!(screen.contains("heuristic"), "{screen}");
+        assert!(screen.contains("Type y to allow"), "{screen}");
+
+        for code in [KeyCode::Enter, KeyCode::Char(' ')] {
+            app.key(key(code));
+            assert!(app.settings_download_armed);
+            assert!(app.settings_saving.is_none());
+        }
+
+        app.key(key(KeyCode::Esc));
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
+
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.open_view(View::Chat);
+        assert_eq!(app.view, View::Chat);
+        assert!(!app.settings_download_armed);
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.key(key(KeyCode::Char('y')));
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
+    }
+
+    #[test]
+    fn naming_auto_download_confirmation_precedes_pending_approval_decision() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.on_event(Event::ApprovalRequested {
+            context: None,
+            approval_id: "pending-approval".into(),
+            session_id: "s1".into(),
+            tool_name: "create_tool".into(),
+            version: 1,
+            capabilities: Vec::new(),
+            memory_mb: 256,
+            detail: None,
+            already_allowed: Vec::new(),
+            code_preview: None,
+            tool_id: Some("tool-1".into()),
+            batch: None,
+            path_options: Vec::new(),
+        });
+        assert_eq!(app.view, View::Settings);
+        assert!(app.settings_download_armed);
+        assert_eq!(app.approvals.len(), 1);
+
+        app.key(key(KeyCode::Char('y')));
+
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
+        assert_eq!(
+            app.approvals.front().unwrap().approval_id,
+            "pending-approval"
+        );
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            request.request,
+            Request::SetSetting { key, value }
+                if key == "naming.auto_download" && value == serde_json::json!(true)
+        ));
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn naming_auto_download_cannot_be_enabled_without_a_supported_model() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.naming.model = "not-in-catalog".into();
+        cfg.save(&app.paths).unwrap();
+        app.open_view(View::Settings);
+
+        let rows = app.settings_rows();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "naming.model_size")
+                .unwrap()
+                .value,
+            "—"
+        );
+        let row = rows
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("downloads are unavailable")));
+        app.key(key(KeyCode::Char('y')));
+        assert!(app.settings_saving.is_none());
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
     }
 
     #[test]

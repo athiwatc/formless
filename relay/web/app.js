@@ -7344,7 +7344,11 @@
       const d = key && docs[key];
       if (!d) return null;
       const def = typeof d.default === "string" ? d.default : JSON.stringify(d.default);
-      return h("div", { class: "setting-desc muted" }, d.description + (def ? " · default " + def : ""));
+      const naming = (S.settings && S.settings.naming) || {};
+      const notice = key === "naming.auto_download"
+        ? " " + namingDownloadInfo(naming).help
+        : "";
+      return h("div", { class: "setting-desc muted" }, d.description + notice + (def ? " · default " + def : ""));
     };
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
       rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
@@ -7354,7 +7358,7 @@
           // A pointer click need not focus a native button on macOS. Give the
           // prompt a stable invoker to restore when it closes.
           event.currentTarget.focus({ preventScroll: true });
-          editSetting(key, v, kind, choices);
+          editSetting(key, v, kind, choices, S.settings);
         } }, "Edit") : key ? h("span", { class: "muted setting-readonly" }, " · read-only: edit config.toml / use its CLI") : null,
         help(key))])));
     const grid = h("div", { class: "settings-grid" });
@@ -7830,7 +7834,24 @@
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), body: descriptionReviewCard(r.skill.description_review, r.skill.description_reviews), ok: "Close" });
   }
-  async function editSetting(key, current, kind, choices = []) {
+  function namingDownloadInfo(naming) {
+    const model = typeof naming?.model === "string" ? naming.model.trim() : "";
+    const size = typeof naming?.model_size === "string" ? naming.model_size.trim() : "";
+    const supported = Boolean(model && size && size !== "—");
+    if (!supported) {
+      const notice = model
+        ? "Configured naming model " + model + " is not supported; titles use a heuristic. Automatic model downloads are unavailable."
+        : "No supported naming model is configured; titles use a heuristic. Automatic model downloads are unavailable.";
+      return { supported, help: notice, consent: notice };
+    }
+    return {
+      supported,
+      help: "First-use download: " + model + " (about " + size + "). Without it, titles use a heuristic.",
+      consent: "On first use, formless will download " + model + " (about " + size + "). Without it, Session titles use a heuristic.",
+    };
+  }
+
+  async function editSetting(key, current, kind, choices = [], settings = null) {
     let value;
     if (kind === "bool") value = !(current === "on" || current === true);
     else if (kind === "choice") {
@@ -7851,6 +7872,24 @@
         try { value = parseSettingInput(text, kind); break; }
         catch (cause) { draft = text; error = cause.message || "Invalid value"; }
       }
+    }
+    if (key === "naming.auto_download" && value === true) {
+      const naming = (settings && settings.naming) || {};
+      const download = namingDownloadInfo(naming);
+      if (!download.supported) {
+        await ask({
+          title: "No supported session-naming model",
+          text: download.consent,
+          ok: "Close",
+        });
+        return;
+      }
+      const accepted = await ask({
+        title: "Allow session-naming model download?",
+        text: download.consent,
+        ok: "Allow download",
+      });
+      if (!accepted) return;
     }
     const r = await act({ type: "set_setting", key, value });
     if (!r) return;
