@@ -536,6 +536,70 @@ fn tool_definitions_exclude_tools_without_a_current_version() {
 }
 
 #[test]
+fn windowed_successes_ignores_retired_and_attention_tools() {
+    let db = temp_db("windowed-eligible-tools");
+    let store = Store::open(&db).unwrap();
+    let caps = formless_runtime::Capabilities::parse(&[]).unwrap();
+    let session = store
+        .create_session(Some("windowed fixture".into()))
+        .unwrap()
+        .id;
+    let mut ids = Vec::new();
+    for name in ["windowed_active", "windowed_retired", "windowed_attention"] {
+        let (tool, version) = store
+            .create_tool_version(
+                name,
+                name,
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(){}",
+                &caps,
+                64,
+                "test",
+            )
+            .unwrap();
+        store
+            .record_invocation(
+                &tool.id,
+                version,
+                Some(&session),
+                None,
+                None,
+                "failure",
+                "",
+                "{}",
+                "",
+                "",
+                1,
+                100,
+            )
+            .unwrap();
+        ids.push(tool.id);
+    }
+    drop(store);
+
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute("UPDATE tools SET retired=1 WHERE id=?1", params![&ids[1]])
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE tools SET needs_attention=1 WHERE id=?1",
+            params![&ids[2]],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&db).unwrap();
+    let windowed = store.windowed_successes(1).unwrap();
+    assert!(windowed.contains_key(&ids[0]));
+    assert!(!windowed.contains_key(&ids[1]));
+    assert!(!windowed.contains_key(&ids[2]));
+    drop(store);
+    std::fs::remove_dir_all(db.parent().unwrap()).unwrap();
+}
+
+#[test]
 #[ignore = "release-mode scale check for the registry summary hot path"]
 fn registry_summary_and_tool_definitions_meet_the_500_by_200_budget() {
     const TOOLS: usize = 500;

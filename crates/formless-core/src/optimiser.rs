@@ -253,8 +253,12 @@ impl Daemon {
 
     fn scan_triggers(&self, cfg: &Config) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
-        let windowed = self.with_store(|st| st.windowed_successes(cfg.metrics.success_window))?;
+        let (tools, windowed) = self.with_reader(|st| {
+            Ok((
+                st.registry_tool_summaries(false)?,
+                st.windowed_successes(cfg.metrics.success_window)?,
+            ))
+        })?;
         for tool in tools {
             if tool.needs_attention {
                 continue;

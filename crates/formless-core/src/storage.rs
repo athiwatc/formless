@@ -7486,9 +7486,10 @@ impl Store {
     pub fn windowed_successes(&self, window: usize) -> Result<HashMap<String, (i64, Option<f64>)>> {
         let mut stmt = self.ps("SELECT tool_id,COUNT(*),COALESCE(SUM(status='success'),0)
              FROM (
-                 SELECT tool_id,status,
-                        ROW_NUMBER() OVER (PARTITION BY tool_id ORDER BY rowid DESC) AS position
-                 FROM invocations WHERE status IN ('success','failure')
+                 SELECT i.tool_id,i.status,
+                        ROW_NUMBER() OVER (PARTITION BY i.tool_id ORDER BY i.rowid DESC) AS position
+                 FROM invocations i JOIN tools t ON t.id=i.tool_id
+                 WHERE i.status IN ('success','failure') AND t.retired=0 AND t.needs_attention=0
              )
              WHERE position<=?1
              GROUP BY tool_id")?;
