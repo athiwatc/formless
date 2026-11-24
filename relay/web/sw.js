@@ -42,6 +42,11 @@ function storeIncomingShare(share) {
 }
 
 async function receiveShare(request) {
+  const origin = request.headers?.get?.("Origin");
+  const fetchSite = request.headers?.get?.("Sec-Fetch-Site");
+  if (origin != null && origin !== location.origin || fetchSite === "cross-site" || fetchSite === "same-site") {
+    return new Response("Untrusted share request", { status: 403 });
+  }
   try {
     const form = await request.formData();
     const text = form.get("text");

@@ -184,6 +184,34 @@ test("Session-specific notification clicks still open their Session", async () =
   assert.equal(JSON.stringify(messages), JSON.stringify([{ type: "formless-open-notification-session", session: "topic-chat" }]));
 });
 
+test("share target rejects explicit cross-site request metadata before reading or storing the body", async () => {
+  for (const headers of [
+    new Headers({ Origin: "https://attacker.example" }),
+    new Headers({ Origin: "null" }),
+    new Headers({ "Sec-Fetch-Site": "cross-site" }),
+    new Headers({ "Sec-Fetch-Site": "same-site" }),
+  ]) {
+    const records = new Map();
+    let formReads = 0;
+    const request = {
+      url: "https://formless.example/share",
+      method: "POST",
+      mode: "navigate",
+      headers,
+      formData: async () => { formReads++; return new FormData(); },
+    };
+    const { event } = fetchEvent({
+      request,
+      fetch: async () => new Response("unexpected"),
+      caches: {},
+      globals: { indexedDB: shareDatabase(records), crypto: webcrypto },
+    });
+    assert.equal((await event.response).status, 403);
+    assert.equal(formReads, 0);
+    assert.equal(records.size, 0);
+  }
+});
+
 test("share target stores shared text, URL, and files before redirecting to the app", async () => {
   const records = new Map();
   const file = new File(["photo"], "photo.png", { type: "image/png" });
