@@ -41,11 +41,11 @@ impl Daemon {
         session: &str,
         run: &str,
         seq: i64,
-        included_user_message_ids: &[String],
+        included_steer_message_ids: &[String],
         step: i64,
     ) -> Result<()> {
         if self.with_store(|st| {
-            st.mark_steering_context_included(session, run, seq, included_user_message_ids, step)
+            st.mark_steering_context_included(session, run, seq, included_steer_message_ids, step)
         })? {
             self.broadcast(Event::MessagesEdited {
                 session_id: session.to_string(),

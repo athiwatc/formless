@@ -6382,7 +6382,7 @@ impl Daemon {
             )?
             .0;
         let first_message_seq = cache.last_included_seq();
-        let first_user_message_ids = cache.included_user_message_ids().to_vec();
+        let first_steer_message_ids = cache.included_steer_message_ids().to_vec();
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .resolved_dispatch(&forecast.basis.model)
@@ -6402,7 +6402,7 @@ impl Daemon {
                 defs,
                 checkpoint,
                 sources,
-                first_user_message_ids,
+                first_steer_message_ids,
             ))),
         }))
     }
@@ -7595,40 +7595,35 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources, consumed_seq, included_user_message_ids) = if let Some((
-                mut ctx,
-                defs,
-                _,
-                sources,
-                included_user_message_ids,
-            )) = first.take()
-            {
-                if let Some(policy) = &pipeline {
-                    policy.options.project_context(&mut ctx)?;
-                }
-                (
-                    ctx,
-                    defs,
-                    Some(sources),
-                    first_message_seq,
-                    included_user_message_ids,
-                )
-            } else {
-                let (built, consumed_seq, included_user_message_ids) = self
-                    .session_context_with_policy_tracked(
-                        session_id,
-                        &provider,
-                        &model,
-                        context_tokens,
-                        cfg.compaction.fraction(),
-                        pipeline.as_ref().map(|p| &p.options),
-                    )?;
-                let ctx = built.0;
-                let defs = self.with_store(|st| {
-                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                })?;
-                (ctx, defs, None, consumed_seq, included_user_message_ids)
-            };
+            let (ctx, defs, sources, consumed_seq, included_steer_message_ids) =
+                if let Some((mut ctx, defs, _, sources, included_steer_message_ids)) = first.take()
+                {
+                    if let Some(policy) = &pipeline {
+                        policy.options.project_context(&mut ctx)?;
+                    }
+                    (
+                        ctx,
+                        defs,
+                        Some(sources),
+                        first_message_seq,
+                        included_steer_message_ids,
+                    )
+                } else {
+                    let (built, consumed_seq, included_steer_message_ids) = self
+                        .session_context_with_policy_tracked(
+                            session_id,
+                            &provider,
+                            &model,
+                            context_tokens,
+                            cfg.compaction.fraction(),
+                            pipeline.as_ref().map(|p| &p.options),
+                        )?;
+                    let ctx = built.0;
+                    let defs = self.with_store(|st| {
+                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                    })?;
+                    (ctx, defs, None, consumed_seq, included_steer_message_ids)
+                };
             let call_provider = match sources {
                 Some(sources) => provider.clone().with_frozen_attachments(sources),
                 None => provider.clone(),
@@ -7661,7 +7656,7 @@ impl Daemon {
                     session_id,
                     run_id,
                     consumed_seq,
-                    &included_user_message_ids,
+                    &included_steer_message_ids,
                     step,
                 )?;
                 self.mark_context_consumed(session_id,run_id,consumed_seq);
@@ -15631,7 +15626,7 @@ impl Daemon {
             if let Some(policy) = policy {
                 policy.project_context(&mut built.0)?;
             }
-            let included_user_message_ids = cache.included_user_message_ids().to_vec();
+            let included_steer_message_ids = cache.included_steer_message_ids().to_vec();
             let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
@@ -15642,7 +15637,7 @@ impl Daemon {
             Ok((
                 cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction),
                 included_seq,
-                included_user_message_ids,
+                included_steer_message_ids,
             ))
         });
         if built.is_ok() {
