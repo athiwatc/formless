@@ -6527,7 +6527,7 @@
       h("td", null, toolStatusDot(t), toolLabel(t), t.retired ? h("span", { class: "muted" }, " (retired)") : null),
       h("td", null, "v" + t.current_version),
       h("td", { class: "num" }, t.invocations),
-      h("td", { class: "num" }, rateCell(t.success_rate), toolRecent(t.recent)),
+      h("td", { class: "num" }, rateCell(t.success_rate)),
       h("td", { class: "muted" }, t.last_used_at ? relTime(t.last_used_at) : "—"),
       opts.bars ? h("td", null, bar(t.success_rate)) : h("td", { class: "caps" }, (t.capabilities || []).join(", ") || "—")));
     }
