@@ -89,6 +89,28 @@ test('pull commands preserve provider selection and resolve explicit or implicit
     type: 'cancel_ollama_pull', pull_id: 'pull-explicit',
   });
 });
+test('pull requests check tracked-pull support before dispatch', async () => {
+  const requests = [], notices = [];
+  const parsed = value => JSON.parse(JSON.stringify(value));
+  const c = setup(['hasPullJobsFeature', 'requestPull'], {
+    act: async request => {
+      requests.push(request);
+      return request.type === 'ping' ? { features: [] } : { pull_id: 'pull-1' };
+    },
+    note: (text, error) => notices.push({ text, error }),
+  });
+  assert.equal(await c.requestPull({ type: 'ollama_pull', model: 'llama3', provider: 'remote' }), null);
+  assert.deepEqual(parsed(requests), [{ type: 'ping' }]);
+  assert.match(notices[0].text, /does not support tracked Ollama pulls/);
+
+  requests.length = 0;
+  c.act = async request => {
+    requests.push(request);
+    return request.type === 'ping' ? { features: ['ollama_pull_jobs_v1'] } : { pull_id: 'pull-1' };
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(await c.requestPull({ type: 'ollama_pull', model: 'llama3' }))), { pull_id: 'pull-1' });
+  assert.deepEqual(parsed(requests), [{ type: 'ping' }, { type: 'ollama_pull', model: 'llama3' }]);
+});
 test('pull progress preserves another active pull and reports provider-aware resume guidance', () => {
   const notices = [], activities = [];
   const c = setup(['handlePullProgress'], {

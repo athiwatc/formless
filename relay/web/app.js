@@ -9161,9 +9161,9 @@
           h("td", null, c.qualified === false ? "below the quality gate" : "")))))))), { trigger });
     } },
     { name: "pull", args: "MODEL [--provider NAME] | cancel [PULL_ID]", group: "Settings", desc: "Ollama: download, attach to, or cancel a model pull", run: async (arg) => {
-      const request = parsePullCommand(arg, S.pullId);
-      if (request.error) return note(request.error, true);
-      if (await act(request)) note(request.type === "ollama_pull" ? "checking Ollama endpoint for " + request.model + "…" : "cancelling Ollama pull…");
+      const pullRequest = parsePullCommand(arg, S.pullId);
+      if (pullRequest.error) return note(pullRequest.error, true);
+      if (await requestPull(pullRequest)) note(pullRequest.type === "ollama_pull" ? "checking Ollama endpoint for " + pullRequest.model + "…" : "cancelling Ollama pull…");
     } },
     { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: " + Object.keys(topics).join(", "), run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
@@ -9395,6 +9395,20 @@
       provider = parts[2];
     }
     return { type: "ollama_pull", model, provider };
+  }
+
+  function hasPullJobsFeature(response) {
+    return Array.isArray(response && response.features) && response.features.includes("ollama_pull_jobs_v1");
+  }
+
+  async function requestPull(pullRequest) {
+    const ping = await act({ type: "ping" });
+    if (!ping) return null;
+    if (!hasPullJobsFeature(ping)) {
+      note("the running daemon does not support tracked Ollama pulls; restart it with this version", true);
+      return null;
+    }
+    return act(pullRequest);
   }
 
   async function slash(cmd) {

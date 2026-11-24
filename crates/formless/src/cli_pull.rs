@@ -7,6 +7,29 @@ use std::time::Duration;
 pub fn run(paths: &Paths, model: &str, provider: Option<&str>) -> Result<()> {
     formless_core::daemon::ensure_daemon(paths)?;
     let (client, events) = DaemonClient::connect(paths)?;
+    let ping_id = client.send(Request::Ping);
+    loop {
+        match events
+            .recv_timeout(Duration::from_secs(15))
+            .context("checking daemon pull support")?
+        {
+            ServerMessage::Response {
+                id,
+                ok,
+                result,
+                error,
+            } if id == ping_id => {
+                if !ok {
+                    return Err(anyhow!(
+                        error.unwrap_or_else(|| "daemon pull capability check failed".into())
+                    ));
+                }
+                require_pull_jobs_feature(&result.unwrap_or_default())?;
+                break;
+            }
+            _ => {}
+        }
+    }
     let subscribe_id = client.send(Request::Subscribe {
         sessions: None,
         deltas: false,
@@ -175,6 +198,20 @@ fn terminal_safe(text: &str) -> String {
     safe
 }
 
+fn require_pull_jobs_feature(result: &serde_json::Value) -> Result<()> {
+    if result["features"].as_array().is_some_and(|features| {
+        features
+            .iter()
+            .any(|feature| feature.as_str() == Some(formless_protocol::OLLAMA_PULL_JOBS_FEATURE))
+    }) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "the running daemon does not support tracked Ollama pulls; restart it with this version"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +259,15 @@ mod tests {
             terminal_safe("Ollama\u{1b}[2J\u{202e}"),
             "Ollama\\u{1b}[2J\\u{202e}"
         );
+    }
+
+    #[test]
+    fn tracked_pull_requires_daemon_feature_before_dispatch() {
+        assert!(require_pull_jobs_feature(&serde_json::json!({
+            "features": [formless_protocol::OLLAMA_PULL_JOBS_FEATURE]
+        }))
+        .is_ok());
+        assert!(require_pull_jobs_feature(&serde_json::json!({"features": []})).is_err());
+        assert!(require_pull_jobs_feature(&serde_json::Value::Null).is_err());
     }
 }

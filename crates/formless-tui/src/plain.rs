@@ -978,6 +978,14 @@ fn plain_pull_request(
     })
 }
 
+fn plain_pull_jobs_supported(result: &serde_json::Value) -> bool {
+    result["features"].as_array().is_some_and(|features| {
+        features
+            .iter()
+            .any(|feature| feature.as_str() == Some(formless_protocol::OLLAMA_PULL_JOBS_FEATURE))
+    })
+}
+
 fn dispatch_plain_pull<T>(
     arguments: &str,
     active_pull_id: Option<&str>,
@@ -1349,6 +1357,18 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             cmd if cmd == "/pull" || cmd.starts_with("/pull ") => {
                 let arguments = cmd.strip_prefix("/pull").unwrap_or_default();
                 let cancelling = arguments.split_whitespace().next() == Some("cancel");
+                let features =
+                    match wait_response(&rx, &sends, &backlog, client.send(Request::Ping)) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            say(&format!("Pull support check failed: {error}"));
+                            continue;
+                        }
+                    };
+                if !plain_pull_jobs_supported(&features) {
+                    say("The running daemon does not support tracked Ollama pulls; restart it with this version.");
+                    continue;
+                }
                 let request_id =
                     match dispatch_plain_pull(arguments, pull_id.as_deref(), |request| {
                         client.send(request)
@@ -2023,6 +2043,17 @@ mod pull_command_tests {
             Some(Request::OllamaPull { model, provider: Some(provider) })
                 if model == "llama3" && provider == "remote"
         ));
+    }
+
+    #[test]
+    fn plain_pull_feature_gate_rejects_daemons_without_tracked_pull_support() {
+        assert!(plain_pull_jobs_supported(&serde_json::json!({
+            "features": [formless_protocol::OLLAMA_PULL_JOBS_FEATURE]
+        })));
+        assert!(!plain_pull_jobs_supported(
+            &serde_json::json!({"features": []})
+        ));
+        assert!(!plain_pull_jobs_supported(&serde_json::Value::Null));
     }
 }
 

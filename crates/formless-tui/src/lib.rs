@@ -265,6 +265,10 @@ enum Pending {
     },
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
+    OllamaPullFeatureCheck {
+        model: String,
+        provider: Option<String>,
+    },
     SendMessage,
     TourSession,
     TourRun {
@@ -2145,6 +2149,14 @@ fn pull_event_matches_active(active_pull_id: Option<&str>, event_pull_id: Option
     active_pull_id == event_pull_id
 }
 
+fn daemon_supports_ollama_pull_jobs(result: &serde_json::Value) -> bool {
+    result["features"].as_array().is_some_and(|features| {
+        features
+            .iter()
+            .any(|feature| feature.as_str() == Some(formless_protocol::OLLAMA_PULL_JOBS_FEATURE))
+    })
+}
+
 #[cfg(test)]
 mod pull_tracking_tests {
     use super::pull_event_matches_active;
@@ -3545,6 +3557,24 @@ impl App {
                             if let Some(seen) = result["approval_help_seen"].as_bool() {
                                 self.shares_approval_help = true;
                                 self.seen.approval_help |= seen;
+                            }
+                        }
+                        Pending::OllamaPullFeatureCheck { model, provider } => {
+                            if daemon_supports_ollama_pull_jobs(&result) {
+                                self.fire(Request::OllamaPull {
+                                    model: model.clone(),
+                                    provider: provider.clone(),
+                                });
+                                self.notes.push(match provider {
+                                    Some(provider) => {
+                                        format!("checking Ollama provider {provider} for {model}…")
+                                    }
+                                    None => format!(
+                                        "checking the default provider for Ollama model {model}…"
+                                    ),
+                                });
+                            } else {
+                                self.notes.push("the running daemon does not support tracked Ollama pulls; restart it with this version".into());
                             }
                         }
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
@@ -8867,14 +8897,14 @@ impl App {
                             return;
                         }
                     }
-                    self.fire(Request::OllamaPull {
-                        model: model.to_string(),
-                        provider: provider.clone(),
-                    });
-                    self.notes.push(match provider {
-                        Some(provider) => format!("checking Ollama provider {provider} for {model}…"),
-                        None => format!("checking the default provider for Ollama model {model}…"),
-                    });
+                    self.request(
+                        Pending::OllamaPullFeatureCheck {
+                            model: model.to_string(),
+                            provider,
+                        },
+                        Request::Ping,
+                    );
+                    self.notes.push("checking daemon support for tracked Ollama pulls…".into());
                 }
             }
             cmd if cmd == "summarise-branch" || cmd.starts_with("summarise-branch ") => {
@@ -21188,6 +21218,51 @@ mod tests {
             last_click: None,
             stream_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn pull_checks_daemon_feature_before_sending_pull_request() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+
+        app.slash("pull llama3 --provider remote");
+        let ping: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(ping.request, Request::Ping));
+        tx.send(ServerMessage::Response {
+            id: ping.id,
+            ok: true,
+            result: Some(serde_json::json!({"features": []})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(sent.try_recv().is_err());
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("does not support tracked Ollama pulls")));
+
+        app.slash("pull llama3 --provider remote");
+        let ping: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: ping.id,
+            ok: true,
+            result: Some(serde_json::json!({
+                "features": [formless_protocol::OLLAMA_PULL_JOBS_FEATURE]
+            })),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        let pull: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            pull.request,
+            Request::OllamaPull { model, provider: Some(provider) }
+                if model == "llama3" && provider == "remote"
+        ));
     }
 
     #[test]

@@ -470,6 +470,8 @@ pub fn valid_reviewed_run_id(id: &str) -> bool {
 }
 
 /// Named optional capabilities, advertised by `Ping` and `Status`.
+pub const OLLAMA_PULL_JOBS_FEATURE: &str = "ollama_pull_jobs_v1";
+
 pub const FEATURES: &[&str] = &[
     "setting_env_override",
     "setting_map_merge",
@@ -491,7 +493,7 @@ pub const FEATURES: &[&str] = &[
     USAGE_BY_DAY_UTC_OFFSET_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
-    "ollama_pull_jobs_v1",
+    OLLAMA_PULL_JOBS_FEATURE,
 ];
 
 /// Explicit nullable pair; both keys must be present even when inheriting.
