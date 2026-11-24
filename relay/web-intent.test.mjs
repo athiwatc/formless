@@ -569,6 +569,24 @@ test('app shortcut launch opens Main Chat and approvals', async () => {
   assert.equal(c.launchRouteHandled, true);
 });
 
+test('incoming share overrides a restored Approvals view and opens Chat', async () => {
+  const views = [];
+  const c = setup([
+    'handleLaunchRoute', 'readPendingShareLaunch', 'rememberPendingShareLaunch',
+    'pendingShareLaunchForScope', 'clearPendingShareLaunch',
+  ], {
+    launchRouteHandled: false, launchAction: null, launchShareError: false,
+    launchShareToken: 'share-token', launchView: 'approvals',
+    readIncomingShare: async () => ({ files: [] }),
+    applyIncomingShare: async () => true,
+    deleteIncomingShare: async () => {},
+    setView: view => views.push(view),
+    stripLaunchParams() {},
+  });
+  await c.handleLaunchRoute();
+  assert.deepEqual(views, ['chat']);
+});
+
 test('Main Chat shortcut resolves or creates Main Chat through the existing Main Chat path', async () => {
   let refreshed, opened, c;
   c = setup(['openMainChat'], {

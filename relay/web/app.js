@@ -10319,7 +10319,9 @@
     }
     const pendingShare = pendingShareLaunchForScope(S.storageScope);
     const shareToken = launchShareToken || (pendingShare && !pendingShare.scopeMismatch ? pendingShare.token : null);
-    if (pendingShare?.scopeMismatch && (!launchShareToken || pendingShare.token === launchShareToken)) {
+    const shareBlockedByScope = !!(pendingShare?.scopeMismatch && (!launchShareToken || pendingShare.token === launchShareToken));
+    const shareLaunchActive = !!shareToken && !shareBlockedByScope;
+    if (shareBlockedByScope) {
       note("This pending share belongs to a different Formless space; reopen that space to continue.", true);
     } else if (shareToken) {
       rememberPendingShareLaunch(shareToken, S.storageScope);
@@ -10344,9 +10346,10 @@
       }
     }
     if (launchView === "approvals") {
-      setView("approvals");
+      if (!shareLaunchActive) setView("approvals");
       stripLaunchParams(["view"]);
     }
+    if (shareLaunchActive) setView("chat");
     if (launchAction === "focus-pending") {
       focusPending();
       stripLaunchParams(["action"]);
