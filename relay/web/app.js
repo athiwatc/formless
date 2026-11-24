@@ -5858,6 +5858,27 @@
     const failure = S.shareAttachmentFailures?.get(key);
     if (failure?.token === token) S.shareAttachmentFailures.delete(key);
   }
+  async function resolveFailedSharedFiles(token, record, destination, failedFiles, reason) {
+    const failures = S.shareAttachmentFailures || (S.shareAttachmentFailures = new Map());
+    failures.set(sessionCacheKey(destination.scope, destination.sessionId), { token, files: failedFiles });
+    const names = failedFiles.map(file => file?.name || "unnamed file").join(", ");
+    const discard = await ask({
+      title: "Shared files couldn't be attached",
+      text: reason + ": " + names + ". Keep them to retry, or discard them? The caption remains a draft and will not be sent.",
+      ok: "Discard failed files",
+      cancelLabel: "Keep files",
+      danger: true,
+    });
+    if (!discard) {
+      note("Failed shared files are retained; Send stays disabled until you retry or discard them.", true);
+      return false;
+    }
+    record.files = [];
+    await storeIncomingShare(record);
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
+    note("Discarded failed shared files. The caption remains a draft; nothing was sent.");
+    return true;
+  }
   function renderComposer() {
     scheduleForecast();
     const running = isRunning();
@@ -10290,16 +10311,12 @@
     }
     const files = record.files.map(incomingShareFile);
     if (files.some((file) => !file)) {
-      note("Some shared files couldn't be restored; share them again to retry.", true);
-      return false;
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be restored");
     }
     record.files = await attachFiles(files, destination.sessionId, destination.scope);
     await storeIncomingShare(record);
     if (record.files.length) {
-      const failures = S.shareAttachmentFailures || (S.shareAttachmentFailures = new Map());
-      failures.set(sessionCacheKey(destination.scope, destination.sessionId), { token, files: record.files });
-      note("Some shared files couldn't be attached; reload to retry.", true);
-      return false;
+      return resolveFailedSharedFiles(token, record, destination, record.files, "Some shared files couldn't be attached");
     }
     clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
     return true;

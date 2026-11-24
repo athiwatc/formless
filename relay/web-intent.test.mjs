@@ -51,7 +51,7 @@ function setup(names, extras = {}) {
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, renderOutbox() {}, renderComposer() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
+    renderChips() {}, renderOutbox() {}, renderComposer() {}, note() {}, ask: async () => null, autosize() {}, currentTopicAttempt: () => null,
     renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras,
     request: async req => req.type === 'ping'
@@ -63,7 +63,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','sharedSlashDraftKey','sharedSlashDraftValue','rememberSharedSlashDraft','clearSharedSlashDraft','clearEditedSharedSlashDraft','isSharedSlashDraft','shareSendBlocked','clearShareAttachmentFailure','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','sharedSlashDraftKey','sharedSlashDraftValue','rememberSharedSlashDraft','clearSharedSlashDraft','clearEditedSharedSlashDraft','isSharedSlashDraft','shareSendBlocked','clearShareAttachmentFailure','resolveFailedSharedFiles','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
   const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
@@ -254,6 +254,48 @@ test('the composer disables Send and submit refuses while share attachment work 
   c.renderComposer();
   assert.equal(c.$('send-btn').disabled, true);
   await c.submit(false);
+  assert.equal(c.$('input').value, 'caption');
+});
+
+test('discarding a permanently failed shared file is explicit and leaves the caption unsent', async () => {
+  const oversized = new File(['too big'], 'oversized.pdf', { type: 'application/pdf' });
+  const stored = [], prompts = [];
+  let sends = 0;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'shareSendBlocked', 'submit'], {
+    File, Blob,
+    attachFiles: async files => files,
+    ask: async options => { prompts.push(options); return true; },
+    storeIncomingShare: async share => stored.push({ ...share, files: [...share.files] }),
+    submit: () => { sends++; },
+  });
+  c.S.current = 'A';
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'caption', files: [oversized], draftApplied: false }), true);
+  assert.match(prompts[0].text, /oversized\.pdf/);
+  assert.match(prompts[0].text, /will not be sent/);
+  assert.equal(prompts[0].ok, 'Discard failed files');
+  assert.deepEqual(stored.at(-1).files, []);
+  assert.equal(c.$('input').value, 'caption');
+  assert.equal(c.shareSendBlocked(), false);
+  assert.equal(sends, 0);
+});
+
+test('keeping failed shared files retains the share and blocks sending its caption', async () => {
+  const oversized = new File(['too big'], 'oversized.pdf', { type: 'application/pdf' });
+  const stored = [];
+  let sends = 0;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'shareSendBlocked', 'submit'], {
+    File, Blob,
+    attachFiles: async files => files,
+    ask: async () => null,
+    storeIncomingShare: async share => stored.push({ ...share, files: [...share.files] }),
+    submit: () => { sends++; },
+  });
+  c.S.current = 'A';
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'caption', files: [oversized], draftApplied: false }), false);
+  assert.equal(stored.at(-1).files.length, 1);
+  assert.equal(c.shareSendBlocked(), true);
+  await c.submit(false);
+  assert.equal(sends, 0);
   assert.equal(c.$('input').value, 'caption');
 });
 
