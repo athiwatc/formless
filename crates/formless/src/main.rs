@@ -5421,7 +5421,7 @@ fn run_headless(
             summary.line(&status.replace('_', " "), started.elapsed())
         );
     }
-    if progress && !matches!(output, RunOutput::Json | RunOutput::JsonlEvents) {
+    if !quiet && !matches!(output, RunOutput::Json | RunOutput::JsonlEvents) {
         if let Some(served) = &summary.served_model {
             eprintln!("via {} ({})", served.name, served.via);
         }

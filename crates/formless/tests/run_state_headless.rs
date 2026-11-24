@@ -508,6 +508,20 @@ fn quiet_headless_output_suppresses_served_model_feedback() {
 }
 
 #[test]
+fn redirected_final_headless_output_keeps_served_model_feedback() {
+    let fixture = Fixture::with_served_model();
+    let output = fixture.run("final", false, false);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ONLY_FINAL_ANSWER_761\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("via fallback-model (fallback)"), "{stderr}");
+}
+
+#[test]
 fn paused_headless_jsonl_retains_terminal_recap_after_pause_notice() {
     let fixture = Fixture::with_paused(true);
     let output = fixture.run("jsonl-events", true, false);
