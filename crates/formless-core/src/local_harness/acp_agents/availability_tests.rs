@@ -38,7 +38,16 @@ while IFS= read -r request; do
             response=$PROBE_INITIALIZE ;;
         *'"method":"session/new"'*)
             method=session/new
-            case "$request" in *'"cwd":"'"$PWD"'"'*) ;; *) exit 1 ;; esac
+            case "$request" in
+                *'"cwd":"'*)
+                    request_cwd=${request#*'"cwd":"'}
+                    request_cwd=${request_cwd%%'"'*} ;;
+                *) exit 1 ;;
+            esac
+            [ -n "$request_cwd" ] || exit 1
+            request_physical=$(CDPATH= cd "$request_cwd" && pwd -P)
+            current_physical=$(pwd -P)
+            [ "$request_physical" = "$current_physical" ] || exit 1
             case "$request" in *'"mcpServers":[]'*) ;; *) exit 1 ;; esac
             response=$PROBE_SESSION ;;
         *) exit 1 ;;
