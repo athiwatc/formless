@@ -4923,7 +4923,7 @@
   /** The live calls to draw (the TUI's rule), each with how many
    * descendants it folds away: a node shows while it or an ancestor runs,
    * and under a node that finished successfully its descendants fold. */
-  function liveTree(calls) {
+  function liveTree(calls, retained = new Set()) {
     const out = [];
     const stack = []; // [depth, running, open] of the current ancestors
     for (const c of calls) {
@@ -4932,7 +4932,7 @@
       const parentOpen = !stack.length || stack[stack.length - 1][2];
       const ancestorRunning = stack.some((s) => s[1]);
       const running = c.status === "running";
-      const visible = parentOpen && (running || ancestorRunning);
+      const visible = parentOpen && (running || ancestorRunning || retained.has(c));
       const open = visible && c.status !== "ok";
       if (visible) out.push([c, 0]);
       else if (ancestorRunning && !parentOpen) {
@@ -4943,6 +4943,18 @@
       stack.push([d, running, open]);
     }
     return out;
+  }
+  function focusedLiveTools(tools) {
+    if (typeof document === "undefined" || typeof liveRender === "undefined" || !liveRender.rows) return new Set();
+    const active = document.activeElement;
+    return new Set(tools.filter((tool) => {
+      if ((tool.depth || 0) !== 0 || tool.status === "running") return false;
+      const row = liveRender.rows.get(tool) || [...liveRender.rows.values()].find((candidate) =>
+        (tool.invocationId != null && candidate.tool.invocationId === tool.invocationId)
+        || (tool.handle && candidate.tool.handle === tool.handle)
+        || (tool.subagent && candidate.tool.subagent === tool.subagent));
+      return row?.node.contains?.(active) === true;
+    }));
   }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
@@ -5209,7 +5221,8 @@
         liveRender.rows.clear();
       }
       const running = isRunning();
-      const tools = S.liveTools.filter((t) => t.status === "running");
+      const focused = focusedLiveTools(S.liveTools);
+      const tools = S.liveTools.filter((t) => t.status === "running" || focused.has(t));
       const children = [];
       if (running || S.streaming || tools.length) {
         children.push(liveRender.who);
@@ -5229,7 +5242,7 @@
           liveRender.thinking.scrollTop = expanded ? top : 0;
           children.push(liveRender.thinkingBox);
         }
-        for (const [tool, folded] of liveTree(S.liveTools)) {
+        for (const [tool, folded] of liveTree(S.liveTools, focused)) {
           const row = liveToolRow(tool);
           updateLiveTool(row, folded);
           children.push(row.node);
@@ -9728,7 +9741,8 @@
           }
           if (announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id) announcedRun = null;
           clearLiveText();
-          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
+          const focused = focusedLiveTools(S.liveTools || []);
+          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle || focused.has(t)); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status === "abandoned") note("This run has ended; it cannot be resumed.");
