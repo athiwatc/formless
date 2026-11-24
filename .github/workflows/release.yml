@@ -99,6 +99,12 @@ jobs:
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/formless" "$name/"
           cp README.md SPEC.md LICENSE "$name/"
+          mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
+          cp GLOSSARY.md "$name/"
+          cp -R docs "$name/"
+          cp packaging/*.md "$name/packaging/"
+          cp relay/*.md "$name/relay/"
+          cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
           # The man page, from the target binary (or a host build when the
           # runner can't run the target).
           "target/${{ matrix.target }}/release/formless" man > "$name/formless.1" \
@@ -115,6 +121,12 @@ jobs:
           New-Item -ItemType Directory $name
           Copy-Item "target/${{ matrix.target }}/release/formless.exe" $name
           Copy-Item README.md,SPEC.md,LICENSE $name
+          New-Item -ItemType Directory -Path "$name/packaging","$name/relay","$name/crates/formless-desktop" -Force | Out-Null
+          Copy-Item GLOSSARY.md "$name"
+          Copy-Item -Path docs -Destination "$name" -Recurse
+          Copy-Item -Path packaging/*.md -Destination "$name/packaging"
+          Copy-Item -Path relay/*.md -Destination "$name/relay"
+          Copy-Item crates/formless-desktop/README.md "$name/crates/formless-desktop"
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File "$name.zip.sha256" -Encoding ascii
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -197,6 +209,12 @@ jobs:
           name="formless-${GITHUB_REF_NAME}-${FORMLESS_RELEASE_TARGET}"
           mkdir -p dist "$name"
           cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
+          mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
+          cp GLOSSARY.md "$name/"
+          cp -R docs "$name/"
+          cp packaging/*.md "$name/packaging/"
+          cp relay/*.md "$name/relay/"
+          cp crates/formless-desktop/README.md "$name/crates/formless-desktop/"
           tar -czf "dist/$name.tar.gz" "$name"
       - name: Install package-building tools with private intermediates
         if: matrix.packages

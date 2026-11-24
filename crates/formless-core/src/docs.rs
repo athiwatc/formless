@@ -32,6 +32,17 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
     ("skills", "docs/skills.md", "Skills"),
     ("jobs", "docs/jobs.md", "scheduled jobs"),
     ("spec", "SPEC.md", "the full specification"),
+    (
+        "usage",
+        "docs/usage.md",
+        "installing, configuring, and using Formless",
+    ),
+    ("cli", "docs/cli.md", "CLI commands and global flags"),
+    (
+        "architecture",
+        "docs/architecture.md",
+        "architecture, tools, and development",
+    ),
 ];
 
 /// A topic mistake, distinct from the default gallery or a unique prefix.
@@ -112,6 +123,9 @@ impl std::error::Error for TextError {}
 fn embedded(path: &str) -> Option<&'static str> {
     Some(match path {
         "docs/gallery.md" => include_str!("../../../docs/gallery.md"),
+        "docs/usage.md" => include_str!("../../../docs/usage.md"),
+        "docs/cli.md" => include_str!("../../../docs/cli.md"),
+        "docs/architecture.md" => include_str!("../../../docs/architecture.md"),
         "docs/capabilities.md" => include_str!("../../../docs/capabilities.md"),
         "docs/keys.md" => include_str!("../../../docs/keys.md"),
         "docs/troubleshooting.md" => include_str!("../../../docs/troubleshooting.md"),
