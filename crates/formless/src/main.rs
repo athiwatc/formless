@@ -2905,6 +2905,17 @@ fn upgrade_command_for_exe(exe: &str) -> &'static str {
     platform_upgrade_command(exe, cfg!(windows))
 }
 
+fn is_cargo_build_executable(exe: &str) -> bool {
+    let normalized = exe.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/target/debug/") || normalized.contains("/target/release/")
+}
+
+fn is_winget_executable(exe: &str) -> bool {
+    exe.replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/winget/packages/")
+}
+
 fn platform_upgrade_command(exe: &str, windows: bool) -> &'static str {
     if !windows && is_homebrew_executable(exe) {
         "brew upgrade formless"
@@ -2914,10 +2925,13 @@ fn platform_upgrade_command(exe: &str, windows: bool) -> &'static str {
                 .replace('\\', "/")
                 .to_ascii_lowercase()
                 .contains("/.cargo/bin/"))
+        || (windows && is_cargo_build_executable(exe))
     {
         "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
-    } else if windows {
+    } else if windows && is_winget_executable(exe) {
         "winget upgrade --id athiwatc.formless --exact"
+    } else if windows {
+        WINDOWS_MANUAL_UPGRADE_GUIDANCE
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
@@ -2937,6 +2951,7 @@ const INSTALL_COMMAND: &str = concat!(
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
     " -o \"$install_tmp/install.sh\" && sh \"$install_tmp/install.sh\"'"
 );
+const WINDOWS_MANUAL_UPGRADE_GUIDANCE: &str = "Download and verify the latest matching Windows ZIP from https://github.com/athiwatc/formless/releases (see docs/windows-install.md#manual-updates)";
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
@@ -10555,8 +10570,23 @@ exit "$FORMLESS_FIXTURE_CURL_STATUS"
                 .starts_with("cargo install ")
         );
         assert_eq!(
-            super::platform_upgrade_command(r"C:\Program Files\Formless\formless.exe", true),
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Microsoft\WinGet\Packages\athiwatc.formless\formless.exe",
+                true
+            ),
             "winget upgrade --id athiwatc.formless --exact"
+        );
+        assert!(super::platform_upgrade_command(
+            r"C:\Users\person\source\formless\target\debug\deps\formless-test.exe",
+            true
+        )
+        .starts_with("cargo install "));
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Programs\Formless\manual\formless.exe",
+                true
+            ),
+            super::WINDOWS_MANUAL_UPGRADE_GUIDANCE
         );
     }
 

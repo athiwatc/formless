@@ -98,9 +98,9 @@ No administrator or machine-wide PATH change is needed.
 
 ## Manual updates
 
-On Windows, `formless update` prints the winget upgrade command. Cargo
-installations get the Cargo upgrade command. The manual ZIP procedure
-below also applies to binaries installed through the walkthrough above.
+WinGet-installed binaries get the `winget upgrade` command, and Cargo
+installations and build outputs get the Cargo upgrade command. Manual ZIP
+installations are directed to the verified ZIP procedure below.
 
 `formless update check` reports releases; it does not replace the installed
 binary. For a manual update, choose a newer actually available matching release
