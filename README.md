@@ -154,14 +154,11 @@ More: [docs/capabilities.md](docs/capabilities.md) · [docs/troubleshooting.md](
 
 ## Contributing
 
-Open an issue for anything larger than a typo. Behaviour changes go in
-[SPEC.md](SPEC.md) first, and no behaviour lives only in a client. Before a PR:
-
-```bash
-cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace
-```
-
-See [Architecture → Development](docs/architecture.md) for CI and test details, and [packaging/README.md](packaging/README.md) for releases.
+Behaviour changes go in [SPEC.md](SPEC.md) first, and no behaviour lives only
+in a client. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, local checks,
+change recipes, and pull request guidance. See
+[Architecture → Development](docs/architecture.md) for development details and
+[packaging/README.md](packaging/README.md) for releases.
 
 ## License
 
