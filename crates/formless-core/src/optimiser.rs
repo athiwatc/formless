@@ -22,6 +22,7 @@ Propose exactly one concrete, generalisable lesson from the failure signals. Use
 No secrets, no user data, no instructions to ignore safety or approvals.";
 const MAX_PROPOSAL_TOOL_SIGNALS: usize = 20;
 const MAX_PROPOSAL_SIGNAL_CHARS: usize = 12_000;
+const MAX_PROPOSAL_TOOL_SIGNAL_CHARS: usize = 4_000;
 
 const OPTIMISER_PROMPT: &str = concat!(
     "You improve a failing JavaScript Tool for the Formless harness. \
@@ -333,12 +334,12 @@ impl Daemon {
 
     async fn generate_proposal_inner(self: &Arc<Self>, cfg: &Config) -> Result<()> {
         // Signals: per-Tool metrics + recent recorded failure patterns.
-        let mut signals = String::from("Recent signals:\n");
+        let mut tool_signals = String::from("Recent signals:\n");
         let mut narrow = Vec::new();
         let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
         let ranked = top_tool_signals(&tools);
         for tool in &ranked {
-            signals.push_str(&format!(
+            tool_signals.push_str(&format!(
                 "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
                 tool.name,
                 tool.invocations,
@@ -352,7 +353,7 @@ impl Daemon {
             if tool.failure > 0 {
                 if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
                     for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
-                        signals.push_str(&format!(
+                        tool_signals.push_str(&format!(
                             "  failure tag={} error={}\n",
                             f.tag,
                             f.error.chars().take(300).collect::<String>()
@@ -367,12 +368,16 @@ impl Daemon {
             }
         }
         if !narrow.is_empty() {
-            signals.push_str(&format!(
+            tool_signals.push_str(&format!(
                 "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
                  likely hardcoded paths/hosts/names instead of input parameters): {}\n",
                 narrow.join(", ")
             ));
         }
+        if tool_signals.lines().count() <= 1 {
+            tool_signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
+        }
+        let mut signals = capped_tool_signals(tool_signals);
         // Scripts run again and again but never saved (§7.12).
         let recurring = self
             .with_store(|st| st.recurring_scripts(cfg.scripts.recurrence_threshold, 5))
@@ -389,9 +394,6 @@ impl Daemon {
                     head.chars().take(160).collect::<String>()
                 ));
             }
-        }
-        if signals.lines().count() <= 1 {
-            signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
         }
         // Run outcomes (§8.7): whether Runs reach the user's goal.
         if let Ok(runs) = self.with_store(|st| st.run_metrics(200)) {
@@ -1995,6 +1997,10 @@ fn cap_signal_chars(text: String, max_chars: usize) -> String {
     output
 }
 
+fn capped_tool_signals(text: String) -> String {
+    cap_signal_chars(text, MAX_PROPOSAL_TOOL_SIGNAL_CHARS)
+}
+
 /// Prompt-proposal promotion bar: the candidate eval score must beat the
 /// baseline by `margin_points` (scores are 0..1), or match a perfect
 /// baseline with a perfect score.
@@ -2245,5 +2251,22 @@ mod registry_signal_tests {
         let capped = cap_signal_chars("界".repeat(100), 16);
         assert_eq!(capped.chars().count(), 16);
         assert!(capped.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn proposal_tool_budget_preserves_other_signal_context() {
+        let mut signals =
+            capped_tool_signals(format!("Recent signals:\n{}", "failure ".repeat(2_000)));
+        signals
+            .push_str("\nRecurring script context\nRun outcome context\nEarlier proposal context");
+        let signals = cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS);
+        assert!(signals.chars().count() <= MAX_PROPOSAL_SIGNAL_CHARS);
+        for context in [
+            "Recurring script context",
+            "Run outcome context",
+            "Earlier proposal context",
+        ] {
+            assert!(signals.contains(context));
+        }
     }
 }
