@@ -5067,7 +5067,7 @@
   }
   // Completed Markdown chunks and the unfinished tail keep their DOM identity.
   const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null, afterSeq: -1, messages: null, messageCount: -1 };
-  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null };
+  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null, focusoutRoot: null };
   const statusRender = { root: null, spinner: null, text: null };
   function streamingNode(text) {
     if (!liveDone.node || liveDone.session !== S.current) {
@@ -5208,6 +5208,19 @@
   function renderLive({ newContent = false } = {}) {
     const live = $("live");
     if (!live) return;
+    if (liveRender.focusoutRoot !== live) {
+      liveRender.focusoutRoot = live;
+      live.addEventListener("focusout", (event) => {
+        const row = [...liveRender.rows.values()].find((candidate) => candidate.node.contains(event.target));
+        if (!row || (row.tool.depth || 0) !== 0 || row.tool.status === "running") return;
+        requestAnimationFrame(() => {
+          if (liveRender.root !== live || liveRender.session !== S.current || !S.liveTools.includes(row.tool)
+            || row.tool.status === "running" || row.node.contains(document.activeElement)) return;
+          S.liveTools = S.liveTools.filter((tool) => tool !== row.tool);
+          renderLive();
+        });
+      });
+    }
     withTranscriptLayout(() => {
       const textState = currentLiveText();
       if (liveRender.session !== S.current || liveRender.root !== live) {

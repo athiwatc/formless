@@ -444,6 +444,29 @@ test('parallel completion removes an obsolete earlier row without moving the foc
   assert.deepEqual(announcements, [], 'parallel completion adds no live-region announcements');
 });
 
+test('a retained terminal row is cleaned up after focus leaves without stealing focus or announcing', () => {
+  const tool = { invocationId: 'terminal', status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([tool]);
+  c.renderLive();
+  const row = c.liveRender.rows.get(tool);
+  c.document.activeElement = row.summary;
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: tool.invocationId, tool_name: tool.name, ok: true, elapsed_ms: 1234 });
+  c.onEvent({ type: 'run_finished', session_id: 'session', run_id: 'run', status: 'completed' });
+
+  assert.ok(c.S.liveTools.includes(tool), 'the focused result remains available through run end');
+  assert.ok(live.children.includes(row.node));
+  const announcementsBeforeFocusout = announcements.length;
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: row.summary, relatedTarget: outside });
+  assert.ok(c.S.liveTools.includes(tool), 'cleanup waits for the focus transition to settle');
+  c.flushAnimationFrames();
+
+  assert.equal(c.S.liveTools.includes(tool), false, 'the terminal row is removed from live state');
+  assert.equal(live.children.includes(row.node), false, 'the row is no longer visible or tabbable');
+  assert.equal(c.document.activeElement, outside, 'cleanup does not move focus');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focus cleanup adds no live-region announcement');
+});
+
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {
   const { c, root, timers, advance } = fixture();
   c.toast('offline', true, { label: 'Retry', run: () => {} });
