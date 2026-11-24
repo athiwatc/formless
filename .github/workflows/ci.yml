@@ -241,9 +241,11 @@ jobs:
         if: runner.os == 'Linux'
         run: python3 scripts/test-package-completions.py 2>&1 | tee "$CI_DIR/logs/package-completions.log"
 
+      - name: Verify Fish for Linux completion tests
+        if: runner.os == 'Linux'
+        run: fish --version
+
       - name: Workspace unit, integration and doc tests
-        env:
-          FORMLESS_REQUIRE_FISH: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"
 
       - name: Reclaim completed debug artifacts
