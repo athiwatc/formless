@@ -4,7 +4,7 @@
 mod credential_env;
 
 use axum::routing::get;
-use formless_core::config::RoleCfg;
+use formless_core::config::{ModelMetaCfg, RoleCfg};
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
 use std::sync::Arc;
@@ -30,7 +30,11 @@ async fn list_models_returns_provider_models_roles_and_recent() {
         "/models",
         get(|| async {
             axum::Json(serde_json::json!({"data": [
-                {"id": "anthropic/claude-sonnet-4"}, {"id": "openai/gpt-4o"}
+                {"id": "anthropic/claude-sonnet-4",
+                 "architecture": {"input_modalities": ["text", "image"]},
+                 "supported_parameters": ["tools", "reasoning"]},
+                {"id": "openai/gpt-4o"},
+                {"id": "openai/gpt-5-mini", "supported_parameters": ["tools"]}
             ]}))
         }),
     );
@@ -42,6 +46,22 @@ async fn list_models_returns_provider_models_roles_and_recent() {
     let mut cfg = Config::default();
     cfg.provider.base_url = base;
     cfg.provider.model = "openai/gpt-4o".into();
+    cfg.provider.model_meta.insert(
+        "anthropic/claude-sonnet-4".into(),
+        ModelMetaCfg {
+            vision: Some(false),
+            tools: Some(false),
+            efforts: Some(Vec::new()),
+        },
+    );
+    cfg.provider.model_meta.insert(
+        "my-gemini-embed".into(),
+        ModelMetaCfg {
+            vision: Some(true),
+            tools: Some(false),
+            efforts: Some(vec!["ultra".into()]),
+        },
+    );
     cfg.naming.enabled = false;
     cfg.roles.insert(
         "explorer".into(),
@@ -60,20 +80,51 @@ async fn list_models_returns_provider_models_roles_and_recent() {
     std::thread::sleep(std::time::Duration::from_millis(5));
     let newer = store.create_session(None).unwrap().id;
     store
-        .set_session_model(&newer, Some("my-custom".into()), None)
+        .set_session_model(&newer, Some("my-gemini-embed".into()), None)
         .unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
 
     let r = daemon.handle(Request::ListModels).await.unwrap();
     assert_eq!(
         r["models"],
-        serde_json::json!(["anthropic/claude-sonnet-4", "openai/gpt-4o"])
+        serde_json::json!([
+            "anthropic/claude-sonnet-4",
+            "openai/gpt-4o",
+            "openai/gpt-5-mini"
+        ])
     );
     assert_eq!(r["roles"][0]["name"], "explorer");
     assert_eq!(r["roles"][0]["model"], "small");
     assert_eq!(
         r["recent"],
-        serde_json::json!(["my-custom", "openai/gpt-4o"])
+        serde_json::json!(["my-gemini-embed", "openai/gpt-4o"])
+    );
+    assert_eq!(r["meta"]["anthropic/claude-sonnet-4"]["source"], "mixed");
+    assert_eq!(r["meta"]["anthropic/claude-sonnet-4"]["vision"], false);
+    assert_eq!(r["meta"]["anthropic/claude-sonnet-4"]["tools"], false);
+    assert_eq!(
+        r["meta"]["anthropic/claude-sonnet-4"]["efforts"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        r["meta"]["anthropic/claude-sonnet-4"]["overridden"],
+        serde_json::json!(["vision", "tools", "efforts"])
+    );
+    assert_eq!(r["meta"]["openai/gpt-5-mini"]["source"], "mixed");
+    assert_eq!(
+        r["meta"]["openai/gpt-5-mini"]["efforts"],
+        serde_json::json!(["minimal", "low", "medium", "high"])
+    );
+    assert_eq!(r["meta"]["my-gemini-embed"]["vision"], true);
+    assert_eq!(r["meta"]["my-gemini-embed"]["tools"], false);
+    assert_eq!(
+        r["meta"]["my-gemini-embed"]["efforts"],
+        serde_json::json!(["ultra"])
+    );
+    assert!(r["meta"]["my-gemini-embed"].get("source").is_none());
+    assert_eq!(
+        r["meta"]["my-gemini-embed"]["overridden"],
+        serde_json::json!(["vision", "tools", "efforts"])
     );
     assert_eq!(r["current"]["model"], "openai/gpt-4o");
     assert!(r["error"].is_null());

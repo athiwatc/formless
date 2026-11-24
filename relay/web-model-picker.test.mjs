@@ -47,6 +47,7 @@ function fixture() {
   const find = (n, pred) => (pred(n) ? n : n.children.map(k => find(k, pred)).find(Boolean));
   c.status = () => find(c.dialog, n => n.cls.has('modal-actions')).children[0];
   c.button = text => find(c.dialog, n => n.tagName === 'BUTTON' && n.textContent === text);
+  c.effort = () => find(c.dialog, n => n.tagName === 'SELECT');
   c.input = () => find(c.dialog, n => n.tagName === 'INPUT');
   c.list = () => find(c.dialog, n => n.tagName === 'UL');
   return c;
@@ -131,4 +132,22 @@ test('context labels preserve exact binary, decimal and irregular token windows'
   for (const [context, expected] of cases) assert.equal(c.modelDetail({context}, null), expected, String(context));
   for (const context of [undefined,null,'131072',-1,1.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1]) assert.equal(c.modelDetail({context}, null), '');
   assert.equal(c.modelDetail({context:131072,vision:true,tools:true}, {ok:true}), '128Ki ctx · vision · tools · ✓ tested');
+});
+
+test('inferred capabilities are marked in model details', () => {
+  const c = fixture();
+  assert.equal(
+    c.modelDetail({vision:true,tools:false,efforts:['low'],inferred:['vision','tools','efforts']}, null),
+    '~vision · ~no tools · ~effort choices'
+  );
+  assert.equal(c.modelDetail({efforts:[],inferred:['efforts']}, null), '~no effort effect');
+  assert.equal(c.modelDetail({vision:false,tools:true,source:'endpoint'}, null), 'no vision · tools');
+});
+
+test('model effort metadata supplies the picker options', async () => {
+  const c = fixture();
+  c.calls[0].resolve({models:['m1'],meta:{m1:{efforts:['ultra','low','ultra']}}});
+  await c.done;
+  assert.deepEqual(c.effort().children.map(option => option.attrs.value), ['', 'ultra', 'low']);
+  assert.equal(c.effort().disabled, false);
 });

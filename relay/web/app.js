@@ -4392,12 +4392,13 @@
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
+    const inferred = (field) => Array.isArray(m.inferred) && m.inferred.includes(field);
     const context = modelContextLabel(m.context);
     if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
-    if (m.vision) parts.push("vision");
-    if (m.tools === true) parts.push("tools");
-    if (m.tools === false) parts.push("no tools");
+    if (typeof m.vision === "boolean") parts.push((inferred("vision") ? "~" : "") + (m.vision ? "vision" : "no vision"));
+    if (typeof m.tools === "boolean") parts.push((inferred("tools") ? "~" : "") + (m.tools ? "tools" : "no tools"));
+    if (inferred("efforts")) parts.push(Array.isArray(m.efforts) && m.efforts.length === 0 ? "~no effort effect" : "~effort choices");
     if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
@@ -4479,7 +4480,9 @@
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
       const accepted = (meta[choice()] || {}).efforts;
-      const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
+      const offer = Array.isArray(accepted)
+        ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
+        : efforts;
       const was = effort.value;
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
