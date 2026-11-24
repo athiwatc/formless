@@ -194,7 +194,10 @@ fn discard_live_log_with(
             }) =>
         {
             let parent = path.parent().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "log has no parent directory")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "log has no parent directory",
+                )
             })?;
             move_and_delete_log_link(&log, parent)
         }
@@ -242,46 +245,38 @@ fn move_and_delete_log_link_with(
     mark_for_deletion: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     use std::mem::{offset_of, size_of};
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
-        FileRenameInfo, SetFileInformationByHandle, FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE,
+        FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
     };
 
-    let pending = parent.join(PENDING_LOG_NAME);
+    // Use a full Win32 name with a null RootDirectory. A handle-relative
+    // target was rejected by SetFileInformationByHandle with error 87.
+    let pending = std::fs::canonicalize(parent)?.join(PENDING_LOG_NAME);
     match std::fs::symlink_metadata(&pending) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
-                    "pending daemon log slot is occupied or inaccessible: {}",
+                    "pending daemon log slot is occupied or inaccessible (see Windows install guide): {}",
                     pending.display()
                 ),
             ));
         }
     }
-    // Directory-relative rename needs add-file and traversal. As in the
-    // existing Windows namespace helper, allow reading directory attributes
-    // but do not ask for listing, deletion or subdirectory creation.
-    let directory = std::fs::OpenOptions::new()
-        .access_mode(FILE_ADD_FILE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(parent)?;
-    let name: Vec<u16> = PENDING_LOG_NAME.encode_utf16().collect();
+    let name: Vec<u16> = pending.as_os_str().encode_wide().collect();
     // Match the existing Windows namespace rename buffer alignment and include
     // a terminal NUL for compatibility (the declared byte count excludes it).
     let bytes = size_of::<FILE_RENAME_INFO>()
         .max(offset_of!(FILE_RENAME_INFO, FileName) + (name.len() + 1) * 2);
     let mut buffer = vec![0u64; bytes.div_ceil(size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    // SAFETY: aligned, zeroed, correctly sized allocation and borrowed live
-    // file handles remain valid until the synchronous operation returns.
+    // SAFETY: the aligned, zeroed, correctly sized allocation and borrowed
+    // live-file handle remain valid until the synchronous operation returns.
     if unsafe {
         (*info).Anonymous.ReplaceIfExists = 0;
-        (*info).RootDirectory = directory.as_raw_handle();
+        (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = (name.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),

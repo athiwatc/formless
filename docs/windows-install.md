@@ -125,6 +125,22 @@ If Windows rejects a long profile data directory, `formless doctor` reports
 the path length alongside the directory or database error. A shorter
 `FORMLESS_DATA_DIR` can avoid the Windows path limit.
 
+## Recover a pending log rotation
+
+With `daemon.log_keep = 0`, Windows volumes without extended file disposition
+use a temporary `daemon.log.discard-pending` file in the profile's data
+directory. Formless normally removes it when the last handle to the old log
+closes. If it reports that the slot remains occupied or inaccessible, later
+rotations may leave the live log above the configured size.
+
+Stop the affected profile's daemon and close any viewers or writers still
+holding its old log. If the warning persists on restart, stop the daemon again
+and inspect the pending entry in that profile. If you can identify it as an
+ordinary file from the old rotation, move it to a unique archive name outside
+the profile, keeping its contents, then restart. Do not remove or replace the
+live `daemon.log`, overwrite an existing archive, or follow an unexpected link.
+If the pending entry cannot be identified or moved safely, leave it alone.
+
 PowerShell reference: [Get-FileHash](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash),
 [Expand-Archive](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.archive/expand-archive),
 and [per-user environment variables](https://learn.microsoft.com/en-us/dotnet/api/system.environment.setenvironmentvariable).
