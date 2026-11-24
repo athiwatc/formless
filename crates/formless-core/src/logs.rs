@@ -204,8 +204,11 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
         return Ok(false);
     }
     if keep == 0 {
-        std::fs::remove_file(&log)?;
-        return Ok(true);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&log)?;
+        return Ok(false);
     }
     remove_if_present(rotated(paths, keep))?;
     for n in (1..keep).rev() {
