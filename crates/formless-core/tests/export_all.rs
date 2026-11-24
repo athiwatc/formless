@@ -774,6 +774,28 @@ async fn session_bound_jobs_reimport_without_duplicates() {
         .iter()
         .any(|job| job.source_session_id.as_deref() == Some(second_session.id.as_str())));
 
+    assert!(source_store.soft_delete_session(&session.id).unwrap());
+    let during_undo = source
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(during_undo["added"]["jobs"], 0, "{during_undo}");
+    assert_eq!(during_undo["skipped_existing"]["jobs"], 2, "{during_undo}");
+    assert!(source_store.restore_session(&session.id).unwrap().is_some());
+    let after_restore = source
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(after_restore["added"]["jobs"], 0, "{after_restore}");
+    assert_eq!(
+        after_restore["skipped_existing"]["jobs"], 2,
+        "{after_restore}"
+    );
+
     assert!(source_store.delete_session(&session.id).unwrap());
     let recovered = source
         .handle(Request::ImportAll {

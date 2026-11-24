@@ -10814,26 +10814,36 @@ impl Daemon {
                 .map(Value::to_string)
                 .unwrap_or_default()
         };
-        let mut job_identities = self.with_reader(|st| {
-            let jobs = st.list_jobs()?;
-            let live_session_ids = if jobs.iter().any(|job| job.session_id.is_some()) {
-                st.list_sessions()?
-                    .into_iter()
-                    .map(|session| session.id)
-                    .collect::<std::collections::BTreeSet<_>>()
-            } else {
-                std::collections::BTreeSet::new()
-            };
-            let mut identities = std::collections::BTreeSet::new();
-            for job in jobs {
-                if job
-                    .session_id
-                    .as_ref()
-                    .is_some_and(|target| !live_session_ids.contains(target))
-                {
-                    continue;
+        let incoming_jobs = list("jobs");
+        let has_importable_job = incoming_jobs
+            .iter()
+            .any(|job| job["prompt"].as_str().is_some() && job["cron"].as_str().is_some());
+        let mut job_identities = if has_importable_job {
+            self.with_reader(|st| {
+                let jobs = st.list_jobs()?;
+                let target_session_ids = jobs
+                    .iter()
+                    .filter(|job| job.cron.is_some())
+                    .filter_map(|job| job.session_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut existing_session_ids = std::collections::BTreeSet::new();
+                for id in target_session_ids {
+                    if st.get_session(&id)?.is_some() {
+                        existing_session_ids.insert(id);
+                    }
                 }
-                if let Some(cron) = job.cron {
+                let mut identities = std::collections::BTreeSet::new();
+                for job in jobs {
+                    let Some(cron) = job.cron else {
+                        continue;
+                    };
+                    if job
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|target| !existing_session_ids.contains(target))
+                    {
+                        continue;
+                    }
                     identities.insert((
                         job.source_session_id.or(job.session_id),
                         job.prompt,
@@ -10842,10 +10852,12 @@ impl Daemon {
                         delivery_identity(job.deliver.as_ref()),
                     ));
                 }
-            }
-            Ok(identities)
-        })?;
-        for j in list("jobs") {
+                Ok(identities)
+            })?
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        for j in incoming_jobs {
             let (Some(prompt), Some(cron)) = (j["prompt"].as_str(), j["cron"].as_str()) else {
                 continue;
             };
