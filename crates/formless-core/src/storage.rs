@@ -8241,11 +8241,12 @@ impl ContextCache {
         }
         let after = self.live_seqs.last().copied().unwrap_or(up_to);
         for m in store.list_messages_after(session_id, after)? {
+            let mut msg = provider_message(&m);
+            let empty_user = m.role == "user" && msg["content"].as_str() == Some("");
             if m.role == "user" {
                 self.turn_starts.push(self.live_seqs.len());
             }
             self.live_seqs.push(m.seq);
-            let mut msg = provider_message(&m);
             // A tool call without a name (stored before #540 was fixed) makes
             // strict endpoints reject every request: leave it, and its
             // result, out so the Session recovers (#541).
@@ -8290,7 +8291,7 @@ impl ContextCache {
                 }
             }
             self.push(msg);
-            if m.role == "user" {
+            if m.role == "user" && !empty_user {
                 self.included_user_message_ids.push(m.id.clone());
                 let steer_run_id = m
                     .meta
@@ -9231,6 +9232,40 @@ mod context_watermark_tests {
                 &cache.included_steer_message_ids(),
                 None,
                 2,
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn empty_user_messages_are_not_included_ids_or_steer_candidates() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let message = store
+            .append_message_meta(
+                &session,
+                "user",
+                "",
+                Some(json!({"steer":{"run_id":"run"}}).to_string()),
+            )
+            .unwrap();
+        let mut cache = ContextCache::default();
+        let (context, _, _) = cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert_eq!(cache.last_included_seq(), message.seq);
+        assert!(cache.included_user_message_ids().is_empty());
+        assert!(cache.included_steer_candidates().is_empty());
+        assert!(context
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == ""));
+        assert!(!store
+            .mark_steering_context_included(
+                &session,
+                "run",
+                cache.last_included_seq(),
+                &[],
+                None,
+                1,
             )
             .unwrap());
     }
