@@ -4,7 +4,7 @@
 // cached: never /auth, /ws or /relay/ (and URL fragments, which carry the
 // key, never reach a service worker).
 const CACHE = "formless-shell-v2";
-const SHELL = ["/", "/app.js", "/transport.mjs", "/app.css", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png"];
+const SHELL = ["/", "/app.js", "/transport.mjs", "/app.css", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/icon-maskable-192.png", "/icon-maskable-512.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

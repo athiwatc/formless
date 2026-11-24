@@ -57,6 +57,8 @@ async fn local_web_ui_is_locked_to_this_origin_and_a_one_time_token() {
         ("/sw.js", "text/javascript"),
         ("/transport.mjs", "text/javascript"),
         ("/icon-192.png", "image/png"),
+        ("/icon-maskable-192.png", "image/png"),
+        ("/icon-maskable-512.png", "image/png"),
     ] {
         let r = http.get(format!("{origin}{path}")).send().await.unwrap();
         assert_eq!(r.status(), 200, "{path}");
@@ -69,6 +71,28 @@ async fn local_web_ui_is_locked_to_this_origin_and_a_one_time_token() {
                 .contains("export class WireEndpoint"));
         }
     }
+    let manifest = http
+        .get(format!("{origin}/manifest.webmanifest"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let icons = serde_json::from_str::<serde_json::Value>(&manifest).unwrap();
+    let icons = icons["icons"].as_array().unwrap();
+    assert!(icons.iter().any(|icon| {
+        icon["src"] == "icon-192.png" && icon["purpose"] == "any"
+    }));
+    assert!(icons.iter().any(|icon| {
+        icon["src"] == "icon-512.png" && icon["purpose"] == "any"
+    }));
+    assert!(icons.iter().any(|icon| {
+        icon["src"] == "icon-maskable-192.png" && icon["purpose"] == "maskable"
+    }));
+    assert!(icons.iter().any(|icon| {
+        icon["src"] == "icon-maskable-512.png" && icon["purpose"] == "maskable"
+    }));
     let csp = http
         .get(format!("{origin}/"))
         .send()

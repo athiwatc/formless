@@ -92,6 +92,8 @@ test('service worker install actually precaches the shared browser transport',as
   vm.runInNewContext(readFileSync(new URL('./web/sw.js',import.meta.url),'utf8'),{self,caches:{open:async()=>({addAll:async files=>cached.push(...files)})}});
   handlers.get('install')({waitUntil:promise=>{pending=promise;}});await pending;
   assert.ok(cached.includes('/transport.mjs'),'offline app must have its dynamic import');
+  assert.ok(cached.includes('/icon-maskable-192.png'),'offline app must have its 192px maskable icon');
+  assert.ok(cached.includes('/icon-maskable-512.png'),'offline app must have its 512px maskable icon');
 });
 
 test('push registration receipts do not impersonate daemon offline controls',async()=>{

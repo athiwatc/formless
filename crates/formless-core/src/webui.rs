@@ -32,6 +32,8 @@ const SW_JS: &str = include_str!("../../../relay/web/sw.js");
 const MANIFEST: &str = include_str!("../../../relay/web/manifest.webmanifest");
 const ICON_192: &[u8] = include_bytes!("../../../relay/web/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("../../../relay/web/icon-512.png");
+const ICON_MASKABLE_192: &[u8] = include_bytes!("../../../relay/web/icon-maskable-192.png");
+const ICON_MASKABLE_512: &[u8] = include_bytes!("../../../relay/web/icon-maskable-512.png");
 
 /// Same policy as the hosted relay frontend (relay/worker.js).
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
@@ -147,6 +149,14 @@ pub async fn start(daemon: Arc<Daemon>, port: u16) -> Result<Arc<WebUi>> {
         )
         .route("/icon-192.png", get(|s, h| icon(s, h, ICON_192)))
         .route("/icon-512.png", get(|s, h| icon(s, h, ICON_512)))
+        .route(
+            "/icon-maskable-192.png",
+            get(|s, h| icon(s, h, ICON_MASKABLE_192)),
+        )
+        .route(
+            "/icon-maskable-512.png",
+            get(|s, h| icon(s, h, ICON_MASKABLE_512)),
+        )
         .route("/auth", post(auth))
         .route("/ws", get(ws))
         .with_state(state);
