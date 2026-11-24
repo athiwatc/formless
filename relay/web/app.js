@@ -4435,6 +4435,7 @@
     const apply = h("button", { class: "btn small primary", type: "button", title: "Enter" }, selectionOnly ? "Retry" : "Use in this Session");
     const test = h("button", { class: "btn small", type: "button", title: "Latency, streaming, reasoning and tool calls" }, "Test");
     let meta = {}, tests = {};
+    let preferredEffortModel = model;
     const title = selectionOnly ? "Retry with a model" : "Model";
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal picker" },
@@ -4481,12 +4482,18 @@
         input.removeAttribute("aria-activedescendant");
       }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
-      const accepted = (meta[choice()] || {}).efforts;
+      const selectedModel = choice();
+      if (selectedModel && selectedModel !== preferredEffortModel) {
+        preferredEffort = "";
+        preferredEffortModel = selectedModel;
+        effort.value = "";
+      }
+      const accepted = (meta[selectedModel] || {}).efforts;
       const offer = Array.isArray(accepted)
         ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
         : efforts.slice();
       const was = effort.value || preferredEffort;
-      if (!Array.isArray(accepted) && was && !offer.includes(was)) offer.push(was);
+      if (!Array.isArray(accepted) && selectedModel === model && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
       if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";

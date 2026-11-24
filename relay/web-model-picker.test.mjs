@@ -154,7 +154,17 @@ test('model effort metadata supplies the picker options', async () => {
 
 test('saved custom effort survives picker option refresh', async () => {
   const c = fixture({model:'gpt-5-custom',reasoning_effort:'xhigh'});
-  c.calls[0].resolve({models:['gpt-5-custom'],meta:{'gpt-5-custom':{efforts:['xhigh','low']}}});
+  c.calls[0].resolve({
+    models:['gpt-5-custom','gpt-4'],
+    meta:{'gpt-5-custom':{efforts:['xhigh','low']}}
+  });
   await c.done;
   assert.equal(c.effort().value, 'xhigh');
+  c.input().value = 'gpt-4';
+  c.input().oninput();
+  assert.deepEqual(
+    c.effort().children.map(option => option.attrs.value),
+    ['', 'low', 'medium', 'high']
+  );
+  assert.equal(c.effort().value, '');
 });
