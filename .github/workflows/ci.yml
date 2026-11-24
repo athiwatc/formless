@@ -47,7 +47,7 @@ jobs:
       - name: Legacy console code pages and TUI frame
         run: cargo test --locked -p formless-tui --lib windows_console_smoke -- --test-threads=1
       - name: Windows update guidance
-        run: cargo test --locked -p formless-bin --bin formless windows_upgrade_uses_cargo_or_winget
+        run: cargo test --locked -p formless-bin --bin formless upgrade
       - name: Release check
         run: .\target\debug\formless.exe update check --json
 
