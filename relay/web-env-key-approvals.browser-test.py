@@ -22,7 +22,7 @@ HOOK = r'''
     queue(names) {
       $('pair').classList.add('hidden');
       $('app').classList.remove('hidden');
-      $('toasts').querySelectorAll('.toast .toast-dismiss').forEach(button => button.click());
+      $('toasts').replaceChildren();
       S.daemonOnline = true;
       S.approvals = [];
       S.approvalLater = false;

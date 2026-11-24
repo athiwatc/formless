@@ -18,25 +18,6 @@ function fixture() {
   let now = 0;
   let nextTimer = 0;
   const timers = new Map();
-  function eventTarget() {
-    const listeners = new Map();
-    return {
-      listeners,
-      addEventListener(type, listener) {
-        if (!listeners.has(type)) listeners.set(type, new Set());
-        listeners.get(type).add(listener);
-      },
-      removeEventListener(type, listener) {
-        listeners.get(type)?.delete(listener);
-        if (!listeners.get(type)?.size) listeners.delete(type);
-      },
-      dispatch(type, event = {}) {
-        for (const listener of listeners.get(type) || []) listener(event);
-      },
-    };
-  }
-  const document = eventTarget();
-  const window = eventTarget();
   const root = { children: [], append(child) { this.children.push(child); child.parent = this; } };
   const announcer = { textContent: '' };
   function node(tag, props, children) {
@@ -45,12 +26,10 @@ function fixture() {
       disabled: false, removed: false,
       remove() { this.removed = true; this.parent?.children.splice(this.parent.children.indexOf(this), 1); },
       contains(target) { return target === this || this.children.some(child => child?.contains?.(target)); },
-      getBoundingClientRect() { return { left: 10, top: 20, right: 110, bottom: 60 }; },
     };
   }
   const c = vm.createContext({
     S: { current: 'session', messages: [] },
-    document, window,
     $: id => id === 'toasts' ? root : id === 'chat-announcer' ? announcer : null,
     h: (tag, props, ...children) => node(tag, props, children),
     Date: { now: () => now },
@@ -75,8 +54,7 @@ function fixture() {
       due[1].fn();
     }
   }
-  const listenerCount = target => [...target.listeners.values()].reduce((count, listeners) => count + listeners.size, 0);
-  return { c, root, announcer, timers, advance, node, document, window, listenerCount };
+  return { c, root, announcer, timers, advance, node };
 }
 
 test('transcript is not live and chat has a separate polite status announcer', () => {
@@ -349,53 +327,4 @@ test('toast live message is populated after its empty status node is mounted', (
   assert.equal(toast.children[0].children.length, 0);
   advance(0);
   assert.equal(toast.children[0].textContent, 'Saved');
-});
-
-test('pointer-transparent toast hover pauses timers and removes listeners on every dismissal path', () => {
-  const { c, root, document, window, advance, listenerCount } = fixture();
-  const inside = { pointerType: 'mouse', clientX: 50, clientY: 40 };
-
-  c.toast('Persistent error', true);
-  const error = root.children.at(-1);
-  assert.equal(listenerCount(document) + listenerCount(window), 0, 'persistent errors need no timer pointer listeners');
-  error.children[1].children[0].props.onclick();
-  assert.equal(listenerCount(document) + listenerCount(window), 0, 'dismiss removes the error toast');
-
-  c.toast('Hover pause', false, { ms: 1000 });
-  const timed = root.children.at(-1);
-  assert.deepEqual([...document.listeners.keys()].sort(), ['pointermove', 'pointerout']);
-  assert.equal(listenerCount(window), 1);
-  document.dispatch('pointermove', inside);
-  advance(1500);
-  assert.equal(timed.removed, false, 'pointer over toast text pauses dismissal');
-  document.dispatch('pointermove', { ...inside, clientX: 110 });
-  advance(999);
-  assert.equal(timed.removed, false);
-  advance(1);
-  assert.equal(timed.removed, true, 'leaving toast text resumes dismissal');
-  assert.equal(listenerCount(document) + listenerCount(window), 0, 'timeout removes global listeners');
-
-  c.toast('Leave viewport', false, { ms: 1000 });
-  const pointerOut = root.children.at(-1);
-  document.dispatch('pointermove', inside);
-  document.dispatch('pointerout', { pointerType: 'mouse', relatedTarget: null });
-  advance(1000);
-  assert.equal(pointerOut.removed, true, 'pointer exit resumes dismissal');
-  assert.equal(listenerCount(document) + listenerCount(window), 0);
-
-  let actions = 0;
-  c.toast('Action removal', false, { ms: 60000, label: 'Run', run: () => { actions++; } });
-  const action = root.children.at(-1);
-  action.children[1].children[0].props.onclick();
-  assert.equal(actions, 1);
-  assert.equal(action.removed, true);
-  assert.equal(listenerCount(document) + listenerCount(window), 0, 'action removal removes global listeners');
-
-  c.toast('Window blur', false, { ms: 1000 });
-  const blurred = root.children.at(-1);
-  document.dispatch('pointermove', inside);
-  window.dispatch('blur');
-  advance(1000);
-  assert.equal(blurred.removed, true, 'window blur resumes dismissal');
-  assert.equal(listenerCount(document) + listenerCount(window), 0, 'blurred toast timeout removes listeners');
 });

@@ -1088,16 +1088,7 @@
   function toast(text, err, action) {
     let timer = null, deadline = 0, hovered = false, focused = false;
     let remaining = err ? null : Number.isFinite(action?.ms) && action.ms >= 0 ? action.ms : 3500;
-    const trackPointerHover = remaining != null;
-    const remove = () => {
-      clearTimeout(timer); timer = null; remaining = null;
-      if (trackPointerHover) {
-        document.removeEventListener("pointermove", updatePointerHover);
-        document.removeEventListener("pointerout", clearPointerHoverOnExit);
-        window.removeEventListener("blur", clearPointerHover);
-      }
-      t.remove();
-    };
+    const remove = () => { clearTimeout(timer); timer = null; remaining = null; t.remove(); };
     const pauseTimer = () => {
       if (remaining == null || timer == null) return;
       clearTimeout(timer);
@@ -1130,21 +1121,6 @@
       onfocusin: () => updatePause("focus", true),
       onfocusout: (event) => { if (!t.contains(event.relatedTarget)) updatePause("focus", false); } },
     message, h("span", { class: "toast-actions" }, button, dismiss));
-    const updatePointerHover = (event) => {
-      if (event.pointerType !== "mouse") return;
-      const rect = t.getBoundingClientRect();
-      updatePause("hover", event.clientX >= rect.left && event.clientX < rect.right
-        && event.clientY >= rect.top && event.clientY < rect.bottom);
-    };
-    const clearPointerHover = () => updatePause("hover", false);
-    const clearPointerHoverOnExit = (event) => {
-      if (event.pointerType === "mouse" && !event.relatedTarget) clearPointerHover();
-    };
-    if (trackPointerHover) {
-      document.addEventListener("pointermove", updatePointerHover, { passive: true });
-      document.addEventListener("pointerout", clearPointerHoverOnExit, { passive: true });
-      window.addEventListener("blur", clearPointerHover);
-    }
     $("toasts").append(t);
     setTimeout(() => { if (t.isConnected) message.textContent = text; }, 0);
     if (remaining != null) {
