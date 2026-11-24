@@ -2369,11 +2369,20 @@ fn attempt_label(attempt: &TopicAttemptInfo) -> String {
 
 pub fn harness_availability_line(harness: &formless_protocol::HarnessAvailability) -> String {
     let name = harness_name(harness.kind, harness.acp_agent.as_deref());
-    let state = match (harness.installed, harness.signed_in) {
-        (false, _) => "not installed",
-        (true, Some(false)) => "signed out",
-        (true, Some(true)) => "ready",
-        (true, None) => "installed (sign-in unknown)",
+    let state = if harness.kind == HarnessKind::Acp {
+        match (harness.installed, harness.signed_in) {
+            (false, _) => "not installed; unavailable for execution",
+            (true, Some(false)) => "unavailable for execution; sign-in required",
+            (true, Some(true)) => "ready",
+            (true, None) => "unavailable for execution; sign-in readiness cannot be verified",
+        }
+    } else {
+        match (harness.installed, harness.signed_in) {
+            (false, _) => "not installed",
+            (true, Some(false)) => "signed out",
+            (true, Some(true)) => "ready",
+            (true, None) => "installed (sign-in unknown)",
+        }
     };
     let mut line = format!("{name}: {state}");
     if let Some(version) = &harness.version {

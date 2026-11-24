@@ -37,13 +37,40 @@ pub(super) struct ApprovedSubstitute {
     pub wanted: HarnessChoice,
     pub substitute: HarnessChoice,
 }
+
+fn harness_choice_label(choice: &HarnessChoice) -> String {
+    match (choice.harness, choice.acp_agent.as_deref()) {
+        (HarnessKind::Acp, Some(agent)) => format!("ACP profile `{agent}`"),
+        _ => format!("{:?}", choice.harness),
+    }
+}
+
+fn substitute_option(choice: &HarnessChoice) -> String {
+    format!("Use {}", harness_choice_label(choice))
+}
+
+fn substitute_question(
+    wanted: &HarnessChoice,
+    substitute: &HarnessChoice,
+    step_title: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "{} instead of {} for {}? {}",
+        substitute_option(substitute),
+        harness_choice_label(wanted),
+        step_title.trim(),
+        reason
+    )
+}
+
 impl TopicDecision {
     fn options(&self) -> Vec<String> {
         match &self.kind {
             TopicDecisionKind::Limit(_) => vec!["Raise limit and continue".into(), "Stop".into()],
             TopicDecisionKind::Substitute { substitute, .. } => vec![
                 "Sign in and retry".into(),
-                format!("Use {:?}", substitute.harness),
+                substitute_option(substitute),
                 "Skip step".into(),
             ],
         }
@@ -432,7 +459,7 @@ impl Daemon {
                 response,
             } = decision.kind
             {
-                if selected == format!("Use {:?}", substitute.harness) {
+                if selected == substitute_option(&substitute) {
                     self.topic_substitutes.locked().insert(
                         (decision.topic_id.clone(), decision.feature_id, step_title),
                         ApprovedSubstitute { wanted, substitute },
@@ -496,12 +523,11 @@ impl Daemon {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let (response, receiver) = oneshot::channel();
-        let question = format!(
-            "Use {:?} instead of {:?} for {}? {}",
-            request.substitute.harness,
-            request.wanted.harness,
-            request.step_title.trim(),
-            request.reason
+        let question = substitute_question(
+            &request.wanted,
+            &request.substitute,
+            &request.step_title,
+            &request.reason,
         );
         let decision = TopicDecision {
             topic_id: topic.id.clone(),
@@ -1302,4 +1328,29 @@ fn normalized_topic_answers(
         .chain(std::iter::repeat_with(QuestionAnswer::default))
         .take(questions.len())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn substitute_approval_names_the_selected_acp_agents() {
+        let wanted = HarnessChoice {
+            harness: HarnessKind::Acp,
+            acp_agent: Some("gemini".into()),
+            model: None,
+        };
+        let substitute = HarnessChoice {
+            harness: HarnessKind::Acp,
+            acp_agent: Some("cline".into()),
+            model: None,
+        };
+
+        assert_eq!(
+            substitute_question(&wanted, &substitute, " Build ", "Gemini is unavailable"),
+            "Use ACP profile `cline` instead of ACP profile `gemini` for Build? Gemini is unavailable"
+        );
+        assert_eq!(substitute_option(&substitute), "Use ACP profile `cline`");
+    }
 }

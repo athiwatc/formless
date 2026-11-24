@@ -17,6 +17,30 @@ use std::{
 };
 
 const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
+pub(crate) const ACP_PLANNER_READINESS: &str = "For ACP, only installed profiles with signed_in=true are executable; signed_in=null or false is unavailable. Cursor, Cline, Junie, Auggie, and Devin are unavailable because Formless has not integrated a supported non-model sign-in check for them. Signing in alone will not unblock them. Explain this limitation and request the user's explicit approval through topic_request_harness_substitute before using a supported substitute. For explicit sign-in errors on supported profiles, direct the user to sign in and retry.";
+pub(crate) const NON_ACP_PLANNER_READINESS: &str = "For non-ACP harnesses only, preserve legacy readiness: installed=true and signed_in!=false; signed_in=null remains eligible. Do not apply this legacy rule to ACP.";
+
+#[cfg(test)]
+mod planner_readiness_tests {
+    use super::{ACP_PLANNER_READINESS, NON_ACP_PLANNER_READINESS};
+
+    #[test]
+    fn unverified_profiles_are_never_advertised_as_ready() {
+        for id in ["Cursor", "Cline", "Junie", "Auggie", "Devin"] {
+            assert!(ACP_PLANNER_READINESS.contains(id));
+        }
+        assert!(ACP_PLANNER_READINESS.contains("Signing in alone will not unblock"));
+        assert!(ACP_PLANNER_READINESS.contains("explicit approval"));
+    }
+
+    #[test]
+    fn topic_kickoff_preserves_non_acp_legacy_readiness_separately() {
+        assert!(NON_ACP_PLANNER_READINESS.contains("installed=true"));
+        assert!(NON_ACP_PLANNER_READINESS.contains("signed_in!=false"));
+        assert!(NON_ACP_PLANNER_READINESS.contains("signed_in=null remains eligible"));
+        assert!(ACP_PLANNER_READINESS.contains("signed_in=true"));
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -470,7 +494,8 @@ impl Daemon {
             concat!(
                 "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
                 "Features, workspace and advisory outline:\n{}\n",
-                "Available harness kinds: claude, codex, pi, antigravity, opencode, muse; generic ACP currently returns adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
+                "Available harness kinds: claude, codex, pi, antigravity, acp, opencode, muse; ACP requires acp_agent. OpenCode uses ACP. Muse Code uses its interactive session protocol and requires one-run workspace trust from the user. Pi uses the Formless RPC adapter. ",
+                "Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
             ),
             serde_json::to_string_pretty(&topic)?
         );
@@ -486,7 +511,7 @@ impl Daemon {
             if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
             if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
             if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
-            let kickoff=format!("{kickoff}\nFresh local harness availability (ready means installed && signed_in != false; unknown auth is ready):\n{}\nNever launch an unready harness. Ask the user through topic_request_harness_substitute to sign in and retry, approve a substitute for one feature+step, or skip. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
+            let kickoff=format!("{kickoff}\nFresh local harness availability:\n{}\n{NON_ACP_PLANNER_READINESS}\n{ACP_PLANNER_READINESS}\nNever launch an unready harness. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
@@ -667,32 +692,49 @@ impl Daemon {
             step.acp_agent = approval.substitute.acp_agent.clone();
             step.model = approval.substitute.model.clone();
         }
-        let (availability, resolved_antigravity_executable) = if step.harness
-            == HarnessKind::Antigravity
-        {
-            local_harness::antigravity::topic_readiness().await
+        let (
+            availability,
+            resolved_acp_executable,
+            resolved_acp_executable_argv0,
+            resolved_antigravity_executable,
+        ) = if step.harness == HarnessKind::Antigravity {
+            let (availability, executable) = local_harness::antigravity::topic_readiness().await;
+            (availability, None, None, executable)
         } else {
+            let readiness =
+                local_harness::harness_readiness(step.harness, step.acp_agent.as_deref()).await;
             (
-                local_harness::harness_availability(step.harness, step.acp_agent.as_deref()).await,
+                readiness.availability,
+                readiness.resolved_executable,
+                readiness.resolved_executable_argv0,
                 None,
             )
         };
+        let missing_acp_executable =
+            step.harness == HarnessKind::Acp && resolved_acp_executable.is_none();
         let missing_antigravity_identity =
             step.harness == HarnessKind::Antigravity && resolved_antigravity_executable.is_none();
         if !availability.installed
             || availability.signed_in == Some(false)
+            || missing_acp_executable
             || missing_antigravity_identity
         {
-            let detail =
-                availability
-                    .detail
-                    .as_deref()
-                    .unwrap_or(if missing_antigravity_identity {
-                        "Antigravity executable identity could not be resolved"
-                    } else {
-                        "not signed in"
-                    });
-            bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+            let detail = availability
+                .detail
+                .as_deref()
+                .unwrap_or(if missing_acp_executable {
+                    "ACP executable identity could not be resolved"
+                } else if missing_antigravity_identity {
+                    "Antigravity executable identity could not be resolved"
+                } else {
+                    "not signed in"
+                });
+            let retry_guidance = if availability.installed && missing_acp_executable {
+                "Check the selected ACP executable/profile"
+            } else {
+                "Install/sign in"
+            };
+            bail!("{:?} is not ready: {detail}. {retry_guidance} and retry, or ask the user with topic_request_harness_substitute",step.harness);
         }
         if step.harness == HarnessKind::Antigravity {
             local_harness::antigravity::require_selected_executable(
@@ -821,6 +863,8 @@ impl Daemon {
                 inputs,
                 step_cancel,
                 run_cancel,
+                resolved_acp_executable,
+                resolved_acp_executable_argv0,
                 resolved_antigravity_executable,
             ))
             .catch_unwind()
@@ -858,6 +902,8 @@ impl Daemon {
         inputs: Vec<TopicArtifact>,
         step_cancel: CancellationToken,
         cancel: CancellationToken,
+        resolved_acp_executable: Option<PathBuf>,
+        resolved_acp_executable_argv0: Option<OsString>,
         resolved_antigravity_executable: Option<PathBuf>,
     ) -> Result<()> {
         let feature = topic
@@ -878,6 +924,8 @@ impl Daemon {
                 &inputs,
                 handler.clone(),
                 &step_cancel,
+                resolved_acp_executable.as_deref(),
+                resolved_acp_executable_argv0.as_deref(),
                 resolved_antigravity_executable.as_deref(),
             );
             tokio::pin!(execution);
@@ -993,6 +1041,8 @@ impl Daemon {
         inputs: &[TopicArtifact],
         handler: Arc<dyn InteractionHandler>,
         cancel: &CancellationToken,
+        resolved_acp_executable: Option<&Path>,
+        resolved_acp_executable_argv0: Option<&std::ffi::OsStr>,
         resolved_antigravity_executable: Option<&Path>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
         let mut worktree = None;
@@ -1195,9 +1245,19 @@ impl Daemon {
                 HarnessKind::Antigravity => Some(local_harness::antigravity::topic_executable(
                     resolved_antigravity_executable,
                 )?),
+                HarnessKind::Acp => Some(
+                    resolved_acp_executable
+                        .context("ACP topic launch is missing its readiness executable")?
+                        .to_path_buf(),
+                ),
                 HarnessKind::Pi => executable("FORMLESS_TOPIC_PI_EXE")?,
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
+            },
+            executable_argv0: if step.harness == HarnessKind::Acp {
+                resolved_acp_executable_argv0.map(|value| value.to_os_string())
+            } else {
+                None
             },
             environment: BTreeMap::from([
                 (CAPABILITY.into(), OsString::from(token)),
@@ -1366,7 +1426,17 @@ impl Daemon {
                 )
                 .await
             }
-            HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
+            HarnessKind::Acp => {
+                self.run_topic_acp(
+                    attempt,
+                    token,
+                    local_harness::acp_agents::run_request_with_spawn,
+                    request,
+                    handler.as_ref(),
+                    cancel,
+                )
+                .await
+            }
             HarnessKind::Muse => local_harness::muse::run(request, handler.as_ref(), cancel).await,
         }
     }

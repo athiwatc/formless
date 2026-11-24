@@ -51,10 +51,18 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
         .record_usage(&b, "r2", "cheap", &use_(0, 1_000_000, 0))
         .unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let ping = daemon.handle(Request::Ping).await.unwrap();
+    assert!(ping["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(
+            formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE
+        )));
 
     let by = |by: Option<&str>| Request::UsageByDay {
         since: None,
         by: by.map(Into::into),
+        utc_offset_minutes: None,
     };
     let days = daemon.handle(by(None)).await.unwrap();
     let days = days.as_array().unwrap();
@@ -85,11 +93,96 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
         .handle(Request::UsageByDay {
             since: Some("2999-01-01T00:00:00Z".into()),
             by: None,
+            utc_offset_minutes: None,
         })
         .await
         .unwrap();
     assert!(none.as_array().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn daily_usage_shifts_by_the_request_offset_and_defaults_to_utc() {
+    let root = std::env::temp_dir().join(format!("fl-usage-offset-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.naming.enabled = false;
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let session_id = store
+        .create_session(Some("offset fixture".into()))
+        .unwrap()
+        .id;
+    let conn = rusqlite::Connection::open(paths.db_file()).unwrap();
+    conn.execute(
+        "INSERT INTO run_usage (session_id, run_id, model, prompt_tokens, completion_tokens,
+                                reasoning_tokens, cached_tokens, created_at)
+         VALUES (?1, 'offset-positive', 'fixture', 5, 0, 0, 0, '2026-11-16T20:00:00Z'),
+                (?1, 'offset-negative', 'fixture', 7, 0, 0, 0, '2026-11-17T02:00:00Z')",
+        [&session_id],
+    )
+    .unwrap();
+    drop(conn);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let request = |utc_offset_minutes| Request::UsageByDay {
+        since: None,
+        by: None,
+        utc_offset_minutes,
+    };
+
+    let local = daemon.handle(request(Some(420))).await.unwrap();
+    assert_eq!(local[0]["key"], "2026-11-17");
+    assert_eq!(local[0]["prompt_tokens"], 12);
+
+    let negative = daemon.handle(request(Some(-300))).await.unwrap();
+    assert_eq!(negative[0]["key"], "2026-11-16");
+    assert_eq!(negative[0]["prompt_tokens"], 12);
+
+    let legacy_request: Request = serde_json::from_value(serde_json::json!({
+        "type": "usage_by_day",
+        "since": null,
+        "by": null
+    }))
+    .unwrap();
+    assert!(matches!(
+        &legacy_request,
+        Request::UsageByDay {
+            utc_offset_minutes: None,
+            ..
+        }
+    ));
+    let utc = daemon.handle(legacy_request).await.unwrap();
+    assert_eq!(utc[0]["key"], "2026-11-16");
+    assert_eq!(utc[0]["prompt_tokens"], 5);
+    assert_eq!(utc[1]["key"], "2026-11-17");
+    assert_eq!(utc[1]["prompt_tokens"], 7);
+
+    let model = daemon
+        .handle(Request::UsageByDay {
+            since: None,
+            by: Some("model".into()),
+            utc_offset_minutes: Some(420),
+        })
+        .await
+        .unwrap();
+    assert_eq!(model[0]["key"], "fixture");
+    assert_eq!(model[0]["prompt_tokens"], 12);
+
+    for invalid_offset in [1440, -1440, i32::MIN, i32::MAX] {
+        let err = daemon
+            .handle(request(Some(invalid_offset)))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("usage UTC offset must be between -1439 and 1439 minutes"),
+            "{invalid_offset}: {err}"
+        );
+    }
+
+    drop(daemon);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -139,6 +232,7 @@ async fn session_usage_groups_keep_identity_when_names_match_or_disappear() {
     let request = || Request::UsageByDay {
         since: None,
         by: Some("session".into()),
+        utc_offset_minutes: None,
     };
     let expected = |id: &str, key: &str, prompt_tokens, completion_tokens, cost: Value| {
         json!({
@@ -260,6 +354,7 @@ async fn each_provider_prices_its_own_usage() {
         .handle(Request::UsageByDay {
             since: None,
             by: Some("provider".into()),
+            utc_offset_minutes: None,
         })
         .await
         .unwrap();

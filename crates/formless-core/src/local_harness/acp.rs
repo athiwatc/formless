@@ -7,9 +7,9 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -27,7 +27,6 @@ use super::{
 };
 
 const PROTOCOL_VERSION: u64 = 1;
-const JSON_RPC_AUTH_REQUIRED: i64 = -32000;
 const CANCELLED: &str = "The harness run was cancelled.";
 const POLL: Duration = Duration::from_millis(50);
 /// How long the agent may take to end a turn after `session/cancel` before it is killed.
@@ -48,8 +47,10 @@ pub struct AgentSpec {
     pub args: fn(&HarnessRequest) -> Vec<OsString>,
     /// Validates the `initialize` result (protocol, version, capabilities).
     pub check_agent: fn(&Value) -> Result<()>,
-    /// Returned when `session/new` reports JSON-RPC -32000 (authentication required).
+    /// Returned when `session/new` reports one of `auth_error_codes`.
     pub not_signed_in: &'static str,
+    /// JSON-RPC session errors that indicate missing authentication or configuration.
+    pub auth_error_codes: &'static [i64],
     /// Read-only session modes for review runs, most preferred first. The first one the
     /// session advertises (a `mode` config option, or `modes.availableModes`) is selected;
     /// if none is advertised, `session/set_mode` is tried with the first candidate.
@@ -163,6 +164,7 @@ impl PermissionHandler for Interactions<'_> {
         };
         self.runtime
             .block_on(self.handler.request_permission(permission, request.cancel))
+            .or_else(|| option_of_kind(request.options, &["reject_once", "reject_always"]))
     }
 
     fn on_update(&mut self, update: &Value) {
@@ -472,6 +474,7 @@ pub fn probe(
         mcp_env_vars: vec![],
         cwd,
         executable,
+        executable_argv0: None,
         environment: environment.clone(),
     };
     let mut agent = match AgentProcess::spawn(spec, &request) {
@@ -496,6 +499,67 @@ pub fn probe(
         .and_then(|(reader, writer)| probe_lines(spec, reader, writer, &cancel));
     drop(agent);
     probe_result(spec, initialized)
+}
+
+pub(super) struct SessionProbe {
+    pub version: Option<String>,
+    pub auth_methods: Vec<String>,
+    pub session: Result<std::result::Result<Value, i64>>,
+}
+
+/// A bounded readiness check that records auth methods but does not authenticate.
+pub(super) fn probe_session(
+    spec: &AgentSpec,
+    request: &HarnessRequest,
+    timeout: Duration,
+) -> SessionProbe {
+    let mut version = None;
+    let mut auth_methods = Vec::new();
+    let cancel = CancellationToken::new();
+    let timer = cancel.clone();
+    let (stop, stopped) = mpsc::channel();
+    std::thread::spawn(move || {
+        if stopped.recv_timeout(timeout).is_err() {
+            timer.cancel();
+        }
+    });
+    let session = (|| {
+        let mut agent = AgentProcess::spawn(spec, request)?;
+        let (reader, writer) = agent.pipes()?;
+        let mut rpc = Rpc::new(spec, reader, writer, &cancel, StepAccess::Write);
+        let initialized = match rpc.initialize_response(spec, &mut RejectAll)? {
+            Ok(initialized) => initialized,
+            Err(code) => return Ok(Err(code)),
+        };
+        auth_methods = initialized
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|method| method.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        version = initialized
+            .pointer("/agentInfo/version")
+            .or_else(|| initialized.pointer("/_meta/agentVersion"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        (spec.check_agent)(&initialized)?;
+        rpc.call(
+            "session/new",
+            json!({"cwd": request.cwd.to_str().context("probe cwd must be UTF-8")?, "mcpServers": []}),
+            &mut RejectAll,
+        )
+    })();
+    let _ = stop.send(());
+    SessionProbe {
+        version,
+        auth_methods,
+        session: if cancel.is_cancelled() {
+            Err(anyhow!("ACP readiness probe timed out."))
+        } else {
+            session
+        },
+    }
 }
 
 fn probe_lines<R: BufRead + Send + 'static, W: Write>(
@@ -582,8 +646,129 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
     environment
 }
 
+fn anchor_relative_search_path(path: &OsStr, base: &Path) -> Result<OsString> {
+    let entries = if path.is_empty() {
+        vec![base.to_path_buf()]
+    } else {
+        std::env::split_paths(path)
+            .map(|entry| {
+                if entry.is_absolute() {
+                    entry
+                } else {
+                    base.join(entry)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    std::env::join_paths(entries).context("could not anchor relative ACP PATH entries")
+}
+
+// Keep tool and shebang-interpreter lookup daemon-relative; topic workspaces
+// are not implicit PATH trust sources.
+fn path_for_agent_directory(path: &OsStr) -> Result<OsString> {
+    let entries = std::env::split_paths(path).collect::<Vec<_>>();
+    if !path.is_empty() && entries.iter().all(|entry| entry.is_absolute()) {
+        return Ok(path.to_os_string());
+    }
+    let base = std::env::current_dir().context("could not resolve daemon working directory")?;
+    anchor_relative_search_path(path, &base)
+}
+
+fn is_path_environment_variable(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().eq_ignore_ascii_case("PATH")
+    }
+    #[cfg(not(windows))]
+    {
+        name == OsStr::new("PATH")
+    }
+}
+
 /// The agent and every process it starts (MCP servers, tools); dropping it kills them all.
 pub(super) struct AgentProcess(SupervisedProcess);
+
+pub(super) fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub(super) fn find_executable(
+    program: &str,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    find_executable_with_platform(program, environment, cfg!(windows))
+}
+
+fn find_executable_with_platform(
+    program: &str,
+    environment: &BTreeMap<OsString, OsString>,
+    windows: bool,
+) -> Option<PathBuf> {
+    let path = environment
+        .get(OsStr::new("PATH"))
+        .cloned()
+        .or_else(|| std::env::var_os("PATH"))?;
+    let suffixes: Vec<_> = if windows {
+        if Path::new(program).extension().is_some() {
+            vec![String::new()]
+        } else {
+            let extensions = environment
+                .get(OsStr::new("PATHEXT"))
+                .cloned()
+                .or_else(|| std::env::var_os("PATHEXT"))
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            extensions
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }
+    } else {
+        vec![String::new()]
+    };
+    for directory in std::env::split_paths(&path) {
+        for suffix in &suffixes {
+            let candidate = directory.join(format!("{program}{suffix}"));
+            if is_executable(&candidate) {
+                return std::path::absolute(candidate).ok();
+            }
+        }
+    }
+    None
+}
+
+fn agent_program(
+    program: &str,
+    request: &HarnessRequest,
+    process_environment: &BTreeMap<OsString, OsString>,
+    windows: bool,
+) -> PathBuf {
+    if let Some(executable) = &request.executable {
+        return executable.clone();
+    }
+    if !windows {
+        return PathBuf::from(program);
+    }
+    let mut environment = process_environment.clone();
+    environment.extend(request.environment.clone());
+    find_executable_with_platform(program, &environment, windows)
+        .unwrap_or_else(|| PathBuf::from(program))
+}
 
 impl AgentProcess {
     pub(super) fn spawn(spec: &AgentSpec, request: &HarnessRequest) -> Result<Self> {
@@ -600,30 +785,45 @@ impl AgentProcess {
         spawn: &mut ProcessSpawner,
     ) -> Result<Self> {
         validate(request)?;
-        let program = request
-            .executable
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(spec.program));
+        let process_environment = std::env::vars_os().collect();
+        let program = agent_program(spec.program, request, &process_environment, cfg!(windows));
         let mut command = Command::new(&program);
-        command
-            .args((spec.args)(request))
-            .current_dir(&request.cwd)
-            .env_clear()
-            .envs(std::env::vars_os().filter(|(name, _)| {
+        #[cfg(unix)]
+        if let Some(argv0) = &request.executable_argv0 {
+            use std::os::unix::process::CommandExt;
+            command.arg0(argv0);
+        }
+        let mut child_environment = std::env::vars_os()
+            .filter(|(name, _)| {
                 !request
                     .mcp_env_vars
                     .iter()
                     .map(String::as_str)
                     .chain(spec.strip_env.iter().copied())
                     .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(agent_environment(request).into_iter().filter(|(name, _)| {
-                !spec
-                    .strip_env
-                    .iter()
-                    .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(spec.set_env.iter().copied())
+            })
+            .collect::<Vec<_>>();
+        child_environment.extend(agent_environment(request).into_iter().filter(|(name, _)| {
+            !spec
+                .strip_env
+                .iter()
+                .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
+        }));
+        child_environment.extend(
+            spec.set_env
+                .iter()
+                .map(|(name, value)| (OsString::from(*name), OsString::from(*value))),
+        );
+        for (name, value) in &mut child_environment {
+            if is_path_environment_variable(name) {
+                *value = path_for_agent_directory(value)?;
+            }
+        }
+        command
+            .args((spec.args)(request))
+            .current_dir(&request.cwd)
+            .env_clear()
+            .envs(child_environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -683,7 +883,7 @@ pub(super) fn drive<R: BufRead + Send + 'static, W: Write>(
             permissions,
         )?
         .map_err(|code| match code {
-            JSON_RPC_AUTH_REQUIRED => {
+            code if spec.auth_error_codes.contains(&code) => {
                 let methods: Vec<&str> = initialized
                     .get("authMethods")
                     .and_then(Value::as_array)
@@ -868,13 +1068,23 @@ pub fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(version)
 }
 
-/// The id of a select config option in `category` that offers `value`.
+/// The id of a select option offering `value`, preferring its id over its category.
 fn find_config_option(session: &Value, category: &str, value: &str) -> Option<String> {
     session
         .get("configOptions")?
         .as_array()?
         .iter()
-        .filter(|option| option.get("category").and_then(Value::as_str) == Some(category))
+        .filter(|option| option.get("id").and_then(Value::as_str) == Some(category))
+        .chain(
+            session
+                .get("configOptions")?
+                .as_array()?
+                .iter()
+                .filter(|option| {
+                    option.get("id").and_then(Value::as_str) != Some(category)
+                        && option.get("category").and_then(Value::as_str) == Some(category)
+                }),
+        )
         .find(|option| {
             option
                 .get("options")
@@ -980,6 +1190,20 @@ impl<W: Write> Rpc<W> {
         spec: &AgentSpec,
         permissions: &mut dyn PermissionHandler,
     ) -> Result<Value> {
+        self.initialize_response(spec, permissions)?
+            .map_err(|code| {
+                anyhow!(
+                    "{} rejected ACP initialize (JSON-RPC error {code}).",
+                    spec.name
+                )
+            })
+    }
+
+    fn initialize_response(
+        &mut self,
+        spec: &AgentSpec,
+        permissions: &mut dyn PermissionHandler,
+    ) -> Result<std::result::Result<Value, i64>> {
         let mut client_capabilities = json!({
             "fs": {"readTextFile": false, "writeTextFile": false},
             "terminal": false
@@ -993,13 +1217,7 @@ impl<W: Write> Rpc<W> {
                 "clientInfo": {"name": "formless", "version": env!("CARGO_PKG_VERSION")}
             }),
             permissions,
-        )?
-        .map_err(|code| {
-            anyhow!(
-                "{} rejected ACP initialize (JSON-RPC error {code}).",
-                spec.name
-            )
-        })
+        )
     }
 
     fn send(&mut self, message: &Value) -> Result<()> {
@@ -1230,10 +1448,189 @@ mod tests {
             mcp_args: vec!["mcp".into(), "--run".into(), "run-7".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::from([
                 ("FORMLESS_TOPIC_CAPABILITY".into(), "cap-secret".into()),
                 ("HOME".into(), "/home/user".into()),
             ]),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_pathext_skips_extensionless_shims_and_preserves_precedence_and_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "formless-acp-launch-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let extensionless = first.join("gemini");
+        std::fs::write(&extensionless, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&extensionless, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cmd_shim = first.join("gemini.CMD");
+        std::fs::write(&cmd_shim, "fixture").unwrap();
+        std::fs::set_permissions(&cmd_shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exe = second.join("gemini.EXE");
+        std::fs::write(&exe, "fixture").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut request = request(StepAccess::Write);
+        request.environment.insert(
+            "PATH".into(),
+            std::env::join_paths([first.as_os_str(), second.as_os_str()]).unwrap(),
+        );
+        request
+            .environment
+            .insert("PATHEXT".into(), ".EXE;.CMD".into());
+        let expected = std::path::absolute(&cmd_shim).unwrap();
+        let process_environment = BTreeMap::new();
+        assert_eq!(
+            find_executable_with_platform("gemini", &request.environment, true),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            agent_program("gemini", &request, &process_environment, true),
+            expected
+        );
+
+        let override_path = root.join("explicit-agent.exe");
+        request.executable = Some(override_path.clone());
+        assert_eq!(
+            agent_program("gemini", &request, &process_environment, true),
+            override_path
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relative_path_entries_are_anchored_to_the_daemon_directory() {
+        let daemon_cwd = std::env::temp_dir().join("formless-daemon-cwd");
+        let relative = PathBuf::from("repository/bin");
+        let absolute = std::env::temp_dir().join("system/bin");
+        let path = std::env::join_paths([relative.as_os_str(), absolute.as_os_str()]).unwrap();
+
+        let anchored = anchor_relative_search_path(&path, &daemon_cwd).unwrap();
+
+        assert_eq!(
+            std::env::split_paths(&anchored).collect::<Vec<_>>(),
+            vec![daemon_cwd.join(&relative), absolute.clone()]
+        );
+
+        let path_with_empty_entries = std::env::join_paths([
+            relative.as_os_str(),
+            OsStr::new(""),
+            absolute.as_os_str(),
+            OsStr::new(""),
+        ])
+        .unwrap();
+        let anchored_with_empty_entries =
+            anchor_relative_search_path(&path_with_empty_entries, &daemon_cwd).unwrap();
+        assert_eq!(
+            std::env::split_paths(&anchored_with_empty_entries).collect::<Vec<_>>(),
+            vec![
+                daemon_cwd.join(&relative),
+                daemon_cwd.clone(),
+                absolute.clone(),
+                daemon_cwd.clone(),
+            ]
+        );
+
+        let anchored_empty = anchor_relative_search_path(OsStr::new(""), &daemon_cwd).unwrap();
+        assert_eq!(anchored_empty.as_os_str(), daemon_cwd.as_os_str());
+
+        let absolute_only = absolute.as_os_str().to_os_string();
+        assert_eq!(
+            path_for_agent_directory(&absolute_only).unwrap(),
+            absolute_only
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_launch_uses_readiness_executable_over_workspace_relative_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let process_cwd = std::env::current_dir().unwrap();
+        let target = process_cwd.join("target");
+        let target_preexisted = target.exists();
+        let name = format!(
+            "formless-acp-path-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let relative_bin = PathBuf::from("target").join(&name);
+        let daemon_bin = process_cwd.join(&relative_bin);
+        let workspace = std::env::temp_dir().join(format!("formless-{name}"));
+        let workspace_bin = workspace.join(&relative_bin);
+        let global_bin = workspace.join("global");
+        let marker = workspace.join("selected");
+        let marker_complete = workspace.join("selected.complete");
+        for directory in [&daemon_bin, &workspace_bin, &global_bin] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+
+        for (directory, selected) in [
+            (&daemon_bin, "daemon"),
+            (&workspace_bin, "workspace"),
+            (&global_bin, "global"),
+        ] {
+            let executable = directory.join("gemini");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{selected}' > \"$ACP_LAUNCH_MARKER\"\n: > \"$ACP_LAUNCH_MARKER_COMPLETE\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let mut request = request(StepAccess::Write);
+        request.kind = HarnessKind::Acp;
+        request.acp_agent = Some("gemini".into());
+        request.cwd = workspace.clone();
+        request.environment.insert(
+            "PATH".into(),
+            std::env::join_paths([relative_bin.as_os_str(), OsStr::new("global")]).unwrap(),
+        );
+        request.environment.insert(
+            "ACP_LAUNCH_MARKER".into(),
+            marker.as_os_str().to_os_string(),
+        );
+        request.environment.insert(
+            "ACP_LAUNCH_MARKER_COMPLETE".into(),
+            marker_complete.as_os_str().to_os_string(),
+        );
+        request.executable = Some(std::fs::canonicalize(daemon_bin.join("gemini")).unwrap());
+        assert_eq!(
+            agent_program("gemini", &request, &BTreeMap::new(), false),
+            request.executable.clone().unwrap()
+        );
+
+        let spec = crate::local_harness::acp_agents::spec("gemini").unwrap();
+        let agent = AgentProcess::spawn(spec, &request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker_complete.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            marker_complete.exists(),
+            "workspace PATH executable did not finish writing its marker"
+        );
+        let selected = std::fs::read_to_string(&marker).unwrap();
+        drop(agent);
+        assert_eq!(selected, "daemon");
+
+        std::fs::remove_dir_all(&daemon_bin).unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        if !target_preexisted {
+            let _ = std::fs::remove_dir(&target);
         }
     }
 

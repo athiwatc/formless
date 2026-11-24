@@ -961,6 +961,7 @@ mod tests {
             mcp_args: vec!["mcp".into()],
             mcp_env_vars: vec!["FORMLESS_FIXTURE_TOKEN".into()],
             executable: None,
+            executable_argv0: None,
             environment: BTreeMap::from([(
                 "FORMLESS_FIXTURE_TOKEN".into(),
                 "fixture secret".into(),
@@ -1224,7 +1225,12 @@ fi
                 timeout: Duration::from_secs(5),
             })
             .await;
-            assert_eq!(result.version.as_deref(), Some(version));
+            assert_eq!(
+                result.version.as_deref(),
+                Some(version),
+                "Muse Code probe detail: {:?}",
+                result.detail
+            );
             assert_eq!(result.signed_in, signed_in);
             assert_eq!(marker.exists(), signed_in.is_some());
         }

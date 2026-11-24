@@ -7049,7 +7049,7 @@ impl App {
                 }
                 self.restore_session_selection(selected.as_deref());
             }
-            Event::MessagesEdited { session_id } => {
+            Event::MessagesEdited { session_id, .. } => {
                 if self.current.as_deref() == Some(&session_id) {
                     self.request(Pending::GetSession, Request::GetSession { id: session_id });
                 }
@@ -15050,10 +15050,29 @@ fn shell_words(s: &str) -> Vec<String> {
     out
 }
 
-/// The step a steering message (sent while a Run was active) arrived at.
+/// The provider turn whose request context first included this steering message.
 fn steer_step(m: &MessageInfo) -> Option<i64> {
     let meta: serde_json::Value = serde_json::from_str(m.meta.as_deref()?).ok()?;
-    meta["steer"]["step"].as_i64()
+    (meta["steer"]["context_included"] == true)
+        .then(|| meta["steer"]["step"].as_i64())
+        .flatten()
+        .filter(|step| *step > 0)
+}
+
+fn is_steer(m: &MessageInfo) -> bool {
+    serde_json::from_str::<serde_json::Value>(m.meta.as_deref().unwrap_or_default())
+        .ok()
+        .and_then(|meta| meta["steer"]["run_id"].as_str().map(str::to_owned))
+        .is_some()
+}
+
+fn steer_mark(m: &MessageInfo) -> Option<String> {
+    is_steer(m).then(|| {
+        steer_step(m).map_or_else(
+            || "↳ steer sent during a Run".to_string(),
+            |step| format!("↳ steer joined at step {step}"),
+        )
+    })
 }
 
 /// Text the daemon wrote in place of an empty refusal or filter stop,
@@ -16364,6 +16383,7 @@ impl App {
                 since: since.clone(),
                 by: Some(USAGE_BY[self.usage_by % USAGE_BY.len()].to_string())
                     .filter(|b| b != "day"),
+                utc_offset_minutes: None,
             },
         );
         if since.is_some() {
@@ -17102,9 +17122,9 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                         ui::dim(app.color),
                     ));
                 }
-                if let Some(step) = steer_step(m) {
+                if let Some(mark) = steer_mark(m) {
                     lines.push(Line::styled(
-                        format!("  ↳ steer at step {step}"),
+                        format!("  {mark}"),
                         fg(app.color, Color::Yellow),
                     ));
                 }
@@ -21406,9 +21426,34 @@ mod tests {
             created_at: String::new(),
             meta: meta.map(str::to_string),
         };
-        assert_eq!(steer_step(&msg(Some(r#"{"steer":{"step":4}}"#))), Some(4));
+        assert_eq!(
+            steer_step(&msg(Some(
+                r#"{"steer":{"step":4,"context_included":true}}"#
+            ))),
+            Some(4)
+        );
+        assert_eq!(
+            steer_step(&msg(Some(r#"{"steer":{"step":0,"run_id":"r"}}"#))),
+            None
+        );
+        assert!(is_steer(&msg(Some(r#"{"steer":{"run_id":"r"}}"#))));
+        assert_eq!(
+            steer_mark(&msg(Some(r#"{"steer":{"run_id":"r"}}"#))).as_deref(),
+            Some("↳ steer sent during a Run")
+        );
+        assert_eq!(
+            steer_mark(&msg(Some(
+                r#"{"steer":{"run_id":"r","step":4,"context_included":true}}"#
+            )))
+            .as_deref(),
+            Some("↳ steer joined at step 4")
+        );
         assert_eq!(
             steer_step(&msg(Some(r#"{"client":{"label":"web"}}"#))),
+            None
+        );
+        assert_eq!(
+            steer_mark(&msg(Some(r#"{"client":{"label":"web"}}"#))),
             None
         );
         assert_eq!(steer_step(&msg(None)), None);
@@ -30238,6 +30283,7 @@ mod tests {
         let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
         app.on_event(Event::MessagesEdited {
             session_id: "source".into(),
+            metadata_only: None,
         });
         branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
         app.drain_daemon();
@@ -32863,6 +32909,7 @@ mod tests {
         let generation = app.forecast_generation();
         app.on_event(Event::MessagesEdited {
             session_id: "s1".into(),
+            metadata_only: None,
         });
         assert_ne!(generation, app.forecast_generation());
         tx.send(ServerMessage::Response {
