@@ -562,6 +562,7 @@ mod tests {
                 &tag,
                 &Event::MessagesEdited {
                     session_id: "s".into(),
+                    metadata_only: None,
                 },
             )
             .unwrap();

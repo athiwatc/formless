@@ -7049,7 +7049,7 @@ impl App {
                 }
                 self.restore_session_selection(selected.as_deref());
             }
-            Event::MessagesEdited { session_id } => {
+            Event::MessagesEdited { session_id, .. } => {
                 if self.current.as_deref() == Some(&session_id) {
                     self.request(Pending::GetSession, Request::GetSession { id: session_id });
                 }
@@ -30282,6 +30282,7 @@ mod tests {
         let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
         app.on_event(Event::MessagesEdited {
             session_id: "source".into(),
+            metadata_only: None,
         });
         branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
         app.drain_daemon();
@@ -32907,6 +32908,7 @@ mod tests {
         let generation = app.forecast_generation();
         app.on_event(Event::MessagesEdited {
             session_id: "s1".into(),
+            metadata_only: None,
         });
         assert_ne!(generation, app.forecast_generation());
         tx.send(ServerMessage::Response {

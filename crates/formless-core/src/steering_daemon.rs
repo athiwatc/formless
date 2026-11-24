@@ -57,6 +57,7 @@ impl Daemon {
         })? {
             self.broadcast(Event::MessagesEdited {
                 session_id: session.to_string(),
+                metadata_only: Some(true),
             });
         }
         Ok(())

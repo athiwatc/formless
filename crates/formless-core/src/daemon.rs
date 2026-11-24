@@ -2125,6 +2125,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: topic.source_session_id.clone(),
+                    metadata_only: None,
                 });
                 if let Some(session_id) = &topic.topic_session_id {
                     if let Some(session) = self.with_reader(|st| st.get_session(session_id))? {
@@ -2613,6 +2614,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(serde_json::to_value(msg)?)
@@ -3059,6 +3061,7 @@ impl Daemon {
                 }
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(json!({"model":model,"original_session":original.map(|s|s.id)}))

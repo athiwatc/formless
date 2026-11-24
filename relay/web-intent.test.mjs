@@ -344,6 +344,83 @@ test('opening Session clears old messages and merges live appended messages into
   wait.resolve({ messages: [{ id: 'snapshot' }, { id: 'duplicate' }] }); await a;
   assert.deepEqual(Array.from(c.S.messages, m => m.id), ['snapshot', 'duplicate', 'live']);
 });
+test('metadata-only message updates preserve Settings and Tools state', async () => {
+  for (const view of ['settings', 'tools']) {
+    let historyRenders = 0;
+    const settingInput = { value: 'unsaved setting' };
+    const openClasses = new Set(['open']);
+    const c = setup(['onEvent', 'refreshEditedMessages'], {
+      act: async request => {
+        assert.deepEqual({ ...request }, { type: 'get_session', id: 'A' });
+        return { messages: [
+          { id: 'steer', role: 'user', seq: 1, content: 'steer', meta: '{"steer":{"context_included":true,"step":2}}' },
+          { id: 'deleted', role: 'user', seq: 2, content: 'deleted', meta: '{}' },
+          { id: 'edited', role: 'user', seq: 3, content: 'old content', meta: '{"steer":{"step":4}}' },
+        ] };
+      },
+      renderHistory: () => { historyRenders++; },
+      notifyFor() {},
+      document: { activeElement: settingInput },
+    });
+    vm.runInContext('let sessionSeq = 2; let metadataRefreshSeq = 0;', c);
+    c.S.view = view;
+    const steer = { id: 'steer', role: 'user', seq: 1, content: 'steer', meta: '{"steer":{"run_id":"r"}}' };
+    const live = { id: 'live', role: 'assistant', content: 'in flight' };
+    const edited = { id: 'edited', role: 'user', seq: 3, content: 'new content', meta: '{}' };
+    c.S.messages = [steer, live, edited];
+    c.$('sidebar').classList = {
+      add: name => openClasses.add(name),
+      remove: name => openClasses.delete(name),
+      toggle: (name, force) => force === undefined ? (openClasses.has(name) ? openClasses.delete(name) : openClasses.add(name)) : (force ? openClasses.add(name) : openClasses.delete(name)),
+      contains: name => openClasses.has(name),
+    };
+
+    await c.onEvent({ type: 'messages_edited', session_id: 'A', metadata_only: true });
+
+    assert.equal(c.S.view, view);
+    assert.equal(c.$('sidebar').classList.contains('open'), true);
+    assert.equal(c.document.activeElement, settingInput);
+    assert.equal(settingInput.value, 'unsaved setting');
+    assert.equal(c.S.messages[0].meta, '{"steer":{"context_included":true,"step":2}}');
+    assert.strictEqual(c.S.messages[0], steer);
+    assert.strictEqual(c.S.messages[1], live);
+    assert.strictEqual(c.S.messages[2], edited);
+    assert.equal(edited.meta, '{}');
+    assert.equal(c.S.messages.length, 3);
+    assert.equal(historyRenders, 0);
+  }
+});
+test('ordinary MessagesEdited events keep their full-reload behavior', () => {
+  const opened = [];
+  const c = setup(['onEvent'], { openSession: id => opened.push(id), notifyFor() {} });
+  c.onEvent({ type: 'messages_edited', session_id: 'A' });
+  assert.deepEqual(opened, ['A']);
+});
+test('stale metadata refreshes cannot cross session or refresh generations', async () => {
+  const oldSession = deferred(), oldRefresh = deferred(), currentRefresh = deferred();
+  const waits = [oldSession, oldRefresh, currentRefresh];
+  let calls = 0;
+  const c = setup(['refreshEditedMessages'], { act: () => waits[calls++].promise, renderHistory() {} });
+  vm.runInContext('let sessionSeq = 1; let metadataRefreshSeq = 0;', c);
+  const steer = { id: 'steer', role: 'user', seq: 1, content: 'steer', meta: '{"steer":{"run_id":"r"}}' };
+  c.S.messages = [steer, { id: 'live', content: 'keep' }];
+
+  const firstSession = c.refreshEditedMessages('A');
+  vm.runInContext('S.current = "B"; sessionSeq = 2; S.current = "A"; sessionSeq = 3;', c);
+  oldSession.resolve({ messages: [{ ...steer, meta: '{"steer":{"step":2}}' }] });
+  await firstSession;
+  assert.equal(steer.meta, '{"steer":{"run_id":"r"}}');
+
+  const firstRefresh = c.refreshEditedMessages('A');
+  const latestRefresh = c.refreshEditedMessages('A');
+  oldRefresh.resolve({ messages: [{ ...steer, meta: '{"steer":{"step":2}}' }] });
+  await firstRefresh;
+  assert.equal(steer.meta, '{"steer":{"run_id":"r"}}');
+  currentRefresh.resolve({ messages: [{ ...steer, meta: '{"steer":{"context_included":true,"step":3}}' }] });
+  await latestRefresh;
+  assert.equal(steer.meta, '{"steer":{"context_included":true,"step":3}}');
+  assert.equal(c.S.messages.length, 2);
+});
 test('approval decisions stay pending until confirmed; failures remain retryable', async () => {
   const waits = [deferred(), deferred()]; let calls = 0; const notes = [], errors = [];
   const c = setup(['decide'], { request: () => waits[calls++].promise, renderApproval() {}, renderStatus() {},
@@ -436,9 +513,15 @@ function node(tag, attrs, ...children) {
 }
 const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] : [];
 const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
-test('steering marks distinguish unrecorded inclusion from joined steps', () => {
+test('steering marks update from unrecorded to joined step without reloading the view', async () => {
   const transcript = node('div');
-  const c = setup(['renderHistory', 'messageBody', 'messageMenu', 'beginEdit', 'assistantStopNote', 'steerStep'], {
+  let editedSnapshot = [];
+  const c = setup(['renderHistory', 'messageBody', 'messageMenu', 'beginEdit', 'assistantStopNote', 'steerStep', 'onEvent', 'refreshEditedMessages'], {
+    act: async request => {
+      assert.deepEqual({ ...request }, { type: 'get_session', id: 'A' });
+      return { messages: editedSnapshot };
+    },
+    notifyFor() {},
     h: node, isRunning: () => false, markdown: text => node('p', null, text),
     speaker: role => role === 'user' ? 'user' : 'assistant',
     sentElsewhere: () => null, withMentions: text => text, attachmentTags: () => [],
@@ -446,10 +529,10 @@ test('steering marks distinguish unrecorded inclusion from joined steps', () => 
   });
   const lookup = c.$;
   c.$ = id => id === 'transcript' ? transcript : lookup(id);
-  vm.runInContext('const rendered = new Map(); const WHO = { user: "You", assistant: "Formless" }; let popover;', c);
+  vm.runInContext('const rendered = new Map(); const WHO = { user: "You", assistant: "Formless" }; let popover; let sessionSeq = 4; let metadataRefreshSeq = 0;', c);
   c.S.daemonOnline = true;
   c.S.messages = [
-    { id: 'pending', role: 'user', content: 'pending', meta: JSON.stringify({ steer: { run_id: 'run' } }) },
+    { id: 'pending', role: 'user', seq: 1, content: 'pending', meta: JSON.stringify({ steer: { run_id: 'run' } }) },
     { id: 'joined', role: 'user', content: 'joined', meta: JSON.stringify({ steer: { run_id: 'run', step: 2, context_included: true } }) },
     { id: 'legacy-zero', role: 'user', content: 'legacy', meta: JSON.stringify({ steer: { run_id: 'old-run', step: 0 } }) },
     { id: 'ordinary', role: 'user', content: 'ordinary', meta: '{}' },
@@ -463,6 +546,17 @@ test('steering marks distinguish unrecorded inclusion from joined steps', () => 
   ]);
   assert.equal(marks[0].attrs.title, 'Provider-context inclusion was not recorded');
   assert.equal(marks[1].attrs.title, 'First provider request context that included this steer');
+
+  const pendingMessage = c.S.messages[0];
+  editedSnapshot = [{ ...pendingMessage, meta: JSON.stringify({ steer: { run_id: 'run', step: 2, context_included: true } }) }];
+  await c.onEvent({ type: 'messages_edited', session_id: 'A', metadata_only: true });
+
+  assert.strictEqual(c.S.messages[0], pendingMessage);
+  assert.deepEqual(all(transcript).filter(n => n.attrs.class === 'steer-mark').map(plainText), [
+    '↳ steer joined at step 2',
+    '↳ steer joined at step 2',
+    '↳ steer sent during a Run',
+  ]);
 });
 test('generated user-role messages render as Formless and cannot be moved or edited as user requests', () => {
   const transcript = node('div');

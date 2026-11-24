@@ -404,7 +404,7 @@ async fn steer_during_real_tool_execution_produces_exactly_one_final_answer() {
     assert_eq!(steer_meta["steer"]["step"], 2);
     assert_eq!(steer_meta["steer"]["context_included"], true);
     client
-        .event(|event| matches!(event, Event::MessagesEdited { session_id } if session_id == &fixture.session))
+        .event(|event| matches!(event, Event::MessagesEdited { session_id, metadata_only: Some(true) } if session_id == &fixture.session))
         .await;
     final_call.answer(json!({"content":"single final answer including steer"}));
     client.finished(&run, "completed").await;
@@ -485,7 +485,7 @@ async fn steer_during_first_provider_request_keeps_its_first_joined_step() {
     assert_eq!(steer_meta["steer"]["step"], 2);
     assert_eq!(steer_meta["steer"]["context_included"], true);
     client
-        .event(|event| matches!(event, Event::MessagesEdited { session_id } if session_id == &fixture.session))
+        .event(|event| matches!(event, Event::MessagesEdited { session_id, metadata_only: Some(true) } if session_id == &fixture.session))
         .await;
 
     let mut next_batch = calls(&[("race_gate", json!({}))]);

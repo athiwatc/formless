@@ -8495,6 +8495,20 @@
   }
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
+  let metadataRefreshSeq = 0;
+  async function refreshEditedMessages(id) {
+    const seq = ++metadataRefreshSeq;
+    const session = sessionSeq;
+    const result = await act({ type: "get_session", id });
+    if (!result || seq !== metadataRefreshSeq || session !== sessionSeq || S.current !== id) return;
+    const current = new Map((S.messages || []).map((message) => [message.id, message]));
+    for (const updated of result.messages || []) {
+      const message = current.get(updated.id);
+      if (!message || message.content !== updated.content || message.seq !== updated.seq) continue;
+      message.meta = updated.meta;
+    }
+    if (S.view === "chat") renderHistory();
+  }
   async function openSession(id, stay) {
     if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
@@ -9855,7 +9869,12 @@
         renderAll();
         break;
       case "messages_edited":
-        if (here) openSession(S.current);
+        if (here) {
+          if (ev.metadata_only === true) {
+            return refreshEditedMessages(S.current);
+          }
+          openSession(S.current);
+        }
         break;
       case "tool_updated": {
         refreshDescriptionReviews();
