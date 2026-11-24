@@ -150,8 +150,25 @@ fn targeted_message_lookup_narrows_only_unrelated_corruption_and_keeps_target_ma
         .append_message(&session.id, "user", "valid target")
         .unwrap();
     let unrelated = store
-        .append_message(&session.id, "assistant", "unrelated")
+        .append_message(&session.id, "assistant", "unrelated 文件")
         .unwrap();
+    let unrelated_rowid: i64 = store
+        .conn
+        .query_row(
+            "SELECT rowid FROM messages WHERE id=?1",
+            params![unrelated.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let indexed_unrelated: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_unicode_fts WHERE rowid=?1",
+            params![unrelated_rowid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_unrelated, 1);
     store
         .conn
         .execute(
@@ -175,6 +192,15 @@ fn targeted_message_lookup_narrows_only_unrelated_corruption_and_keeps_target_ma
         .edit_message(&session.id, &target.id, "edited")
         .unwrap()
         .is_some());
+    let remaining_unrelated_index: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_unicode_fts WHERE rowid=?1",
+            params![unrelated_rowid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_unrelated_index, 0);
     store
         .conn
         .execute(
