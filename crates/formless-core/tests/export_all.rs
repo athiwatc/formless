@@ -79,10 +79,77 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
             .unwrap();
     }
     let a = Arc::new(formless_core::daemon::Daemon::new(from.clone()).unwrap());
-    let bundle = a
+    let source_store = Store::open(&from.db_file()).unwrap();
+    let session_id = source_store
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.name == "History")
+        .unwrap()
+        .id;
+    a.handle(Request::AttachFile {
+        session_id: session_id.clone(),
+        name: "notes.txt".into(),
+        data_b64: "aGVsbG8=".into(),
+        mime: Some("text/plain".into()),
+    })
+    .await
+    .unwrap();
+    let held = source_store.take_pending_attachments(&session_id).unwrap();
+    source_store
+        .append_message_meta(
+            &session_id,
+            "user",
+            "read the attached note",
+            Some(json!({"attachments": held}).to_string()),
+        )
+        .unwrap();
+    source_store
+        .save_checkpoint(&session_id, "before attachment", 1)
+        .unwrap();
+    source_store
+        .save_checkpoint(&session_id, "after attachment", 2)
+        .unwrap();
+    let mut bundle = a
         .handle(Request::ExportAll { sessions: true })
         .await
         .unwrap();
+    let session_bundle = &mut bundle["sessions"][0];
+    assert_eq!(session_bundle["messages"].as_array().unwrap().len(), 2);
+    session_bundle["messages"][0]["seq"] = json!(10);
+    session_bundle["messages"][1]["seq"] = json!(20);
+    session_bundle["plan"] = json!([{"content":"Review attachment","status":"completed"}]);
+    session_bundle["plan_state"] = json!({
+        "run_id":"source-run",
+        "updated_at":"2026-01-01T00:00:00Z",
+        "run_status":"completed",
+        "previous_task":false,
+        "origin":"live",
+    });
+    session_bundle["plan_history"] = json!([
+        {
+            "anchor_seq":10,
+            "items":[{"content":"Review attachment","status":"pending"}],
+            "state":{
+                "run_id":"source-run",
+                "updated_at":"2026-01-01T00:00:00Z",
+                "run_status":"running",
+                "previous_task":false,
+                "origin":"live",
+            },
+        },
+        {
+            "anchor_seq":20,
+            "items":[{"content":"Review attachment","status":"completed"}],
+            "state":{
+                "run_id":"source-run",
+                "updated_at":"2026-01-01T00:00:01Z",
+                "run_status":"completed",
+                "previous_task":true,
+                "origin":"live",
+            },
+        },
+    ]);
     assert_eq!(bundle["format"], "formless.all/1");
     let text = bundle.to_string();
     assert!(!text.contains("sekrit"), "secrets are blanked");
@@ -106,6 +173,20 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
     fresh.naming.enabled = false;
     fresh.save(&to).unwrap();
     let b = Arc::new(formless_core::daemon::Daemon::new(to.clone()).unwrap());
+    let target_store = Store::open(&to.db_file()).unwrap();
+    let fixed_session = target_store
+        .create_session(Some("Local job history".into()))
+        .unwrap();
+    target_store
+        .create_job(
+            "check the news",
+            Some(&fixed_session.id),
+            Some("0 9 * * 1-5"),
+            "2030-01-01T09:00:00+00:00",
+            true,
+            "user",
+        )
+        .unwrap();
     let r = b
         .handle(Request::ImportAll {
             bundle: bundle.clone(),
@@ -156,8 +237,16 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
     assert!(store.get_tool_by_name("shout").unwrap().is_some());
     assert!(store.get_module_by_name("strutil").unwrap().is_some());
     let jobs = store.list_jobs().unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert!(!jobs[0].enabled, "jobs come in paused");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(
+        jobs.iter().filter(|job| job.session_id.is_none()).count(),
+        1
+    );
+    assert!(
+        jobs.iter()
+            .any(|job| job.session_id.is_none() && !job.enabled),
+        "standalone imported jobs come in paused"
+    );
     assert!(store
         .list_sessions()
         .unwrap()
@@ -188,7 +277,12 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
         .unwrap();
 
     // Re-import skips existing entries without changing their current state.
-    let again = b.handle(Request::ImportAll { bundle }).await.unwrap();
+    let again = b
+        .handle(Request::ImportAll {
+            bundle: bundle.clone(),
+        })
+        .await
+        .unwrap();
     assert_eq!(
         (
             again["tools"].as_i64(),
@@ -247,8 +341,168 @@ async fn everything_moves_to_a_new_machine_without_secrets() {
     let skill = store.get_skill("travel-guide").unwrap().unwrap();
     assert_eq!((skill.version, skill.enabled), (2, true));
     assert!(!store.get_memory(&memory.id).unwrap().unwrap().enabled);
-    assert_eq!(store.list_jobs().unwrap().len(), 1);
-    assert_eq!(store.list_sessions().unwrap().len(), 1);
+    assert_eq!(store.list_jobs().unwrap().len(), 2);
+    assert_eq!(store.list_sessions().unwrap().len(), 2);
+
+    let mut normalized = bundle.clone();
+    let normalized_session = &mut normalized["sessions"][0];
+    assert!(normalized_session
+        .as_object_mut()
+        .unwrap()
+        .remove("model")
+        .is_some());
+    assert!(normalized_session
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_effort")
+        .is_some());
+    normalized_session["checkpoints"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    normalized_session["messages"][0]["seq"] = json!(100);
+    normalized_session["messages"][1]["seq"] = json!(200);
+    normalized_session["plan_history"][0]["anchor_seq"] = json!(100);
+    normalized_session["plan_history"][1]["anchor_seq"] = json!(200);
+    normalized_session["plan_state"] = json!({
+        "run_id":"detached-run",
+        "updated_at":"2026-02-01T00:00:00Z",
+        "run_status":"failed",
+        "previous_task":true,
+        "origin":"copied",
+    });
+    normalized_session["plan_history"][0]["state"] = normalized_session["plan_state"].clone();
+    normalized_session["plan_history"][1]["state"] = normalized_session["plan_state"].clone();
+    let normalized_again = b
+        .handle(Request::ImportAll {
+            bundle: normalized.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        normalized_again["added"]["sessions"], 0,
+        "{normalized_again}"
+    );
+    assert_eq!(
+        normalized_again["skipped_existing"]["sessions"], 1,
+        "{normalized_again}"
+    );
+    let imported_session = store
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.name == "History")
+        .unwrap();
+    let attached_message = store
+        .list_messages(&imported_session.id)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.content == "read the attached note")
+        .unwrap();
+    let attachment_meta: serde_json::Value =
+        serde_json::from_str(attached_message.meta.as_deref().unwrap()).unwrap();
+    assert!(attachment_meta["attachments"][0]["imported"]
+        .as_bool()
+        .unwrap());
+    assert!(attachment_meta["attachments"][0].get("path").is_none());
+
+    store
+        .append_message(&imported_session.id, "user", "local continuation")
+        .unwrap();
+    store
+        .set_session_model(
+            &imported_session.id,
+            Some("local-model".into()),
+            Some("high".into()),
+        )
+        .unwrap();
+    store
+        .rename_session(&imported_session.id, "Locally evolved")
+        .unwrap();
+    store
+        .save_checkpoint(&imported_session.id, "local checkpoint", 3)
+        .unwrap();
+    let evolved_again = b
+        .handle(Request::ImportAll {
+            bundle: normalized.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(evolved_again["added"]["sessions"], 0, "{evolved_again}");
+    assert_eq!(
+        evolved_again["skipped_existing"]["sessions"], 1,
+        "{evolved_again}"
+    );
+    let evolved = store.get_session(&imported_session.id).unwrap().unwrap();
+    assert_eq!(evolved.name, "Locally evolved");
+    assert_eq!(evolved.model.as_deref(), Some("local-model"));
+    assert_eq!(evolved.reasoning_effort.as_deref(), Some("high"));
+    assert!(store
+        .list_messages(&imported_session.id)
+        .unwrap()
+        .iter()
+        .any(|message| message.content == "local continuation"));
+    assert_eq!(
+        store.session_plan(&imported_session.id).unwrap()[0].content,
+        "Review attachment"
+    );
+    assert!(!store.get_memory(&memory.id).unwrap().unwrap().enabled);
+
+    let mut revised_plan = normalized.clone();
+    let revised_session = &mut revised_plan["sessions"][0];
+    revised_session["plan"][0]["content"] = json!("Review and summarize the attachment");
+    revised_session["plan_history"][1]["items"][0]["content"] =
+        json!("Review and summarize the attachment");
+    let plan_import = b
+        .handle(Request::ImportAll {
+            bundle: revised_plan.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(plan_import["added"]["sessions"], 1, "{plan_import}");
+    assert_eq!(store.list_sessions().unwrap().len(), 3);
+    let revised_imported = store
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.name == "History")
+        .unwrap();
+    assert_eq!(
+        store.session_plan(&revised_imported.id).unwrap()[0].content,
+        "Review and summarize the attachment"
+    );
+    assert_eq!(
+        store.session_plan(&imported_session.id).unwrap()[0].content,
+        "Review attachment"
+    );
+    let revised_again = b
+        .handle(Request::ImportAll {
+            bundle: revised_plan,
+        })
+        .await
+        .unwrap();
+    assert_eq!(revised_again["added"]["sessions"], 0, "{revised_again}");
+    assert_eq!(
+        revised_again["skipped_existing"]["sessions"], 1,
+        "{revised_again}"
+    );
+
+    let mut mislabeled_skill = bundle.clone();
+    mislabeled_skill["skills"][0]["name"] = json!("trip-helper");
+    let skill_collision = b
+        .handle(Request::ImportAll {
+            bundle: mislabeled_skill,
+        })
+        .await
+        .unwrap();
+    assert_eq!(skill_collision["added"]["skills"], 0, "{skill_collision}");
+    assert_eq!(
+        skill_collision["skipped_existing"]["skills"], 1,
+        "{skill_collision}"
+    );
+    let skill = store.get_skill("travel-guide").unwrap().unwrap();
+    assert_eq!((skill.version, skill.enabled), (2, true));
+    assert!(!store.get_memory(&memory.id).unwrap().unwrap().enabled);
 }
 
 /// A provider key whose provider was removed from the config by hand is

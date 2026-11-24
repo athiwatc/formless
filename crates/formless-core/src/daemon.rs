@@ -3,6 +3,7 @@ use formless_protocol::*;
 use formless_runtime::LockExt as _;
 use formless_runtime::{Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -10401,6 +10402,15 @@ impl Daemon {
 
     /// Load a `formless.session/1` bundle as a new Session.
     fn import_session_bundle(&self, bundle: &Value) -> Result<SessionInfo> {
+        self.import_session_bundle_with_fingerprint(bundle, None)
+            .map(|(session, _)| session)
+    }
+
+    fn import_session_bundle_with_fingerprint(
+        &self,
+        bundle: &Value,
+        fingerprint: Option<&str>,
+    ) -> Result<(SessionInfo, bool)> {
         if bundle["format"].as_str() != Some("formless.session/1") {
             return Err(anyhow!("unsupported session bundle format"));
         }
@@ -10436,53 +10446,141 @@ impl Daemon {
             .enumerate()
             .map(|(index, message)| message["seq"].as_i64().unwrap_or(index as i64 + 1))
             .collect();
-        let s = self.with_store(|st| {
+        self.with_store(|st| {
             st.transaction(|st| {
-                let s = st.import_session(
+                if let Some(fingerprint) = fingerprint {
+                    if let Some(session_id) = st.imported_session_for_fingerprint(fingerprint)? {
+                        let session = st
+                            .get_session(&session_id)?
+                            .context("recorded imported session disappeared")?;
+                        return Ok((session, false));
+                    }
+                }
+                let session = st.import_session(
                     bundle["name"].as_str().unwrap_or("Imported"),
                     bundle["model"].as_str().map(str::to_string),
                     bundle["reasoning_effort"].as_str().map(str::to_string),
                     &messages,
                     &checkpoints,
                 )?;
-                st.import_session_plan_bundle(&s.id, bundle, &source_seqs)?;
-                Ok(s)
+                st.import_session_plan_bundle(&session.id, bundle, &source_seqs)?;
+                if let Some(fingerprint) = fingerprint {
+                    st.remember_imported_session_fingerprint(fingerprint, &session.id)?;
+                }
+                Ok((session, true))
             })
-        })?;
-        Ok(s)
+        })
     }
 
-    fn import_session_identity(bundle: &Value) -> Value {
-        let messages = bundle["messages"]
-            .as_array()
-            .into_iter()
-            .flatten()
+    fn import_session_identity(bundle: &Value) -> Result<Value> {
+        let raw_messages = bundle["messages"].as_array().cloned().unwrap_or_default();
+        let mut source_positions = BTreeMap::new();
+        let mut previous_seq = 0;
+        for (index, message) in raw_messages.iter().enumerate() {
+            let source_seq = message["seq"].as_i64().unwrap_or(index as i64 + 1);
+            if source_seq <= previous_seq
+                || source_positions
+                    .insert(source_seq, index as i64 + 1)
+                    .is_some()
+            {
+                bail!("Imported message sequence mapping is ambiguous or out of order");
+            }
+            previous_seq = source_seq;
+        }
+        let messages = raw_messages
+            .iter()
             .map(|message| {
                 json!({
                     "role": message["role"].as_str().unwrap_or("user"),
                     "content": message["content"].as_str().unwrap_or_default(),
-                    "meta": message["meta"].as_str(),
+                    "meta": crate::storage::sanitize_imported_message_meta(message["meta"].as_str()),
                 })
             })
             .collect::<Vec<_>>();
-        let checkpoints = bundle["checkpoints"]
+        let mut checkpoints = bundle["checkpoints"]
             .as_array()
             .into_iter()
             .flatten()
-            .map(|checkpoint| {
-                json!({
-                    "summary": checkpoint["summary"].as_str().unwrap_or_default(),
-                    "up_to_seq": checkpoint["up_to_seq"].as_i64().unwrap_or(0),
-                })
+            .enumerate()
+            .map(|(index, checkpoint)| {
+                let up_to_seq = checkpoint["up_to_seq"].as_i64().unwrap_or(0);
+                (
+                    up_to_seq,
+                    index,
+                    json!({
+                        "summary": checkpoint["summary"].as_str().unwrap_or_default(),
+                        "up_to_seq": up_to_seq,
+                    }),
+                )
             })
             .collect::<Vec<_>>();
-        json!({
+        checkpoints.sort_by_key(|(up_to_seq, index, _)| (*up_to_seq, *index));
+        let checkpoints = checkpoints
+            .into_iter()
+            .map(|(_, _, checkpoint)| checkpoint)
+            .collect::<Vec<_>>();
+        let current_plan = bundle
+            .get("plan")
+            .map(crate::storage::portable_plan)
+            .transpose()?
+            .unwrap_or_default();
+        let has_current_plan = bundle.get("plan").is_some() || bundle.get("plan_state").is_some();
+        if bundle.get("plan_history").is_some() && !has_current_plan {
+            bail!("Plan history requires an explicit current plan or plan_state; history-only imports are ambiguous");
+        }
+        let mut plan_history = BTreeMap::<i64, Vec<PlanItem>>::new();
+        if let Some(history) = bundle.get("plan_history") {
+            let history = history
+                .as_array()
+                .context("plan_history must be an array")?;
+            if history.len() > raw_messages.len() + 1 {
+                bail!("Plan history exceeds retained message boundaries");
+            }
+            let mut seen = BTreeSet::new();
+            for revision in history {
+                let source_seq = revision["anchor_seq"]
+                    .as_i64()
+                    .context("Plan revision boundary required")?;
+                if !seen.insert(source_seq) {
+                    bail!("Duplicate plan revision boundary");
+                }
+                let anchor = if source_seq == 0 {
+                    0
+                } else {
+                    *source_positions
+                        .get(&source_seq)
+                        .context("Plan revision points outside imported messages")?
+                };
+                let items = crate::storage::portable_plan(&revision["items"])?;
+                plan_history.insert(anchor, items);
+            }
+        }
+        if has_current_plan {
+            plan_history.insert(raw_messages.len() as i64, current_plan.clone());
+        }
+        if plan_history.values().all(|items| items.is_empty()) {
+            plan_history.clear();
+        }
+        let plan_history = plan_history
+            .into_iter()
+            .map(|(anchor, items)| json!({"anchor": anchor, "items": items}))
+            .collect::<Vec<_>>();
+        Ok(json!({
             "name": bundle["name"].as_str().unwrap_or("Imported"),
-            "model": bundle.get("model").cloned().unwrap_or(Value::Null),
-            "reasoning_effort": bundle.get("reasoning_effort").cloned().unwrap_or(Value::Null),
+            "model": bundle.get("model").and_then(Value::as_str),
+            "reasoning_effort": bundle.get("reasoning_effort").and_then(Value::as_str),
             "messages": messages,
             "checkpoints": checkpoints,
-        })
+            "plan": current_plan,
+            "plan_history": plan_history,
+        }))
+    }
+
+    fn import_session_fingerprint(identity: &Value) -> Result<String> {
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(identity)?)
+        ))
     }
 
     /// `ExportAll` (SPEC §15): one bundle for a new machine.
@@ -10664,20 +10762,24 @@ impl Daemon {
             }
         }
         for b in list("skills") {
-            if b["format"].as_str() == Some("formless.skill/1") {
-                if let Some(name) = b["name"].as_str() {
-                    if self.with_reader(|st| st.get_skill(name))?.is_some() {
-                        count(&mut skipped_existing, "skills");
-                        continue;
+            let bundle_name = b["name"].as_str().unwrap_or("?").to_string();
+            match crate::skills::prepare_bundle(&self.paths, &b) {
+                Ok(staged) => {
+                    let name = staged.meta.name.clone();
+                    match self.with_store(|st| {
+                        if st.get_skill(&name)?.is_some() {
+                            Ok(false)
+                        } else {
+                            crate::skills::commit(&self.paths, st, &staged, "import")?;
+                            Ok(true)
+                        }
+                    }) {
+                        Ok(true) => count(&mut added, "skills"),
+                        Ok(false) => count(&mut skipped_existing, "skills"),
+                        Err(e) => failed.push(format!("skill {name}: {e}")),
                     }
                 }
-            }
-            let res = crate::skills::prepare_bundle(&self.paths, &b).and_then(|staged| {
-                self.with_store(|st| crate::skills::commit(&self.paths, st, &staged, "import"))
-            });
-            match res {
-                Ok(_) => count(&mut added, "skills"),
-                Err(e) => failed.push(format!("skill {}: {e}", b["name"].as_str().unwrap_or("?"))),
+                Err(e) => failed.push(format!("skill {bundle_name}: {e}")),
             }
         }
         let mut memory_keys = self.with_reader(|st| {
@@ -10717,6 +10819,7 @@ impl Daemon {
             for job in st.list_jobs()? {
                 if let Some(cron) = job.cron {
                     identities.insert((
+                        job.session_id,
                         job.prompt,
                         cron,
                         job.overlap,
@@ -10731,6 +10834,7 @@ impl Daemon {
                 continue;
             };
             let identity = (
+                None,
                 prompt.to_string(),
                 cron.to_string(),
                 j["overlap"].as_str().unwrap_or("skip").to_string(),
@@ -10766,26 +10870,59 @@ impl Daemon {
                 Err(e) => failed.push(format!("job {cron}: {e}")),
             }
         }
-        let mut session_identities = std::collections::BTreeSet::new();
-        for session in self.with_reader(|st| st.list_sessions())? {
-            let exported = self.session_bundle(&session.id)?;
-            session_identities.insert(serde_json::to_string(&Self::import_session_identity(
-                &exported,
-            ))?);
+        let sessions = list("sessions");
+        let mut session_identities = BTreeMap::new();
+        if !sessions.is_empty() {
+            for session in self.with_reader(|st| st.list_sessions())? {
+                let exported = self.session_bundle(&session.id)?;
+                let identity = Self::import_session_identity(&exported)?;
+                session_identities
+                    .entry(serde_json::to_string(&identity)?)
+                    .or_insert(session.id);
+            }
         }
-        for b in list("sessions") {
-            let identity = serde_json::to_string(&Self::import_session_identity(&b))?;
-            if session_identities.contains(&identity) {
+        let mut seen_session_fingerprints = BTreeSet::new();
+        for b in sessions {
+            let identity = match Self::import_session_identity(&b) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    failed.push(format!(
+                        "session {}: {e}",
+                        b["name"].as_str().unwrap_or("?")
+                    ));
+                    continue;
+                }
+            };
+            let fingerprint = Self::import_session_fingerprint(&identity)?;
+            if !seen_session_fingerprints.insert(fingerprint.clone()) {
                 count(&mut skipped_existing, "sessions");
                 continue;
             }
-            match self.import_session_bundle(&b) {
-                Ok(session) => {
+            if self
+                .with_reader(|st| st.imported_session_for_fingerprint(&fingerprint))?
+                .is_some()
+            {
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            let identity_key = serde_json::to_string(&identity)?;
+            if let Some(session_id) = session_identities.get(&identity_key) {
+                let session_id = session_id.clone();
+                self.with_store(|st| {
+                    st.transaction(|st| {
+                        st.remember_imported_session_fingerprint(&fingerprint, &session_id)
+                    })
+                })?;
+                count(&mut skipped_existing, "sessions");
+                continue;
+            }
+            match self.import_session_bundle_with_fingerprint(&b, Some(&fingerprint)) {
+                Ok((session, true)) => {
                     count(&mut added, "sessions");
-                    let exported = self.session_bundle(&session.id)?;
-                    session_identities.insert(serde_json::to_string(
-                        &Self::import_session_identity(&exported),
-                    )?);
+                    session_identities.insert(identity_key, session.id);
+                }
+                Ok((_, false)) => {
+                    count(&mut skipped_existing, "sessions");
                 }
                 Err(e) => failed.push(format!(
                     "session {}: {e}",
