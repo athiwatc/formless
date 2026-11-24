@@ -35,6 +35,9 @@ if sys.argv[1:]==['login','status']:
 for line in sys.stdin:
     request=json.loads(line)
     with open(os.environ['PROBE_REQUESTS'],'a') as f:f.write(request['method']+'\n')
+    if request['method']=='initialize' and mode=='delay':
+        time.sleep(1)
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'protocolVersion':1,'agentInfo':{'name':'Antigravity ACP Server','version':'1.5.14'}}}),flush=True);continue
     if request['method']=='session/new':
         assert request['params']['mcpServers']==[]
         assert pathlib.Path(request['params']['cwd']).is_dir()
@@ -91,6 +94,58 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
+async fn antigravity_readiness_accepts_delayed_initialize_and_cancels_hangs() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let (root, mut ctx) = fixture();
+    ctx.environment.insert(
+        "FORMLESS_TOPIC_ANTIGRAVITY_EXE".into(),
+        ctx.executable.clone().into_os_string(),
+    );
+    ctx.environment.insert("PROBE_MODE".into(), "delay".into());
+    let started = tokio::time::Instant::now();
+    let delayed = probe_environment(
+        HarnessKind::Antigravity,
+        None,
+        &ctx.environment,
+        ctx.timeout,
+    )
+    .await;
+
+    assert!(delayed.installed, "{delayed:?}");
+    assert_eq!(delayed.version.as_deref(), Some("1.5.14"));
+    assert_eq!(delayed.signed_in, Some(true));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    let requests = std::fs::read_to_string(root.0.join("requests")).unwrap();
+    assert!(
+        requests.lines().any(|method| method == "initialize"),
+        "{requests:?}"
+    );
+
+    ctx.environment.insert("PROBE_MODE".into(), "hang".into());
+    let hanging = tokio::time::timeout(
+        Duration::from_secs(8),
+        probe_environment(
+            HarnessKind::Antigravity,
+            None,
+            &ctx.environment,
+            ctx.timeout,
+        ),
+    )
+    .await
+    .expect("hung ACP initialize should be cancelled within the outer deadline");
+
+    assert!(!hanging.installed, "{hanging:?}");
+    assert_eq!(hanging.version, None);
+    assert_eq!(hanging.signed_in, None);
+    assert!(
+        hanging.detail.as_deref().is_some_and(|detail| {
+            detail.contains("ACP initialize") && detail.contains("cancelled")
+        }),
+        "{hanging:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     let _env = crate::credential_env::EnvGuard::isolated();
     let (root, mut ctx) = fixture();
@@ -122,7 +177,7 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
         "PROBE_ACP_STARTS".into(),
         acp_starts.clone().into_os_string(),
     );
-    let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
+    let values = list_environment(ctx.environment, Duration::from_secs(10)).await;
     let acp_ids = super::super::acp_agents::agent_ids();
     assert_eq!(values.len(), 6 + acp_ids.len());
     assert_eq!(

@@ -18,6 +18,18 @@ use std::{
 const BEGIN: &str = "PRIVATE_DOCTOR_STDOUT_BEGIN\n";
 const END: &str = "PRIVATE_DOCTOR_STDOUT_END\n";
 
+#[test]
+fn naming_status_reports_auto_download_and_model_size() {
+    let f = Fixture::new();
+    let mut cfg = Config::load(&f.paths).unwrap();
+    cfg.naming.enabled = true;
+    let status = super::naming_model_status(&f.paths, &cfg);
+    assert!(status.contains("not installed"), "{status}");
+    assert!(status.contains("auto-download"), "{status}");
+    assert!(!status.contains("auto-download on first use"), "{status}");
+    assert!(status.contains("409 MiB"), "{status}");
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {

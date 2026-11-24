@@ -421,7 +421,7 @@ test('Tools and Metrics rows display retained use and treat old or empty history
   }
 });
 
-test('Tools and Metrics rows show the same retained sample without changing lifetime success', () => {
+test('Tools and Metrics rows use summary success without retained outcome data', () => {
   for (const bars of [false, true]) {
     const setup = fixture();
     const table = new Node('table');
@@ -429,11 +429,7 @@ test('Tools and Metrics rows show the same retained sample without changing life
     setup.context.toolsTable(table, [tool], { bars, onselect: () => {} });
     const cell = table.children[1].children[0].children[3];
     assert.equal(cell.children[0], '0.5');
-    const recent = cell.children[1];
-    assert.equal(recent.attrs.role, 'img');
-    assert.match(recent.attrs['aria-label'], /Succeeded: 5; Failed: 15; Recent sample trend: down/);
-    assert.equal(recent.children[0].children.length, 20);
-    assert.equal(recent.children[1].textContent, '5/20 ✓ ↓');
+    assert.equal(cell.children.length, 1);
   }
 });
 

@@ -51,6 +51,9 @@ async fn config_edit_keeps_the_symlink_and_publishes_the_validated_text() {
     )
     .unwrap();
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cancel_editor = fixture.0.join("cancel-editor");
+    std::fs::write(&cancel_editor, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&cancel_editor, std::fs::Permissions::from_mode(0o700)).unwrap();
     let edited = "# keep my comment\n[provider]\nmodel = \"fixture\"\n";
     for name in ["linked", "regular"] {
         let root = fixture.0.join(name);
@@ -69,10 +72,30 @@ async fn config_edit_keeps_the_symlink_and_publishes_the_validated_text() {
         assert!(!invalid.status.success());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "# old config\n");
 
+        let cancelled = edit(&paths, &cancel_editor, "").await;
+        assert!(!cancelled.status.success());
+        assert!(String::from_utf8_lossy(&cancelled.stderr).contains("config.toml unchanged"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "# old config\n");
+
         let result = edit(&paths, &editor, edited).await;
         assert!(result.status.success(), "{result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), edited);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+
+        let unmarked = "[naming]\nauto_download = true\n";
+        let result = edit(&paths, &editor, unmarked).await;
+        assert!(result.status.success(), "{result:?}");
+        let warning = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            warning.contains("unmarked naming.auto_download = true is treated as false"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("formless config set naming.auto_download true"),
+            "{warning}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), unmarked);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), unmarked);
         assert_eq!(
             std::fs::symlink_metadata(&file)
                 .unwrap()

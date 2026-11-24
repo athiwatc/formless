@@ -1,15 +1,15 @@
 //! Exact selectors remain exact; fuzzy names only help recover from a miss.
 use super::*;
-use formless_protocol::ToolInfo;
+use formless_protocol::ToolSummary;
 
-pub(super) fn resolve<'a>(tools: &'a [ToolInfo], query: &str) -> Result<&'a ToolInfo> {
+pub(super) fn resolve<'a>(tools: &'a [ToolSummary], query: &str) -> Result<&'a ToolSummary> {
     tools
         .iter()
         .find(|tool| tool.name == query || tool.id == query)
         .ok_or_else(|| missing(tools, query))
 }
 
-fn missing(tools: &[ToolInfo], query: &str) -> anyhow::Error {
+fn missing(tools: &[ToolSummary], query: &str) -> anyhow::Error {
     let mut message = format!(
         "no tool '{}' (formless tools list)",
         comparison_terminal_text(query)
@@ -26,7 +26,7 @@ fn missing(tools: &[ToolInfo], query: &str) -> anyhow::Error {
     usage(message)
 }
 
-fn suggest<'a>(tools: &'a [ToolInfo], query: &str) -> Vec<&'a str> {
+fn suggest<'a>(tools: &'a [ToolSummary], query: &str) -> Vec<&'a str> {
     if query.trim().is_empty() {
         return Vec::new();
     }
@@ -45,7 +45,7 @@ fn suggest<'a>(tools: &'a [ToolInfo], query: &str) -> Vec<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn tool(id: &str, name: &str) -> ToolInfo {
+    fn tool(id: &str, name: &str) -> ToolSummary {
         serde_json::from_value(serde_json::json!({"id":id,"name":name,"description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""})).unwrap()
     }
 

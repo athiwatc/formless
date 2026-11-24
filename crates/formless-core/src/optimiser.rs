@@ -20,6 +20,9 @@ const PROPOSAL_PROMPT: &str = "You improve the Formless agent's learned guidance
 Reply with ONLY a JSON object: {\"kind\": \"prompt\", \"content\": one short imperative guidance line (max 400 chars), \"rationale\": why the signals justify it}. \
 Propose exactly one concrete, generalisable lesson from the failure signals. User preferences are not guidance: the agent keeps those in its user memory. \
 No secrets, no user data, no instructions to ignore safety or approvals.";
+const MAX_PROPOSAL_TOOL_SIGNALS: usize = 20;
+const MAX_PROPOSAL_SIGNAL_CHARS: usize = 12_000;
+const MAX_PROPOSAL_TOOL_SIGNAL_CHARS: usize = 4_000;
 
 const OPTIMISER_PROMPT: &str = concat!(
     "You improve a failing JavaScript Tool for the Formless harness. \
@@ -251,12 +254,17 @@ impl Daemon {
 
     fn scan_triggers(&self, cfg: &Config) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        for tool in self.with_store(|st| st.list_tools(false))? {
+        let (tools, windowed) = self.with_reader(|st| {
+            Ok((
+                st.registry_tool_summaries(false)?,
+                st.windowed_successes(cfg.metrics.success_window)?,
+            ))
+        })?;
+        for tool in tools {
             if tool.needs_attention {
                 continue;
             }
-            let (sample, rate) =
-                self.with_store(|st| st.windowed_success(&tool.id, cfg.metrics.success_window))?;
+            let (sample, rate) = windowed.get(&tool.id).copied().unwrap_or((0, None));
             if sample >= cfg.metrics.trigger_min_invocations as i64
                 && rate
                     .map(|r| r < cfg.metrics.trigger_success_below)
@@ -326,78 +334,52 @@ impl Daemon {
 
     async fn generate_proposal_inner(self: &Arc<Self>, cfg: &Config) -> Result<()> {
         // Signals: per-Tool metrics + recent recorded failure patterns.
-        let mut signals = String::from("Recent signals:\n");
-        let mut narrow = Vec::new();
-        for tool in self.with_store(|st| st.list_tools(false))? {
-            let metrics = self.with_store(|st| st.tool_metrics(&tool.id, None))?;
-            if metrics.total == 0 {
-                continue;
-            }
-            signals.push_str(&format!(
-                "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
-                tool.name,
-                metrics.total,
-                metrics.success,
-                metrics.success_rate,
-                metrics.failure,
-                metrics.validation_failures,
-                metrics.denied,
-                metrics.sessions
-            ));
-            if is_narrow(&metrics) {
-                narrow.push(tool.name.clone());
-            }
-            if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
-                for f in replay.iter().filter(|r| !r.recorded_success).take(4) {
-                    signals.push_str(&format!("  failure tag={} error={}\n", f.tag, f.error));
+        let tools = self.with_store(|st| st.registry_tool_summaries(false))?;
+        let ranked = top_tool_signals(&tools);
+        let mut replay_examples = Vec::new();
+        for tool in &ranked {
+            if tool.failure > 0 {
+                if let Ok(replay) = self.with_store(|st| st.replay_set(&tool.id)) {
+                    replay_examples.push((
+                        tool.id.clone(),
+                        replay
+                            .iter()
+                            .filter(|item| !item.recorded_success)
+                            .take(4)
+                            .map(|item| (item.tag.clone(), item.error.clone()))
+                            .collect(),
+                    ));
                 }
             }
         }
-        if !narrow.is_empty() {
-            signals.push_str(&format!(
-                "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
-                 likely hardcoded paths/hosts/names instead of input parameters): {}\n",
-                narrow.join(", ")
-            ));
-        }
+        let tool_signals = assemble_tool_signal_section(&ranked, &replay_examples);
         // Scripts run again and again but never saved (§7.12).
         let recurring = self
             .with_store(|st| st.recurring_scripts(cfg.scripts.recurrence_threshold, 5))
             .unwrap_or_default();
-        if !recurring.is_empty() {
-            signals.push_str(
-                "\nRecurring run_script scripts never saved as a Tool (save_as would make them reusable and measured):\n",
-            );
-            for (sessions, uses, source) in &recurring {
-                let head: String = source.lines().take(3).collect::<Vec<_>>().join(" / ");
-                signals.push_str(&format!(
-                    "- {sessions} sessions, uses [{}]: {}\n",
-                    uses.join(", "),
-                    head.chars().take(160).collect::<String>()
-                ));
-            }
-        }
-        if signals.lines().count() <= 1 {
-            signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
-        }
         // Run outcomes (§8.7): whether Runs reach the user's goal.
-        if let Ok(runs) = self.with_store(|st| st.run_metrics(200)) {
-            let summary = crate::runs::summarize(&runs);
-            if summary.runs > 0 {
-                signals.push_str(&format!("\n{}\n", crate::runs::summary_line(&summary)));
-            }
-        }
+        let run_summary = self
+            .with_store(|st| st.run_metrics(200))
+            .ok()
+            .and_then(|runs| {
+                let summary = crate::runs::summarize(&runs);
+                (summary.runs > 0).then(|| crate::runs::summary_line(&summary))
+            });
         // Every earlier proposal, not only applied ones: with unchanged
         // signals the model would otherwise suggest the same thing again.
         let earlier = self.with_store(|st| st.list_proposals())?;
-        if !earlier.is_empty() {
-            signals.push_str(
-                "\nEarlier proposals (do not repeat or rephrase them; rejected and rolled-back ones were judged unhelpful):\n",
-            );
-            for p in earlier.iter().take(40) {
-                signals.push_str(&format!("- [{}] {}\n", p.status, p.content));
-            }
-        }
+        let earlier_signals: Vec<_> = earlier
+            .iter()
+            .take(40)
+            .map(|proposal| (proposal.status.to_string(), proposal.content.clone()))
+            .collect();
+        let signals = assemble_proposal_signals(
+            tool_signals,
+            !ranked.is_empty(),
+            &recurring,
+            run_summary.as_deref(),
+            &earlier_signals,
+        );
         let provider = self.provider(cfg).await?;
         let model = cfg
             .optimiser
@@ -1961,6 +1943,116 @@ pub fn is_narrow(m: &ToolMetricsInfo) -> bool {
     m.sessions == 1 && m.total >= 3
 }
 
+fn top_tool_signals(
+    tools: &[crate::storage::RegistryToolSummary],
+) -> Vec<&crate::storage::RegistryToolSummary> {
+    let mut ranked: Vec<_> = tools.iter().filter(|tool| tool.invocations > 0).collect();
+    ranked.sort_by(|a, b| b.failure.cmp(&a.failure).then_with(|| a.name.cmp(&b.name)));
+    ranked.truncate(MAX_PROPOSAL_TOOL_SIGNALS);
+    ranked
+}
+
+fn cap_signal_chars(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    let suffix = " [truncated]";
+    let keep = max_chars.saturating_sub(suffix.chars().count());
+    let mut output: String = text.chars().take(keep).collect();
+    output.extend(suffix.chars().take(max_chars - keep));
+    output
+}
+
+fn capped_tool_signals(text: String) -> String {
+    cap_signal_chars(text, MAX_PROPOSAL_TOOL_SIGNAL_CHARS)
+}
+
+fn assemble_tool_signal_section(
+    ranked: &[&crate::storage::RegistryToolSummary],
+    replay_examples: &[(String, Vec<(String, String)>)],
+) -> String {
+    let mut signals = String::from("Recent signals:\n");
+    for tool in ranked {
+        signals.push_str(&format!(
+            "- {}: calls={} success={}/{:?} failures={} validation={} denied={} sessions={}\n",
+            tool.name,
+            tool.invocations,
+            tool.success,
+            tool.success_rate,
+            tool.failure,
+            tool.validation_failures,
+            tool.denied,
+            tool.sessions
+        ));
+    }
+    let narrow: Vec<_> = ranked
+        .iter()
+        .filter(|tool| tool.sessions == 1 && tool.invocations >= 3)
+        .map(|tool| tool.name.as_str())
+        .collect();
+    if !narrow.is_empty() {
+        signals.push_str(&format!(
+            "\nPossibly over-specific Tools (used repeatedly, but only ever in one session; \
+             likely hardcoded paths/hosts/names instead of input parameters): {}\n",
+            narrow.join(", ")
+        ));
+    }
+    for tool in ranked {
+        if let Some((_, examples)) = replay_examples.iter().find(|(id, _)| id == &tool.id) {
+            if examples.is_empty() {
+                continue;
+            }
+            signals.push_str(&format!("  failures for Tool {}:\n", tool.name));
+            for (tag, error) in examples.iter().take(4) {
+                signals.push_str(&format!(
+                    "    failure tag={} error={}\n",
+                    tag,
+                    error.chars().take(300).collect::<String>()
+                ));
+            }
+        }
+    }
+    capped_tool_signals(signals)
+}
+
+fn assemble_proposal_signals(
+    tool_signals: String,
+    has_tool_activity: bool,
+    recurring: &[(usize, Vec<String>, String)],
+    run_summary: Option<&str>,
+    earlier: &[(String, String)],
+) -> String {
+    let mut signals = tool_signals;
+    if !recurring.is_empty() {
+        signals.push_str(
+            "\nRecurring run_script scripts never saved as a Tool (save_as would make them reusable and measured):\n",
+        );
+        for (sessions, uses, source) in recurring {
+            let head: String = source.lines().take(3).collect::<Vec<_>>().join(" / ");
+            signals.push_str(&format!(
+                "- {sessions} sessions, uses [{}]: {}\n",
+                uses.join(", "),
+                head.chars().take(160).collect::<String>()
+            ));
+        }
+    }
+    if !has_tool_activity && recurring.is_empty() {
+        signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
+    }
+    if let Some(summary) = run_summary {
+        signals.push_str(&format!("\n{summary}\n"));
+    }
+    if !earlier.is_empty() {
+        signals.push_str(
+            "\nEarlier proposals (do not repeat or rephrase them; rejected and rolled-back ones were judged unhelpful):\n",
+        );
+        for (status, content) in earlier {
+            signals.push_str(&format!("- [{status}] {content}\n"));
+        }
+    }
+    cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS)
+}
+
 /// Prompt-proposal promotion bar: the candidate eval score must beat the
 /// baseline by `margin_points` (scores are 0..1), or match a perfect
 /// baseline with a perfect score.
@@ -2174,5 +2266,162 @@ mod race_tests {
             "{audit:?}"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+#[cfg(test)]
+mod registry_signal_tests {
+    use super::*;
+    use crate::storage::RegistryToolSummary;
+
+    fn tool(name: &str, invocations: i64, failure: i64) -> RegistryToolSummary {
+        RegistryToolSummary {
+            name: name.into(),
+            invocations,
+            failure,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proposal_signals_keep_the_highest_failure_volumes() {
+        let mut tools: Vec<_> = (0..22)
+            .map(|failure| tool(&format!("tool-{failure:02}"), 1, failure))
+            .collect();
+        tools.push(tool("unused", 0, 100));
+
+        let ranked = top_tool_signals(&tools);
+
+        assert_eq!(ranked.len(), MAX_PROPOSAL_TOOL_SIGNALS);
+        assert_eq!(ranked[0].failure, 21);
+        assert_eq!(ranked.last().unwrap().failure, 2);
+        assert!(!ranked.iter().any(|tool| tool.name == "unused"));
+    }
+
+    #[test]
+    fn proposal_signal_character_cap_is_unicode_safe() {
+        let capped = cap_signal_chars("界".repeat(100), 16);
+        assert_eq!(capped.chars().count(), 16);
+        assert!(capped.ends_with(" [truncated]"));
+    }
+
+    #[test]
+    fn proposal_tool_assembly_keeps_warnings_before_verbose_replay_examples() {
+        let tools: Vec<_> = (0..16)
+            .map(|index| {
+                let mut tool = tool(&format!("narrow-{index:02}"), 4, 4);
+                tool.id = format!("tool-id-{index:02}");
+                tool.sessions = 1;
+                tool
+            })
+            .collect();
+        let ranked = top_tool_signals(&tools);
+        let replay_examples: Vec<_> = ranked
+            .iter()
+            .map(|tool| {
+                (
+                    tool.id.clone(),
+                    vec![("failure-tag".into(), "x".repeat(300)); 4],
+                )
+            })
+            .collect();
+
+        let signals = assemble_tool_signal_section(&ranked, &replay_examples);
+
+        let warning = signals.find("Possibly over-specific Tools").unwrap();
+        let failure = signals.find("failure tag=").unwrap();
+        assert!(warning < failure);
+        assert!(signals.contains("narrow-00"));
+        assert!(signals.chars().count() <= MAX_PROPOSAL_TOOL_SIGNAL_CHARS);
+    }
+
+    #[test]
+    fn proposal_tool_replay_examples_are_labeled_per_tool() {
+        let mut first = tool("first-tool", 4, 4);
+        first.id = "first-id".into();
+        let mut second = tool("second-tool", 4, 2);
+        second.id = "second-id".into();
+        let tools = [first, second];
+        let ranked = top_tool_signals(&tools);
+        let replay_examples = vec![
+            (
+                "first-id".into(),
+                vec![("first-tag".into(), "first-error".into())],
+            ),
+            (
+                "second-id".into(),
+                vec![("second-tag".into(), "second-error".into())],
+            ),
+        ];
+
+        let signals = assemble_tool_signal_section(&ranked, &replay_examples);
+
+        assert!(signals.contains(
+            "failures for Tool first-tool:\n    failure tag=first-tag error=first-error"
+        ));
+        assert!(signals.contains(
+            "failures for Tool second-tool:\n    failure tag=second-tag error=second-error"
+        ));
+    }
+
+    #[test]
+    fn proposal_tool_budget_preserves_other_signal_context() {
+        let tools: Vec<_> = (0..16)
+            .map(|index| {
+                let mut tool = tool(&format!("narrow-{index:02}"), 4, 4);
+                tool.id = format!("tool-id-{index:02}");
+                tool.sessions = 1;
+                tool
+            })
+            .collect();
+        let ranked = top_tool_signals(&tools);
+        let replay_examples: Vec<_> = ranked
+            .iter()
+            .map(|tool| {
+                (
+                    tool.id.clone(),
+                    vec![("failure-tag".into(), "x".repeat(300)); 4],
+                )
+            })
+            .collect();
+        let tool_signals = assemble_tool_signal_section(&ranked, &replay_examples);
+        let recurring = vec![(2, vec!["run_script".into()], "function run(){}".into())];
+        let earlier = vec![("rejected".into(), "Earlier proposal context".into())];
+        let signals = assemble_proposal_signals(
+            tool_signals,
+            !ranked.is_empty(),
+            &recurring,
+            Some("Run outcome context"),
+            &earlier,
+        );
+
+        assert!(signals.chars().count() <= MAX_PROPOSAL_SIGNAL_CHARS);
+        for context in [
+            "Recurring run_script scripts",
+            "Run outcome context",
+            "Earlier proposal context",
+            "function run(){}",
+        ] {
+            assert!(signals.contains(context));
+        }
+    }
+
+    #[test]
+    fn first_run_lesson_waits_for_recurring_script_evidence() {
+        let tool_signals = assemble_tool_signal_section(&[], &[]);
+        let recurring = vec![(2, vec!["run_script".into()], "function run(){}".into())];
+        let signals = assemble_proposal_signals(tool_signals, false, &recurring, None, &[]);
+        assert!(signals.contains("Recurring run_script scripts"));
+        assert!(signals.contains("function run(){}"));
+        assert!(!signals.contains("no Tool activity yet"));
+
+        let no_activity = assemble_proposal_signals(
+            assemble_tool_signal_section(&[], &[]),
+            false,
+            &[],
+            None,
+            &[],
+        );
+        assert!(no_activity.contains("no Tool activity yet"));
     }
 }

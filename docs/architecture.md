@@ -301,7 +301,7 @@ formless memory rm m1a2b3c4
 * **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
 * **Auto-naming** — when a Run finishes, the daemon can give an eligible Session with a provisional title a short name. Naming runs in the background, never replaces a name you set, and uses no provider tokens. The configured naming model runs locally on the CPU.
-  Naming and automatic downloads are enabled by default. In a build with `embedded-llm`, these settings let an eligible Session with naming text fetch its missing configured catalogue model and tokenizer from Hugging Face. These are pinned assets verified with SHA-256 and stored under `<data dir>/models/`. If the model is unavailable, fails, or exceeds `naming.timeout_secs`, the daemon can use a first-words title instead. Set `naming.enabled = false` to turn off automatic naming or `naming.auto_download = false` to disable automatic downloads. These settings do not delete installed assets or disable the explicit `formless naming pull` command.
+  Automatic naming is enabled by default, but model downloads are opt-in. In a build with `embedded-llm`, enabling `naming.auto_download` lets an eligible Session with naming text fetch its missing configured catalogue model and tokenizer from Hugging Face. These are pinned assets verified with SHA-256 and stored under `<data dir>/models/`. If the model is unavailable, fails, or exceeds `naming.timeout_secs`, the daemon can use a first-words title instead. Older saved configs are migrated with `naming.auto_download = false`. Set `naming.enabled = false` to turn off automatic naming. These settings do not delete installed assets or disable the explicit `formless naming pull` command.
   Downloads time out after 60 seconds without data or two hours per file. After a failed automatic download, a later naming attempt can retry once five minutes have passed. Builds without the default `embedded-llm` Cargo feature use first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
@@ -310,6 +310,8 @@ formless memory rm m1a2b3c4
 #### Local naming models
 
 Set `naming.model` to select a model. Sizes are decimal MB rounded to two places and cover the GGUF weights only. The tokenizer is downloaded separately.
+
+A hand-authored `[naming]` config that sets `auto_download = true` without `auto_download_migration_done = true` is conservatively treated as legacy and remains off. Opt in with `formless config set naming.auto_download true`, or set both keys to `true` in TOML.
 
 | Model ID | Model | Quantization | Weights | License |
 | --- | --- | --- | --- | --- |
@@ -396,7 +398,7 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Network activity includes calls to configured providers, connections to a [user-enabled relay](usage.md#browser-access-via-the-relay-v2), and [local naming model](#local-naming-models) downloads. In builds with embedded model support, automatic naming and downloads are enabled by default. Naming an untitled or provisionally named Session with suitable user text can trigger a background download if the selected catalogue model needs weights or a tokenizer. Set `naming.auto_download = false` to disable automatic downloads or `naming.enabled = false` to disable automatic naming.
+* **Local-first.** Network activity includes calls to configured providers, connections to a [user-enabled relay](usage.md#browser-access-via-the-relay-v2), and [local naming model](#local-naming-models) downloads. In builds with embedded model support, automatic naming is enabled by default, but downloads require opt-in through `naming.auto_download`. Naming an untitled or provisionally named Session with suitable user text can trigger a background download only when that setting is enabled and the selected catalogue model needs weights or a tokenizer. Set `naming.enabled = false` to disable automatic naming.
 * **Zero telemetry.** There is no automatic update checker; `formless update check` runs on request ([§3.12](usage.md#updating)).
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
