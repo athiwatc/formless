@@ -274,12 +274,34 @@ pub fn is_env_template_file(path: &Path) -> bool {
     }
 }
 
+pub fn is_credential_filename(path: &Path) -> bool {
+    let Some(name) = path.file_name().map(credential_name) else {
+        return false;
+    };
+    matches!(
+        name.as_str(),
+        ".npmrc"
+            | ".pypirc"
+            | "credentials"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | ".my.cnf"
+            | ".mylogin.cnf"
+    ) || (name.starts_with("id_dsa") && !name.ends_with(".pub"))
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+}
+
 fn builtin(path: &Path) -> Option<&'static str> {
     if formless_protocol::is_pulumi_credentials_path(path) {
         return Some("Pulumi credentials file");
     }
     if formless_protocol::is_composer_auth_path(path) {
         return Some("Composer credentials");
+    }
+    if is_credential_filename(path) {
+        return Some("credential-shaped filename");
     }
     let parts: Vec<_> = path
         .components()
@@ -408,6 +430,11 @@ mod tests {
             ".cargo/registry/cache.txt",
             ".cargo/credentials.toml.example",
             "notes.txt",
+            "my.cnf",
+            "id_rsa.pub",
+            "id_ed25519.pub",
+            "id_ecdsa.pub",
+            "id_dsa.pub",
         ] {
             let path = home.join(relative);
             assert_eq!(
@@ -451,6 +478,17 @@ mod tests {
             "Microsoft/Credentials/store",
             ".env",
             ".env.local",
+            ".npmrc",
+            ".pypirc",
+            "credentials",
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "ID_DSA",
+            "codesign.p12",
+            "codesign.PFX",
+            ".my.cnf",
+            ".mylogin.cnf",
             ".yarnrc",
             "project/.YARNRC.YML",
             "server.pem",

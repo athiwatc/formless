@@ -18121,8 +18121,6 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
     let secret_file = [
         ".netrc",
         ".htpasswd",
-        ".npmrc",
-        ".pypirc",
         ".s3cfg",
         ".boto",
         ".vault-token",
@@ -18133,7 +18131,6 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         "credentials.tfrc.json",
         ".terraformrc",
         "terraform.rc",
-        "credentials",
         "credentials.toml",
         ".git-credentials",
         ".pgpass",
@@ -18151,9 +18148,8 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         || name.ends_with(".key")
         || name.ends_with(".jks")
         || name.ends_with(".keystore")
-        || name.ends_with(".p12")
-        || name.ends_with(".pfx")
-        || name.ends_with(".kdbx");
+        || name.ends_with(".kdbx")
+        || formless_runtime::sensitive_paths::is_credential_filename(path);
     if formless_protocol::is_pulumi_credentials_path(path) {
         return Some("a Pulumi credentials file");
     }
