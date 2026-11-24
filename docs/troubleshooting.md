@@ -116,7 +116,7 @@ For the ordinary daemon-side summarizer, an empty or output-limit-cut summary
 fails before saving a checkpoint; the turns remain. Read the reported failure
 and provider diagnostics before retrying. A successful summary is not lossless.
 Provider-side compaction is optional and endpoint-specific. See
-[README context guidance](../README.md#context-and-compaction),
+[context guidance](architecture.md#context-and-compaction),
 [the generated commands](keys.md#session), and
 [SPEC §11](../SPEC.md#11-compaction) for the existing contract.
 

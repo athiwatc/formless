@@ -12,7 +12,7 @@ fn script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
     let path = f.root.join("fake-harness");
     std::fs::write(&path,r#"#!/usr/bin/env python3
 import sys,os,json,socket,pathlib,subprocess,hashlib,time,shutil
-if '--version' in sys.argv:print('fixture 1.0');sys.exit()
+if '--version' in sys.argv:print('1.6.0' if os.environ.get('TOPIC_FIXTURE_MODE')=='pi' else 'fixture 1.0');sys.exit()
 if sys.argv[1:]==['auth','status']:print(json.dumps({} if os.environ.get('TOPIC_FIXTURE_AUTH_UNKNOWN') else {'loggedIn':True}));sys.exit()
 if sys.argv[1:]==['login','status']:print('Logged in');sys.exit()
 mode=os.environ.get('TOPIC_FIXTURE_MODE','git')
@@ -31,6 +31,25 @@ def rpc(op):
         if response.get('kind')=='response' and response['id']==17:
             if not response['ok']:raise RuntimeError(response.get('error'))
             return response.get('result')
+if mode=='pi':
+    config=json.loads(os.environ['FORMLESS_PI_MCP_CONFIG'])
+    extension=pathlib.Path(sys.argv[sys.argv.index('builtin:mcp')+2])
+    assert extension.parent.name==os.environ['FORMLESS_TOPIC_ATTEMPT_ID']
+    assert extension.parent!=pathlib.Path.cwd()
+    assert extension.is_file()
+    state=json.loads(sys.stdin.readline());assert state['type']=='get_state'
+    print(json.dumps({'type':'response','id':state['id'],'command':'get_state','success':True,'data':{'sessionId':'fixture-pi'}}),flush=True)
+    prompt=json.loads(sys.stdin.readline());assert prompt['type']=='prompt'
+    rpc({'operation':'report_result','status':'succeeded','summary':'Pi topic complete','outputs':[{'kind':'text','title':'Pi output','content':'Pi topic output'}]})
+    for event in [
+        {'type':'response','id':prompt['id'],'command':'prompt','success':True,'data':{'disposition':'started'}},
+        {'type':'message_end','message':{'role':'custom','customType':'formless-pi-bridge','content':'formless-pi-mcp-registered'}},
+        {'type':'message_end','message':{'role':'assistant','content':[{'type':'text','text':'Pi topic complete'}],'stopReason':'stop'}},
+        {'type':'agent_end','willRetry':False}, {'type':'agent_settled','aborted':False}]:print(json.dumps(event),flush=True)
+    for line in sys.stdin:
+        command=json.loads(line)
+        if command['type']=='get_state':print(json.dumps({'type':'response','id':command['id'],'command':'get_state','success':True,'data':{'sessionId':'fixture-pi'}}),flush=True)
+    sys.exit()
 if mode=='permission':
     answer=rpc({'operation':'request_permission','title':'Fixture write','kind':'write','options':[{'option_id':'allow','name':'Allow once','kind':'allow_once'},{'option_id':'deny','name':'Deny','kind':'reject_once'}]})
     if answer!='allow':sys.exit(9)
@@ -127,6 +146,7 @@ else:print(json.dumps({'result':result,'session_id':'fixture-claude'}))
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     env.set("FORMLESS_TOPIC_CLAUDE_EXE", &path);
     env.set("FORMLESS_TOPIC_CODEX_EXE", &path);
+    env.set("FORMLESS_TOPIC_PI_EXE", &path);
     env.set("TOPIC_FIXTURE_SOCKET", f.paths.socket_path());
     env.set("TOPIC_FIXTURE_PID", f.root.join("pid"));
     env.set("TOPIC_FIXTURE_RELEASE_DIR", &f.root);
@@ -282,6 +302,7 @@ async fn topic_generated_kickoff_is_marked_in_first_broadcast_and_session_wire()
     .await
     .unwrap();
     assert_eq!(message.role, "user");
+    assert!(message.content.contains("Available harness kinds: claude, codex, antigravity, pi, muse; opencode and acp currently return adapter-not-integrated errors."));
     assert_eq!(message.generated_by.as_deref(), Some("topic_kickoff"));
     assert!(message
         .content
@@ -2234,6 +2255,40 @@ async fn topic_git_writes_have_distinct_branches_and_explicit_merge_gets_both_re
         )
         .is_ok());
     }
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_pi_rpc_launch_and_recorded_outputs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_MODE", "pi");
+    let f = Fixture::new(&env);
+    script(&f, &env);
+    let ipc = tokio::spawn(f.daemon().clone().serve());
+    wait_until(|| f.paths.socket_path().exists()).await;
+    let topic = topic(&f, None, false);
+    let server = model(&f, &env, &topic, HarnessKind::Pi, HarnessKind::Pi, false).await;
+    f.daemon()
+        .handle(Request::StartTopicWorkflow {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    settled(&f, topic.topic_session_id.as_ref().unwrap()).await;
+    let saved = state(&f, &topic.id);
+    assert_eq!(saved.status, TopicStatus::Complete, "{saved:?}");
+    assert_eq!(saved.attempts.len(), 2);
+    for attempt in &saved.attempts {
+        assert_eq!(attempt.status, TopicAttemptStatus::Succeeded, "{attempt:?}");
+        assert_eq!(attempt.harness, HarnessKind::Pi);
+        assert_eq!(attempt.summary.as_deref(), Some("Pi topic complete"));
+        assert_eq!(attempt.harness_session_id.as_deref(), Some("fixture-pi"));
+        assert!(
+            matches!(&attempt.outputs[0], TopicArtifact::Text { content, .. } if content == "Pi topic output")
+        );
+    }
+    server.abort();
+    f.daemon().shutdown.cancel();
+    ipc.await.unwrap().unwrap();
 }
 
 #[tokio::test]

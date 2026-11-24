@@ -22,7 +22,7 @@ if '--version' in sys.argv:
         gate=pathlib.Path(os.environ['PROBE_GATE'])
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
         while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
-    print('fixture 1.0');sys.exit()
+    print('1.6.0' if pathlib.Path(sys.argv[0]).name=='pi' else 'fixture 1.0');sys.exit()
 mode=os.environ.get('PROBE_MODE','ok')
 if mode=='hang':time.sleep(120)
 if sys.argv[1:]==['auth','status']:
@@ -89,7 +89,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 }
 
 #[tokio::test]
-async fn list_probes_run_concurrently_and_report_fallbacks_and_muse_allowance() {
+async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -123,7 +123,17 @@ async fn list_probes_run_concurrently_and_report_fallbacks_and_muse_allowance() 
         .iter()
         .all(|value| value.version.as_deref() == Some("fixture 1.0")
             && value.signed_in == Some(true)));
-    assert!(values[2..5]
+    assert_eq!(values[2].kind, HarnessKind::Pi);
+    assert_eq!(values[2].version.as_deref(), Some("1.6.0"));
+    assert_eq!(values[2].signed_in, None);
+    assert!(values[2]
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("Sign-in unknown"));
+    assert_eq!(values[3].kind, HarnessKind::OpenCode);
+    assert_eq!(values[4].kind, HarnessKind::Antigravity);
+    assert!(values[3..5]
         .iter()
         .filter(|value| value.kind != HarnessKind::Antigravity)
         .all(|value| value.signed_in.is_none() && value.version.as_deref() == Some("fixture 1.0")));
@@ -213,13 +223,13 @@ async fn fallback_missing_version_failure_and_timeout_keep_auth_unknown_and_kill
     let (root, mut ctx) = fixture();
     let executable = ctx.executable.clone();
     ctx.executable = root.0.join("missing");
-    let missing = dispatch(HarnessKind::Pi, &ctx, None).await;
+    let missing = dispatch(HarnessKind::OpenCode, &ctx, None).await;
     assert!(!missing.installed);
     assert_eq!(missing.signed_in, None);
     ctx.executable = executable;
     ctx.environment
         .insert("PROBE_VERSION_FAIL".into(), "1".into());
-    let failed = dispatch(HarnessKind::Pi, &ctx, None).await;
+    let failed = dispatch(HarnessKind::OpenCode, &ctx, None).await;
     assert!(failed.installed);
     assert_eq!(failed.signed_in, None);
     assert_eq!(failed.version, None);
