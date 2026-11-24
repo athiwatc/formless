@@ -4426,7 +4426,9 @@
       role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
-    effort.value = (session && session.reasoning_effort) || "";
+    let preferredEffort = (session && session.reasoning_effort) || "";
+    effort.value = preferredEffort;
+    effort.onchange = () => { preferredEffort = effort.value; };
     const status = h("span", { class: "muted" }, "loading models…");
     const cancel = h("button", { class: "btn small", type: "button" }, "Cancel");
     const asDefault = h("button", { class: "btn small", type: "button", title: "Ctrl/⌘+Enter" }, "Set as default");
@@ -4482,10 +4484,13 @@
       const accepted = (meta[choice()] || {}).efforts;
       const offer = Array.isArray(accepted)
         ? [""].concat([...new Set(accepted.filter((e) => typeof e === "string" && e !== ""))])
-        : efforts;
-      const was = effort.value;
+        : efforts.slice();
+      const was = effort.value || preferredEffort;
+      if (!Array.isArray(accepted) && was && !offer.includes(was)) offer.push(was);
       effort.replaceChildren(...offer.map((e) => h("option", { value: e }, e || "default (provider)")));
       effort.value = offer.includes(was) ? was : "";
+      if (Array.isArray(accepted) && !offer.includes(was)) preferredEffort = "";
+      else if (effort.value) preferredEffort = effort.value;
       effort.disabled = offer.length <= 1;
       effort.title = offer.length <= 1 ? "Effort has no effect for this model" : "";
       if (!items.length) return;

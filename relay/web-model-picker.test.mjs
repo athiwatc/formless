@@ -32,10 +32,10 @@ function h(tag, props, ...kids) {
   for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) node.append(kid);
   return node;
 }
-function fixture() {
+function fixture(session = {}) {
   const calls = [], applied = [];
   const c = vm.createContext({
-    h, calls, applied, modelPickerSequence: 0, S: { sessions: [{ id: 's', model: '' }], current: 's' },
+    h, calls, applied, modelPickerSequence: 0, S: { sessions: [{ id: 's', model: '', ...session }], current: 's' },
     act: req => new Promise(resolve => calls.push({ req, resolve })),
     openDialog: node => { node.isConnected = true; c.dialog = node; },
     closeDialog: node => { node.isConnected = false; },
@@ -150,4 +150,11 @@ test('model effort metadata supplies the picker options', async () => {
   await c.done;
   assert.deepEqual(c.effort().children.map(option => option.attrs.value), ['', 'ultra', 'low']);
   assert.equal(c.effort().disabled, false);
+});
+
+test('saved custom effort survives picker option refresh', async () => {
+  const c = fixture({model:'gpt-5-custom',reasoning_effort:'xhigh'});
+  c.calls[0].resolve({models:['gpt-5-custom'],meta:{'gpt-5-custom':{efforts:['xhigh','low']}}});
+  await c.done;
+  assert.equal(c.effort().value, 'xhigh');
 });
