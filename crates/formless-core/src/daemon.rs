@@ -5056,12 +5056,16 @@ impl Daemon {
                 draft.version = ver.version + 1;
                 let mut out = json!({ "diff": crate::diff::version_diff(&ver, &draft), "ok": true, "description_review":crate::descriptions::screen(&info.description) });
                 // The same gate as saving, without the save.
-                let checked = match ToolDraft::parse(&edit_args(&info, &ver, &code), &cfg, true) {
-                    Err(e) => Err(("syntax", e.to_string())),
-                    Ok(d) => self
-                        .smoke_gate(&d, &cfg, None)
-                        .await
-                        .map_err(|e| ("smoke", e.to_string())),
+                let args = edit_args(&info, &ver, &code);
+                let checked = match toolreg::validate_object_input_schema(&args["input_schema"]) {
+                    Err(e) => Err(("schema", e.to_string())),
+                    Ok(()) => match ToolDraft::parse(&args, &cfg, true) {
+                        Err(e) => Err(("syntax", e.to_string())),
+                        Ok(d) => self
+                            .smoke_gate(&d, &cfg, None)
+                            .await
+                            .map_err(|e| ("smoke", e.to_string())),
+                    },
                 };
                 match checked {
                     Ok(note) => out["smoke_note"] = json!(note),
@@ -11177,8 +11181,10 @@ impl Daemon {
             // Wrappers the search missed join the list, ahead of the raw row.
             for n in &names {
                 if !hits.iter().any(|t| &t.name == n) {
-                    if let Some((info, _)) = self.with_reader(|st| st.get_tool_by_name(n))? {
-                        hits.push(info);
+                    if let Some((info, version)) = self.with_reader(|st| st.get_tool_by_name(n))? {
+                        if toolreg::validate_stored_input_schema(&version.input_schema).is_ok() {
+                            hits.push(info);
+                        }
                     }
                 }
             }
@@ -13822,6 +13828,7 @@ impl Daemon {
                 memory_mb: ver.memory_mb,
             }
         };
+        toolreg::validate_object_input_schema(&d.input_schema)?;
         let mut input = input;
         let coerced = toolreg::coerce_json_strings(&d.input_schema, &mut input);
         self.note_coerced(&d.name, &coerced);
@@ -16914,6 +16921,7 @@ impl ToolDraft {
             }
         };
         let input_schema = schema("input_schema", json!({"type": "object"}))?;
+        toolreg::validate_object_input_schema(&input_schema)?;
         let output_schema = schema("output_schema", json!({}))?;
         let code = args["implementation_js"]
             .as_str()
