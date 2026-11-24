@@ -77,14 +77,15 @@ validate that feature itself.
    checks the projection, values, choices, file-only exclusions, and redaction
    for keys already declared in `SETTABLE`. Those tests do not infer that a
    new setting should be settable, and the default test checks only selected
-   values. Add a focused assertion in `settings.rs` for the new setter,
-   default, and validation behavior; the existing
+   values. Add a focused assertion in `crates/formless-core/tests/settings.rs`
+   for the new setter, default, and validation behavior; the existing
    `set_key_validates_types_keys_and_the_allow_list` test only covers its
    explicit cases.
 
 ```bash
 cargo test -p formless-core --no-default-features --test setting_docs --locked
 cargo test -p formless-core --no-default-features --test settings_inventory --locked
+cargo test -p formless-core --no-default-features --test settings --locked
 ```
 
 ### Add a protocol request
