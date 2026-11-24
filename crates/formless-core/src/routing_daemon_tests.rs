@@ -9,6 +9,7 @@ mod exact_run_tests;
 enum Mode {
     Fallback,
     FallbackToolCallRecovery,
+    RouteSuccess,
     Neutral(u16),
     Pending,
     Held,
@@ -67,7 +68,7 @@ impl Fixture {
         cfg.provider.base_url = base.clone();
         cfg.provider.model = match mode {
             Mode::Pending => "agent-model",
-            Mode::FallbackToolCallRecovery => "auto",
+            Mode::FallbackToolCallRecovery | Mode::RouteSuccess => "auto",
             _ => "requested",
         }
         .into();
@@ -78,7 +79,7 @@ impl Fixture {
         if matches!(mode, Mode::Fallback | Mode::FallbackToolCallRecovery) {
             cfg.provider.fallback_models = vec!["served".into()];
         }
-        if matches!(mode, Mode::FallbackToolCallRecovery) {
+        if matches!(mode, Mode::FallbackToolCallRecovery | Mode::RouteSuccess) {
             cfg.provider.routing_models = vec!["requested".into()];
         }
         cfg.naming.enabled = false;
@@ -177,24 +178,18 @@ impl Fixture {
 #[test]
 fn assistant_turn_metadata_keeps_tool_calls_and_uses_attempt_provenance() {
     let mut tool_meta = json!({"tool_calls": [{"id": "call-1"}]});
-    add_served_model_meta(&mut tool_meta, "auto", "picked", "picked", false);
+    add_served_model_meta(&mut tool_meta, "requested", Some("picked"), "picked", false);
     assert_eq!(tool_meta["tool_calls"][0]["id"], "call-1");
     assert_eq!(tool_meta["model"]["name"], "picked");
     assert_eq!(tool_meta["model"]["via"], "routing:picked");
     assert_eq!(tool_meta["model"]["requested"], "requested");
 
     let mut fallback_meta = json!({});
-    add_served_model_meta(
-        &mut fallback_meta,
-        "requested",
-        "requested",
-        "fallback",
-        true,
-    );
+    add_served_model_meta(&mut fallback_meta, "requested", None, "fallback", true);
     assert_eq!(fallback_meta["model"]["via"], "fallback");
 
     let mut unchanged = json!({});
-    add_served_model_meta(&mut unchanged, "requested", "requested", "requested", false);
+    add_served_model_meta(&mut unchanged, "requested", None, "requested", false);
     assert!(unchanged.get("model").is_none());
 }
 impl Drop for Fixture {
@@ -256,6 +251,9 @@ async fn actual_run_fallback_records_served_quality_and_all_billed_physical_spen
 async fn auto_routed_fallback_tool_call_keeps_failover_metadata_through_recovery() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env, Mode::FallbackToolCallRecovery).await;
+    let migrated = f.daemon().config().unwrap();
+    assert_eq!(migrated.provider.model, "role:primary");
+    assert_eq!(migrated.roles["primary"].model, "auto");
     let (created, ok) = f
         .daemon()
         .call_tool_direct_outcome(
@@ -304,6 +302,32 @@ async fn auto_routed_fallback_tool_call_keeps_failover_metadata_through_recovery
     assert_eq!(answer_meta["model"]["requested"], "requested");
     assert_eq!(answer_meta["model"]["name"], "served");
     assert_eq!(answer_meta["model"]["via"], "fallback");
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrated_primary_role_route_success_records_selected_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, Mode::RouteSuccess).await;
+    let migrated = f.daemon().config().unwrap();
+    assert_eq!(migrated.provider.model, "role:primary");
+    assert_eq!(migrated.roles["primary"].model, "auto");
+
+    f.send().await;
+    f.idle().await;
+    assert_eq!(*f.models.locked(), ["requested"]);
+    let answer = f
+        .daemon()
+        .with_reader(|st| st.list_messages(&f.sid))
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.content == "done")
+        .unwrap();
+    let meta: Value = serde_json::from_str(answer.meta.as_deref().unwrap()).unwrap();
+    assert_eq!(meta["model"]["name"], "requested");
+    assert_eq!(meta["model"]["requested"], "requested");
+    assert_eq!(meta["model"]["via"], "routing:requested");
     f.shutdown().await;
 }
 
@@ -493,6 +517,7 @@ async fn selection_keeps_one_pass_aliases_and_admitted_role_identity_without_htt
             cfg: cfg.clone(),
             requested: "role:worker".into(),
             resolved_model: "served".into(),
+            routing_pick: None,
             effort: None,
             recovery_messages: vec![],
             resumed_from: None,

@@ -518,28 +518,29 @@ fn stop_note(result: &crate::provider::ChatResult) -> Option<String> {
 
 fn served_model_info(
     requested: &str,
-    routing_pick: &str,
+    routing_pick: Option<&str>,
     served: &str,
     used_fallback: bool,
 ) -> Option<ServedModelInfo> {
     let via = if used_fallback {
         "fallback".to_string()
-    } else if ProviderCfg::is_auto_model(requested) {
+    } else if let Some(routing_pick) = routing_pick {
         format!("routing:{routing_pick}")
     } else {
         return None;
     };
-    (!served.is_empty() && served != requested).then(|| ServedModelInfo {
-        name: served.to_string(),
-        via,
-        requested: requested.to_string(),
-    })
+    (!served.is_empty() && (served != requested || (!used_fallback && routing_pick.is_some())))
+        .then(|| ServedModelInfo {
+            name: served.to_string(),
+            via,
+            requested: requested.to_string(),
+        })
 }
 
 fn add_served_model_meta(
     meta: &mut Value,
     requested: &str,
-    routing_pick: &str,
+    routing_pick: Option<&str>,
     served: &str,
     used_fallback: bool,
 ) {
@@ -832,6 +833,7 @@ struct RunAdmission {
     cfg: Config,
     requested: String,
     resolved_model: String,
+    routing_pick: Option<String>,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
     resumed_from: Option<String>,
@@ -1482,6 +1484,7 @@ impl Daemon {
                 .map(|c| pcfg.resolve_alias(c))
                 .collect();
             let provider = self.provider_named(cfg, role.provider.as_deref()).await?;
+            let mut routing_pick = None;
             let model = if role.model.is_empty() {
                 cfg.provider_cfg(role.provider.as_deref())?.model
             } else if ProviderCfg::is_auto_model(&role.model) && !role.candidates.is_empty() {
@@ -1500,6 +1503,7 @@ impl Daemon {
                     .context("no role model candidates")?;
                 choice.explanation["kind"] = json!(format!("role:{role_name}"));
                 self.note_routing(session_id, choice.explanation);
+                routing_pick = Some(choice.model.clone());
                 choice.model
             } else {
                 role.model.clone()
@@ -1512,6 +1516,7 @@ impl Daemon {
             return Ok(Target {
                 provider: provider.resolved_dispatch(&model),
                 model,
+                routing_pick,
                 effort,
                 system: role.system.clone(),
                 role: Some(role_name.to_string()),
@@ -1523,6 +1528,7 @@ impl Daemon {
                 .await?
                 .resolved_dispatch(resolved.unwrap_or(&wanted)),
             model: resolved.unwrap_or(&wanted).to_string(),
+            routing_pick: None,
             effort: session_effort,
             system: None,
             role: None,
@@ -6415,6 +6421,19 @@ impl Daemon {
             .rsplit_once(':')
             .map(|(name, _)| name)
             .unwrap_or(crate::config::DEFAULT_PROVIDER);
+        let routing_pick = if let Some(role_name) = forecast.basis.role.strip_prefix("role:") {
+            let role = cfg.role(role_name)?;
+            let role_provider = cfg.provider_cfg(role.provider.as_deref())?;
+            let role_model = role_provider.resolve_alias(if role.model.is_empty() {
+                &role_provider.model
+            } else {
+                &role.model
+            });
+            ProviderCfg::is_auto_model(&role_model).then(|| forecast.basis.model.clone())
+        } else {
+            let model = cfg.provider.resolve_alias(&cfg.provider.model);
+            ProviderCfg::is_auto_model(&model).then(|| forecast.basis.model.clone())
+        };
         let mut fixed = cfg.clone();
         let requested = if forecast.basis.role.starts_with("role:") {
             let role = forecast.basis.role.trim_start_matches("role:");
@@ -6474,6 +6493,7 @@ impl Daemon {
             cfg: fixed,
             requested,
             resolved_model: forecast.basis.model.clone(),
+            routing_pick,
             effort,
             recovery_messages,
             resumed_from,
@@ -7567,6 +7587,7 @@ impl Daemon {
         };
         if let Some(admitted) = &admitted {
             target.effort = admitted.effort.clone();
+            target.routing_pick = admitted.routing_pick.clone();
         }
         let provider = {
             let (sid, rid, subs) = (
@@ -7636,6 +7657,10 @@ impl Daemon {
             &cfg,
         )?;
         let model = self.resolve_model_named(&requested_model, &cfg, provider.name(), complex)?;
+        let routing_pick = target
+            .routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested_model).then_some(model.as_str()));
         self.run_models
             .lock()
             .unwrap()
@@ -8096,7 +8121,7 @@ impl Daemon {
                     add_served_model_meta(
                         &mut meta,
                         &requested_model,
-                        &model,
+                        routing_pick,
                         &result.model_used,
                         result.used_fallback,
                     );
@@ -8198,7 +8223,7 @@ impl Daemon {
                 }
                 let served = served_model_info(
                     &requested_model,
-                    &model,
+                    routing_pick,
                     &result.model_used,
                     result.used_fallback,
                 );
@@ -8277,7 +8302,7 @@ impl Daemon {
             add_served_model_meta(
                 &mut meta,
                 &requested_model,
-                &model,
+                routing_pick,
                 &result.model_used,
                 result.used_fallback,
             );
@@ -11059,6 +11084,7 @@ impl Daemon {
                 _ = cancel.cancelled() => bail!("interrupted"),
                 result = self.target(cfg, session_id, model) => result?,
             };
+            let target_routing_pick = target.routing_pick.clone();
             let provider = target.provider;
             let session_effort = target.effort;
             let requested = target.model;
@@ -11113,6 +11139,9 @@ impl Daemon {
                 provider.name(),
                 self.routing_complex(&provider, &requested, &messages, &sub_defs()?, cfg)?,
             )?;
+            let routing_pick = target_routing_pick
+                .as_deref()
+                .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
             let label = match &role {
                 Some(r) => format!("{r} · {model}"),
                 None => model.clone(),
@@ -11174,7 +11203,7 @@ impl Daemon {
                     let result=result?;
                     let served_model = served_model_info(
                         &requested,
-                        &model,
+                        routing_pick,
                         &result.model_used,
                         result.used_fallback,
                     );
@@ -18085,6 +18114,7 @@ impl HostOps for NestedOps {
             .handle
             .block_on(self.daemon.target(&self.cfg, &self.session_id, model))
             .map_err(|e| e.to_string())?;
+        let target_routing_pick = target.routing_pick.clone();
         let provider = target.provider;
         let effort = target.effort;
         let requested = target.model;
@@ -18108,6 +18138,9 @@ impl HostOps for NestedOps {
             .daemon
             .resolve_model_named(&requested, &self.cfg, provider.name(), complex)
             .map_err(|e| e.to_string())?;
+        let routing_pick = target_routing_pick
+            .as_deref()
+            .or_else(|| ProviderCfg::is_auto_model(&requested).then_some(model.as_str()));
         let (routing_call, (result, terminal)) = self.block_cancellable(async {
             let call =
                 crate::routing_observation::Call::new(self.daemon.routing_recorder.call_sink());
@@ -18139,8 +18172,12 @@ impl HostOps for NestedOps {
             }
         })?;
         self.data_observed("llm", &result.model_used)?;
-        let served =
-            served_model_info(&requested, &model, &result.model_used, result.used_fallback);
+        let served = served_model_info(
+            &requested,
+            routing_pick,
+            &result.model_used,
+            result.used_fallback,
+        );
         if let (Some(inv), Some(served)) = (self.parent_inv.as_deref(), served.as_ref()) {
             let _ = self
                 .daemon
@@ -18784,6 +18821,7 @@ pub(crate) struct Target {
     pub provider: Provider,
     /// The model to request (may still be `auto`, resolved by routing).
     pub model: String,
+    pub routing_pick: Option<String>,
     pub effort: Option<String>,
     /// A role's system prompt addendum.
     pub system: Option<String>,
