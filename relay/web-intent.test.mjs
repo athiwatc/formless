@@ -1204,6 +1204,9 @@ test('deferred enqueue drops its submitted fallback without deleting a newer sha
   assert.equal(c.S.unpersistedDrafts.get(fallbackKey), 'submitted source draft');
   assert.equal(c.S.unpersistedDraftSharedValues.get(fallbackKey), 'older shared draft');
   assert.equal(prefs.get(draftKey), 'newer shared draft');
+  assert.equal(c.saveDraft('A', 'submitted source draft'), false);
+  assert.equal(c.S.unpersistedDraftSharedValues.get(fallbackKey), 'older shared draft');
+  assert.equal(prefs.get(draftKey), 'newer shared draft');
   c.S.daemonOnline = false;
   c.S.channel = null;
   enqueueGate.resolve();

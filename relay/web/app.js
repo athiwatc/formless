@@ -239,14 +239,15 @@
     S.unpersistedDrafts = S.unpersistedDrafts || new Map();
     S.unpersistedDraftSharedValues = S.unpersistedDraftSharedValues || new Map();
     const fallbackKey = sessionCacheKey(scope, sessionId);
-    const sharedValue = prefs.get(key, null);
+    const hasFallback = S.unpersistedDrafts.has(fallbackKey);
+    const sharedValue = hasFallback ? null : prefs.get(key, null);
     const saved = value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
     if (saved) {
       S.unpersistedDrafts.delete(fallbackKey);
       S.unpersistedDraftSharedValues.delete(fallbackKey);
     } else {
       S.unpersistedDrafts.set(fallbackKey, value);
-      S.unpersistedDraftSharedValues.set(fallbackKey, sharedValue);
+      if (!hasFallback) S.unpersistedDraftSharedValues.set(fallbackKey, sharedValue);
     }
     return saved;
   }
