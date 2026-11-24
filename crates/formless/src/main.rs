@@ -2023,7 +2023,7 @@ const FISH_DOCS_TOPIC_CONDITION: &str = r#"function __fish_formless_docs_topic_a
             continue
         end
         if test $command_seen -eq 0
-            if test "$token" = formless
+            if test (string replace -r '^.*/' '' -- "$token") = formless
                 set command_seen 1
             end
             continue

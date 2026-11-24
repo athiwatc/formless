@@ -574,6 +574,25 @@ fn docs_zsh_completions_offer_topic_names_from_the_table() {
 }
 
 #[test]
+fn docs_fish_completions_include_topic_names_and_descriptions() {
+    let mut script = Vec::new();
+    super::generate_completions(clap_complete::Shell::Fish, &mut script).unwrap();
+    let script = String::from_utf8(script).expect("fish completion script is utf-8");
+
+    for (name, _, description) in formless_core::docs::TOPICS {
+        let expected = format!(
+            "complete -c formless -f -n '__fish_formless_docs_topic_argument' -a {} -d {}",
+            super::fish_quote(name),
+            super::fish_quote(description)
+        );
+        assert!(
+            script.lines().any(|line| line == expected),
+            "missing fish topic completion for {name}: {script}"
+        );
+    }
+}
+
+#[test]
 fn docs_fish_completions_follow_topic_argument_position() {
     let fish_version = ProcessCommand::new("fish").arg("--version").output();
     let Ok(fish_version) = fish_version else {
@@ -619,9 +638,18 @@ fn docs_fish_completions_follow_topic_argument_position() {
             .collect::<Vec<_>>()
     };
 
-    let mut visible = topic_suggestions("formless docs ");
-    visible.sort_unstable();
-    assert_eq!(visible, all_topics);
+    for input in [
+        "formless docs ",
+        "/usr/bin/formless docs ",
+        "./target/debug/formless docs ",
+    ] {
+        let mut visible = topic_suggestions(input);
+        visible.sort_unstable();
+        assert_eq!(
+            visible, all_topics,
+            "unexpected topic candidates for {input:?}"
+        );
+    }
     assert_eq!(topic_suggestions("formless docs cap"), ["capabilities"]);
     for input in [
         "formless docs cap ",
