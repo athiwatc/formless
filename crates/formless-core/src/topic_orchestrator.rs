@@ -17,7 +17,7 @@ use std::{
 };
 
 const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
-pub(crate) const ACP_PLANNER_READINESS: &str = "For ACP, only installed profiles with signed_in=true are executable; signed_in=null or false is unavailable. Cursor, Cline, Junie, Auggie, and Devin are unavailable because Formless has no supported non-model sign-in check for them. Signing in alone will not unblock them. Explain this limitation and request the user's explicit approval through topic_request_harness_substitute before using a supported substitute. For explicit sign-in errors on supported profiles, direct the user to sign in and retry.";
+pub(crate) const ACP_PLANNER_READINESS: &str = "For ACP, only installed profiles with signed_in=true are executable; signed_in=null or false is unavailable. Cursor, Cline, Junie, Auggie, and Devin are unavailable because Formless has not integrated a supported non-model sign-in check for them. Signing in alone will not unblock them. Explain this limitation and request the user's explicit approval through topic_request_harness_substitute before using a supported substitute. For explicit sign-in errors on supported profiles, direct the user to sign in and retry.";
 
 #[cfg(test)]
 mod planner_readiness_tests {

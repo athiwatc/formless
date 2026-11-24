@@ -7307,8 +7307,9 @@ entry per ACP registry id with acp_agent set. Every probe is capped at
 detail "probe timed out". Legacy non-ACP readiness requires installed and
 signed_in is not Some(false). ACP requires signed_in=true and a resolved
 executable; unknown ACP authentication is unavailable. Cursor, Cline, Junie,
-Auggie, and Devin have no supported non-model sign-in check in Formless and
-remain unavailable even if session/new succeeds. Signing in alone does not
+Auggie, and Devin remain unavailable because Formless has not integrated a
+supported non-model sign-in readiness check for them, even if session/new
+succeeds. Signing in alone does not
 unblock them. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Muse Code

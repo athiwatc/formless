@@ -119,8 +119,14 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
         if matches!(*id, "junie" | "auggie" | "devin") {
             assert_eq!(result.signed_in, None, "{id}: {result:?}");
             let detail = result.detail.as_deref().unwrap();
-            assert!(detail.contains("unavailable for execution"), "{id}: {detail}");
-            assert!(detail.contains("Signing in alone will not unblock"), "{id}: {detail}");
+            assert!(
+                detail.contains("unavailable for execution"),
+                "{id}: {detail}"
+            );
+            assert!(
+                detail.contains("Signing in alone will not unblock"),
+                "{id}: {detail}"
+            );
             assert!(readiness.executable.is_none(), "{id}: {result:?}");
             assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
         } else {
@@ -222,8 +228,14 @@ fn readiness_session_success_uses_profile_auth_policy_not_method_presence() {
             SessionAuthPolicy::Unverifiable => {
                 assert_eq!(result.signed_in, None, "{id}: {result:?}");
                 let detail = result.detail.as_deref().unwrap();
-                assert!(detail.contains("unavailable for execution"), "{id}: {detail}");
-                assert!(detail.contains("Signing in alone will not unblock"), "{id}: {detail}");
+                assert!(
+                    detail.contains("unavailable for execution"),
+                    "{id}: {detail}"
+                );
+                assert!(
+                    detail.contains("Signing in alone will not unblock"),
+                    "{id}: {detail}"
+                );
                 assert!(readiness.executable.is_none(), "{id}: {result:?}");
                 assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
             }

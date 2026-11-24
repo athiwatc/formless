@@ -53,7 +53,7 @@ fn auth_methods_detail(methods: &[String]) -> String {
 
 fn unverifiable_auth_detail(id: &str, sign_in: &str, methods: &[String]) -> String {
     format!(
-        "ACP profile `{id}` is unavailable for execution because Formless has no supported non-model sign-in check. {sign_in} Signing in alone will not unblock it; ask the user to approve a supported substitute. This readiness result is not launchable. {}",
+        "ACP profile `{id}` is unavailable for execution because Formless has not integrated a supported non-model sign-in check. {sign_in} Signing in alone will not unblock it; ask the user to approve a supported substitute. This readiness result is not launchable. {}",
         auth_methods_detail(methods)
     )
 }
@@ -166,20 +166,20 @@ fn with_timeout_with_executable(
     match probe.session {
         Ok(Err(code)) if spec.auth_error_codes.contains(&code) => {
             result.signed_in = Some(false);
-            result.detail = Some(if session_auth_policy(id)
-                == Some(SessionAuthPolicy::Unverifiable)
-            {
-                format!(
-                    "ACP readiness explicitly reported authentication required (JSON-RPC error {code}); signed-in status is false. {} Formless did not perform ACP authentication.",
-                    format!("{} Formless did not perform ACP authentication.", unverifiable_auth_detail(id, spec.not_signed_in, &auth_methods))
+            result.detail = Some(
+                if session_auth_policy(id) == Some(SessionAuthPolicy::Unverifiable) {
+                    format!(
+                    "ACP readiness explicitly reported authentication required (JSON-RPC error {code}); signed-in status is false. Formless did not perform ACP authentication. {}",
+                    unverifiable_auth_detail(id, spec.not_signed_in, &auth_methods)
                 )
-            } else {
-                format!(
+                } else {
+                    format!(
                     "ACP readiness reported authentication required (JSON-RPC error {code}). {} Formless did not perform ACP authentication; this readiness result is not launchable. {}",
                     spec.not_signed_in,
                     auth_methods_detail(&auth_methods)
                 )
-            });
+                },
+            );
             return unlaunchable(result);
         }
         Ok(Ok(session))

@@ -5,11 +5,12 @@
 `open_session(id, request)` are available to callers. Topic outlines and attempt
 inputs validate `HarnessKind::Acp` selectors against this registry.
 Cursor, Cline, Junie, and Auggie are registered but unavailable for execution
-because Formless cannot verify their sign-in without a model turn. Devin is also
-unavailable until its documented `devin auth status` check is integrated. The IDs
-remain selectable, but selecting one does not make it executable; signing in
-alone does not unblock these profiles. Use a supported profile or request a
-user-approved substitute.
+because Formless has not integrated supported sign-in readiness checks for them.
+Devin is also unavailable: its SSO documentation shows `devin auth status`, but
+does not establish a universal output or exit-status contract, and Formless does
+not integrate that command. The IDs remain selectable, but selecting one does
+not make it executable; signing in alone does not unblock these profiles. Use a
+supported profile or request a user-approved substitute.
 `local_harness::run(request, interaction_handler, cancel)` dispatches ACP and
 Antigravity sessions through the core interaction handler; Antigravity retains
 its own spec. Core topic steps dispatch registered ACP profiles when
@@ -39,8 +40,9 @@ Readiness sends `initialize` and `session/new` and records advertised
 a terminal-login helper. Advertised methods alone do not make a profile
 unready: profiles whose session creation requires authentication can use a
 successful session response as sign-in evidence. Cursor, Cline, Junie, Auggie,
-and Devin remain unavailable for execution when readiness cannot verify sign-in;
-even a successful session open is not proof of model authentication. Signing in
+and Devin remain unavailable for execution because Formless has not integrated
+supported sign-in readiness checks for them; a successful session open is not
+proof of model authentication. Signing in
 alone does not unblock them. Auth-required failures report signed-in false,
 the profile sign-in hint, and advertised method IDs; other errors, empty
 sessions, and timeouts remain unknown and not launchable. The
