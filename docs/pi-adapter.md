@@ -63,7 +63,7 @@ probes; Pi's version subprocess additionally has its own three-second timeout.
 
 References: [configuration](https://docs.pi.dev/latest/configuration),
 [providers](https://docs.pi.dev/latest/providers), and
-[CLI authentication commands](https://docs.pi.dev/latest/cli#authentication-commands).
+[CLI authentication commands](https://docs.pi.dev/latest/cli#credential-commands).
 
 ## Questions, updates and shutdown
 
