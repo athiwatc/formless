@@ -257,6 +257,7 @@
     storageScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     submitting: new Set(),
+    shareApplyPending: false,
     pending: new Map(),
     subagents: [], // last /agents listing
   };
@@ -5848,6 +5849,15 @@
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }
 
+  function shareSendBlocked() {
+    return !!S.shareApplyPending || !!(S.current && S.storageScope
+      && S.shareAttachmentFailures?.has(sessionCacheKey(S.storageScope, S.current)));
+  }
+  function clearShareAttachmentFailure(token, scope, sessionId) {
+    const key = sessionCacheKey(scope, sessionId);
+    const failure = S.shareAttachmentFailures?.get(key);
+    if (failure?.token === token) S.shareAttachmentFailures.delete(key);
+  }
   function renderComposer() {
     scheduleForecast();
     const running = isRunning();
@@ -5879,7 +5889,7 @@
     $("session-title").textContent = attempt ? (attempt.step_title || "Step") + " · " + harnessLabel(attempt.harness)
       : topic ? topic.name : S.current === S.mainChat?.id ? "Main Chat" : s ? s.name : "No session";
     $("input").disabled = !!attempt;
-    $("send-btn").disabled = !!attempt;
+    $("send-btn").disabled = !!attempt || shareSendBlocked();
     $("attach-btn").disabled = !!attempt;
     $("fork-btn").disabled = !!attempt;
     $("status-model").disabled = !!attempt;
@@ -9280,6 +9290,10 @@
   const attachmentDrafts = {};
   async function submit(queued) {
     if (currentTopicAttempt()) return;
+    if (shareSendBlocked()) {
+      note("Wait for shared files to finish attaching or resolve the failed files before sending.", true);
+      return;
+    }
     const input = $("input");
     const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
@@ -10165,6 +10179,21 @@
     return null;
   }
   async function applyIncomingShare(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
+    const hasFiles = Array.isArray(share.files) && share.files.length > 0;
+    const alreadyPending = S.shareApplyPending;
+    if (hasFiles) {
+      S.shareApplyPending = true;
+      renderComposer();
+    }
+    try { return await applyIncomingShareRecord(token, share, selected); }
+    finally {
+      if (hasFiles) {
+        S.shareApplyPending = alreadyPending;
+        renderComposer();
+      }
+    }
+  }
+  async function applyIncomingShareRecord(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
     const record = { ...share, token, files: Array.isArray(share.files) ? share.files : [] };
     const selectionIsCurrent = () => S.current === selected.sessionId && S.storageScope === selected.scope;
     if (record.draftApplied && !record.draftSessionId) {
@@ -10267,9 +10296,12 @@
     record.files = await attachFiles(files, destination.sessionId, destination.scope);
     await storeIncomingShare(record);
     if (record.files.length) {
+      const failures = S.shareAttachmentFailures || (S.shareAttachmentFailures = new Map());
+      failures.set(sessionCacheKey(destination.scope, destination.sessionId), { token, files: record.files });
       note("Some shared files couldn't be attached; reload to retry.", true);
       return false;
     }
+    clearShareAttachmentFailure(token, destination.scope, destination.sessionId);
     return true;
   }
   function stripLaunchParams(keys) {

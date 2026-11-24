@@ -46,12 +46,12 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
     document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
-    renderChips() {}, renderOutbox() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
+    renderChips() {}, renderOutbox() {}, renderComposer() {}, note() {}, autosize() {}, currentTopicAttempt: () => null,
     renderTopicNavigation() {}, topicSessionIds: () => new Set(),
     ...extras,
     request: async req => req.type === 'ping'
@@ -63,7 +63,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','sharedSlashDraftKey','sharedSlashDraftValue','rememberSharedSlashDraft','clearSharedSlashDraft','clearEditedSharedSlashDraft','isSharedSlashDraft','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','sharedSlashDraftKey','sharedSlashDraftValue','rememberSharedSlashDraft','clearSharedSlashDraft','clearEditedSharedSlashDraft','isSharedSlashDraft','shareSendBlocked','clearShareAttachmentFailure','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
   const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
@@ -72,7 +72,8 @@ function setup(names, extras = {}) {
     assert.ok(start >= 0 && end > start, 'approval text helpers');
     vm.runInContext(source.slice(start, end), context);
   }
-  vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
+  const implementations = names.includes('applyIncomingShare') ? [...names, 'applyIncomingShareRecord'] : names;
+  vm.runInContext([...new Set([...dependencies, ...implementations])].map(fn).join('\n'), context);
   return context;
 }
 test('queued edits submit the revision opened by the editor', () => {
@@ -215,6 +216,37 @@ test('leading-slash shared text submits literally until the user edits it', asyn
   assert.equal(commands, 0);
   c.clearEditedSharedSlashDraft('test-room', 'A', '/tmp/notes --edited');
   assert.equal(c.isSharedSlashDraft('test-room', 'A', '/tmp/notes --edited'), false);
+});
+
+test('a shared caption cannot submit while its files are still uploading', async () => {
+  const gate = deferred(), attachStarted = deferred();
+  const photo = new File(['photo'], 'photo.png', { type: 'image/png' });
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'shareSendBlocked'], {
+    File, Blob,
+    attachFiles: () => { attachStarted.resolve(); return gate.promise; },
+    storeIncomingShare: async () => {},
+  });
+  c.S.current = 'A';
+  const pending = c.applyIncomingShare('share-token', { text: 'caption', files: [photo], draftApplied: false });
+  await attachStarted.promise;
+  assert.equal(c.shareSendBlocked(), true);
+  gate.resolve([]);
+  assert.equal(await pending, true);
+  assert.equal(c.shareSendBlocked(), false);
+});
+
+test('the composer disables Send and submit refuses while share attachment work is pending', async () => {
+  const c = setup(['renderComposer', 'submit', 'shareSendBlocked'], {
+    isRunning: () => false, composerEnterSends: () => true, enterModeHint: () => 'Enter sends',
+    h: () => ({}), historyRender: { welcome: null }, topicForSession: () => null,
+    renderTopicContext() {},
+  });
+  c.S.shareApplyPending = true;
+  c.$('input').value = 'caption';
+  c.renderComposer();
+  assert.equal(c.$('send-btn').disabled, true);
+  await c.submit(false);
+  assert.equal(c.$('input').value, 'caption');
 });
 
 test('share inbox read does not apply to a Session selected while IndexedDB is resolving', async () => {
