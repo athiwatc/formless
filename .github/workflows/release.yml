@@ -98,7 +98,7 @@ jobs:
           name="formless-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/formless" "$name/"
-          cp README.md SPEC.md LICENSE "$name/"
+          cp README.md SPEC.md LICENSE SECURITY.md "$name/"
           mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
           cp GLOSSARY.md "$name/"
           cp -R docs "$name/"
@@ -120,7 +120,7 @@ jobs:
           $name = "formless-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory $name
           Copy-Item "target/${{ matrix.target }}/release/formless.exe" $name
-          Copy-Item README.md,SPEC.md,LICENSE $name
+          Copy-Item README.md,SPEC.md,LICENSE,SECURITY.md $name
           New-Item -ItemType Directory -Path "$name/packaging","$name/relay","$name/crates/formless-desktop" -Force | Out-Null
           Copy-Item GLOSSARY.md "$name"
           Copy-Item -Path docs -Destination "$name" -Recurse
@@ -208,7 +208,7 @@ jobs:
           test "$host" = "$FORMLESS_RELEASE_TARGET"
           name="formless-${GITHUB_REF_NAME}-${FORMLESS_RELEASE_TARGET}"
           mkdir -p dist "$name"
-          cp target/release/formless target/formless.1 README.md SPEC.md LICENSE "$name/"
+          cp target/release/formless target/formless.1 README.md SPEC.md LICENSE SECURITY.md "$name/"
           mkdir -p "$name/packaging" "$name/relay" "$name/crates/formless-desktop"
           cp GLOSSARY.md "$name/"
           cp -R docs "$name/"

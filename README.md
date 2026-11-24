@@ -139,6 +139,9 @@ Normative behaviour: [SPEC.md](SPEC.md). Vocabulary: [GLOSSARY.md](GLOSSARY.md).
 
 More: [docs/capabilities.md](docs/capabilities.md) · [docs/troubleshooting.md](docs/troubleshooting.md).
 
+For security reports, see [SECURITY.md](SECURITY.md); do not post vulnerability
+details in public issues.
+
 ## Documentation
 
 | | |

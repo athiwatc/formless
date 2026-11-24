@@ -16,7 +16,7 @@ function fixture() {
     act: async req => { calls.push(JSON.parse(JSON.stringify(req))); return { applies: req.key === 'tui.on_start' ? 'on_tui_start' : 'now' }; },
     note: text => notes.push(text), toast: text => errors.push(text), refreshSettings: () => {},
   });
-  vm.runInContext(['settingsRows', 'settingDisplay', 'parseSettingInput', 'editSetting'].map(fn).join('\n'), c);
+  vm.runInContext(['settingsRows', 'settingDisplay', 'parseSettingInput', 'namingDownloadInfo', 'editSetting'].map(fn).join('\n'), c);
   return c;
 }
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -98,6 +98,47 @@ test('cancelled or malformed edits never submit requests', async () => {
   assert.deepEqual(c.calls, []); assert.equal(c.errors.length, 0);
 });
 
+test('enabling naming auto-download asks consent before saving', async () => {
+  const c = fixture();
+  let prompt;
+  c.ask = async options => { prompt = options; return false; };
+  const settings = { naming: { model: 'qwen2.5-0.5b', model_size: '409 MiB' } };
+  await c.editSetting('naming.auto_download', false, 'bool', [], settings);
+  assert.match(prompt.title, /download/i);
+  assert.match(prompt.text, /qwen2\.5-0\.5b/);
+  assert.match(prompt.text, /409 MiB/);
+  assert.match(prompt.text, /heuristic/);
+  const info = c.namingDownloadInfo(settings.naming);
+  assert.match(info.help, /qwen2\.5-0\.5b/);
+  assert.match(info.help, /409 MiB/);
+  assert.deepEqual(c.calls, []);
+  c.ask = async () => true;
+  await c.editSetting('naming.auto_download', false, 'bool', [], settings);
+  assert.deepEqual(c.calls, [{ type: 'set_setting', key: 'naming.auto_download', value: true }]);
+});
+
+test('unsupported naming models show information without granting download permission', async () => {
+  for (const naming of [
+    { model: '', model_size: '—', status: 'heuristic only' },
+    { model: 'not-in-catalog', model_size: '—', status: 'unknown model not-in-catalog; titles use a heuristic' },
+  ]) {
+    const c = fixture();
+    let prompt;
+    c.ask = async options => { prompt = options; return true; };
+    await c.editSetting('naming.auto_download', false, 'bool', [], { naming });
+    assert.equal(prompt.title, 'No supported session-naming model');
+    assert.equal(prompt.ok, 'Close');
+    assert.match(prompt.text, /heuristic/);
+    assert.doesNotMatch(prompt.text, /will download|about |409 MiB/i);
+    const info = c.namingDownloadInfo(naming);
+    assert.equal(info.supported, false);
+    assert.match(info.help, /heuristic/);
+    assert.doesNotMatch(info.help, /will download|about |409 MiB/i);
+    if (naming.model) assert.match(info.help, /not supported/);
+    else assert.match(info.help, /No supported naming model/);
+    assert.deepEqual(c.calls, []);
+  }
+});
 
 test('invalid Settings text can be corrected before the only update request', async () => {
   const c=fixture();const replies=['  {bad  ','{"fixed":[1,2]}'];const prompts=[];

@@ -2951,6 +2951,7 @@ fn shipped_tool_filters_keep_default_pipe_bytes_and_apply_the_same_json_selectio
                             .clone(),
                     )
                     .unwrap();
+                    let original: formless_protocol::ToolSummary = original.into();
                     assert_eq!(row, &serde_json::to_value(original).unwrap());
                 }
             } else {

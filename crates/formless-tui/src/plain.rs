@@ -938,6 +938,7 @@ pub enum ChatStart {
 /// The line-oriented client: the TUI's `--plain`/screen-reader mode and
 /// `formless chat` (SPEC §10.5).
 pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
+    let _ = Config::persist_naming_download_migration(&paths);
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
         eprintln!(

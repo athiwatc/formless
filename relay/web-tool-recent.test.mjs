@@ -54,8 +54,10 @@ test('missing, empty or malformed retained samples do not invent outcomes', () =
   }
 });
 
-test('shared Tools/Metrics renderer uses recent data without extra requests', () => {
+test('shared Tools/Metrics table uses summary metrics without recent-detail data', () => {
   const table = fn('toolsTable');
-  assert.match(table, /rateCell\(t.success_rate\), toolRecent\(t.recent\)/);
+  assert.match(table, /t\.invocations/);
+  assert.match(table, /rateCell\(t\.success_rate\)/);
+  assert.doesNotMatch(table, /toolRecent\(t\.recent\)/);
   assert.doesNotMatch(fn('toolRecent') + fn('recentCalls'), /\brpc\b|fetch\(|setInterval/);
 });

@@ -31,6 +31,7 @@ fn every_shown_or_settable_key_is_documented() {
         "limits.run_usd",
         "limits.run_steps",
         "naming.enabled",
+        "naming.auto_download",
         "daemon.idle_grace_secs",
         "relay.enabled",
         "relay.url",
@@ -55,6 +56,7 @@ fn defaults_come_from_the_config_types() {
     let docs = setting_docs_json();
     assert_eq!(docs["provider.max_retries"]["default"], 5);
     assert_eq!(docs["tui.notify_min_secs"]["default"], 20);
+    assert_eq!(docs["naming.auto_download"]["default"], false);
     // Unset by default: SPEC's words.
     assert_eq!(docs["provider.model"]["default"], "— (wizard)");
     assert!(docs["tools.max_tool_depth"]["description"]

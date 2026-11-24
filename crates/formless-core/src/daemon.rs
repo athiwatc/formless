@@ -52,6 +52,14 @@ const CLIENT_QUEUE: usize = 4096;
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 const MODEL_DOWNLOAD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+fn model_download_notice(spec: &ModelSpec) -> String {
+    format!(
+        "Downloading optional session-naming model {} ({}). Session titles use a heuristic until it is installed.",
+        spec.id,
+        namer::display_size(spec.gguf_bytes)
+    )
+}
+
 /// Session-update recency, independent of list pin/archive grouping. This is
 /// not measured model-use history; equal stored timestamps use Session IDs.
 fn recent_session_models(sessions: &[SessionInfo]) -> Vec<String> {
@@ -794,6 +802,7 @@ struct RunAdmission {
     resolved_model: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
+    resumed_from: Option<String>,
     first_message_seq: i64,
     first: StdMutex<
         Option<(
@@ -801,6 +810,7 @@ struct RunAdmission {
             Vec<Value>,
             String,
             Arc<crate::provider::FrozenAttachments>,
+            Vec<crate::storage::SteerCandidate>,
         )>,
     >,
 }
@@ -836,6 +846,8 @@ pub struct Daemon {
     run_publication_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     run_final_decision_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    model_download_test_spec: StdMutex<Option<ModelSpec>>,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -1077,6 +1089,7 @@ impl Daemon {
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
         if !offline && paths.config_file().exists() {
+            let _ = Config::persist_naming_download_migration(&paths);
             if let Ok(mut cfg) = Config::load_file_only(&paths) {
                 if let Some(w) = cfg.migrate_global_auto() {
                     if cfg.save(&paths).is_ok() {
@@ -1134,6 +1147,8 @@ impl Daemon {
             run_publication_test: StdMutex::new(None),
             #[cfg(test)]
             run_final_decision_test: StdMutex::new(None),
+            #[cfg(test)]
+            model_download_test_spec: StdMutex::new(None),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -2123,6 +2138,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: topic.source_session_id.clone(),
+                    metadata_only: None,
                 });
                 if let Some(session_id) = &topic.topic_session_id {
                     if let Some(session) = self.with_reader(|st| st.get_session(session_id))? {
@@ -2611,6 +2627,7 @@ impl Daemon {
                 })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(serde_json::to_value(msg)?)
@@ -3057,6 +3074,7 @@ impl Daemon {
                 }
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
+                    metadata_only: None,
                 });
                 self.launch_prepared_run(session_id, id, admission)?;
                 Ok(json!({"model":model,"original_session":original.map(|s|s.id)}))
@@ -4905,7 +4923,7 @@ impl Daemon {
                 }
             }
             Request::ListTools => Ok(serde_json::to_value(
-                self.with_reader(|s| s.list_tools(true))?,
+                self.with_reader(|s| s.list_tool_summaries(true))?,
             )?),
             Request::ListModules => Ok(serde_json::to_value(
                 self.with_reader(|s| s.list_modules())?,
@@ -6178,10 +6196,7 @@ impl Daemon {
         }
         match control {
             Some(control) => {
-                let step = self
-                    .with_reader(|st| st.run_steps(&control.run_id))
-                    .unwrap_or(0);
-                let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
+                let extra = Some(("steer", json!({"run_id":control.run_id})));
                 let run_id = control.run_id.clone();
                 let result = json!({"steered":true,"run_id":run_id});
                 let (message, outcome, inserted) = self.with_store(|st| {
@@ -6245,7 +6260,7 @@ impl Daemon {
                         }
                         let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
                         let admission =
-                            self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                            self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                         let run_id = st.create_run(&session_id)?;
                         st.record_forecast(&run_id, &forecast)?;
                         let outcome = json!({"started":true,"run_id":run_id});
@@ -6293,11 +6308,30 @@ impl Daemon {
                 };
                 let output = mutation(st)?;
                 // Freeze the same pre-Run request the forecast described.
-                let admission = self.prepare_run_admission(st, cfg, session_id, &forecast)?;
+                let admission = self.prepare_run_admission(
+                    st,
+                    cfg,
+                    session_id,
+                    &forecast,
+                    resumed_from.clone(),
+                )?;
+                let candidate_ids = admission
+                    .first
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|(_, _, _, _, candidates)| {
+                        candidates
+                            .iter()
+                            .map(|candidate| candidate.id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let id = st.create_run(session_id)?;
                 st.record_forecast(&id, &forecast)?;
-                if let Some(previous) = resumed_from {
-                    st.resume_session_plan(session_id, &previous, &id)?;
+                if let Some(previous) = resumed_from.as_deref() {
+                    st.rebind_pending_steers_for_resume(session_id, previous, &id, &candidate_ids)?;
+                    st.resume_session_plan(session_id, previous, &id)?;
                 }
                 Ok((output, id, admission))
             })
@@ -6310,6 +6344,7 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         forecast: &RunForecast,
+        resumed_from: Option<String>,
     ) -> Result<Arc<RunAdmission>> {
         Self::ensure_session_description_trust(st, session_id)?;
         let session = st
@@ -6395,6 +6430,7 @@ impl Daemon {
             )?
             .0;
         let first_message_seq = cache.last_included_seq();
+        let first_steer_candidates = cache.included_steer_candidates().to_vec();
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .resolved_dispatch(&forecast.basis.model)
@@ -6408,8 +6444,15 @@ impl Daemon {
             resolved_model: forecast.basis.model.clone(),
             effort,
             recovery_messages,
+            resumed_from,
             first_message_seq,
-            first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
+            first: StdMutex::new(Some((
+                ctx,
+                defs,
+                checkpoint,
+                sources,
+                first_steer_candidates,
+            ))),
         }))
     }
 
@@ -6617,7 +6660,8 @@ impl Daemon {
                         },
                     )?,
                 };
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok((id, admission))
@@ -7087,7 +7131,8 @@ impl Daemon {
                     None,
                     !no_pending_attachments,
                 )?;
-                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let admission =
+                    self.prepare_run_admission(st, &cfg, &session_id, &forecast, None)?;
                 let id = st.create_run(&session_id)?;
                 st.record_forecast(&id, &forecast)?;
                 Ok(Some((msg, id, admission)))
@@ -7134,12 +7179,20 @@ impl Daemon {
             return;
         };
         let spec = cfg.naming.spec();
+        #[cfg(test)]
+        let spec = {
+            let test_spec = *self
+                .model_download_test_spec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            test_spec.or(spec)
+        };
         if let Some(spec) = spec {
             if cfg.naming.auto_download
                 && namer::embedded_available()
                 && !spec.installed(&self.paths)
             {
-                self.spawn_model_download(spec);
+                self.spawn_model_download(spec, session_id);
             }
         }
         let this = self.clone();
@@ -7358,7 +7411,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec) {
+    fn spawn_model_download(self: &Arc<Self>, spec: ModelSpec, session_id: &str) {
         let Ok(mut retry_at) = self.model_download.clone().try_lock_owned() else {
             return;
         };
@@ -7366,12 +7419,17 @@ impl Daemon {
             return;
         }
         let this = self.clone();
+        let session_id = session_id.to_string();
         tokio::spawn(async move {
             tracing::info!(
-                "downloading session-naming model {} ({} MB)",
+                "downloading session-naming model {} ({})",
                 spec.id,
-                spec.gguf_bytes / 1_000_000
+                namer::display_size(spec.gguf_bytes)
             );
+            this.broadcast(Event::Note {
+                session_id: Some(session_id.clone()),
+                text: model_download_notice(&spec),
+            });
             let result = tokio::select! {
                 _ = this.shutdown.cancelled() => return,
                 result = namer::download(&this.paths, &spec) => result,
@@ -7379,11 +7437,23 @@ impl Daemon {
             if let Err(e) = result {
                 *retry_at = Some(tokio::time::Instant::now() + MODEL_DOWNLOAD_COOLDOWN);
                 tracing::warn!("session-naming model download failed: {e:#}");
+                this.broadcast(Event::Note {
+                    session_id: Some(session_id),
+                    text: "Session-naming model download failed; titles will continue using a heuristic.".into(),
+                });
                 return;
             }
             *retry_at = None;
             drop(retry_at);
             tracing::info!("session-naming model {} installed", spec.id);
+            this.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!(
+                    "Session-naming model {} is installed ({})",
+                    spec.id,
+                    namer::display_size(spec.gguf_bytes)
+                ),
+            });
             // Sessions titled by the heuristic while it downloaded
             // get a real title now (#871).
             let ids = this
@@ -7412,6 +7482,9 @@ impl Daemon {
         let first_message_seq = admitted
             .as_ref()
             .map_or(0, |admission| admission.first_message_seq);
+        let resumed_from = admitted
+            .as_ref()
+            .and_then(|admission| admission.resumed_from.clone());
         let pipeline = admitted.as_ref().and_then(|a| a.pipeline.clone());
         if pipeline
             .as_ref()
@@ -7499,7 +7572,7 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let route_context = if let Some((ctx, _, _, _)) = &first {
+        let route_context = if let Some((ctx, _, _, _, _)) = &first {
             let mut ctx = ctx.clone();
             if let Some(policy) = &pipeline {
                 policy.options.project_context(&mut ctx)?;
@@ -7516,7 +7589,7 @@ impl Daemon {
             )?
             .0
         };
-        let route_defs = if let Some((_, defs, _, _)) = &first {
+        let route_defs = if let Some((_, defs, _, _, _)) = &first {
             defs.clone()
         } else {
             self.with_store(|st| {
@@ -7572,7 +7645,7 @@ impl Daemon {
         )
         .await?;
 
-        if let Some((_, _, checkpoint, _)) = &first {
+        if let Some((_, _, checkpoint, _, _)) = &first {
             if self.with_reader(|st| {
                 Ok(crate::forecast::hash(
                     &st.latest_checkpoint_record(session_id)?,
@@ -7601,14 +7674,27 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources, consumed_seq) =
-                if let Some((mut ctx, defs, _, sources)) = first.take() {
-                    if let Some(policy) = &pipeline {
-                        policy.options.project_context(&mut ctx)?;
-                    }
-                    (ctx, defs, Some(sources), first_message_seq)
-                } else {
-                    let (built, consumed_seq) = self.session_context_with_policy_tracked(
+            let (ctx, defs, sources, consumed_seq, included_steer_candidates) = if let Some((
+                mut ctx,
+                defs,
+                _,
+                sources,
+                included_steer_candidates,
+            )) = first.take()
+            {
+                if let Some(policy) = &pipeline {
+                    policy.options.project_context(&mut ctx)?;
+                }
+                (
+                    ctx,
+                    defs,
+                    Some(sources),
+                    first_message_seq,
+                    included_steer_candidates,
+                )
+            } else {
+                let (built, consumed_seq, included_steer_candidates) = self
+                    .session_context_with_policy_tracked(
                         session_id,
                         &provider,
                         &model,
@@ -7616,12 +7702,17 @@ impl Daemon {
                         cfg.compaction.fraction(),
                         pipeline.as_ref().map(|p| &p.options),
                     )?;
-                    let ctx = built.0;
-                    let defs = self.with_store(|st| {
-                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                    })?;
-                    (ctx, defs, None, consumed_seq)
-                };
+                let ctx = built.0;
+                let defs = self.with_store(|st| {
+                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                })?;
+                (ctx, defs, None, consumed_seq, included_steer_candidates)
+            };
+            let included_steer_message_ids = crate::storage::steer_message_ids_for_run(
+                &included_steer_candidates,
+                run_id,
+                resumed_from.as_deref(),
+            );
             let call_provider = match sources {
                 Some(sources) => provider.clone().with_frozen_attachments(sources),
                 None => provider.clone(),
@@ -7649,7 +7740,30 @@ impl Daemon {
                 last_byte.store(epoch_ms(), Ordering::SeqCst);
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
-                self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let step = self.with_reader(|st| st.run_steps(run_id))? + 1;
+                let dispatch_daemon = self.clone();
+                let dispatch_session = session_id.to_string();
+                let dispatch_run = run_id.to_string();
+                let dispatch_steer_ids = included_steer_message_ids.clone();
+                let dispatch_resumed_from = resumed_from.clone();
+                let request_provider = call_provider
+                    .clone()
+                    .with_request_dispatch_hook(Arc::new(move || {
+                        dispatch_daemon.mark_steering_context_included(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                            &dispatch_steer_ids,
+                            dispatch_resumed_from.as_deref(),
+                            step,
+                        )?;
+                        dispatch_daemon.mark_context_consumed(
+                            &dispatch_session,
+                            &dispatch_run,
+                            consumed_seq,
+                        );
+                        Ok(())
+                    }));
                 let mut correlated = transcript_attempts::Attempt::start(
                     self.transcript_attempts.clone(), self.subs.clone(),
                     session_id, run_id, &transcript_turn, consumed_seq, !hide_candidate,
@@ -7660,7 +7774,7 @@ impl Daemon {
                     "run",
                     session_id,
                     run_id,
-                    call_provider.chat_stream(
+                    request_provider.chat_stream(
                         &ctx,
                         &defs,
                         &model,
@@ -8400,7 +8514,7 @@ impl Daemon {
                     let selected=self.action_model(st,&cfg,&input)?;
                     let forecast=self.forecast_estimate_selected(st,&cfg,&input,Some(&selected))?;
                     if forecast.confirmation_required {return Err(refusal(&forecast));}
-                    let admission=self.prepare_run_admission(st,&cfg,&fork.id,&forecast)?;
+                    let admission = self.prepare_run_admission(st, &cfg, &fork.id, &forecast, None)?;
                     let run=st.create_run(&fork.id)?;st.record_forecast(&run,&forecast)?;
                     prepared.push((fork,message,run,admission,model.clone()));
                 }
@@ -15590,7 +15704,7 @@ impl Daemon {
             trigger_fraction,
             policy,
         )
-        .map(|(built, _)| built)
+        .map(|(built, _, _)| built)
     }
     #[allow(clippy::too_many_arguments)]
     fn session_context_with_policy_tracked(
@@ -15601,7 +15715,11 @@ impl Daemon {
         context_tokens: u32,
         trigger_fraction: f64,
         policy: Option<&crate::pipeline::CompiledRunOptions>,
-    ) -> Result<(crate::storage::BuiltContext, i64)> {
+    ) -> Result<(
+        crate::storage::BuiltContext,
+        i64,
+        Vec<crate::storage::SteerCandidate>,
+    )> {
         let prompt = self.session_prompt(session_id)?;
         let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
@@ -15616,6 +15734,7 @@ impl Daemon {
             if let Some(policy) = policy {
                 policy.project_context(&mut built.0)?;
             }
+            let included_steer_candidates = cache.included_steer_candidates().to_vec();
             let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
@@ -15626,6 +15745,7 @@ impl Daemon {
             Ok((
                 cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction),
                 included_seq,
+                included_steer_candidates,
             ))
         });
         if built.is_ok() {
@@ -20073,6 +20193,192 @@ mod model_download_tests {
     use tokio::sync::Notify;
     use tokio::time::{timeout, Instant};
 
+    fn subscribe(daemon: &Daemon) -> mpsc::Receiver<ServerMessage> {
+        let (tx, rx) = mpsc::channel(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: Default::default(),
+        });
+        rx
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn finish_first_run(daemon: &Arc<Daemon>) -> String {
+        let (session_id, run_id) = daemon
+            .with_store(|st| {
+                let session = st.create_session(None)?;
+                st.append_message(
+                    &session.id,
+                    "user",
+                    "Create a local-only fixture for first-run naming consent checks.",
+                )?;
+                let run_id = st.create_run(&session.id)?;
+                Ok((session.id, run_id))
+            })
+            .unwrap();
+        daemon
+            .finish_run(session_id.clone(), run_id, "completed")
+            .await;
+        session_id
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_session_update(events: &mut mpsc::Receiver<ServerMessage>) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    ServerMessage::Event(Event::SessionUpdated { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("first-run heuristic title was not published");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn wait_for_note(
+        events: &mut mpsc::Receiver<ServerMessage>,
+        session_id: &str,
+        expected_text: &str,
+    ) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    ServerMessage::Event(Event::Note {
+                        session_id: Some(id),
+                        text,
+                    }) if id == session_id && text == expected_text => return,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("expected first-run model download status note");
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    async fn assert_no_model_fetch(requests: &AtomicU64, requested: &Notify, paths: &Paths) {
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(timeout(Duration::from_millis(100), requested.notified())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 0);
+        assert!(!namer::models_dir(paths).exists());
+    }
+
+    #[cfg(feature = "embedded-llm")]
+    #[tokio::test]
+    async fn first_run_consent_gates_local_model_fetch_and_reports_status() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let base =
+            std::env::temp_dir().join(format!("fl-first-run-download-{}", uuid::Uuid::new_v4()));
+        let requests = Arc::new(AtomicU64::new(0));
+        let requested = Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/tokenizer",
+            axum::routing::get({
+                let requests = requests.clone();
+                let requested = requested.clone();
+                move || {
+                    let (requests, requested) = (requests.clone(), requested.clone());
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        requested.notify_one();
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let base_url = format!("http://{addr}");
+        let spec = ModelSpec {
+            id: "consent-fixture",
+            tokenizer_url: Box::leak(format!("{base_url}/tokenizer").into_boxed_str()),
+            tokenizer_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"fixture tokenizer")).into_boxed_str(),
+            ),
+            gguf_url: Box::leak(format!("{base_url}/weights").into_boxed_str()),
+            gguf_sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"not a model")).into_boxed_str(),
+            ),
+            gguf_bytes: 42,
+            ..namer::QWEN2_5_0_5B
+        };
+        let paths = Paths::from_dirs(base.join("data"), base.join("config")).unwrap();
+        let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let default_cfg = daemon.config().unwrap();
+        assert!(default_cfg.naming.enabled);
+        assert!(!default_cfg.naming.auto_download);
+        assert!(default_cfg.naming.spec().is_some());
+        assert!(!paths.config_file().exists());
+        *daemon.model_download_test_spec.lock().unwrap() = Some(spec);
+        let mut events = subscribe(&daemon);
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut declined_cfg = Config::default();
+        declined_cfg.naming.auto_download = false;
+        declined_cfg.naming.auto_download_migration_done = true;
+        declined_cfg.save(&paths).unwrap();
+        assert!(
+            !daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        finish_first_run(&daemon).await;
+        wait_for_session_update(&mut events).await;
+        assert_no_model_fetch(&requests, &requested, &paths).await;
+
+        let mut enabled_cfg = Config::load(&paths).unwrap();
+        enabled_cfg.naming.auto_download = true;
+        enabled_cfg.naming.auto_download_migration_done = true;
+        enabled_cfg.save(&paths).unwrap();
+        assert!(
+            daemon
+                .config_with_refresh(true)
+                .unwrap()
+                .naming
+                .auto_download
+        );
+        let session_id = finish_first_run(&daemon).await;
+        wait_for_note(&mut events, &session_id, &model_download_notice(&spec)).await;
+        timeout(Duration::from_secs(5), requested.notified())
+            .await
+            .expect("enabled first run did not contact the local fetch fixture");
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        wait_for_note(
+            &mut events,
+            &session_id,
+            "Session-naming model download failed; titles will continue using a heuristic.",
+        )
+        .await;
+        assert!(!spec.installed(&paths));
+        assert!(!spec.tokenizer_path(&paths).exists());
+        assert!(!spec.gguf_path(&paths).exists());
+        drop(daemon);
+        server.abort();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn download_notice_names_model_size_and_heuristic_fallback() {
+        let notice = model_download_notice(&namer::QWEN2_5_0_5B);
+        assert!(notice.contains("qwen2.5-0.5b"), "{notice}");
+        assert!(notice.contains("409 MiB"), "{notice}");
+        assert!(notice.contains("heuristic"), "{notice}");
+    }
+
     #[tokio::test]
     async fn a_failed_naming_model_download_retries_after_cooldown() {
         let _env = crate::credential_env::EnvGuard::isolated();
@@ -20080,6 +20386,7 @@ mod model_download_tests {
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         Config::default().save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        let mut events = subscribe(&daemon);
         let calls = Arc::new(AtomicU64::new(0));
         let requested = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -20119,26 +20426,64 @@ mod model_download_tests {
             ..namer::QWEN2_5_0_5B
         };
         let wait = Duration::from_secs(5);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         timeout(wait, requested.notified()).await.unwrap();
-        daemon.spawn_model_download(spec);
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        daemon.spawn_model_download(spec, "fixture-session");
         let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
         release.notify_one();
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.unwrap() >= earliest_retry);
         assert!(!spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected failed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            "Session-naming model download failed; titles will continue using a heuristic."
+        );
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         // Move the retry deadline to the present without a real five-minute wait.
         *retry_at = Some(Instant::now());
         drop(retry_at);
-        daemon.spawn_model_download(spec);
+        daemon.spawn_model_download(spec, "fixture-session");
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(spec.installed(&paths));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected retry-start status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected completed-download status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            format!(
+                "Session-naming model {} is installed ({})",
+                spec.id,
+                namer::display_size(spec.gguf_bytes)
+            )
+        );
         drop(retry_at);
         server.abort();
         drop(daemon);
