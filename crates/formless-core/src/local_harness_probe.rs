@@ -292,7 +292,7 @@ async fn dispatch(
     match kind {
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
-        HarnessKind::Pi => fallback_probe(kind, ctx).await,
+        HarnessKind::Pi => super::pi::availability(Some(&ctx.executable)).await,
         HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
         HarnessKind::Antigravity => fallback_probe(kind, ctx).await,
         HarnessKind::Acp => {

@@ -55,6 +55,12 @@ without redesign.
 
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).
   Optional `--profile <name>` runs an additional isolated daemon + data dir.
+- Local Pi harness runs stage their extension in an attempt-private directory.
+  `FORMLESS_PI_MCP_CONFIG` carries per-attempt MCP command metadata and
+  allow-listed environment-variable names; values of those named variables
+  remain in the child environment and are not serialized into this value.
+  `FORMLESS_TOPIC_CAPABILITY` is the per-attempt MCP capability token; it is
+  passed through the selected child environment, never command arguments.
 - Clients: TUI (v1 UI), CLI (§12), and any future frontend. Clients are thin:
   they render streamed events and send intents; they hold no authoritative
   state and can disconnect/reattach without losing work (daemon persists all
@@ -7085,8 +7091,9 @@ Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
 another harness. Muse Code uses its interactive session protocol and requires
-one-run workspace trust from the user. Pi, OpenCode, Antigravity and ACP
-currently return actionable adapter-not-integrated step results.
+one-run workspace trust from the user. Pi uses its integrated RPC adapter.
+OpenCode, Antigravity and ACP currently return actionable adapter-not-integrated
+step results.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7095,7 +7102,8 @@ topics become NeedsUser, with durable detail and no automatic restart.
 
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
-CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
+CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
+`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
 `FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
@@ -7104,6 +7112,13 @@ AskUser and RequestPermission in addition to the scoped conversation/artifact
 operations. RequestPermission only raises a user request; it cannot decide one.
 An undecided or cancelled permission is denied. The bridge uses the existing
 five-minute IPC request deadline; cancellation closes pending requests.
+
+The Pi adapter's availability probe accepts an absolute `FORMLESS_TOPIC_PI_EXE`
+override before searching absolute PATH directories for `pi`; it skips relative
+or empty PATH entries and does not fall back to a bare `pi`. It only runs
+`--version`; sign-in remains unknown because Pi has no read-only, any-provider
+CLI auth probe. It does not write Pi configuration or isolate the user's agent
+directory.
 
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
@@ -7271,13 +7286,13 @@ or copy raw auth output into detail or logs.
 Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
 or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
 its version probe, along with `FORMLESS_TOPIC_PI_EXE` and
-`FORMLESS_TOPIC_MUSE_EXE`. An availability result does not mean the step adapter
-is integrated: Pi, OpenCode and Antigravity have dedicated dispatch arms that run --version
-in a private cwd under the probe deadline, with kill-on-drop and process-group
-cleanup; their auth remains unknown, including version failures. ACP reports
-lookup-only availability and preserves its configured agent. Adapter owners
-can replace these fallbacks with async probes or the bounded spawn_blocking
-probe hook. The reusable ACP
+`FORMLESS_TOPIC_MUSE_EXE`. Pi has adapter-specific availability and an
+attempt-private RPC runner. OpenCode and Antigravity have availability-only
+fallback probes that run --version in a private cwd under the probe deadline,
+with kill-on-drop and process-group cleanup; their auth remains unknown,
+including version failures. ACP reports lookup-only availability and preserves
+its configured agent. Adapter owners can replace these fallbacks with async
+probes or the bounded spawn_blocking probe hook. The reusable ACP
 probe initializes and creates a session with no MCP servers in a private
 temporary cwd, never prompts, maps configured auth errors, and kills its
 process group on success, failure or timeout.

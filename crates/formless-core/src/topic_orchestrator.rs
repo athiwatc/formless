@@ -15,7 +15,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-const CAPABILITY: &str = "FORMLESS_TOPIC_CAPABILITY";
+const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -465,7 +465,14 @@ impl Daemon {
 
     pub(super) async fn start_topic_workflow(self: &Arc<Self>, topic_id: String) -> Result<Value> {
         let topic = self.with_store(|st| st.claim_topic_workflow(&topic_id))?;
-        let kickoff=format!("You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\nFeatures, workspace and advisory outline:\n{}\nAvailable harness kinds: claude, codex, muse; pi, opencode, antigravity and acp currently return adapter-not-integrated errors. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n",serde_json::to_string_pretty(&topic)?);
+        let kickoff = format!(
+            concat!(
+                "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
+                "Features, workspace and advisory outline:\n{}\n",
+                "Available harness kinds: claude, codex, pi, muse; opencode, antigravity and acp currently return adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
+            ),
+            serde_json::to_string_pretty(&topic)?
+        );
         let start = async {
             let session = topic
                 .topic_session_id
@@ -1141,6 +1148,7 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::Pi => executable("FORMLESS_TOPIC_PI_EXE")?,
                 HarnessKind::Muse => executable("FORMLESS_TOPIC_MUSE_EXE")?,
                 _ => None,
             },
@@ -1258,7 +1266,36 @@ impl Daemon {
                 self.run_topic_cli(attempt, token, request, handler, cancel)
                     .await
             }
-            HarnessKind::Pi => bail!("Pi adapter not integrated yet; choose Claude or Codex"),
+            HarnessKind::Pi => {
+                let private = self
+                    .paths
+                    .data_dir
+                    .canonicalize()?
+                    .join("topic-attempts")
+                    .join(&attempt.id);
+                let staged = local_harness::pi::stage_extension(&private)?;
+                local_harness::pi::run_with_spawn(
+                    request,
+                    &staged,
+                    handler,
+                    cancel,
+                    |mut command| {
+                        spawn_pi_with_topic_launch_guard(
+                            || self.topic_launch.locked(),
+                            cancel,
+                            &self.shutdown,
+                            || {
+                                self.with_reader(|st| {
+                                    st.authenticate_topic_attempt(&attempt.id, token)
+                                })
+                                .map(|_| ())
+                            },
+                            || command.spawn().context("failed to start Pi RPC process"),
+                        )
+                    },
+                )
+                .await
+            }
             HarnessKind::OpenCode => {
                 bail!("OpenCode adapter not integrated yet; choose Claude or Codex")
             }
@@ -1342,6 +1379,21 @@ impl Daemon {
     }
 }
 
+fn spawn_pi_with_topic_launch_guard<G, T>(
+    lock: impl FnOnce() -> G,
+    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
+    authenticate: impl FnOnce() -> Result<()>,
+    spawn: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _launch = lock();
+    authenticate()?;
+    if cancel.is_cancelled() || shutdown.is_cancelled() {
+        bail!("step cancelled before launch");
+    }
+    spawn()
+}
+
 fn executable(name: &str) -> Result<Option<PathBuf>> {
     std::env::var_os(name)
         .map(|value| {
@@ -1352,4 +1404,70 @@ fn executable(name: &str) -> Result<Option<PathBuf>> {
             Ok(path)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod pi_spawn_guard_tests {
+    use super::spawn_pi_with_topic_launch_guard;
+    use std::{
+        fs,
+        sync::{mpsc, Arc, Mutex},
+        thread,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cancellation_returned_before_guarded_spawn_prevents_launch() {
+        let directory =
+            std::env::temp_dir().join(format!("formless-pi-launch-guard-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let marker = directory.join("spawned");
+        let launch_lock = Arc::new(Mutex::new(()));
+        let cancel = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (lock_held_tx, lock_held_rx) = mpsc::channel();
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (spawn_release_tx, spawn_release_rx) = mpsc::channel();
+
+        let cancel_lock = launch_lock.clone();
+        let cancel_token = cancel.clone();
+        let cancel_thread = thread::spawn(move || {
+            let guard = cancel_lock.lock().unwrap();
+            lock_held_tx.send(()).unwrap();
+            prepared_rx.recv().unwrap();
+            cancel_token.cancel();
+            drop(guard);
+            cancelled_tx.send(()).unwrap();
+            let _ = spawn_release_tx.send(());
+        });
+        lock_held_rx.recv().unwrap();
+
+        let spawn_lock = launch_lock.clone();
+        let spawn_cancel = cancel.clone();
+        let spawn_shutdown = shutdown.clone();
+        let spawn_marker = marker.clone();
+        let spawn_thread = thread::spawn(move || {
+            let spawn = move || {
+                spawn_release_rx.recv().unwrap();
+                fs::write(spawn_marker, b"spawned")?;
+                Ok(())
+            };
+            prepared_tx.send(()).unwrap();
+            spawn_pi_with_topic_launch_guard(
+                || spawn_lock.lock().unwrap(),
+                &spawn_cancel,
+                &spawn_shutdown,
+                || Ok(()),
+                spawn,
+            )
+        });
+
+        cancelled_rx.recv().unwrap();
+        cancel_thread.join().unwrap();
+        let error = spawn_thread.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!marker.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
