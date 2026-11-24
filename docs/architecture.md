@@ -177,8 +177,9 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 
 If a Tool returns the full `process.run` result and its `output_schema` sets
 `additionalProperties: false`, declare `stdout_cap_truncated` and
-`stderr_cap_truncated` as boolean properties and include them in `required`;
-otherwise output validation rejects the result.
+`stderr_cap_truncated` as boolean properties. Declaring these properties is
+sufficient for `additionalProperties: false`; adding them to `required` is
+optional and only makes the schema reject results missing either flag.
 
 Windows Job and Tool notifications use the BurntToast module in Windows
 PowerShell and require an interactive login for the daemon account.
