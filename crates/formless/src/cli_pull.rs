@@ -126,26 +126,53 @@ fn print_progress(event: &Event, pull_id: &str) -> Option<bool> {
     let expected = expected_size
         .map(|size| format!("; expected size {size} bytes"))
         .unwrap_or_default();
-    println!("pull {pull_id} {model}: {status}{progress}{expected}");
+    println!(
+        "pull {} {}: {}{progress}{expected}",
+        terminal_safe(pull_id),
+        terminal_safe(model),
+        terminal_safe(status)
+    );
     if let Some(warning) = warning {
-        println!("warning: {warning}");
+        println!("warning: {}", terminal_safe(warning));
     }
     if *done {
         if let Some(error) = error {
-            println!("error: {error}");
+            println!("error: {}", terminal_safe(error));
             if status == "incomplete" {
+                let resume = resume_command(model, provider.as_deref());
                 println!(
                     "partial download can be resumed with `{}`",
-                    resume_command(model, provider.as_deref())
+                    terminal_safe(&resume)
                 );
             }
         } else if status == "success" {
-            println!("pulled {model}; select it with `/model`");
+            println!("pulled {}; select it with `/model`", terminal_safe(model));
         }
         Some(error.is_none() && status == "success")
     } else {
         None
     }
+}
+
+fn terminal_safe(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control()
+            || matches!(
+                ch,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
+            safe.extend(ch.escape_default());
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
 }
 
 #[cfg(test)]
@@ -186,6 +213,14 @@ mod tests {
         assert_eq!(
             resume_command("llama3", Some("remote")),
             "formless pull llama3 --provider remote"
+        );
+    }
+
+    #[test]
+    fn terminal_output_escapes_control_sequences() {
+        assert_eq!(
+            terminal_safe("Ollama\u{1b}[2J\u{202e}"),
+            "Ollama\\u{1b}[2J\\u{202e}"
         );
     }
 }
