@@ -67,7 +67,7 @@ validate that feature itself.
    If it is changeable through the daemon, add it to the appropriate
    `SETTABLE`/map rules and validation there too; secrets and other file-only
    values must stay file-only.
-2. Document its meaning and default in [SPEC.md §13](SPEC.md#13-configuration),
+2. Document its meaning and default in [SPEC.md §13](SPEC.md#13-configuration-complete-settings-table),
    and update generated setting help or client controls only through the
    existing shared settings path.
 3. Existing `setting_docs::every_config_key_is_documented` catches missing
