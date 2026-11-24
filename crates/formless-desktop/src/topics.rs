@@ -194,19 +194,47 @@ pub fn rule_summary(rule: &formless_protocol::TopicPermissionRule) -> String {
     )
 }
 pub fn harness_availability(info: &formless_protocol::HarnessAvailability) -> String {
-    let status = if !info.installed {
-        "not installed"
-    } else {
-        match info.signed_in {
-            Some(true) => "ready",
-            Some(false) => "installed; sign in required",
-            None => "installed; sign-in status unknown",
-        }
-    };
+    let status = harness_status(info);
     format!(
         "{} · {status}",
         chosen_harness(Some(info.kind), info.acp_agent.as_deref())
     )
+}
+
+fn harness_status(info: &formless_protocol::HarnessAvailability) -> &'static str {
+    if !info.installed {
+        return if info.kind == HarnessKind::Acp {
+            "not installed; unavailable for execution"
+        } else {
+            "not installed"
+        };
+    }
+    if info.kind == HarnessKind::Acp {
+        return match info.signed_in {
+            Some(true) => "ready",
+            Some(false) => "unavailable for execution; sign-in required",
+            None => "unavailable for execution; sign-in readiness cannot be verified",
+        };
+    }
+    match info.signed_in {
+        Some(true) => "ready",
+        Some(false) => "installed; sign in required",
+        None => "installed; sign-in status unknown",
+    }
+}
+
+pub fn acp_outline_readiness_status(
+    agent: Option<&str>,
+    harnesses: &[formless_protocol::HarnessAvailability],
+) -> &'static str {
+    let Some(agent) = agent.map(str::trim).filter(|agent| !agent.is_empty()) else {
+        return "unavailable for execution; select a profile and check readiness";
+    };
+    harnesses
+        .iter()
+        .find(|info| info.kind == HarnessKind::Acp && info.acp_agent.as_deref() == Some(agent))
+        .map(harness_status)
+        .unwrap_or("unavailable for execution; readiness not checked")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +537,40 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_readiness_labels_distinguish_sign_in_required_from_unknown() {
+        let availability = |signed_in| formless_protocol::HarnessAvailability {
+            kind: HarnessKind::Acp,
+            acp_agent: Some("cursor".into()),
+            installed: true,
+            signed_in,
+            version: None,
+            detail: Some("diagnostic text".into()),
+        };
+        assert!(harness_availability(&availability(Some(false)))
+            .contains("unavailable for execution; sign-in required"));
+        assert!(harness_availability(&availability(Some(true))).ends_with("· ready"));
+        assert!(harness_availability(&availability(None))
+            .contains("unavailable for execution; sign-in readiness cannot be verified"));
+        assert_eq!(
+            acp_outline_readiness_status(Some("cursor"), &[availability(None)]),
+            "unavailable for execution; sign-in readiness cannot be verified"
+        );
+        assert_eq!(
+            acp_outline_readiness_status(Some("unknown"), &[]),
+            "unavailable for execution; readiness not checked"
+        );
+        let non_acp = formless_protocol::HarnessAvailability {
+            kind: HarnessKind::Codex,
+            acp_agent: None,
+            installed: true,
+            signed_in: None,
+            version: None,
+            detail: None,
+        };
+        assert!(harness_availability(&non_acp).contains("installed; sign-in status unknown"));
+    }
     use serde_json::json;
     #[test]
     fn generated_user_messages_are_never_move_candidates_but_user_wording_is_not_filtered() {

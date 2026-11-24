@@ -152,16 +152,29 @@ pub(super) fn editor(ui: &Ui, busy: bool, cx: &mut Context<Shell>) -> AnyElement
                     .aria_label(format!("Step {} title", index + 1)),
             );
         if !step.expanded {
+            let value = step.value(cx);
+            let readiness = if step.harness == Some(HarnessKind::Acp) {
+                format!(
+                    " · {}",
+                    topics::acp_outline_readiness_status(
+                        value.acp_agent.as_deref(),
+                        &ui.state.harnesses
+                    )
+                )
+            } else {
+                String::new()
+            };
             editor = editor.child(
                 card.child(
                     Label::new(format!(
-                        "{}{} · {}",
-                        topics::chosen_harness(step.harness, step.value(cx).acp_agent.as_deref()),
-                        step.value(cx)
+                        "{}{} · {}{}",
+                        topics::chosen_harness(step.harness, value.acp_agent.as_deref()),
+                        value
                             .model
                             .map(|model| format!(" / {model}"))
                             .unwrap_or_default(),
-                        topics::access(step.access)
+                        topics::access(step.access),
+                        readiness
                     ))
                     .text_xs(),
                 ),
@@ -199,11 +212,22 @@ pub(super) fn editor(ui: &Ui, busy: bool, cx: &mut Context<Shell>) -> AnyElement
                 .aria_label(format!("Step {} model", index + 1)),
         );
         if step.harness == Some(HarnessKind::Acp) {
-            card = card.child(
-                Input::new(&step.acp_agent)
-                    .small()
-                    .aria_label(format!("Step {} ACP agent", index + 1)),
-            );
+            let agent = step.value(cx).acp_agent;
+            let readiness =
+                topics::acp_outline_readiness_status(agent.as_deref(), &ui.state.harnesses);
+            card = card
+                .child(
+                    Input::new(&step.acp_agent)
+                        .small()
+                        .aria_label(format!("Step {} ACP agent", index + 1)),
+                )
+                .child(
+                    readable(
+                        SharedString::from(format!("topic-step-acp-readiness-{id}")),
+                        format!("ACP execution status: {readiness}"),
+                    )
+                    .text_xs(),
+                );
         }
         let mut permissions = h_flex().flex_wrap().gap_2();
         for access in [StepAccess::ReadOnly, StepAccess::Write] {
