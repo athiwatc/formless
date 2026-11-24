@@ -8454,7 +8454,29 @@ impl Daemon {
                 }
             }
         }
-        send("ended".into(), None, None, true, None);
+        if !buf.is_empty() {
+            if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
+                if let Some(e) = v["error"].as_str() {
+                    return send("failed".into(), None, None, true, Some(e.to_string()));
+                }
+                if v["status"].as_str() == Some("success") {
+                    return send(
+                        "success".into(),
+                        v["completed"].as_u64(),
+                        v["total"].as_u64(),
+                        true,
+                        None,
+                    );
+                }
+            }
+        }
+        send(
+            "failed".into(),
+            None,
+            None,
+            true,
+            Some("pull ended before completing".into()),
+        );
     }
 
     /// `CompareModels` (SPEC §5.10): one fork per model, each asked the
@@ -20986,3 +21008,78 @@ mod pending_attachment_inventory_tests;
 #[cfg(test)]
 #[path = "session_selection_daemon_tests.rs"]
 mod session_selection_daemon_tests;
+
+#[cfg(test)]
+mod ollama_pull_tests {
+    use super::*;
+
+    async fn pull_events(body: &'static str) -> Vec<Event> {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/api/pull",
+            axum::routing::post(move || async move { body }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!("fl-ollama-pull-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let daemon = Daemon::new(paths).unwrap();
+        let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
+        daemon.subs.locked().push(Subscriber {
+            conn: 1,
+            tx: tx.into(),
+            filter: Arc::new(StdMutex::new(EventFilter::default())),
+            kick: CancellationToken::new(),
+            gaps: BTreeMap::new(),
+        });
+
+        daemon
+            .ollama_pull(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "test-model",
+            )
+            .await;
+        server.abort();
+
+        let mut events = Vec::new();
+        while let Ok(ServerMessage::Event(event)) = rx.try_recv() {
+            events.push(event);
+        }
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+        events
+    }
+
+    #[tokio::test]
+    async fn stream_end_without_success_is_a_failure() {
+        let events = pull_events("{\"status\":\"pulling\",\"completed\":1,\"total\":2}\n").await;
+        assert!(matches!(
+            events.last(),
+            Some(Event::ModelPullProgress {
+                status,
+                done: true,
+                error: Some(error),
+                ..
+            }) if status == "failed" && error == "pull ended before completing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_success_without_newline_is_still_success() {
+        let events = pull_events("{\"status\":\"success\"}").await;
+        assert!(matches!(
+            events.last(),
+            Some(Event::ModelPullProgress {
+                status,
+                done: true,
+                error: None,
+                ..
+            }) if status == "success"
+        ));
+    }
+}

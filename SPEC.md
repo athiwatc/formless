@@ -481,7 +481,9 @@ without redesign.
   doctor` and `Status.proxy` show which.
 - **Ollama.** `/pull MODEL` (`OllamaPull`) downloads a model through the
   Ollama server behind `provider.base_url`, streaming `ModelPullProgress
-  {status, completed, total, done, error}` to the status bar.
+  `{status, completed, total, done, error}` to the status bar. A pull is
+  complete only after an explicit `status: "success"`; a stream that ends
+  first reports `pull ended before completing` as an error.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
