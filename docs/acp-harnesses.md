@@ -28,15 +28,25 @@ Install each vendor's CLI separately and put its executable on PATH, or supply
 or passes credentials in argv. Sign in using the vendor CLI or configure its
 environment outside Formless. Agent names and ACP v1 are checked, without minimum
 version requirements; Cursor does not report agentInfo and is protocol-checked only.
-Readiness sends `initialize` and `session/new` only; it does not inspect advertised
-`authMethods`, send ACP `authenticate`, or launch a terminal-login helper. The
+Readiness sends `initialize` and `session/new` and records advertised
+`authMethods` IDs for diagnostics; it does not send ACP `authenticate` or launch
+a terminal-login helper. Advertised methods alone do not make a profile
+unready: profiles whose session creation requires authentication can use a
+successful session response as sign-in evidence. Cursor and Cline remain
+not launchable when `session/new` returns an authentication error; even a
+successful session open remains unknown because Formless does not complete
+their advertised auth flows. Their captured readiness probes currently return
+authentication-required errors. Auth-required failures report signed-in false,
+the profile sign-in hint, and advertised method IDs; other errors, empty
+sessions, and timeouts remain unknown and not launchable. The
 [ACP v1 authentication flow](https://agentclientprotocol.com/protocol/v1/authentication)
 defines agent-managed and terminal authentication. Cursor's [ACP guide](https://cursor.com/docs/cli/acp)
-describes `authenticate` with `cursor_login`; Cline's [ACP guide](https://docs.cline.bot/usage/acp)
+describes `authenticate` with `cursor_login` and pre-authentication via `agent login`
+or API-key/token configuration; Cline's [ACP guide](https://docs.cline.bot/usage/acp)
 says ACP clients can prompt for sign-in when a session starts and reuse credentials
-saved by `cline auth`. Formless does not implement these authentication flows, so
-probe success does not establish that a later model turn can authenticate. No
-authenticated model turn is verified.
+saved by `cline auth`. Formless does not implement these authentication flows,
+so readiness does not verify signed-in model execution. No authenticated model
+turn is verified.
 
 ## Commands, access, and live evidence
 

@@ -503,16 +503,18 @@ pub fn probe(
 
 pub(super) struct SessionProbe {
     pub version: Option<String>,
+    pub auth_methods: Vec<String>,
     pub session: Result<std::result::Result<Value, i64>>,
 }
 
-/// A bounded readiness check, without a bridge, prompt or authentication request.
+/// A bounded readiness check that records auth methods but does not authenticate.
 pub(super) fn probe_session(
     spec: &AgentSpec,
     request: &HarnessRequest,
     timeout: Duration,
 ) -> SessionProbe {
     let mut version = None;
+    let mut auth_methods = Vec::new();
     let cancel = CancellationToken::new();
     let timer = cancel.clone();
     let (stop, stopped) = mpsc::channel();
@@ -529,6 +531,13 @@ pub(super) fn probe_session(
             Ok(initialized) => initialized,
             Err(code) => return Ok(Err(code)),
         };
+        auth_methods = initialized
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|method| method.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
         version = initialized
             .pointer("/agentInfo/version")
             .or_else(|| initialized.pointer("/_meta/agentVersion"))
@@ -544,6 +553,7 @@ pub(super) fn probe_session(
     let _ = stop.send(());
     SessionProbe {
         version,
+        auth_methods,
         session: if cancel.is_cancelled() {
             Err(anyhow!("ACP readiness probe timed out."))
         } else {
