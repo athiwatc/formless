@@ -727,11 +727,11 @@ fn readme_and_spec_reference_all_visible_root_commands_and_flags_exactly() {
     );
     for (name, document) in [
         (
-            "README §3.11",
+            "docs/cli.md CLI reference",
             section(
-                include_str!("../../../README.md"),
-                "### 3.11 CLI reference",
-                "### 3.12 ",
+                include_str!("../../../docs/cli.md"),
+                "## CLI reference",
+                "## Further reading",
             ),
         ),
         (

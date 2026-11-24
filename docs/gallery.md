@@ -1,7 +1,7 @@
 # What can Formless do?
 
 A fresh install includes 25 built-in Tools and no starter domain Tools
-([the built-in set](../README.md#51-the-built-in-tools)). You ask for something;
+([the built-in set](architecture.md#the-built-in-tools)). You ask for something;
 when the agent has no registry Tool for it, it writes one (a small JavaScript program with only the access
 it declares, see [Capabilities](capabilities.md)), uses it, and keeps it. The
 next similar request reuses that Tool, and the optimiser improves it over
@@ -120,7 +120,7 @@ headless with `formless run "…"`.
     has ended, use `/compact Keep repository constraints and unresolved decisions`
     to request a focused summary. `/compact` without a focus is also supported.
     Summaries can omit details; review the result and failure notes. See the
-    [context guide](../README.md#context-and-compaction) and
+    [context guide](architecture.md#context-and-compaction) and
     [command reference](keys.md#session).
 
 ## Seeing what it built

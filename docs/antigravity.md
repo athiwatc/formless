@@ -31,7 +31,11 @@ FORMLESS_LIVE_AGY=1 cargo test -p formless-core live_agy_acp -- --ignored --noca
 
 `antigravity::availability` reports readiness for `ListHarnesses` without touching credentials: an ACP `initialize` (no `session/new`, so no bridge or prompt) gives install state and version, then `agy models` gives the sign-in state. A "sign in" error means signed out, success means signed in, and anything else (timeout, network error) leaves it unknown.
 
-Set `FORMLESS_AGY_BIN` if `agy` is not on PATH. The test opens a session whose bridge is a shell stub, and checks that it started with the run's capability variable.
+For this live test only, set `FORMLESS_AGY_BIN` to use an `agy` binary that
+is not on PATH. Topic-step launches instead use
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE` (an absolute path) or the `agy` found on
+PATH. The test opens a session whose bridge is a shell stub, and checks that it
+started with the run's capability variable.
 
 ## Documented CLI capabilities
 
