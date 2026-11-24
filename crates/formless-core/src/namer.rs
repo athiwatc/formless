@@ -882,6 +882,31 @@ mod tests {
 
     #[test]
     fn remove_all_requires_exclusive_access_to_every_selected_model() {
+        // A parallel sibling may fork while the model lock is held. Its
+        // close-on-exec descriptor still holds the lock until that child
+        // execs. Exercise release in a single-test process after exec.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "namer::tests::remove_all_exclusive_access_child_fixture",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("running 1 test"),
+            "isolated model-cache fixture did not pass one test: {}\n{stdout}{stderr}",
+            output.status
+        );
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for the exclusive model-cache test"]
+    fn remove_all_exclusive_access_child_fixture() {
         let (paths, root) = cache_fixture();
         let active = try_model_lock(&models_dir(&paths), &LFM2_5_350M).unwrap();
         let first = QWEN2_5_0_5B.gguf_path(&paths);
