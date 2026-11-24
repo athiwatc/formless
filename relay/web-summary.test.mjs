@@ -104,13 +104,21 @@ test('historical tool result names include the stored outcome and duration', () 
   }
 });
 
-test('disclosure markers use text-free CSS shapes', () => {
+test('disclosure markers use stable text-free clipped shapes and preserve reserved widths', () => {
   const marker = styles.match(/\.chip summary::before, \.generated-details summary::before \{([^}]+)\}/)?.[1];
   assert.ok(marker);
   assert.match(marker, /content: ""/);
-  assert.match(marker, /border-left: \.35em solid var\(--muted\)/);
+  assert.match(marker, /width: \.75em; height: \.75em; flex: 0 0 \.75em/);
+  assert.match(marker, /background: var\(--muted\)/);
+  assert.match(marker, /clip-path: polygon\(0 15%, 55% 50%, 0 85%\)/);
   assert.doesNotMatch(marker, /content: ["'][^"']+["']/);
-  assert.match(styles, /\.chip\[open\] summary::before, \.generated-details\[open\] summary::before \{ transform: rotate\(90deg\); \}/);
+  assert.doesNotMatch(styles, /content: ["'][▸▾]["']/);
+  const openMarker = styles.match(/\.chip\[open\] summary::before, \.generated-details\[open\] summary::before \{([^}]+)\}/)?.[1];
+  assert.ok(openMarker);
+  assert.match(openMarker, /clip-path: polygon\(17% 15%, 83% 15%, 50% 65%\)/);
+  assert.doesNotMatch(openMarker, /transform:/);
+  assert.match(styles, /\.chip\.tool-call > summary::before \{ flex: 0 0 1em; \}/);
+  assert.match(styles, /\.chip\.result > summary::before \{ flex: 0 0 1em; \}/);
 });
 
 test('tool call summary exposes the tool name as content rather than a generic span label', () => {
