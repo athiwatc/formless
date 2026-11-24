@@ -693,6 +693,22 @@ fn canonical_ollama_model(model: &str) -> String {
     }
 }
 
+fn resolve_ollama_model_alias(settings: &ProviderCfg, model: &str) -> String {
+    let mut resolved = model.trim().to_string();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(resolved.to_ascii_lowercase()) {
+            break;
+        }
+        let next = settings.resolve_alias(&resolved);
+        if next.eq_ignore_ascii_case(&resolved) || seen.contains(&next.to_ascii_lowercase()) {
+            break;
+        }
+        resolved = next;
+    }
+    resolved
+}
+
 fn ollama_resume_command(provider: &str, model: &str) -> String {
     if provider == crate::config::DEFAULT_PROVIDER {
         format!("/pull {model}")
@@ -5485,7 +5501,7 @@ impl Daemon {
             Request::OllamaPull { model, provider } => {
                 let cfg = self.config()?;
                 let endpoint = self.provider_named(&cfg, provider.as_deref()).await?;
-                let model = endpoint.settings().resolve_alias(&model);
+                let model = resolve_ollama_model_alias(endpoint.settings(), &model);
                 if model.is_empty() {
                     bail!("usage: /pull MODEL [--provider NAME]");
                 }
@@ -21986,6 +22002,17 @@ mod ollama_pull_tests {
         assert!(cancel.is_cancelled());
         drop(daemon);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ollama_pull_follows_alias_chains_and_stops_cycles() {
+        let mut settings = ProviderCfg::default();
+        settings.aliases.insert("A".into(), "B".into());
+        settings.aliases.insert("b".into(), "C".into());
+        assert_eq!(resolve_ollama_model_alias(&settings, "A"), "C");
+
+        settings.aliases.insert("C".into(), "A".into());
+        assert_eq!(resolve_ollama_model_alias(&settings, "A"), "C");
     }
 
     #[test]
