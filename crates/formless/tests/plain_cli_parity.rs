@@ -2575,7 +2575,7 @@ fn shipped_grouped_usage_checks_day_support_and_keeps_all_daemon_values() {
             } else {
                 let text = String::from_utf8(out.stdout).unwrap();
                 assert_eq!(
-                    text.contains("DAY (LOCAL, UTC"),
+                    text.contains("Daily usage offset: UTC"),
                     group.is_none() || group == Some("day")
                 );
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());

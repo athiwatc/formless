@@ -82,9 +82,8 @@ fn human(
     } else {
         None
     };
-    let day_header = format!("DAY (LOCAL, {})", offset_label(offset));
     let mut table = Table::new(&[
-        if daily { day_header.as_str() } else { "KEY" },
+        if daily { "DAY" } else { "KEY" },
         "PROMPT TOKENS",
         "COMPLETION TOKENS",
         "CACHED TOKENS",
@@ -142,7 +141,15 @@ fn human(
         table.row(usage_cells(&key, counts, cache_write, cost));
     }
     table.row(usage_cells("TOTAL", totals, total_cache_write, total_cost));
-    let mut report = table.render(terminal, color, width);
+    let mut report = if daily {
+        format!(
+            "Daily usage offset: {}\n{}",
+            offset_label(offset),
+            table.render(terminal, color, width)
+        )
+    } else {
+        table.render(terminal, color, width)
+    };
     if terminal {
         if let Some(day) = partial {
             // A fitted table can clip the marker at ordinary terminal widths.
@@ -240,7 +247,7 @@ mod tests {
         let render =
             |group, since| human(&rows, group, since, Some(420), false, false, None).unwrap();
         let truncated = render(Group::Day, Some("2026-11-17T03:00:00+07:00"));
-        assert!(truncated.contains("DAY (LOCAL, UTC+07:00)"));
+        assert!(truncated.starts_with("Daily usage offset: UTC+07:00\n"));
         assert!(truncated.contains("2026-11-17 (partial)"));
         assert!(!truncated.contains("2026-11-16 (partial)"));
         let next = render(Group::Day, Some("2026-11-16T20:00:00-05:00"));
@@ -252,12 +259,12 @@ mod tests {
             Some("2026-11-18T17:00:00Z"),
         ] {
             let whole = render(Group::Day, since);
-            assert!(whole.contains("DAY (LOCAL, UTC+07:00)"));
+            assert!(whole.starts_with("Daily usage offset: UTC+07:00\n"));
             assert!(!whole.contains("(partial)"));
         }
         let grouped = render(Group::Model, Some("2026-11-16T20:00:00Z"));
         assert!(grouped.contains("KEY"));
-        assert!(!grouped.contains("DAY (LOCAL") && !grouped.contains("(partial)"));
+        assert!(!grouped.contains("Daily usage offset:") && !grouped.contains("(partial)"));
     }
 
     #[test]
@@ -293,6 +300,18 @@ mod tests {
             .unwrap();
             assert!(!missing.contains("Partial local day"), "{missing}");
         }
+    }
+
+    #[test]
+    fn all_history_daily_offset_is_visible_at_80_columns() {
+        let rows = serde_json::json!([
+            {"key":"2026-11-16","prompt_tokens":1,"completion_tokens":0,"cached_tokens":0,"cost":null}
+        ]);
+        let rendered = human(&rows, Group::Day, None, Some(840), true, false, Some(80)).unwrap();
+        assert!(
+            rendered.contains("Daily usage offset: UTC+14:00"),
+            "{rendered}"
+        );
     }
 
     #[test]
