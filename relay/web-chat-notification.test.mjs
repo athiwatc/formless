@@ -49,6 +49,25 @@ test("browser notification permission is requested only from its explicit settin
   assert.equal(requests, 1);
 });
 
+test("explicit Web Push opt-in requests browser permission before fetching the relay key", async () => {
+  const calls = [];
+  const subscription = { toJSON: () => ({ endpoint: "test" }) };
+  const c = {
+    S: { forgetting: false, pushRemoval: false, pushEnabling: false },
+    Notification: { requestPermission: async () => { calls.push("permission"); return "granted"; } },
+    fetch: async path => { calls.push(path); return { ok: true, json: async () => ({ key: "test" }) }; },
+    navigator: { serviceWorker: { ready: Promise.resolve({ pushManager: {
+      subscribe: async () => { calls.push("subscribe"); return subscription; },
+    } }) } },
+    b64uToBytes: () => new Uint8Array(),
+    registerRelayPush: (_ws, _sub, interactive) => calls.push(["register", interactive]),
+    renderView: () => calls.push("render"), toast: message => calls.push(["toast", message]),
+  };
+  runInNewContext(appFunction("pushOn"), c);
+  await c.pushOn();
+  assert.deepEqual(calls, ["permission", "push/key", "subscribe", ["register", true], "render"]);
+});
+
 test("page chooses a worker first and keeps Session and event tags distinct", async () => {
   const messages = [];
   const c = { navigator: { serviceWorker: { getRegistration: async () => ({

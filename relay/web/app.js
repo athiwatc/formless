@@ -7598,10 +7598,10 @@
         registerRelayPush(S.ws, existing, true);
         return;
       }
+      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
-      if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
       if (S.forgetting || S.pushRemoval) return;
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
