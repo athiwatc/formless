@@ -7001,9 +7001,15 @@ impl App {
                         .iter_mut()
                         .find(|c| c.subagent.as_deref() == Some(&subagent.id))
                     {
-                        if !subagent.model.is_empty() {
+                        if !subagent.model.is_empty() || subagent.served_model.is_some() {
+                            let served = subagent
+                                .served_model
+                                .as_ref()
+                                .map_or_else(String::new, |served| {
+                                    format!(" · via {} ({})", served.name, served.via)
+                                });
                             node.name = format!(
-                                "sub-agent ({}): {}",
+                                "sub-agent ({}{served}): {}",
                                 subagent.model,
                                 truncate_chars(&subagent.task, 60)
                             );

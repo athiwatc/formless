@@ -2323,6 +2323,9 @@ pub struct SubagentInfo {
     /// The role and model it ran on ("explorer · qwen3", or just a model).
     #[serde(default)]
     pub model: String,
+    /// Attribution for its last response when the provider used another model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<ServedModelInfo>,
     pub status: String,
     pub steps: i64,
     pub result: Option<String>,

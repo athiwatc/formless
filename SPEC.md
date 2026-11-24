@@ -470,8 +470,9 @@ without redesign.
   routing selected the intended model. The pick is captured from the
   resolved route, not inferred from model-name equality. Tool-call and
   pause-turn assistant messages retain the same metadata.
-  Sub-agent assistant messages retain it in their transcript and completed
-  sub-agent nodes show the served model. `llm.complete` keeps its text/value
+  Sub-agent assistant messages retain it in their transcript; completed
+  sub-agent nodes carry optional structured `served_model` attribution
+  separately from the role/model label. `llm.complete` keeps its text/value
   result contract and records any served-model attribution on the enclosing
   Tool Invocation; the invocation detail displays it.
   Session exports preserve assistant message metadata. Headless `run` prints

@@ -10189,7 +10189,11 @@
           note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · click it to read its transcript", ev.subagent.status !== "completed");
           const node = S.liveTools.find((t) => t.subagent === ev.subagent.id);
           if (node) {
-            if (ev.subagent.model) node.name = "sub-agent (" + ev.subagent.model + "): " + truncate(ev.subagent.task, 60);
+            if (ev.subagent.model || ev.subagent.served_model) {
+              const served = ev.subagent.served_model;
+              const suffix = served ? " · via " + served.name + " (" + served.via + ")" : "";
+              node.name = "sub-agent (" + (ev.subagent.model || "") + suffix + "): " + truncate(ev.subagent.task, 60);
+            }
             node.status = ev.subagent.status === "completed" ? "ok" : "failed";
             node.elapsedMs = Date.now() - node.started;
           }

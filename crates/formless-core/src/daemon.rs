@@ -11304,10 +11304,6 @@ impl Daemon {
                 Ok(text) => ("completed", text.clone()),
                 Err(e) => ("failed", e.to_string()),
             };
-            let model_label = last_served_model.as_ref().map_or_else(
-                || label.clone(),
-                |served| format!("{label} · via {} ({})", served.name, served.via),
-            );
             // A Tool's `agents.run` is that Tool's model use (§10.4).
             if let Some(inv) = parent_inv.filter(|_| task_tokens > 0) {
                 let _ =
@@ -11348,9 +11344,9 @@ impl Daemon {
                     )
                 });
             }
-            if let Ok(sub) =
-                self.with_store(|st| st.finish_subagent(&sub_id, status, &result, &model_label))
-            {
+            if let Ok(sub) = self.with_store(|st| {
+                st.finish_subagent(&sub_id, status, &result, &label, last_served_model.as_ref())
+            }) {
                 self.broadcast(Event::SubagentFinished {
                     session_id: session_id.to_string(),
                     subagent: sub,

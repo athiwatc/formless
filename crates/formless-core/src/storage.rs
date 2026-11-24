@@ -998,7 +998,7 @@ fn run_duration_ms(created: &str, updated: &str) -> i64 {
 }
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 81;
+pub const SCHEMA_VERSION: i64 = 82;
 
 #[path = "topic_context.rs"]
 mod topic_context;
@@ -1289,7 +1289,7 @@ fn migrate_v80(conn: &Connection) -> Result<()> {
 }
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 79] = [
+const MIGRATIONS: [(i64, MigrationStep); 80] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -1659,6 +1659,7 @@ const MIGRATIONS: [(i64, MigrationStep); 79] = [
     (81, |c| {
         add_column(c, "invocations", "served_models TEXT NOT NULL DEFAULT '[]'")
     }),
+    (82, |c| add_column(c, "subagents", "served_model TEXT")),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -4650,6 +4651,9 @@ impl Store {
     fn row_subagent(r: &rusqlite::Row) -> rusqlite::Result<SubagentInfo> {
         Ok(SubagentInfo {
             model: r.get("model")?,
+            served_model: r
+                .get::<_, Option<String>>("served_model")?
+                .and_then(|value| serde_json::from_str(&value).ok()),
             id: r.get("id")?,
             session_id: r.get("session_id")?,
             run_id: r.get("run_id")?,
@@ -4724,10 +4728,12 @@ impl Store {
         status: &str,
         result: &str,
         model: &str,
+        served_model: Option<&formless_protocol::ServedModelInfo>,
     ) -> Result<SubagentInfo> {
+        let served_model = served_model.map(serde_json::to_string).transpose()?;
         self.ex(
-            "UPDATE subagents SET status=?2, result=?3, updated_at=?4, model=?5 WHERE id=?1",
-            params![id, status, result, now(), model],
+            "UPDATE subagents SET status=?2, result=?3, updated_at=?4, model=?5, served_model=?6 WHERE id=?1",
+            params![id, status, result, now(), model, served_model],
         )?;
         self.get_subagent(id)?.context("sub-agent vanished")
     }
@@ -8555,6 +8561,48 @@ mod subagent_message_projection_tests {
             store.subagent_messages(&agent.id).unwrap().last(),
             Some(&serde_json::json!({"appended":"last"}))
         );
+    }
+
+    #[test]
+    fn subagent_served_model_is_stored_separately_from_model_label() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session(Some("served model fixture".into()))
+            .unwrap();
+        let agent = store
+            .create_subagent(
+                &session.id,
+                "fixture-run",
+                "fixture",
+                0,
+                "reviewer · requested",
+            )
+            .unwrap();
+        let served = formless_protocol::ServedModelInfo {
+            name: "fallback".into(),
+            via: "fallback".into(),
+            requested: "requested".into(),
+        };
+        let finished = store
+            .finish_subagent(
+                &agent.id,
+                "completed",
+                "answer",
+                &agent.model,
+                Some(&served),
+            )
+            .unwrap();
+        assert_eq!(finished.model, "reviewer · requested");
+        assert_eq!(finished.served_model, Some(served));
+        assert_eq!(
+            store.list_subagents(&session.id).unwrap(),
+            vec![finished.clone()]
+        );
+
+        let mut legacy = serde_json::to_value(finished).unwrap();
+        legacy.as_object_mut().unwrap().remove("served_model");
+        let legacy: formless_protocol::SubagentInfo = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.served_model.is_none());
     }
 }
 
