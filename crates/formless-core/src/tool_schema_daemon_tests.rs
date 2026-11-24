@@ -305,6 +305,67 @@ fn invalid_legacy_schema_does_not_consume_provider_filler_slots() {
     );
 }
 
+#[test]
+fn find_tools_does_not_claim_incompatible_legacy_tools_are_callable() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("formless-find-schema-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let daemon = Daemon::new(paths).unwrap();
+    let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    daemon
+        .with_store(|st| {
+            st.create_tool_version(
+                "legacy_string_input",
+                "legacy string lookup",
+                r#"{"type":"string"}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            st.create_tool_version(
+                "legacy_object_input",
+                "legacy_string_input migration match",
+                r#"{"type":"object"}"#,
+                "{}",
+                "function run(input){return input;}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let found: Value = serde_json::from_str(
+        &daemon
+            .find_tools_impl(
+                &session,
+                &json!({"query": "legacy_string_input", "limit": 1}),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let next_step = daemon
+        .with_store(|st| toolreg::tool_definitions(st, Some(&session), 100))
+        .unwrap();
+    assert!(
+        found["tools"]
+            .as_array()
+            .is_some_and(|tools| { tools.len() == 1 && tools[0]["name"] == "legacy_object_input" }),
+        "find_tools did not skip the incompatible Tool and return the valid match: {found}"
+    );
+    assert!(
+        next_step.iter().all(|definition| {
+            definition["function"]["name"].as_str() != Some("legacy_string_input")
+        }),
+        "incompatible legacy Tool appeared in next-step definitions: {next_step:?}"
+    );
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn schema_save_flag_is_required_despite_forged_author_and_reports_reach_reads() {
     let env = crate::credential_env::EnvGuard::isolated();

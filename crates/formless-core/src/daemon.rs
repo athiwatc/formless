@@ -11177,8 +11177,10 @@ impl Daemon {
             // Wrappers the search missed join the list, ahead of the raw row.
             for n in &names {
                 if !hits.iter().any(|t| &t.name == n) {
-                    if let Some((info, _)) = self.with_reader(|st| st.get_tool_by_name(n))? {
-                        hits.push(info);
+                    if let Some((info, version)) = self.with_reader(|st| st.get_tool_by_name(n))? {
+                        if toolreg::validate_stored_input_schema(&version.input_schema).is_ok() {
+                            hits.push(info);
+                        }
                     }
                 }
             }

@@ -935,6 +935,21 @@ fn agent_tools(store: &Store) -> Result<Vec<ToolInfo>> {
     Ok(tools)
 }
 
+fn provider_compatible_tools(store: &Store) -> Result<Vec<ToolInfo>> {
+    let mut compatible = Vec::new();
+    for info in agent_tools(store)? {
+        let Some((_, version)) = store.get_tool_current(&info.id)? else {
+            continue;
+        };
+        if let Err(error) = validate_stored_input_schema(&version.input_schema) {
+            warn_omitted_tool_schema(&info.id, &info.name, &error);
+            continue;
+        }
+        compatible.push(info);
+    }
+    Ok(compatible)
+}
+
 /// Search active Tools with the configured ranking (`tools.search`).
 pub fn search_tools_with(
     store: &Store,
@@ -942,10 +957,11 @@ pub fn search_tools_with(
     limit: usize,
     method: &str,
 ) -> Result<Vec<ToolInfo>> {
+    let tools = provider_compatible_tools(store)?;
     if method.eq_ignore_ascii_case("keyword") {
-        search_tools(store, query, limit)
+        search_tools_from(store, tools, query, limit)
     } else {
-        search_tools_bm25(store, query, limit)
+        search_tools_bm25_from(store, tools, query, limit)
     }
 }
 
@@ -996,7 +1012,15 @@ fn stems(s: &str) -> Vec<String> {
 /// matches and the [`SYNONYMS`] groups at reduced weight. Ties go to the
 /// more used, more reliable Tool.
 pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
-    let tools = agent_tools(store)?;
+    search_tools_bm25_from(store, agent_tools(store)?, query, limit)
+}
+
+fn search_tools_bm25_from(
+    store: &Store,
+    tools: Vec<ToolInfo>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ToolInfo>> {
     let docs: Vec<Vec<String>> = tools
         .iter()
         .map(|t| {
@@ -1084,8 +1108,17 @@ pub fn search_tools_bm25(store: &Store, query: &str, limit: usize) -> Result<Vec
 /// Keyword search over active Tools (SPEC §7.1). Name hits outrank
 /// description hits; ties go to the more used, more reliable Tool.
 pub fn search_tools(store: &Store, query: &str, limit: usize) -> Result<Vec<ToolInfo>> {
+    search_tools_from(store, agent_tools(store)?, query, limit)
+}
+
+fn search_tools_from(
+    _store: &Store,
+    tools: Vec<ToolInfo>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ToolInfo>> {
     let q = tokens(query);
-    let mut scored: Vec<(f64, ToolInfo)> = agent_tools(store)?
+    let mut scored: Vec<(f64, ToolInfo)> = tools
         .into_iter()
         .filter_map(|t| {
             let name = tokens(&t.name);
@@ -1121,7 +1154,7 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
     })
 }
 
-fn validate_stored_input_schema(input_schema: &str) -> Result<()> {
+pub(crate) fn validate_stored_input_schema(input_schema: &str) -> Result<()> {
     let schema: Value = serde_json::from_str(input_schema)
         .map_err(|error| anyhow!("invalid stored input_schema JSON: {error}"))?;
     validate_object_input_schema(&schema)
