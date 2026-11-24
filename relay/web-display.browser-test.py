@@ -153,7 +153,7 @@ def run():
                         check(page.locator('#sidebar').evaluate('(e)=>getComputedStyle(e).visibility')=='hidden','closed drawer descendants are hidden')
                         check(rect(page,'#sidebar')['right']<=1, f'closed sidebar clears safe area at 200% in {width}x{height}')
                         page.screenshot(path=str(OUT/f'screen-200-closed-{width}x{height}.png'),full_page=True)
-                        page.locator('#toasts').evaluate('e=>e.replaceChildren()')
+                        page.locator('#toasts').evaluate("e=>e.querySelectorAll('.toast .toast-dismiss').forEach(button=>button.click())")
                     # Deep live calls must retain readable names and timing, even
                     # with larger browser text and either writing direction.
                     page.set_viewport_size({'width':360,'height':800})

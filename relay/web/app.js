@@ -1088,11 +1088,14 @@
   function toast(text, err, action) {
     let timer = null, deadline = 0, hovered = false, focused = false;
     let remaining = err ? null : Number.isFinite(action?.ms) && action.ms >= 0 ? action.ms : 3500;
+    const trackPointerHover = remaining != null;
     const remove = () => {
       clearTimeout(timer); timer = null; remaining = null;
-      document.removeEventListener("pointermove", updatePointerHover);
-      document.removeEventListener("pointerout", clearPointerHoverOnExit);
-      window.removeEventListener("blur", clearPointerHover);
+      if (trackPointerHover) {
+        document.removeEventListener("pointermove", updatePointerHover);
+        document.removeEventListener("pointerout", clearPointerHoverOnExit);
+        window.removeEventListener("blur", clearPointerHover);
+      }
       t.remove();
     };
     const pauseTimer = () => {
@@ -1137,9 +1140,11 @@
     const clearPointerHoverOnExit = (event) => {
       if (event.pointerType === "mouse" && !event.relatedTarget) clearPointerHover();
     };
-    document.addEventListener("pointermove", updatePointerHover, { passive: true });
-    document.addEventListener("pointerout", clearPointerHoverOnExit, { passive: true });
-    window.addEventListener("blur", clearPointerHover);
+    if (trackPointerHover) {
+      document.addEventListener("pointermove", updatePointerHover, { passive: true });
+      document.addEventListener("pointerout", clearPointerHoverOnExit, { passive: true });
+      window.addEventListener("blur", clearPointerHover);
+    }
     $("toasts").append(t);
     setTimeout(() => { if (t.isConnected) message.textContent = text; }, 0);
     if (remaining != null) {
