@@ -20163,22 +20163,23 @@ mod model_download_tests {
             panic!("expected download status note");
         };
         assert_eq!(session_id.as_deref(), Some("fixture-session"));
-        assert!(text.contains("fixture"), "{text}");
-        assert!(text.contains("16 B"), "{text}");
-        assert!(text.contains("heuristic"), "{text}");
+        assert_eq!(text, model_download_notice(&spec));
         daemon.spawn_model_download(spec, "fixture-session");
         let earliest_retry = Instant::now() + MODEL_DOWNLOAD_COOLDOWN;
         release.notify_one();
         let retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
         assert!(retry_at.unwrap() >= earliest_retry);
         assert!(!spec.installed(&paths));
-        let ServerMessage::Event(Event::Note { text, .. }) =
+        let ServerMessage::Event(Event::Note { session_id, text }) =
             timeout(wait, events.recv()).await.unwrap().unwrap()
         else {
             panic!("expected failed-download status note");
         };
-        assert!(text.contains("failed"), "{text}");
-        assert!(text.contains("heuristic"), "{text}");
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            "Session-naming model download failed; titles will continue using a heuristic."
+        );
         drop(retry_at);
         daemon.spawn_model_download(spec, "fixture-session");
         let mut retry_at = timeout(wait, daemon.model_download.lock()).await.unwrap();
@@ -20191,12 +20192,27 @@ mod model_download_tests {
         assert!(retry_at.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!(spec.installed(&paths));
-        let ServerMessage::Event(Event::Note { text, .. }) =
+        let ServerMessage::Event(Event::Note { session_id, text }) =
+            timeout(wait, events.recv()).await.unwrap().unwrap()
+        else {
+            panic!("expected retry-start status note");
+        };
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(text, model_download_notice(&spec));
+        let ServerMessage::Event(Event::Note { session_id, text }) =
             timeout(wait, events.recv()).await.unwrap().unwrap()
         else {
             panic!("expected completed-download status note");
         };
-        assert!(text.contains("installed"), "{text}");
+        assert_eq!(session_id.as_deref(), Some("fixture-session"));
+        assert_eq!(
+            text,
+            format!(
+                "Session-naming model {} is installed ({})",
+                spec.id,
+                namer::display_size(spec.gguf_bytes)
+            )
+        );
         drop(retry_at);
         server.abort();
         drop(daemon);
