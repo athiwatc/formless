@@ -1,5 +1,6 @@
 use super::*;
 use crate::local_harness::{self, HarnessRequest, HarnessResult, InteractionHandler};
+use formless_runtime::process_group::SupervisedProcess;
 use serde::Deserialize;
 #[cfg(unix)]
 use std::os::unix::{
@@ -469,7 +470,7 @@ impl Daemon {
             concat!(
                 "You are the Formless topic orchestrator. Launch independent features concurrently with topic_run_step, then loop on topic_wait. Steps are asynchronous and return attempt IDs, not results. Answer a harness question with topic_answer_question only when its evidence is an exact whole-message quote from this feature's approved request in the narrow form '<stem>: <one offered option>' (optional one final period on source), or a prior human-answer receipt from this same attempt for identical questions and answers. Request stems and option labels allow only ASCII letters, digits, spaces, hyphens and underscores; punctuation or quotes within either atom, nonempty option descriptions, and conditional, negation, conjunction or uncertainty tokens (maybe, perhaps, might, could, possibly, probably) are unsupported. The basis is explanation, not proof. There is no paraphrase or general semantic matching: if evidence is missing, ambiguous, changed or does not match exactly, leave the existing harness question pending for direct user response; do not ask_user a duplicate question. Never answer user_only questions or permissions. Inspect the finished outputs and explicitly call topic_complete_feature or topic_fail_feature; a step result is not feature completion. The outline is advisory: you decide the steps and harnesses. Never push or modify the source workspace or its branch. Do not use registry or shell tools to bypass step isolation.\n",
                 "Features, workspace and advisory outline:\n{}\n",
-                "Available harness kinds: claude, codex, antigravity, pi, muse; opencode and acp currently return adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
+                "Available harness kinds: claude, codex, pi, antigravity, opencode, muse; generic ACP currently returns adapter-not-integrated errors. Muse Code uses its interactive session protocol and requires one-run workspace trust. ACP requires acp_agent. Inputs are exact artifact references from any finalized output in this topic. Combine inputs only when intended, in an isolated step. If you end your turn with active attempts, the topic becomes NeedsUser with a durable note; nothing resumes the model automatically.\n"
             ),
             serde_json::to_string_pretty(&topic)?
         );
@@ -875,7 +876,7 @@ impl Daemon {
                 &workspace,
                 &root,
                 &inputs,
-                handler.as_ref(),
+                handler.clone(),
                 &step_cancel,
                 resolved_antigravity_executable.as_deref(),
             );
@@ -958,10 +959,18 @@ impl Daemon {
                 let saved = self
                     .with_reader(|st| st.get_topic_attempt(attempt_id))?
                     .context("attempt vanished")?;
-                if cancelled || saved.status != TopicAttemptStatus::Succeeded {
+                let recoverable = match saved.status {
+                    TopicAttemptStatus::Succeeded => true,
+                    TopicAttemptStatus::NeedsUser => saved
+                        .summary
+                        .as_deref()
+                        .is_some_and(|summary| !summary.trim().is_empty()),
+                    _ => false,
+                };
+                if cancelled || !recoverable {
                     return Err(error);
                 }
-                tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after successful topic report; daemon validation still required");
+                tracing::warn!(attempt_id,error=%format!("{error:#}"),"ignoring harness error after a validated topic report; daemon validation still required");
                 Ok(HarnessResult {
                     session_id: saved.harness_session_id,
                     message: saved.summary.unwrap_or_default(),
@@ -982,7 +991,7 @@ impl Daemon {
         workspace: &Path,
         root: &Path,
         inputs: &[TopicArtifact],
-        handler: &dyn InteractionHandler,
+        handler: Arc<dyn InteractionHandler>,
         cancel: &CancellationToken,
         resolved_antigravity_executable: Option<&Path>,
     ) -> Result<(HarnessResult, Vec<TopicArtifact>)> {
@@ -1179,6 +1188,10 @@ impl Daemon {
             executable: match step.harness {
                 HarnessKind::Claude => executable("FORMLESS_TOPIC_CLAUDE_EXE")?,
                 HarnessKind::Codex => executable("FORMLESS_TOPIC_CODEX_EXE")?,
+                HarnessKind::OpenCode => {
+                    let environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+                    Some(resolve_topic_opencode_executable(&environment)?)
+                }
                 HarnessKind::Antigravity => Some(local_harness::antigravity::topic_executable(
                     resolved_antigravity_executable,
                 )?),
@@ -1207,7 +1220,7 @@ impl Daemon {
             ]),
         };
         let result = self
-            .launch_topic_adapter(attempt, token, &request, handler, cancel)
+            .launch_topic_adapter(attempt, token, &request, handler.clone(), cancel)
             .await;
         let result = self.accept_topic_harness_result(
             &attempt.id,
@@ -1247,19 +1260,27 @@ impl Daemon {
                 bail!("Git Write step did not leave a clean worktree");
             }
             let revision = head.context("Git Write step has no HEAD")?;
-            if Some(&revision) == base.as_ref() {
-                bail!("Git Write step did not create a new commit");
+            let needs_user_report = reported.status == TopicAttemptStatus::NeedsUser
+                && reported
+                    .summary
+                    .as_deref()
+                    .is_some_and(|summary| !summary.trim().is_empty());
+            let base = base.as_deref().context("missing worktree base")?;
+            if needs_user_report
+                && revision == base
+                && reported
+                    .outputs
+                    .iter()
+                    .any(|output| matches!(output, TopicArtifact::GitRevision { .. }))
+            {
+                bail!(
+                    "NeedsUser Git Write report cannot include a GitRevision without a new commit"
+                );
             }
-            git(
-                workspace,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    base.as_deref().context("missing worktree base")?,
-                    &revision,
-                ],
-            )?;
-            outputs.push(TopicArtifact::GitRevision { revision });
+            if let Some(revision) = git_write_output_revision(base, revision, needs_user_report)? {
+                git(workspace, &["merge-base", "--is-ancestor", base, &revision])?;
+                outputs.push(TopicArtifact::GitRevision { revision });
+            }
         }
         if step.access == StepAccess::Write && topic.workspace_kind == WorkspaceKind::Directory {
             let directory = workspace.canonicalize()?;
@@ -1283,21 +1304,21 @@ impl Daemon {
         Ok(path)
     }
 
-    async fn launch_topic_adapter(
+    pub(super) async fn launch_topic_adapter(
         self: &Arc<Self>,
         attempt: &TopicAttemptInfo,
         token: &str,
         request: &HarnessRequest,
-        handler: &dyn InteractionHandler,
+        handler: Arc<dyn InteractionHandler>,
         cancel: &CancellationToken,
     ) -> Result<HarnessResult> {
         match request.kind {
             HarnessKind::Claude => {
-                self.run_topic_cli(attempt, token, request, handler, cancel)
+                self.run_topic_cli(attempt, token, request, handler.as_ref(), cancel)
                     .await
             }
             HarnessKind::Codex => {
-                self.run_topic_cli(attempt, token, request, handler, cancel)
+                self.run_topic_cli(attempt, token, request, handler.as_ref(), cancel)
                     .await
             }
             HarnessKind::Pi => {
@@ -1311,7 +1332,7 @@ impl Daemon {
                 local_harness::pi::run_with_spawn(
                     request,
                     &staged,
-                    handler,
+                    handler.as_ref(),
                     cancel,
                     |mut command| {
                         spawn_pi_with_topic_launch_guard(
@@ -1331,21 +1352,22 @@ impl Daemon {
                 .await
             }
             HarnessKind::OpenCode => {
-                bail!("OpenCode adapter not integrated yet; choose Claude or Codex")
+                let spawn = self.topic_process_spawner(&attempt.id, token, || {});
+                local_harness::opencode::run_with_spawn(request, handler, cancel, spawn).await
             }
             HarnessKind::Antigravity => {
                 self.run_topic_acp(
                     attempt,
                     token,
-                    local_harness::antigravity::run,
+                    local_harness::antigravity::run_with_spawn,
                     request,
-                    handler,
+                    handler.as_ref(),
                     cancel,
                 )
                 .await
             }
             HarnessKind::Acp => bail!("ACP adapter not integrated yet; choose Claude or Codex"),
-            HarnessKind::Muse => local_harness::muse::run(request, handler, cancel).await,
+            HarnessKind::Muse => local_harness::muse::run(request, handler.as_ref(), cancel).await,
         }
     }
 
@@ -1353,18 +1375,11 @@ impl Daemon {
         self: &Arc<Self>,
         attempt: &TopicAttemptInfo,
         token: &str,
-        adapter: local_harness::acp::Adapter,
+        adapter: local_harness::acp::GuardedAdapter,
         request: &HarnessRequest,
         handler: &dyn InteractionHandler,
         cancel: &CancellationToken,
     ) -> Result<HarnessResult> {
-        {
-            let _launch = self.topic_launch.locked();
-            self.with_reader(|st| st.authenticate_topic_attempt(&attempt.id, token))?;
-            if cancel.is_cancelled() || self.shutdown.is_cancelled() {
-                bail!("step cancelled before launch");
-            }
-        }
         let run_cancel = cancel.child_token();
         let stop = run_cancel.clone();
         let shutdown = self.shutdown.clone();
@@ -1372,14 +1387,45 @@ impl Daemon {
             shutdown.cancelled().await;
             stop.cancel();
         });
-        let result =
-            local_harness::acp::run_interactive(adapter, request.clone(), handler, &run_cancel)
-                .await;
+        let spawn = self.topic_process_spawner(&attempt.id, token, || {});
+        let result = local_harness::acp::run_interactive_with_spawn(
+            adapter,
+            request.clone(),
+            handler,
+            &run_cancel,
+            spawn,
+        )
+        .await;
         watcher.abort();
         if self.shutdown.is_cancelled() {
             bail!("daemon is shutting down");
         }
         result
+    }
+
+    pub(super) fn topic_process_spawner<F>(
+        self: &Arc<Self>,
+        attempt_id: &str,
+        token: &str,
+        before_lock: F,
+    ) -> impl FnMut(Command, &CancellationToken) -> Result<SupervisedProcess> + Send + 'static
+    where
+        F: FnMut() + Send + 'static,
+    {
+        let daemon = self.clone();
+        let attempt_id = attempt_id.to_owned();
+        let token = token.to_owned();
+        let shutdown = self.shutdown.clone();
+        let mut before_lock = before_lock;
+        move |command, cancel| {
+            before_lock();
+            let _launch = daemon.topic_launch.locked();
+            daemon.with_reader(|st| st.authenticate_topic_attempt(&attempt_id, &token))?;
+            if cancel.is_cancelled() || shutdown.is_cancelled() {
+                bail!("step cancelled before launch");
+            }
+            SupervisedProcess::spawn(command).map_err(|error| anyhow!("{error}"))
+        }
     }
 
     async fn run_topic_cli(
@@ -1454,6 +1500,20 @@ impl Daemon {
     }
 }
 
+fn git_write_output_revision(
+    base: &str,
+    revision: String,
+    needs_user_report: bool,
+) -> Result<Option<String>> {
+    if revision == base {
+        if needs_user_report {
+            return Ok(None);
+        }
+        bail!("Git Write step did not create a new commit");
+    }
+    Ok(Some(revision))
+}
+
 fn spawn_pi_with_topic_launch_guard<G, T>(
     lock: impl FnOnce() -> G,
     cancel: &CancellationToken,
@@ -1468,7 +1528,6 @@ fn spawn_pi_with_topic_launch_guard<G, T>(
     }
     spawn()
 }
-
 fn executable(name: &str) -> Result<Option<PathBuf>> {
     std::env::var_os(name)
         .map(|value| {
@@ -1479,6 +1538,20 @@ fn executable(name: &str) -> Result<Option<PathBuf>> {
             Ok(path)
         })
         .transpose()
+}
+pub(crate) fn resolve_topic_opencode_executable(
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<PathBuf> {
+    if let Some(value) = environment.get(std::ffi::OsStr::new("FORMLESS_TOPIC_OPENCODE_EXE")) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            bail!("FORMLESS_TOPIC_OPENCODE_EXE must be an absolute executable path");
+        }
+        return Ok(path);
+    }
+    local_harness::resolve_executable(HarnessKind::OpenCode, environment).context(
+        "OpenCode executable was not found on an absolute PATH entry; configure FORMLESS_TOPIC_OPENCODE_EXE",
+    )
 }
 
 #[cfg(test)]

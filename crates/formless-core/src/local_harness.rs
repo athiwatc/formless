@@ -2,6 +2,7 @@
 
 pub mod acp;
 pub mod antigravity;
+pub mod opencode;
 
 use std::{collections::BTreeMap, ffi::OsString, fmt, path::PathBuf, process::Command};
 
@@ -16,6 +17,7 @@ pub mod muse;
 
 #[path = "local_harness_probe.rs"]
 mod readiness;
+pub(crate) use readiness::resolve_executable;
 pub use readiness::{
     acp_probe, blocking_probe, claude_probe, codex_probe, harness_availability, list_harnesses,
     ProbeContext,
@@ -147,8 +149,33 @@ pub(crate) fn validate_acp_agent(kind: Option<HarnessKind>, agent: Option<&str>)
     Ok(())
 }
 
+/// Runs an integrated interactive harness using the core's interaction contract.
+pub async fn run(
+    request: &HarnessRequest,
+    interactions: std::sync::Arc<dyn InteractionHandler>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<HarnessResult> {
+    validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    match request.kind {
+        HarnessKind::OpenCode => opencode::run(request, interactions, cancel).await,
+        _ => bail!("{:?} has no integrated interactive adapter; use its supported local harness entry point", request.kind),
+    }
+}
+
 fn validate_request(request: &HarnessRequest) -> Result<()> {
     validate_acp_agent(Some(request.kind), request.acp_agent.as_deref())?;
+    if request.kind == HarnessKind::OpenCode {
+        bail!("OpenCode requires interactive ACP; use local_harness::opencode::run.");
+    }
+    if request.kind == HarnessKind::Antigravity {
+        return Ok(());
+    }
+    if request.kind == HarnessKind::Acp {
+        bail!(
+            "{:?} adapter not integrated yet; use Claude or Codex for now",
+            request.kind
+        );
+    }
     if request.prompt.trim().is_empty() {
         bail!("harness prompt must not be empty");
     }
@@ -312,6 +339,7 @@ pub fn parse_output(kind: HarnessKind, stdout: &str) -> Result<HarnessResult> {
         HarnessKind::Codex => parse_codex(stdout),
         HarnessKind::Antigravity => antigravity::parse_output(stdout),
         HarnessKind::Pi => pi::parse_output(stdout),
+        HarnessKind::OpenCode => bail!("OpenCode uses ACP; run/JSONL output is unsupported."),
         HarnessKind::Muse => bail!("Muse Code requires the interactive harness runner"),
         _ => bail!("{kind:?} adapter not integrated yet; use Claude or Codex for now"),
     }
@@ -613,6 +641,15 @@ mod access_tests {
                     .unwrap_err()
                     .to_string()
                     .contains("bridge registration"));
+            } else if kind == HarnessKind::OpenCode {
+                assert!(command_spec(&request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("opencode::run"));
+                assert!(parse_output(kind, "{}")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ACP"));
             } else {
                 let expected = if kind == HarnessKind::Muse {
                     "requires the interactive harness runner"

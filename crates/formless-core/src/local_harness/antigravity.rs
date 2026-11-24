@@ -50,6 +50,21 @@ pub fn run(
     }
 }
 
+pub fn run_with_spawn(
+    request: &HarnessRequest,
+    permissions: &mut dyn PermissionHandler,
+    cancel: &CancellationToken,
+    spawn: &mut acp::ProcessSpawner,
+) -> Result<HarnessResult> {
+    let executable = require_selected_executable(request.executable.as_deref())?;
+    match acp::run_with_spawn(&SPEC, request, permissions, cancel, spawn) {
+        Err(error) if !executable_file(executable) => Err(error).context(format!(
+            "The Antigravity executable selected during readiness became unavailable; {EXECUTABLE_RETRY_GUIDANCE}"
+        )),
+        result => result,
+    }
+}
+
 /// Opens an `agy acp` session with the Formless bridge attached, without prompting.
 pub fn open_session(request: &HarnessRequest) -> Result<String> {
     require_selected_executable(request.executable.as_deref())?;
@@ -535,7 +550,11 @@ mod tests {
         )
         .await;
 
-        assert!(availability.installed);
+        assert!(
+            availability.installed,
+            "Antigravity availability failed: {}",
+            availability.detail.as_deref().unwrap_or("<no detail>")
+        );
         let expected = selected.to_string_lossy();
         assert_eq!(availability.version.as_deref(), Some(expected.as_ref()));
         assert_eq!(executable.as_deref(), Some(selected.as_path()));
@@ -699,6 +718,25 @@ mod tests {
             error.contains("topic_request_harness_substitute"),
             "{error}"
         );
+        let spawn_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawn_called_by_callback = spawn_called.clone();
+        let mut spawn = move |_: std::process::Command, _: &CancellationToken| {
+            spawn_called_by_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("spawn must not be called without an executable identity");
+        };
+        let guarded_error = super::run_with_spawn(
+            &request,
+            &mut RejectAll,
+            &CancellationToken::new(),
+            &mut spawn,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            guarded_error.contains("executable identity is missing"),
+            "{guarded_error}"
+        );
+        assert!(!spawn_called.load(std::sync::atomic::Ordering::SeqCst));
         let open_session_error = super::open_session(&request).unwrap_err().to_string();
         assert!(
             open_session_error.contains("executable identity is missing"),

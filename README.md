@@ -67,9 +67,9 @@ distinguishes installation from sign-in: an unknown sign-in status is not proof
 that a harness is signed in or authenticated.
 
 Current topic-step adapters are Claude Code and Codex via their official
-non-interactive CLIs, Pi via its attempt-private extension, Antigravity through
-its ACP integration, and Muse Code via its `muse serve` protocol. OpenCode,
-Grok Build, and additional ACP profiles are still in progress.
+non-interactive CLIs, Pi via its attempt-private extension, OpenCode and
+Antigravity through their ACP integrations, and Muse Code via its `muse serve`
+protocol. Grok Build and additional ACP profiles are still in progress.
 This list describes implemented integrations, not authenticated end-to-end validation.
 
 For topic runs with `agy` not on PATH, set `FORMLESS_TOPIC_ANTIGRAVITY_EXE`
@@ -124,7 +124,7 @@ scheduled Jobs plug into the same registry.
                                                          ├─ Main Chat · Topics · Runs (SQLite)
                                                          ├─ Tool registry ─▶ QuickJS sandbox
                                                          ├─ Providers: Chat Completions · Responses · Anthropic
-                                                         └─ Harness steps ─▶ Claude Code · Codex · Pi · Antigravity · Muse Code
+                                                         └─ Harness steps ─▶ Claude Code · Codex · Pi · OpenCode · Antigravity · Muse Code
 ```
 
 Architecture, the Tool system and self-optimisation: [docs/architecture.md](docs/architecture.md).

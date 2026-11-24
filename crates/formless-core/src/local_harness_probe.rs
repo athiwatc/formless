@@ -125,6 +125,13 @@ pub(super) fn lookup(
     }
     None
 }
+pub(crate) fn resolve_executable(
+    kind: HarnessKind,
+    environment: &BTreeMap<OsString, OsString>,
+) -> Option<PathBuf> {
+    lookup(kind, environment)
+}
+
 pub(super) fn availability(kind: HarnessKind, executable: Option<&Path>) -> HarnessAvailability {
     HarnessAvailability {
         kind,
@@ -302,7 +309,15 @@ async fn dispatch(
         HarnessKind::Claude => claude_probe(ctx).await,
         HarnessKind::Codex => codex_probe(ctx).await,
         HarnessKind::Pi => super::pi::availability(Some(&ctx.executable)).await,
-        HarnessKind::OpenCode => fallback_probe(kind, ctx).await,
+        HarnessKind::OpenCode => {
+            blocking_probe(
+                kind,
+                Some(ctx.executable.clone()),
+                ctx.environment.clone(),
+                super::opencode::availability,
+            )
+            .await
+        }
         HarnessKind::Antigravity => {
             blocking_probe(
                 kind,
