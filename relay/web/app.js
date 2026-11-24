@@ -4784,7 +4784,11 @@
       if (liveRender.session !== S.current || liveRender.root !== $("live")) return;
       if (liveRender.activity.isConnected && S.activity) updateText(liveRender.activityText, activityText(S.activity));
       for (const row of liveRender.rows.values()) {
-        if (row.node.isConnected && row.tool.elapsedMs == null) updateText(row.timer, elapsed(row.tool.started));
+        if (row.node.isConnected && row.tool.elapsedMs == null) {
+          const duration = elapsed(row.tool.started);
+          if (row.tool.status === "running") updateText(row.status, "Running · " + duration);
+          updateText(row.timer, duration);
+        }
       }
     }, { newContent: false });
   }

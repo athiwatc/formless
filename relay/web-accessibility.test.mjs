@@ -124,11 +124,11 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   c.withTranscriptLayout = render => render();
   c.statusRender = { text: null };
   const liveElement = {};
-  const row = { node: { isConnected: true }, tool: { elapsedMs: null, started: 0 }, timer: { data: '' } };
+  const row = { node: { isConnected: true }, tool: { status: 'running', elapsedMs: null, started: 0 }, status: { data: '' }, timer: { data: '' } };
   c.liveRender = { session: 'session', root: liveElement, activity: { isConnected: false }, rows: new Map([['tool', row]]) };
   c.$ = id => id === 'chat-announcer' ? announcer : id === 'live' ? liveElement : null;
-  let ticks = 0;
-  c.elapsed = () => `${++ticks}s`;
+  let elapsed = '1s';
+  c.elapsed = () => elapsed;
   vm.runInContext(fn('onEvent') + fn('updateElapsedTimers'), c);
 
   c.onEvent({ type: 'run_started', session_id: 'session', run_id: 'run' });
@@ -136,15 +136,21 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   c.onEvent({ type: 'tool_call_started', session_id: 'session', run_id: 'run', invocation_id: 'call', tool_name: 'read_file', arguments: '{}', depth: 0 });
   c.onEvent({ type: 'message_delta', session_id: 'session', delta: ' at a time' });
   c.updateElapsedTimers();
+  assert.equal(row.status.data, 'Running · 1s');
+  elapsed = '2s';
   advance(1000);
   c.updateElapsedTimers();
+  assert.equal(row.status.data, 'Running · 2s', 'the accessible duration refreshes on elapsed ticks');
   assert.equal(row.timer.data, '2s', 'the live timer rerenders while the run is streaming');
   assert.deepEqual(writes, ['Run started', 'Running read_file']);
 
   c.onEvent({ type: 'message_delta', session_id: 'session', delta: ' without announcements' });
+  elapsed = '3s';
   c.updateElapsedTimers();
+  elapsed = '4s';
   advance(1000);
   c.updateElapsedTimers();
+  assert.equal(row.status.data, 'Running · 4s');
   assert.deepEqual(writes, ['Run started', 'Running read_file'], 'tokens and timer ticks do not update the announcer');
 
   c.onEvent({ type: 'message_complete', session_id: 'session', message: { id: 'answer', role: 'assistant', seq: 1, content: 'The complete answer', meta: '{}' } });
