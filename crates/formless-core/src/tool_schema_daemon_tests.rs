@@ -242,6 +242,69 @@ fn legacy_object_input_schemas_are_omitted_from_provider_definitions() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn invalid_legacy_schema_does_not_consume_provider_filler_slots() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(None).unwrap();
+    let invalid_tool_id = store
+        .create_tool_version(
+            "a_legacy_string_input",
+            "legacy slot fixture",
+            r#"{"type":"string"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+        )
+        .unwrap()
+        .0
+        .id;
+    store
+        .create_tool_version(
+            "z_legacy_object_input",
+            "legacy slot fixture",
+            r#"{"type":"object"}"#,
+            "{}",
+            "function run(input){return input;}",
+            &Capabilities::default(),
+            64,
+            "agent",
+        )
+        .unwrap();
+
+    let _first = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    let second = toolreg::tool_definitions(&store, Some(&session.id), 1).unwrap();
+    assert!(
+        second.iter().any(|definition| {
+            definition["function"]["name"].as_str() == Some("z_legacy_object_input")
+        }),
+        "valid Tool stayed out of the frozen filler listing: {second:?}"
+    );
+    assert!(
+        second.iter().all(|definition| {
+            definition["function"]["name"].as_str() != Some("a_legacy_string_input")
+        }),
+        "invalid legacy Tool was listed: {second:?}"
+    );
+
+    let pre_frozen_session = store.create_session(None).unwrap();
+    store
+        .load_session_tools(
+            &pre_frozen_session.id,
+            std::slice::from_ref(&invalid_tool_id),
+            "filler",
+        )
+        .unwrap();
+    let refilled = toolreg::tool_definitions(&store, Some(&pre_frozen_session.id), 1).unwrap();
+    assert!(
+        refilled.iter().any(|definition| {
+            definition["function"]["name"].as_str() == Some("z_legacy_object_input")
+        }),
+        "existing frozen filler was not replaced after invalid Tool omission: {refilled:?}"
+    );
+}
+
 #[tokio::test]
 async fn schema_save_flag_is_required_despite_forged_author_and_reports_reach_reads() {
     let env = crate::credential_env::EnvGuard::isolated();

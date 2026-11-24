@@ -1397,7 +1397,19 @@ fn definitions(
     inline_limit: usize,
     persist: bool,
 ) -> Result<Vec<Value>> {
-    let tools = agent_tools(store)?;
+    let mut invalid_tool_ids = std::collections::HashSet::new();
+    let mut tools = Vec::new();
+    for info in agent_tools(store)? {
+        let Some((_, version)) = store.get_tool_current(&info.id)? else {
+            continue;
+        };
+        if let Err(error) = validate_stored_input_schema(&version.input_schema) {
+            warn_omitted_tool_schema(&info.id, &info.name, &error);
+            invalid_tool_ids.insert(info.id);
+        } else {
+            tools.push(info);
+        }
+    }
     // Every Session's listing is frozen at its first step (in small and
     // large registries alike): Tool definitions are part of the cached
     // prompt prefix, so a Tool created or used in another Session must not
@@ -1408,9 +1420,25 @@ fn definitions(
             Some(s) => store.session_tool_ids(s)?,
             None => Default::default(),
         };
+        if let Some(s) = session_id {
+            for info in tools.iter().filter(|tool| loaded.contains(&tool.id)) {
+                if let Some((_, definition)) = store.pinned_definition(s, &info.id)? {
+                    if let Ok(definition) = serde_json::from_str::<Value>(&definition) {
+                        if let Err(error) = validate_definition_input_schema(&definition) {
+                            warn_omitted_tool_schema(&info.id, &info.name, &error);
+                            invalid_tool_ids.insert(info.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let invalid_loaded_count = loaded
+            .iter()
+            .filter(|id| invalid_tool_ids.contains(*id))
+            .count();
         let active_ids: std::collections::HashSet<&str> =
             tools.iter().map(|tool| tool.id.as_str()).collect();
-        loaded.retain(|id| active_ids.contains(id.as_str()));
+        loaded.retain(|id| active_ids.contains(id.as_str()) && !invalid_tool_ids.contains(id));
         let frozen = match session_id {
             Some(s) => store.session_has_filler(s)?,
             None => false,
@@ -1434,6 +1462,25 @@ fn definitions(
                 .into_iter()
                 .take(inline_limit.saturating_sub(loaded.len()))
                 .map(|t| t.id.clone())
+                .collect();
+            if let Some(s) = session_id.filter(|_| persist) {
+                store.load_session_tools(s, &filler, "filler")?;
+            }
+            loaded.extend(filler);
+        } else if invalid_loaded_count > 0 {
+            let mut rest: Vec<&ToolInfo> = tools
+                .iter()
+                .filter(|tool| !tool.pinned && !loaded.contains(&tool.id))
+                .collect();
+            rest.sort_by_key(|tool| std::cmp::Reverse(tool.invocations));
+            let filler: Vec<String> = rest
+                .into_iter()
+                .take(
+                    inline_limit
+                        .saturating_sub(loaded.len())
+                        .min(invalid_loaded_count),
+                )
+                .map(|tool| tool.id.clone())
                 .collect();
             if let Some(s) = session_id.filter(|_| persist) {
                 store.load_session_tools(s, &filler, "filler")?;
