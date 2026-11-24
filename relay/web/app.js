@@ -1562,6 +1562,7 @@
    * Keep typography and the main layout width native; only the keyboard's
    * available height and floating controls follow the visible rectangle. */
   let viewportFrame = 0;
+  let viewportGeometryPending = false;
   let composerInputWidth = 0;
   let viewportPrinting = false;
   function viewportBounds() {
@@ -1666,6 +1667,8 @@
   function syncViewport() {
     viewportFrame = 0;
     if (viewportPrinting || document.hidden || matchMedia("print").matches) return;
+    const geometryChanged = viewportGeometryPending;
+    viewportGeometryPending = false;
     const viewport = viewportBounds(), root = document.documentElement;
     const fontSize = parseFloat(getComputedStyle(root).fontSize) || 16;
     const zoomed = Math.abs(viewport.scale - 1) > .01;
@@ -1727,7 +1730,7 @@
         const chrome = focused?.closest(".topbar, .statusbar");
         if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
       }
-    }, { newContent: false });
+    }, { newContent: false, geometryChanged });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
     if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor();
@@ -1735,8 +1738,13 @@
   function scheduleViewportSync() {
     if (!viewportFrame) viewportFrame = requestAnimationFrame(syncViewport);
   }
-  window.addEventListener("resize", scheduleViewportSync);
-  window.visualViewport?.addEventListener("resize", scheduleViewportSync);
+  function scheduleViewportGeometrySync() {
+    viewportGeometryPending = true;
+    invalidateReadingRoots();
+    scheduleViewportSync();
+  }
+  window.addEventListener("resize", scheduleViewportGeometrySync);
+  window.visualViewport?.addEventListener("resize", scheduleViewportGeometrySync);
   window.visualViewport?.addEventListener("scroll", scheduleViewportSync);
   document.addEventListener("focusin", scheduleViewportSync);
   document.addEventListener("focusout", scheduleViewportSync);
@@ -3757,7 +3765,7 @@
         img.addEventListener("load", () => {
           // The decoded image may already have resized. Keep the reading
           // anchor captured before that reflow, even after a recent scroll.
-          if (current() && $("transcript").contains(img)) settleReadingLayout();
+          readingDiagramLoaded(img, current);
         }, { once: true });
         update(() => {
           view.replaceChildren(img);
@@ -5262,7 +5270,8 @@
   // Keep the last committed reading block, not geometry captured after reflow.
   const reading = { session: null, saved: new Map(), anchor: null, unseen: new Map(), unseenIds: new Set(), deferred: new Map(), pendingContent: false, pendingLive: false, afterSeq: -1,
     depth: 0, changed: false, adjustment: 0, intentUntil: 0, direction: 0, writeTop: null,
-    writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set() };
+    writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set(),
+    roots: null, rootTree: null, rootTreeSize: 0 };
   const printMedia = window.matchMedia("print");
   const anchorBlocks = "p, pre, summary, li, h1, h2, h3, h4, .bubble, .diagram-view, .stream-tail";
   function visibleReadingBounds() {
@@ -5283,19 +5292,76 @@
     const bounds = visibleReadingBounds();
     return bounds.height > 0 && bounds.width > 0;
   }
+  function invalidateReadingRoots() {
+    reading.roots = null;
+    reading.rootTree = null;
+    reading.rootTreeSize = 0;
+  }
+  function readingGeometryChanged(records) {
+    const box = $("transcript");
+    const changed = records.some(record => record.type !== "attributes" || record.target !== box || record.attributeName !== "style");
+    if (changed) invalidateReadingRoots();
+    return changed;
+  }
+  function readingDiagramLoaded(img, isCurrent) {
+    if (!isCurrent() || !$("transcript").contains(img)) return;
+    invalidateReadingRoots();
+    settleReadingLayout();
+  }
+  function readingDetailsWillToggle(event) {
+    if (event.target?.closest?.("summary")?.closest("details")) invalidateReadingRoots();
+  }
+  function watchReadingDetails(box) {
+    box.addEventListener("click", readingDetailsWillToggle, true);
+    box.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") readingDetailsWillToggle(event);
+    }, true);
+  }
+  function readingRoots(box, origin) {
+    if (!reading.roots) {
+      const scrollTop = box.scrollTop, adjustment = reading.adjustment;
+      // Normalize bottoms into transcript content space so scrollTop and the
+      // reading-offset translation only change the query threshold.
+      reading.roots = [...box.querySelectorAll("[data-message-id], [data-live-root]")].map(node => {
+        const rect = node.getBoundingClientRect();
+        return { node, height: rect.height, bottom: rect.bottom - origin + scrollTop - adjustment };
+      });
+      reading.rootTreeSize = 1;
+      while (reading.rootTreeSize < reading.roots.length) reading.rootTreeSize *= 2;
+      reading.rootTree = Array(reading.rootTreeSize * 2).fill(-Infinity);
+      for (let index = 0; index < reading.roots.length; index++) {
+        if (reading.roots[index].height > 0) reading.rootTree[reading.rootTreeSize + index] = reading.roots[index].bottom;
+      }
+      // Range maxima preserve selector order without assuming DOM order is
+      // geometric order, and skip whole ranges that cannot qualify.
+      for (let index = reading.rootTreeSize - 1; index > 0; index--) {
+        reading.rootTree[index] = Math.max(reading.rootTree[index * 2], reading.rootTree[index * 2 + 1]);
+      }
+    }
+    return reading.roots;
+  }
+  function firstReadingRoot(start, threshold, left, right, index) {
+    if (right <= start || reading.rootTree[index] <= threshold) return -1;
+    if (right - left === 1) return left < reading.roots.length ? left : -1;
+    const middle = (left + right) >> 1;
+    const found = firstReadingRoot(start, threshold, left, middle, index * 2);
+    return found >= 0 ? found : firstReadingRoot(start, threshold, middle, right, index * 2 + 1);
+  }
   function captureReadingAnchor() {
     if (!readingVisible()) return null;
+    // Take pending records before using the index; observer callbacks may not
+    // have run yet for mutations in this task.
+    readingGeometryChanged(readingRootChanges.takeRecords());
     const box = $("transcript"), bounds = visibleReadingBounds();
     const origin = box.getBoundingClientRect().top;
-    // These are the first four eligible roots in DOM order, not necessarily
-    // inside the viewport. Skip the remaining rectangle reads, but keep the
-    // same lower bound and do not assume the roots are sorted by geometry.
+    const roots = readingRoots(box, origin);
+    const threshold = bounds.top - origin + box.scrollTop - reading.adjustment + 1;
     const messages = [];
-    for (const node of box.querySelectorAll("[data-message-id], [data-live-root]")) {
-      const r = node.getBoundingClientRect();
-      if (!(r.height && r.bottom > bounds.top + 1)) continue;
-      messages.push(node);
-      if (messages.length === 4) break;
+    for (let start = 0; messages.length < 4;) {
+      const index = firstReadingRoot(start, threshold, 0, reading.rootTreeSize, 1);
+      if (index < 0) break;
+      messages.push(roots[index].node);
+      start = index + 1;
     }
     const candidates = [];
     for (const message of messages) {
@@ -5397,6 +5463,7 @@
   }
   function resetReadingSession(id) {
     if (reading.session === id) return;
+    invalidateReadingRoots();
     if (reading.session != null) {
       const anchor = reading.anchor || (!S.follow && captureReadingAnchor());
       const unseenIds = [...reading.unseenIds, ...[...reading.unseen.keys(), ...reading.deferred.keys()].map(node =>
@@ -5491,6 +5558,8 @@
     $("jump").classList.toggle("hidden", S.follow || !reading.unseen.size);
   }
   function observeReadingNodes(records) {
+    const changed = readingGeometryChanged(records);
+    const pending = readingGeometryChanged(readingRootChanges.takeRecords());
     for (const record of records) if (record.type === "childList") {
       for (const root of record.addedNodes) if (root instanceof Element) {
         const nodes = root.matches("[data-message-id], [data-live-root]") ? [root] : [...root.querySelectorAll("[data-message-id], [data-live-root]")];
@@ -5501,6 +5570,7 @@
         for (const node of nodes) if (!$("transcript").contains(node)) { reading.observed.delete(node); readingResize.unobserve(node); }
       }
     }
+    return changed || pending;
   }
   function settleReadingLayout() {
     if (!readingVisible() || reading.depth || reading.inputFrame) return;
@@ -5509,7 +5579,7 @@
     else if (!reading.anchor) reading.anchor = captureReadingAnchor();
     updateReadingPill();
   }
-  function withTranscriptLayout(update, { newContent = false } = {}) {
+  function withTranscriptLayout(update, { newContent = false, geometryChanged = false } = {}) {
     resetReadingSession(S.current);
     const outer = !reading.depth++;
     if (outer) {
@@ -5524,6 +5594,7 @@
       if (outer) {
         const records = readingChanges.takeRecords();
         observeReadingNodes(records);
+        if (geometryChanged) invalidateReadingRoots();
         restoreReadingAnchor();
         if (reading.changed) markNewOutput(records);
         if (S.follow) reading.anchor = null;
@@ -5533,13 +5604,21 @@
     }
   }
   const readingChanges = new MutationObserver(records => {
-    observeReadingNodes(records);
-    settleReadingLayout();
+    if (observeReadingNodes(records)) settleReadingLayout();
   });
-  readingChanges.observe($("transcript"), { childList: true, subtree: true,
-    characterData: true, characterDataOldValue: true, attributes: true, attributeFilter: ["open", "class"] });
-  const readingResize = new ResizeObserver(settleReadingLayout);
+  const readingRootChanges = new MutationObserver(readingGeometryChanged);
+  const readingMutationOptions = { childList: true, subtree: true,
+    characterData: true, characterDataOldValue: true, attributes: true,
+    attributeFilter: ["open", "class", "style", "hidden", "data-message-id", "data-live-root"] };
+  readingChanges.observe($("transcript"), readingMutationOptions);
+  readingRootChanges.observe($("transcript"), readingMutationOptions);
+  function readingResizeChanged() {
+    invalidateReadingRoots();
+    settleReadingLayout();
+  }
+  const readingResize = new ResizeObserver(readingResizeChanged);
   readingResize.observe($("transcript"));
+  watchReadingDetails($("transcript"));
   function resumeReadingFollow() {
     S.follow = true;
     reading.unseen.clear(); reading.unseenIds.clear(); reading.deferred.clear();
