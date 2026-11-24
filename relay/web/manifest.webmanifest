@@ -9,16 +9,16 @@
   "display": "standalone",
   "shortcuts": [
     {
-      "name": "New Session",
-      "short_name": "New",
-      "description": "Start a new Session in Formless.",
-      "url": "/?action=new-session",
+      "name": "Main Chat",
+      "short_name": "Main Chat",
+      "description": "Open Main Chat in Formless.",
+      "url": "/?action=main-chat",
       "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
     },
     {
       "name": "Approvals",
       "short_name": "Approvals",
-      "description": "Review pending approvals in Formless.",
+      "description": "Manage tool grants in Formless.",
       "url": "/?view=approvals",
       "icons": [{ "src": "icon-192.png", "sizes": "192x192", "type": "image/png" }]
     }

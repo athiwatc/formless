@@ -131,11 +131,12 @@ test('malformed fragment pairs preserve independently valid pairs and plus signs
 
 test('incoming share content is appended to the selected Topic Chat draft and files stay staged', async () => {
   const staged = [], stored = [];
+  let sends = 0;
   const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
     File, Blob,
-    attachFiles: async files => { staged.push(...files); return []; },
+    attachFiles: async (files, sessionId, scope) => { staged.push({ files, sessionId, scope }); return []; },
     storeIncomingShare: async share => { stored.push(share); },
-    submit: () => { throw new Error('sharing must not send'); },
+    submit: () => { sends++; },
   });
   c.S.current = 'topic-chat';
   c.$('input').value = 'keep my draft';
@@ -145,40 +146,372 @@ test('incoming share content is appended to the selected Topic Chat draft and fi
   }), true);
   assert.equal(c.$('input').value, 'keep my draft\n\nLook at this\nhttps://example.test/page');
   assert.equal(c.prefs.get('draft:test-room:topic-chat'), c.$('input').value);
-  assert.deepEqual(staged, [photo]);
+  assert.deepEqual(staged, [{ files: [photo], sessionId: 'topic-chat', scope: 'test-room' }]);
+  assert.equal(stored.at(-1).draftApplied, true);
+  assert.equal(stored.at(-1).draftSessionId, 'topic-chat');
+  assert.equal(stored.at(-1).draftScope, 'test-room');
+  assert.equal(sends, 0);
+});
+
+test('identical repeat shares append independently instead of being deduplicated by text', async () => {
+  const stored = [];
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    storeIncomingShare: async share => stored.push({ ...share }),
+    attachFiles: async () => [],
+  });
+  c.S.current = 'A';
+  c.$('input').value = 'existing draft';
+  for (const token of ['share-one', 'share-two']) {
+    assert.equal(await c.applyIncomingShare(token, { text: 'same content', files: [], draftApplied: false }), true);
+  }
+  assert.equal(c.$('input').value, 'existing draft\n\nsame content\n\nsame content');
+  const finalRecords = new Map(stored.map(share => [share.token, share]));
+  assert.deepEqual([...finalRecords.values()].map(share => [share.token, share.draftApplied]), [
+    ['share-one', true], ['share-two', true],
+  ]);
+});
+
+test('failed draft persistence leaves the per-share marker false for a safe retry', async () => {
+  const prefs = memoryPrefs(), baseSet = prefs.set.bind(prefs), stored = [];
+  let writesAllowed = false, attachCalls = 0;
+  prefs.set = (key, value) => writesAllowed ? baseSet(key, value) : false;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    prefs,
+    storeIncomingShare: async share => stored.push({ ...share, files: [...share.files] }),
+    attachFiles: async () => { attachCalls++; return []; },
+  });
+  c.S.current = 'A';
+  const share = { text: 'shared content', files: [], draftApplied: false };
+  assert.equal(await c.applyIncomingShare('share-token', share), false);
+  assert.equal(stored.at(-1).draftApplied, false);
+  assert.equal(c.$('input').value, 'shared content');
+  assert.equal(c.prefs.get('draft:test-room:A', null), null);
+
+  assert.equal(await c.applyIncomingShare('share-token', stored[0]), false);
+  assert.equal(stored.at(-1).draftApplied, false);
+  assert.equal(c.prefs.get('draft:test-room:A', null), null);
+  assert.equal(attachCalls, 0);
+
+  writesAllowed = true;
+  c.$('input').value = c.prefs.get('draft:test-room:A', '');
+  assert.equal(await c.applyIncomingShare('share-token', stored[0]), true);
+  assert.equal(c.$('input').value, 'shared content');
+  assert.equal(c.prefs.get('draft:test-room:A'), 'shared content');
   assert.equal(stored.at(-1).draftApplied, true);
 });
 
-test('incoming shares from a Topic Chat attempt use its writable parent chat', async () => {
-  const opened = [], staged = [];
+test('share inbox read does not apply to a Session selected while IndexedDB is resolving', async () => {
+  const gate = deferred(), notes = [];
+  let applied = 0, deleted = 0;
+  const c = setup(['handleLaunchRoute'], {
+    launchRouteHandled: false, launchAction: null, launchShareError: false,
+    launchShareToken: 'share-token', launchView: null,
+    readIncomingShare: () => gate.promise,
+    applyIncomingShare: async () => { applied++; return true; },
+    deleteIncomingShare: async () => { deleted++; },
+    note: message => notes.push(message),
+  });
+  c.S.current = 'A';
+  const pending = c.handleLaunchRoute();
+  c.S.current = 'B';
+  gate.resolve({ text: 'shared content', files: [] });
+  await pending;
+  assert.equal(applied, 0);
+  assert.equal(deleted, 0);
+  assert.match(notes[0], /changed while the share was loading/);
+});
+
+test('share destination write rechecks selection before changing the composer or attaching files', async () => {
+  const gate = deferred(), photo = new File(['photo'], 'photo.png', { type: 'image/png' });
+  let attached = 0;
   const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
     File, Blob,
-    currentTopicAttempt: () => ({ conversation_session_id: 'attempt' }),
+    storeIncomingShare: async () => gate.promise,
+    attachFiles: async () => { attached++; return []; },
+  });
+  c.S.current = 'A';
+  c.$('input').value = 'A draft';
+  const pending = c.applyIncomingShare('share-token', { text: 'shared', files: [photo], draftApplied: false });
+  c.S.current = 'B';
+  c.$('input').value = 'B draft';
+  gate.resolve();
+  assert.equal(await pending, false);
+  assert.equal(c.$('input').value, 'B draft');
+  assert.equal(c.prefs.get('draft:test-room:A', null), null);
+  assert.equal(attached, 0);
+});
+
+test('share destination scope change after an IndexedDB write prevents composer and attachment access', async () => {
+  const gate = deferred(), photo = new File(['photo'], 'photo.png', { type: 'image/png' });
+  let attached = 0;
+  const c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    File, Blob,
+    storeIncomingShare: async () => gate.promise,
+    attachFiles: async () => { attached++; return []; },
+  });
+  c.S.current = 'A';
+  c.$('input').value = 'A draft';
+  const pending = c.applyIncomingShare('share-token', { text: 'shared', files: [photo], draftApplied: false });
+  c.S.storageScope = 'other-room';
+  c.$('input').value = 'other room draft';
+  gate.resolve();
+  assert.equal(await pending, false);
+  assert.equal(c.$('input').value, 'other room draft');
+  assert.equal(c.prefs.get('draft:test-room:A', null), null);
+  assert.equal(attached, 0);
+});
+
+test('share marker write rechecks selection before attachment upload begins', async () => {
+  const gate = deferred();
+  let stores = 0, signalMarkerStore, attached = 0;
+  const markerStoreEntered = new Promise(resolve => { signalMarkerStore = resolve; });
+  const c = setup(['incomingShareText', 'applyIncomingShare', 'saveDraft'], {
+    storeIncomingShare: async () => {
+      stores++;
+      if (stores === 2) { signalMarkerStore(); await gate.promise; }
+    },
+    attachFiles: async () => { attached++; return []; },
+  });
+  c.S.current = 'A';
+  c.$('input').value = 'A draft';
+  const pending = c.applyIncomingShare('share-token', { text: 'shared', files: [], draftApplied: false });
+  await markerStoreEntered;
+  c.S.current = 'B';
+  c.$('input').value = 'B draft';
+  gate.resolve();
+  assert.equal(await pending, false);
+  assert.equal(c.$('input').value, 'B draft');
+  assert.equal(c.prefs.get('draft:test-room:A'), 'A draft\n\nshared');
+  assert.equal(attached, 0);
+});
+
+test('incoming shares from a Topic Chat attempt use its writable parent chat', async () => {
+  const opened = [], staged = [], stored = [];
+  let c;
+  c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    File, Blob,
+    currentTopicAttempt: () => c.S.current === 'attempt' ? ({ conversation_session_id: 'attempt' }) : null,
     topicForSession: () => ({ topic_session_id: 'topic-chat' }),
     openSession: async id => { opened.push(id); c.S.current = id; c.$('input').value = 'topic draft'; },
-    attachFiles: async files => { staged.push(...files); return []; },
-    storeIncomingShare: async () => {},
+    attachFiles: async (files, sessionId, scope) => { staged.push({ files, sessionId, scope }); return []; },
+    storeIncomingShare: async share => { stored.push(share); },
   });
   c.S.current = 'attempt';
   assert.equal(await c.applyIncomingShare('share-token', { text: 'shared text', files: [], draftApplied: false }), true);
   assert.deepEqual(opened, ['topic-chat']);
   assert.equal(c.S.current, 'topic-chat');
   assert.equal(c.$('input').value, 'topic draft\n\nshared text');
-  assert.deepEqual(staged, []);
+  assert.deepEqual(staged, [{ files: [], sessionId: 'topic-chat', scope: 'test-room' }]);
+  assert.equal(stored.at(-1).draftSessionId, 'topic-chat');
 });
 
-test('app shortcut launch routes create a Session and open approvals', async () => {
+test('incoming share falls back to Main Chat when the Topic Chat parent cannot be opened', async () => {
+  const opened = [], stored = [];
+  let c;
+  c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    currentTopicAttempt: () => c.S.current === 'attempt' ? ({ conversation_session_id: 'attempt' }) : null,
+    topicForSession: () => ({ topic_session_id: 'topic-chat' }),
+    openSession: async id => {
+      opened.push(id);
+      c.S.current = id;
+      c.S.sessionLoad = { id, status: 'failed' };
+    },
+    openMainChat: async selected => {
+      assert.deepEqual({ ...selected }, { sessionId: 'topic-chat', scope: 'test-room' });
+      c.S.current = 'main';
+      c.S.mainChat = { id: 'main' };
+      c.S.sessionLoad = { id: 'main', status: 'loaded' };
+      c.$('input').value = 'Main draft';
+      return true;
+    },
+    attachFiles: async () => [],
+    storeIncomingShare: async share => stored.push({ ...share }),
+  });
+  c.S.current = 'attempt';
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'shared text', files: [], draftApplied: false }), true);
+  assert.deepEqual(opened, ['topic-chat']);
+  assert.equal(c.S.current, 'main');
+  assert.equal(c.$('input').value, 'Main draft\n\nshared text');
+  assert.equal(stored.at(-1).draftSessionId, 'main');
+});
+
+test('incoming share with no current Session opens Main Chat rather than creating a regular Session', async () => {
+  const stored = [], attached = [];
+  let c;
+  c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    openMainChat: async selected => {
+      assert.deepEqual({ ...selected }, { sessionId: null, scope: 'test-room' });
+      c.S.mainChat = { id: 'main' };
+      c.S.current = 'main';
+      c.S.sessionLoad = { id: 'main', status: 'loaded' };
+      c.$('input').value = 'Main draft';
+      return true;
+    },
+    newSession: () => assert.fail('share must not create a legacy regular Session'),
+    attachFiles: async (files, sessionId, scope) => { attached.push({ files, sessionId, scope }); return []; },
+    storeIncomingShare: async share => stored.push({ ...share }),
+  });
+  c.S.current = null;
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'shared', files: [], draftApplied: false }), true);
+  assert.equal(c.S.current, 'main');
+  assert.equal(c.$('input').value, 'Main draft\n\nshared');
+  assert.equal(stored.at(-1).draftSessionId, 'main');
+  assert.deepEqual(attached, [{ files: [], sessionId: 'main', scope: 'test-room' }]);
+});
+
+test('incoming share retry reopens its original Session after partial upload failure', async () => {
+  const prefs = memoryPrefs(), uploads = [], opened = [];
+  const original = new File(['first'], 'first.png', { type: 'image/png' });
+  const retry = new File(['retry'], 'retry.png', { type: 'image/png' });
+  let savedShare, sends = 0, first;
+  first = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    prefs, File, Blob,
+    attachFiles: async files => { uploads.push({ session: first.S.current, names: files.map(file => file.name) }); return [retry]; },
+    storeIncomingShare: async share => { savedShare = { ...share, files: [...share.files] }; },
+    submit: () => { sends++; },
+  });
+  first.S.current = 'A';
+  first.S.sessions = [{ id: 'A' }, { id: 'B' }];
+  first.$('input').value = 'A draft';
+  assert.equal(await first.applyIncomingShare('share-token', {
+    text: 'shared content', files: [original, retry], draftApplied: false,
+  }), false);
+  assert.deepEqual(uploads, [{ session: 'A', names: ['first.png', 'retry.png'] }]);
+  assert.equal(savedShare.draftSessionId, 'A');
+  assert.equal(savedShare.draftScope, 'test-room');
+  assert.equal(savedShare.draftApplied, true);
+  assert.deepEqual(savedShare.files.map(file => file.name), ['retry.png']);
+  assert.equal(first.prefs.get('draft:test-room:A'), 'A draft\n\nshared content');
+
+  let resumed;
+  resumed = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    prefs, File, Blob,
+    attachFiles: async files => { uploads.push({ session: resumed.S.current, names: files.map(file => file.name) }); return []; },
+    openSession: async id => {
+      opened.push(id);
+      if (resumed.S.current) resumed.saveDraft(resumed.S.current, resumed.$('input').value);
+      resumed.S.current = id;
+      resumed.$('input').value = resumed.prefs.get('draft:test-room:' + id, '');
+    },
+    storeIncomingShare: async share => { savedShare = { ...share, files: [...share.files] }; },
+    submit: () => { sends++; },
+  });
+  resumed.S.current = 'B';
+  resumed.S.sessions = [{ id: 'A' }, { id: 'B' }];
+  resumed.$('input').value = 'B draft';
+  resumed.saveDraft('B', 'B draft');
+  assert.equal(await resumed.applyIncomingShare('share-token', savedShare), true);
+  assert.deepEqual(opened, ['A']);
+  assert.deepEqual(uploads, [
+    { session: 'A', names: ['first.png', 'retry.png'] },
+    { session: 'A', names: ['retry.png'] },
+  ]);
+  assert.equal(resumed.$('input').value, 'A draft\n\nshared content');
+  assert.equal(resumed.prefs.get('draft:test-room:B'), 'B draft');
+  assert.deepEqual(savedShare.files, []);
+  assert.equal(sends, 0);
+});
+
+test('incoming share from a Topic Chat attempt without a parent falls back to Main Chat', async () => {
+  let stored = 0, attached = 0, c;
+  c = setup(['incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft'], {
+    currentTopicAttempt: () => c.S.current === 'attempt' ? ({ conversation_session_id: 'attempt' }) : null,
+    topicForSession: () => ({ attempts: [{ conversation_session_id: 'attempt' }] }),
+    openMainChat: async selected => {
+      assert.deepEqual({ ...selected }, { sessionId: 'attempt', scope: 'test-room' });
+      c.S.current = 'main';
+      c.S.mainChat = { id: 'main' };
+      c.S.sessionLoad = { id: 'main', status: 'loaded' };
+      c.$('input').value = 'Main draft';
+      return true;
+    },
+    attachFiles: async (files, sessionId) => { attached += files.length; assert.equal(sessionId, 'main'); return []; },
+    storeIncomingShare: async () => { stored++; },
+  });
+  c.S.current = 'attempt';
+  c.$('input').value = 'read-only transcript';
+  assert.equal(await c.applyIncomingShare('share-token', { text: 'shared text', files: [], draftApplied: false }), true);
+  assert.equal(c.S.current, 'main');
+  assert.equal(c.$('input').value, 'Main draft\n\nshared text');
+  assert.equal(stored, 3);
+  assert.equal(attached, 0);
+});
+
+test('staged share attachments restore as chips after the inbox record is complete', async () => {
+  const prefs = memoryPrefs();
+  const attachment = { id: 'pending-file', name: 'photo.png', mime: 'image/png', bytes: 5 };
+  const c = setup([
+    'incomingShareText', 'incomingShareFile', 'applyIncomingShare', 'saveDraft', 'attachFiles',
+    'refreshAttachmentInventory', 'saveAttachmentInventory', 'loadAttachmentInventory', 'attachmentStorageKey',
+  ], {
+    prefs, File, Blob,
+    uploadFile: async (sessionId, file) => ({ ...attachment, name: file.name, session_id: sessionId }),
+    request: async request => request.type === 'list_pending_attachments' ? { attachments: [attachment] } : {},
+    storeIncomingShare: async () => {},
+  });
+  c.S.current = 'A';
+  const photo = new File(['photo'], 'photo.png', { type: 'image/png' });
+  assert.equal(await c.applyIncomingShare('share-token', { files: [photo], draftApplied: false }), true);
+  assert.deepEqual(c.S.chips.A, [attachment]);
+
+  const reloaded = setup([
+    'refreshAttachmentInventory', 'saveAttachmentInventory', 'loadAttachmentInventory', 'attachmentStorageKey',
+  ], { prefs });
+  reloaded.S.storageScope = 'test-room';
+  reloaded.S.daemonOnline = false;
+  reloaded.S.channel = null;
+  await reloaded.refreshAttachmentInventory('A');
+  assert.deepEqual(reloaded.S.chips.A, [attachment]);
+});
+
+test('app shortcut launch opens Main Chat and approvals', async () => {
   const calls = [];
   const c = setup(['handleLaunchRoute'], {
     launchRouteHandled: false,
-    launchAction: 'new-session', launchShareError: false, launchShareToken: null, launchView: 'approvals',
-    newSession: async () => { calls.push('new-session'); return {}; },
+    launchAction: 'main-chat', launchShareError: false, launchShareToken: null, launchView: 'approvals',
+    openMainChat: async () => { calls.push('main-chat'); return true; },
     stripLaunchParams: keys => calls.push(['strip', ...keys]),
     setView: view => calls.push(['view', view]),
   });
   await c.handleLaunchRoute();
-  assert.deepEqual(calls, ['new-session', ['strip', 'action'], ['view', 'approvals'], ['strip', 'view']]);
+  assert.deepEqual(calls, ['main-chat', ['strip', 'action'], ['view', 'approvals'], ['strip', 'view']]);
   assert.equal(c.launchRouteHandled, true);
+});
+
+test('Main Chat shortcut resolves or creates Main Chat through the existing Main Chat path', async () => {
+  let refreshed, opened, c;
+  c = setup(['openMainChat'], {
+    refreshTopics: async initial => { refreshed = initial; c.S.mainChat = { id: 'main' }; },
+    openSession: async id => { opened = id; c.S.current = id; c.S.sessionLoad = { id, status: 'loaded' }; },
+  });
+  c.S.mainChat = null;
+  assert.equal(await c.openMainChat(), true);
+  assert.equal(refreshed, true);
+  assert.equal(opened, 'main');
+  assert.equal(c.S.current, 'main');
+});
+
+test('generic service-worker push clicks focus pending work, not the grants view', () => {
+  const calls = [];
+  const c = setup(['handleServiceWorkerMessage'], {
+    focusPending: () => calls.push('pending'),
+    openNotificationSession: async session => calls.push(session),
+  });
+  c.handleServiceWorkerMessage({ data: { type: 'formless-focus-pending' } });
+  c.handleServiceWorkerMessage({ data: { type: 'formless-open-notification-session', session: 'topic-chat' } });
+  assert.deepEqual(calls, ['pending', 'topic-chat']);
+});
+
+test('cold generic push route focuses pending work after the saved Session opens', async () => {
+  const calls = [];
+  const c = setup(['handleLaunchRoute'], {
+    launchRouteHandled: false,
+    launchAction: 'focus-pending', launchShareError: false, launchShareToken: null, launchView: null,
+    focusPending: () => calls.push('pending'),
+    stripLaunchParams: keys => calls.push(['strip', ...keys]),
+  });
+  await c.handleLaunchRoute();
+  assert.deepEqual(calls, ['pending', ['strip', 'action']]);
 });
 
 test('environment approvals distinguish credential words from ordinary name fragments', () => {

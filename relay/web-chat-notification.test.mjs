@@ -102,5 +102,5 @@ test("worker notification opens the sending tab or a Session link if it was clos
   await click(notice.data);
   assert.deepEqual(calls.slice(-2), ["close", "/#s=test%20session"]);
   await click(undefined);
-  assert.deepEqual(calls.slice(-2), ["close", "focus"]);
+  assert.deepEqual(calls.slice(-3), ["close", "focus", { type: "formless-focus-pending" }]);
 });

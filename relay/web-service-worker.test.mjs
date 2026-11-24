@@ -6,6 +6,14 @@ import { webcrypto } from "node:crypto";
 
 const source = readFileSync(new URL("./web/sw.js", import.meta.url), "utf8");
 const manifest = JSON.parse(readFileSync(new URL("./web/manifest.webmanifest", import.meta.url), "utf8"));
+function workerListeners({ self: worker = {}, ...globals } = {}) {
+  const listeners = {};
+  runInNewContext(source, {
+    self: { ...worker, addEventListener: (type, handler) => { listeners[type] = handler; } },
+    location: { origin: "https://formless.example" }, URL, Response, ...globals,
+  });
+  return listeners;
+}
 function fetchEvent({ fetch, caches, path = "/app.js", method = "GET", request, globals = {} }) {
   const listeners = {};
   runInNewContext(source, {
@@ -109,11 +117,71 @@ test("unsuccessful responses and non-shell requests do not write to the cache", 
   }
 });
 
-test("installed app shortcuts route to a new Session and approvals", () => {
-  assert.deepEqual(manifest.shortcuts.map(shortcut => [shortcut.name, shortcut.url]), [
-    ["New Session", "/?action=new-session"],
-    ["Approvals", "/?view=approvals"],
+test("installed app shortcuts route to Main Chat and approvals", () => {
+  assert.deepEqual(manifest.shortcuts.map(shortcut => [shortcut.name, shortcut.url, shortcut.description]), [
+    ["Main Chat", "/?action=main-chat", "Open Main Chat in Formless."],
+    ["Approvals", "/?view=approvals", "Manage tool grants in Formless."],
   ]);
+});
+
+test("generic waiting notifications focus the pending item or launch its focus route", async () => {
+  const messages = [];
+  let focused = 0, opened;
+  const win = {
+    type: "window",
+    url: "https://formless.example/",
+    async focus() { focused++; },
+    postMessage(message) { messages.push(message); },
+  };
+  const click = (listeners, data) => {
+    let lifetime;
+    listeners.notificationclick({
+      notification: { data, close() {} },
+      waitUntil(promise) { lifetime = promise; },
+    });
+    return lifetime;
+  };
+  const listeners = workerListeners({ self: { clients: {
+    get: async () => null,
+    matchAll: async () => [win],
+    openWindow: async url => { opened = url; },
+  } } });
+  await click(listeners, null);
+  assert.equal(focused, 1);
+  assert.equal(JSON.stringify(messages), JSON.stringify([{ type: "formless-focus-pending" }]));
+  assert.equal(opened, undefined);
+
+  const closedListeners = workerListeners({ self: { clients: {
+    get: async () => null,
+    matchAll: async () => [],
+    openWindow: async url => { opened = url; },
+  } } });
+  await click(closedListeners, null);
+  assert.equal(opened, "/?action=focus-pending");
+});
+
+test("Session-specific notification clicks still open their Session", async () => {
+  const messages = [];
+  let focused = 0;
+  const win = {
+    type: "window",
+    url: "https://formless.example/",
+    async focus() { focused++; },
+    postMessage(message) { messages.push(message); },
+  };
+  const listeners = workerListeners({ self: { clients: {
+    get: async () => win,
+    matchAll: async () => [],
+    openWindow: async () => assert.fail("existing client should be used"),
+  } } });
+  let lifetime;
+  listeners.notificationclick({
+    notification: { data: { client: "client-1", session: "topic-chat" }, close() {} },
+    waitUntil(promise) { lifetime = promise; },
+  });
+  await lifetime;
+  assert.equal(focused, 1);
+  assert.equal(JSON.stringify(messages), JSON.stringify([{ type: "formless-open-notification-session", session: "topic-chat" }]));
 });
 
 test("share target stores shared text, URL, and files before redirecting to the app", async () => {

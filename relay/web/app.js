@@ -1439,13 +1439,16 @@
   }
 
   // Installable app shell (SPEC §12): the page opens offline and says so.
+  function handleServiceWorkerMessage(event) {
+    if (event.data?.type === "formless-open-notification-session") {
+      openNotificationSession(event.data.session).catch(() => {});
+    } else if (event.data?.type === "formless-focus-pending") {
+      focusPending();
+    }
+  }
   if ("serviceWorker" in navigator && window.isSecureContext) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
-    navigator.serviceWorker.addEventListener("message", (event) => {
-      if (event.data?.type === "formless-open-notification-session") {
-        openNotificationSession(event.data.session).catch(() => {});
-      }
-    });
+    navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
   }
   window.addEventListener("offline", () => renderAll());
   window.addEventListener("online", () => { renderAll(); if (S.reconnect) retryNow(); });
@@ -8604,7 +8607,15 @@
     S.sessions = [s, ...S.sessions.filter((x) => x.id !== s.id)];
     await openSession(s.id);
     $("input").focus();
-    return s;
+  }
+  async function openMainChat(expectedSelection) {
+    if (!S.mainChat?.id) await refreshTopics(true);
+    if (expectedSelection && (S.current !== expectedSelection.sessionId || S.storageScope !== expectedSelection.scope)) return false;
+    const main = S.mainChat;
+    if (!main?.id) return false;
+    await openSession(main.id);
+    return S.current === main.id && (!expectedSelection || S.storageScope === expectedSelection.scope)
+      && !(S.sessionLoad?.id === main.id && S.sessionLoad.status === "failed");
   }
   /** What this client is called to others on the same Session (§10.4). */
   const CLIENT_LABEL = document.querySelector('meta[name="formless-local"]') ? "web" : "web (relay)";
@@ -10092,28 +10103,104 @@
     }
     return null;
   }
-  async function applyIncomingShare(token, share) {
-    if (!S.current && !await newSession()) return false;
-    if (currentTopicAttempt()) {
-      const parent = topicForSession()?.topic_session_id;
-      if (parent) await openSession(parent);
-    }
-    if (!S.current) return false;
+  async function applyIncomingShare(token, share, selected = { sessionId: S.current, scope: S.storageScope }) {
     const record = { ...share, token, files: Array.isArray(share.files) ? share.files : [] };
+    const selectionIsCurrent = () => S.current === selected.sessionId && S.storageScope === selected.scope;
+    if (record.draftApplied && !record.draftSessionId) {
+      if (record.files.length) {
+        note("This shared item needs to be shared again because its original draft cannot be identified.", true);
+        return false;
+      }
+      return true;
+    }
+    if (record.draftSessionId) {
+      if (record.draftScope !== S.storageScope) {
+        note("This shared item belongs to a different Formless space; reopen that space to continue.", true);
+        return false;
+      }
+      if (S.current !== record.draftSessionId) {
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) await refreshSessions();
+        if (!selectionIsCurrent()) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+          return false;
+        }
+        if (!S.sessions.some((session) => session.id === record.draftSessionId)) {
+          note("The Session for this shared draft is no longer available.", true);
+          return false;
+        }
+        await openSession(record.draftSessionId);
+      }
+    } else {
+      if (!selectionIsCurrent()) {
+        note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        return false;
+      }
+      if (currentTopicAttempt()) {
+        const parent = topicForSession()?.topic_session_id;
+        if (parent) {
+          await openSession(parent);
+          if (S.current !== parent || S.storageScope !== selected.scope) {
+            note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+            return false;
+          }
+          if (S.sessionLoad?.id === parent && S.sessionLoad.status === "failed"
+            && !await openMainChat({ sessionId: parent, scope: selected.scope })) {
+            note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+            return false;
+          }
+        }
+      }
+      if (!S.current || currentTopicAttempt() || S.sessionLoad?.status === "failed") {
+        if (!await openMainChat({ sessionId: S.current, scope: S.storageScope })) {
+          note("Main Chat couldn't be opened for this share; the share is still waiting.", true);
+          return false;
+        }
+      }
+      if (!S.current || !S.storageScope || currentTopicAttempt() || S.sessionLoad?.status === "failed") return false;
+      record.draftSessionId = S.current;
+      record.draftScope = S.storageScope;
+      await storeIncomingShare(record);
+      if (S.current !== record.draftSessionId || S.storageScope !== record.draftScope) {
+        note("The selected Session changed while the share was being saved; reload to apply it safely.", true);
+        return false;
+      }
+    }
+    const destination = { sessionId: record.draftSessionId, scope: record.draftScope };
+    const destinationIsCurrent = () => S.current === destination.sessionId && S.storageScope === destination.scope;
+    if (!destinationIsCurrent()
+      || S.sessionLoad?.id === record.draftSessionId && S.sessionLoad.status === "failed") {
+      note("The destination Session for this share couldn't be opened; the share is still waiting.", true);
+      return false;
+    }
     if (!record.draftApplied) {
       const sharedText = incomingShareText(record);
       if (sharedText) {
         const input = $("input");
         input.value = input.value ? input.value + (input.value.endsWith("\n") ? "" : "\n\n") + sharedText : sharedText;
-        saveDraft(S.current, input.value);
+        if (!saveDraft(destination.sessionId, input.value, destination.scope)) {
+          note("Shared text couldn't be saved to this draft; reload to retry.", true);
+          return false;
+        }
         autosize();
         scheduleForecast();
       }
       record.draftApplied = true;
       await storeIncomingShare(record);
+      if (!destinationIsCurrent()) {
+        note("The selected Session changed while the share was being saved; reload to finish safely.", true);
+        return false;
+      }
     }
-    const files = record.files.map(incomingShareFile).filter(Boolean);
-    record.files = await attachFiles(files);
+    const files = record.files.map(incomingShareFile);
+    if (files.some((file) => !file)) {
+      note("Some shared files couldn't be restored; share them again to retry.", true);
+      return false;
+    }
+    record.files = await attachFiles(files, destination.sessionId, destination.scope);
     await storeIncomingShare(record);
     if (record.files.length) {
       note("Some shared files couldn't be attached; reload to retry.", true);
@@ -10129,19 +10216,23 @@
   async function handleLaunchRoute() {
     if (launchRouteHandled) return;
     launchRouteHandled = true;
-    if (launchAction === "new-session" && await newSession()) stripLaunchParams(["action"]);
+    if (launchAction === "main-chat" && await openMainChat()) stripLaunchParams(["action"]);
     if (launchShareError) {
       note("Shared content couldn't be saved. Please share it again.", true);
       stripLaunchParams(["share-error"]);
     }
     if (launchShareToken) {
+      const selected = { sessionId: S.current, scope: S.storageScope };
       try {
         const share = await readIncomingShare(launchShareToken);
         if (!share) {
           note("This shared content is no longer available. Share it again.", true);
           stripLaunchParams(["share"]);
         }
-        else if (await applyIncomingShare(launchShareToken, share)) {
+        else if (S.current !== selected.sessionId || S.storageScope !== selected.scope) {
+          note("The selected Session changed while the share was loading; reload to apply it safely.", true);
+        }
+        else if (await applyIncomingShare(launchShareToken, share, selected)) {
           await deleteIncomingShare(launchShareToken);
           stripLaunchParams(["share"]);
         }
@@ -10152,6 +10243,10 @@
     if (launchView === "approvals") {
       setView("approvals");
       stripLaunchParams(["view"]);
+    }
+    if (launchAction === "focus-pending") {
+      focusPending();
+      stripLaunchParams(["action"]);
     }
   }
 
@@ -10600,9 +10695,9 @@
       return null;
     }
   }
-  async function attachFiles(files) {
-    if (currentTopicAttempt()) return files;
-    const sid = S.current;
+  async function attachFiles(files, sessionId = S.current, storageScope = S.storageScope) {
+    if (sessionId === S.current && currentTopicAttempt()) return files;
+    const sid = sessionId;
     if (!sid) { note("Open a session first", true); return files; }
     const failed = [];
     for (const file of files) {
@@ -10612,7 +10707,7 @@
         if (S.current === sid) renderChips();
       } else failed.push(file);
     }
-    await refreshAttachmentInventory(sid);
+    await refreshAttachmentInventory(sid, storageScope);
     return failed;
   }
   /** A sent message's attachments by name; one retention removed says

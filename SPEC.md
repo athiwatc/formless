@@ -6075,12 +6075,21 @@ during its snapshot fetch, deduplicated by message id.
   CSP allows `manifest-src 'self'` and `worker-src 'self'` for this.
   Installed browsers that implement Web Share Target can share a title,
   text, URL, image, text file or PDF to Formless. The service worker stores
-  the incoming content in the browser's IndexedDB until the client connects;
-  Formless then adds text to the selected Session's draft (or opens the
-  writable parent Topic Chat for a Topic Chat attempt) and stages files using
-  the pending-attachment flow. Existing draft text is preserved, and nothing
-  is sent until the user submits it. The manifest also offers New Session and
-  Approvals shortcuts where the platform supports them. These manifest
+  the incoming content in the browser's IndexedDB until the client connects.
+  The share uses the app's existing launch selection: linked Session, current
+  Session, saved per-scope Session, Main Chat, then the first Session. If there
+  is no writable selection, it opens or creates Main Chat through the existing
+  `get_main_chat` path. The saved selection is the existing `sessionStorageKey`
+  preference, not a share-specific choice. A share to a Topic Chat attempt
+  opens its writable parent Topic Chat, or Main Chat if no parent is writable.
+  An unfinished share records its storage scope and destination Session so a retry cannot redirect
+  text or files after the user switches chats. Formless adds text to that
+  Session's draft and stages files through the pending-attachment flow; the
+  pending attachment inventory restores chips when the Session is reopened.
+  Existing draft text is preserved, and nothing is sent until the user submits
+  it. The Main Chat shortcut opens Main Chat through the existing route, not a
+  newly created regular Session. The manifest also offers an Approvals shortcut
+  to the existing tool-grants view, with the platform-supported browser features. These manifest
   features are supported by installed Chromium-based Android browsers;
   Safari on iOS does not implement Web Share Target or manifest shortcuts,
   and unsupported browsers ignore them. The relay's pairing key remains
@@ -6107,11 +6116,13 @@ during its snapshot fetch, deduplicated by message id.
     and a push service refusing our signature (400/401/403) shows there
     and in the log.
   - The service worker shows "An approval or a question is waiting for
-    you", and clicking a generic push focuses the app (or opens it when
-    closed). Pushes carry no Session identifier, so they cannot select a
-    specific waiting item. Notifications raised by the connected page carry
-    the relevant Session locally and open it on click. No Session content
-    reaches the relay or the push service.
+    you". A generic push click focuses the currently selected pending approval
+    or question when that item is available in the app; if the app is closed,
+    it opens the saved Session and asks it to focus pending work. Pushes carry
+    no Session identifier, so they cannot select a waiting item in another
+    Session. Notifications raised by the connected page carry the relevant
+    Session locally and open it on click. No Session content reaches the relay
+    or the push service.
 
 ## 13. Configuration (complete settings table)
 

@@ -87,8 +87,8 @@ self.addEventListener("fetch", (e) => {
   );
 });
 
-// Web Push (opt-in, SPEC §12): pushes carry no content, so the notice is
-// generic; opening it brings the app to the front.
+// Web Push (opt-in, SPEC §12): pushes carry no Session ID, so clicks can only
+// focus a pending item already available in the app.
 self.addEventListener("push", (e) => {
   e.waitUntil(self.registration.showNotification("Formless", {
     body: "An approval or a question is waiting for you.",
@@ -126,12 +126,19 @@ self.addEventListener("notificationclick", (e) => {
       if (win?.type === "window" && new URL(win.url).origin === location.origin) {
         await win.focus();
         if (session) win.postMessage({ type: "formless-open-notification-session", session });
+        else win.postMessage({ type: "formless-focus-pending" });
         return;
       }
-      return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/");
+      return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/?action=focus-pending");
     }
     const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const win = wins.find((w) => new URL(w.url).origin === location.origin);
-    return win ? win.focus() : self.clients.openWindow("/");
+    if (win) {
+      await win.focus();
+      if (session) win.postMessage({ type: "formless-open-notification-session", session });
+      else win.postMessage({ type: "formless-focus-pending" });
+      return;
+    }
+    return self.clients.openWindow(session ? "/#s=" + encodeURIComponent(session) : "/?action=focus-pending");
   })());
 });
