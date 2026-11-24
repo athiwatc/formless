@@ -222,6 +222,8 @@
     topicFocus: null,
     current: null,
     pullId: null,
+    pullActivity: null,
+    pullTracking: { generation: 0, order: 0, active: [], finished: [] },
     drafts: {},
     unpersistedDrafts: new Map(),
     unpersistedDraftSharedValues: new Map(),
@@ -5994,7 +5996,7 @@
     const stateClass = running ? "state busy" : "state";
     if (state.className !== stateClass) state.className = stateClass;
     if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
-    const activity = running ? S.activity : S.pullActivity || S.activity;
+    const activity = running ? S.activity : S.pullActivity;
     updateText(statusRender.text, activity ? activityText(activity) : running ? "running" : "● ready");
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
@@ -8587,6 +8589,7 @@
     for (const q of questions) cancelAsk("question:" + q.id);
   }
   function clearLiveState() {
+    clearPullTracking();
     S.toolVersionDiff = null;
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
@@ -9398,11 +9401,52 @@
     return { type: "ollama_pull", model, provider };
   }
 
+  function pullTracking() {
+    return S.pullTracking || (S.pullTracking = { generation: 0, order: 0, active: [], finished: [] });
+  }
+
+  function beginPullRequest() {
+    const tracking = pullTracking();
+    tracking.order += 1;
+    return { generation: tracking.generation, order: tracking.order };
+  }
+
+  function acknowledgePull(ticket, pullId) {
+    const tracking = pullTracking();
+    if (!ticket || ticket.generation !== tracking.generation || tracking.finished.includes(pullId)) return;
+    const existing = tracking.active.find(entry => entry.id === pullId);
+    if (existing) existing.order = Math.max(existing.order, ticket.order);
+    else tracking.active.push({ order: ticket.order, id: pullId });
+    tracking.active.sort((a, b) => a.order - b.order);
+    S.pullId = tracking.active.length ? tracking.active[tracking.active.length - 1].id : null;
+  }
+
+  function completePull(pullId) {
+    if (!pullId) return;
+    const tracking = pullTracking();
+    tracking.active = tracking.active.filter(entry => entry.id !== pullId);
+    if (!tracking.finished.includes(pullId)) {
+      tracking.finished.push(pullId);
+    }
+    S.pullId = tracking.active.length ? tracking.active[tracking.active.length - 1].id : null;
+  }
+
+  function clearPullTracking() {
+    const tracking = pullTracking();
+    tracking.generation += 1;
+    tracking.order = 0;
+    tracking.active = [];
+    tracking.finished = [];
+    S.pullId = null;
+    S.pullActivity = null;
+  }
+
   function hasPullJobsFeature(response) {
     return Array.isArray(response && response.features) && response.features.includes("ollama_pull_jobs_v1");
   }
 
   async function requestPull(pullRequest) {
+    const ticket = pullRequest.type === "ollama_pull" ? beginPullRequest() : null;
     const ping = await act({ type: "ping" });
     if (!ping) return null;
     if (!hasPullJobsFeature(ping)) {
@@ -9410,7 +9454,7 @@
       return null;
     }
     const response = await act(pullRequest);
-    if (pullRequest.type === "ollama_pull" && response && response.pull_id) S.pullId = response.pull_id;
+    if (ticket && response && response.pull_id) acknowledgePull(ticket, response.pull_id);
     return response;
   }
 
@@ -9835,7 +9879,7 @@
 
   function handlePullProgress(ev) {
     if (ev.done) {
-      if (S.pullId === ev.pull_id) S.pullId = null;
+      completePull(ev.pull_id);
       if (S.pullActivity && S.pullActivity.pull_id === ev.pull_id) {
         const label = S.pullActivity.label;
         S.pullActivity = null;
@@ -9845,7 +9889,7 @@
       if (ev.error) {
         if (ev.status === "incomplete") {
           const provider = ev.provider && ev.provider !== "default" ? " --provider " + ev.provider : "";
-          const resume = "/pull " + ev.model + provider;
+          const resume = "/pull " + (ev.requested_model || ev.model) + provider;
           const error = ev.error.includes("partial download can resume with") ? ev.error : ev.error + "; rerun `" + resume + "` to resume";
           note("pull incomplete: " + error, true);
         } else note("could not pull " + ev.model + ": " + ev.error, true);
@@ -10629,6 +10673,7 @@
     loadAll();
   }
   function openRelay() {
+    clearPullTracking();
     S.local = false;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null;
@@ -10790,6 +10835,7 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    clearPullTracking();
     S.toolVersionDiff = null;
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;

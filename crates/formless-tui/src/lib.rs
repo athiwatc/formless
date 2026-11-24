@@ -268,8 +268,11 @@ enum Pending {
     OllamaPullFeatureCheck {
         model: String,
         provider: Option<String>,
+        ticket: PullTicket,
     },
-    OllamaPullStarted,
+    OllamaPullStarted {
+        ticket: PullTicket,
+    },
     SendMessage,
     TourSession,
     TourRun {
@@ -2116,7 +2119,8 @@ struct App {
     mcp_import_pick: Option<String>,
     /// An Ollama download in progress (`/pull`), for the status bar.
     pull_status: Option<String>,
-    pull_id: Option<String>,
+    pull_status_id: Option<String>,
+    pulls: PullTracker,
     /// One-time onboarding moments, persisted.
     seen: Seen,
     tour: Option<tour::Tour>,
@@ -2146,8 +2150,104 @@ struct App {
     stream_cache: std::cell::RefCell<Option<(StreamKey, markdown::Rendered)>>,
 }
 
-fn pull_event_matches_active(active_pull_id: Option<&str>, event_pull_id: Option<&str>) -> bool {
-    active_pull_id == event_pull_id
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PullTicket {
+    generation: u64,
+    order: u64,
+}
+
+#[derive(Default)]
+struct PullTracker {
+    generation: u64,
+    next_order: u64,
+    active: Vec<(u64, String)>,
+    terminal: Vec<String>,
+}
+
+impl PullTracker {
+    fn begin(&mut self) -> PullTicket {
+        self.next_order = self.next_order.saturating_add(1);
+        PullTicket {
+            generation: self.generation,
+            order: self.next_order,
+        }
+    }
+
+    fn acknowledge(&mut self, ticket: PullTicket, pull_id: String) {
+        if ticket.generation != self.generation || self.terminal.iter().any(|id| id == &pull_id) {
+            return;
+        }
+        if let Some((order, _)) = self.active.iter_mut().find(|(_, id)| id == &pull_id) {
+            *order = (*order).max(ticket.order);
+        } else {
+            self.active.push((ticket.order, pull_id));
+        }
+        self.active.sort_by_key(|(order, _)| *order);
+    }
+
+    fn complete(&mut self, pull_id: &str) {
+        self.active.retain(|(_, id)| id != pull_id);
+        if !self.terminal.iter().any(|id| id == pull_id) {
+            self.terminal.push(pull_id.to_string());
+        }
+    }
+
+    fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active.clear();
+        self.terminal.clear();
+    }
+
+    fn current_id(&self) -> Option<&str> {
+        self.active.last().map(|(_, id)| id.as_str())
+    }
+}
+
+#[cfg(test)]
+mod pull_tracker_tests {
+    use super::PullTracker;
+
+    #[test]
+    fn active_pull_order_uses_initiation_and_falls_back_after_completion() {
+        let mut pulls = PullTracker::default();
+        let first = pulls.begin();
+        let second = pulls.begin();
+        pulls.acknowledge(second, "pull-2".into());
+        pulls.acknowledge(first, "pull-1".into());
+        assert_eq!(pulls.current_id(), Some("pull-2"));
+
+        pulls.complete("pull-2");
+        assert_eq!(pulls.current_id(), Some("pull-1"));
+    }
+
+    #[test]
+    fn terminal_event_before_acknowledgement_does_not_restore_pull() {
+        let mut pulls = PullTracker::default();
+        let ticket = pulls.begin();
+        pulls.complete("pull-1");
+        pulls.acknowledge(ticket, "pull-1".into());
+        assert_eq!(pulls.current_id(), None);
+    }
+
+    #[test]
+    fn acknowledgement_before_terminal_event_removes_pull() {
+        let mut pulls = PullTracker::default();
+        let ticket = pulls.begin();
+        pulls.acknowledge(ticket, "pull-1".into());
+        assert_eq!(pulls.current_id(), Some("pull-1"));
+        pulls.complete("pull-1");
+        assert_eq!(pulls.current_id(), None);
+    }
+
+    #[test]
+    fn reset_invalidates_acknowledgements_from_old_connection() {
+        let mut pulls = PullTracker::default();
+        let ticket = pulls.begin();
+        pulls.acknowledge(ticket, "pull-1".into());
+        pulls.reset();
+        pulls.acknowledge(ticket, "pull-2".into());
+        assert_eq!(pulls.current_id(), None);
+    }
 }
 
 fn daemon_supports_ollama_pull_jobs(result: &serde_json::Value) -> bool {
@@ -2156,17 +2256,6 @@ fn daemon_supports_ollama_pull_jobs(result: &serde_json::Value) -> bool {
             .iter()
             .any(|feature| feature.as_str() == Some(formless_protocol::OLLAMA_PULL_JOBS_FEATURE))
     })
-}
-
-#[cfg(test)]
-mod pull_tracking_tests {
-    use super::pull_event_matches_active;
-
-    #[test]
-    fn unrelated_terminal_pull_does_not_match_the_active_cancel_id() {
-        assert!(!pull_event_matches_active(Some("pull-2"), Some("pull-1")));
-        assert!(pull_event_matches_active(Some("pull-2"), Some("pull-2")));
-    }
 }
 
 impl App {
@@ -2429,7 +2518,8 @@ impl App {
             seen: Seen::default(),
             tour: None,
             pull_status: None,
-            pull_id: None,
+            pull_status_id: None,
+            pulls: PullTracker::default(),
             step_mode: false,
             step: None,
             editing_step: false,
@@ -2563,6 +2653,9 @@ impl App {
         self.pending.clear();
         self.pending_since.clear();
         self.activity = None;
+        self.pull_status = None;
+        self.pull_status_id = None;
+        self.pulls.reset();
         self.running_sessions.clear();
         self.streaming.clear();
         self.thinking.clear();
@@ -3560,10 +3653,14 @@ impl App {
                                 self.seen.approval_help |= seen;
                             }
                         }
-                        Pending::OllamaPullFeatureCheck { model, provider } => {
+                        Pending::OllamaPullFeatureCheck {
+                            model,
+                            provider,
+                            ticket,
+                        } => {
                             if daemon_supports_ollama_pull_jobs(&result) {
                                 self.request(
-                                    Pending::OllamaPullStarted,
+                                    Pending::OllamaPullStarted { ticket },
                                     Request::OllamaPull {
                                         model: model.clone(),
                                         provider: provider.clone(),
@@ -3581,9 +3678,9 @@ impl App {
                                 self.notes.push("the running daemon does not support tracked Ollama pulls; restart it with this version".into());
                             }
                         }
-                        Pending::OllamaPullStarted => {
+                        Pending::OllamaPullStarted { ticket } => {
                             if let Some(pull_id) = result["pull_id"].as_str() {
-                                self.pull_id = Some(pull_id.to_string());
+                                self.pulls.acknowledge(ticket, pull_id.to_string());
                             }
                         }
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
@@ -6216,6 +6313,7 @@ impl App {
             }
             Event::ModelPullProgress {
                 model,
+                requested_model,
                 status,
                 completed,
                 total,
@@ -6228,9 +6326,12 @@ impl App {
                 ..
             } => {
                 if done {
-                    if pull_event_matches_active(self.pull_id.as_deref(), pull_id.as_deref()) {
+                    if let Some(pull_id) = pull_id.as_deref() {
+                        self.pulls.complete(pull_id);
+                    }
+                    if self.pull_status_id.as_deref() == pull_id.as_deref() {
                         self.pull_status = None;
-                        self.pull_id = None;
+                        self.pull_status_id = None;
                     }
                     self.notes.push(match error {
                         Some(e) if status == "incomplete" => {
@@ -6239,7 +6340,8 @@ impl App {
                                 .filter(|name| *name != formless_core::config::DEFAULT_PROVIDER)
                                 .map(|name| format!(" --provider {name}"))
                                 .unwrap_or_default();
-                            let resume = format!("/pull {model}{provider}");
+                            let resume_model = requested_model.as_deref().unwrap_or(&model);
+                            let resume = format!("/pull {resume_model}{provider}");
                             let guidance = if e.contains("partial download can resume with") {
                                 String::new()
                             } else {
@@ -6263,6 +6365,7 @@ impl App {
                         .unwrap_or_default();
                     self.pull_status =
                         Some(format!("pulling {model}: {status}{pct}{expected}{warning}"));
+                    self.pull_status_id = pull_id;
                 }
             }
             Event::ComparisonReady {
@@ -8876,7 +8979,7 @@ impl App {
                     let pull_id = args
                         .get(1)
                         .map(|id| (*id).to_string())
-                        .or_else(|| self.pull_id.clone());
+                        .or_else(|| self.pulls.current_id().map(str::to_string));
                     if let Some(pull_id) = pull_id {
                         self.fire(Request::CancelOllamaPull { pull_id });
                         self.notes.push("cancelling Ollama pull…".into());
@@ -8890,6 +8993,7 @@ impl App {
                         );
                         return;
                     };
+                    let ticket = self.pulls.begin();
                     let mut provider = None;
                     let mut index = 1;
                     while index < args.len() {
@@ -8908,6 +9012,7 @@ impl App {
                         Pending::OllamaPullFeatureCheck {
                             model: model.to_string(),
                             provider,
+                            ticket,
                         },
                         Request::Ping,
                     );
@@ -21212,7 +21317,8 @@ mod tests {
             seen: Seen::default(),
             tour: None,
             pull_status: None,
-            pull_id: None,
+            pull_status_id: None,
+            pulls: PullTracker::default(),
             step_mode: false,
             step: None,
             editing_step: false,
@@ -21279,16 +21385,16 @@ mod tests {
         })
         .unwrap();
         app.drain_daemon();
-        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+        assert_eq!(app.pulls.current_id(), Some("pull-1"));
 
         let pull_event = |pull_id: &str, done: bool| Event::ModelPullProgress {
-            model: "llama3".into(),
-            requested_model: None,
-            status: if done { "success" } else { "pulling" }.into(),
+            model: "B".into(),
+            requested_model: Some("A".into()),
+            status: if done { "incomplete" } else { "pulling" }.into(),
             completed: None,
             total: None,
             done,
-            error: None,
+            error: done.then(|| "stream ended".into()),
             pull_id: Some(pull_id.into()),
             provider: Some("remote".into()),
             expected_size: None,
@@ -21297,15 +21403,69 @@ mod tests {
         tx.send(ServerMessage::Event(pull_event("pull-other", false)))
             .unwrap();
         app.drain_daemon();
-        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+        assert_eq!(app.pulls.current_id(), Some("pull-1"));
         tx.send(ServerMessage::Event(pull_event("pull-other", true)))
             .unwrap();
         app.drain_daemon();
-        assert_eq!(app.pull_id.as_deref(), Some("pull-1"));
+        assert_eq!(app.pulls.current_id(), Some("pull-1"));
         tx.send(ServerMessage::Event(pull_event("pull-1", true)))
             .unwrap();
         app.drain_daemon();
-        assert_eq!(app.pull_id, None);
+        assert_eq!(app.pulls.current_id(), None);
+        assert!(app
+            .notes
+            .iter()
+            .any(|note| note.contains("/pull A --provider remote")));
+    }
+
+    #[test]
+    fn terminal_pull_event_before_start_ack_does_not_restore_cancel_target() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+
+        app.slash("pull A");
+        let ping: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: ping.id,
+            ok: true,
+            result: Some(serde_json::json!({
+                "features": [formless_protocol::OLLAMA_PULL_JOBS_FEATURE]
+            })),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        let pull: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+
+        tx.send(ServerMessage::Event(Event::ModelPullProgress {
+            model: "A".into(),
+            requested_model: Some("A".into()),
+            status: "success".into(),
+            completed: None,
+            total: None,
+            done: true,
+            error: None,
+            pull_id: Some("pull-1".into()),
+            provider: None,
+            expected_size: None,
+            warning: None,
+        }))
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pulls.current_id(), None);
+
+        tx.send(ServerMessage::Response {
+            id: pull.id,
+            ok: true,
+            result: Some(serde_json::json!({"pull_id":"pull-1"})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.pulls.current_id(), None);
     }
 
     #[test]

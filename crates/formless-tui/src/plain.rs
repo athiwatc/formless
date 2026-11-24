@@ -3,6 +3,7 @@
 //! are printed once, in order, and approvals and questions become plain
 //! prompts answered on the next line.
 
+use super::PullTracker;
 use crate::client::DaemonClient;
 use crate::text::escape_approval_controls;
 use anyhow::Result;
@@ -786,6 +787,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
         ),
         Event::ModelPullProgress {
             model,
+            requested_model,
             status,
             completed,
             total,
@@ -819,7 +821,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool, call_label: &str) -
                             .filter(|name| *name != formless_core::config::DEFAULT_PROVIDER)
                             .map(|name| format!(" --provider {name}"))
                             .unwrap_or_default();
-                        format!("{}Pull for {model} is incomplete: {error}; rerun `formless pull {model}{provider}` to resume.", end_stream(streaming))
+                        format!("{}Pull for {model} is incomplete: {error}; rerun `formless pull {}{provider}` to resume.", end_stream(streaming), requested_model.as_deref().unwrap_or(model))
                     }
                     (_, Some(error)) => format!("{}Pull for {model} failed: {error}.", end_stream(streaming)),
                     _ => format!("{}Pull for {model} ended in state {status}.", end_stream(streaming)),
@@ -986,12 +988,6 @@ fn plain_pull_jobs_supported(result: &serde_json::Value) -> bool {
     })
 }
 
-fn update_plain_pull_target(active_pull_id: &mut Option<String>, event_pull_id: &str, done: bool) {
-    if done && active_pull_id.as_deref() == Some(event_pull_id) {
-        *active_pull_id = None;
-    }
-}
-
 fn dispatch_plain_pull<T>(
     arguments: &str,
     active_pull_id: Option<&str>,
@@ -1105,7 +1101,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut streaming = false;
     let mut running = false;
     let mut feedback = PlainFeedback::default();
-    let mut pull_id: Option<String> = None;
+    let mut pulls = PullTracker::default();
     let mut template_diagnostics = VecDeque::new();
     let mut run_state = RunState::default();
     let mut snapshots = HashMap::new();
@@ -1184,7 +1180,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 ..
             } = &ev
             {
-                update_plain_pull_target(&mut pull_id, event_pull_id, *done);
+                if *done {
+                    pulls.complete(event_pull_id);
+                }
             }
             for (kind, request) in gap_requests(&ev) {
                 if !gap_refreshes.values().any(|pending| *pending == kind) {
@@ -1357,6 +1355,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             cmd if cmd == "/pull" || cmd.starts_with("/pull ") => {
                 let arguments = cmd.strip_prefix("/pull").unwrap_or_default();
                 let cancelling = arguments.split_whitespace().next() == Some("cancel");
+                let ticket = (!cancelling).then(|| pulls.begin());
                 let features =
                     match wait_response(&rx, &sends, &backlog, client.send(Request::Ping)) {
                         Ok(result) => result,
@@ -1370,7 +1369,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     continue;
                 }
                 let request_id =
-                    match dispatch_plain_pull(arguments, pull_id.as_deref(), |request| {
+                    match dispatch_plain_pull(arguments, pulls.current_id(), |request| {
                         client.send(request)
                     }) {
                         Ok(request_id) => request_id,
@@ -1382,7 +1381,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 match wait_response(&rx, &sends, &backlog, request_id) {
                     Ok(result) => {
                         if let Some(started_pull_id) = result["pull_id"].as_str() {
-                            pull_id = Some(started_pull_id.to_string());
+                            if let Some(ticket) = ticket {
+                                pulls.acknowledge(ticket, started_pull_id.to_string());
+                            }
                         }
                         say(if cancelling {
                             "Ollama pull cancellation requested."
@@ -1989,8 +1990,8 @@ mod tests {
         assert!(output.contains("expected size 20 bytes"), "{output}");
         assert!(output.contains("warning: low disk"), "{output}");
         let incomplete = Event::ModelPullProgress {
-            model: "llama3".into(),
-            requested_model: None,
+            model: "B".into(),
+            requested_model: Some("A".into()),
             status: "incomplete".into(),
             completed: None,
             total: None,
@@ -2004,7 +2005,7 @@ mod tests {
         let output = format_event(&incomplete, &mut streaming, "").unwrap();
         assert!(output.contains("is incomplete"), "{output}");
         assert!(
-            output.contains("formless pull llama3 --provider local"),
+            output.contains("formless pull A --provider local"),
             "{output}"
         );
     }
@@ -2049,15 +2050,20 @@ mod pull_command_tests {
 
     #[test]
     fn interleaved_progress_does_not_retarget_plain_cancel_id() {
-        let mut active_pull_id = Some("pull-latest".to_string());
-        update_plain_pull_target(&mut active_pull_id, "pull-other", false);
-        update_plain_pull_target(&mut active_pull_id, "pull-other", true);
+        let mut pulls = PullTracker::default();
+        let earlier = pulls.begin();
+        let latest = pulls.begin();
+        pulls.acknowledge(latest, "pull-latest".into());
+        pulls.acknowledge(earlier, "pull-earlier".into());
         assert!(matches!(
-            plain_pull_request("cancel", active_pull_id.as_deref()),
+            plain_pull_request("cancel", pulls.current_id()),
             Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-latest"
         ));
-        update_plain_pull_target(&mut active_pull_id, "pull-latest", true);
-        assert_eq!(active_pull_id, None);
+        pulls.complete("pull-latest");
+        assert!(matches!(
+            plain_pull_request("cancel", pulls.current_id()),
+            Ok(Request::CancelOllamaPull { pull_id }) if pull_id == "pull-earlier"
+        ));
     }
 
     #[test]

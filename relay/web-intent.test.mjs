@@ -46,7 +46,7 @@ function setup(names, extras = {}) {
     if (!elements.has(id)) elements.set(id, { value: '', style: {}, textContent: '', classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } }, attrs: {}, setAttribute(k,v) { this.attrs[k]=v; }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; }, replaceChildren() {}, select() {}, focus() {} });
     return elements.get(id);
   };
-  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, messages: [], sessions: [], view: 'chat', tools: [] },
+  const context = vm.createContext({ $, tr: text => text, prefs, navigator: { locks: testLocks() }, queueMicrotask: callback => Promise.resolve().then(callback), mentionAttached: {}, S: { approvalHelpSeen: true, current: 'A', storageScope: 'test-room', chips: {}, attachmentInventories: {}, drafts: {}, outbox: [], outboxFlushing: false, outboxFlushRequested: false, submitting: new Set(), shareApplyPending: false, running: new Set(), liveRun: null, daemonOnline: true, channel: {}, local: true, pullId: null, pullActivity: null, pullTracking: { generation: 0, order: 0, active: [], finished: [] }, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
@@ -92,7 +92,7 @@ test('pull commands preserve provider selection and resolve explicit or implicit
 test('pull requests check tracked-pull support before dispatch', async () => {
   const requests = [], notices = [];
   const parsed = value => JSON.parse(JSON.stringify(value));
-  const c = setup(['hasPullJobsFeature', 'requestPull'], {
+  const c = setup(['hasPullJobsFeature', 'requestPull', 'pullTracking', 'beginPullRequest', 'acknowledgePull'], {
     act: async request => {
       requests.push(request);
       return request.type === 'ping' ? { features: [] } : { pull_id: 'pull-1' };
@@ -112,27 +112,84 @@ test('pull requests check tracked-pull support before dispatch', async () => {
   assert.equal(c.S.pullId, 'pull-1');
   assert.deepEqual(parsed(requests), [{ type: 'ping' }, { type: 'ollama_pull', model: 'llama3' }]);
 });
-test('pull progress does not retarget the active cancel ID and reports provider-aware resume guidance', () => {
+
+test('terminal progress before pull response does not restore its cancel ID', async () => {
+  const pullResponse = deferred(), pullRequested = deferred();
+  const c = setup([
+    'hasPullJobsFeature', 'requestPull', 'pullTracking', 'beginPullRequest',
+    'acknowledgePull', 'handlePullProgress', 'completePull',
+  ], {
+    act: async request => {
+      if (request.type === 'ping') return { features: ['ollama_pull_jobs_v1'] };
+      pullRequested.resolve();
+      return pullResponse.promise;
+    },
+    note() {}, setActivity() {}, renderStatus() {},
+  });
+  const request = c.requestPull({ type: 'ollama_pull', model: 'A' });
+  await pullRequested.promise;
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-1' });
+  pullResponse.resolve({ pull_id: 'pull-1' });
+  await request;
+  assert.equal(c.S.pullId, null);
+});
+
+test('pull cancellation follows initiation order and resumes the requested alias', () => {
   const notices = [], activities = [];
-  const c = setup(['handlePullProgress'], {
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
     note: (text, error) => notices.push({ text, error }),
     setActivity: text => activities.push(text),
     renderStatus() {},
   });
-  c.S.pullId = 'pull-active';
-  c.handlePullProgress({ type: 'model_pull_progress', model: 'other', status: 'success', done: true, pull_id: 'pull-other' });
-  assert.equal(c.S.pullId, 'pull-active');
-  c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'pulling', done: false, pull_id: 'pull-next', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
-  assert.equal(c.S.pullId, 'pull-active');
+  const earlier = c.beginPullRequest();
+  const latest = c.beginPullRequest();
+  c.acknowledgePull(latest, 'pull-latest');
+  c.acknowledgePull(earlier, 'pull-earlier');
+  assert.equal(c.S.pullId, 'pull-latest');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'pulling', done: false, pull_id: 'pull-earlier', completed: 1, total: 2, expected_size: 20, warning: 'advisory' });
   assert.match(activities.pop(), /50%.*expected 20 bytes.*advisory/);
-  c.handlePullProgress({ type: 'model_pull_progress', model: 'llama3', status: 'incomplete', done: true, pull_id: 'pull-next', provider: 'remote', error: 'stream ended' });
-  assert.equal(c.S.pullId, 'pull-active');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'incomplete', done: true, pull_id: 'pull-latest', provider: 'remote', error: 'stream ended' });
+  assert.equal(c.S.pullId, 'pull-earlier');
+  assert.match(notices.pop().text, /\/pull A --provider remote/);
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'B', requested_model: 'A', status: 'success', done: true, pull_id: 'pull-earlier', provider: 'remote' });
+  assert.equal(c.S.pullId, null);
   assert.equal(c.S.pullActivity, null);
-  assert.match(notices.pop().text, /\/pull llama3 --provider remote/);
+});
+
+test('terminal progress and acknowledgement are idempotent in either order', () => {
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull'], {
+    note() {}, setActivity() {}, renderStatus() {},
+  });
+  const ackFirst = c.beginPullRequest();
+  c.acknowledgePull(ackFirst, 'pull-ack-first');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-ack-first' });
+  assert.equal(c.S.pullId, null);
+
+  const eventFirst = c.beginPullRequest();
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'success', done: true, pull_id: 'pull-event-first' });
+  c.acknowledgePull(eventFirst, 'pull-event-first');
+  assert.equal(c.S.pullId, null);
+});
+
+test('new browser connection clears pull state and invalidates old acknowledgements', () => {
+  const c = setup(['handlePullProgress', 'pullTracking', 'beginPullRequest', 'acknowledgePull', 'completePull', 'clearPullTracking'], {
+    note() {}, setActivity() {}, renderStatus() {},
+  });
+  const oldRequest = c.beginPullRequest();
+  c.acknowledgePull(oldRequest, 'pull-old');
+  c.handlePullProgress({ type: 'model_pull_progress', model: 'A', status: 'pulling', done: false, pull_id: 'pull-old' });
+  c.clearPullTracking();
+  c.acknowledgePull(oldRequest, 'pull-late');
+  assert.equal(c.S.pullId, null);
+  assert.equal(c.S.pullActivity, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.S.pullTracking.active)), []);
+  assert.match(fn('clearLiveState'), /clearPullTracking\(\)/);
+  assert.match(fn('openRelay'), /clearPullTracking\(\)/);
+  assert.match(fn('connectLocal'), /clearPullTracking\(\)/);
 });
 test('idle status shows pull progress and clears it on the matching terminal event', () => {
   let context;
-  const c = setup(['renderStatus', 'handlePullProgress'], {
+  const c = setup(['renderStatus', 'handlePullProgress', 'pullTracking', 'completePull'], {
     document: { activeElement: null, createTextNode: () => ({ textContent: '' }) },
     statusRender: { root: null, spinner: null, text: null },
     h: () => ({ hidden: false }),
@@ -169,6 +226,9 @@ test('idle status shows pull progress and clears it on the matching terminal eve
     type: 'model_pull_progress', model: 'llama3', status: 'success', done: true,
     pull_id: 'pull-1',
   });
+  assert.equal(c.statusRender.text.textContent, '● ready');
+  c.S.activity = { label: 'stale unrelated activity', since: 0 };
+  c.renderStatus();
   assert.equal(c.statusRender.text.textContent, '● ready');
 });
 test('queued edits submit the revision opened by the editor', () => {
@@ -1462,7 +1522,7 @@ test('parallel questions queue across Sessions; closing queued question preserve
 test('local and relay reconnect rebuild pending prompts/running and reject stale snapshot state', async () => {
   for (const transport of ['local', 'relay']) {
     let reply = deferred();
-    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
+    const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'pullTracking', 'clearPullTracking', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
       act: () => reply.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
       closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
       renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
@@ -1502,7 +1562,7 @@ test('local and relay reconnect rebuild pending prompts/running and reject stale
 
 function liveSetup(extras = {}) {
   const wait = deferred();
-  const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
+  const c = setup(['openSession', 'onEvent', 'clearQuestions', 'clearLiveState', 'pullTracking', 'clearPullTracking', 'applySessionLiveState', 'addApproval', 'queueQuestion', 'removeQuestion'], {
     act: () => wait.promise, request: async () => ({}), prefs: memoryPrefs(), rendered: new Map(),
     closeSidebar() {}, renderHistory() {}, renderRunTools() {}, renderStatus() {}, renderQueue() {}, renderPlan() {}, renderStep() {}, renderRunBanner() {}, renderAll() {},
     renderApproval() {}, renderComposer() {}, showQuestion() {}, cancelAsk() {}, notifyFor() {}, setActivity() {},
@@ -2804,7 +2864,7 @@ function summaryQueue() {
 function summaryHarness() {
   const requests=summaryQueue(),dialogs=summaryQueue(),calls=[],prompts=new Map(),notes=[],events=[];
   const document={createTreeWalker(root){const items=[];function walk(n){if(!n||typeof n==='string')return;(n.children||[]).forEach((child,i)=>{if(typeof child==='string')items.push({get data(){return n.children[i];},set data(value){n.children[i]=value;}});else walk(child);});}walk(root);return{nextNode:()=>items.shift()||null};}};
-  const c=setup(['invalidateBranchSummary','branchSummaryStampMatches','branchSummaryCurrent','branchSummaryEvent','branchSummaryHash','branchSummaryPreviewMatches','branchSummaryReviewText','summariseBranchCommand','resolveSessionRef','showBidi','clearLiveState'],{crypto:webcrypto,TextEncoder,h:node,document,NodeFilter:{SHOW_TEXT:4},sessionSeq:0,clearQuestions(){},renderApproval(){},note:text=>notes.push(text),onEvent:ev=>events.push(ev),
+  const c=setup(['invalidateBranchSummary','branchSummaryStampMatches','branchSummaryCurrent','branchSummaryEvent','branchSummaryHash','branchSummaryPreviewMatches','branchSummaryReviewText','summariseBranchCommand','resolveSessionRef','showBidi','clearLiveState','pullTracking','clearPullTracking'],{crypto:webcrypto,TextEncoder,h:node,document,NodeFilter:{SHOW_TEXT:4},sessionSeq:0,clearQuestions(){},renderApproval(){},note:text=>notes.push(text),onEvent:ev=>events.push(ev),
     ask(opts){const d=deferred(),prompt={opts,...d};prompts.set(opts.tag,prompt);dialogs.push(prompt);return d.promise;},
     cancelAsk(tag){const prompt=prompts.get(tag);if(prompt){prompts.delete(tag);prompt.resolve(null);}},
     act(request){const d=deferred();calls.push(JSON.parse(JSON.stringify(request)));requests.push({request,...d});return d.promise;}});
