@@ -6810,6 +6810,11 @@ fn config_edit(paths: &Paths) -> Result<()> {
     let file = paths.config_file();
     if !file.exists() {
         Config::default().save(paths)?;
+    } else if let Err(error) = Config::load_file_only(paths) {
+        eprintln!(
+            "warning: {} could not be loaded before editing: {error:#}",
+            file.display()
+        );
     }
     let draft = file.with_extension("toml.edit");
     #[cfg(unix)]
@@ -8446,12 +8451,35 @@ fn naming_cmd(paths: Paths, action: NamingAction) -> Result<()> {
 
 fn naming_model_status(paths: &Paths, cfg: &Config) -> String {
     match cfg.naming.spec() {
-        _ if !formless_core::namer::embedded_available() => {
-            "heuristic (built without embedded-llm)".into()
+        Some(spec) => {
+            let installed = spec.installed(paths);
+            let download = if !formless_core::namer::embedded_available() {
+                "auto-download unavailable in this build"
+            } else if installed {
+                "auto-download not needed"
+            } else if !cfg.naming.enabled {
+                "auto-download will not happen (auto-naming disabled)"
+            } else if cfg.naming.auto_download {
+                "auto-download on first use"
+            } else {
+                "auto-download disabled"
+            };
+            format!(
+                "{} ({}; {}; {}; install with `formless naming pull`)",
+                spec.id,
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                },
+                download,
+                formless_core::namer::display_size(spec.gguf_bytes)
+            )
         }
-        Some(spec) if spec.installed(paths) => format!("{} (installed)", spec.id),
-        Some(spec) => format!("{} (not installed: `formless naming pull`)", spec.id),
-        None => format!("heuristic (unknown model '{}')", cfg.naming.model),
+        None => format!(
+            "heuristic (unknown model '{}'; auto-download unavailable; size unknown)",
+            cfg.naming.model
+        ),
     }
 }
 

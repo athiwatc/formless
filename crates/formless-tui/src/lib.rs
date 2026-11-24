@@ -1928,6 +1928,7 @@ struct App {
     /// (key, text), the key being saved and the last error by key.
     settings_sel: usize,
     settings_edit: Option<(String, input::InputLine)>,
+    settings_download_armed: bool,
     settings_saving: Option<String>,
     settings_error: Option<(String, String)>,
     settings_form: Option<settings::Form>,
@@ -2293,6 +2294,7 @@ impl App {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -7935,6 +7937,7 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        self.settings_download_armed = false;
         self.search_serial = self.search_serial.wrapping_add(1);
         if view != View::Chat {
             self.cancel_rename();
@@ -11416,6 +11419,9 @@ impl App {
 
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
+        if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            self.settings_download_armed = false;
+        }
         if let Some(form) = &mut self.settings_form {
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
                 form.viewport.get_mut().page(key.code == KeyCode::PageDown);
@@ -11543,7 +11549,17 @@ impl App {
                     }
                 }
                 settings::Kind::Bool => {
-                    self.save_setting(&row.key, serde_json::json!(row.value != "on"))
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        if self.settings_download_armed {
+                            self.settings_download_armed = false;
+                            self.save_setting(&row.key, serde_json::json!(true));
+                        } else {
+                            self.settings_download_armed = true;
+                        }
+                    } else {
+                        self.settings_download_armed = false;
+                        self.save_setting(&row.key, serde_json::json!(row.value != "on"));
+                    }
                 }
                 settings::Kind::Choice(choices) => {
                     self.save_setting(&row.key, settings::next_choice(choices, &row.value))
@@ -17905,8 +17921,13 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![Span::styled(label, label_style), value]));
         if selected {
             let width = area.width.saturating_sub(6) as usize;
+            let confirmation = (row.key == "naming.auto_download" && app.settings_download_armed)
+                .then(|| {
+                    "Enter or Space again to allow; any other key keeps it disabled.".to_string()
+                });
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
                 .chain(row.help.clone())
+                .chain(confirmation)
             {
                 for line in wrap_rows(&text, width) {
                     lines.push(Line::styled(format!("    {line}"), ui::dim(app.color)));
@@ -20956,6 +20977,7 @@ mod tests {
             palette_hidden: None,
             settings_sel: 0,
             settings_edit: None,
+            settings_download_armed: false,
             settings_saving: None,
             settings_error: None,
             settings_form: None,
@@ -25519,6 +25541,64 @@ mod tests {
         }
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+    }
+
+    #[test]
+    fn naming_auto_download_requires_tui_confirmation() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app();
+        app.open_view(View::Settings);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        assert_eq!(app.settings_rows()[row].value, "off");
+
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("409 MiB"), "{screen}");
+        assert!(screen.contains("heuristic"), "{screen}");
+        assert!(screen.contains("Enter or Space again to allow"), "{screen}");
+
+        app.key(key(KeyCode::Esc));
+        assert!(!app.settings_download_armed);
+        assert!(app.settings_saving.is_none());
+        assert_eq!(
+            app.settings_rows()
+                .iter()
+                .find(|row| row.key == "naming.auto_download")
+                .unwrap()
+                .value,
+            "off"
+        );
+
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        let row = app
+            .settings_rows()
+            .iter()
+            .position(|row| row.key == "naming.auto_download")
+            .unwrap();
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.open_view(View::Chat);
+        assert_eq!(app.view, View::Chat);
+        assert!(!app.settings_download_armed);
+        app.open_view(View::Settings);
+        assert_eq!(app.view, View::Settings);
+        assert!(!app.settings_download_armed);
+        app.settings_sel = row;
+        app.key(key(KeyCode::Enter));
+        assert!(app.settings_download_armed);
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
+        assert!(!app.settings_download_armed);
     }
 
     #[test]

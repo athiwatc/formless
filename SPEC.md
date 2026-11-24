@@ -4503,8 +4503,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   [MODEL]` removes weights, the tokenizer and partial downloads for one
   model. `formless naming remove --all` removes those files for every
   supported naming model. Removal respects the same lock as downloads and
-  model loading. Automatic downloads can fetch the configured model again
-  unless `naming.auto_download` is disabled.
+  model loading. If `naming.auto_download` is enabled, a future naming attempt
+  can fetch the configured model again.
 - **Title cleanup.** Model and fallback heuristic titles strip balanced
   quote/backtick/emphasis wrappers and a leading Markdown heading marker only
   when followed by whitespace. Unpaired punctuation is retained: `C#`,
@@ -6277,7 +6277,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `limits.forecast_confirm_usd` | (none) | Ask before sending when a priced local forecast p90 exceeds this finite nonnegative USD amount; previews add no caps and unpriced/no-history forecasts have no invented dollar range (§5.2) |
 | `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2). Profile edits apply to an in-flight Run before its next model step (§5.4). |
 | `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
-| `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
+| `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / false / 30 | Embedded naming model (empty: a heuristic title), whether to allow a first-use download (the default is about 409 MiB; without it, titles use a heuristic), and how long one naming may take before the heuristic is used |
 
 ## 14. Security
 
@@ -6364,9 +6364,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   secrets (§8.3). In builds with embedded model support, naming an untitled
   or provisionally named Session with suitable user text can download weights
   or a tokenizer when the selected [catalogue model](docs/architecture.md#local-naming-models)
-  needs them. Automatic naming and downloads are enabled by default. Set
-  `naming.auto_download = false` to disable automatic downloads or
-  `naming.enabled = false` to disable automatic naming.
+  needs them. Automatic naming is enabled by default, but model downloads are
+  opt-in. Older saved configs are migrated to disable automatic downloads;
+  enable `naming.auto_download` to allow a first-use download, or set
+  `naming.enabled = false` to disable automatic naming. Without the model,
+  titles use a heuristic.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).

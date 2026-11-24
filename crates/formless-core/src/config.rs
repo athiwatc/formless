@@ -819,7 +819,10 @@ pub const SETTABLE: &[&str] = &[
     "metrics.",
     "optimiser.",
     "compaction.",
-    "naming.",
+    "naming.enabled",
+    "naming.model",
+    "naming.auto_download",
+    "naming.timeout_secs",
     "skills.",
     "artifacts.",
     "run_files.",
@@ -1861,6 +1864,10 @@ impl Default for TuiCfg {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Automatic Session naming by a small embedded model (see `namer`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1870,10 +1877,13 @@ pub struct NamingCfg {
     /// Embedded model id ("qwen2.5-0.5b" or "lfm2.5-350m"); empty uses
     /// the heuristic title only.
     pub model: String,
-    /// Fetch the model in the background when naming needs it. After a
-    /// failure, a later naming attempt may retry after cooldown.
+    /// Allow fetching the model in the background on first use. This is
+    /// opt-in; after a failure, a later naming attempt may retry after cooldown.
     /// Off: install with `formless naming pull`.
     pub auto_download: bool,
+    /// Internal marker for the pre-consent config migration.
+    #[serde(skip_serializing_if = "is_false")]
+    pub auto_download_migration_done: bool,
     /// Give up on a single inference after this long and use the
     /// heuristic title instead.
     pub timeout_secs: u64,
@@ -1883,12 +1893,22 @@ impl Default for NamingCfg {
         Self {
             enabled: true,
             model: crate::namer::QWEN2_5_0_5B.id.into(),
-            auto_download: true,
+            auto_download: false,
+            auto_download_migration_done: false,
             timeout_secs: 30,
         }
     }
 }
 impl NamingCfg {
+    fn migrate_auto_download(&mut self) -> bool {
+        if self.auto_download_migration_done {
+            return false;
+        }
+        self.auto_download = false;
+        self.auto_download_migration_done = true;
+        true
+    }
+
     pub fn spec(&self) -> Option<crate::namer::ModelSpec> {
         crate::namer::spec(&self.model)
     }
@@ -2021,6 +2041,35 @@ impl Config {
             .filter(|(key, _)| values.contains_key(*key))
             .map(|(key, choices)| ((*key).into(), serde_json::json!(choices)))
             .collect();
+        let naming_spec = self.naming.spec();
+        let naming_installed = naming_spec.is_some_and(|spec| spec.installed(paths));
+        let naming_cache_bytes = naming_spec.and_then(|spec| {
+            let models = crate::namer::cached_models(paths).ok()?;
+            Some(
+                models
+                    .into_iter()
+                    .find(|model| model.id == spec.id)
+                    .map_or(0, |model| model.bytes),
+            )
+        });
+        let naming_cache_size = naming_cache_bytes
+            .map(crate::namer::display_size)
+            .unwrap_or_else(|| "unknown".into());
+        let naming_model_size = naming_spec
+            .map(|spec| crate::namer::display_size(spec.gguf_bytes))
+            .unwrap_or_else(|| "—".into());
+        let naming_status = match naming_spec {
+            Some(_) if naming_installed => format!("installed ({naming_cache_size} cached)"),
+            Some(_) if naming_cache_bytes.is_some_and(|bytes| bytes > 0) => {
+                format!("not installed ({naming_cache_size} cached)")
+            }
+            Some(_) => "not installed".into(),
+            None if self.naming.model.trim().is_empty() => "heuristic only".into(),
+            None => format!(
+                "unknown model {}; titles use a heuristic",
+                self.naming.model
+            ),
+        };
         let mut read_only = serde_json::json!({
             "provider.base_url": self.provider.base_url,
             "provider.auth": self.provider.auth.mode,
@@ -2033,7 +2082,11 @@ impl Config {
                 self.security.roots().len(), self.security.trusted_hosts.len(), self.security.secret_patterns.len()),
             "hooks": format!("{} configured", self.hooks.len()),
             "mcp.servers": format!("{} configured", self.mcp.servers.len()),
-            "naming.installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+            "naming.model": self.naming.model,
+            "naming.model_size": naming_model_size,
+            "naming.cache_size": naming_cache_size,
+            "naming.status": naming_status,
+            "naming.installed": naming_installed,
             "config": paths.config_file().display().to_string(),
             "data": paths.data_dir.display().to_string(),
         });
@@ -2091,7 +2144,11 @@ impl Config {
             "naming": {
                 "enabled": self.naming.enabled,
                 "model": self.naming.model,
-                "installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+                "auto_download": self.naming.auto_download,
+                "installed": naming_installed,
+                "model_size": naming_model_size,
+                "cache_size": naming_cache_size,
+                "status": naming_status,
             },
             "paths": {
                 "config": paths.config_file().display().to_string(),
@@ -2101,7 +2158,9 @@ impl Config {
     }
 
     pub fn load(paths: &Paths) -> Result<Self> {
-        Self::load_from(&paths.config_file())
+        let mut cfg = Self::load_file_only(paths)?;
+        cfg.apply_env()?;
+        Ok(cfg)
     }
     pub fn load_from(file: &Path) -> Result<Self> {
         if file.exists() {
@@ -2118,6 +2177,7 @@ impl Config {
     pub fn load_from_text(text: &str, file: &Path) -> Result<Self> {
         let mut cfg: Self =
             toml::from_str(text).with_context(|| format!("parse {}", file.display()))?;
+        cfg.naming.migrate_auto_download();
         cfg.apply_env()?;
         Ok(cfg)
     }
@@ -2130,7 +2190,14 @@ impl Config {
         }
         let text =
             std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-        toml::from_str(&text).with_context(|| format!("parse {}", file.display()))
+        let mut cfg: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", file.display()))?;
+        if cfg.naming.migrate_auto_download() {
+            if let Err(error) = cfg.save_inner(paths, false) {
+                tracing::warn!("could not persist naming download-consent migration: {error:#}");
+            }
+        }
+        Ok(cfg)
     }
 
     /// Set one dotted key (`tools.inline_limit`) from JSON, validated by
@@ -2174,9 +2241,12 @@ impl Config {
             let v = toml::Value::try_from(&value).context("unsupported value")?;
             table.insert(leaf.to_string(), v.clone());
         }
-        let next: Config = doc
+        let mut next: Config = doc
             .try_into()
             .with_context(|| format!("invalid value for '{key}'"))?;
+        if key == "naming.auto_download" {
+            next.naming.auto_download_migration_done = true;
+        }
         // A typo'd key would be dropped silently: make sure it took.
         if !value.is_null() {
             let mut check = toml::Value::try_from(&next)?;
@@ -2241,11 +2311,17 @@ impl Config {
         if self.daemon.log_keep > crate::logs::MAX_LOG_KEEP {
             anyhow::bail!("daemon.log_keep must be between 0 and 64");
         }
+        self.save_inner(paths, true)
+    }
+
+    fn save_inner(&self, paths: &Paths, discard_setup_draft: bool) -> Result<()> {
         let file = paths.config_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let fresh = toml::to_string_pretty(self)?;
+        let mut persisted = self.clone();
+        persisted.naming.auto_download_migration_done = true;
+        let fresh = toml::to_string_pretty(&persisted)?;
         let text = match std::fs::read_to_string(&file) {
             Ok(old) => match merge_toml(&old, &fresh) {
                 Some(merged) => merged,
@@ -2269,8 +2345,10 @@ impl Config {
             .with_context(|| format!("write {}", file.display()))?;
         // A saved config supersedes any unfinished TUI setup, including when
         // setup completed through the CLI or a daemon setting update.
-        if let Err(e) = crate::setup_draft::discard(paths) {
-            tracing::warn!("could not remove superseded setup draft: {e}");
+        if discard_setup_draft {
+            if let Err(e) = crate::setup_draft::discard(paths) {
+                tracing::warn!("could not remove superseded setup draft: {e}");
+            }
         }
         Ok(())
     }

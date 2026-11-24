@@ -70,6 +70,9 @@ impl Row {
     pub fn hint(&self) -> &'static str {
         match &self.kind {
             Kind::ReadOnly(why) => why,
+            Kind::Bool if self.key == "naming.auto_download" => {
+                "Enter/Space toggles; enabling asks for consent"
+            }
             Kind::Bool | Kind::Thinking => "Enter toggles",
             Kind::Choice(_) => "Enter cycles",
             Kind::Number => "Enter edits",
@@ -101,6 +104,31 @@ pub fn rows(
 ) -> Vec<Row> {
     use Kind::*;
     let p = &cfg.provider;
+    let naming_spec = cfg.naming.spec();
+    let naming_cache_bytes = naming_spec.and_then(|spec| {
+        let models = formless_core::namer::cached_models(paths).ok()?;
+        Some(
+            models
+                .into_iter()
+                .find(|model| model.id == spec.id)
+                .map_or(0, |model| model.bytes),
+        )
+    });
+    let naming_cache_size = naming_cache_bytes
+        .map(formless_core::namer::display_size)
+        .unwrap_or_else(|| "unknown".into());
+    let naming_model_size = naming_spec
+        .map(|spec| formless_core::namer::display_size(spec.gguf_bytes))
+        .unwrap_or_else(|| "—".into());
+    let naming_status = match naming_spec {
+        Some(spec) if spec.installed(paths) => format!("installed ({naming_cache_size} cached)"),
+        Some(_) if naming_cache_bytes.is_some_and(|bytes| bytes > 0) => {
+            format!("not installed ({naming_cache_size} cached)")
+        }
+        Some(_) => "not installed".into(),
+        None if cfg.naming.model.trim().is_empty() => "heuristic only".into(),
+        None => format!("unknown model {}; titles use a heuristic", cfg.naming.model),
+    };
     let mut out = vec![
         Row::new(
             "Provider",
@@ -285,6 +313,45 @@ pub fn rows(
             Bool,
         ),
         Row::new(
+            "Naming",
+            "naming.model",
+            "model",
+            if cfg.naming.model.is_empty() {
+                "heuristic only".into()
+            } else {
+                cfg.naming.model.clone()
+            },
+            ReadOnly("edit config.toml"),
+        ),
+        Row::new(
+            "Naming",
+            "naming.model_size",
+            "model size",
+            naming_model_size,
+            ReadOnly("estimated model weight size"),
+        ),
+        Row::new(
+            "Naming",
+            "naming.cache_size",
+            "installed size",
+            naming_cache_size,
+            ReadOnly("bytes currently cached for this model"),
+        ),
+        Row::new(
+            "Naming",
+            "naming.status",
+            "model status",
+            naming_status,
+            ReadOnly("current model installation state"),
+        ),
+        Row::new(
+            "Naming",
+            "naming.auto_download",
+            "auto-download",
+            on(cfg.naming.auto_download),
+            Bool,
+        ),
+        Row::new(
             "Daemon",
             "daemon.idle_grace_secs",
             "idle_grace_secs",
@@ -405,6 +472,22 @@ pub fn rows(
     }
     for row in &mut out {
         row.help = help(&row.key, &current);
+        if row.key == "naming.auto_download" {
+            let notice = naming_spec.map_or_else(
+                || "No supported model is configured; titles use a heuristic.".into(),
+                |spec| {
+                    format!(
+                        "Allow first-use download of {} (about {}). Without it, titles use a heuristic.",
+                        spec.id,
+                        formless_core::namer::display_size(spec.gguf_bytes)
+                    )
+                },
+            );
+            row.help = Some(format!(
+                "{} {notice}",
+                row.help.as_deref().unwrap_or_default()
+            ));
+        }
     }
     let warnings = cfg.security.network_scope_warnings();
     if !warnings.is_empty() {
@@ -1095,6 +1178,27 @@ mod tests {
                 row.key
             );
         }
+    }
+
+    #[test]
+    fn naming_settings_show_model_size_state_and_download_consent() {
+        let cfg = Config::default();
+        let paths = formless_core::Paths {
+            data_dir: "/d".into(),
+            config_dir: "/c".into(),
+            profile: "p".into(),
+        };
+        let rows = rows(&cfg, &json!({}), false, &paths);
+        let find = |key: &str| rows.iter().find(|row| row.key == key).unwrap();
+        let download = find("naming.auto_download");
+        assert_eq!(download.value, "off");
+        assert!(matches!(download.kind, Kind::Bool));
+        let help = download.help.as_deref().unwrap();
+        assert!(help.contains("qwen2.5-0.5b"), "{help}");
+        assert!(help.contains("409 MiB"), "{help}");
+        assert!(help.contains("heuristic"), "{help}");
+        assert_eq!(find("naming.model_size").value, "409 MiB");
+        assert_eq!(find("naming.status").value, "not installed");
     }
 
     #[test]

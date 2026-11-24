@@ -115,6 +115,16 @@ pub fn models_dir(paths: &Paths) -> PathBuf {
     paths.data_dir.join("models")
 }
 
+pub fn display_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KiB", (bytes as f64 / 1024.0).round() as u64)
+    } else {
+        format!("{} MiB", (bytes as f64 / (1024.0 * 1024.0)).round() as u64)
+    }
+}
+
 pub struct CachedModel {
     pub id: &'static str,
     pub bytes: u64,

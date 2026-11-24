@@ -98,6 +98,21 @@ test('cancelled or malformed edits never submit requests', async () => {
   assert.deepEqual(c.calls, []); assert.equal(c.errors.length, 0);
 });
 
+test('enabling naming auto-download asks consent before saving', async () => {
+  const c = fixture();
+  let prompt;
+  c.ask = async options => { prompt = options; return false; };
+  const settings = { naming: { model: 'qwen2.5-0.5b', model_size: '409 MiB' } };
+  await c.editSetting('naming.auto_download', false, 'bool', [], settings);
+  assert.match(prompt.title, /download/i);
+  assert.match(prompt.text, /qwen2\.5-0\.5b/);
+  assert.match(prompt.text, /409 MiB/);
+  assert.match(prompt.text, /heuristic/);
+  assert.deepEqual(c.calls, []);
+  c.ask = async () => true;
+  await c.editSetting('naming.auto_download', false, 'bool', [], settings);
+  assert.deepEqual(c.calls, [{ type: 'set_setting', key: 'naming.auto_download', value: true }]);
+});
 
 test('invalid Settings text can be corrected before the only update request', async () => {
   const c=fixture();const replies=['  {bad  ','{"fixed":[1,2]}'];const prompts=[];
