@@ -92,6 +92,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 
 #[tokio::test]
 async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
+    let _env = crate::credential_env::EnvGuard::isolated();
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -158,10 +159,14 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     assert!(!antigravity.installed);
     assert_eq!(antigravity.version, None);
     assert_eq!(antigravity.signed_in, None);
-    assert!(antigravity
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("does not speak ACP v1")));
+    assert!(
+        antigravity
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("does not speak ACP v1")),
+        "Antigravity readiness detail: {:?}",
+        antigravity.detail
+    );
     let acp: Vec<_> = values
         .iter()
         .filter(|value| value.kind == HarnessKind::Acp)
