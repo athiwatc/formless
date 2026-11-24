@@ -1987,6 +1987,36 @@ impl clap::builder::TypedValueParser for NamingModelParser {
     }
 }
 
+fn generate_completions(shell: clap_complete::Shell, out: &mut impl Write) -> std::io::Result<()> {
+    use clap::CommandFactory;
+
+    clap_complete::generate(shell, &mut Cli::command(), "formless", out);
+    if shell == clap_complete::Shell::Fish {
+        let topics = formless_core::docs::TOPICS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let condition = format!(
+            "__fish_seen_subcommand_from docs; and not __fish_seen_subcommand_from --text --keys {topics}"
+        );
+        for (name, _, description) in formless_core::docs::TOPICS {
+            writeln!(
+                out,
+                "complete -c formless -f -n {} -a {} -d {}",
+                fish_quote(&condition),
+                fish_quote(name),
+                fish_quote(description)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn fish_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<()> {
     let result: Result<()> = (|| {
         let mut out = std::io::stdout().lock();
@@ -2155,13 +2185,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
     if let Some(Cmd::Completions { shell }) = cli.cmd {
-        use clap::CommandFactory;
-        clap_complete::generate(
-            shell,
-            &mut Cli::command(),
-            "formless",
-            &mut std::io::stdout(),
-        );
+        generate_completions(shell, &mut std::io::stdout())?;
         return Ok(());
     }
     if let Some(Cmd::Man) = cli.cmd {

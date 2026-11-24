@@ -574,6 +574,39 @@ fn docs_zsh_completions_offer_topic_names_from_the_table() {
 }
 
 #[test]
+fn docs_fish_completions_offer_topic_names_from_the_table() {
+    let mut script = Vec::new();
+    super::generate_completions(clap_complete::Shell::Fish, &mut script).unwrap();
+    let script = String::from_utf8(script).expect("fish completion script is utf-8");
+    let topics = formless_core::docs::TOPICS
+        .iter()
+        .map(|(name, _, _)| *name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let condition = format!(
+        "__fish_seen_subcommand_from docs; and not __fish_seen_subcommand_from --text --keys {topics}"
+    );
+    let completion_prefix = format!(
+        "complete -c formless -f -n {} -a",
+        super::fish_quote(&condition)
+    );
+    let completions: Vec<_> = script
+        .lines()
+        .filter(|line| line.starts_with(&completion_prefix))
+        .collect();
+    assert_eq!(completions.len(), formless_core::docs::TOPICS.len());
+    for ((name, _, description), completion) in formless_core::docs::TOPICS.iter().zip(completions)
+    {
+        let expected = format!(
+            "{completion_prefix} {} -d {}",
+            super::fish_quote(name),
+            super::fish_quote(description)
+        );
+        assert_eq!(completion, expected);
+    }
+}
+
+#[test]
 fn run_output_choices_explain_their_distinct_formats() {
     let root = command_tree();
     let output = root
