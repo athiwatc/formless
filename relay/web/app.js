@@ -350,7 +350,9 @@
     const box = $("outbox");
     if (!box) return;
     const entries = S.outbox || [];
-    box.hidden = entries.length === 0;
+    const hidden = entries.length === 0;
+    box.hidden = hidden;
+    box.classList.toggle("hidden", hidden);
     box.replaceChildren(...entries.map((item) => {
       const status = item.status === "sending" ? "Sending" : item.status === "failed" ? "Failed" : "Queued";
       return h("div", { class: "outbox-item", "data-status": item.status },

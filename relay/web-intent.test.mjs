@@ -1416,10 +1416,17 @@ test('outbox rendering exposes each message state, content and discard action', 
     prefs, S: { storageScope: 'test-room', local: true, daemonOnline: true, channel: {}, outbox: [item] },
     h: (tag, attrs, ...children) => ({ tag, attrs, children }),
   });
-  const box = c.$('outbox'); let rendered;
+  const box = c.$('outbox'), classes = new Set(['outbox', 'hidden']); let rendered;
+  box.classList = {
+    add(name) { classes.add(name); },
+    remove(name) { classes.delete(name); },
+    toggle(name, hidden) { if (hidden) classes.add(name); else classes.delete(name); return hidden; },
+    contains(name) { return classes.has(name); },
+  };
   box.replaceChildren = (...children) => { rendered = children; };
   c.renderOutbox();
   assert.equal(box.hidden, false);
+  assert.equal(box.classList.contains('hidden'), false);
   assert.match(plainText(rendered[0]), /Failed/);
   assert.match(plainText(rendered[0]), /message text/);
   assert.match(plainText(rendered[0]), /daemon rejected it/);
@@ -1427,6 +1434,7 @@ test('outbox rendering exposes each message state, content and discard action', 
   assert.equal(await rendered[0].children[1].attrs.onclick(), true);
   assert.equal(c.S.outbox.length, 0);
   assert.equal(box.hidden, true);
+  assert.equal(box.classList.contains('hidden'), true);
 });
 
 test('offline submissions persist the selected mode per Session without sending', async () => {
