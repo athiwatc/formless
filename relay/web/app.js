@@ -2627,6 +2627,13 @@
       ok: "Remove rule", saveRequest: () => ({ type: "remove_topic_permission_rule", topic_id: topic.id, rule_id: rule.rule_id }) });
   }
   function harnessAvailabilityLabel(item) {
+    if (item.kind === "acp") {
+      if (!item.installed) return "Not installed · unavailable for execution";
+      if (item.signed_in === true) return "Installed · ready";
+      return item.signed_in === false
+        ? "Installed · unavailable for execution; sign-in required"
+        : "Installed · unavailable for execution; sign-in readiness cannot be verified";
+    }
     if (!item.installed) return "Not installed";
     return item.signed_in === true ? "Installed · signed in" : item.signed_in === false ? "Installed · sign in required" : "Installed · sign-in status unknown";
   }

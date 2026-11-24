@@ -42,15 +42,28 @@ fn usage_cells(
     ]
 }
 
-fn partial_utc_day(since: Option<&str>) -> Option<String> {
+fn local_utc_offset_minutes() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
+}
+
+fn offset_label(minutes: i32) -> String {
+    let sign = if minutes >= 0 { '+' } else { '-' };
+    let magnitude = minutes.unsigned_abs();
+    format!("UTC{sign}{:02}:{:02}", magnitude / 60, magnitude % 60)
+}
+
+fn partial_local_day(since: Option<&str>, utc_offset_minutes: i32) -> Option<String> {
     let cutoff = chrono::DateTime::parse_from_rfc3339(since?).ok()?.to_utc();
-    (cutoff.time() != chrono::NaiveTime::MIN).then(|| cutoff.date_naive().to_string())
+    let local_cutoff =
+        cutoff.checked_add_signed(chrono::Duration::minutes(i64::from(utc_offset_minutes)))?;
+    (local_cutoff.time() != chrono::NaiveTime::MIN).then(|| local_cutoff.date_naive().to_string())
 }
 
 fn human(
     value: &Value,
     by: Group,
     since: Option<&str>,
+    utc_offset_minutes: Option<i32>,
     terminal: bool,
     color: bool,
     width: Option<usize>,
@@ -62,13 +75,15 @@ fn human(
         return Ok("No usage in range.\n".into());
     }
     let daily = matches!(by, Group::Day);
+    let offset = utc_offset_minutes.unwrap_or_default();
     let partial = if daily {
-        partial_utc_day(since).filter(|day| rows.iter().any(|row| row["key"].as_str() == Some(day)))
+        partial_local_day(since, offset)
+            .filter(|day| rows.iter().any(|row| row["key"].as_str() == Some(day)))
     } else {
         None
     };
     let mut table = Table::new(&[
-        if daily { "DAY (UTC)" } else { "KEY" },
+        if daily { "DAY" } else { "KEY" },
         "PROMPT TOKENS",
         "COMPLETION TOKENS",
         "CACHED TOKENS",
@@ -126,11 +141,22 @@ fn human(
         table.row(usage_cells(&key, counts, cache_write, cost));
     }
     table.row(usage_cells("TOTAL", totals, total_cache_write, total_cost));
-    let mut report = table.render(terminal, color, width);
+    let mut report = if daily {
+        format!(
+            "Daily usage offset: {}\n{}",
+            offset_label(offset),
+            table.render(terminal, color, width)
+        )
+    } else {
+        table.render(terminal, color, width)
+    };
     if terminal {
         if let Some(day) = partial {
             // A fitted table can clip the marker at ordinary terminal widths.
-            report.push_str(&format!("Partial UTC day {day}\n"));
+            report.push_str(&format!(
+                "Partial local day {day} ({})\n",
+                offset_label(offset)
+            ));
         }
     }
     Ok(report)
@@ -143,9 +169,26 @@ pub(super) fn write_report(
     json: bool,
     mut request: impl FnMut(Request) -> Result<Value>,
 ) -> Result<()> {
+    let daily = matches!(by, Group::Day);
+    let utc_offset_minutes = if daily {
+        let ping = request(Request::Ping)?;
+        let supports_local_days = ping["features"].as_array().is_some_and(|features| {
+            features.iter().any(|feature| {
+                feature.as_str() == Some(formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE)
+            })
+        });
+        anyhow::ensure!(
+            supports_local_days,
+            "the running daemon does not advertise caller-local daily usage support; restart the selected daemon with the same --profile and configuration flags used for this request, then retry"
+        );
+        Some(local_utc_offset_minutes())
+    } else {
+        None
+    };
     let value = request(Request::UsageByDay {
         since: since.clone(),
         by: by.key(),
+        utc_offset_minutes,
     })?;
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&value)?)?;
@@ -165,6 +208,7 @@ pub(super) fn write_report(
                 &value,
                 by,
                 since.as_deref(),
+                utc_offset_minutes,
                 terminal,
                 terminal && table::color_allowed(),
                 width
@@ -177,32 +221,53 @@ pub(super) fn write_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn human_uses_utc_days_and_marks_only_a_present_truncated_cutoff_day() {
+    fn daily_usage_refuses_daemons_without_offset_support_before_output() {
+        let mut out = Vec::new();
+        let mut requests = Vec::new();
+        let error = write_report(&mut out, Group::Day, None, true, |request| {
+            requests.push(request);
+            Ok(serde_json::json!({"pong":true,"features":[]}))
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not advertise caller-local daily usage support"));
+        assert!(error.to_string().contains(
+            "restart the selected daemon with the same --profile and configuration flags used for this request"
+        ));
+        assert!(matches!(&requests[..], [Request::Ping]));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn human_uses_local_days_and_marks_only_a_present_truncated_cutoff_day() {
         let rows = serde_json::json!([
             {"key":"2026-11-16","prompt_tokens":1,"completion_tokens":0,"cached_tokens":0,"cost":null},
             {"key":"2026-11-17","prompt_tokens":2,"completion_tokens":0,"cached_tokens":0,"cost":null}
         ]);
-        let render = |group, since| human(&rows, group, since, false, false, None).unwrap();
+        let render =
+            |group, since| human(&rows, group, since, Some(420), false, false, None).unwrap();
         let truncated = render(Group::Day, Some("2026-11-17T03:00:00+07:00"));
-        assert!(truncated.contains("DAY (UTC)"));
-        assert!(truncated.contains("2026-11-16 (partial)"));
-        assert!(!truncated.contains("2026-11-17 (partial)"));
+        assert!(truncated.starts_with("Daily usage offset: UTC+07:00\n"));
+        assert!(truncated.contains("2026-11-17 (partial)"));
+        assert!(!truncated.contains("2026-11-16 (partial)"));
         let next = render(Group::Day, Some("2026-11-16T20:00:00-05:00"));
         assert!(next.contains("2026-11-17 (partial)"));
         for since in [
             None,
-            Some("2026-11-16T07:00:00+07:00"),
-            Some("2026-11-16T19:00:00-05:00"),
-            Some("2026-11-15T20:00:00Z"),
+            Some("2026-11-15T17:00:00Z"),
+            Some("2026-11-16T17:00:00Z"),
+            Some("2026-11-18T17:00:00Z"),
         ] {
             let whole = render(Group::Day, since);
-            assert!(whole.contains("DAY (UTC)"));
+            assert!(whole.starts_with("Daily usage offset: UTC+07:00\n"));
             assert!(!whole.contains("(partial)"));
         }
         let grouped = render(Group::Model, Some("2026-11-16T20:00:00Z"));
         assert!(grouped.contains("KEY"));
-        assert!(!grouped.contains("DAY (UTC)") && !grouped.contains("(partial)"));
+        assert!(!grouped.contains("Daily usage offset:") && !grouped.contains("(partial)"));
     }
 
     #[test]
@@ -216,26 +281,40 @@ mod tests {
                 &rows,
                 Group::Day,
                 Some("2026-11-16T20:00:00Z"),
+                Some(420),
                 true,
                 false,
                 Some(width),
             )
             .unwrap();
             assert!(
-                rendered.ends_with("Partial UTC day 2026-11-16\n"),
+                rendered.ends_with("Partial local day 2026-11-17 (UTC+07:00)\n"),
                 "{rendered}"
             );
             let missing = human(
                 &rows,
                 Group::Day,
-                Some("2026-11-15T20:00:00Z"),
+                Some("2026-11-17T20:00:00Z"),
+                Some(420),
                 true,
                 false,
                 Some(width),
             )
             .unwrap();
-            assert!(!missing.contains("Partial UTC day"), "{missing}");
+            assert!(!missing.contains("Partial local day"), "{missing}");
         }
+    }
+
+    #[test]
+    fn all_history_daily_offset_is_visible_at_80_columns() {
+        let rows = serde_json::json!([
+            {"key":"2026-11-16","prompt_tokens":1,"completion_tokens":0,"cached_tokens":0,"cost":null}
+        ]);
+        let rendered = human(&rows, Group::Day, None, Some(840), true, false, Some(80)).unwrap();
+        assert!(
+            rendered.contains("Daily usage offset: UTC+14:00"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -280,7 +359,8 @@ mod tests {
     }
 
     #[test]
-    fn one_request_preserves_cutoff_order_values_unknown_cost_and_json_fields() {
+    fn daily_capability_check_preserves_cutoff_order_values_unknown_cost_and_json_fields() {
+        let expected_offset = local_utc_offset_minutes();
         let value = serde_json::json!([
             {"key":"日本語","prompt_tokens":1,"completion_tokens":2,"cached_tokens":0,"cache_write_tokens":1,"cost":null,"future":7},
             {"key":"ไทย","prompt_tokens":100,"completion_tokens":200,"cached_tokens":3,"cache_write_tokens":4,"cost":0.125},
@@ -297,13 +377,21 @@ mod tests {
                 Some("2026-10-14T12:00:00+00:00".into()),
                 json,
                 |request| {
+                    let reply = if matches!(&request, Request::Ping) {
+                        serde_json::json!({
+                            "pong":true,
+                            "features":[formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE]
+                        })
+                    } else {
+                        value.clone()
+                    };
                     calls.push(request);
-                    Ok(value.clone())
+                    Ok(reply)
                 },
             )
             .unwrap();
             assert!(
-                matches!(&calls[..],[Request::UsageByDay{since:Some(since),by:None}] if since=="2026-10-14T12:00:00+00:00")
+                matches!(&calls[..],[Request::Ping,Request::UsageByDay{since:Some(since),by:None,utc_offset_minutes:Some(offset)}] if since=="2026-10-14T12:00:00+00:00" && *offset==expected_offset)
             );
             if json {
                 let unformatted = serde_json::to_string_pretty(&value).unwrap() + "\n";
@@ -332,12 +420,13 @@ mod tests {
                 assert!(!text.contains("0.30000000000000004"));
             }
         }
-        let narrow = human(&value, Group::Day, None, true, false, Some(30)).unwrap();
+        let narrow = human(&value, Group::Day, None, Some(420), true, false, Some(30)).unwrap();
         assert!(!narrow.is_empty());
         assert!(human(
             &serde_json::json!([]),
             Group::Day,
             Some("2026-11-16T20:00:00Z"),
+            Some(420),
             false,
             false,
             None
@@ -353,7 +442,7 @@ mod tests {
 
         let mut priced = value;
         priced[0]["cost"] = serde_json::json!(0.25);
-        let rendered = human(&priced, Group::Day, None, false, false, None).unwrap();
+        let rendered = human(&priced, Group::Day, None, Some(420), false, false, None).unwrap();
         assert_eq!(
             rendered.lines().last().unwrap().split_whitespace().last(),
             Some("$0.675123")

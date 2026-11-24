@@ -25,6 +25,7 @@ fn request(access: StepAccess) -> HarnessRequest {
         mcp_args: vec!["mcp.py".into()],
         mcp_env_vars: vec!["PROBE_ENV".into()],
         executable: Some(PathBuf::from("/custom/opencode")),
+        executable_argv0: None,
         environment: BTreeMap::from([
             ("PROBE_ENV".into(), "cap-secret".into()),
             ("PWD".into(), "/wrong".into()),
@@ -629,7 +630,12 @@ async fn public_dispatch_runs_executable_override_with_core_interactions() {
         }]),
         ..CoreHandler::default()
     });
-    let result = crate::local_harness::run(&request, core.clone(), &CancellationToken::new()).await;
+    let result = crate::local_harness::run(
+        request,
+        core.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
     std::fs::remove_dir_all(&dir).unwrap();
     let result = result.unwrap();
     assert_eq!(result.session_id.as_deref(), Some("fake-session"));

@@ -53,6 +53,19 @@ without redesign.
 
 ### 2.2 Processes and clients
 
+- The Grok Build ACP profile targets the official `grok agent --no-leader stdio`
+  interface (ACP v1, Grok 1.0.92 or newer). It disables automatic updates with
+  `GROK_DISABLE_AUTOUPDATER=1`; `XAI_API_KEY` and `GROK_HOME` remain environment
+  inputs, never command arguments. Read-only steps add `--sandbox read-only`
+  and require ACP plan mode plus the shared fail-closed tool permission policy.
+  Permissions are user-answered through the shared handler; vendor tool metadata
+  remains in raw input and `allow_always` is attempt-scoped. Native
+  `_x.ai/ask_user_question` requests translate to the same user question types as
+  the Formless bridge, with explicit accepted/cancelled replies. Questions may
+  also use bridge `AskUser` or a turn-end message. The profile uses shared ACP
+  dispatch, selected as harness `acp` with `acp_agent: "grok"`; see
+  `docs/grok-adapter.md` for the current integration boundary and live evidence.
+
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).
   Optional `--profile <name>` runs an additional isolated daemon + data dir.
 - Local Pi harness runs stage their extension in an attempt-private directory.
@@ -4634,8 +4647,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   {since}`). Model outcomes in a range come from the `model_events` log
   (migration v38), so ranges only cover history from that version on;
   "all time" still uses the running totals.
-- **Token and cost chart.** `UsageByDay {since, by}` sums provider token
-  use (prompt, completion, cached, cache write) per UTC day, or with `by` = "model",
+- **Token and cost chart.** `UsageByDay {since, by, utc_offset_minutes}` sums
+  provider token use (prompt, completion, cached, cache write) per UTC day when
+  the offset is omitted, or shifted by the supplied caller UTC offset in minutes
+  (`-1439..=1439`; invalid values are rejected), or with `by` = "model",
   "role" or "session" per that key over the range, priced with
   `provider.prices` (no cost when a model in the bucket has no price). Session
   rows carry the stable `session_id` and display the Session name in `key`.
@@ -5420,7 +5435,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
-| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human UTC day rows mark a truncated cutoff day. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. Human daily rows show the applied UTC offset and mark a truncated cutoff day. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 `providers test NAME [--model MODEL] [--json]` lists the available model IDs
@@ -6718,6 +6733,19 @@ under `crates/*/src` against README or SPEC, including test-only references.
 not a user override. Named key fixtures use the documented
 `FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
 
+`FORMLESS_LIVE_GROK=1` enables the ignored Grok ACP initialization smoke test.
+`FORMLESS_GROK_BIN` selects its installed executable instead of `grok` on PATH.
+This test only negotiates ACP and validates version metadata; it does not prove
+authentication, MCP attachment, permission enforcement, or a completed turn.
+`FORMLESS_GROK_MCP_SCRIPT` supplies the Python MCP fixture for the separate ignored
+`live_grok_acp_turn` test. With the isolated loopback provider and dummy key, that
+test exercises per-session MCP and user questions through the shared ACP driver.
+
+`FORMLESS_LIVE_AGY=1` enables the ignored Antigravity ACP smoke test;
+`FORMLESS_AGY_BIN` selects its executable. `FORMLESS_TOPIC_CAPABILITY` carries
+the per-attempt bridge capability only in the selected MCP environment, never
+in harness command arguments.
+
 `FORMLESS_BIN` supplies a fallback CLI path when the desktop app starts its
 daemon. Lookup tries a sibling CLI first, then this nonempty path, then PATH.
 
@@ -6746,6 +6774,23 @@ configuration interface): `FORMLESS_CLIPBOARD_CHILD_FIXTURE`,
 `FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
 for the test-only doctor subprocess, which installs an in-memory credential
 backend before read-only dispatch; the shipped binary does not read this variable).
+
+`FORMLESS_LIVE_ACP_BIN_DIR` gates the ignored ACP initialize and availability tests.
+It names a directory of installed ACP CLI executables (or symlinks). These tests
+use isolated HOME/XDG directories and skip absent binaries. Initialize-only tests
+send only ACP initialize; the availability test also sends session/new without
+MCP servers, with an eight-second deadline. It is not a product configuration
+override and does not authenticate or send prompts.
+
+The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
+opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.
+`FORMLESS_TOPIC_CAPABILITY` is the per-attempt bearer capability for the private
+MCP bridge. Pi topic runs include it in the Pi RPC process environment and
+forward it to the MCP child through the extension's allow-listed `envVars`; it
+is not placed in argv, prompts, or transcripts. Pi and descendants inheriting
+the environment can access it. The Pi process also inherits the daemon's
+ambient environment, so native credentials already present there are not
+isolated from the harness.
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
@@ -6878,12 +6923,18 @@ is exposed by these commands.
 
 `usage [--by day|model|provider|purpose|role|session] [--since DURATION] [--json]`
 reads the existing full-range UsageByDay aggregation once, independently of
-the bounded recent Run list. Default/explicit day sends no group key and keeps
-the daemon's oldest-first day order; other groups keep its descending total-token
-order. No since means all history; durations use the shared checked parser
-and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
-Human tables show cache writes, total tokens (prompt plus completion), and a
-final total row. Cached and cache-write tokens are included in prompt tokens.
+the bounded recent Run list. Default/explicit day sends no group key and the
+caller's current local UTC offset in minutes; its oldest-first buckets and JSON
+keys are local dates. The daemon advertises this support as
+usage_by_day_utc_offset_v1; if absent, the CLI refuses to display UTC buckets
+as local. Other groups omit the offset and keep their descending
+total-token order. Requests without an offset, including existing TUI clients,
+keep UTC day grouping. The offset is fixed for the entire query, including
+history across daylight-saving changes. No since means all history; durations
+use the shared checked parser and one UTC RFC3339 cutoff matching the existing
+stored TEXT representation. Human tables show the local UTC offset, cache writes,
+total tokens (prompt plus completion), and a final total row. Cached and
+cache-write tokens are included in prompt tokens.
 Unknown costs and unavailable cache-write counts display as `-`, including in
 totals that contain an unknown value. JSON preserves the complete row array,
 including `cache_write_tokens` and null costs. Cost is the daemon's current estimate, not a
@@ -7107,10 +7158,10 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Pi uses its integrated RPC adapter; OpenCode and Antigravity
-use their ACP adapters. Muse Code uses its interactive session protocol and
-requires one-run workspace trust from the user. Generic ACP returns an
-actionable adapter-not-integrated step result.
+another harness. Pi uses its integrated RPC adapter; Antigravity, named ACP
+profiles and OpenCode use their ACP adapters. Muse Code uses its interactive
+session protocol and requires one-run workspace trust from the user. ACP
+requires a valid acp_agent.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7171,10 +7222,10 @@ sets persisted allow_external_context (default false); opting in permits all
 non-deleted conversations. List/read/search share this scope. Search is a
 case-insensitive substring match returning at most 40 bounded snippets.
 
-The wire also includes ACP (`acp`) and Muse (`muse`), without integrated adapters
-in Phase A. `acp_agent` is required, nonempty and present only for ACP; selectors
-are otherwise opaque until adapter integration. It is retained in advisory
-steps and attempt metadata.
+The wire also includes ACP (acp) and Muse (muse). ACP dispatches through the
+registered named-agent adapter and requires acp_agent to be nonempty and
+present only for ACP; selectors are validated against the registry and retained
+in advisory steps and attempt metadata.
 
 Harness questions reuse UserQuestion, AnswerQuestion and UserQuestionClosed on
 the canonical attempt conversation. Topic MCP AskUser and InteractionHandler
@@ -7301,43 +7352,77 @@ rejected. Raising increments the hit cap by its default (3 or 20, saturating)
 and returns the topic to Running; Stop leaves NeedsUser. Neither answer starts
 a model or harness automatically. SetTopicLimits itself changes limits only.
 
-ListHarnesses refreshes CLI harnesses concurrently. Every probe is capped at
+ListHarnesses refreshes all seven kinds concurrently, expanding ACP into one
+entry per ACP registry id with acp_agent set. Every probe is capped at
 10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
-detail "probe timed out". A harness is ready iff installed and signed_in is
-not Some(false): unknown auth is ready. Planning receives fresh availability,
+detail "probe timed out". Legacy non-ACP readiness requires installed and
+signed_in is not Some(false). ACP requires signed_in=true and a resolved
+executable; unknown ACP authentication is unavailable. Cursor, Cline, Junie,
+Auggie, and Devin remain unavailable because Formless has not integrated a
+supported non-model sign-in readiness check for them, even if session/new
+succeeds. Signing in alone does not
+unblock them. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Muse Code
 checks its version before using usage --json and only confirms sign-in when
 it receives a Meta account allowance. These probes do not send model turns
 or copy raw auth output into detail or logs.
 
-Readiness resolves the CLI from absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides
-or the kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE` for
-its version probe, along with `FORMLESS_TOPIC_PI_EXE`,
-`FORMLESS_TOPIC_MUSE_EXE`, and `FORMLESS_TOPIC_ANTIGRAVITY_EXE` overrides.
-Pi has adapter-specific availability and an attempt-private RPC runner. OpenCode
-has an availability probe that runs `--version` in a private cwd under the
-probe deadline, with kill-on-drop and process-group cleanup; its auth remains
-unknown, including version failures. Antigravity uses a bounded adapter-specific
-probe: ACP initialization checks installation/version and `agy models` checks
-existing sign-in. Topic steps carry the selected executable identity from
-readiness through launch and fail closed if it is unavailable. Generic ACP
-reports lookup-only availability and preserves its configured agent. Adapter
-owners can replace fallbacks with async probes or the bounded spawn_blocking
-probe hook. The reusable ACP
-probe initializes and creates a session with no MCP servers in a private
-temporary cwd, never prompts, maps configured auth errors, and kills its
-process group on success, failure or timeout.
+Readiness resolves absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides or each
+kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE`,
+`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`. Pi has adapter-specific availability and an
+attempt-private RPC runner. OpenCode has a bounded `--version` probe in a
+private cwd with kill-on-drop and process-group cleanup; it requires V2 >= 2.3.2
+and leaves credential status unknown because checking auth initializes
+providers and makes network requests. Muse Code checks its version before
+`usage --json` and only confirms sign-in when it receives a Meta account
+allowance. Antigravity uses a bounded adapter-specific probe: ACP initialization
+checks installation/version and `agy models` checks existing sign-in. Topic
+steps carry the selected Antigravity executable identity from readiness through
+launch and fail closed if it is unavailable.
 
-Antigravity readiness resolves `agy`, verifies ACP v1 and the minimum supported
-version, then runs `agy models` to determine sign-in. An explicit sign-in prompt
-means not signed in; inconclusive failures remain unknown.
-Adapter blocking probes must enforce their own internal deadline and kill
-child processes on drop: core's outer timeout cannot abort spawn_blocking.
-Core does not own the ACP agent registry and omits the bare ACP entry from
-ListHarnesses; the ACP adapter's registry supplies per-agent entries.
-The per-kind probe dispatch receives the selected acp_agent id, including
-for its current executable-only fallback. ACP is a protocol, not a CLI.
+ACP applies `FORMLESS_TOPIC_ACP_EXE` to each named-agent preparation; otherwise
+the agent's command is resolved from the daemon's PATH. Readiness canonicalizes
+the selected absolute path and probes that path on a bounded blocking worker,
+including initialize version (`agentInfo.version`, then
+`_meta.agentVersion`) and `session/new` sign-in checks. It retains the
+pre-canonical selected absolute path as `executable_argv0` alongside the
+canonical executable. Each topic step carries both internally; public
+`HarnessAvailability` and ListHarnesses shapes remain unchanged. The topic
+launch executes the canonical path with the retained invocation path as argv0
+on Unix, without rereading PATH or the ACP override and without executing the
+symlink path. Workspace-local PATH entries therefore cannot substitute a
+different ACP executable. If preparation does not produce an executable
+identity, the step stops before attempt launch with the existing
+retry/substitute guidance. Unknown ACP authentication is unavailable. If the selected path
+disappears before spawn, launch fails without a PATH fallback. Resolution is
+fresh after each retry or approved substitute; this pins path selection, not
+executable contents.
+
+The shared ACP spawn also anchors relative and empty child `PATH` entries to
+the daemon's working directory before setting the topic workspace as cwd. This
+applies to named ACP agents, OpenCode, and Antigravity. Workspace-local `./bin`
+is not implicitly searched for child tools or shebang interpreters, so
+workflows relying on workspace-relative `PATH` entries may resolve differently.
+
+The reusable ACP probe initializes and creates a session with no MCP servers in
+a private temporary cwd, never prompts, maps configured auth errors, and kills
+its process group on success, failure or timeout. ACP's inner probe deadline is
+eight seconds; the blocking worker is bounded at ten seconds. Antigravity
+readiness resolves `agy`, verifies ACP v1 and the minimum supported version,
+then runs `agy models` to determine sign-in. An explicit sign-in prompt means
+not signed in; inconclusive failures remain unknown. Adapter blocking probes
+must enforce their own internal deadline and kill child processes on drop:
+core's outer timeout cannot abort spawn_blocking. Core does not own the ACP
+agent registry and omits the bare ACP entry from ListHarnesses; the ACP
+adapter's registry supplies per-agent entries. The per-kind probe dispatch
+receives the selected acp_agent id.
+
+Grok's registry probe reads `_meta.agentVersion` (minimum 1.0.92), reports
+signed_in true on session creation and false on -32000, and forces
+`GROK_DISABLE_AUTOUPDATER=1` through the shared launcher. It never places
+`XAI_API_KEY` in arguments or sends a model turn.
 
 topic_request_harness_substitute raises a user_only question with "Sign in and
 retry", "Use <substitute>", and "Skip step". Model answers are rejected.
