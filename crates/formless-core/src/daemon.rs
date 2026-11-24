@@ -4283,11 +4283,22 @@ impl Daemon {
             Request::ListBuiltinStats { since } => Ok(serde_json::to_value(
                 self.with_reader(|st| st.builtin_stats(since.as_deref()))?,
             )?),
-            Request::UsageByDay { since, by } => {
+            Request::UsageByDay {
+                since,
+                by,
+                utc_offset_minutes,
+            } => {
+                if let Some(offset) = utc_offset_minutes {
+                    anyhow::ensure!(
+                        (-1439..=1439).contains(&offset),
+                        "usage UTC offset must be between -1439 and 1439 minutes"
+                    );
+                }
                 let by = by.unwrap_or_default();
                 let cfg = self.config()?;
-                let rows =
-                    self.with_reader(|st| st.usage_grouped_with_labels(since.as_deref(), &by))?;
+                let rows = self.with_reader(|st| {
+                    st.usage_grouped_with_labels(since.as_deref(), &by, utc_offset_minutes)
+                })?;
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 struct UsageBucket {

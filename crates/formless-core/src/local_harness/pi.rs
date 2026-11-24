@@ -2254,6 +2254,7 @@ mod tests {
             mcp_args: vec!["serve".into(), "--literal $value".into()],
             mcp_env_vars: vec!["FORMLESS_TOPIC_CAPABILITY".into()],
             executable: Some(std::env::current_exe().unwrap()),
+            executable_argv0: None,
             environment: BTreeMap::from([(
                 OsString::from("FORMLESS_TOPIC_CAPABILITY"),
                 OsString::from("secret-token"),

@@ -23,6 +23,8 @@ if '--version' in sys.argv:
         (gate/(pathlib.Path(sys.argv[0]).name+'.ready')).write_text('ready')
         while not all((gate/(name+'.ready')).exists() for name in ['claude','codex']):time.sleep(.01)
     print('opencode v2.3.2' if pathlib.Path(sys.argv[0]).name=='opencode' else '1.6.0' if pathlib.Path(sys.argv[0]).name=='pi' else 'fixture 1.0');sys.exit()
+if pathlib.Path(sys.argv[0]).name=='acp':
+    pathlib.Path(os.environ['PROBE_ACP_STARTS'],str(os.getpid())).touch()
 mode=os.environ.get('PROBE_MODE','ok')
 if mode=='hang':time.sleep(120)
 if sys.argv[1:]==['auth','status']:
@@ -90,6 +92,7 @@ async fn official_probes_report_version_and_explicit_auth_status() {
 
 #[tokio::test]
 async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
+    let _env = crate::credential_env::EnvGuard::isolated();
     let (root, mut ctx) = fixture();
     for kind in [
         HarnessKind::Claude,
@@ -97,6 +100,7 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
         HarnessKind::Pi,
         HarnessKind::OpenCode,
         HarnessKind::Antigravity,
+        HarnessKind::Acp,
         HarnessKind::Muse,
     ] {
         let target = root.0.join(kind_name(kind));
@@ -112,9 +116,20 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     }
     ctx.environment
         .insert("PROBE_GATE".into(), root.0.clone().into_os_string());
+    let acp_starts = root.0.join("acp-starts");
+    std::fs::create_dir(&acp_starts).unwrap();
+    ctx.environment.insert(
+        "PROBE_ACP_STARTS".into(),
+        acp_starts.clone().into_os_string(),
+    );
     let values = list_environment(ctx.environment, Duration::from_secs(2)).await;
-    assert_eq!(values.len(), 6);
-    assert!(!values.iter().any(|value| value.kind == HarnessKind::Acp));
+    let acp_ids = super::super::acp_agents::agent_ids();
+    assert_eq!(values.len(), 6 + acp_ids.len());
+    assert_eq!(
+        std::fs::read_dir(acp_starts).unwrap().count(),
+        acp_ids.len(),
+        "ListHarnesses should launch one ACP probe per registry id"
+    );
     assert!(values
         .iter()
         .filter(|value| value.kind != HarnessKind::Antigravity)
@@ -144,13 +159,26 @@ async fn list_probes_run_concurrently_with_pi_adapter_and_muse_allowance() {
     assert!(!antigravity.installed);
     assert_eq!(antigravity.version, None);
     assert_eq!(antigravity.signed_in, None);
-    assert!(antigravity
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("does not speak ACP v1")));
-    assert_eq!(values[5].kind, HarnessKind::Muse);
-    assert_eq!(values[5].version.as_deref(), Some("1.4.24"));
-    assert_eq!(values[5].signed_in, Some(true));
+    assert!(
+        antigravity
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("does not speak ACP v1")),
+        "Antigravity readiness detail: {:?}",
+        antigravity.detail
+    );
+    let acp: Vec<_> = values
+        .iter()
+        .filter(|value| value.kind == HarnessKind::Acp)
+        .collect();
+    assert_eq!(acp.len(), acp_ids.len());
+    assert!(acp
+        .iter()
+        .all(|value| value.signed_in.is_none() && value.version.is_none()));
+    let muse = values.last().unwrap();
+    assert_eq!(muse.kind, HarnessKind::Muse);
+    assert_eq!(muse.version.as_deref(), Some("1.4.24"));
+    assert_eq!(muse.signed_in, Some(true));
 }
 
 #[tokio::test]
@@ -210,6 +238,109 @@ async fn muse_pi_overrides_and_missing_or_relative_executables() {
 }
 
 #[tokio::test]
+async fn list_harnesses_expands_acp_registry_with_missing_binaries() {
+    let root = ProbeDirectory::new().unwrap();
+    let values = list_environment(
+        BTreeMap::from([("PATH".into(), root.0.clone().into_os_string())]),
+        Duration::from_secs(1),
+    )
+    .await;
+    let acp: Vec<_> = values
+        .iter()
+        .filter(|value| value.kind == HarnessKind::Acp)
+        .collect();
+    let ids = super::super::acp_agents::agent_ids();
+    assert_eq!(values.len(), 6 + ids.len());
+    assert_eq!(acp.len(), ids.len());
+    for id in ids {
+        let matches: Vec<_> = acp
+            .iter()
+            .filter(|value| value.acp_agent.as_deref() == Some(*id))
+            .collect();
+        assert_eq!(matches.len(), 1, "{id}");
+        assert!(!matches[0].installed);
+        assert_eq!(matches[0].signed_in, None);
+        assert_eq!(matches[0].version, None);
+        assert!(matches[0].detail.is_some());
+    }
+}
+
+#[tokio::test]
+async fn named_acp_probe_uses_registry_and_executable_override() {
+    let (_root, mut ctx) = fixture();
+    let captured: serde_json::Value =
+        serde_json::from_str(include_str!("local_harness/acp_agents/captured.json")).unwrap();
+    std::fs::write(
+        &ctx.executable,
+        r#"#!/bin/sh
+set -eu
+IFS= read -r request
+printf '%s\n' "$ACP_INITIALIZE"
+IFS= read -r request
+printf '%s\n' "$ACP_SESSION"
+"#,
+    )
+    .unwrap();
+    ctx.environment.insert(
+        "ACP_INITIALIZE".into(),
+        captured["gemini"]["initialize"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "ACP_SESSION".into(),
+        captured["gemini"]["session_new"].to_string().into(),
+    );
+    ctx.environment.insert(
+        "FORMLESS_TOPIC_ACP_EXE".into(),
+        ctx.executable.clone().into_os_string(),
+    );
+    let result = probe_environment(
+        HarnessKind::Acp,
+        Some("gemini"),
+        &ctx.environment,
+        ctx.timeout,
+    )
+    .await;
+    assert_eq!(result.kind, HarnessKind::Acp);
+    assert_eq!(result.acp_agent.as_deref(), Some("gemini"));
+    assert!(result.installed);
+    assert_eq!(result.signed_in, Some(false));
+    assert_eq!(result.version.as_deref(), Some("0.70.0"));
+    let detail = result.detail.as_deref().unwrap();
+    assert!(detail.contains(
+        super::super::acp_agents::spec("gemini")
+            .unwrap()
+            .not_signed_in
+    ));
+    assert!(
+        detail.contains("ACP readiness reported authentication required (JSON-RPC error -32000)")
+    );
+    assert!(detail.contains("Formless did not perform ACP authentication"));
+    assert!(detail.contains("this readiness result is not launchable"));
+    assert!(detail.contains("Advertised ACP authentication methods"));
+    for method in captured["gemini"]["initialize"]["result"]["authMethods"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(detail.contains(method["id"].as_str().unwrap()));
+    }
+
+    let result = dispatch(HarnessKind::Acp, &ctx, None).await;
+    assert!(!result.installed);
+    assert!(result.detail.unwrap().contains("requires an acp_agent"));
+    let result = dispatch(HarnessKind::Acp, &ctx, Some("unknown")).await;
+    assert!(!result.installed);
+    assert_eq!(result.acp_agent.as_deref(), Some("unknown"));
+    assert!(result.detail.unwrap().contains("available agents:"));
+    for invalid in ["", "relative"] {
+        ctx.environment
+            .insert("FORMLESS_TOPIC_ACP_EXE".into(), invalid.into());
+        let result = dispatch(HarnessKind::Acp, &ctx, Some("gemini")).await;
+        assert!(!result.installed);
+        assert!(result.detail.unwrap().contains("absolute"));
+    }
+}
+
+#[tokio::test]
 async fn official_probe_timeout_is_unknown_and_bounded() {
     assert_eq!(ProbeContext::default().timeout, Duration::from_secs(10));
     let (_root, mut ctx) = fixture();
@@ -225,25 +356,29 @@ async fn official_probe_timeout_is_unknown_and_bounded() {
 
 #[tokio::test]
 async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() {
-    let (_root, mut ctx) = fixture();
-    let value = dispatch(HarnessKind::Acp, &ctx, Some("grok")).await;
-    assert_eq!(value.acp_agent.as_deref(), Some("grok"));
+    let (root, mut ctx) = fixture();
+    let value = dispatch(HarnessKind::Acp, &ctx, Some("gemini")).await;
+    assert_eq!(value.acp_agent.as_deref(), Some("gemini"));
     assert!(value.installed);
     assert!(value.signed_in.is_none());
     ctx.environment.clear();
+    let missing_path = root.0.join("missing-path");
+    std::fs::create_dir(&missing_path).unwrap();
+    ctx.environment
+        .insert("PATH".into(), missing_path.into_os_string());
     let missing = probe_environment(
         HarnessKind::Acp,
-        Some("grok"),
+        Some("gemini"),
         &ctx.environment,
         Duration::from_secs(1),
     )
     .await;
-    assert_eq!(missing.acp_agent.as_deref(), Some("grok"));
+    assert_eq!(missing.acp_agent.as_deref(), Some("gemini"));
     assert!(!missing.installed);
-    assert_eq!(
-        missing.detail.as_deref(),
-        Some("ACP agent executable is not configured")
-    );
+    assert!(missing
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("not installed")));
 }
 
 #[tokio::test]

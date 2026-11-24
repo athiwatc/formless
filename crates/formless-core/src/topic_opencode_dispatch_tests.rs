@@ -159,6 +159,7 @@ fn request(
         ],
         mcp_env_vars,
         executable: Some(executable),
+        executable_argv0: None,
         environment: std::mem::take(&mut environment),
     }
 }

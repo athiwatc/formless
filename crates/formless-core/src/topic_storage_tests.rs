@@ -1505,6 +1505,7 @@ fn topic_acp_selector_is_required_iff_acp_and_persisted() {
         (Some(HarnessKind::Acp), Some(" ")),
         (Some(HarnessKind::Muse), Some("agent")),
         (None, Some("agent")),
+        (Some(HarnessKind::Acp), Some("unknown-agent")),
     ] {
         request.outline[0].harness = kind;
         request.outline[0].acp_agent = agent.map(str::to_owned);
@@ -1513,12 +1514,31 @@ fn topic_acp_selector_is_required_iff_acp_and_persisted() {
             .is_err());
     }
     request.outline[0].harness = Some(HarnessKind::Acp);
-    request.outline[0].acp_agent = Some("custom agent/id".into());
+    request.outline[0].acp_agent = Some("gemini".into());
     let topic = store
         .propose_topic(&request, WorkspaceKind::Git, Some(&"a".repeat(40)))
         .unwrap();
     store.approve_topic(&topic.id).unwrap();
     store.claim_topic_workflow(&topic.id).unwrap();
+    let error = store
+        .begin_topic_attempt(
+            &topic.id,
+            &topic.features[0].id,
+            "ACP",
+            StepAccess::Write,
+            HarnessKind::Acp,
+            None,
+            Some("unknown-agent"),
+            &[],
+            &"token".repeat(8),
+            Path::new("/topic/build"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Unknown ACP agent `unknown-agent`"),
+        "{error}"
+    );
     let attempt = store
         .begin_topic_attempt(
             &topic.id,
@@ -1527,13 +1547,13 @@ fn topic_acp_selector_is_required_iff_acp_and_persisted() {
             StepAccess::Write,
             HarnessKind::Acp,
             None,
-            Some("custom agent/id"),
+            Some("gemini"),
             &[],
             &"token".repeat(8),
             Path::new("/topic/build"),
         )
         .unwrap();
-    assert_eq!(attempt.acp_agent.as_deref(), Some("custom agent/id"));
+    assert_eq!(attempt.acp_agent.as_deref(), Some("gemini"));
 }
 
 #[test]
