@@ -352,43 +352,34 @@ impl Daemon {
                 }
             }
         }
-        let mut signals = assemble_tool_signal_section(&ranked, &replay_examples);
+        let tool_signals = assemble_tool_signal_section(&ranked, &replay_examples);
         // Scripts run again and again but never saved (§7.12).
         let recurring = self
             .with_store(|st| st.recurring_scripts(cfg.scripts.recurrence_threshold, 5))
             .unwrap_or_default();
-        if !recurring.is_empty() {
-            signals.push_str(
-                "\nRecurring run_script scripts never saved as a Tool (save_as would make them reusable and measured):\n",
-            );
-            for (sessions, uses, source) in &recurring {
-                let head: String = source.lines().take(3).collect::<Vec<_>>().join(" / ");
-                signals.push_str(&format!(
-                    "- {sessions} sessions, uses [{}]: {}\n",
-                    uses.join(", "),
-                    head.chars().take(160).collect::<String>()
-                ));
-            }
-        }
         // Run outcomes (§8.7): whether Runs reach the user's goal.
-        if let Ok(runs) = self.with_store(|st| st.run_metrics(200)) {
-            let summary = crate::runs::summarize(&runs);
-            if summary.runs > 0 {
-                signals.push_str(&format!("\n{}\n", crate::runs::summary_line(&summary)));
-            }
-        }
+        let run_summary = self
+            .with_store(|st| st.run_metrics(200))
+            .ok()
+            .and_then(|runs| {
+                let summary = crate::runs::summarize(&runs);
+                (summary.runs > 0).then(|| crate::runs::summary_line(&summary))
+            });
         // Every earlier proposal, not only applied ones: with unchanged
         // signals the model would otherwise suggest the same thing again.
         let earlier = self.with_store(|st| st.list_proposals())?;
-        if !earlier.is_empty() {
-            signals.push_str(
-                "\nEarlier proposals (do not repeat or rephrase them; rejected and rolled-back ones were judged unhelpful):\n",
-            );
-            for p in earlier.iter().take(40) {
-                signals.push_str(&format!("- [{}] {}\n", p.status, p.content));
-            }
-        }
-        let signals = cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS);
+        let earlier_signals: Vec<_> = earlier
+            .iter()
+            .take(40)
+            .map(|proposal| (proposal.status.to_string(), proposal.content.clone()))
+            .collect();
+        let signals = assemble_proposal_signals(
+            tool_signals,
+            !ranked.is_empty(),
+            &recurring,
+            run_summary.as_deref(),
+            &earlier_signals,
+        );
         let provider = self.provider(cfg).await?;
         let model = cfg
             .optimiser
@@ -2017,10 +2008,45 @@ fn assemble_tool_signal_section(
             }
         }
     }
-    if ranked.is_empty() {
+    capped_tool_signals(signals)
+}
+
+fn assemble_proposal_signals(
+    tool_signals: String,
+    has_tool_activity: bool,
+    recurring: &[(usize, Vec<String>, String)],
+    run_summary: Option<&str>,
+    earlier: &[(String, String)],
+) -> String {
+    let mut signals = tool_signals;
+    if !recurring.is_empty() {
+        signals.push_str(
+            "\nRecurring run_script scripts never saved as a Tool (save_as would make them reusable and measured):\n",
+        );
+        for (sessions, uses, source) in recurring {
+            let head: String = source.lines().take(3).collect::<Vec<_>>().join(" / ");
+            signals.push_str(&format!(
+                "- {sessions} sessions, uses [{}]: {}\n",
+                uses.join(", "),
+                head.chars().take(160).collect::<String>()
+            ));
+        }
+    }
+    if !has_tool_activity && recurring.is_empty() {
         signals.push_str("(no Tool activity yet; propose a general first-run lesson)\n");
     }
-    capped_tool_signals(signals)
+    if let Some(summary) = run_summary {
+        signals.push_str(&format!("\n{summary}\n"));
+    }
+    if !earlier.is_empty() {
+        signals.push_str(
+            "\nEarlier proposals (do not repeat or rephrase them; rejected and rolled-back ones were judged unhelpful):\n",
+        );
+        for (status, content) in earlier {
+            signals.push_str(&format!("- [{status}] {content}\n"));
+        }
+    }
+    cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS)
 }
 
 /// Prompt-proposal promotion bar: the candidate eval score must beat the
@@ -2307,18 +2333,62 @@ mod registry_signal_tests {
 
     #[test]
     fn proposal_tool_budget_preserves_other_signal_context() {
-        let mut signals =
-            capped_tool_signals(format!("Recent signals:\n{}", "failure ".repeat(2_000)));
-        signals
-            .push_str("\nRecurring script context\nRun outcome context\nEarlier proposal context");
-        let signals = cap_signal_chars(signals, MAX_PROPOSAL_SIGNAL_CHARS);
+        let tools: Vec<_> = (0..16)
+            .map(|index| {
+                let mut tool = tool(&format!("narrow-{index:02}"), 4, 4);
+                tool.id = format!("tool-id-{index:02}");
+                tool.sessions = 1;
+                tool
+            })
+            .collect();
+        let ranked = top_tool_signals(&tools);
+        let replay_examples: Vec<_> = ranked
+            .iter()
+            .map(|tool| {
+                (
+                    tool.id.clone(),
+                    vec![("failure-tag".into(), "x".repeat(300)); 4],
+                )
+            })
+            .collect();
+        let tool_signals = assemble_tool_signal_section(&ranked, &replay_examples);
+        let recurring = vec![(2, vec!["run_script".into()], "function run(){}".into())];
+        let earlier = vec![("rejected".into(), "Earlier proposal context".into())];
+        let signals = assemble_proposal_signals(
+            tool_signals,
+            !ranked.is_empty(),
+            &recurring,
+            Some("Run outcome context"),
+            &earlier,
+        );
+
         assert!(signals.chars().count() <= MAX_PROPOSAL_SIGNAL_CHARS);
         for context in [
-            "Recurring script context",
+            "Recurring run_script scripts",
             "Run outcome context",
             "Earlier proposal context",
+            "function run(){}",
         ] {
             assert!(signals.contains(context));
         }
+    }
+
+    #[test]
+    fn first_run_lesson_waits_for_recurring_script_evidence() {
+        let tool_signals = assemble_tool_signal_section(&[], &[]);
+        let recurring = vec![(2, vec!["run_script".into()], "function run(){}".into())];
+        let signals = assemble_proposal_signals(tool_signals, false, &recurring, None, &[]);
+        assert!(signals.contains("Recurring run_script scripts"));
+        assert!(signals.contains("function run(){}"));
+        assert!(!signals.contains("no Tool activity yet"));
+
+        let no_activity = assemble_proposal_signals(
+            assemble_tool_signal_section(&[], &[]),
+            false,
+            &[],
+            None,
+            &[],
+        );
+        assert!(no_activity.contains("no Tool activity yet"));
     }
 }
