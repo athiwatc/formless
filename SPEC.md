@@ -4789,6 +4789,11 @@ run_tool = "network_policy"     # a registry Tool, or…
     (including configuration environment overrides, but independent of the
     running daemon's approval-mode display override). `?` opens the complete entry
     in the scrollable text viewer for long descriptions or small terminals;
+  - enabling `naming.auto_download` requires a supported catalogue model.
+    Enter/Space arms consent and a separate `y` confirms it; Escape cancels.
+    Repeated Enter/Space presses do not confirm. Without a supported model,
+    the Web and TUI explain that downloads are unavailable and do not save
+    the setting as enabled;
   - every settable key has an editor or a read-only pointer to config.toml,
     including keys in whole settable sections; optional keys remain visible
     when unset. File-only hooks, security and MCP areas show compact counts,

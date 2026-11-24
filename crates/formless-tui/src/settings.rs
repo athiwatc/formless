@@ -71,7 +71,7 @@ impl Row {
         match &self.kind {
             Kind::ReadOnly(why) => why,
             Kind::Bool if self.key == "naming.auto_download" => {
-                "Enter/Space toggles; a supported naming model is required"
+                "Enter/Space arms; y confirms with a supported model"
             }
             Kind::Bool | Kind::Thinking => "Enter toggles",
             Kind::Choice(_) => "Enter cycles",

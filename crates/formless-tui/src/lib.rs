@@ -11419,8 +11419,28 @@ impl App {
 
     /// Settings view keys (SPEC §10.4).
     fn settings_key(&mut self, key: KeyEvent) {
-        if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+        if self.settings_download_armed {
             self.settings_download_armed = false;
+            if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                let rows = self.settings_rows();
+                let selected = self.settings_sel.min(rows.len().saturating_sub(1));
+                if let Some(row) = rows.get(selected) {
+                    if row.key == "naming.auto_download" && row.value != "on" {
+                        let model_supported = rows.iter().any(|candidate| {
+                            candidate.key == "naming.model_size" && candidate.value != "—"
+                        });
+                        if model_supported {
+                            self.save_setting(&row.key, serde_json::json!(true));
+                        } else {
+                            self.notes.push(
+                                "No supported session-naming model is configured; automatic model downloads are unavailable."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                return;
+            }
         }
         if let Some(form) = &mut self.settings_form {
             if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) && key.modifiers.is_empty() {
@@ -11561,15 +11581,7 @@ impl App {
                             );
                             return;
                         }
-                        if key.kind != KeyEventKind::Press {
-                            return;
-                        }
-                        if self.settings_download_armed {
-                            self.settings_download_armed = false;
-                            self.save_setting(&row.key, serde_json::json!(true));
-                        } else {
-                            self.settings_download_armed = true;
-                        }
+                        self.settings_download_armed = true;
                     } else {
                         self.settings_download_armed = false;
                         self.save_setting(&row.key, serde_json::json!(row.value != "on"));
@@ -17936,9 +17948,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         if selected {
             let width = area.width.saturating_sub(6) as usize;
             let confirmation = (row.key == "naming.auto_download" && app.settings_download_armed)
-                .then(|| {
-                    "Enter or Space again to allow; any other key keeps it disabled.".to_string()
-                });
+                .then(|| "Type y to allow; Enter/Space cannot confirm.".to_string());
             for text in std::iter::once(format!("{} · ? full description", row.hint()))
                 .chain(row.help.clone())
                 .chain(confirmation)
@@ -25577,14 +25587,10 @@ mod tests {
         let screen = render(&mut app, 80, 24);
         assert!(screen.contains("409 MiB"), "{screen}");
         assert!(screen.contains("heuristic"), "{screen}");
-        assert!(screen.contains("Enter or Space again to allow"), "{screen}");
+        assert!(screen.contains("Type y to allow"), "{screen}");
 
         for code in [KeyCode::Enter, KeyCode::Char(' ')] {
-            app.key(KeyEvent::new_with_kind(
-                code,
-                KeyModifiers::NONE,
-                KeyEventKind::Repeat,
-            ));
+            app.key(key(code));
             assert!(app.settings_download_armed);
             assert!(app.settings_saving.is_none());
         }
@@ -25621,7 +25627,7 @@ mod tests {
         app.settings_sel = row;
         app.key(key(KeyCode::Enter));
         assert!(app.settings_download_armed);
-        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Char('y')));
         assert_eq!(app.settings_saving.as_deref(), Some("naming.auto_download"));
         assert!(!app.settings_download_armed);
     }
@@ -25656,6 +25662,8 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("downloads are unavailable")));
+        app.key(key(KeyCode::Char('y')));
+        assert!(app.settings_saving.is_none());
         assert_eq!(
             app.settings_rows()
                 .iter()
