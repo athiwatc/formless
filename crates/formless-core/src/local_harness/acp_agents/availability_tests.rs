@@ -103,6 +103,21 @@ done
 }
 
 #[test]
+fn selected_executable_path_is_retained_as_argv0_without_spawning() {
+    let root = ProbeDir::new().unwrap();
+    let target = root.0.join("native-target");
+    let selected = root.0.join("gemini");
+    fs::write(&target, b"not executed").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&target, &selected).unwrap();
+
+    let (canonical, argv0) = resolve_executable_identity(selected.clone()).unwrap();
+
+    assert_eq!(canonical, fs::canonicalize(target).unwrap());
+    assert_eq!(argv0, selected.as_os_str());
+}
+
+#[test]
 fn captured_readiness_auth_errors_and_unverifiable_successes() {
     let captured: Value = serde_json::from_str(include_str!("captured.json")).unwrap();
     for id in agent_ids() {

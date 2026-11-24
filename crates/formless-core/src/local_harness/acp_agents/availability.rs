@@ -58,6 +58,16 @@ fn unverifiable_auth_detail(id: &str, sign_in: &str, methods: &[String]) -> Stri
     )
 }
 
+fn resolve_executable_identity(program: PathBuf) -> Result<(PathBuf, OsString), String> {
+    let argv0 = program.as_os_str().to_os_string();
+    let canonical = match fs::canonicalize(&program) {
+        Ok(path) if acp::is_executable(&path) => path,
+        Ok(_) => return Err("ACP executable is not executable.".into()),
+        Err(error) => return Err(format!("Could not resolve ACP executable path: {error}")),
+    };
+    Ok((canonical, argv0))
+}
+
 pub(crate) fn availability_with_executable(
     id: &str,
     executable: Option<PathBuf>,
@@ -114,24 +124,11 @@ fn with_timeout_with_executable(
             executable_argv0: None,
         };
     };
-    let executable_argv0 = program.as_os_str().to_os_string();
-    let program = match fs::canonicalize(program) {
-        Ok(path) if acp::is_executable(&path) => path,
-        Ok(_) => {
-            result.detail = Some("ACP executable is not executable.".into());
-            return AvailabilityWithExecutable {
-                availability: result,
-                executable: None,
-                executable_argv0: None,
-            };
-        }
-        Err(error) => {
-            result.detail = Some(format!("Could not resolve ACP executable path: {error}"));
-            return AvailabilityWithExecutable {
-                availability: result,
-                executable: None,
-                executable_argv0: None,
-            };
+    let (program, executable_argv0) = match resolve_executable_identity(program) {
+        Ok(identity) => identity,
+        Err(detail) => {
+            result.detail = Some(detail);
+            return unlaunchable(result);
         }
     };
     result.installed = true;
