@@ -1587,10 +1587,36 @@ mod tests {
 
         assert_eq!(
             std::env::split_paths(&anchored).collect::<Vec<_>>(),
-            vec![daemon_cwd.join(relative), absolute]
+            vec![daemon_cwd.join(&relative), absolute.clone()]
         );
+
+        let path_with_empty_entries = std::env::join_paths([
+            relative.as_os_str(),
+            OsStr::new(""),
+            absolute.as_os_str(),
+            OsStr::new(""),
+        ])
+        .unwrap();
+        let anchored_with_empty_entries =
+            anchor_relative_search_path(&path_with_empty_entries, &daemon_cwd).unwrap();
+        assert_eq!(
+            std::env::split_paths(&anchored_with_empty_entries).collect::<Vec<_>>(),
+            vec![
+                daemon_cwd.join(&relative),
+                daemon_cwd.clone(),
+                absolute.clone(),
+                daemon_cwd.clone(),
+            ]
+        );
+
         let anchored_empty = anchor_relative_search_path(OsStr::new(""), &daemon_cwd).unwrap();
         assert_eq!(anchored_empty.as_os_str(), daemon_cwd.as_os_str());
+
+        let absolute_only = absolute.as_os_str().to_os_string();
+        assert_eq!(
+            path_for_agent_directory(&absolute_only).unwrap(),
+            absolute_only
+        );
     }
 
     #[cfg(unix)]

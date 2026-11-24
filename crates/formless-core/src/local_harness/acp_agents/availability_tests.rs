@@ -246,10 +246,14 @@ fn readiness_other_errors_and_empty_sessions_are_unknown() {
             .to_string()
             .into(),
     );
-    let result = fixture.probe("gemini");
-    assert!(result.installed);
-    assert_eq!(result.signed_in, None);
-    assert!(result.detail.unwrap().contains("ACP v1"));
+    let result = fixture.probe_with_executable("gemini");
+    assert!(result.availability.installed);
+    assert_eq!(result.availability.signed_in, None);
+    let detail = result.availability.detail.as_deref().unwrap();
+    assert!(detail.contains("ACP protocol or identity mismatch"));
+    assert!(detail.contains("ACP v1"));
+    assert!(result.executable.is_none());
+    assert!(result.executable_argv0.is_none());
 }
 
 #[test]
