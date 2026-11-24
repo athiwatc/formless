@@ -663,6 +663,8 @@ fn anchor_relative_search_path(path: &OsStr, base: &Path) -> Result<OsString> {
     std::env::join_paths(entries).context("could not anchor relative ACP PATH entries")
 }
 
+// Keep tool and shebang-interpreter lookup daemon-relative; topic workspaces
+// are not implicit PATH trust sources.
 fn path_for_agent_directory(path: &OsStr) -> Result<OsString> {
     let entries = std::env::split_paths(path).collect::<Vec<_>>();
     if !path.is_empty() && entries.iter().all(|entry| entry.is_absolute()) {

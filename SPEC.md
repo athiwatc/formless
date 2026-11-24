@@ -7349,6 +7349,12 @@ disappears before spawn, launch fails without a PATH fallback. Resolution is
 fresh after each retry or approved substitute; this pins path selection, not
 executable contents.
 
+The shared ACP spawn also anchors relative and empty child `PATH` entries to
+the daemon's working directory before setting the topic workspace as cwd. This
+applies to named ACP agents, OpenCode, and Antigravity. Workspace-local `./bin`
+is not implicitly searched for child tools or shebang interpreters, so
+workflows relying on workspace-relative `PATH` entries may resolve differently.
+
 The reusable ACP probe initializes and creates a session with no MCP servers in
 a private temporary cwd, never prompts, maps configured auth errors, and kills
 its process group on success, failure or timeout. ACP's inner probe deadline is
