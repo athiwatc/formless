@@ -7557,8 +7557,8 @@ impl App {
         }
     }
 
-    /// Whether the current model takes images (`provider.vision`, else a
-    /// guess from its name).
+    /// Whether the current model takes images (per-model setting, provider
+    /// default, else a guess from its name).
     fn vision_model(&self) -> bool {
         let Ok(cfg) = Config::load(&self.paths) else {
             return true;
@@ -7569,8 +7569,12 @@ impl App {
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
             .and_then(|s| s.model.clone())
             .unwrap_or(cfg.provider.model);
+        let model = cfg.provider.resolve_alias(&model);
         cfg.provider
-            .vision
+            .model_meta
+            .get(&model)
+            .and_then(|meta| meta.vision)
+            .or(cfg.provider.vision)
             .unwrap_or_else(|| formless_core::provider::is_vision_model(&model))
     }
 
@@ -26337,6 +26341,34 @@ mod tests {
                     .iter()
                     .any(|note| note.contains("may not read images")),
                 !vision
+            );
+        }
+        for (model, resolved, per_model_vision, provider_vision, warns) in [
+            ("o3-alias", "o3-mini", true, Some(false), false),
+            ("gpt-5", "gpt-5", false, Some(true), true),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = provider_vision;
+            cfg.provider.model_meta.insert(
+                resolved.into(),
+                formless_core::config::ModelMetaCfg {
+                    vision: Some(per_model_vision),
+                    ..Default::default()
+                },
+            );
+            if model == "o3-alias" {
+                cfg.provider.aliases.insert(model.into(), resolved.into());
+            }
+            cfg.save(&app.paths).unwrap();
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "per-model vision override for {model}"
             );
         }
     }
