@@ -83,7 +83,7 @@ pub fn run(paths: &Paths, model: &str, provider: Option<&str>) -> Result<()> {
     };
 
     for event in pending {
-        if let Some(success) = print_progress(&event, &pull_id) {
+        if let Some(success) = print_progress(&event, &pull_id, &paths.profile) {
             return terminal_result(success);
         }
     }
@@ -92,7 +92,7 @@ pub fn run(paths: &Paths, model: &str, provider: Option<&str>) -> Result<()> {
             .recv()
             .context("daemon connection closed during model pull")?;
         if let ServerMessage::Event(event) = message {
-            if let Some(success) = print_progress(&event, &pull_id) {
+            if let Some(success) = print_progress(&event, &pull_id, &paths.profile) {
                 return terminal_result(success);
             }
         }
@@ -107,15 +107,20 @@ fn terminal_result(success: bool) -> Result<()> {
     }
 }
 
-fn resume_command(model: &str, provider: Option<&str>) -> String {
+fn resume_command(model: &str, provider: Option<&str>, profile: &str) -> String {
     let provider = provider
         .filter(|provider| *provider != formless_core::config::DEFAULT_PROVIDER)
         .map(|provider| format!(" --provider {provider}"))
         .unwrap_or_default();
-    format!("formless pull {model}{provider}")
+    let profile = if profile == "default" {
+        String::new()
+    } else {
+        format!("--profile {profile} ")
+    };
+    format!("formless {profile}pull {model}{provider}")
 }
 
-fn print_progress(event: &Event, pull_id: &str) -> Option<bool> {
+fn print_progress(event: &Event, pull_id: &str, profile: &str) -> Option<bool> {
     let Event::ModelPullProgress {
         model,
         status,
@@ -162,7 +167,7 @@ fn print_progress(event: &Event, pull_id: &str) -> Option<bool> {
         if let Some(error) = error {
             println!("error: {}", terminal_safe(error));
             if status == "incomplete" {
-                let resume = resume_command(model, provider.as_deref());
+                let resume = resume_command(model, provider.as_deref(), profile);
                 println!(
                     "partial download can be resumed with `{}`",
                     terminal_safe(&resume)
@@ -238,18 +243,24 @@ mod tests {
                 .map(|()| 0)
                 .unwrap_or_else(|error| crate::exit_code(&error))
         };
-        let success = print_progress(&terminal_event("success", None), "pull-1").unwrap();
+        let success =
+            print_progress(&terminal_event("success", None), "pull-1", "default").unwrap();
         assert_eq!(cli_exit_code(terminal_result(success)), 0);
 
         let failure = print_progress(
             &terminal_event("incomplete", Some("stream ended")),
             "pull-1",
+            "research",
         )
         .unwrap();
         assert_eq!(cli_exit_code(terminal_result(failure)), 1);
         assert_eq!(
-            resume_command("llama3", Some("remote")),
-            "formless pull llama3 --provider remote"
+            resume_command("llama3", Some("remote"), "research"),
+            "formless --profile research pull llama3 --provider remote"
+        );
+        assert_eq!(
+            resume_command("llama3", None, "default"),
+            "formless pull llama3"
         );
     }
 
