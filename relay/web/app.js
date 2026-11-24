@@ -81,6 +81,28 @@
     const value = prefs.get(draftStorageKey(scope, sessionId), "");
     return typeof value === "string" ? value : "";
   }
+  function normalizeTextareaValue(value) {
+    return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
+  }
+  function clearSubmittedDraft(scope, sessionId, snapshot) {
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
+    const hasFallback = fallbacks.has(fallbackKey);
+    const fallback = hasFallback ? fallbacks.get(fallbackKey) : null;
+    const key = draftStorageKey(scope, sessionId);
+    const shared = prefs.get(key, null);
+    if (hasFallback && normalizeTextareaValue(fallback) === snapshot) fallbacks.delete(fallbackKey);
+    if (typeof shared === "string" && normalizeTextareaValue(shared) === snapshot) {
+      const removed = typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
+      if (!removed && !fallbacks.has(fallbackKey)) fallbacks.set(fallbackKey, "");
+    }
+    const latest = loadDraft(scope, sessionId);
+    if (scope === S.storageScope) {
+      if (latest) S.drafts[sessionId] = latest;
+      else delete S.drafts[sessionId];
+    }
+    return latest;
+  }
   function loadOutbox(scope) {
     if (!scope) return [];
     const saved = prefs.get(outboxStorageKey(scope), []);
@@ -9063,8 +9085,8 @@
   async function submit(queued) {
     if (currentTopicAttempt()) return;
     const input = $("input");
-    const draftSnapshot = input.value;
-    const text = draftSnapshot.trim();
+    const draftSnapshot = normalizeTextareaValue(input.value);
+    const text = input.value.trim();
     if (!text) return;
     if (text.startsWith("/") && !S.editMessageId) {
       input.value = "";
@@ -9262,18 +9284,20 @@
       }
       const sourceIsCurrent = S.current === sid && scope === S.storageScope;
       const fallbackKey = sessionCacheKey(scope, sid);
-      const hasFallbackDraft = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey);
-      const savedDraft = prefs.get(draftStorageKey(scope, sid), null);
-      const hasSavedDraft = hasFallbackDraft || typeof savedDraft === "string";
-      const latestSourceDraft = loadDraft(scope, sid);
-      if (sourceIsCurrent && input.value !== draftSnapshot && (latestSourceDraft === draftSnapshot || !hasSavedDraft)) {
+      const hasFallback = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey);
+      const fallback = hasFallback ? S.unpersistedDrafts.get(fallbackKey) : null;
+      const shared = prefs.get(draftStorageKey(scope, sid), null);
+      const composerDraft = normalizeTextareaValue(input.value);
+      const noConflictingDraft = (!hasFallback || normalizeTextareaValue(fallback) === draftSnapshot)
+        && (typeof shared !== "string" || normalizeTextareaValue(shared) === draftSnapshot);
+      if (sourceIsCurrent && composerDraft !== draftSnapshot && noConflictingDraft) {
         saveCurrentDraft(input.value);
       }
-      const sourceDraftStillSubmitted = (latestSourceDraft === draftSnapshot && (!sourceIsCurrent || input.value === draftSnapshot))
-        || (!hasSavedDraft && sourceIsCurrent && input.value === draftSnapshot);
-      if (sourceDraftStillSubmitted) {
-        saveDraft(sid, "", scope);
-        if (sourceIsCurrent && input.value === draftSnapshot) { input.value = ""; autosize(); }
+      const latestSourceDraft = clearSubmittedDraft(scope, sid, draftSnapshot);
+      if (sourceIsCurrent && normalizeTextareaValue(input.value) === draftSnapshot) {
+        const latest = normalizeTextareaValue(latestSourceDraft);
+        input.value = latest === draftSnapshot ? "" : latest;
+        autosize();
       }
       if (item.status === "failed") { note(item.error, true); return; }
       return scope === S.storageScope ? flushOutbox() : undefined;

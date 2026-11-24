@@ -63,7 +63,7 @@ function setup(names, extras = {}) {
   if (names.some(name => ['rateButtons', 'retryRun'].includes(name))) {
     vm.runInContext(['currentRunTarget', 'ensureRunTarget'].map(fn).join('\n'), context);
   }
-  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
+  const storageFunctions = ['outboxStorageKey','draftStorageKey','attachmentStorageKey','sessionCacheKey','outboxLockName','sessionStorageKey','loadDraft','normalizeTextareaValue','clearSubmittedDraft','loadOutbox','saveDraft','restoreDraft','persistOutbox','hasOutboxLock','withOutboxLock','refreshOutbox','activateStorageScope','loadAttachmentInventory','saveAttachmentInventory','refreshAttachmentInventory','fetchFreshAttachmentInventory','enqueueOutbox','canFlushOutbox','discardOutbox','flushOutbox','onStorage'];
   const dependencies = [...(names.some(name => ['decide', 'renderApproval'].includes(name)) ? ['approvalHelpSeen', 'rememberApprovalHelp'] : []), ...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : []), ...(names.some(name => storageFunctions.includes(name)) || names.includes('submit') || names.includes('openSession') || names.includes('acceptMention') || names.includes('acceptCommand') ? storageFunctions : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
   if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
@@ -1164,8 +1164,106 @@ test('deferred enqueue clears only the unchanged source draft after a Session sw
     assert.equal(c.$('input').value, 'draft for Session B');
     assert.equal(c.loadDraft('test-room', 'A'), newerSourceDraft ? 'newer source draft' : '');
     assert.equal(c.loadDraft('test-room', 'B'), 'draft for Session B');
-    if (unpersistedDraft) assert.equal(c.S.unpersistedDrafts.get(c.sessionCacheKey('test-room', 'A')), newerSourceDraft ? 'newer source draft' : '');
+    if (unpersistedDraft) {
+      const fallbackKey = c.sessionCacheKey('test-room', 'A');
+      assert.equal(c.S.unpersistedDrafts.has(fallbackKey), newerSourceDraft);
+      if (newerSourceDraft) assert.equal(c.S.unpersistedDrafts.get(fallbackKey), 'newer source draft');
+    }
   }
+});
+
+test('deferred enqueue drops its submitted fallback without deleting a newer shared draft', async () => {
+  const prefs = memoryPrefs(), draftKey = 'draft:test-room:A';
+  const sharedSet = prefs.set.bind(prefs), sharedRemove = prefs.remove.bind(prefs), removed = [];
+  sharedSet(draftKey, 'older shared draft');
+  prefs.set = (key, value) => key === draftKey ? false : sharedSet(key, value);
+  prefs.remove = key => { if (key === draftKey) removed.push(key); return sharedRemove(key); };
+  const enqueueStarted = deferred(), enqueueGate = deferred();
+  const c = setup(['submit'], {
+    prefs,
+    crypto: { randomUUID: () => 'shared-draft-update' },
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+  });
+  c.S.settings = { limits: {} };
+  c.$('input').value = 'submitted source draft';
+  assert.equal(c.saveDraft('A', 'submitted source draft'), false);
+  const fallbackKey = c.sessionCacheKey('test-room', 'A');
+  const enqueue = c.enqueueOutbox;
+  c.enqueueOutbox = async (...args) => {
+    enqueueStarted.resolve();
+    await enqueueGate.promise;
+    return enqueue(...args);
+  };
+  const submitting = c.submit(false);
+  await enqueueStarted.promise;
+  c.S.current = 'B';
+  c.$('input').value = 'draft for Session B';
+  c.saveDraft('B', 'draft for Session B');
+  sharedSet(draftKey, 'newer shared draft');
+  c.onStorage({ key: 'formless.' + draftKey, newValue: JSON.stringify('newer shared draft') });
+  assert.equal(c.S.unpersistedDrafts.get(fallbackKey), 'submitted source draft');
+  assert.equal(prefs.get(draftKey), 'newer shared draft');
+  c.S.daemonOnline = false;
+  c.S.channel = null;
+  enqueueGate.resolve();
+  await submitting;
+  assert.equal(c.S.current, 'B');
+  assert.equal(c.$('input').value, 'draft for Session B');
+  assert.equal(c.S.unpersistedDrafts.has(fallbackKey), false);
+  assert.equal(prefs.get(draftKey), 'newer shared draft');
+  assert.equal(c.loadDraft('test-room', 'A'), 'newer shared draft');
+  assert.equal(c.S.drafts.A, 'newer shared draft');
+  assert.deepEqual(removed, []);
+});
+
+test('MCP CRLF prompts compare as textarea LF without losing meaningful whitespace', async () => {
+  const prompt = 'First line\r\n  preserve  these spaces\r\nLast line';
+  const textareaPrompt = prompt.replace(/\r\n?/g, '\n');
+  const prefs = memoryPrefs(), set = prefs.set.bind(prefs), calls = [];
+  prefs.set = (key, value) => key.startsWith('draft:') ? false : set(key, value);
+  const enqueueStarted = deferred(), enqueueGate = deferred();
+  const c = setup(['slash', 'submit'], {
+    prefs,
+    crypto: { randomUUID: () => 'mcp-crlf-prompt' },
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    act: async request => {
+      calls.push(request);
+      return request.type === 'get_mcp_prompt' ? { text: prompt } : null;
+    },
+    request: async request => {
+      calls.push(request);
+      return request.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  });
+  c.S.settings = { limits: {} };
+  const input = c.$('input');
+  let value = input.value;
+  Object.defineProperty(input, 'value', {
+    configurable: true,
+    get: () => value,
+    set: next => { value = String(next).replace(/\r\n?/g, '\n'); },
+  });
+  input.value = '/mcp:server:prompt';
+  const fallbackKey = c.sessionCacheKey('test-room', 'A');
+  const enqueue = c.enqueueOutbox;
+  c.enqueueOutbox = async (...args) => {
+    enqueueStarted.resolve();
+    await enqueueGate.promise;
+    return enqueue(...args);
+  };
+  const submitting = c.submit(false);
+  await enqueueStarted.promise;
+  assert.equal(input.value, textareaPrompt);
+  assert.equal(c.S.unpersistedDrafts.get(fallbackKey), prompt);
+  c.S.daemonOnline = false;
+  c.S.channel = null;
+  enqueueGate.resolve();
+  await submitting;
+  assert.equal(calls.some(request => request.type === 'get_mcp_prompt'), true);
+  assert.equal(c.S.outbox[0].content, textareaPrompt.trim());
+  assert.match(c.S.outbox[0].content, /  preserve  these spaces/);
+  assert.equal(input.value, '');
+  assert.equal(c.S.unpersistedDrafts.has(fallbackKey), false);
 });
 
 test('outbox submission explains that unsupported Web Locks fail closed', async () => {
