@@ -2008,6 +2008,11 @@ fn generate_completions(shell: clap_complete::Shell, out: &mut impl Write) -> st
 
 const FISH_DOCS_TOPIC_CONDITION: &str = r#"function __fish_formless_docs_topic_argument
     set -l tokens (commandline -opc)
+    set -l current_process (commandline -pc)
+    set -l redirected_target 0
+    if string match -qr '(^|[[:space:]])([[:alnum:]_./=&-]+[<>]+|[0-9&]*[<>]+)[[:space:]]*[^[:space:]]+[[:space:]]+$' -- "$current_process"
+        set redirected_target 1
+    end
     set -l command_seen 0
     set -l docs_seen 0
     set -l pending_value 0
@@ -2041,6 +2046,9 @@ const FISH_DOCS_TOPIC_CONDITION: &str = r#"function __fish_formless_docs_topic_a
     end
 
     test $docs_seen -eq 1; or return 1
+    if test $redirected_target -eq 1; and test (count $docs_arguments) -gt 0
+        set -e docs_arguments[-1]
+    end
 
     set pending_value 0
     set -l options_ended 0

@@ -642,6 +642,8 @@ fn docs_fish_completions_follow_topic_argument_position() {
         "formless docs ",
         "/usr/bin/formless docs ",
         "./target/debug/formless docs ",
+        "formless docs > /tmp/out ",
+        "formless docs>/tmp/out ",
     ] {
         let mut visible = topic_suggestions(input);
         visible.sort_unstable();
@@ -655,6 +657,7 @@ fn docs_fish_completions_follow_topic_argument_position() {
         "formless docs cap ",
         "formless docs Troubleshooting ",
         "formless docs unknown-topic ",
+        "formless docs > /tmp/out",
         "formless docs --text cap ",
         "formless docs --keys ",
         "formless --plain docs ",
