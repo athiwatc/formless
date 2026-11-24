@@ -37,7 +37,6 @@ function fixture() {
     clearTimeout: id => timers.delete(id),
     request: async () => { throw new Error('offline'); },
     note: () => {},
-    updateText: (target, text) => { target.textContent = text; },
     summarizeArgs: () => 'args',
     elapsed: () => '2s',
     uiFixed: value => value.toFixed(1),
@@ -45,7 +44,7 @@ function fixture() {
   });
   const announceStart = app.indexOf('  const chatAnnouncement =');
   const announceEnd = app.indexOf('\n\n  // -------------------------------------------------------- ask dialogs', announceStart);
-  vm.runInContext(fn('toast') + fn('act') + fn('recordedDuration') + app.slice(announceStart, announceEnd), c);
+  vm.runInContext(fn('updateText') + fn('toast') + fn('act') + fn('recordedDuration') + app.slice(announceStart, announceEnd), c);
   function advance(ms) {
     now += ms;
     while (true) {
@@ -125,7 +124,7 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   c.withTranscriptLayout = render => render();
   c.statusRender = { text: null };
   const liveElement = {};
-  const row = { node: { isConnected: true }, tool: { elapsedMs: null, started: 0 }, timer: { textContent: '' } };
+  const row = { node: { isConnected: true }, tool: { elapsedMs: null, started: 0 }, timer: { data: '' } };
   c.liveRender = { session: 'session', root: liveElement, activity: { isConnected: false }, rows: new Map([['tool', row]]) };
   c.$ = id => id === 'chat-announcer' ? announcer : id === 'live' ? liveElement : null;
   let ticks = 0;
@@ -139,7 +138,7 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   c.updateElapsedTimers();
   advance(1000);
   c.updateElapsedTimers();
-  assert.equal(row.timer.textContent, '2s', 'the live timer rerenders while the run is streaming');
+  assert.equal(row.timer.data, '2s', 'the live timer rerenders while the run is streaming');
   assert.deepEqual(writes, ['Run started', 'Running read_file']);
 
   c.onEvent({ type: 'message_delta', session_id: 'session', delta: ' without announcements' });
@@ -165,21 +164,22 @@ test('live tool status name includes completion state and duration without timer
   const tool = { status: 'running', name: 'read_file', version: 1, arguments: '{}', depth: 0, started: 0 };
   const row = {
     tool, node: { className: '', style: {}, dataset: {} }, summary: { firstChild: attribute() },
-    mark: { className: '', style: {}, textContent: '' }, name: { textContent: '' }, args: { textContent: '' },
-    status: { textContent: '' }, folded: { hidden: true, textContent: '' },
-    progressBox: { hidden: true }, progress: { hidden: true }, progressText: { textContent: '' },
+    mark: { className: '', style: {}, textContent: '' }, name: { data: '' }, args: { data: '' },
+    status: { data: '' }, folded: { hidden: true, textContent: '' },
+    progressBox: { hidden: true }, progress: { hidden: true }, progressText: { data: '' },
     stalled: { hidden: true, textContent: '' }, cancel: { hidden: true }, transcript: { hidden: true },
-    timer: { textContent: '' }, payloadInitialized: true, payloadArgs: '{}', payloadSubagent: undefined,
+    timer: { data: '' }, payloadInitialized: true, payloadArgs: '{}', payloadSubagent: undefined,
   };
   vm.runInContext(fn('updateLiveTool'), c);
   c.updateLiveTool(row, 0);
-  assert.equal(row.status.textContent, 'Running · 2s');
+  assert.equal(row.status.data, 'Running · 2s');
   tool.status = 'failed';
   tool.elapsedMs = 1234;
   c.updateLiveTool(row, 0);
-  assert.equal(row.status.textContent, 'Failed · 1.2s');
-  assert.equal(row.timer.textContent, '1.2s');
-  assert.match(app, /const status = h\("span", \{ class: "sr-only", "data-live-status": "" \}\)/);
+  assert.equal(row.status.data, 'Failed · 1.2s');
+  assert.equal(row.timer.data, '1.2s');
+  assert.match(app, /const statusText = document\.createTextNode\(""\)/);
+  assert.match(app, /h\("span", \{ class: "sr-only", "data-live-status": "" \}, statusText\)/);
   assert.match(app, /const mark = h\("span", \{ "aria-hidden": "true" \}\)/);
 });
 

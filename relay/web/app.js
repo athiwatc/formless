@@ -4649,7 +4649,8 @@
     const mark = h("span", { "aria-hidden": "true" });
     const name = document.createTextNode("");
     const args = document.createTextNode("");
-    const status = h("span", { class: "sr-only", "data-live-status": "" });
+    const statusText = document.createTextNode("");
+    const status = h("span", { class: "sr-only", "data-live-status": "" }, statusText);
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -4661,7 +4662,7 @@
     const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
       h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
