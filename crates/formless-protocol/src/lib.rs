@@ -34,6 +34,8 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// A reviewed Send requires idle state and a reviewed Steer requires an active Run.
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
+/// Durable session-scoped receipts for the browser's persisted outbox.
+pub const DURABLE_OUTBOX_FEATURE: &str = "durable_outbox_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
 pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v2";
@@ -479,6 +481,7 @@ pub const FEATURES: &[&str] = &[
     "dropped_event_kinds",
     "future_transcript_attempts_v1",
     "pending_attachment_inventory_v1",
+    DURABLE_OUTBOX_FEATURE,
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
@@ -5410,6 +5413,7 @@ mod future_attempt_wire_tests {
             old
         );
         assert!(FEATURES.contains(&"future_transcript_attempts_v1"));
+        assert!(FEATURES.contains(&DURABLE_OUTBOX_FEATURE));
     }
     #[test]
     fn attempts_have_explicit_scope_identity_offset_and_terminal_semantics() {

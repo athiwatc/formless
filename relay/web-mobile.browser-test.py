@@ -59,7 +59,7 @@ INIT=r'''(() => {
 def expose_script(route):
     source=(ROOT/'web/app.js').read_text();end=source.rfind('\n})();');assert end>0
     hooks=r'''
-    const fixture815={S,h,renderAll,renderHistory,renderLive,autosize,setReading,onEvent,scrollToBottom,resetReadingSession,
+    const fixture815={S,h,renderAll,renderHistory,renderLive,autosize,setReading,onEvent,scrollToBottom,resetReadingSession,activateStorageScope,
       updatePalette,updateMentions,closePalette,closeMentions,sessionMenu,messageMenu,closePopover,ask,closeAsk,
       openModelPicker,codeEditor,modal,activeDialog,closeDialog,setEnterSends,composerEnterSends,renderComposer,renderSettings,
       renameSession,suggestName,editInstructions,editSetting,bulkSessions,calls:[],submits:[]};
@@ -67,6 +67,8 @@ def expose_script(route):
     submit=(...args)=>{fixture815.submits.push(args[0]);return submit815(...args);};
     const reply815=async req=>{
       fixture815.calls.push({...req});
+      if(req.type==='ping')return {features:['durable_outbox_v1']};
+      if(req.type==='list_pending_attachments')return {attachments:[]};
       if(req.type==='send_outbox_message')return {accepted:true};
       if(req.type==='suggest_session_name')return {name:'Suggested fixture name'};
       if(req.type==='list_tools'||req.type==='list_modules')return [];
@@ -86,7 +88,7 @@ def settle(page,ms=100):
 
 
 def fixture(page):
-    page.evaluate(r'''() => {const d=__mobile815;d.S.current='mobile-A';d.S.view='chat';d.S.channel={};d.S.daemonOnline=true;d.S.approvalLater=false;d.S.settings={provider:{model:'fixture'},tui:{notify:'off'},limits:{}};
+    page.evaluate(r'''() => {const d=__mobile815;d.S.local=true;d.activateStorageScope();d.S.current='mobile-A';d.S.view='chat';d.S.channel={};d.S.daemonOnline=true;d.S.approvalLater=false;d.S.settings={provider:{model:'fixture'},tui:{notify:'off'},limits:{}};
       d.S.sessions=[{id:'mobile-A',name:'Mobile fixture',updated_at:'2026-11-02T12:00:00Z'}];d.S.messages=[];
       for(let i=0;i<24;i++)d.S.messages.push({id:'mobile-message-'+i,seq:i,role:i%2?'assistant':'user',content:'Message '+i+' '+('Stable mobile reading content. '.repeat(18)),created_at:'2026-11-02T12:00:00Z',meta:'{}'});
       d.S.running.add('mobile-A');d.S.liveRun={id:'mobile-run',ended:false};d.S.streaming='Visible live transcript tail';d.S.activity={label:'responding',since:Date.now()};

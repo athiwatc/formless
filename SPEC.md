@@ -3423,6 +3423,11 @@ such as `read_file`, `read_text_file` and `file_read`.
   response/waiter does not cancel the claimed send or lose its outcome.
   Outbox sends compare the complete pending attachment inventory at admission;
   queued outbox actions do not consume attachments added after they were queued.
+  Browser drafts and outbox entries are stored per relay pairing or local page
+  origin. Local origin includes the port: reopen the UI at the same host and
+  port to recover local data (for example, consistently run `formless web
+  --port N`). A different port is a different browser origin; cross-origin
+  storage migration is not provided.
   Cached in-flight/failure outcomes are process-local for 10 minutes after
   completion; successful durable receipts remain until their Session is deleted.
   Cached failures preserve the same machine-readable error code and message.

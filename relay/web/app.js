@@ -104,6 +104,7 @@
           expected_run_id: typeof item.expected_run_id === "string" ? item.expected_run_id : null,
           forecast_pending: item.forecast_pending === true,
           client_msg_id: item.client_msg_id,
+          attempted: item.attempted !== false,
           status,
           error,
         };
@@ -180,6 +181,7 @@
     follow: true,
     editMessageId: null,
     storageScope: null,
+    draftsScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
     submitting: new Set(),
     pending: new Map(),
@@ -190,6 +192,7 @@
     if (!sessionId) return true;
     S.drafts = S.drafts || {};
     if (scope === S.storageScope) {
+      S.draftsScope = scope;
       if (value) S.drafts[sessionId] = value;
       else delete S.drafts[sessionId];
     }
@@ -198,8 +201,9 @@
     return value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
   }
   function restoreDraft(sessionId) {
-    const value = loadDraft(S.storageScope, sessionId);
+    const value = S.draftsScope === S.storageScope && Object.prototype.hasOwnProperty.call(S.drafts, sessionId) ? S.drafts[sessionId] : loadDraft(S.storageScope, sessionId);
     S.drafts[sessionId] = value;
+    S.draftsScope = S.storageScope;
     $("input").value = value;
     autosize();
   }
@@ -229,6 +233,7 @@
     if (S.current) saveDraft(S.current, $("input").value);
     S.storageScope = scope;
     S.drafts = {};
+    S.draftsScope = scope;
     S.attachmentInventories = {};
     S.chips = {};
     S.outbox = loadOutbox(scope);
@@ -302,6 +307,7 @@
       expected_run_id: expectedRunId || null,
       forecast_pending: !!forecastPending,
       client_msg_id: clientMsgId,
+      attempted: false,
       status: error ? "failed" : "queued",
       error,
     };
@@ -348,16 +354,35 @@
         if (!canFlushOutbox(scope)) return;
         let entries = loadOutbox(scope);
         let recovered = false;
-        for (const item of entries) if (item.status === "sending") { item.status = "queued"; recovered = true; }
+        for (const item of entries) if (item.status === "sending") { item.status = "queued"; item.attempted = true; recovered = true; }
         if (recovered && !persistOutbox(scope, entries)) return;
         refreshOutbox(scope);
+        let durableOutboxSupported = null;
         while (canFlushOutbox(scope)) {
           entries = loadOutbox(scope);
           const item = entries[0];
           if (!item || item.status === "failed") break;
+          if (durableOutboxSupported === null) {
+            try {
+              const ping = await request({ type: "ping" });
+              durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
+            } catch (_) { break; }
+          }
+          if (!durableOutboxSupported && item.attempted) {
+            item.status = "failed";
+            item.error = "This daemon does not support durable retries; this previously attempted message was not sent again.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
           if (item.forecast_pending) {
             if (S.current !== item.session_id) {
               item.error = "Open this Session to review and approve its forecast before sending.";
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            const currentAttachments = await refreshAttachmentInventory(item.session_id, scope, true);
+            if (!Array.isArray(currentAttachments)) break;
+            if (JSON.stringify(currentAttachments) !== JSON.stringify(item.expected_attachments)) {
+              item.status = "failed";
+              item.error = "Pending attachments changed since this forecast was composed; review the message again before sending.";
               persistOutbox(scope, entries); refreshOutbox(scope); break;
             }
             try {
@@ -382,16 +407,16 @@
           }
           item.status = "sending";
           item.error = "";
+          item.attempted = true;
           if (!persistOutbox(scope, entries)) break;
           refreshOutbox(scope);
           try {
             await request({
-              type: "send_outbox_message",
+              type: durableOutboxSupported ? "send_outbox_message" : "send_message",
               session_id: item.session_id,
               content: item.content,
               mode: item.mode,
-              expected_attachments: item.expected_attachments,
-              expected_run_id: item.expected_run_id,
+              ...(durableOutboxSupported ? { expected_attachments: item.expected_attachments, expected_run_id: item.expected_run_id } : {}),
               client_msg_id: item.client_msg_id,
             });
           } catch (error) {
@@ -428,7 +453,7 @@
     }
   }
 
-  window.addEventListener("storage", (event) => {
+  function onStorage(event) {
     const scope = S.storageScope;
     if (!scope || !event.key) return;
     if (event.key === "formless." + outboxStorageKey(scope)) {
@@ -439,10 +464,14 @@
     if (event.key.startsWith(prefix)) {
       const sessionId = decodeURIComponent(event.key.slice(prefix.length));
       const value = typeof event.newValue === "string" ? (() => { try { return JSON.parse(event.newValue); } catch (_) { return ""; } })() : "";
-      if (typeof value === "string") S.drafts[sessionId] = value;
-      if (S.current === sessionId && typeof value === "string") { $("input").value = value; autosize(); }
+      const composer = $("input");
+      const localDraft = S.drafts[sessionId];
+      const preserveComposer = S.current === sessionId && (S.editMessageId || composer.value !== (localDraft || ""));
+      if (typeof value === "string" && !preserveComposer) { S.drafts[sessionId] = value; S.draftsScope = scope; }
+      if (S.current === sessionId && !preserveComposer && typeof value === "string") { composer.value = value; autosize(); }
     }
-  });
+  }
+  window.addEventListener("storage", onStorage);
 
   // --------------------------------------------------------------- crypto
   function b64ToBytes(s) {
@@ -3965,7 +3994,7 @@
     t.value = t.value.slice(0, at.start) + insert + t.value.slice(t.selectionStart);
     const caret = at.start + insert.length;
     t.setSelectionRange(caret, caret);
-    saveDraft(S.current, t.value);
+    if (!S.editMessageId) saveDraft(S.current, t.value);
     mention.query = null;
     autosize();
     updateMentions();
@@ -9005,12 +9034,12 @@
       const needsForecast = !S.running.has(sid) && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null;
       if (editMessageId) {
         if (needsForecast) {
-          if (!S.daemonOnline) { saveDraft(sid, text, scope); note("Reconnect to approve the forecast before editing this message.", true); return; }
+          if (!S.daemonOnline) { note("Reconnect to approve the forecast before editing this message.", true); return; }
           try {
-            if (!(await confirmForecast(sid, text, { edit_message_id: editMessageId }))) { saveDraft(sid, text, scope); return; }
-          } catch (error) { saveDraft(sid, text, scope); note("forecast: " + error.message, true); return; }
+            if (!(await confirmForecast(sid, text, { edit_message_id: editMessageId }))) return;
+          } catch (error) { note("forecast: " + error.message, true); return; }
         }
-        if (scope !== S.storageScope) { saveDraft(sid, text, scope); return; }
+        if (scope !== S.storageScope) return;
         S.editMessageId = null;
         restoreDraft(sid);
         renderComposer();
