@@ -21283,6 +21283,7 @@ mod tests {
 
         let pull_event = |pull_id: &str, done: bool| Event::ModelPullProgress {
             model: "llama3".into(),
+            requested_model: None,
             status: if done { "success" } else { "pulling" }.into(),
             completed: None,
             total: None,

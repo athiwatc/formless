@@ -479,12 +479,15 @@ without redesign.
   relay, fetch) through that proxy, from daemon start; otherwise
   `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` apply as usual. `formless
   doctor` and `Status.proxy` show which.
-- **Ollama.** `/pull MODEL [--provider NAME]` resolves the selected
-  provider's model alias, verifies `/api/version` or `/api/tags`, and streams
-  `ModelPullProgress` with a pull ID, model, provider, state, byte counts,
-  expected size when `/api/tags` reports it, and a low-disk warning when
-  possible. That warning is an advisory estimate of the Formless daemon's
-  local filesystem, not the Ollama server's known free space; a different
+- **Ollama.** `/pull MODEL [--provider NAME]` rejects cyclic aliases before
+  starting a job and resolves one alias level, matching chat's existing
+  `ProviderCfg::resolve_alias` semantics. It verifies `/api/version` or
+  `/api/tags`, and streams `ModelPullProgress` with a pull ID, resolved model,
+  optional `requested_model` (the original alias for repeatable resume
+  guidance), provider, state, byte counts, expected size when `/api/tags`
+  reports it, and a low-disk warning when possible. That warning is an
+  advisory estimate of the Formless daemon's local filesystem, not the
+  Ollama server's known free space; a different
   Ollama user or container may use different storage.
   Concurrent pulls for the same provider/model attach to one job; events are
   sent only to attached client connections. `/pull cancel [PULL_ID]` cancels

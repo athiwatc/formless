@@ -1970,6 +1970,7 @@ mod tests {
         let mut streaming = false;
         let progress = Event::ModelPullProgress {
             model: "llama3".into(),
+            requested_model: None,
             status: "pulling".into(),
             completed: Some(1),
             total: Some(2),
@@ -1989,6 +1990,7 @@ mod tests {
         assert!(output.contains("warning: low disk"), "{output}");
         let incomplete = Event::ModelPullProgress {
             model: "llama3".into(),
+            requested_model: None,
             status: "incomplete".into(),
             completed: None,
             total: None,

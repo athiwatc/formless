@@ -130,6 +130,7 @@ fn print_progress(event: &Event, pull_id: &str, profile: &str) -> Option<bool> {
         error,
         pull_id: Some(event_id),
         provider,
+        requested_model,
         expected_size,
         warning,
         ..
@@ -167,7 +168,11 @@ fn print_progress(event: &Event, pull_id: &str, profile: &str) -> Option<bool> {
         if let Some(error) = error {
             println!("error: {}", terminal_safe(error));
             if status == "incomplete" {
-                let resume = resume_command(model, provider.as_deref(), profile);
+                let resume = resume_command(
+                    requested_model.as_deref().unwrap_or(model),
+                    provider.as_deref(),
+                    profile,
+                );
                 println!(
                     "partial download can be resumed with `{}`",
                     terminal_safe(&resume)
@@ -231,6 +236,7 @@ mod tests {
             error: error.map(str::to_string),
             pull_id: Some("pull-1".into()),
             provider: Some("remote".into()),
+            requested_model: Some("A".into()),
             expected_size: None,
             warning: None,
         }
@@ -261,6 +267,14 @@ mod tests {
         assert_eq!(
             resume_command("llama3", None, "default"),
             "formless pull llama3"
+        );
+    }
+
+    #[test]
+    fn resume_command_preserves_requested_alias_and_provider_profile() {
+        assert_eq!(
+            resume_command("A", Some("remote"), "research"),
+            "formless --profile research pull A --provider remote"
         );
     }
 

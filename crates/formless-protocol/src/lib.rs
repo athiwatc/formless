@@ -3935,6 +3935,8 @@ pub enum Event {
     /// and in total when known); `done` ends it.
     ModelPullProgress {
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_model: Option<String>,
         status: String,
         #[serde(default)]
         completed: Option<u64>,
@@ -5957,11 +5959,35 @@ mod ollama_pull_wire_tests {
             legacy_event,
             Event::ModelPullProgress {
                 pull_id: None,
+                requested_model: None,
                 provider: None,
                 expected_size: None,
                 warning: None,
                 ..
             }
+        ));
+        let requested_event = Event::ModelPullProgress {
+            model: "B".into(),
+            requested_model: Some("A".into()),
+            status: "pulling".into(),
+            completed: None,
+            total: None,
+            done: false,
+            error: None,
+            pull_id: Some("pull-1".into()),
+            provider: Some("remote".into()),
+            expected_size: None,
+            warning: None,
+        };
+        let encoded = serde_json::to_value(&requested_event).unwrap();
+        assert_eq!(encoded["requested_model"], "A");
+        assert!(matches!(
+            serde_json::from_value::<Event>(encoded).unwrap(),
+            Event::ModelPullProgress {
+                model,
+                requested_model: Some(requested_model),
+                ..
+            } if model == "B" && requested_model == "A"
         ));
         assert!(FEATURES.contains(&"ollama_pull_jobs_v1"));
         assert_eq!(PROTOCOL_VERSION, 1);

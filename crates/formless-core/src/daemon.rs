@@ -661,6 +661,7 @@ struct OllamaPullRecord {
     key: (String, String),
     provider: String,
     model: String,
+    requested_model: String,
     state: String,
     clients: BTreeSet<u64>,
     cancel: CancellationToken,
@@ -693,20 +694,34 @@ fn canonical_ollama_model(model: &str) -> String {
     }
 }
 
-fn resolve_ollama_model_alias(settings: &ProviderCfg, model: &str) -> String {
+fn resolve_ollama_model_alias(settings: &ProviderCfg, model: &str) -> Result<String> {
+    reject_ollama_model_alias_cycles(settings, model)?;
+    Ok(settings.resolve_alias(model.trim()))
+}
+
+fn reject_ollama_model_alias_cycles(settings: &ProviderCfg, model: &str) -> Result<()> {
     let mut resolved = model.trim().to_string();
     let mut seen = std::collections::HashSet::new();
+    let mut chain = Vec::new();
     loop {
         if !seen.insert(resolved.to_ascii_lowercase()) {
-            break;
+            chain.push(resolved);
+            bail!("Ollama model alias cycle detected: {}", chain.join(" -> "));
         }
-        let next = settings.resolve_alias(&resolved);
-        if next.eq_ignore_ascii_case(&resolved) || seen.contains(&next.to_ascii_lowercase()) {
-            break;
+        chain.push(resolved.clone());
+        let next = settings
+            .aliases
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(&resolved))
+            .map(|(_, target)| target.trim().to_string());
+        let Some(next) = next else { break };
+        if seen.contains(&next.to_ascii_lowercase()) {
+            chain.push(next);
+            bail!("Ollama model alias cycle detected: {}", chain.join(" -> "));
         }
         resolved = next;
     }
-    resolved
+    Ok(())
 }
 
 fn ollama_resume_command(provider: &str, model: &str) -> String {
@@ -5508,7 +5523,8 @@ impl Daemon {
             Request::OllamaPull { model, provider } => {
                 let cfg = self.config()?;
                 let endpoint = self.provider_named(&cfg, provider.as_deref()).await?;
-                let model = resolve_ollama_model_alias(endpoint.settings(), &model);
+                let requested_model = model.trim().to_string();
+                let model = resolve_ollama_model_alias(endpoint.settings(), &requested_model)?;
                 if model.is_empty() {
                     bail!("usage: /pull MODEL [--provider NAME]");
                 }
@@ -5517,7 +5533,7 @@ impl Daemon {
                     .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER.into());
                 let requester = current_client().map(|(conn, _)| conn);
                 let (pull_id, attached, event, cancel) =
-                    self.register_ollama_pull(&provider_name, &model, requester);
+                    self.register_ollama_pull(&provider_name, &model, &requested_model, requester);
                 if attached {
                     if let Some(conn) = requester {
                         send_selected(&self.subs, event, Some(&BTreeSet::from([conn])));
@@ -5530,11 +5546,13 @@ impl Daemon {
                     let pull_id_for_task = pull_id.clone();
                     let provider_for_task = provider_name.clone();
                     let model_for_task = model.clone();
+                    let requested_model_for_task = requested_model.clone();
                     tokio::spawn(async move {
                         this.ollama_pull(
                             &pull_id_for_task,
                             &provider_for_task,
                             &model_for_task,
+                            &requested_model_for_task,
                             endpoint,
                             cancel,
                         )
@@ -8583,6 +8601,7 @@ impl Daemon {
         &self,
         provider: &str,
         model: &str,
+        requested_model: &str,
         requester: Option<u64>,
     ) -> (String, bool, Event, CancellationToken) {
         let key = (provider.to_string(), canonical_ollama_model(model));
@@ -8604,6 +8623,7 @@ impl Daemon {
         }
         let event = Event::ModelPullProgress {
             model: model.to_string(),
+            requested_model: Some(requested_model.to_string()),
             status: "checking".into(),
             completed: None,
             total: None,
@@ -8621,6 +8641,7 @@ impl Daemon {
                 key,
                 provider: provider.to_string(),
                 model: model.to_string(),
+                requested_model: requested_model.to_string(),
                 state: "checking".into(),
                 clients,
                 cancel: cancel.clone(),
@@ -8630,28 +8651,36 @@ impl Daemon {
         (pull_id, false, event, cancel)
     }
 
-    fn publish_ollama_pull(&self, event: Event) {
-        let Event::ModelPullProgress {
-            pull_id: Some(pull_id),
-            status,
-            done,
-            ..
-        } = &event
-        else {
-            self.broadcast(event);
-            return;
+    fn publish_ollama_pull(&self, mut event: Event) {
+        let (pull_id, status, done) = match &event {
+            Event::ModelPullProgress {
+                pull_id: Some(pull_id),
+                status,
+                done,
+                ..
+            } => (pull_id.clone(), status.clone(), *done),
+            _ => {
+                self.broadcast(event);
+                return;
+            }
         };
         let clients = {
             let mut pulls = self.ollama_pulls.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(record) = pulls.records.get_mut(pull_id) else {
+            let Some(record) = pulls.records.get_mut(&pull_id) else {
                 self.broadcast(event);
                 return;
             };
+            if let Event::ModelPullProgress {
+                requested_model, ..
+            } = &mut event
+            {
+                *requested_model = Some(record.requested_model.clone());
+            }
             record.last = event.clone();
-            record.state = status.clone();
+            record.state = status;
             let key = record.key.clone();
             let clients = record.clients.clone();
-            if *done {
+            if done {
                 pulls.active.remove(&key);
                 pulls.finished.push_back(pull_id.clone());
                 while pulls.finished.len() > 64 {
@@ -8768,6 +8797,7 @@ impl Daemon {
         pull_id: &str,
         provider_name: &str,
         model: &str,
+        requested_model: &str,
         endpoint: Provider,
         cancel: CancellationToken,
     ) {
@@ -8777,7 +8807,7 @@ impl Daemon {
             .trim_end_matches('/')
             .trim_end_matches("/v1")
             .to_string();
-        let resume_command = ollama_resume_command(provider_name, model);
+        let resume_command = ollama_resume_command(provider_name, requested_model);
         let send = |status: String,
                     completed: Option<u64>,
                     total: Option<u64>,
@@ -8787,6 +8817,7 @@ impl Daemon {
                     warning: Option<String>| {
             self.publish_ollama_pull(Event::ModelPullProgress {
                 model: model.to_string(),
+                requested_model: Some(requested_model.to_string()),
                 status,
                 completed,
                 total,
@@ -19748,6 +19779,7 @@ mod backpressure_tests {
             },
             Event::ModelPullProgress {
                 model: "model".into(),
+                requested_model: None,
                 status: "pulling".into(),
                 completed: Some(1),
                 total: Some(2),
@@ -21636,7 +21668,7 @@ mod ollama_pull_tests {
                 ..
             }) if status == "incomplete"
                 && error.starts_with("pull ended before completing")
-                && error.contains("`/pull test-model`")
+                && error.contains("`/pull shortcut`")
         ));
     }
 
@@ -21682,7 +21714,7 @@ mod ollama_pull_tests {
                 status,
                 error: Some(error),
                 ..
-            }) if status == "incomplete" && error.contains("`/pull test-model --provider local`")
+            }) if status == "incomplete" && error.contains("`/pull shortcut --provider local`")
         ));
     }
 
@@ -22017,16 +22049,17 @@ mod ollama_pull_tests {
             });
         }
         let (pull_id, attached, event, cancel) =
-            daemon.register_ollama_pull("local", "model", Some(1));
+            daemon.register_ollama_pull("local", "model", "model", Some(1));
         assert!(!attached);
         daemon.publish_ollama_pull(event);
         let (same_id, attached, event, _) =
-            daemon.register_ollama_pull("local", "model:latest", Some(2));
+            daemon.register_ollama_pull("local", "model:latest", "model:latest", Some(2));
         assert!(attached);
         assert_eq!(same_id, pull_id);
         send_selected(&daemon.subs, event, Some(&BTreeSet::from([2])));
         let update = Event::ModelPullProgress {
             model: "model".into(),
+            requested_model: None,
             status: "pulling".into(),
             completed: Some(1),
             total: Some(2),
@@ -22047,6 +22080,42 @@ mod ollama_pull_tests {
             Ok(ServerMessage::Event(Event::ModelPullProgress { .. }))
         ));
         assert!(rx3.try_recv().is_err());
+
+        let (alias_pull_id, attached, alias_event, alias_cancel) =
+            daemon.register_ollama_pull("local", "B", "A", Some(3));
+        assert!(!attached);
+        daemon.publish_ollama_pull(alias_event);
+        assert!(matches!(
+            rx3.try_recv(),
+            Ok(ServerMessage::Event(Event::ModelPullProgress {
+                model,
+                requested_model: Some(requested_model),
+                ..
+            })) if model == "B" && requested_model == "A"
+        ));
+        daemon.publish_ollama_pull(Event::ModelPullProgress {
+            model: "B".into(),
+            requested_model: None,
+            status: "pulling".into(),
+            completed: Some(1),
+            total: Some(2),
+            done: false,
+            error: None,
+            pull_id: Some(alias_pull_id.clone()),
+            provider: Some("local".into()),
+            expected_size: None,
+            warning: None,
+        });
+        assert!(matches!(
+            rx3.try_recv(),
+            Ok(ServerMessage::Event(Event::ModelPullProgress {
+                requested_model: Some(requested_model),
+                ..
+            })) if requested_model == "A"
+        ));
+        daemon.cancel_ollama_pull(&alias_pull_id, Some(3)).unwrap();
+        assert!(alias_cancel.is_cancelled());
+
         assert!(daemon.cancel_ollama_pull(&pull_id, Some(3)).is_err());
         daemon.cancel_ollama_pull(&pull_id, Some(2)).unwrap();
         assert!(cancel.is_cancelled());
@@ -22055,14 +22124,29 @@ mod ollama_pull_tests {
     }
 
     #[test]
-    fn ollama_pull_follows_alias_chains_and_stops_cycles() {
+    fn ollama_pull_alias_resolution_is_idempotent_for_resume_target() {
         let mut settings = ProviderCfg::default();
         settings.aliases.insert("A".into(), "B".into());
         settings.aliases.insert("b".into(), "C".into());
-        assert_eq!(resolve_ollama_model_alias(&settings, "A"), "C");
+        let resolved = resolve_ollama_model_alias(&settings, "A").unwrap();
+        assert_eq!(resolved, "B");
+        assert_eq!(
+            resolve_ollama_model_alias(&settings, "A").unwrap(),
+            resolved
+        );
+    }
 
+    #[test]
+    fn ollama_pull_rejects_alias_cycles() {
+        let mut settings = ProviderCfg::default();
+        settings.aliases.insert("A".into(), "B".into());
+        settings.aliases.insert("b".into(), "C".into());
         settings.aliases.insert("C".into(), "A".into());
-        assert_eq!(resolve_ollama_model_alias(&settings, "A"), "C");
+        let error = resolve_ollama_model_alias(&settings, "A")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Ollama model alias cycle detected"));
+        assert!(error.contains("A -> B -> C -> A"));
     }
 
     #[test]
