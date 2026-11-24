@@ -6387,9 +6387,19 @@
   }
   function focusReturn(el) {
     const top = activeDialog();
-    if (focusVisible(el) && (!top || dialogAllows(top, el))) {
+    const sessionRow = el?.closest("#sessions [data-session-id]");
+    const sessionControl = sessionRow && ["mark", "session-open", "menu"].find((name) => el.classList.contains(name));
+    const allowed = !top || dialogAllows(top, el);
+    if (allowed && sessionControl === "menu" && !focusVisible(el)) {
+      const sessionOpen = sessionRow.querySelector(".session-open");
+      if (focusVisible(sessionOpen)) sessionOpen.focus({ preventScroll: true });
+    }
+    if (allowed && focusVisible(el)) {
       el.focus({ preventScroll: true });
-      if (document.activeElement === el) return;
+      if (document.activeElement === el) {
+        if (sessionControl) revealSessionControl(el);
+        return;
+      }
     }
     if (top) return focusDialog(top);
     // A re-render or view change can remove/hide the original control.
