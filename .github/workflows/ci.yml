@@ -172,9 +172,6 @@ jobs:
       - name: Clippy (all workspace targets)
         run: cargo clippy --workspace --all-targets --locked 2>&1 | tee "$CI_DIR/logs/clippy.log"
 
-      - name: Compile benchmark targets
-        run: cargo bench --workspace --no-run --locked
-
       - name: Relay and web regression tests
         run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
 
@@ -251,6 +248,9 @@ jobs:
 
       - name: Build release workspace
         run: cargo build --workspace --release --locked 2>&1 | tee "$CI_DIR/logs/release.log"
+
+      - name: Compile benchmark targets
+        run: cargo bench --workspace --no-run --locked
 
       - name: Smoke test release binary and generated assets
         run: |
