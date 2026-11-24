@@ -152,6 +152,9 @@ jobs:
       - name: Relay and web regression tests
         run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
 
+      - name: Pi extension tests
+        run: node --test crates/formless-core/src/local_harness/*.test.mjs 2>&1 | tee "$CI_DIR/logs/pi-extension.log"
+
       - name: Relay test inventory
         run: python3 -B relay/browser_suite.py --check-inventory
 
