@@ -95,7 +95,7 @@ mod tests {
                 .unwrap()
                 .selected_effort
                 .as_deref(),
-            Some("minimal")
+            Some("low")
         );
         app.model_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(app.model_overlay.as_ref().unwrap().selected_effort, None);
