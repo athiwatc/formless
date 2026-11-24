@@ -51,6 +51,13 @@ async fn usage_groups_by_day_or_key_and_prices_it() {
         .record_usage(&b, "r2", "cheap", &use_(0, 1_000_000, 0))
         .unwrap();
     let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let ping = daemon.handle(Request::Ping).await.unwrap();
+    assert!(ping["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(
+            formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE
+        )));
 
     let by = |by: Option<&str>| Request::UsageByDay {
         since: None,

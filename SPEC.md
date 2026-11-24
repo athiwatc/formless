@@ -6865,7 +6865,9 @@ is exposed by these commands.
 reads the existing full-range UsageByDay aggregation once, independently of
 the bounded recent Run list. Default/explicit day sends no group key and the
 caller's current local UTC offset in minutes; its oldest-first buckets and JSON
-keys are local dates. Other groups omit the offset and keep their descending
+keys are local dates. The daemon advertises this support as
+usage_by_day_utc_offset_v1; if absent, the CLI refuses to display UTC buckets
+as local. Other groups omit the offset and keep their descending
 total-token order. Requests without an offset, including existing TUI clients,
 keep UTC day grouping. The offset is fixed for the entire query, including
 history across daylight-saving changes. No since means all history; durations

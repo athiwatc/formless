@@ -37,6 +37,7 @@ pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
 pub const TOPIC_ORCHESTRATION_FEATURE: &str = "topic_orchestration_v2";
+pub const USAGE_BY_DAY_UTC_OFFSET_FEATURE: &str = "usage_by_day_utc_offset_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -484,6 +485,7 @@ pub const FEATURES: &[&str] = &[
     REVIEWED_STEER_RUN_FEATURE,
     TOPIC_ORCHESTRATION_FEATURE,
     IDLE_STEP_OFF_FEATURE,
+    USAGE_BY_DAY_UTC_OFFSET_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
 ];
@@ -5119,6 +5121,36 @@ mod tests {
         assert!(matches!(newer.request, Request::Ping));
         let round = serde_json::to_string(&newer).unwrap();
         assert!(serde_json::from_str::<RequestEnvelope>(&round).is_ok());
+    }
+
+    #[test]
+    fn usage_offset_is_ignored_by_the_previous_request_shape() {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum PreviousRequest {
+            UsageByDay {
+                #[serde(default)]
+                since: Option<String>,
+                #[serde(default)]
+                by: Option<String>,
+            },
+        }
+
+        let request = serde_json::to_value(Request::UsageByDay {
+            since: None,
+            by: None,
+            utc_offset_minutes: Some(420),
+        })
+        .unwrap();
+        let previous: PreviousRequest = serde_json::from_value(request).unwrap();
+        assert!(matches!(
+            previous,
+            PreviousRequest::UsageByDay {
+                since: None,
+                by: None
+            }
+        ));
+        assert!(FEATURES.contains(&USAGE_BY_DAY_UTC_OFFSET_FEATURE));
     }
 
     #[test]

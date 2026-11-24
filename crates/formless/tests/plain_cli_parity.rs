@@ -379,6 +379,10 @@ impl Fixture {
                         Request::Subscribe { .. } => json!({"conn":1}),
                         Request::GetRun { run_id } => inspected_run(run_id),
                         Request::CancelRunId { run_id } => cancellation_reply(run_id),
+                        Request::Ping => json!({
+                            "pong":true,
+                            "features":[formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE]
+                        }),
                         Request::UsageByDay { .. } => grouped_usage(),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
@@ -2539,7 +2543,7 @@ fn grouped_usage() -> Value {
 }
 
 #[test]
-fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
+fn shipped_grouped_usage_checks_day_support_and_keeps_all_daemon_values() {
     let fixture = Fixture::new();
     for group in [
         None,
@@ -2596,11 +2600,19 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 );
             }
             let requests = fixture.requests.lock().unwrap();
-            let [Request::UsageByDay {
+            let daily = group.is_none() || group == Some("day");
+            if daily {
+                assert_eq!(requests.len(), 2, "{requests:?}");
+                assert!(matches!(requests.first(), Some(Request::Ping)));
+            } else {
+                assert_eq!(requests.len(), 1, "{requests:?}");
+                assert!(!matches!(requests.first(), Some(Request::Ping)));
+            }
+            let Some(Request::UsageByDay {
                 since,
                 by,
                 utc_offset_minutes,
-            }] = &requests[..]
+            }) = requests.last()
             else {
                 panic!("{requests:?}")
             };
@@ -2619,7 +2631,7 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
     let latest = chrono::Utc::now() - chrono::Duration::days(30);
     assert!(out.status.success());
     let requests = fixture.requests.lock().unwrap();
-    let [Request::UsageByDay {
+    let [Request::Ping, Request::UsageByDay {
         since: Some(since),
         by: None,
         utc_offset_minutes: Some(offset),

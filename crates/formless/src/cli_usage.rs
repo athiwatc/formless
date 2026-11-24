@@ -162,7 +162,22 @@ pub(super) fn write_report(
     json: bool,
     mut request: impl FnMut(Request) -> Result<Value>,
 ) -> Result<()> {
-    let utc_offset_minutes = matches!(by, Group::Day).then(local_utc_offset_minutes);
+    let daily = matches!(by, Group::Day);
+    let utc_offset_minutes = if daily {
+        let ping = request(Request::Ping)?;
+        let supports_local_days = ping["features"].as_array().is_some_and(|features| {
+            features.iter().any(|feature| {
+                feature.as_str() == Some(formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE)
+            })
+        });
+        anyhow::ensure!(
+            supports_local_days,
+            "the running daemon does not advertise caller-local daily usage support; run formless daemon restart before retrying"
+        );
+        Some(local_utc_offset_minutes())
+    } else {
+        None
+    };
     let value = request(Request::UsageByDay {
         since: since.clone(),
         by: by.key(),
@@ -199,6 +214,23 @@ pub(super) fn write_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daily_usage_refuses_daemons_without_offset_support_before_output() {
+        let mut out = Vec::new();
+        let mut requests = Vec::new();
+        let error = write_report(&mut out, Group::Day, None, true, |request| {
+            requests.push(request);
+            Ok(serde_json::json!({"pong":true,"features":[]}))
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not advertise caller-local daily usage support"));
+        assert!(matches!(&requests[..], [Request::Ping]));
+        assert!(out.is_empty());
+    }
+
     #[test]
     fn human_uses_local_days_and_marks_only_a_present_truncated_cutoff_day() {
         let rows = serde_json::json!([
@@ -305,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn one_request_preserves_cutoff_order_values_unknown_cost_and_json_fields() {
+    fn daily_capability_check_preserves_cutoff_order_values_unknown_cost_and_json_fields() {
         let expected_offset = local_utc_offset_minutes();
         let value = serde_json::json!([
             {"key":"日本語","prompt_tokens":1,"completion_tokens":2,"cached_tokens":0,"cache_write_tokens":1,"cost":null,"future":7},
@@ -323,13 +355,21 @@ mod tests {
                 Some("2026-10-14T12:00:00+00:00".into()),
                 json,
                 |request| {
+                    let reply = if matches!(&request, Request::Ping) {
+                        serde_json::json!({
+                            "pong":true,
+                            "features":[formless_protocol::USAGE_BY_DAY_UTC_OFFSET_FEATURE]
+                        })
+                    } else {
+                        value.clone()
+                    };
                     calls.push(request);
-                    Ok(value.clone())
+                    Ok(reply)
                 },
             )
             .unwrap();
             assert!(
-                matches!(&calls[..],[Request::UsageByDay{since:Some(since),by:None,utc_offset_minutes:Some(offset)}] if since=="2026-10-14T12:00:00+00:00" && *offset==expected_offset)
+                matches!(&calls[..],[Request::Ping,Request::UsageByDay{since:Some(since),by:None,utc_offset_minutes:Some(offset)}] if since=="2026-10-14T12:00:00+00:00" && *offset==expected_offset)
             );
             if json {
                 let unformatted = serde_json::to_string_pretty(&value).unwrap() + "\n";
