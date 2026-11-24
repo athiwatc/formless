@@ -173,9 +173,17 @@ else:print(json.dumps({'result':result,'session_id':'fixture-claude'}))
     path
 }
 fn topic(f: &Fixture, workspace: Option<PathBuf>, two: bool) -> TopicInfo {
+    topic_with_request(f, workspace, two, "Account for X and Y")
+}
+fn topic_with_request(
+    f: &Fixture,
+    workspace: Option<PathBuf>,
+    two: bool,
+    request: &str,
+) -> TopicInfo {
     let message = f
         .daemon()
-        .with_store(|st| st.append_message(&f.session, "user", "Account for X and Y"))
+        .with_store(|st| st.append_message(&f.session, "user", request))
         .unwrap();
     let features = if two {
         vec![
@@ -3820,6 +3828,33 @@ fn add_workspace_gemini_decoy(repo: &Path, relative_bin: &Path) {
     .unwrap();
 }
 
+fn add_workspace_grok_decoy(repo: &Path, relative_bin: &Path) {
+    let bin = repo.join(relative_bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let executable = bin.join("grok");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf 'decoy' > \"$TOPIC_FIXTURE_GROK_DECOY_MARKER\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let relative = relative_bin.join("grok");
+    git(repo, &["add", relative.to_str().unwrap()]).unwrap();
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "workspace ACP decoy",
+        ],
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn topic_gemini_uses_daemon_resolved_executable_over_workspace_path_decoy() {
     let env = crate::credential_env::EnvGuard::isolated();
@@ -3994,6 +4029,166 @@ async fn topic_acp_removed_resolved_executable_does_not_fall_back_to_workspace_d
         1
     );
     assert!(!f.root.join("gemini-decoy-started").exists());
+}
+
+#[tokio::test]
+async fn topic_grok_uses_daemon_resolved_executable_over_workspace_path_decoy() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set("TOPIC_FIXTURE_GROK_MODE", "complete");
+    env.set("TOPIC_FIXTURE_GROK_SELECTED_EXECUTABLE", "");
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let python = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let f = Fixture::new(&env);
+    let relative_root = PathBuf::from("target").join(f.root.file_name().unwrap());
+    let relative_bin = relative_root.join("bin");
+    let daemon_root = std::env::current_dir().unwrap().join(&relative_root);
+    let _daemon_path_fixture = CwdFixtureDir(daemon_root.clone());
+    std::fs::create_dir_all(daemon_root.join("bin")).unwrap();
+
+    let repo = repository(&f);
+    add_workspace_grok_decoy(&repo, &relative_bin);
+    let executable = grok_acp_script(&f, &env);
+    let daemon_executable = daemon_root.join("bin/grok");
+    std::fs::copy(&executable, &daemon_executable).unwrap();
+    std::fs::set_permissions(&daemon_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set(
+        "TOPIC_FIXTURE_GROK_RUN_MARKER",
+        f.root.join("grok-run-path"),
+    );
+    env.set(
+        "TOPIC_FIXTURE_GROK_DECOY_MARKER",
+        f.root.join("grok-decoy-started"),
+    );
+    env.set(
+        "PATH",
+        std::env::join_paths([
+            relative_bin,
+            python.parent().unwrap().to_path_buf(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap(),
+    );
+
+    let topic = topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::ReadOnly,
+        &[],
+    );
+    args["acp_agent"] = json!("grok");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_deref().unwrap(),
+            &args,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    let result = result.unwrap();
+
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("grok-run-path")).unwrap(),
+        std::fs::canonicalize(daemon_executable)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+    assert!(!f.root.join("grok-decoy-started").exists());
+}
+
+#[tokio::test]
+async fn topic_grok_removed_resolved_executable_does_not_fall_back_to_workspace_decoy() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set("TOPIC_FIXTURE_GROK_MODE", "complete");
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let python = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let f = Fixture::new(&env);
+    let relative_root = PathBuf::from("target").join(f.root.file_name().unwrap());
+    let relative_bin = relative_root.join("bin");
+    let daemon_root = std::env::current_dir().unwrap().join(&relative_root);
+    let _daemon_path_fixture = CwdFixtureDir(daemon_root.clone());
+    std::fs::create_dir_all(daemon_root.join("bin")).unwrap();
+
+    let repo = repository(&f);
+    add_workspace_grok_decoy(&repo, &relative_bin);
+    let executable = grok_acp_script(&f, &env);
+    let daemon_executable = daemon_root.join("bin/grok");
+    std::fs::copy(&executable, &daemon_executable).unwrap();
+    std::fs::set_permissions(&daemon_executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let selected = std::fs::canonicalize(&daemon_executable).unwrap();
+    env.remove("FORMLESS_TOPIC_ACP_EXE");
+    env.set("TOPIC_FIXTURE_GROK_SELECTED_EXECUTABLE", &selected);
+    env.set(
+        "TOPIC_FIXTURE_GROK_RUN_MARKER",
+        f.root.join("grok-run-path"),
+    );
+    env.set(
+        "TOPIC_FIXTURE_GROK_DECOY_MARKER",
+        f.root.join("grok-decoy-started"),
+    );
+    env.set(
+        "PATH",
+        std::env::join_paths([
+            relative_bin,
+            python.parent().unwrap().to_path_buf(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .unwrap(),
+    );
+
+    let topic = topic(&f, Some(repo), false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::ReadOnly,
+        &[],
+    );
+    args["acp_agent"] = json!("grok");
+    let result = f
+        .daemon()
+        .run_topic_step_until_done(
+            topic.topic_session_id.as_deref().unwrap(),
+            &args,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(result["acp_agent"], "grok", "{result}");
+    let startup_error = result["summary"].as_str().unwrap_or_default();
+    let not_found_error = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert!(
+        startup_error.contains("failed to start Grok Build")
+            && startup_error.contains(&not_found_error),
+        "expected startup failure for removed selected Grok executable at {}: {result}",
+        selected.display()
+    );
+    assert!(!selected.exists());
+    assert!(!f.root.join("grok-run-path").exists());
+    assert!(!f.root.join("grok-decoy-started").exists());
 }
 
 #[tokio::test]
@@ -4197,6 +4392,348 @@ async fn topic_orchestrator_fixture_antigravity_step_reaches_acp_with_permission
             "{observed:?}"
         );
     }
+}
+fn grok_acp_script(f: &Fixture, env: &crate::credential_env::EnvGuard) -> PathBuf {
+    let path = f.root.join("fake-grok-acp");
+    std::fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+assert os.environ.get('GROK_DISABLE_AUTOUPDATER')=='1'
+def send(value):
+    sys.stdout.write(json.dumps(value)+'\n');sys.stdout.flush()
+def read():
+    line=sys.stdin.readline()
+    if not line:sys.exit(0)
+    return json.loads(line)
+while True:
+    message=read();method=message.get('method')
+    if method=='initialize':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'protocolVersion':1,'_meta':{'agentVersion':'1.0.92'}}})
+    elif method=='session/new':
+        servers=message['params']['mcpServers']
+        if servers:
+            marker=os.environ.get('TOPIC_FIXTURE_GROK_RUN_MARKER')
+            if marker:pathlib.Path(marker).write_text(os.path.realpath(sys.argv[0]))
+        else:
+            selected=os.environ.get('TOPIC_FIXTURE_GROK_SELECTED_EXECUTABLE')
+            if selected:pathlib.Path(selected).unlink()
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'sessionId':'grok-topic-fixture'}})
+        if not servers:sys.exit(0)
+    elif method=='session/set_mode':
+        send({'jsonrpc':'2.0','id':message['id'],'result':{}})
+    elif method=='session/prompt':
+        prompt_id=message['id']
+        if os.environ.get('TOPIC_FIXTURE_GROK_MODE')=='hold':
+            child=subprocess.Popen(['/bin/sleep','120'])
+            pathlib.Path(os.environ['TOPIC_FIXTURE_GROK_PID']).write_text(str(os.getpid()))
+            pathlib.Path(os.environ['TOPIC_FIXTURE_GROK_CHILD_PID']).write_text(str(child.pid))
+            while read().get('method')!='session/cancel':pass
+            send({'jsonrpc':'2.0','id':prompt_id,'result':{'stopReason':'cancelled'}})
+            continue
+        if os.environ.get('TOPIC_FIXTURE_GROK_MODE')=='complete':
+            send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'grok-topic-fixture','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Grok executable fixture completed'}}}})
+            send({'jsonrpc':'2.0','id':prompt_id,'result':{'stopReason':'end_turn'}})
+            break
+        send({'jsonrpc':'2.0','id':90,'method':'session/request_permission','params':{'sessionId':'grok-topic-fixture','toolCall':{'toolCallId':'grok-call','kind':'execute','title':'Grok fixture tool','_meta':{'x.ai/tool':{'namespace':'grok_build','name':'use_tool'}}},'options':[{'optionId':'allow','name':'Allow once','kind':'allow_once'},{'optionId':'deny','name':'Reject','kind':'reject_once'}]}})
+        permission=read()
+        assert permission['id']==90 and permission['result']['outcome']['optionId']=='allow'
+        send({'jsonrpc':'2.0','id':91,'method':'_x.ai/ask_user_question','params':{'questions':[{'question':'Proceed with the topic fixture?','options':[{'label':'Proceed'},{'label':'Stop'}],'multiSelect':False}]}})
+        question=read()
+        assert question['id']==91
+        reply=question['result']
+        assert reply=={'outcome':'accepted','answers':{'Proceed with the topic fixture?':'Proceed'}}
+        with open(os.environ['TOPIC_FIXTURE_GROK_REPLY'],'w') as output:json.dump(reply,output)
+        send({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'grok-topic-fixture','update':{'sessionUpdate':'agent_message_chunk','content':{'type':'text','text':'Grok ACP topic fixture completed'}}}})
+        send({'jsonrpc':'2.0','id':prompt_id,'result':{'stopReason':'end_turn'}})
+        break
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    env.set("FORMLESS_TOPIC_ACP_EXE", &path);
+    env.set("TOPIC_FIXTURE_GROK_REPLY", f.root.join("grok-reply.json"));
+    env.set("TOPIC_FIXTURE_GROK_PID", f.root.join("grok-pid"));
+    env.set(
+        "TOPIC_FIXTURE_GROK_CHILD_PID",
+        f.root.join("grok-child-pid"),
+    );
+    path
+}
+
+fn grok_fixture_process_stopped(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.split(')')
+                .nth(1)
+                .is_some_and(|state| matches!(state.trim_start().chars().next(), Some('Z' | 'X')))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn grok_fixture_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+struct GrokFixtureProcessGuard {
+    cancel: CancellationToken,
+    agent_pid_path: PathBuf,
+    child_pid_path: PathBuf,
+    armed: bool,
+}
+
+impl GrokFixtureProcessGuard {
+    fn terminate(&self) {
+        self.cancel.cancel();
+        if let Some(pid) = grok_fixture_pid(&self.agent_pid_path) {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        for path in [&self.agent_pid_path, &self.child_pid_path] {
+            if let Some(pid) = grok_fixture_pid(path) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrokFixtureProcessGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.terminate();
+        }
+    }
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_grok_acp_step_routes_permissions_questions_and_completion() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    grok_acp_script(&f, &env);
+    let topic = topic_with_request(&f, None, true, "Proceed with the topic fixture: Proceed");
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let cancel = CancellationToken::new();
+    let (tx, mut events) = mpsc::channel(256);
+    f.daemon().subs.locked().push(Subscriber {
+        conn: 99,
+        tx: tx.into(),
+        filter: Arc::new(StdMutex::new(EventFilter::default())),
+        kick: CancellationToken::new(),
+        gaps: BTreeMap::new(),
+    });
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut args = step(
+            &topic.features[0].id,
+            HarnessKind::Acp,
+            StepAccess::Write,
+            &[],
+        );
+        args["acp_agent"] = json!("grok");
+        let launched = f
+            .daemon()
+            .run_topic_step(&session, &args, &cancel)
+            .await
+            .unwrap();
+        let attempt_id = launched["attempt_id"].as_str().unwrap();
+        let permission = f
+            .daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[attempt_id]}), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(permission["event"], "permission");
+        assert_eq!(permission["harness"], "acp");
+        assert_eq!(permission["acp_agent"], "grok");
+        let permission_id = permission["permission_id"].as_str().unwrap();
+        let raw_input = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(ServerMessage::Event(Event::HarnessPermissionRequested {
+                    permission_id: id,
+                    raw_input: Some(raw_input),
+                    ..
+                })) = events.recv().await
+                {
+                    if id == permission_id {
+                        break raw_input;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_input["_meta"]["x.ai/tool"],
+            json!({"namespace":"grok_build","name":"use_tool"})
+        );
+        f.daemon()
+            .handle(Request::HarnessPermissionDecision {
+                permission_id: permission_id.into(),
+                option_id: Some("allow".into()),
+            })
+            .await
+            .unwrap();
+        let question = f
+            .daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[attempt_id]}), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(question["event"], "question");
+        assert_eq!(question["user_only"], false);
+        assert_eq!(
+            question["questions"][0]["question"],
+            "Proceed with the topic fixture?"
+        );
+        let answered = f
+            .daemon()
+            .answer_topic_question_tool(
+                &session,
+                &json!({
+                    "question_id":question["question_id"],
+                    "answers":[{"selected":["Proceed"]}],
+                    "basis":"The approved request explicitly selects Proceed.",
+                    "evidence":{
+                        "message_id":topic.features[0].source_message_id,
+                        "quote":"Proceed with the topic fixture: Proceed"
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(answered["answered"], true);
+        let completed = f
+            .daemon()
+            .wait_topic_steps(&session, &json!({"attempt_ids":[attempt_id]}), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(completed["event"], "completed");
+        assert_eq!(completed["status"], "succeeded");
+        let reply = std::fs::read_to_string(f.root.join("grok-reply.json")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap(),
+            json!({
+                "outcome":"accepted",
+                "answers":{"Proceed with the topic fixture?":"Proceed"}
+            })
+        );
+        let attempt = &state(&f, &topic.id).attempts[0];
+        assert_eq!(attempt.harness, HarnessKind::Acp);
+        assert_eq!(attempt.acp_agent.as_deref(), Some("grok"));
+    })
+    .await;
+    if result.is_err() {
+        cancel.cancel();
+    }
+    result.expect("Grok through-topic ACP fixture timed out");
+}
+
+#[tokio::test]
+async fn topic_orchestrator_fixture_grok_acp_cancellation_cleans_up_process_group() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("TOPIC_FIXTURE_GROK_MODE", "hold");
+    let f = Fixture::new(&env);
+    grok_acp_script(&f, &env);
+    let topic = topic(&f, None, false);
+    f.daemon()
+        .with_store(|st| st.claim_topic_workflow(&topic.id))
+        .unwrap();
+    let session = topic.topic_session_id.clone().unwrap();
+    let mut args = step(
+        &topic.features[0].id,
+        HarnessKind::Acp,
+        StepAccess::Write,
+        &[],
+    );
+    args["acp_agent"] = json!("grok");
+    let daemon = f.daemon().clone();
+    let cancel = CancellationToken::new();
+    let agent_pid_path = f.root.join("grok-pid");
+    let child_pid_path = f.root.join("grok-child-pid");
+    let mut cleanup = GrokFixtureProcessGuard {
+        cancel: cancel.clone(),
+        agent_pid_path: agent_pid_path.clone(),
+        child_pid_path: child_pid_path.clone(),
+        armed: true,
+    };
+    let run_cancel = cancel.clone();
+    let mut task = tokio::spawn(async move {
+        daemon
+            .run_topic_step_until_done(&session, &args, &run_cancel)
+            .await
+    });
+    wait_until(|| agent_pid_path.exists() && child_pid_path.exists()).await;
+    f.daemon()
+        .handle(Request::CancelTopic {
+            topic_id: topic.id.clone(),
+        })
+        .await
+        .unwrap();
+    let result = match tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            cleanup.terminate();
+            let agent_pid = grok_fixture_pid(&agent_pid_path).expect("ACP agent pid was captured");
+            let child_pid = grok_fixture_pid(&child_pid_path).expect("ACP child pid was captured");
+            let processes_stopped = tokio::time::timeout(Duration::from_secs(3), async {
+                while !grok_fixture_process_stopped(agent_pid)
+                    || !grok_fixture_process_stopped(child_pid)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let mut task_stopped = tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_ok();
+            if !task_stopped {
+                task.abort();
+                task_stopped = tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .is_ok();
+            }
+            if processes_stopped {
+                cleanup.disarm();
+            }
+            assert!(
+                processes_stopped,
+                "watchdog left the Grok ACP process group alive"
+            );
+            assert!(task_stopped, "watchdog could not stop the Grok ACP task");
+            panic!("Grok ACP cancellation exceeded its watchdog after cleanup");
+        }
+    };
+    assert_eq!(result["status"], "cancelled", "{result}");
+    assert_eq!(result["harness"], "acp");
+    assert_eq!(result["acp_agent"], "grok");
+    for path in [agent_pid_path, child_pid_path] {
+        let pid: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !grok_fixture_process_stopped(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(grok_fixture_process_stopped(pid));
+    }
+    cleanup.disarm();
 }
 
 #[tokio::test]

@@ -357,28 +357,32 @@ async fn official_probe_timeout_is_unknown_and_bounded() {
 #[tokio::test]
 async fn acp_dispatch_receives_agent_id_and_missing_executable_keeps_identity() {
     let (root, mut ctx) = fixture();
-    let value = dispatch(HarnessKind::Acp, &ctx, Some("gemini")).await;
-    assert_eq!(value.acp_agent.as_deref(), Some("gemini"));
-    assert!(value.installed);
-    assert!(value.signed_in.is_none());
+    for id in ["grok", "gemini"] {
+        let value = dispatch(HarnessKind::Acp, &ctx, Some(id)).await;
+        assert_eq!(value.acp_agent.as_deref(), Some(id));
+        assert!(value.installed);
+        assert!(value.signed_in.is_none());
+    }
     ctx.environment.clear();
     let missing_path = root.0.join("missing-path");
     std::fs::create_dir(&missing_path).unwrap();
     ctx.environment
         .insert("PATH".into(), missing_path.into_os_string());
-    let missing = probe_environment(
-        HarnessKind::Acp,
-        Some("gemini"),
-        &ctx.environment,
-        Duration::from_secs(1),
-    )
-    .await;
-    assert_eq!(missing.acp_agent.as_deref(), Some("gemini"));
-    assert!(!missing.installed);
-    assert!(missing
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("not installed")));
+    for id in ["grok", "gemini"] {
+        let missing = probe_environment(
+            HarnessKind::Acp,
+            Some(id),
+            &ctx.environment,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(missing.acp_agent.as_deref(), Some(id));
+        assert!(!missing.installed);
+        assert!(missing
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not installed")));
+    }
 }
 
 #[tokio::test]

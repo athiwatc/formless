@@ -19,6 +19,11 @@ impl Fixture {
             &executable,
             br##"#!/bin/sh
 set -eu
+if [ "${PROBE_GROK-}" = 1 ]; then
+    [ "$GROK_DISABLE_AUTOUPDATER" = 1 ]
+    [ "$XAI_API_KEY" = fixture-key ]
+    [ "$*" = '--permission-mode default agent --no-leader stdio' ]
+fi
 [ "${FORMLESS_TOPIC_CAPABILITY+x}" != x ]
 [ "${FORMLESS_TOPIC_ATTEMPT_ID+x}" != x ]
 [ "${FORMLESS_DATA_DIR+x}" != x ]
@@ -81,6 +86,11 @@ done
         for name in BRIDGE_ENV {
             environment.insert((*name).into(), "must-not-reach-agent".into());
         }
+        if id == "grok" {
+            environment.insert("PROBE_GROK".into(), "1".into());
+            environment.insert("XAI_API_KEY".into(), "fixture-key".into());
+            environment.insert("GROK_DISABLE_AUTOUPDATER".into(), "0".into());
+        }
         Self {
             root,
             executable,
@@ -138,7 +148,10 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
         assert!(result.installed, "{id}: {result:?}");
         assert_eq!(
             result.version.as_deref(),
-            captured[id]["initialize"]["result"]["agentInfo"]["version"].as_str()
+            captured[id]["initialize"]["result"]
+                .pointer("/agentInfo/version")
+                .or_else(|| captured[id]["initialize"]["result"].pointer("/_meta/agentVersion"))
+                .and_then(Value::as_str)
         );
         if matches!(*id, "junie" | "auggie" | "devin") {
             assert_eq!(result.signed_in, None, "{id}: {result:?}");
@@ -176,6 +189,50 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
             assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
         }
     }
+}
+
+#[test]
+fn grok_readiness_signed_in_signed_out_and_missing() {
+    let mut fixture = Fixture::new("grok");
+    let signed_out = fixture.probe("grok");
+    assert_eq!(signed_out.acp_agent.as_deref(), Some("grok"));
+    assert!(signed_out.installed);
+    assert_eq!(signed_out.version.as_deref(), Some("1.0.92"));
+    assert_eq!(signed_out.signed_in, Some(false));
+    assert!(signed_out
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains(crate::local_harness::grok::AUTH_HINT));
+
+    fixture.session(json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"grok-ready"}}));
+    let signed_in = fixture.probe("grok");
+    assert_eq!(signed_in.kind, HarnessKind::Acp);
+    assert_eq!(signed_in.acp_agent.as_deref(), Some("grok"));
+    assert!(signed_in.installed);
+    assert_eq!(signed_in.version.as_deref(), Some("1.0.92"));
+    assert_eq!(signed_in.signed_in, Some(true));
+    assert_eq!(signed_in.detail, None);
+
+    for session in [
+        json!({"jsonrpc":"2.0","id":2,"result":{}}),
+        json!({"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"fixture failure"}}),
+    ] {
+        fixture.session(session);
+        let unknown = fixture.probe("grok");
+        assert!(unknown.installed);
+        assert_eq!(unknown.signed_in, None);
+        assert_eq!(unknown.version.as_deref(), Some("1.0.92"));
+        assert!(unknown.detail.is_some());
+    }
+
+    fs::remove_file(&fixture.executable).unwrap();
+    let missing = availability("grok", None, &fixture.environment);
+    assert_eq!(missing.acp_agent.as_deref(), Some("grok"));
+    assert!(!missing.installed);
+    assert_eq!(missing.signed_in, None);
+    assert_eq!(missing.version, None);
+    assert!(missing.detail.unwrap().contains("not installed"));
 }
 
 #[test]

@@ -3,6 +3,7 @@
 pub mod acp;
 pub mod acp_agents;
 pub mod antigravity;
+pub mod grok;
 mod interaction;
 pub mod opencode;
 

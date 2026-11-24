@@ -89,17 +89,19 @@ macro_rules! agents {
         fn session_auth_policy(id: &str) -> Option<SessionAuthPolicy> {
             match id {
                 $($id => Some($auth),)*
+                "grok" => Some(SessionAuthPolicy::Required),
                 _ => None,
             }
         }
 
         pub fn agent_ids() -> &'static [&'static str] {
-            &[$($id),*]
+            &[$($id,)* "grok"]
         }
 
         pub fn spec(id: &str) -> Option<&'static AgentSpec> {
             match id {
                 $($id => Some(&$symbol),)*
+                "grok" => Some(&super::grok::SPEC),
                 _ => None,
             }
         }
