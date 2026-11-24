@@ -57,6 +57,13 @@ function fixture() {
   return { c, root, announcer, timers, advance, node };
 }
 
+function accessibleText(element) {
+  if (element == null || element.hidden || element.props?.hidden || element.props?.['aria-hidden'] === 'true') return '';
+  if (typeof element === 'string') return element;
+  if (typeof element.data === 'string') return element.data;
+  return (element.children || []).map(accessibleText).join('');
+}
+
 test('transcript is not live and chat has a separate polite status announcer', () => {
   assert.match(html, /id="transcript"[^>]*tabindex="0"/);
   assert.doesNotMatch(html.match(/<div id="transcript"[^>]*>/)?.[0] || '', /aria-live|role="status"/);
@@ -201,32 +208,43 @@ test('artifact Load more retry reopens its viewer when the original dialog has c
   assert.deepEqual(requests.map(request => request.offset), [0, 5, 0]);
 });
 
-test('live tool status name includes completion state and duration without timer text', () => {
+test('live tool disclosure separates status, duration, and name in every state', () => {
   const { c } = fixture();
-  const attribute = () => {
-    const values = {};
-    return { hidden: false, getAttribute: key => values[key] ?? null, setAttribute: (key, value) => { values[key] = value; } };
-  };
-  const tool = { status: 'running', name: 'read_file', version: 1, arguments: '{}', depth: 0, started: 0 };
-  const row = {
-    tool, node: { className: '', style: {}, dataset: {} }, summary: { firstChild: attribute() },
-    mark: { className: '', style: {}, textContent: '' }, name: { data: '' }, args: { data: '' },
-    status: { data: '' }, folded: { hidden: true, textContent: '' },
-    progressBox: { hidden: true }, progress: { hidden: true }, progressText: { data: '' },
-    stalled: { hidden: true, textContent: '' }, cancel: { hidden: true }, transcript: { hidden: true },
-    timer: { data: '' }, payloadInitialized: true, payloadArgs: '{}', payloadSubagent: undefined,
-  };
+  c.document = { createTextNode: data => ({ data }) };
+  c.liveRender = { rows: new Map() };
+  vm.runInContext(fn('liveToolRow'), c);
   vm.runInContext(fn('updateLiveTool'), c);
+  const tool = { status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const row = c.liveToolRow(tool);
+  row.node.style = {};
+  row.node.dataset = {};
+  row.summary.firstChild = row.summary.children[0];
+  const depthMarker = row.summary.firstChild;
+  depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
+  depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
+  row.mark.style = {};
+  row.payloadInitialized = true;
+  row.payloadArgs = tool.arguments;
+  row.payloadSubagent = undefined;
+
+  for (const [status, elapsedMs, expected] of [
+    ['running', null, 'Running · 2s'],
+    ['ok', 1234, 'Done · 1.2s'],
+    ['failed', 5678, 'Failed · 5.6s'],
+  ]) {
+    tool.status = status;
+    tool.elapsedMs = elapsedMs;
+    c.updateLiveTool(row, 0);
+    const name = accessibleText(row.summary);
+    assert.ok(name.startsWith(expected + ', tool: check_timer, arguments: args'), name);
+    assert.doesNotMatch(name, /(?:2s|1\.2s|5\.6s)check_timer/);
+    assert.equal((name.match(/(?:2s|1\.2s|5\.6s)/g) || []).length, 1, name);
+  }
+  c.summarizeArgs = () => '';
+  tool.status = 'running';
+  tool.elapsedMs = null;
   c.updateLiveTool(row, 0);
-  assert.equal(row.status.data, 'Running · 2s');
-  tool.status = 'failed';
-  tool.elapsedMs = 1234;
-  c.updateLiveTool(row, 0);
-  assert.equal(row.status.data, 'Failed · 1.2s');
-  assert.equal(row.timer.data, '1.2s');
-  assert.match(app, /const statusText = document\.createTextNode\(""\)/);
-  assert.match(app, /h\("span", \{ class: "sr-only", "data-live-status": "" \}, statusText\)/);
-  assert.match(app, /const mark = h\("span", \{ "aria-hidden": "true" \}\)/);
+  assert.doesNotMatch(accessibleText(row.summary), /arguments:/);
 });
 
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {
