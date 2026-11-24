@@ -208,11 +208,19 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
             std::fs::remove_file(&log)?;
             return Ok(true);
         }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&log)?;
-        return Ok(false);
+        #[cfg(windows)]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&log)?;
+            return Ok(false);
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::remove_file(&log)?;
+            return Ok(true);
+        }
     }
     remove_if_present(rotated(paths, keep))?;
     for n in (1..keep).rev() {

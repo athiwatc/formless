@@ -29,16 +29,31 @@ fn logs_rotate_past_the_size_cap_and_keep_a_bounded_history() {
     assert!(!std::path::Path::new(&rotated(3)).exists());
     assert_eq!(log_usage(&paths), 2 * ("round 3 ".len() as u64 + 200));
 
-    // keep = 0 truncates the live log in place; max = 0 disables rotation.
+    // keep = 0 discards history; max = 0 disables size-triggered rotation.
     std::fs::write(&log, "y".repeat(300)).unwrap();
     assert!(!rotate_if_needed(&paths, 0, 2).unwrap());
     let mut open_log = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
-    assert!(!rotate_if_needed(&paths, 100, 0).unwrap());
-    assert!(log.exists());
-    assert!(std::fs::read(&log).unwrap().is_empty());
-    open_log.write_all(b"after truncation").unwrap();
-    open_log.flush().unwrap();
-    assert_eq!(std::fs::read(&log).unwrap(), b"after truncation");
+
+    #[cfg(windows)]
+    {
+        assert!(!rotate_if_needed(&paths, 100, 0).unwrap());
+        assert!(log.exists());
+        assert!(std::fs::read(&log).unwrap().is_empty());
+        open_log.write_all(b"after truncation").unwrap();
+        open_log.flush().unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"after truncation");
+    }
+
+    #[cfg(unix)]
+    {
+        assert!(rotate_if_needed(&paths, 100, 0).unwrap());
+        assert!(!log.exists(), "the daemon reopens the unlinked log");
+        open_log.write_all(b"old handle").unwrap();
+        open_log.flush().unwrap();
+        assert!(!log.exists());
+        std::fs::write(&log, b"after reopen").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(), b"after reopen");
+    }
 }
 
 #[cfg(unix)]
@@ -145,9 +160,17 @@ fn retention_reductions_apply_under_cap_and_when_live_rotation_is_disabled() {
         .unwrap()
         .is_empty());
     std::fs::write(f.paths.log_file(), "x".repeat(200)).unwrap();
-    assert!(!rotate_if_needed(&f.paths, 100, 0).unwrap());
-    assert!(f.paths.log_file().exists());
-    assert_eq!(std::fs::metadata(f.paths.log_file()).unwrap().len(), 0);
+    #[cfg(windows)]
+    {
+        assert!(!rotate_if_needed(&f.paths, 100, 0).unwrap());
+        assert!(f.paths.log_file().exists());
+        assert_eq!(std::fs::metadata(f.paths.log_file()).unwrap().len(), 0);
+    }
+    #[cfg(unix)]
+    {
+        assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+        assert!(!f.paths.log_file().exists());
+    }
     assert_eq!(log_usage(&f.paths), 0);
 }
 
