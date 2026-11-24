@@ -1999,9 +1999,13 @@ fn assemble_tool_signal_section(
     }
     for tool in ranked {
         if let Some((_, examples)) = replay_examples.iter().find(|(id, _)| id == &tool.id) {
+            if examples.is_empty() {
+                continue;
+            }
+            signals.push_str(&format!("  failures for Tool {}:\n", tool.name));
             for (tag, error) in examples.iter().take(4) {
                 signals.push_str(&format!(
-                    "  failure tag={} error={}\n",
+                    "    failure tag={} error={}\n",
                     tag,
                     error.chars().take(300).collect::<String>()
                 ));
@@ -2329,6 +2333,35 @@ mod registry_signal_tests {
         assert!(warning < failure);
         assert!(signals.contains("narrow-00"));
         assert!(signals.chars().count() <= MAX_PROPOSAL_TOOL_SIGNAL_CHARS);
+    }
+
+    #[test]
+    fn proposal_tool_replay_examples_are_labeled_per_tool() {
+        let mut first = tool("first-tool", 4, 4);
+        first.id = "first-id".into();
+        let mut second = tool("second-tool", 4, 2);
+        second.id = "second-id".into();
+        let tools = [first, second];
+        let ranked = top_tool_signals(&tools);
+        let replay_examples = vec![
+            (
+                "first-id".into(),
+                vec![("first-tag".into(), "first-error".into())],
+            ),
+            (
+                "second-id".into(),
+                vec![("second-tag".into(), "second-error".into())],
+            ),
+        ];
+
+        let signals = assemble_tool_signal_section(&ranked, &replay_examples);
+
+        assert!(signals.contains(
+            "failures for Tool first-tool:\n    failure tag=first-tag error=first-error"
+        ));
+        assert!(signals.contains(
+            "failures for Tool second-tool:\n    failure tag=second-tag error=second-error"
+        ));
     }
 
     #[test]
