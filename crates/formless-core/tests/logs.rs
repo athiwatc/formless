@@ -2,6 +2,7 @@
 
 use formless_core::logs::{log_usage, rotate_if_needed};
 use formless_core::Paths;
+use std::io::Write;
 
 #[test]
 fn logs_rotate_past_the_size_cap_and_keep_a_bounded_history() {
@@ -28,11 +29,35 @@ fn logs_rotate_past_the_size_cap_and_keep_a_bounded_history() {
     assert!(!std::path::Path::new(&rotated(3)).exists());
     assert_eq!(log_usage(&paths), 2 * ("round 3 ".len() as u64 + 200));
 
-    // keep = 0 discards the old log; max = 0 disables rotation.
+    // keep = 0 truncates the live log in place; max = 0 disables rotation.
     std::fs::write(&log, "y".repeat(300)).unwrap();
     assert!(!rotate_if_needed(&paths, 0, 2).unwrap());
-    assert!(rotate_if_needed(&paths, 100, 0).unwrap());
-    assert!(!log.exists());
+    let mut open_log = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    assert!(!rotate_if_needed(&paths, 100, 0).unwrap());
+    assert!(log.exists());
+    assert!(std::fs::read(&log).unwrap().is_empty());
+    open_log.write_all(b"after truncation").unwrap();
+    open_log.flush().unwrap();
+    assert_eq!(std::fs::read(&log).unwrap(), b"after truncation");
+}
+
+#[cfg(unix)]
+#[test]
+fn zero_retention_unlinks_live_symlink_without_truncating_target() {
+    let f = Fixture::new();
+    let target = f.root.join("external.log");
+    let contents = "y".repeat(300);
+    std::fs::write(&target, &contents).unwrap();
+    std::os::unix::fs::symlink(&target, f.paths.log_file()).unwrap();
+
+    assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert_eq!(
+        std::fs::symlink_metadata(f.paths.log_file())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    assert_eq!(std::fs::read_to_string(target).unwrap(), contents);
 }
 
 struct Fixture {
@@ -120,7 +145,9 @@ fn retention_reductions_apply_under_cap_and_when_live_rotation_is_disabled() {
         .unwrap()
         .is_empty());
     std::fs::write(f.paths.log_file(), "x".repeat(200)).unwrap();
-    assert!(rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert!(!rotate_if_needed(&f.paths, 100, 0).unwrap());
+    assert!(f.paths.log_file().exists());
+    assert_eq!(std::fs::metadata(f.paths.log_file()).unwrap().len(), 0);
     assert_eq!(log_usage(&f.paths), 0);
 }
 

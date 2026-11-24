@@ -3,6 +3,7 @@ pub mod client;
 mod clipboard_write;
 mod clipimg;
 mod commands;
+pub mod console_encoding;
 mod editor_viewport;
 mod external_editor;
 pub use external_editor::windows_editor_command;
@@ -20609,6 +20610,7 @@ pub fn run(paths: Paths) -> Result<()> {
 /// [`run`], opening `start` ("last", "new" or "picker") instead of
 /// `tui.on_start` (SPEC §10.1): `formless --continue` / `--new`.
 pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
+    let _console = console_encoding::ConsoleEncoding::enable();
     // Screen readers get the line-oriented mode (SPEC §10.5).
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);

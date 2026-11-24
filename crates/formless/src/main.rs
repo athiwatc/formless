@@ -2042,13 +2042,25 @@ fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<
     }
 }
 
+fn exit_cli(code: i32) -> ! {
+    formless_tui::console_encoding::restore_before_exit();
+    std::process::exit(code);
+}
+
 fn main() {
-    let cli = Cli::parse();
+    let _console = formless_tui::console_encoding::ConsoleEncoding::enable();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            exit_cli(error.exit_code());
+        }
+    };
     if let Err(e) = run_cli(cli) {
         if !e.is::<DoctorProblems>() {
             eprintln!("error: {e:#}");
         }
-        std::process::exit(exit_code(&e));
+        exit_cli(exit_code(&e));
     }
 }
 
@@ -2396,17 +2408,25 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         })
     );
     let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+    let long_path_hint = matches!(&cli.cmd, Some(Cmd::Doctor { .. }))
+        .then(|| windows_profile_path_hint(&paths))
+        .flatten();
+    let profile_directory_error = |error: anyhow::Error| match &long_path_hint {
+        Some(hint) => error.context(hint.clone()),
+        None => error,
+    };
     let _operation = if destructive || serving || read_only {
         None
     } else {
-        Some(formless_core::profile_lock::ProfileLock::hierarchy_shared(
-            &paths,
-        )?)
+        Some(
+            formless_core::profile_lock::ProfileLock::hierarchy_shared(&paths)
+                .map_err(profile_directory_error)?,
+        )
     };
     let paths = if destructive || read_only {
         paths
     } else {
-        Paths::resolve(cli.profile.as_deref())?
+        Paths::resolve(cli.profile.as_deref()).map_err(profile_directory_error)?
     };
     // Metadata-only early commands above deliberately avoid reading config.
     // Ordinary table surfaces share the TUI colorblind palette for this profile.
@@ -2462,7 +2482,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
         Some(Cmd::Models { action }) => {
             let code = cli_models::run(&paths, action)?;
             if code != 0 {
-                std::process::exit(code);
+                exit_cli(code);
             }
             Ok(())
         }
@@ -2719,7 +2739,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
             };
             let task = prepared.task;
@@ -2729,7 +2749,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 Ok(f) => f,
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
             };
             if let Some(bytes) = attachment {
@@ -2740,7 +2760,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                     Ok(id) => Some(id),
                     Err(e) => {
                         eprintln!("{e}");
-                        std::process::exit(2);
+                        exit_cli(2);
                     }
                 }
             } else {
@@ -2750,7 +2770,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("{e}");
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
             };
             let pipeline_mode = pipeline.enabled();
@@ -2771,7 +2791,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                     Ok(p) if p.is_dir() => Some(p),
                     _ => {
                         eprintln!("--cwd {}: no such directory", d.display());
-                        std::process::exit(2);
+                        exit_cli(2);
                     }
                 },
                 None if session.is_none() => std::env::current_dir().ok(),
@@ -2820,7 +2840,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
             let code = code?;
-            std::process::exit(code);
+            exit_cli(code);
         }
     }
 }
@@ -2889,10 +2909,36 @@ fn is_homebrew_executable(exe: &str) -> bool {
 }
 
 fn upgrade_command_for_exe(exe: &str) -> &'static str {
-    if is_homebrew_executable(exe) {
+    platform_upgrade_command(exe, cfg!(windows))
+}
+
+fn is_cargo_build_executable(exe: &str) -> bool {
+    let normalized = exe.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/target/debug/") || normalized.contains("/target/release/")
+}
+
+fn is_winget_executable(exe: &str) -> bool {
+    let normalized = exe.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/winget/packages/") || normalized.contains("/winget/links/")
+}
+
+fn platform_upgrade_command(exe: &str, windows: bool) -> &'static str {
+    if !windows && is_homebrew_executable(exe) {
         "brew upgrade formless"
-    } else if exe.contains("/.cargo/bin/") {
+    } else if exe.contains("/.cargo/bin/")
+        || (windows
+            && exe
+                .replace('\\', "/")
+                .to_ascii_lowercase()
+                .contains("/.cargo/bin/"))
+    {
         "cargo install --git https://github.com/athiwatc/formless --locked formless-bin --force"
+    } else if windows && is_cargo_build_executable(exe) {
+        WINDOWS_SOURCE_BUILD_UPGRADE_GUIDANCE
+    } else if windows && is_winget_executable(exe) {
+        "winget upgrade --id athiwatc.formless --exact"
+    } else if windows {
+        WINDOWS_MANUAL_UPGRADE_GUIDANCE
     } else {
         // Downloaded first, so a failed download stops with an error
         // instead of piping nothing into sh (#834).
@@ -2912,6 +2958,9 @@ const INSTALL_COMMAND: &str = concat!(
     "https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh",
     " -o \"$install_tmp/install.sh\" && sh \"$install_tmp/install.sh\"'"
 );
+const WINDOWS_MANUAL_UPGRADE_GUIDANCE: &str = "Download and verify the latest matching Windows ZIP from https://github.com/athiwatc/formless/releases (see docs/windows-install.md#manual-updates)";
+const WINDOWS_SOURCE_BUILD_UPGRADE_GUIDANCE: &str =
+    "Update this source checkout and rebuild it with cargo run";
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
@@ -3772,6 +3821,20 @@ impl std::fmt::Display for DoctorProblems {
 
 impl std::error::Error for DoctorProblems {}
 
+#[cfg(windows)]
+fn windows_profile_path_hint(paths: &Paths) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    let length = paths.data_dir.as_os_str().encode_wide().count();
+    (length >= 260).then(|| format!(
+        "The Windows data directory path is {length} UTF-16 code units long. If Windows rejects this path, use a shorter FORMLESS_DATA_DIR or enable Windows long paths."
+    ))
+}
+
+#[cfg(not(windows))]
+fn windows_profile_path_hint(_paths: &Paths) -> Option<String> {
+    None
+}
+
 fn doctor(paths: Paths, fix: bool) -> Result<bool> {
     let problems = doctor_report(&paths, false)?;
     if problems.is_empty() {
@@ -4269,15 +4332,26 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             });
         }
     }
-    if let Ok((n, bytes)) =
-        Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
-    {
-        say!(
-            "artifacts:  {n} ({:.1} MB; caps {} MB, {} days)",
-            bytes as f64 / 1e6,
-            cfg.artifacts.max_total_mb,
-            cfg.artifacts.max_age_days
-        );
+    match Store::open(&paths.db_file()) {
+        Ok(store) => {
+            if let Ok((n, bytes)) = formless_core::artifacts::usage(&store) {
+                say!(
+                    "artifacts:  {n} ({:.1} MB; caps {} MB, {} days)",
+                    bytes as f64 / 1e6,
+                    cfg.artifacts.max_total_mb,
+                    cfg.artifacts.max_age_days
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(hint) = windows_profile_path_hint(&paths) {
+                problems.push(Problem {
+                    what: format!("SQLite could not open the profile database ({error:#}). {hint}"),
+                    next: None,
+                    fix: None,
+                });
+            }
+        }
     }
     let snapshots = run_file_doctor_facts(&paths);
     if let Some(rows) = snapshots["rows"].as_u64() {
@@ -6339,7 +6413,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
         } => {
             let code = cli_attach::follow(&paths, &id, json || jsonl)?;
             if code != 0 {
-                std::process::exit(code);
+                exit_cli(code);
             }
             return Ok(());
         }
@@ -6679,7 +6753,7 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
             Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
                 eprintln!("no setting '{key}' (see `formless config list` or SPEC §13)");
-                std::process::exit(2);
+                exit_cli(2);
             }
         },
         ConfigAction::Set {
@@ -7381,7 +7455,7 @@ fn providers_cmd(paths: Paths, action: ProvidersAction) -> Result<()> {
             }
             if !ok {
                 std::io::stdout().flush()?;
-                std::process::exit(1);
+                exit_cli(1);
             }
         }
         ProvidersAction::Test {
@@ -8205,7 +8279,7 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         }
         McpAction::Test { name, json } => {
             if !cli_mcp_test::run(&name, json, daemon, &mut std::io::stdout().lock())? {
-                std::process::exit(1);
+                exit_cli(1);
             }
         }
         McpAction::Login { server } => {
@@ -8564,10 +8638,10 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
             let tool = find_tool(&paths, &name)?;
             if let Err(e) = formless_tui::client::require_secure_daemon(&paths) {
                 eprintln!("error: {e:#}");
-                std::process::exit(2);
+                exit_cli(2);
             }
             let code = tool_run(&paths, tool, input, yes, session, dry_run, json)?;
-            std::process::exit(code);
+            exit_cli(code);
         }
         ToolsAction::Undo => {
             let v = request_once(&paths, Request::UndoRegistryChange)?;
@@ -8607,7 +8681,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                     "{} is at v{}; give --to with an earlier version",
                     tool.name, tool.current_version
                 );
-                std::process::exit(2);
+                exit_cli(2);
             }
             request_once(
                 &paths,
@@ -8636,7 +8710,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                         "purge deletes {} for good; pass --force to confirm without a terminal",
                         tool.name
                     );
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
                 eprint!(
                     "This deletes {} and all its versions and history. Type its name to confirm: ",
@@ -8647,7 +8721,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                 std::io::stdin().lock().read_line(&mut line)?;
                 if line.trim() != tool.name {
                     eprintln!("aborted");
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
             }
             request_once(
@@ -8667,7 +8741,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction, prepared_input: Option<Value>) -
                     "Import it? Imported Tools still ask before their first sensitive call. [y/N] ",
                 )? {
                     eprintln!("not imported");
-                    std::process::exit(2);
+                    exit_cli(2);
                 }
                 fetched["bundle"].clone()
             } else {
@@ -8945,19 +9019,32 @@ fn logs_cmd(
     }
     // Follow: print what's appended; a smaller file means it was rotated.
     let mut pos = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let len = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
-        if len < pos {
-            pos = 0;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            tokio::select! {
+                result = &mut ctrl_c => {
+                    result?;
+                    exit_cli(130);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+            let len = std::fs::metadata(&live).map(|m| m.len()).unwrap_or(0);
+            if len < pos {
+                pos = 0;
+            }
+            if len > pos {
+                let summary =
+                    log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
+                pos = len;
+                log_truncation_notice(&summary);
+            }
         }
-        if len > pos {
-            let summary =
-                log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
-            pos = len;
-            log_truncation_notice(&summary);
-        }
-    }
+    })
 }
 
 /// The Tool with this name or id.
@@ -10393,8 +10480,8 @@ mod tests {
         assert!(root.join(path).is_file(), "{path}");
         let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
         assert!(readme.contains(super::INSTALL_SCRIPT_URL));
-        // Whatever this machine's install, a script upgrade names that URL.
-        let cmd = super::upgrade_command();
+        // The generic Unix installer command names the checked-in script.
+        let cmd = super::platform_upgrade_command("/usr/local/bin/formless", false);
         assert!(
             cmd.starts_with("brew")
                 || cmd.starts_with("cargo")
@@ -10404,6 +10491,11 @@ mod tests {
         assert!(
             !cmd.contains("| sh"),
             "a failed download must not be piped into sh: {cmd}"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            super::upgrade_command(),
+            super::WINDOWS_SOURCE_BUILD_UPGRADE_GUIDANCE
         );
     }
 
@@ -10486,6 +10578,42 @@ exit "$FORMLESS_FIXTURE_CURL_STATUS"
     }
 
     #[test]
+    fn windows_upgrade_uses_cargo_or_winget() {
+        assert!(
+            super::platform_upgrade_command(r"C:\Users\person\.Cargo\bin\formless.exe", true)
+                .starts_with("cargo install ")
+        );
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Microsoft\WinGet\Packages\athiwatc.formless\formless.exe",
+                true
+            ),
+            "winget upgrade --id athiwatc.formless --exact"
+        );
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Microsoft\WinGet\Links\formless.exe",
+                true
+            ),
+            "winget upgrade --id athiwatc.formless --exact"
+        );
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\source\formless\target\debug\deps\formless-test.exe",
+                true
+            ),
+            super::WINDOWS_SOURCE_BUILD_UPGRADE_GUIDANCE
+        );
+        assert_eq!(
+            super::platform_upgrade_command(
+                r"C:\Users\person\AppData\Local\Programs\Formless\manual\formless.exe",
+                true
+            ),
+            super::WINDOWS_MANUAL_UPGRADE_GUIDANCE
+        );
+    }
+
+    #[test]
     fn uninstall_uses_the_package_manager_for_winget_and_homebrew() {
         for exe in [
             "/home/linuxbrew/.linuxbrew/bin/formless",
@@ -10496,7 +10624,10 @@ exit "$FORMLESS_FIXTURE_CURL_STATUS"
                 super::package_uninstall_command(exe),
                 Some("brew uninstall formless")
             );
-            assert_eq!(super::upgrade_command_for_exe(exe), "brew upgrade formless");
+            assert_eq!(
+                super::platform_upgrade_command(exe, false),
+                "brew upgrade formless"
+            );
         }
         assert_eq!(
             super::package_uninstall_command(
