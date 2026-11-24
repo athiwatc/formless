@@ -434,12 +434,16 @@ def run_engine(p, name, url, out):
     flush(page)
     check(page.evaluate('refs816.completed===document.querySelector(".streaming .md")?.firstChild'),name+' completed stream prefix retains old DOM blocks')
     drain(page)
-    page.evaluate(r'''() => {window.timer816=document.querySelector('[data-live-timer]')?.firstChild;if(!timer816)throw new Error('Missing live timer Text');window.timerData816=timer816.data;window.timerMutations816=[];
+    page.evaluate(r'''() => {window.timer816=document.querySelector('[data-live-timer]')?.firstChild;if(!timer816)throw new Error('Missing live timer Text');window.timerData816=timer816.data;
+      window.status816=document.querySelector('#live [data-live-timer]')?.closest('summary')?.querySelector('[data-live-status]')?.firstChild;
+      if(!status816)throw new Error('Missing live tool status Text');window.statusData816=status816.data;window.announcerData816=document.querySelector('#chat-announcer').textContent;window.timerMutations816=[];
       window.timerObserver816=new MutationObserver(items=>timerMutations816.push(...items));timerObserver816.observe(document.querySelector('#transcript'),{childList:true,subtree:true,characterData:true});
       __stream816.resetStats();window.realNow816=Date.now;Date.now=()=>realNow816()+3000;__raf816.tick(1000);Date.now=realNow816;
     }''')
     settle(page,25)
     check(page.evaluate('timer816===document.querySelector("[data-live-timer]").firstChild && timer816.data!==timerData816'),name+' elapsed interval updates existing time Text')
+    check(page.evaluate('status816===document.querySelector("#live [data-live-timer]").closest("summary").querySelector("[data-live-status]").firstChild && status816.data!==statusData816 && status816.data.includes("Running ·")'),name+' elapsed interval refreshes accessible tool duration')
+    check(page.evaluate('document.querySelector("#chat-announcer").textContent===announcerData816'),name+' elapsed interval leaves chat announcements unchanged')
     check(page.evaluate('__stream816.stats.history===0 && __stream816.stats.live===0'),name+' elapsed interval does not repaint transcript')
     check(page.evaluate('!timerMutations816.some(m=>m.type==="childList")'),name+' elapsed interval changes only text, not structure')
     page.evaluate('timerObserver816.disconnect();__raf816.release()')

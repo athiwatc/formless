@@ -3414,14 +3414,22 @@ such as `read_file`, `read_text_file` and `file_read`.
 - **Ordering.** `InterruptRun` and `RetryProviderRequest` skip the
   per-connection queue; an interrupt cancels a `SendMessage` for that
   Session still queued behind a slow request (it fails with "interrupted
-  before it started"). `SendMessage.client_msg_id` makes a retried send
-  on the same connection and Session return the first outcome instead of sending
-  twice (kept 10 minutes, removed when that connection closes). A different
-  connection using the same key performs its own send. A key is claimed before
-  execution; concurrent retries wait for the in-flight outcome, including errors.
-  Losing a response/waiter does not cancel the claimed send or lose its outcome.
-  After reconnecting, retrying an unacknowledged send can repeat an uncertain
-  prior send: action ids deduplicate only within the original connection.
+  before it started"). Successful `SendOutboxMessage.client_msg_id` receipts
+  are stored durably per Session, so a persisted outbox retry returns the
+  first outcome across reconnects, daemon restarts and outages of any duration.
+  A different Session using the same key performs its own send. A key is
+  claimed before execution; concurrent retries wait for the in-flight outcome,
+  including errors. Losing a
+  response/waiter does not cancel the claimed send or lose its outcome.
+  Outbox sends compare the complete pending attachment inventory at admission;
+  queued outbox actions do not consume attachments added after they were queued.
+  Browser drafts and outbox entries are stored per relay pairing or local page
+  origin. Local origin includes the port: reopen the UI at the same host and
+  port to recover local data (for example, consistently run `formless web
+  --port N`). A different port is a different browser origin; cross-origin
+  storage migration is not provided.
+  Cached in-flight/failure outcomes are process-local for 10 minutes after
+  completion; successful durable receipts remain until their Session is deleted.
   Cached failures preserve the same machine-readable error code and message.
   TUI, plain mode and headless sends carry a fresh UUID per user action.
   Until a response arrives, retrying the same text in that Session reuses
@@ -3572,7 +3580,19 @@ such as `read_file`, `read_text_file` and `file_read`.
   (macOS), `$XDG_DATA_HOME/formless` (Linux), `%APPDATA%\formless`
   (Windows); config in the matching config dir (`config.toml` + keychain/
   fallback key file). Contents: SQLite DB, Tool version files, artifacts,
-  rotated daemon logs, audit log.
+  rotated daemon logs, audit log. With `log_keep > 0`, once `daemon.log`
+  exceeds `daemon.log_max_bytes`, the daemon shifts numbered history, renames
+  the live file to `.1`, then reopens stdout/stderr on a fresh `daemon.log`.
+  This rename-and-reopen behavior also works on Windows, so new output does
+  not remain in `.1`. With `log_keep = 0`, no numbered history is kept.
+  Once the live log exceeds `daemon.log_max_bytes`, Unix unlinks the live
+  name and reopens stdio. Windows discards the opened live name without
+  truncating the file or following a final symlink. If extended deletion
+  is unsupported, Windows moves the live name to a single pending name
+  for deletion after its handles close, then reopens stdio. A pending
+  entry that cannot be reclaimed is preserved and can prevent further
+  fallback rotation; see the Windows install guide. Setting
+  `daemon.log_max_bytes = 0` disables size-triggered rotation.
 - **SQLite** holds Sessions, Runs, Tool metadata/versions index,
   Invocations, metrics tallies, compaction checkpoints, approvals, audit
   events. Schema is versioned; the daemon auto-migrates on start and takes a
@@ -5603,7 +5623,8 @@ previous headless Run's Session.
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
-  keeps printing appended entries and follows rotation. Numeric rotations
+  keeps printing appended entries and restarts from byte zero when it observes
+  the live file shrink after rotation. Numeric rotations
   are discovered from the directory (including old suffixes above 64),
   rather than a fixed filename range. Bounded tails read newest first until
   enough matching entries are found; `-n 0` streams all history oldest first.

@@ -62,3 +62,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+criterion = "0.5"
+
+[[bench]]
+name = "hot_paths"
+harness = false

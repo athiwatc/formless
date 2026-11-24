@@ -88,6 +88,21 @@ The daemon listens on a named pipe only your user can open. "Access is
 denied" means a daemon from another user (or an elevated prompt) owns it:
 stop it there, or start Formless from the same kind of prompt.
 
+## Windows: daemon log rotation
+
+With `log_keep > 0`, when `daemon.log` exceeds `daemon.log_max_bytes`, the
+daemon rotates it on Windows and reopens stdout/stderr on a fresh
+`daemon.log`. The previous file is `daemon.log.1` and numbered history is
+retained up to the configured count; `formless logs` includes these files in
+its output. `formless logs -f` prints appended live-log entries and restarts
+from the beginning when it observes the live file shrink. With `log_keep = 0`,
+Formless keeps no numbered history and reopens stdio after discarding the
+live name. On Windows it never truncates the opened log; when extended
+deletion is unavailable it can temporarily move the log to a pending name.
+If that name stays occupied, see [Recover a pending log rotation](windows-install.md#recover-a-pending-log-rotation).
+Setting `daemon.log_max_bytes = 0` disables size-triggered rotation.
+See SPEC §9.4 for the data-directory details.
+
 ## The relay doesn't connect
 
 `formless relay status` shows the pairing and the connection. Check that

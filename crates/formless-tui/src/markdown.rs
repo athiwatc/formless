@@ -118,8 +118,7 @@ pub(crate) fn render_with_links(text: &str, color: bool, indent: &str, width: us
     r.out
 }
 
-#[cfg(test)]
-pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
+pub fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
     render_with_links(text, color, indent, width).lines
 }
 

@@ -59,9 +59,96 @@
       }
     },
     set(k, v) {
-      try { localStorage.setItem("formless." + k, JSON.stringify(v)); } catch (_) {}
+      try { localStorage.setItem("formless." + k, JSON.stringify(v)); return true; } catch (_) { return false; }
+    },
+    remove(k) {
+      try { localStorage.removeItem("formless." + k); return true; } catch (_) { return false; }
     },
   };
+
+  function outboxStorageKey(scope) { return "outbox:" + encodeURIComponent(scope); }
+  function draftStorageKey(scope, sessionId) { return "draft:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId); }
+  function attachmentStorageKey(scope, sessionId) { return "attachment-inventory:" + encodeURIComponent(scope) + ":" + encodeURIComponent(sessionId); }
+  function sessionCacheKey(scope, sessionId) {
+    return (scope || "") + "\u0000" + sessionId;
+  }
+  function outboxLockName(scope) { return "formless-outbox:" + encodeURIComponent(scope); }
+  function sessionStorageKey(scope) { return scope ? "session:" + encodeURIComponent(scope) : "session"; }
+  function loadDraft(scope, sessionId) {
+    if (!scope || !sessionId) return "";
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    if (S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)) return S.unpersistedDrafts.get(fallbackKey);
+    const value = prefs.get(draftStorageKey(scope, sessionId), "");
+    return typeof value === "string" ? value : "";
+  }
+  function normalizeTextareaValue(value) {
+    return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
+  }
+  function clearSubmittedDraft(scope, sessionId, snapshot) {
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    const fallbacks = S.unpersistedDrafts || (S.unpersistedDrafts = new Map());
+    const sharedValues = S.unpersistedDraftSharedValues || (S.unpersistedDraftSharedValues = new Map());
+    const hasFallback = fallbacks.has(fallbackKey);
+    const fallback = hasFallback ? fallbacks.get(fallbackKey) : null;
+    const fallbackIsSubmitted = hasFallback && normalizeTextareaValue(fallback) === snapshot;
+    const hasSharedBaseline = hasFallback && sharedValues.has(fallbackKey);
+    const sharedBaseline = hasSharedBaseline ? sharedValues.get(fallbackKey) : null;
+    const key = draftStorageKey(scope, sessionId);
+    const shared = prefs.get(key, null);
+    if (fallbackIsSubmitted) {
+      fallbacks.delete(fallbackKey);
+      sharedValues.delete(fallbackKey);
+    }
+    const sharedMatchesSnapshot = typeof shared === "string" && normalizeTextareaValue(shared) === snapshot;
+    const sharedIsUnchanged = hasSharedBaseline && typeof shared === "string" && Object.is(shared, sharedBaseline);
+    const shouldRemoveShared = typeof shared === "string" && (fallbackIsSubmitted && hasSharedBaseline ? sharedIsUnchanged : sharedMatchesSnapshot);
+    if (shouldRemoveShared) {
+      const removed = typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
+      if (!removed && !fallbacks.has(fallbackKey)) {
+        fallbacks.set(fallbackKey, "");
+        sharedValues.set(fallbackKey, shared);
+      }
+    }
+    const latest = loadDraft(scope, sessionId);
+    if (scope === S.storageScope) {
+      if (latest) S.drafts[sessionId] = latest;
+      else delete S.drafts[sessionId];
+    }
+    return latest;
+  }
+  function loadOutbox(scope) {
+    if (!scope) return [];
+    const saved = prefs.get(outboxStorageKey(scope), []);
+    if (!Array.isArray(saved)) return [];
+    return saved.filter((item) => item && item.scope === scope && typeof item.session_id === "string"
+      && typeof item.content === "string" && typeof item.client_msg_id === "string"
+      && item.client_msg_id && ["send", "steer", "queue"].includes(item.mode))
+      .map((item) => {
+        const validInventory = Array.isArray(item.expected_attachments);
+        let status = ["queued", "sending", "failed"].includes(item.status) ? item.status : "queued";
+        let error = typeof item.error === "string" ? item.error : "";
+        if (!validInventory) { status = "failed"; error = "Attachment inventory is unavailable; review this message before sending."; }
+        if (item.mode === "steer" && (typeof item.expected_run_id !== "string" || !item.expected_run_id)) {
+          status = "failed"; error = "The original Run could not be identified; this message was not sent.";
+        }
+        return {
+          scope,
+          order: Number.isFinite(item.order) ? item.order : 0,
+          session_id: item.session_id,
+          content: item.content,
+          mode: item.mode,
+          expected_attachments: validInventory ? item.expected_attachments : null,
+          expected_run_id: typeof item.expected_run_id === "string" ? item.expected_run_id : null,
+          forecast_pending: item.forecast_pending === true,
+          client_msg_id: item.client_msg_id,
+          attempted: item.attempted !== false,
+          dispatch_kind: item.dispatch_kind === "durable" ? "durable" : null,
+          status,
+          error,
+        };
+      })
+      .sort((a, b) => a.order - b.order || a.client_msg_id.localeCompare(b.client_msg_id));
+  }
 
   // While an IME is composing (Japanese, Chinese, Korean…), Enter and
   // other keys confirm candidates: no shortcut, palette, mention or form
@@ -100,6 +187,13 @@
     topicRevision: 0,
     topicFocus: null,
     current: null,
+    drafts: {},
+    unpersistedDrafts: new Map(),
+    unpersistedDraftSharedValues: new Map(),
+    attachmentInventories: {},
+    outbox: [],
+    outboxFlushing: false,
+    outboxFlushRequested: false,
     messages: [],
     sessionLoad: null, // { id, status: pending | failed | loaded }
     streaming: "",
@@ -126,10 +220,362 @@
     enterSends: prefs.get("enterSends", null),
     follow: true,
     editMessageId: null,
+    storageScope: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
+    submitting: new Set(),
     pending: new Map(),
     subagents: [], // last /agents listing
   };
+
+  function saveDraft(sessionId, value, scope = S.storageScope) {
+    if (!sessionId) return true;
+    S.drafts = S.drafts || {};
+    if (scope === S.storageScope) {
+      if (value) S.drafts[sessionId] = value;
+      else delete S.drafts[sessionId];
+    }
+    if (!scope) return true;
+    const key = draftStorageKey(scope, sessionId);
+    S.unpersistedDrafts = S.unpersistedDrafts || new Map();
+    S.unpersistedDraftSharedValues = S.unpersistedDraftSharedValues || new Map();
+    const fallbackKey = sessionCacheKey(scope, sessionId);
+    const hasFallback = S.unpersistedDrafts.has(fallbackKey);
+    const sharedValue = hasFallback ? null : prefs.get(key, null);
+    const saved = value ? prefs.set(key, value) : typeof prefs.remove === "function" ? prefs.remove(key) : prefs.set(key, "");
+    if (saved) {
+      S.unpersistedDrafts.delete(fallbackKey);
+      S.unpersistedDraftSharedValues.delete(fallbackKey);
+    } else {
+      S.unpersistedDrafts.set(fallbackKey, value);
+      if (!hasFallback) S.unpersistedDraftSharedValues.set(fallbackKey, sharedValue);
+    }
+    return saved;
+  }
+  function restoreDraft(sessionId) {
+    const fallbackKey = sessionCacheKey(S.storageScope, sessionId);
+    const value = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)
+      ? S.unpersistedDrafts.get(fallbackKey)
+      : loadDraft(S.storageScope, sessionId);
+    S.drafts[sessionId] = value;
+    $("input").value = value;
+    autosize();
+  }
+  function persistOutbox(scope, entries) {
+    return !!scope && prefs.set(outboxStorageKey(scope), entries);
+  }
+  function hasOutboxLock() {
+    return typeof navigator !== "undefined" && !!navigator.locks && typeof navigator.locks.request === "function";
+  }
+  function withOutboxLock(scope, action) {
+    if (!scope || !hasOutboxLock()) return Promise.resolve(false);
+    return navigator.locks.request(outboxLockName(scope), action);
+  }
+  function refreshOutbox(scope = S.storageScope) {
+    if (!scope) return;
+    const entries = loadOutbox(scope);
+    if (scope === S.storageScope) {
+      S.outbox = entries;
+      renderOutbox();
+    }
+    return entries;
+  }
+  function activateStorageScope() {
+    const scope = S.local ? "local:" + location.origin : S.room ? "relay:" + S.room : null;
+    if (!scope) return false;
+    if (scope === S.storageScope) { refreshOutbox(scope); return true; }
+    if (S.current) saveDraft(S.current, $("input").value);
+    S.storageScope = scope;
+    S.drafts = {};
+    S.attachmentInventories = {};
+    S.chips = {};
+    S.outbox = loadOutbox(scope);
+    if (S.current) {
+      S.current = null;
+      $("input").value = "";
+      autosize();
+      renderChips();
+    }
+    renderOutbox();
+    return true;
+  }
+  function loadAttachmentInventory(scope, sessionId) {
+    const value = scope && prefs.get(attachmentStorageKey(scope, sessionId), null);
+    return Array.isArray(value) ? value : null;
+  }
+  function saveAttachmentInventory(scope, sessionId, attachments) {
+    if (!scope || !sessionId || !Array.isArray(attachments)) return false;
+    S.attachmentInventories[sessionId] = attachments;
+    S.chips[sessionId] = attachments;
+    return prefs.set(attachmentStorageKey(scope, sessionId), attachments);
+  }
+  async function refreshAttachmentInventory(sessionId, scope = S.storageScope, requireFresh = false) {
+    if (!scope || !sessionId) return null;
+    if (scope !== S.storageScope) return requireFresh ? null : loadAttachmentInventory(scope, sessionId);
+    if (S.daemonOnline && S.channel) {
+      try {
+        const result = await request({ type: "list_pending_attachments", session_id: sessionId });
+        if (scope !== S.storageScope) return null;
+        const attachments = Array.isArray(result && result.attachments) ? result.attachments : null;
+        if (attachments) {
+          saveAttachmentInventory(scope, sessionId, attachments);
+          if (S.current === sessionId) renderChips();
+          return attachments;
+        }
+      } catch (_) {}
+    }
+    if (requireFresh) return null;
+    const cached = S.attachmentInventories[sessionId] || loadAttachmentInventory(scope, sessionId);
+    if (cached) {
+      S.attachmentInventories[sessionId] = cached;
+      S.chips[sessionId] = cached;
+      if (S.current === sessionId) renderChips();
+    }
+    return cached;
+  }
+  async function fetchFreshAttachmentInventory(sessionId, scope = S.storageScope) {
+    if (!scope || !sessionId) return null;
+    const result = await request({ type: "list_pending_attachments", session_id: sessionId });
+    if (scope !== S.storageScope) return null;
+    if (!Array.isArray(result && result.attachments)) {
+      const error = new Error("The daemon did not return a pending attachment inventory.");
+      error.daemonResponse = true;
+      throw error;
+    }
+    const attachments = result.attachments;
+    saveAttachmentInventory(scope, sessionId, attachments);
+    if (S.current === sessionId) renderChips();
+    return attachments;
+  }
+  function renderOutbox() {
+    const box = $("outbox");
+    if (!box) return;
+    const entries = S.outbox || [];
+    const hidden = entries.length === 0;
+    box.hidden = hidden;
+    box.classList.toggle("hidden", hidden);
+    box.replaceChildren(...entries.map((item) => {
+      const status = item.status === "sending" ? "Sending" : item.status === "failed" ? "Failed" : "Queued";
+      return h("div", { class: "outbox-item", "data-status": item.status },
+        h("div", { class: "outbox-entry" },
+          h("strong", { class: "outbox-status" }, status),
+          h("div", { class: "outbox-content" }, item.content),
+          item.error ? h("div", { class: "outbox-error" }, item.error) : null),
+          h("button", { type: "button", class: "btn ghost", "aria-label": "Discard " + status.toLowerCase() + " message", onclick: () => discardOutbox(item) }, "Discard"));
+    }));
+  }
+  async function enqueueOutbox(sessionId, content, mode, { expectedAttachments, expectedRunId, forecastPending = false, blockedReason = "", queuedReason = "", storageScope = S.storageScope } = {}) {
+    if (!sessionId || !content || !["send", "steer", "queue"].includes(mode) || !storageScope || !hasOutboxLock()) return null;
+    const scope = storageScope;
+    const clientMsgId = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
+    const inventory = Array.isArray(expectedAttachments) ? expectedAttachments : null;
+    const error = blockedReason || (!inventory ? "Attachment inventory could not be verified; reconnect and review before sending." : "");
+    const item = {
+      scope, order: 0, session_id: sessionId, content, mode,
+      expected_attachments: inventory,
+      expected_run_id: expectedRunId || null,
+      forecast_pending: !!forecastPending,
+      client_msg_id: clientMsgId,
+      attempted: false,
+      dispatch_kind: null,
+      status: error ? "failed" : "queued",
+      error: error || queuedReason,
+    };
+    let saved = false;
+    await withOutboxLock(scope, async () => {
+      const entries = loadOutbox(scope);
+      item.order = entries.reduce((max, entry) => Math.max(max, entry.order), 0) + 1;
+      saved = persistOutbox(scope, [...entries, item]);
+      if (saved && scope === S.storageScope) refreshOutbox(scope);
+    });
+    return saved ? item : null;
+  }
+  function canFlushOutbox(scope = S.storageScope) {
+    return !!(scope && scope === S.storageScope && hasOutboxLock() && S.daemonOnline && S.channel && (S.local || S.relayReady));
+  }
+  async function discardOutbox(item) {
+    const scope = item && item.scope;
+    if (!scope) return false;
+    let discarded = false;
+    try {
+      await withOutboxLock(scope, async () => {
+        const entries = loadOutbox(scope);
+        const next = entries.filter((entry) => entry.client_msg_id !== item.client_msg_id);
+        if (next.length === entries.length) return;
+        discarded = persistOutbox(scope, next);
+        if (discarded) refreshOutbox(scope);
+      });
+    } catch (_) {}
+    if (!discarded) {
+      note("Could not save the outbox change; the message was not discarded.", true);
+      return false;
+    }
+    if (scope === S.storageScope) void flushOutbox();
+    return true;
+  }
+  async function flushOutbox() {
+    const scope = S.storageScope;
+    if (S.outboxFlushing) { S.outboxFlushRequested = true; return; }
+    if (!canFlushOutbox(scope)) return;
+    S.outboxFlushing = true;
+    try {
+      S.outboxFlushRequested = false;
+      await withOutboxLock(scope, async () => {
+        if (!canFlushOutbox(scope)) return;
+        let entries = loadOutbox(scope);
+        let recovered = false;
+        for (const item of entries) if (item.status === "sending") { item.status = "queued"; item.attempted = true; recovered = true; }
+        if (recovered && !persistOutbox(scope, entries)) return;
+        refreshOutbox(scope);
+        let durableOutboxSupported = null;
+        while (canFlushOutbox(scope)) {
+          entries = loadOutbox(scope);
+          const item = entries[0];
+          if (!item || item.status === "failed") break;
+          if (item.attempted && item.dispatch_kind !== "durable") {
+            item.status = "failed";
+            item.error = "A previous send attempt cannot be classified as durably protected. Check the Session before resending to avoid a duplicate.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
+          if (durableOutboxSupported === null) {
+            try {
+              const ping = await request({ type: "ping" });
+              durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
+            } catch (error) {
+              if (scope !== S.storageScope) break;
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = "Could not verify durable outbox support: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+          }
+          if (!durableOutboxSupported) {
+            item.status = "failed";
+            item.error = item.attempted
+              ? "This daemon does not support durable retries. The message may already have been sent; check the Session before resending."
+              : "This daemon does not support the durable outbox; upgrade it, manually copy this message text, discard the saved item, and resend it; it was not sent.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
+          if (item.forecast_pending) {
+            if (S.current !== item.session_id) {
+              item.error = "Open this Session to review and approve its forecast before sending.";
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            let currentAttachments;
+            try {
+              currentAttachments = await fetchFreshAttachmentInventory(item.session_id, scope);
+            } catch (error) {
+              if (scope !== S.storageScope) break;
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = error.daemonResponse
+                ? "Pending attachment inventory failed; this message was not sent: " + error.message
+                : "Pending attachment inventory is unavailable; this message remains queued: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            if (scope !== S.storageScope) break;
+            if (!Array.isArray(currentAttachments)) break;
+            if (JSON.stringify(currentAttachments) !== JSON.stringify(item.expected_attachments)) {
+              item.status = "failed";
+              item.error = "Pending attachments changed since this forecast was composed; review the message again before sending.";
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+            try {
+              if (!(await confirmForecast(item.session_id, item.content))) {
+                item.status = S.daemonOnline && S.current === item.session_id ? "failed" : "queued";
+                item.error = item.status === "failed" ? "Forecast approval was declined; this message was not sent." : "Forecast approval is pending; reconnect and review before sending.";
+                persistOutbox(scope, entries); refreshOutbox(scope); break;
+              }
+              item.forecast_pending = false;
+              item.error = "";
+              if (!persistOutbox(scope, entries)) break;
+            } catch (error) {
+              item.status = error.daemonResponse ? "failed" : "queued";
+              item.error = "Forecast approval is pending: " + error.message;
+              persistOutbox(scope, entries); refreshOutbox(scope); break;
+            }
+          }
+          if (!Array.isArray(item.expected_attachments)) {
+            item.status = "failed";
+            item.error = "Attachment inventory is unavailable; this message was not sent.";
+            persistOutbox(scope, entries); refreshOutbox(scope); break;
+          }
+          item.status = "sending";
+          item.error = "";
+          item.attempted = true;
+          item.dispatch_kind = "durable";
+          if (!persistOutbox(scope, entries)) break;
+          refreshOutbox(scope);
+          try {
+            await request({
+              type: "send_outbox_message",
+              session_id: item.session_id,
+              content: item.content,
+              mode: item.mode,
+              expected_attachments: item.expected_attachments,
+              expected_run_id: item.expected_run_id,
+              client_msg_id: item.client_msg_id,
+            });
+          } catch (error) {
+            const latest = loadOutbox(scope);
+            const current = latest.find((entry) => entry.client_msg_id === item.client_msg_id);
+            if (!current) continue;
+            current.status = error.daemonResponse ? "failed" : "queued";
+            current.error = error.message;
+            persistOutbox(scope, latest); refreshOutbox(scope);
+            if (error.daemonResponse) { toast(error.message, true); note(error.message, true); }
+            break;
+          }
+          const remaining = loadOutbox(scope).filter((entry) => entry.client_msg_id !== item.client_msg_id);
+          if (!persistOutbox(scope, remaining)) break;
+          refreshOutbox(scope);
+          if (scope === S.storageScope) {
+            const attachments = await refreshAttachmentInventory(item.session_id, scope, true);
+            const mentioned = mentionAttached[sessionCacheKey(scope, item.session_id)];
+            if (Array.isArray(attachments) && mentioned) {
+              const pendingPaths = new Set(attachments.map((attachment) => attachment.path).filter((path) => typeof path === "string"));
+              for (const path of [...mentioned]) if (!pendingPaths.has(path)) mentioned.delete(path);
+              if (!mentioned.size) delete mentionAttached[sessionCacheKey(scope, item.session_id)];
+            }
+          }
+          if (item.mode === "steer") note("steering the original run");
+        }
+      });
+    } finally {
+      S.outboxFlushing = false;
+      if (S.outboxFlushRequested && canFlushOutbox()) {
+        S.outboxFlushRequested = false;
+        queueMicrotask(() => { void flushOutbox(); });
+      }
+    }
+  }
+
+  function onStorage(event) {
+    const scope = S.storageScope;
+    if (!scope || !event.key) return;
+    if (event.key === "formless." + outboxStorageKey(scope)) {
+      refreshOutbox(scope);
+      if (canFlushOutbox(scope)) void flushOutbox();
+    }
+    const prefix = "formless.draft:" + encodeURIComponent(scope) + ":";
+    if (event.key.startsWith(prefix)) {
+      const sessionId = decodeURIComponent(event.key.slice(prefix.length));
+      const storedValue = typeof event.newValue === "string" ? (() => { try { return JSON.parse(event.newValue); } catch (_) { return ""; } })() : "";
+      const fallbackKey = sessionCacheKey(scope, sessionId);
+      let value = storedValue;
+      if (S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey)) {
+        const fallback = S.unpersistedDrafts.get(fallbackKey);
+        if (normalizeTextareaValue(fallback) === normalizeTextareaValue(storedValue)) {
+          S.unpersistedDrafts.delete(fallbackKey);
+          if (S.unpersistedDraftSharedValues) S.unpersistedDraftSharedValues.delete(fallbackKey);
+        }
+        else value = fallback;
+      }
+      const composer = $("input");
+      const localDraft = S.drafts[sessionId];
+      const preserveComposer = S.current === sessionId && (S.editMessageId || composer.value !== (localDraft || ""));
+      if (typeof value === "string") S.drafts[sessionId] = value;
+      if (S.current === sessionId && !preserveComposer && typeof value === "string") { composer.value = value; autosize(); }
+    }
+  }
+  window.addEventListener("storage", onStorage);
 
   // --------------------------------------------------------------- crypto
   function b64ToBytes(s) {
@@ -279,13 +725,13 @@
     });
   }
   /** Request that reports failures as a toast; resolves null on error. */
-  async function act(req, okText, timeoutMs) {
+  async function act(req, okText, timeoutMs, retry) {
     try {
       const r = await request(req, timeoutMs);
       if (okText) toast(okText);
       return r;
     } catch (e) {
-      toast(e.message, true);
+      toast(e.message, true, retry ? { label: "Retry", run: retry } : null);
       note(e.message, true);
       return null;
     }
@@ -638,19 +1084,84 @@
     renderNotes();
     renderStatus();
   }
-  /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
+  /** A toast; `action` ({label, run, ms}) adds a button; `ms` defaults to 3500. */
   function toast(text, err, action) {
+    let timer = null, deadline = 0, hovered = false, focused = false;
+    let remaining = err ? null : Number.isFinite(action?.ms) && action.ms >= 0 ? action.ms : 3500;
+    const remove = () => { clearTimeout(timer); timer = null; remaining = null; t.remove(); };
+    const pauseTimer = () => {
+      if (remaining == null || timer == null) return;
+      clearTimeout(timer);
+      timer = null;
+      remaining = Math.max(0, deadline - Date.now());
+    };
+    const resumeTimer = () => {
+      if (remaining == null || timer != null) return;
+      deadline = Date.now() + remaining;
+      timer = setTimeout(remove, remaining);
+    };
+    const updatePause = (source, active) => {
+      const wasPaused = hovered || focused;
+      if (source === "hover") hovered = active;
+      else focused = active;
+      const isPaused = hovered || focused;
+      if (!wasPaused && isPaused) pauseTimer();
+      else if (wasPaused && !isPaused) resumeTimer();
+    };
     const button = action && h("button", { class: "btn small", type: "button", onclick: () => {
       if (button.disabled) return;
       button.disabled = true;
-      t.remove();
+      remove();
       action.run();
     } }, action.label);
-    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
-      button);
+    const dismiss = h("button", { class: "btn ghost small toast-dismiss", type: "button", "aria-label": "Dismiss notification", onclick: remove }, "×");
+    const message = h("span", { class: "toast-message" });
+    const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status",
+      onmouseenter: () => updatePause("hover", true), onmouseleave: () => updatePause("hover", false),
+      onfocusin: () => updatePause("focus", true),
+      onfocusout: (event) => { if (!t.contains(event.relatedTarget)) updatePause("focus", false); } },
+    message, h("span", { class: "toast-actions" }, button, dismiss));
     $("toasts").append(t);
-    setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
+    setTimeout(() => { if (t.isConnected) message.textContent = text; }, 0);
+    if (remaining != null) {
+      deadline = Date.now() + remaining;
+      timer = setTimeout(remove, remaining);
+    }
   }
+
+  const chatAnnouncement = { last: 0, timer: null, pending: null };
+  function announceChat(text, session = S.current, immediate = false) {
+    const announcer = $("chat-announcer");
+    if (!announcer || !text || session !== S.current) return;
+    if (immediate) {
+      clearTimeout(chatAnnouncement.timer);
+      chatAnnouncement.timer = null;
+      chatAnnouncement.pending = null;
+      announcer.textContent = text;
+      chatAnnouncement.last = Date.now();
+      return;
+    }
+    chatAnnouncement.pending = { text, session };
+    if (chatAnnouncement.timer) return;
+    chatAnnouncement.timer = setTimeout(() => {
+      chatAnnouncement.timer = null;
+      const next = chatAnnouncement.pending;
+      chatAnnouncement.pending = null;
+      if (!next || next.session !== S.current) return;
+      announcer.textContent = next.text;
+      chatAnnouncement.last = Date.now();
+    }, Math.max(0, 500 - (Date.now() - chatAnnouncement.last)));
+  }
+  function completedRunAnswer(messages, afterSeq) {
+    const message = [...messages].reverse().find((item) =>
+      item.role === "assistant" && typeof item.content === "string" && item.seq > afterSeq);
+    if (!message) return "";
+    let meta = {};
+    try { meta = JSON.parse(message.meta || "{}"); } catch (_) {}
+    return Array.isArray(meta?.tool_calls) && meta.tool_calls.length ? "" : message.content;
+  }
+  let announcedRun = null;
+  let lastAnnouncedFinishedRun = null;
 
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
@@ -878,6 +1389,7 @@
       renderChrome();
       renderSessions();
       renderHistory();
+      renderOutbox();
       renderComposer();
       renderView();
       renderStatus();
@@ -3486,20 +3998,32 @@
 
   function toolCallChip(call) {
     const f = call.function || {};
+    const name = f.name || "tool";
     return h("details", { class: "chip tool-call" },
-      h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
+      h("summary", null, h("span", { class: "tname" }, h("span", { "aria-hidden": "true" }, "⚙ "), name), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
   function toolResultChip(content, meta) {
     // The daemon stores the error outcome separately from arbitrary output.
     // Older or incomplete transcripts may not carry a recorded failure.
     let failed = false;
-    try { failed = JSON.parse(meta || "{}")?.is_error === true; } catch (_) {}
+    let resultMeta = {};
+    try {
+      const parsed = JSON.parse(meta || "{}");
+      if (parsed && typeof parsed === "object") resultMeta = parsed;
+      failed = resultMeta.is_error === true;
+    } catch (_) {}
+    const name = typeof resultMeta.name === "string" ? resultMeta.name : "";
+    const duration = Number.isFinite(resultMeta.elapsed_ms) && resultMeta.elapsed_ms >= 0
+      ? recordedDuration(resultMeta.elapsed_ms) : "";
+    const status = failed ? "failed" : "done";
+    const label = [name || "Tool", status, duration && "duration " + duration].filter(Boolean).join(" · ");
     const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
-        h("span", { class: "tname" }, failed ? "↳ failed" : "↳ result"),
+        h("span", { class: "tname" },
+          h("span", { "aria-hidden": "true" }, "↳ "), label),
         h("span", { class: "targs" }, truncate(content, 160)),
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
@@ -3518,10 +4042,11 @@
   // Stored outputs open over the protocol (GetArtifact), never by path.
   async function openArtifact(id) {
     const trigger = document.activeElement;
-    const first = await act({ type: "get_artifact", id, offset: 0 });
+    const first = await act({ type: "get_artifact", id, offset: 0 }, null, undefined, () => openArtifact(id));
     if (!first) return;
     let text = first.text;
     let end = first.end;
+    let viewer;
     const pre = h("pre", { class: "diff artifact-text" }, text);
     const more = h("button", { class: "btn small", type: "button" }, "Load more");
     const status = h("span", { class: "muted" });
@@ -3529,14 +4054,16 @@
       status.textContent = end + " of " + first.total_chars + " characters";
       more.hidden = end >= first.total_chars;
     };
-    more.onclick = async () => {
-      const r = await act({ type: "get_artifact", id, offset: end });
-      if (!r) return;
+    const loadMore = async () => {
+      if (!viewer?.isConnected) return openArtifact(id);
+      const r = await act({ type: "get_artifact", id, offset: end }, null, undefined, loadMore);
+      if (!r || !viewer.isConnected) return;
       text += r.text;
       end = r.end;
       pre.textContent = text;
       sync();
     };
+    more.onclick = loadMore;
     const download = h("button", { class: "btn small", type: "button" }, "Download");
     download.onclick = async () => {
       download.disabled = true;
@@ -3544,7 +4071,7 @@
         const chunks = [text];
         let offset = end;
         while (offset < first.total_chars) {
-          const r = await act({ type: "get_artifact", id, offset, length: 1000000 });
+          const r = await act({ type: "get_artifact", id, offset, length: 1000000 }, null, undefined, () => download.onclick());
           if (!r) return;
           chunks.push(r.text);
           offset = r.end;
@@ -3555,7 +4082,7 @@
       }
     };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
-    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
+    viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
         h("h2", null, "Output " + id.slice(0, 8) + " · " + first.bytes + " bytes"),
         pre,
@@ -3651,6 +4178,7 @@
     t.value = t.value.slice(0, at.start) + insert + t.value.slice(t.selectionStart);
     const caret = at.start + insert.length;
     t.setSelectionRange(caret, caret);
+    if (!S.editMessageId) saveDraft(S.current, t.value);
     mention.query = null;
     autosize();
     updateMentions();
@@ -3665,8 +4193,10 @@
     if (!sid) return;
     try {
       const a = await request({ type: "attach_path", session_id: sid, path });
-      (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
+      const key = sessionCacheKey(S.storageScope, sid);
+      (mentionAttached[key] = mentionAttached[key] || new Set()).add(path);
       (S.chips[sid] = S.chips[sid] || []).push({ id: a.reference ? a.path : a.id, name: a.name, mime: a.mime || (a.reference ? "reference" : ""), bytes: a.bytes || 0, path });
+      await refreshAttachmentInventory(sid);
       renderChips();
     } catch (e) {
       note("cannot attach @" + path + ": " + e.message, true);
@@ -3713,10 +4243,12 @@
     const t = $("input");
     if (run && !needsArgs(c)) {
       t.value = "/" + c.name;
+      saveDraft(S.current, t.value);
       closePalette();
       return submit(false);
     }
     t.value = "/" + c.name + (c.args ? " " : "");
+    saveDraft(S.current, t.value);
     if (run) note("usage: " + usage(c));
     palette.sel = 0;
     autosize();
@@ -4329,7 +4861,7 @@
     return h("div", { class: "welcome" },
       h("h2", null, h("span", { class: "mark" }, "◇ "), "Formless"),
       h("p", { class: "muted" }, "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it."),
-      h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; $("input").focus(); autosize(); } }, ex))),
+      h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; saveDraft(S.current, ex); $("input").focus(); autosize(); } }, ex))),
       h("p", { class: "muted" }, h("span", { class: "welcome-enter-hint" }, welcomeEnterHint(composerEnterSends())),
         " · /help commands · /model switch model · @ reference a file"));
   }
@@ -4570,9 +5102,11 @@
       liveRender.rows.set(tool, row);
       return row;
     }
-    const mark = h("span");
+    const mark = h("span", { "aria-hidden": "true" });
     const name = document.createTextNode("");
     const args = document.createTextNode("");
+    const statusText = document.createTextNode("");
+    const status = h("span", { class: "sr-only", "data-live-status": "" }, statusText);
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -4581,10 +5115,10 @@
     const cancel = h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(row.tool.handle); } }, "Cancel");
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
-    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark,
+    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
       h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
-      h("span", { class: "tstat", "data-live-timer": "" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+      h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
@@ -4612,6 +5146,9 @@
       row.mark.textContent = running ? "" : t.status === "ok" ? "✓" : "✗";
     }
     updateText(row.name, t.name + (t.version > 0 ? " v" + t.version : ""));
+    const status = running ? "Running" : t.status === "ok" ? "Done" : "Failed";
+    const duration = t.elapsedMs != null ? recordedDuration(t.elapsedMs) : elapsed(t.started);
+    updateText(row.status, status + " · " + duration);
     updateText(row.args, t.subagent ? t.step || "" : summarizeArgs(t.arguments || ""));
     if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
     if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
@@ -4653,7 +5190,7 @@
         } }, liveRender.thinkingToggleText);
         liveRender.thinkingBox = h("div", { class: "live-thinking" }, liveRender.thinkingToggle, liveRender.thinking);
         liveRender.activityText = document.createTextNode("");
-        liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
+        liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
         liveRender.rows.clear();
       }
       const running = isRunning();
@@ -4699,7 +5236,11 @@
       if (liveRender.session !== S.current || liveRender.root !== $("live")) return;
       if (liveRender.activity.isConnected && S.activity) updateText(liveRender.activityText, activityText(S.activity));
       for (const row of liveRender.rows.values()) {
-        if (row.node.isConnected && row.tool.elapsedMs == null) updateText(row.timer, elapsed(row.tool.started));
+        if (row.node.isConnected && row.tool.elapsedMs == null) {
+          const duration = elapsed(row.tool.started);
+          if (row.tool.status === "running") updateText(row.status, "Running · " + duration);
+          updateText(row.timer, duration);
+        }
       }
     }, { newContent: false });
   }
@@ -7839,7 +8380,7 @@
     S.toolDetailError = null;
     renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
-    const d = await act({ type: "get_tool", id });
+    const d = await act({ type: "get_tool", id }, null, undefined, () => selectTool(id, true));
     if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
     else S.toolDetailError = id;
@@ -7949,6 +8490,7 @@
   /** Open a session; `stay` keeps the current view (initial load). */
   let sessionSeq = 0;
   async function openSession(id, stay) {
+    if (S.current && !S.editMessageId) saveDraft(S.current, $("input").value);
     S.topicFocus = null;
     if (S.current !== id) invalidateBranchSummary();
     cancelEventRender();
@@ -7977,7 +8519,14 @@
     }).catch(() => {});
     rendered.clear(); // a reload may carry edited messages
     renderChips();
-    if (attachmentDrafts[id]) { $("input").value = attachmentDrafts[id]; delete attachmentDrafts[id]; autosize(); }
+    const draftKey = sessionCacheKey(S.storageScope, id);
+    const draft = Object.prototype.hasOwnProperty.call(attachmentDrafts, draftKey) ? attachmentDrafts[draftKey] : loadDraft(S.storageScope, id);
+    S.drafts[id] = draft;
+    delete attachmentDrafts[draftKey];
+    $("input").value = draft;
+    saveDraft(id, draft);
+    autosize();
+    void refreshAttachmentInventory(id);
     // Live traffic only for the Session on screen: the relay then carries
     // (and bills) one Session's tokens, not every Session's.
     S.others = [];
@@ -7988,7 +8537,7 @@
         S.others = (S.others || []).filter((c) => c.conn !== S.conn);
         renderStatus();
       }).catch(() => {});
-    prefs.set("session", id);
+    prefs.set(sessionStorageKey(S.storageScope), id);
     S.editMessageId = null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
@@ -8010,6 +8559,9 @@
       S.queued = r.queued_items || [];
       renderQueue();
       restoreSessionRunState(id, r, snapshot.events);
+      if (S.liveRun && !S.liveRun.ended && S.running.has(id)) {
+        announcedRun = { session: id, id: S.liveRun.id, afterSeq: Math.max(-1, ...S.messages.map((message) => message.seq ?? -1)) };
+      }
       renderPlan();
       S.stepMode = !!r.step_mode;
       const i = S.sessions.findIndex((s) => s.id === id);
@@ -8017,6 +8569,7 @@
     }
     if (!isRunning()) S.activity = null;
     renderAll();
+    void flushOutbox();
   }
   async function newSession() {
     const s = await act({ type: "create_session", name: null });
@@ -8126,7 +8679,7 @@
     if (!r || !r.session) return;
     S.sessions = [r.session, ...S.sessions.filter((x) => x.id !== r.session.id)];
     await openSession(r.session.id);
-    if (r.first_message) $("input").value = r.first_message;
+    if (r.first_message) { $("input").value = r.first_message; saveDraft(S.current, r.first_message); }
     $("input").focus();
   }
   async function templateCommand(arg) {
@@ -8245,6 +8798,7 @@
 
   function beginEdit(msg) {
     if (msg.generated_by != null || (S.topicsAvailable && currentTopicAttempt())) return;
+    if (!S.editMessageId) saveDraft(S.current, $("input").value);
     S.editMessageId = msg.id;
     $("input").value = msg.content;
     autosize();
@@ -8253,8 +8807,7 @@
   }
   function cancelEdit() {
     S.editMessageId = null;
-    $("input").value = "";
-    autosize();
+    restoreDraft(S.current);
     renderComposer();
   }
 
@@ -8479,7 +9032,7 @@
       const [server, name] = (target || "").split(":");
       if (!server || !name) return note("usage: /prompt SERVER:NAME [key=value …] (see /prompts)", true);
       const r = await act({ type: "get_mcp_prompt", server, name, arguments: Object.fromEntries(pairs.filter((p) => p.includes("=")).map((p) => p.split(/=(.*)/s).slice(0, 2))) });
-      if (r) { $("input").value = r.text; autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
+      if (r) { $("input").value = r.text; saveDraft(S.current, r.text); autosize(); $("input").focus(); note("prompt loaded into the composer; edit it, then send"); }
     } },
     { name: "help", group: "App", desc: "all commands and keys (also ? on an empty input)", run: () => showHelp() },
     { name: "quit", group: "App", desc: "disconnect from the daemon", run: () => forget() },
@@ -8634,7 +9187,7 @@
         if (eq) args[eq[1]] = eq[2]; else positional.push(w);
       }
       const r = await act({ type: "get_mcp_prompt", server: mp[1], name: mp[2], arguments: args, positional }, null, 60000);
-      if (r && r.text && r.text.trim()) { $("input").value = r.text; autosize(); return submit(false); }
+      if (r && r.text && r.text.trim()) { $("input").value = r.text; saveDraft(S.current, r.text); autosize(); return submit(false); }
       return;
     }
     const [first, ...rest] = cmd.split(/\s+/);
@@ -8651,87 +9204,225 @@
   async function submit(queued) {
     if (currentTopicAttempt()) return;
     const input = $("input");
+    const draftSnapshot = normalizeTextareaValue(input.value);
     const text = input.value.trim();
     if (!text) return;
     if (text.startsWith("/") && !S.editMessageId) {
       input.value = "";
+      saveDraft(S.current, "");
       autosize();
       return slash(text.slice(1).trim());
     }
-    if (!S.current) await newSession();
-    if (!S.current) return;
-    const sid = S.current;
-    if (S.editMessageId && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
-      try { if (!(await confirmForecast(sid, text))) return; }
-      catch (e) { note("forecast: " + e.message, true); return; }
-    }
-    const mode = queued ? "queue" : isRunning() ? "steer" : "send";
-    input.value = "";
-    autosize();
-    if (S.editMessageId) {
-      const id = S.editMessageId;
-      S.editMessageId = null;
-      renderComposer();
-      await act({ type: "edit_message", session_id: sid, message_id: id, content: text });
+    const submitKey = [S.storageScope || "", text].join("\u0000");
+    if (S.submitting.has(submitKey)) return;
+    if (S.submitting.size) {
+      note("A message is still being prepared; this draft remains in the composer.", true);
       return;
     }
-    askNotifyPermission();
-    // `@path` mentions are attached first (the daemon resolves them in its
-    // working directory); words that aren't files are left as text.
-    closeMentions();
-    const toolNames = new Set((S.tools || []).map((t) => t.name));
-    const already = mentionAttached[sid] || new Set();
-    // A typed or pasted @path is never sent unseen (#863): it becomes a
-    // chip first, and this Send stops so the chips can be checked.
-    const fresh = [];
-    for (const path of mentionsIn(text)) {
-      // Tools are named for the agent; chosen files are attached already.
-      if (toolNames.has(path) || already.has(path)) continue;
-      try {
-        const a = await request({ type: "attach_path", session_id: sid, path });
-        (mentionAttached[sid] = mentionAttached[sid] || new Set()).add(path);
-        (S.chips[sid] = S.chips[sid] || []).push(a);
-        fresh.push(a.name);
-      } catch (e) {
-        if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(e.message)) {
-          note("cannot attach @" + path + ": " + e.message, true);
+    S.submitting.add(submitKey);
+    try {
+      if (!S.current) await newSession();
+      if (!S.current) return;
+      const sid = S.current;
+      const scope = S.storageScope;
+      const saveCurrentDraft = (value) => {
+        if (scope !== S.storageScope || S.current !== sid) return false;
+        return saveDraft(sid, value, scope);
+      };
+      const mode = queued ? "queue" : S.running.has(sid) ? "steer" : "send";
+      const expectedRunId = mode === "steer" && S.liveRun && !S.liveRun.ended ? S.liveRun.id : null;
+      const editMessageId = S.editMessageId;
+      const needsForecast = !S.running.has(sid) && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null;
+      if (editMessageId) {
+        if (needsForecast) {
+          if (!S.daemonOnline) { note("Reconnect to approve the forecast before editing this message.", true); return; }
+          try {
+            if (!(await confirmForecast(sid, text, { edit_message_id: editMessageId }))) return;
+          } catch (error) { note("forecast: " + error.message, true); return; }
+        }
+        if (scope !== S.storageScope) return;
+        S.editMessageId = null;
+        restoreDraft(sid);
+        renderComposer();
+        await act({ type: "edit_message", session_id: sid, message_id: editMessageId, content: text });
+        return;
+      }
+      askNotifyPermission();
+      closeMentions();
+      const toolNames = new Set((S.tools || []).map((tool) => tool.name));
+      const sessionKey = sessionCacheKey(scope, sid);
+      const already = mentionAttached[sessionKey] || new Set();
+      const fresh = [];
+      let attachmentError = "";
+      for (const path of mentionsIn(text)) {
+        if (toolNames.has(path) || already.has(path)) continue;
+        if (!S.daemonOnline || !S.channel) {
+          attachmentError = "File mentions could not be attached while offline; review before sending.";
+          continue;
+        }
+        try {
+          const attachment = await request({ type: "attach_path", session_id: sid, path });
+          if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
+          (mentionAttached[sessionKey] = mentionAttached[sessionKey] || new Set()).add(path);
+          (S.chips[sid] = S.chips[sid] || []).push(attachment);
+          fresh.push(attachment.name);
+        } catch (error) {
+          if (/^.+:\+?[0-9]+$/.test(path) || !/^no file/.test(error.message)) {
+            note("cannot attach @" + path + ": " + error.message, true);
+            if (!S.daemonOnline) attachmentError = "File mentions could not be attached while offline; review before sending.";
+          }
         }
       }
-    }
-    if (fresh.length) {
-      if (S.current === sid) { input.value = text; autosize(); renderChips(); }
-      else attachmentDrafts[sid] = text;
-      note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
-      return;
-    }
-    if (!isRunning() && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
-      try {
-        if (!(await confirmForecast(sid,text))) {
-          if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
-          autosize();return;
-        }
-      } catch (error) {
-        if (S.current === sid && !input.value) input.value=text; else attachmentDrafts[sid]=text;
-        autosize();note("Forecast was not confirmed: "+error.message,true);return;
+      if (fresh.length) {
+        await refreshAttachmentInventory(sid, scope);
+        if (S.current === sid && scope === S.storageScope) { saveCurrentDraft(input.value); autosize(); renderChips(); }
+        else { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
+        note("This message attaches " + fresh.join(", ") + " (shown above the box; × removes one). Press Send again to send.");
+        return;
       }
+      let forecastPending = false;
+      if (needsForecast) {
+        if (!S.daemonOnline || !S.channel) forecastPending = true;
+        else {
+          try {
+            if (!(await confirmForecast(sid, text))) {
+              if (scope !== S.storageScope) saveCurrentDraft(text);
+              else if (S.current !== sid) { attachmentDrafts[sessionCacheKey(scope, sid)] = text; saveCurrentDraft(text); }
+              return;
+            }
+          } catch (error) {
+            if (!S.daemonOnline) forecastPending = true;
+            else { saveCurrentDraft(text); note("Forecast was not confirmed: " + error.message, true); return; }
+          }
+        }
+      }
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
+      const inventory = await refreshAttachmentInventory(sid, scope);
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
+      let durableOutboxSupported = null;
+      let capabilityError = null;
+      if (S.daemonOnline && S.channel) {
+        try {
+          const ping = await request({ type: "ping" });
+          durableOutboxSupported = Array.isArray(ping && ping.features) && ping.features.includes("durable_outbox_v1");
+        } catch (error) { capabilityError = error; }
+      }
+      if (scope !== S.storageScope) { saveCurrentDraft(text); return; }
+      if (durableOutboxSupported === false && mode === "send") {
+        if (S.current !== sid) {
+          saveCurrentDraft(input.value);
+          note("The active Session changed while preparing this message; review it before sending with this daemon.", true);
+          return;
+        }
+        if (!Array.isArray(inventory) || inventory.length) {
+          saveCurrentDraft(input.value);
+          note("This daemon cannot safely send a message with pending attachments; upgrade it before sending.", true);
+          return;
+        }
+        if (S.running.has(sid)) {
+          saveCurrentDraft(input.value);
+          note("The Session started a Run while this message was being prepared; choose a send mode again.", true);
+          return;
+        }
+        saveCurrentDraft(input.value);
+        let legacyResult;
+        try {
+          legacyResult = await withOutboxLock(scope, async () => {
+            if (scope !== S.storageScope || S.current !== sid) return { blocked: "The active Session or pairing changed; this message was not sent." };
+            if (loadOutbox(scope).length) return { blocked: "The pairing outbox is not empty; review its saved messages before sending this legacy message." };
+            if (S.running.has(sid) || input.value.trim() !== text) return { blocked: "The message or Session state changed while preparing it; review before sending." };
+            let currentAttachments;
+            try { currentAttachments = await fetchFreshAttachmentInventory(sid, scope); }
+            catch (error) { return { inventoryError: error }; }
+            if (scope !== S.storageScope || S.current !== sid) return { blocked: "The active Session or pairing changed; this message was not sent." };
+            if (!Array.isArray(currentAttachments) || currentAttachments.length || JSON.stringify(currentAttachments) !== JSON.stringify(inventory)) {
+              return { blocked: "Pending attachments changed while preparing this message; review it before sending." };
+            }
+            if (S.running.has(sid) || input.value.trim() !== text) return { blocked: "The message or Session state changed while preparing it; review before sending." };
+            try {
+              await request({
+                type: "send_message",
+                session_id: sid,
+                content: text,
+                mode: "send",
+                client_msg_id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2),
+              });
+              return { sent: true };
+            } catch (error) { return { requestError: error }; }
+          });
+        } catch (error) { legacyResult = { lockError: error }; }
+        if (!legacyResult) {
+          note("Could not coordinate with other tabs; this legacy message was not sent.", true);
+          return;
+        }
+        if (legacyResult.inventoryError) {
+          note("Could not verify pending attachments for the legacy send: " + legacyResult.inventoryError.message, true);
+          return;
+        }
+        if (legacyResult.blocked) {
+          note(legacyResult.blocked, true);
+          return;
+        }
+        if (legacyResult.lockError) {
+          note("Could not coordinate with other tabs; this legacy message was not sent: " + legacyResult.lockError.message, true);
+          return;
+        }
+        if (legacyResult.requestError) {
+          const error = legacyResult.requestError;
+          note(error.daemonResponse
+            ? "Legacy send failed: " + error.message
+            : "Legacy send outcome is unknown; check the Session before retrying: " + error.message, true);
+          return;
+        }
+        if (legacyResult.sent && scope === S.storageScope && S.current === sid) {
+          if (input.value.trim() === text) { input.value = ""; saveCurrentDraft(""); autosize(); }
+          else saveCurrentDraft(input.value);
+        }
+        return;
+      }
+      let blockedReason = attachmentError;
+      if (mode === "steer" && !expectedRunId) blockedReason = "The active Run could not be identified; this Steer was not sent.";
+      if (mode === "queue" && inventory && inventory.length) blockedReason = "Queue mode cannot preserve pending attachments; this message was not sent.";
+      if (durableOutboxSupported === false) blockedReason = "This daemon does not support the durable outbox; upgrade it, manually copy this message text, discard the saved item, and resend it.";
+      if (capabilityError && capabilityError.daemonResponse) blockedReason = "Could not verify durable outbox support: " + capabilityError.message;
+      const item = await enqueueOutbox(sid, text, mode, {
+        expectedAttachments: inventory,
+        expectedRunId,
+        forecastPending,
+        blockedReason,
+        queuedReason: capabilityError && !capabilityError.daemonResponse
+          ? "Could not verify durable outbox support; this message will wait until the daemon can be checked."
+          : "",
+        storageScope: scope,
+      });
+      if (!item) {
+        note(hasOutboxLock()
+          ? "Could not save this message to the outbox; it is still in the composer."
+          : "This browser cannot safely save messages because the Web Locks API is unavailable. Open this page in a current browser in a secure context (HTTPS or localhost); the message remains in the composer.", true);
+        return;
+      }
+      const sourceIsCurrent = S.current === sid && scope === S.storageScope;
+      const fallbackKey = sessionCacheKey(scope, sid);
+      const hasFallback = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey);
+      const fallback = hasFallback ? S.unpersistedDrafts.get(fallbackKey) : null;
+      const shared = prefs.get(draftStorageKey(scope, sid), null);
+      const composerDraft = normalizeTextareaValue(input.value);
+      const noConflictingDraft = (!hasFallback || normalizeTextareaValue(fallback) === draftSnapshot)
+        && (typeof shared !== "string" || normalizeTextareaValue(shared) === draftSnapshot);
+      if (sourceIsCurrent && composerDraft !== draftSnapshot && noConflictingDraft) {
+        saveCurrentDraft(input.value);
+      }
+      const latestSourceDraft = clearSubmittedDraft(scope, sid, draftSnapshot);
+      if (sourceIsCurrent && normalizeTextareaValue(input.value) === draftSnapshot) {
+        const latest = normalizeTextareaValue(latestSourceDraft);
+        input.value = latest === draftSnapshot ? "" : latest;
+        autosize();
+      }
+      if (item.status === "failed") { note(item.error, true); return; }
+      return scope === S.storageScope ? flushOutbox() : undefined;
+    } finally {
+      S.submitting.delete(submitKey);
     }
-    // One key per user action (#891): pressing Send again after a reply
-    // was lost reuses it, so the daemon doesn't send the message twice.
-    const same = S.unsent && S.unsent.session === sid && S.unsent.text === text;
-    const key = same ? S.unsent.key
-      : (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
-    S.unsent = { session: sid, text, key };
-    let r = null;
-    try { r = await request({ type: "send_message", session_id: sid, content: text, mode, client_msg_id: key }); }
-    catch (error) {
-      if (error.daemonResponse && S.unsent && S.unsent.key === key) S.unsent = null;
-      if (S.current === sid && !input.value) { input.value = text; autosize(); } else attachmentDrafts[sid] = text;
-      toast(error.message,true);note(error.message,true);
-    }
-    if (r && S.unsent && S.unsent.key === key) S.unsent = null;
-    // The attachments went with it.
-    if (r) { delete S.chips[sid]; delete mentionAttached[sid]; renderChips(); }
-    if (r && mode === "steer") note("steering the current run");
   }
   function stop() {
     if (S.topicsAvailable && currentTopicAttempt()) return;
@@ -8917,7 +9608,11 @@
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; S.recapRunId = null; }
-        if (here) { clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
+        if (here) {
+          announcedRun = { session: ev.session_id, id: ev.run_id, afterSeq: Math.max(-1, ...S.messages.map((message) => message.seq ?? -1)) };
+          clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model");
+          announceChat("Run started", ev.session_id, true);
+        }
         break;
       case "run_recap":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
@@ -9010,6 +9705,13 @@
           renderRunBanner();
         }
         if (here) {
+          if (ev.type === "run_finished" && ev.status === "completed" && lastAnnouncedFinishedRun !== ev.run_id) {
+            const answer = announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id
+              ? completedRunAnswer(S.messages, announcedRun.afterSeq) : "";
+            announceChat("Answer finished" + (answer ? ". " + answer : ""), ev.session_id, true);
+            lastAnnouncedFinishedRun = ev.run_id;
+          }
+          if (announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id) announcedRun = null;
           clearLiveText();
           S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
@@ -9032,6 +9734,7 @@
           } catch (_) {}
         }
         if (here) {
+          announceChat("Running " + ev.tool_name, ev.session_id);
           const existing = ev.invocation_id != null && S.liveTools.find(t => t.invocationId === ev.invocation_id);
           if (existing) {
             if (existing.status === "running" && existing.metadataPending) Object.assign(existing, { metadataPending: false, name: ev.tool_name, version: ev.version, arguments: ev.arguments, depth: ev.depth || 0 });
@@ -9102,6 +9805,7 @@
         break;
       case "harness_permission_requested":
         addApproval(ev);
+        if (here) announceChat("Approval needed", ev.session_id, true);
         renderApproval(); scheduleEventRender({ status: true });
         break;
       case "approval_summary": {
@@ -9111,11 +9815,12 @@
       }
       case "approval_requested":
         addApproval(ev);
-        if (here) setActivity("awaiting your approval");
+        if (here) { setActivity("awaiting your approval"); announceChat("Approval needed", ev.session_id, true); }
         renderApproval();
         break;
       case "promotion_approval_requested":
         addApproval(ev);
+        if (here) announceChat("Approval needed", ev.session_id, true);
         renderApproval();
         break;
       case "promotion_approval_resolved":
@@ -9288,7 +9993,7 @@
     if (runningPanelExposed()) refreshRunning("exposure");
     await refreshSessions();
     await refreshTopics(true);
-    const saved = prefs.get("session", null);
+    const saved = prefs.get(sessionStorageKey(S.storageScope), null);
     const linked = S.linkedSession && S.sessions.find((s) => s.id === S.linkedSession);
     if (S.linkedSession && !linked) note("That Session link points to a Session that no longer exists.", true);
     S.linkedSession = null;
@@ -9337,6 +10042,8 @@
     // paired across reloads (#908).
     S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey", "deriveBits"]);
     S.room = await roomFor(keyBytes);
+    S.local = false;
+    activateStorageScope();
     keyBytes.fill(0);
     S.relayModule = await import("./transport.mjs");
     // This bound covers retained byte-backed transport copies; rendered
@@ -9361,6 +10068,8 @@
     restorePushSubscription(ws);
     markStable();
     note("daemon online");
+    refreshOutbox();
+    void flushOutbox();
     loadAll();
   }
   function openRelay() {
@@ -9529,6 +10238,7 @@
     if (S.relayLink) S.relayLink.endpoint.dispose();
     S.relayLink = null; S.relayReady = false;
     S.local = true;
+    activateStorageScope();
     S.userClosed = false;
     if (token) {
       history.replaceState(null, "", location.pathname);
@@ -9551,6 +10261,8 @@
       $("app").classList.remove("hidden");
       renderAll();
       note("connected to the local daemon");
+      refreshOutbox();
+      void flushOutbox();
       loadAll();
     };
     ws.onmessage = (e) => {
@@ -9732,6 +10444,7 @@
         if (S.current === sid) renderChips();
       }
     }
+    await refreshAttachmentInventory(sid);
   }
   /** A sent message's attachments by name; one retention removed says
    * so instead of vanishing (#858). */
@@ -9758,9 +10471,9 @@
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
         if (await act({ type: "detach_file", session_id: sid, id: a.id || a.path })) {
-          S.chips[sid] = (S.chips[sid] || []).filter((x) => x !== a);
+          await refreshAttachmentInventory(sid);
           // Its @path stays in the text but isn't attached again on send.
-          renderChips();
+          if (S.current === sid) renderChips();
         }
       } }, "×"))));
     if (focusIndex >= 0) {
@@ -9796,7 +10509,7 @@
     if (files.length) { e.preventDefault(); attachFiles(files); }
   });
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); submit(false); });
-  $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
+  $("input").addEventListener("input", () => { if (!S.editMessageId) saveDraft(S.current, $("input").value); palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;
