@@ -152,11 +152,16 @@ fn schema_can_describe_object(
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let target = if reference == "#" {
             Some(root)
+        } else if let Some(fragment) = reference.strip_prefix('#') {
+            let Some(pointer) = decode_uri_fragment(fragment) else {
+                return false;
+            };
+            pointer
+                .starts_with('/')
+                .then(|| root.pointer(&pointer))
+                .flatten()
         } else {
-            reference
-                .strip_prefix('#')
-                .filter(|pointer| pointer.starts_with('/'))
-                .and_then(|pointer| root.pointer(pointer))
+            None
         };
         if let Some(target) = target {
             if active_refs.insert(reference.to_string()) {
@@ -232,6 +237,23 @@ fn schema_can_describe_object(
         }
     }
     true
+}
+
+fn decode_uri_fragment(fragment: &str) -> Option<String> {
+    let bytes = fragment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn schema_matches_every_object(schema: &Value) -> bool {
@@ -1644,6 +1666,7 @@ mod tests {
             json!({"anyOf": [{"type": "string"}, {"type": "array"}]}),
             json!({"oneOf": [{"type": "object"}, {"type": "object"}]}),
             json!({"$defs": {"String": {"type": "string"}}, "$ref": "#/$defs/String"}),
+            json!({"$defs": {"Scalar Input": {"type": "string"}}, "$ref": "#/$defs/Scalar%20Input"}),
             json!({"not": {"type": "object"}}),
         ];
         for schema in rejected {
