@@ -19,6 +19,51 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
+def api_endpoint_template(endpoint):
+    if not endpoint:
+        return "/repos/{owner}/{repo}"
+    if endpoint == "/releases?per_page=1":
+        return "/releases"
+    if endpoint == "/releases/latest":
+        return "/releases/latest"
+    if endpoint.startswith("/contents/"):
+        return "/contents/{path}?ref={ref}"
+    for prefix, template in (
+        ("/issues/", "/issues/{number}"),
+        ("/pulls/", "/pulls/{number}"),
+        ("/actions/runs/", "/actions/runs/{id}"),
+        ("/releases/tags/", "/releases/tags/{tag}"),
+        ("/compare/", "/compare/{base}...{head}"),
+    ):
+        if endpoint.startswith(prefix):
+            return template
+    return "unknown"
+
+
+def api_http_diagnostic(endpoint, scoped, error):
+    message = "GitHub API check failed: HTTP " + str(error.code)
+    if error.code not in (403, 429):
+        return message
+    details = ["endpoint=" + api_endpoint_template(endpoint),
+               "mode=" + ("scoped" if scoped else "anonymous")]
+    if error.headers is not None:
+        # Header values are external input too. Reject duplicate or folded
+        # fields rather than printing arbitrary response text in CI.
+        decimal = r"0|[1-9][0-9]{0,9}"
+        for name, pattern in (
+            ("x-ratelimit-limit", decimal),
+            ("x-ratelimit-remaining", decimal),
+            ("x-ratelimit-reset", decimal),
+            ("retry-after", decimal),
+            ("x-github-request-id", r"(?:[0-9A-Fa-f]{1,16}:){3,4}[0-9A-Fa-f]{1,16}"),
+        ):
+            values = error.headers.get_all(name, [])
+            if (len(values) == 1 and isinstance(values[0], str) and
+                    re.fullmatch(pattern, values[0])):
+                details.append(name + "=" + values[0])
+    return message + " (" + ", ".join(details) + ")"
+
+
 def api_get(endpoint, token):
     # Endpoints are constructed below, never taken as arbitrary input URLs.
     if not endpoint.startswith("/") and endpoint != "":
@@ -34,7 +79,7 @@ def api_get(endpoint, token):
         with build_opener(NoRedirects()).open(request, timeout=20) as response:
             return json.load(response)
     except HTTPError as error:
-        raise ValueError("GitHub API check failed: HTTP " + str(error.code)) from None
+        raise ValueError(api_http_diagnostic(endpoint, bool(token), error)) from None
     except (URLError, TimeoutError):
         raise ValueError("GitHub API check failed: network error") from None
 

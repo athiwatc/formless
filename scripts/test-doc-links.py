@@ -2,6 +2,7 @@
 """Offline regression tests; never use real credentials or network."""
 import importlib.util
 from decimal import Decimal
+from email.message import Message
 from pathlib import Path
 import os
 import re
@@ -87,6 +88,77 @@ class LinkChecks(unittest.TestCase):
                 links.main(["script", "lychee", "README.md"])
         api.assert_called_once_with("/actions/runs/123", None)
         self.assertEqual(run.call_count, 1)
+
+    def test_403_keeps_public_evidence_anonymous_and_fails_before_exclusion(self):
+        url = ROOT + "/blob/6372d587/private-file.rs#L1"
+        found = []
+        headers = Message()
+        for key, value in [
+            ("x-ratelimit-limit", "60"),
+            ("X-RateLimit-Remaining", "0"),
+            ("x-ratelimit-reset", "1795478400"),
+            ("Retry-After", "42"),
+            ("X-GitHub-Request-Id", "ABCD:0123:BEEF:DEAD:87654321"),
+            ("Location", "https://private.example/do-not-log"),
+        ]:
+            headers[key] = value
+
+        class Unreadable:
+            def read(self, *args):
+                raise AssertionError("HTTP error body must not be read")
+
+            def close(self):
+                pass
+
+        class Opener:
+            def open(self, request, timeout):
+                found.append(request)
+                raise links.HTTPError(request.full_url, 403, "do-not-log", headers, Unreadable())
+
+        with patch.dict(os.environ, {"FORMLESS_LINK_GITHUB_TOKEN": "fixture-secret"}), \
+             patch.object(links.subprocess, "run", return_value=SimpleNamespace(stdout=url)) as run, \
+             patch.object(links, "build_opener", return_value=Opener()):
+            with self.assertRaises(ValueError) as caught:
+                links.main(["script", "lychee", "README.md"])
+        self.assertEqual(str(caught.exception),
+                         "GitHub API check failed: HTTP 403 (endpoint=/contents/{path}?ref={ref}, "
+                         "mode=anonymous, x-ratelimit-limit=60, x-ratelimit-remaining=0, "
+                         "x-ratelimit-reset=1795478400, retry-after=42, "
+                         "x-github-request-id=ABCD:0123:BEEF:DEAD:87654321)")
+        self.assertEqual(len(found), 1)
+        self.assertIsNone(found[0].get_header("Authorization"))
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn("FORMLESS_LINK_GITHUB_TOKEN", run.call_args.kwargs["env"])
+
+    def test_403_scoped_drops_malformed_oversized_and_duplicate_headers(self):
+        headers = Message()
+        for key, value in [
+            ("x-ratelimit-limit", "100"),
+            ("X-RateLimit-Limit", "200"),
+            ("x-ratelimit-remaining", "１２"),
+            ("x-ratelimit-reset", "12345678901"),
+            ("retry-after", "10\n::warning::fixture-secret"),
+            ("x-github-request-id", "AB:CD:EF:00\nfixture-secret"),
+        ]:
+            headers[key] = value
+        found = []
+
+        class Opener:
+            def open(self, request, timeout):
+                found.append(request.get_header("Authorization"))
+                raise links.HTTPError(request.full_url, 403, "fixture-secret", headers, None)
+
+        with patch.object(links, "build_opener", return_value=Opener()):
+            with self.assertRaises(ValueError) as caught:
+                links.api_get("/issues/1406", "fixture-secret")
+        self.assertEqual(found, ["Bearer fixture-secret"])
+        self.assertEqual(str(caught.exception),
+                         "GitHub API check failed: HTTP 403 (endpoint=/issues/{number}, mode=scoped)")
+
+    def test_429_without_headers_still_names_fixed_endpoint(self):
+        error = links.HTTPError("https://example.test/not-printed", 429, "not printed", None, None)
+        self.assertEqual(links.api_http_diagnostic("/releases?per_page=1", False, error),
+                         "GitHub API check failed: HTTP 429 (endpoint=/releases, mode=anonymous)")
 
     def test_private_root(self):
         calls = []
