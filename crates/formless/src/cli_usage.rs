@@ -179,7 +179,7 @@ pub(super) fn write_report(
         });
         anyhow::ensure!(
             supports_local_days,
-            "the running daemon does not advertise caller-local daily usage support; run formless daemon restart before retrying"
+            "the running daemon does not advertise caller-local daily usage support; restart the selected daemon with the same --profile and configuration flags used for this request, then retry"
         );
         Some(local_utc_offset_minutes())
     } else {
@@ -234,6 +234,9 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not advertise caller-local daily usage support"));
+        assert!(error.to_string().contains(
+            "restart the selected daemon with the same --profile and configuration flags used for this request"
+        ));
         assert!(matches!(&requests[..], [Request::Ping]));
         assert!(out.is_empty());
     }
