@@ -871,6 +871,9 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
         {"id": "gemini-embedding-001"},
         {"id": "vendor/prefix-gpt-5"},
         {"id": "vendor/prefix-claude-3-haiku"},
+        {"id": "claude-3-7-sonnet", "max_tokens": 64000,
+         "architecture": {"input_modalities": ["text", "image"]},
+         "supported_parameters": ["tools"]},
         {"id": "anthropic/claude-2.1"}
     ]});
     let meta = parse_model_meta(&body);
@@ -905,6 +908,11 @@ fn model_metadata_comes_from_the_listing_or_the_table() {
     assert_eq!(meta["vendor/prefix-claude-3-haiku"]["source"], "endpoint");
     assert!(meta["vendor/prefix-gpt-5"].get("vision").is_none());
     assert!(meta["vendor/prefix-claude-3-haiku"].get("tools").is_none());
+    assert_eq!(meta["claude-3-7-sonnet"]["source"], "endpoint");
+    assert_eq!(meta["claude-3-7-sonnet"]["vision"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["tools"], true);
+    assert_eq!(meta["claude-3-7-sonnet"]["max_output"], 64000);
+    assert!(meta["claude-3-7-sonnet"].get("inferred").is_none());
     assert_eq!(known_model_meta("gpt-5-mini")["source"], "builtin");
     assert_eq!(known_model_meta("anthropic/claude-2.1")["vision"], false);
     assert_eq!(known_model_meta("openai/o3-mini")["vision"], false);

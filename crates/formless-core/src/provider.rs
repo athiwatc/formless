@@ -4652,7 +4652,16 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
         .filter_map(|m| {
             let id = m["id"].as_str()?;
             let mut meta = known_model_meta(id);
-            let has_builtin = meta["source"] == "builtin";
+            let mut builtin_fields: Vec<String> = if meta["source"] == "builtin" {
+                meta.as_object()
+                    .into_iter()
+                    .flat_map(|fields| fields.keys())
+                    .filter(|field| !matches!(field.as_str(), "source" | "inferred"))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let mut has_endpoint = false;
             if let Some(c) = windows.get(id) {
                 meta["context"] = json!(c);
@@ -4680,11 +4689,13 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
             // Anthropic's listing: the output cap per model.
             if let Some(cap) = m["max_tokens"].as_u64() {
                 meta["max_output"] = json!(cap);
+                builtin_fields.retain(|field| field != "max_output");
                 has_endpoint = true;
             }
             if let Some(mods) = m["architecture"]["input_modalities"].as_array() {
                 meta["vision"] = json!(mods.iter().any(|x| x == "image"));
                 remove_inferred(&mut meta, "vision");
+                builtin_fields.retain(|field| field != "vision");
                 has_endpoint = true;
             }
             if let Some(params) = m["supported_parameters"].as_array() {
@@ -4692,6 +4703,7 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
                 if has("tools") {
                     meta["tools"] = json!(true);
                     remove_inferred(&mut meta, "tools");
+                    builtin_fields.retain(|field| field != "tools");
                     has_endpoint = true;
                 }
                 if has("reasoning") || has("reasoning_effort") {
@@ -4702,17 +4714,16 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
                     {
                         meta["efforts"] = json!(["low", "medium", "high"]);
                         mark_inferred(&mut meta, "efforts");
+                        builtin_fields.retain(|field| field != "efforts");
                     }
                 }
             }
-            meta["source"] = json!(if has_builtin {
-                if has_endpoint {
-                    "mixed"
-                } else {
-                    "builtin"
-                }
-            } else {
+            meta["source"] = json!(if builtin_fields.is_empty() {
                 "endpoint"
+            } else if has_endpoint {
+                "mixed"
+            } else {
+                "builtin"
             });
             Some((id.to_string(), meta))
         })
