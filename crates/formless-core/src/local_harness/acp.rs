@@ -450,10 +450,7 @@ pub struct Probe {
     pub detail: Option<String>,
 }
 
-#[cfg(not(test))]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
-#[cfg(test)]
-const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Starts the agent and runs ACP `initialize` only: no session, no sign-in, no bridge.
 /// Sign-in is not visible at this step, so callers probe it separately.
