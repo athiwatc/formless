@@ -60,14 +60,20 @@ try:
                 assert preview[0]>0 and preview[1]>preview[0],preview
                 assert preview[2:]==['ellipsis','nowrap'],preview
                 summary.focus()
+                closed_marker = summary.evaluate("""el=>{const marker=getComputedStyle(el,'::before');return [marker.content,marker.clipPath]}""")
+                assert closed_marker[0] == '""', closed_marker
+                assert closed_marker[1] != 'none', closed_marker
                 summary.press('Enter')
                 assert chip.evaluate('el=>el.open')
                 assert chip.locator('pre').text_content()==arguments
                 overflow = chip.locator('pre').evaluate('el=>getComputedStyle(el).overflowY')
                 assert overflow=='auto',overflow
+                open_marker = summary.evaluate("""el=>{const marker=getComputedStyle(el,'::before');return [marker.content,marker.clipPath]}""")
+                assert open_marker[0] == closed_marker[0], open_marker
+                assert open_marker[1] != closed_marker[1], (closed_marker, open_marker)
                 summary.press('Space')
                 assert not chip.evaluate('el=>el.open')
-                assert '▸' in summary.evaluate("el=>getComputedStyle(el,'::before').content")
+                assert summary.evaluate("el=>getComputedStyle(el,'::before').clipPath") == closed_marker[1]
                 page.screenshot(path=str(args.out/f'chip-{width}-{font}-{index}.png'))
             page.evaluate('()=>__chip1519("read","{\\"x\\":1}")')
             name = page.locator('#fixture-chip .tname')

@@ -57,6 +57,119 @@ function fixture() {
   return { c, root, announcer, timers, advance, node };
 }
 
+function accessibleText(element) {
+  if (element == null || element.hidden || element.props?.hidden || element.props?.['aria-hidden'] === true || element.props?.['aria-hidden'] === 'true') return '';
+  if (typeof element === 'string') return element;
+  if (typeof element.props?.['aria-label'] === 'string') return element.props['aria-label'];
+  if (typeof element.data === 'string') return element.data;
+  return (element.children || []).map(accessibleText).join('');
+}
+
+function findElement(element, predicate) {
+  if (element == null || typeof element !== 'object') return null;
+  if (predicate(element)) return element;
+  for (const child of element.children || []) {
+    const found = findElement(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+
+function liveRendererFixture(tools) {
+  const { c, announcer, node } = fixture();
+  const outside = node('button', {}, []);
+  const fallback = node('div', {}, []);
+  const movedFocusedNodes = [];
+  c.document = { activeElement: outside, body: fallback, createTextNode: data => ({ data }) };
+  const domNode = (tag, props, children) => {
+    const element = node(tag, props, children);
+    const listeners = new Map();
+    for (const child of element.children) if (child && typeof child === 'object') child.parent = element;
+    Object.defineProperties(element, {
+      firstChild: { get() { return this.children[0] || null; } },
+      nextSibling: { get() {
+        const index = this.parent?.children.indexOf(this) ?? -1;
+        return index < 0 ? null : this.parent.children[index + 1] || null;
+      } },
+    });
+    element.insertBefore = function (child, reference) {
+      if (child === reference) return child;
+      if (child.parent) {
+        if (child.contains?.(c.document.activeElement)) movedFocusedNodes.push(child);
+        child.remove();
+      }
+      const index = reference == null ? this.children.length : this.children.indexOf(reference);
+      if (index < 0) throw new Error('reference is not a child');
+      this.children.splice(index, 0, child);
+      child.parent = this;
+      return child;
+    };
+    element.remove = function () {
+      if (!this.parent) return;
+      if (this.contains?.(c.document.activeElement)) c.document.activeElement = c.document.body;
+      const siblings = this.parent.children;
+      const index = siblings.indexOf(this);
+      if (index >= 0) siblings.splice(index, 1);
+      this.parent = null;
+    };
+    element.addEventListener = (type, listener) => {
+      const registered = listeners.get(type) || [];
+      registered.push(listener);
+      listeners.set(type, registered);
+    };
+    element.dispatchEvent = event => {
+      for (const listener of listeners.get(event.type) || []) listener.call(element, event);
+    };
+    return element;
+  };
+  const live = domNode('div', {}, []);
+  c.h = (tag, props, ...children) => domNode(tag, props, children);
+  c.S = {
+    current: 'session', messages: [], running: new Set(['session']), liveTools: tools,
+    liveRun: { id: 'run', ended: false }, streaming: '', thinking: '', showThinking: false, activity: null,
+    sessionSnapshot: null, invocations: [], planState: null, unfinished: null,
+  };
+  c.$ = id => id === 'live' ? live : id === 'chat-announcer' ? announcer : null;
+  c.liveRender = { session: 'session', root: live, who: domNode('div', {}, ['Formless']), rows: new Map() };
+  c.currentLiveText = () => ({ expanded: false });
+  c.isRunning = () => c.S.running.has(c.S.current);
+  c.withTranscriptLayout = render => render();
+  const animationFrames = [];
+  c.requestAnimationFrame = callback => { animationFrames.push(callback); return animationFrames.length; };
+  c.flushAnimationFrames = () => { for (const callback of animationFrames.splice(0)) callback(0); };
+  c.payload = () => null;
+  c.renderSessions = () => {};
+  c.note = () => {};
+  c.branchSummaryEvent = () => {};
+  c.scheduleForecast = () => {};
+  c.notifyFor = () => {};
+  c.renderPlan = () => {};
+  c.renderRunBanner = () => {};
+  c.clearLiveText = () => {};
+  c.setActivity = () => {};
+  c.runningTool = (_name, invocationId) => c.S.liveTools.find(tool => tool.invocationId === invocationId && tool.status === 'running');
+  const announcements = [];
+  c.announceChat = text => announcements.push(text);
+  c.scheduleEventRender = flags => { if (flags.live) c.renderLive({ newContent: !!flags.newContent }); };
+  c.forecastRevision = 0;
+  c.announcedRun = null;
+  c.lastAnnouncedFinishedRun = null;
+  c.completedRunAnswer = () => '';
+  vm.runInContext(fn('reconcileChildren') + fn('liveToolRow') + fn('updateLiveTool') + fn('focusedLiveTools') + fn('liveTree') + fn('renderLive') + fn('onEvent'), c);
+  const createLiveToolRow = c.liveToolRow;
+  c.liveToolRow = tool => {
+    const row = createLiveToolRow(tool);
+    row.node.style = {};
+    row.node.dataset = {};
+    const depthMarker = row.summary.firstChild;
+    depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
+    depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
+    row.mark.style = {};
+    return row;
+  };
+  return { c, live, outside, announcements, movedFocusedNodes };
+}
+
 test('transcript is not live and chat has a separate polite status announcer', () => {
   assert.match(html, /id="transcript"[^>]*tabindex="0"/);
   assert.doesNotMatch(html.match(/<div id="transcript"[^>]*>/)?.[0] || '', /aria-live|role="status"/);
@@ -129,7 +242,7 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   c.$ = id => id === 'chat-announcer' ? announcer : id === 'live' ? liveElement : null;
   let elapsed = '1s';
   c.elapsed = () => elapsed;
-  vm.runInContext(fn('onEvent') + fn('updateElapsedTimers'), c);
+  vm.runInContext(fn('focusedLiveTools') + fn('onEvent') + fn('updateElapsedTimers'), c);
 
   c.onEvent({ type: 'run_started', session_id: 'session', run_id: 'run' });
   c.onEvent({ type: 'message_delta', session_id: 'session', delta: 'A token' });
@@ -201,32 +314,224 @@ test('artifact Load more retry reopens its viewer when the original dialog has c
   assert.deepEqual(requests.map(request => request.offset), [0, 5, 0]);
 });
 
-test('live tool status name includes completion state and duration without timer text', () => {
+test('live tool disclosure labels arguments and subagent progress separately in every state', () => {
   const { c } = fixture();
-  const attribute = () => {
-    const values = {};
-    return { hidden: false, getAttribute: key => values[key] ?? null, setAttribute: (key, value) => { values[key] = value; } };
-  };
-  const tool = { status: 'running', name: 'read_file', version: 1, arguments: '{}', depth: 0, started: 0 };
-  const row = {
-    tool, node: { className: '', style: {}, dataset: {} }, summary: { firstChild: attribute() },
-    mark: { className: '', style: {}, textContent: '' }, name: { data: '' }, args: { data: '' },
-    status: { data: '' }, folded: { hidden: true, textContent: '' },
-    progressBox: { hidden: true }, progress: { hidden: true }, progressText: { data: '' },
-    stalled: { hidden: true, textContent: '' }, cancel: { hidden: true }, transcript: { hidden: true },
-    timer: { data: '' }, payloadInitialized: true, payloadArgs: '{}', payloadSubagent: undefined,
-  };
+  c.document = { createTextNode: data => ({ data }) };
+  c.liveRender = { rows: new Map() };
+  vm.runInContext(fn('liveToolRow'), c);
   vm.runInContext(fn('updateLiveTool'), c);
+  function prepareRow(tool) {
+    const row = c.liveToolRow(tool);
+    row.node.style = {};
+    row.node.dataset = {};
+    row.summary.firstChild = row.summary.children[0];
+    const depthMarker = row.summary.firstChild;
+    depthMarker.getAttribute = key => depthMarker.props[key] ?? null;
+    depthMarker.setAttribute = (key, value) => { depthMarker.props[key] = value; };
+    row.mark.style = {};
+    row.payloadInitialized = true;
+    row.payloadArgs = tool.arguments;
+    row.payloadSubagent = tool.subagent;
+    return row;
+  }
+  const tool = { status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const row = prepareRow(tool);
+
+  for (const [status, elapsedMs, expected] of [
+    ['running', null, 'Running · 2s'],
+    ['ok', 1234, 'Done · 1.2s'],
+    ['failed', 5678, 'Failed · 5.6s'],
+  ]) {
+    tool.status = status;
+    tool.elapsedMs = elapsedMs;
+    c.updateLiveTool(row, 0);
+    const name = accessibleText(row.summary);
+    assert.ok(name.startsWith(expected + ', tool: check_timer, arguments: args'), name);
+    assert.doesNotMatch(name, /progress:/);
+    assert.doesNotMatch(name, /(?:2s|1\.2s|5\.6s)check_timer/);
+    assert.equal((name.match(/(?:2s|1\.2s|5\.6s)/g) || []).length, 1, name);
+  }
+  c.summarizeArgs = () => '';
+  tool.status = 'running';
+  tool.elapsedMs = null;
   c.updateLiveTool(row, 0);
-  assert.equal(row.status.data, 'Running · 2s');
-  tool.status = 'failed';
-  tool.elapsedMs = 1234;
-  c.updateLiveTool(row, 0);
-  assert.equal(row.status.data, 'Failed · 1.2s');
-  assert.equal(row.timer.data, '1.2s');
-  assert.match(app, /const statusText = document\.createTextNode\(""\)/);
-  assert.match(app, /h\("span", \{ class: "sr-only", "data-live-status": "" \}, statusText\)/);
-  assert.match(app, /const mark = h\("span", \{ "aria-hidden": "true" \}\)/);
+  assert.doesNotMatch(accessibleText(row.summary), /arguments:/);
+
+  const subagent = { status: 'running', name: 'sub-agent: worker', version: 0, arguments: '', depth: 0, started: 0, subagent: 'child', step: 'step 2: answering' };
+  const subagentRow = prepareRow(subagent);
+  c.updateLiveTool(subagentRow, 0);
+  const subagentName = accessibleText(subagentRow.summary);
+  assert.ok(subagentName.startsWith('Running · 2s, tool: sub-agent: worker, progress: step 2: answering'), subagentName);
+  assert.doesNotMatch(subagentName, /arguments:/);
+});
+
+test('live top-level terminal disclosures retain existing focus without announcing', () => {
+  for (const [ok, status] of [[true, 'Done'], [false, 'Failed']]) {
+    const tool = { invocationId: 'top-level', status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+    const { c, live, announcements } = liveRendererFixture([tool]);
+    c.renderLive();
+    const row = c.liveRender.rows.get(tool);
+    c.document.activeElement = row.summary;
+
+    c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: tool.invocationId, tool_name: tool.name, ok, elapsed_ms: 1234 });
+
+    assert.equal(c.S.running.has('session'), true, 'the run can remain active after the tool ends');
+    assert.ok(live.children.includes(row.node), 'the focused live row remains rendered');
+    assert.equal(c.document.activeElement, row.summary, 'rendering the terminal state does not move focus');
+    assert.ok(accessibleText(row.summary).startsWith(status + ' · 1.2s, tool: check_timer'), accessibleText(row.summary));
+    assert.match(row.node.props.class, /\blive\b/, 'this is live-row evidence, not the historical chip');
+    const statusRegion = findElement(row.summary, child => child.props?.['data-live-status'] !== undefined);
+    assert.ok(statusRegion);
+    assert.equal(statusRegion.props.role, undefined);
+    assert.equal(statusRegion.props['aria-live'], undefined);
+    assert.deepEqual(announcements, [], 'tool completion does not add live-region announcements');
+
+    if (ok) {
+      c.onEvent({ type: 'run_finished', session_id: 'session', run_id: 'run', status: 'completed' });
+      c.renderLive();
+      assert.ok(c.S.liveTools.includes(tool), 'a focused live row survives the run-end state transition');
+      assert.ok(live.children.includes(row.node));
+      assert.equal(c.document.activeElement, row.summary);
+    }
+  }
+});
+
+test('nested terminal rows remain readable and completion does not steal focus elsewhere', () => {
+  for (const [ok, status] of [[true, 'Done'], [false, 'Failed']]) {
+    const parent = { invocationId: 'parent', status: 'running', name: 'run_agent', version: 0, arguments: '{}', depth: 0, started: 0 };
+    const child = { invocationId: 'nested', status: 'running', name: 'nested_task', version: 0, arguments: '{}', depth: 1, started: 0 };
+    const { c, live, announcements } = liveRendererFixture([parent, child]);
+    c.renderLive();
+    const row = c.liveRender.rows.get(child);
+    c.document.activeElement = row.summary;
+
+    c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: child.invocationId, tool_name: child.name, ok, elapsed_ms: 1234 });
+
+    assert.ok(live.children.includes(row.node), 'a nested terminal row remains visible under its running parent');
+    assert.equal(c.document.activeElement, row.summary);
+    assert.ok(accessibleText(row.summary).includes(status + ' · 1.2s, tool: nested_task'), accessibleText(row.summary));
+    assert.deepEqual(announcements, []);
+  }
+
+  const tool = { invocationId: 'unfocused', status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const { c, live, outside } = liveRendererFixture([tool]);
+  c.renderLive();
+  const row = c.liveRender.rows.get(tool);
+  c.document.activeElement = outside;
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: tool.invocationId, tool_name: tool.name, ok: true, elapsed_ms: 1234 });
+  assert.equal(live.children.includes(row.node), false, 'an unfocused top-level terminal row is not retained');
+  assert.equal(c.document.activeElement, outside, 'completion does not steal focus from another control');
+});
+
+test('a focused nested Done row survives owner completion while another tool keeps the run active', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0, handle: 'earlier-handle' };
+  const owner = { invocationId: 'owner', status: 'running', name: 'parent_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const child = { invocationId: 'child', status: 'running', name: 'nested_task', version: 0, arguments: '{}', depth: 1, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([earlier, owner, child]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const ownerRow = c.liveRender.rows.get(owner);
+  const childRow = c.liveRender.rows.get(child);
+  c.document.activeElement = childRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: child.invocationId, tool_name: child.name, ok: true, elapsed_ms: 1234 });
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: owner.invocationId, tool_name: owner.name, ok: true, elapsed_ms: 1234 });
+
+  assert.ok(c.S.running.has('session'), 'the run remains active after the owner completes');
+  assert.ok(live.children.includes(ownerRow.node));
+  assert.ok(live.children.includes(childRow.node));
+  assert.equal(c.document.activeElement, childRow.summary, 'the focused nested result survives owner completion');
+  assert.deepEqual(announcements, [], 'nested tool completion remains silent');
+
+  c.onEvent({ type: 'run_finished', session_id: 'session', run_id: 'run', status: 'completed' });
+  c.renderLive();
+  assert.ok(c.S.liveTools.includes(owner), 'run end retains the focused result owner');
+  assert.ok(c.S.liveTools.includes(child), 'run end retains the focused nested result');
+  assert.ok(live.children.includes(childRow.node));
+  assert.equal(c.document.activeElement, childRow.summary);
+  const announcementsBeforeFocusout = announcements.length;
+
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: childRow.summary, relatedTarget: outside });
+  c.flushAnimationFrames();
+
+  assert.ok(live.children.includes(earlierRow.node), 'the unrelated running tool remains visible');
+  assert.equal(live.children.includes(ownerRow.node), false, 'the unfocused completed owner is hidden');
+  assert.equal(live.children.includes(childRow.node), false, 'the child is hidden with its completed owner');
+  assert.ok(c.S.liveTools.includes(owner), 'focusout redraw leaves pruning to the run lifecycle');
+  assert.ok(c.S.liveTools.includes(child), 'focusout redraw preserves nested ownership');
+  assert.equal(c.document.activeElement, outside, 'focus remains where the user moved it');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focusout redraw adds no announcement');
+});
+
+test('parallel completion removes an obsolete earlier row without moving the focused terminal sibling', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const later = { invocationId: 'later', status: 'running', name: 'second_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const { c, live, announcements, movedFocusedNodes } = liveRendererFixture([earlier, later]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const laterRow = c.liveRender.rows.get(later);
+  c.document.activeElement = laterRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: later.invocationId, tool_name: later.name, ok: true, elapsed_ms: 1234 });
+  assert.equal(c.document.activeElement, laterRow.summary, 'the already-completed focused row remains focused');
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: earlier.invocationId, tool_name: earlier.name, ok: true, elapsed_ms: 1234 });
+
+  assert.ok(live.children.includes(laterRow.node));
+  assert.equal(live.children.includes(earlierRow.node), false);
+  assert.equal(c.document.activeElement, laterRow.summary, 'removing the earlier sibling does not blur the focused row');
+  assert.deepEqual(movedFocusedNodes, [], 'reconciliation removes stale siblings before considering moves');
+  assert.deepEqual(announcements, [], 'parallel completion adds no live-region announcements');
+});
+
+test('an unfocused retained terminal row is hidden without stealing focus or announcing', () => {
+  const tool = { invocationId: 'terminal', status: 'running', name: 'check_timer', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([tool]);
+  c.renderLive();
+  const row = c.liveRender.rows.get(tool);
+  c.document.activeElement = row.summary;
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: tool.invocationId, tool_name: tool.name, ok: true, elapsed_ms: 1234 });
+  c.onEvent({ type: 'run_finished', session_id: 'session', run_id: 'run', status: 'completed' });
+
+  assert.ok(c.S.liveTools.includes(tool), 'the focused result remains available through run end');
+  assert.ok(live.children.includes(row.node));
+  const announcementsBeforeFocusout = announcements.length;
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: row.summary, relatedTarget: outside });
+  assert.ok(c.S.liveTools.includes(tool), 'cleanup waits for the focus transition to settle');
+  c.flushAnimationFrames();
+
+  assert.ok(c.S.liveTools.includes(tool), 'normal run lifecycle retains ownership of state pruning');
+  assert.equal(live.children.includes(row.node), false, 'the row is no longer visible or tabbable');
+  assert.equal(c.document.activeElement, outside, 'cleanup does not move focus');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focus cleanup adds no live-region announcement');
+});
+
+test('leaving a completed top-level tool does not reparent its child under an earlier running tool', () => {
+  const earlier = { invocationId: 'earlier', status: 'running', name: 'first_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const parent = { invocationId: 'parent', status: 'running', name: 'parent_task', version: 0, arguments: '{}', depth: 0, started: 0 };
+  const child = { invocationId: 'child', status: 'ok', name: 'nested_task', version: 0, arguments: '{}', depth: 1, started: 0 };
+  const { c, live, outside, announcements } = liveRendererFixture([earlier, parent, child]);
+  c.renderLive();
+  const earlierRow = c.liveRender.rows.get(earlier);
+  const parentRow = c.liveRender.rows.get(parent);
+  const childRow = c.liveRender.rows.get(child);
+  c.document.activeElement = parentRow.summary;
+
+  c.onEvent({ type: 'tool_call_finished', session_id: 'session', run_id: 'run', invocation_id: parent.invocationId, tool_name: parent.name, ok: true, elapsed_ms: 1234 });
+  assert.ok(live.children.includes(parentRow.node), 'the focused completed parent remains available');
+  const announcementsBeforeFocusout = announcements.length;
+  c.document.activeElement = outside;
+  live.dispatchEvent({ type: 'focusout', target: parentRow.summary, relatedTarget: outside });
+  c.flushAnimationFrames();
+
+  assert.ok(live.children.includes(earlierRow.node), 'the earlier running tool remains visible');
+  assert.equal(live.children.includes(parentRow.node), false, 'the unfocused completed parent is hidden');
+  assert.equal(live.children.includes(childRow.node), false, 'the completed parent’s child does not reappear under the earlier tool');
+  assert.ok(c.S.liveTools.includes(parent), 'the parent remains in structural state');
+  assert.ok(c.S.liveTools.includes(child), 'the child remains owned by its parent in structural state');
+  assert.equal(c.document.activeElement, outside, 'focus remains where the user moved it');
+  assert.equal(announcements.length, announcementsBeforeFocusout, 'focusout redraw adds no live-region announcement');
 });
 
 test('toast dismissal, timer pause, and retry actions are accessible', async () => {

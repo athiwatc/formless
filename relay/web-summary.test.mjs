@@ -59,9 +59,10 @@ test('actual result chip omits one-line badges and preserves expanded text', () 
   const c = fixture();
   for (const [text, badge] of [['',null],['a\n',null],['a\r\n',null],['a\nb\n','2 lines'],['a\n\n','2 lines']]) {
     const chip = c.toolResultChip(text);
-    const stat = chip.children[0].children[2];
+    const stat = chip.children[0].children.find(child => child?.attrs?.class === 'tstat');
     assert.equal(stat?.children[0] ?? null, badge);
     assert.equal(chip.children[1].text, text);
+    if (badge) assert.ok(accessibleText(chip.children[0]).includes(', ' + badge));
   }
 });
 test('stored outcome, not tool payload text, controls the historical result status', () => {
@@ -83,20 +84,41 @@ test('stored outcome, not tool payload text, controls the historical result stat
     assert.equal(summary.tag, 'summary');
     assert.equal(summary.children[0].attrs['aria-label'], undefined);
     assert.equal(accessibleText(summary.children[0]), label);
-    assert.ok(accessibleText(summary).startsWith(label));
+    assert.ok(accessibleText(summary).startsWith(label + ', output: ' + c.truncate(text, 160)));
     assert.equal(chip.children[1].text, text);
   }
 });
 
 test('historical tool result names include the stored outcome and duration', () => {
   const c = fixture();
-  const chip = c.toolResultChip('output', '{"name":"read_file","is_error":true,"elapsed_ms":1234}');
-  const summary = chip.children[0];
-  const name = summary.children[0];
-  assert.equal(summary.tag, 'summary');
-  assert.equal(name.attrs['aria-label'], undefined);
-  assert.equal(accessibleText(name), 'read_file · failed · duration 1.2s');
-  assert.ok(accessibleText(summary).startsWith('read_file · failed · duration 1.2s'));
+  for (const [failed, state] of [[false, 'done'], [true, 'failed']]) {
+    const label = 'check_timer · ' + state + ' · duration 1.2s';
+    const meta = JSON.stringify({name: 'check_timer', is_error: failed, elapsed_ms: 1234});
+    const chip = c.toolResultChip('output', meta);
+    const summary = chip.children[0];
+    const name = summary.children[0];
+    assert.equal(summary.tag, 'summary');
+    assert.equal(name.attrs['aria-label'], undefined);
+    assert.equal(accessibleText(name), label);
+    assert.ok(accessibleText(summary).startsWith(label + ', output: output'));
+  }
+});
+
+test('disclosure markers use stable text-free clipped shapes and preserve reserved widths', () => {
+  const marker = styles.match(/\.chip summary::before, \.generated-details summary::before \{([^}]+)\}/)?.[1];
+  assert.ok(marker);
+  assert.match(marker, /content: ""/);
+  assert.match(marker, /width: \.75em; height: \.75em; flex: 0 0 \.75em/);
+  assert.match(marker, /background: var\(--muted\)/);
+  assert.match(marker, /clip-path: polygon\(0 15%, 55% 50%, 0 85%\)/);
+  assert.doesNotMatch(marker, /content: ["'][^"']+["']/);
+  assert.doesNotMatch(styles, /content: ["'][▸▾]["']/);
+  const openMarker = styles.match(/\.chip\[open\] summary::before, \.generated-details\[open\] summary::before \{([^}]+)\}/)?.[1];
+  assert.ok(openMarker);
+  assert.match(openMarker, /clip-path: polygon\(17% 15%, 83% 15%, 50% 65%\)/);
+  assert.doesNotMatch(openMarker, /transform:/);
+  assert.match(styles, /\.chip\.tool-call > summary::before \{ flex: 0 0 1em; \}/);
+  assert.match(styles, /\.chip\.result > summary::before \{ flex: 0 0 1em; \}/);
 });
 
 test('tool call summary exposes the tool name as content rather than a generic span label', () => {

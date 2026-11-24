@@ -4031,7 +4031,9 @@
       h("summary", null,
         h("span", { class: "tname" },
           h("span", { "aria-hidden": "true" }, "↳ "), label),
+        content ? h("span", { class: "sr-only" }, ", output: ") : null,
         h("span", { class: "targs" }, truncate(content, 160)),
+        lines > 1 ? h("span", { class: "sr-only" }, ", ") : null,
         lines > 1 ? h("span", { class: "tstat" }, lines + " lines") : null),
       payload(content));
     if (!refs.length) return chip;
@@ -4526,6 +4528,13 @@
   const rendered = new Map();
   const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };
   function reconcileChildren(parent, wanted) {
+    const wantedSet = new Set(wanted);
+    let child = parent.firstChild;
+    while (child) {
+      const next = child.nextSibling;
+      if (!wantedSet.has(child)) child.remove();
+      child = next;
+    }
     let cursor = parent.firstChild;
     for (const node of wanted) {
       if (node === cursor) cursor = cursor.nextSibling;
@@ -4927,7 +4936,15 @@
   /** The live calls to draw (the TUI's rule), each with how many
    * descendants it folds away: a node shows while it or an ancestor runs,
    * and under a node that finished successfully its descendants fold. */
-  function liveTree(calls) {
+  function liveTree(calls, retained = new Set()) {
+    const retainedAncestors = new Set();
+    const ancestors = [];
+    for (const call of calls) {
+      const depth = call.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (retained.has(call)) for (const [, ancestor] of ancestors) retainedAncestors.add(ancestor);
+      ancestors.push([depth, call]);
+    }
     const out = [];
     const stack = []; // [depth, running, open] of the current ancestors
     for (const c of calls) {
@@ -4936,8 +4953,8 @@
       const parentOpen = !stack.length || stack[stack.length - 1][2];
       const ancestorRunning = stack.some((s) => s[1]);
       const running = c.status === "running";
-      const visible = parentOpen && (running || ancestorRunning);
-      const open = visible && c.status !== "ok";
+      const visible = parentOpen && (running || ancestorRunning || retained.has(c));
+      const open = visible && (c.status !== "ok" || retainedAncestors.has(c));
       if (visible) out.push([c, 0]);
       else if (ancestorRunning && !parentOpen) {
         for (let i = out.length - 1; i >= 0; i--) {
@@ -4947,6 +4964,27 @@
       stack.push([d, running, open]);
     }
     return out;
+  }
+  function focusedLiveTools(tools) {
+    if (typeof document === "undefined" || typeof liveRender === "undefined" || !liveRender.rows) return new Set();
+    const active = document.activeElement;
+    const focused = new Set(tools.filter((tool) => {
+      if (tool.status === "running") return false;
+      const row = liveRender.rows.get(tool) || [...liveRender.rows.values()].find((candidate) =>
+        (tool.invocationId != null && candidate.tool.invocationId === tool.invocationId)
+        || (tool.handle && candidate.tool.handle === tool.handle)
+        || (tool.subagent && candidate.tool.subagent === tool.subagent));
+      return row?.node.contains?.(active) === true;
+    }));
+    const retained = new Set(focused);
+    const ancestors = [];
+    for (const tool of tools) {
+      const depth = tool.depth || 0;
+      while (ancestors.length && ancestors[ancestors.length - 1][0] >= depth) ancestors.pop();
+      if (focused.has(tool)) for (const [, ancestor] of ancestors) retained.add(ancestor);
+      ancestors.push([depth, tool]);
+    }
+    return retained;
   }
   /** A sub-agent's transcript (GetSubagent) in a dialog. */
   async function showSubagent(id) {
@@ -5052,7 +5090,7 @@
   }
   // Completed Markdown chunks and the unfinished tail keep their DOM identity.
   const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null, afterSeq: -1, messages: null, messageCount: -1 };
-  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null };
+  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null, focusoutRoot: null };
   const statusRender = { root: null, spinner: null, text: null };
   function streamingNode(text) {
     if (!liveDone.node || liveDone.session !== S.current) {
@@ -5120,6 +5158,9 @@
     const args = document.createTextNode("");
     const statusText = document.createTextNode("");
     const status = h("span", { class: "sr-only", "data-live-status": "" }, statusText);
+    const detailLabelText = document.createTextNode(", arguments: ");
+    const detailLabel = h("span", { class: "sr-only" }, detailLabelText);
+    detailLabel.hidden = true;
     const folded = h("span", { class: "tag" });
     const progress = h("progress", { max: "1", "aria-label": "Progress" });
     const progressText = document.createTextNode("");
@@ -5129,9 +5170,9 @@
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
     const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark, status,
-      h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
+      h("span", { class: "sr-only" }, ", tool: "), h("span", { class: "tname" }, name), detailLabel, h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "", "aria-hidden": "true" }, timer));
-    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, status: statusText, detailLabel, detailLabelText, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
     liveRender.rows.set(tool, row);
     return row;
   }
@@ -5162,7 +5203,10 @@
     const status = running ? "Running" : t.status === "ok" ? "Done" : "Failed";
     const duration = t.elapsedMs != null ? recordedDuration(t.elapsedMs) : elapsed(t.started);
     updateText(row.status, status + " · " + duration);
-    updateText(row.args, t.subagent ? t.step || "" : summarizeArgs(t.arguments || ""));
+    const args = t.subagent ? t.step || "" : summarizeArgs(t.arguments || "");
+    updateText(row.args, args);
+    updateText(row.detailLabelText, t.subagent ? ", progress: " : ", arguments: ");
+    if (row.detailLabel.hidden !== !args) row.detailLabel.hidden = !args;
     if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
     if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
     const hideProgress = !running || !t.progress;
@@ -5187,6 +5231,18 @@
   function renderLive({ newContent = false } = {}) {
     const live = $("live");
     if (!live) return;
+    if (liveRender.focusoutRoot !== live) {
+      liveRender.focusoutRoot = live;
+      live.addEventListener("focusout", (event) => {
+        const row = [...liveRender.rows.values()].find((candidate) => candidate.node.contains(event.target));
+        if (!row || row.tool.status === "running") return;
+        requestAnimationFrame(() => {
+          if (liveRender.root !== live || liveRender.session !== S.current || !S.liveTools.includes(row.tool)
+            || row.tool.status === "running" || row.node.contains(document.activeElement)) return;
+          renderLive();
+        });
+      });
+    }
     withTranscriptLayout(() => {
       const textState = currentLiveText();
       if (liveRender.session !== S.current || liveRender.root !== live) {
@@ -5207,7 +5263,8 @@
         liveRender.rows.clear();
       }
       const running = isRunning();
-      const tools = S.liveTools.filter((t) => t.status === "running");
+      const focused = focusedLiveTools(S.liveTools);
+      const tools = S.liveTools.filter((t) => t.status === "running" || focused.has(t));
       const children = [];
       if (running || S.streaming || tools.length) {
         children.push(liveRender.who);
@@ -5227,7 +5284,7 @@
           liveRender.thinking.scrollTop = expanded ? top : 0;
           children.push(liveRender.thinkingBox);
         }
-        for (const [tool, folded] of liveTree(S.liveTools)) {
+        for (const [tool, folded] of liveTree(S.liveTools, focused)) {
           const row = liveToolRow(tool);
           updateLiveTool(row, folded);
           children.push(row.node);
@@ -9744,7 +9801,8 @@
           }
           if (announcedRun?.session === ev.session_id && announcedRun.id === ev.run_id) announcedRun = null;
           clearLiveText();
-          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
+          const focused = focusedLiveTools(S.liveTools || []);
+          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle || focused.has(t)); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status === "abandoned") note("This run has ended; it cannot be resumed.");
