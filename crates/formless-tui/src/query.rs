@@ -79,7 +79,7 @@ mod tests {
         app.model_overlay = Some(ModelOverlay {
             picker: models(),
             meta: serde_json::json!({}),
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         app.model_overlay.as_mut().unwrap().picker.query = "model 日本語".into();
@@ -89,9 +89,16 @@ mod tests {
         app.model_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
         assert!(app.model_overlay.as_ref().unwrap().picker.query.is_empty());
         app.model_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.model_overlay.as_ref().unwrap().effort_idx, 1);
+        assert_eq!(
+            app.model_overlay
+                .as_ref()
+                .unwrap()
+                .selected_effort
+                .as_deref(),
+            Some("minimal")
+        );
         app.model_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(app.model_overlay.as_ref().unwrap().effort_idx, 0);
+        assert_eq!(app.model_overlay.as_ref().unwrap().selected_effort, None);
         let _ = picker_lines(&app.model_overlay.as_ref().unwrap().picker, 7, false);
         app.model_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         let lines = picker_lines(&app.model_overlay.as_ref().unwrap().picker, 7, false);
@@ -110,7 +117,7 @@ mod tests {
             app.model_overlay = Some(ModelOverlay {
                 picker: models(),
                 meta: serde_json::json!({}),
-                effort_idx: 0,
+                selected_effort: None,
                 default_only: false,
             });
             app.model_key(key);

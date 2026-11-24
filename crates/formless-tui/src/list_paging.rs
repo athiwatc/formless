@@ -264,7 +264,7 @@ mod tests {
                     .collect(),
             ),
             meta: serde_json::json!({}),
-            effort_idx: 0,
+            selected_effort: None,
             default_only: false,
         });
         key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
