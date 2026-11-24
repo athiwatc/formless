@@ -148,6 +148,24 @@ fn thai_search_does_not_end_before_a_combining_tone_mark() {
 }
 
 #[test]
+fn thai_search_allows_substrings_after_completed_combining_marks() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store
+        .create_session(Some("Thai substring search".into()))
+        .unwrap();
+    let message = store.append_message(&session.id, "user", "มีขาว").unwrap();
+    let marked_message = store.append_message(&session.id, "user", "ที่นี่").unwrap();
+
+    let hits = store.search_sessions("ขาว", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, message.id);
+
+    let hits = store.search_sessions("นี่", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, marked_message.id);
+}
+
+#[test]
 fn mixed_accented_latin_unicode_terms_preserve_non_latin_marks() {
     let store = Store::open_in_memory().unwrap();
     let session = store

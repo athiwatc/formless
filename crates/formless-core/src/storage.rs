@@ -8701,9 +8701,9 @@ fn contains_without_splitting_combining_marks(content: &str, term: &str) -> bool
     !term.is_empty()
         && content.match_indices(term).any(|(start, matched)| {
             let end = start + matched.len();
-            !content[..start]
+            !content[start..]
                 .chars()
-                .next_back()
+                .next()
                 .is_some_and(unicode_normalization::char::is_combining_mark)
                 && !content[end..]
                     .chars()
