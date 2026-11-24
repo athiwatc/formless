@@ -1421,13 +1421,9 @@ impl Daemon {
                 "This Run is finishing. Your comment was not saved; retry after it finishes.",
             )));
         }
-        let step = active
-            .as_ref()
-            .and_then(|run| self.with_reader(|st| st.run_steps(&run.run_id)).ok())
-            .unwrap_or(0);
         let mut meta = json!({"review_context":context});
         if let Some(run) = &active {
-            meta["steer"] = json!({"step":step,"run_id":run.run_id});
+            meta["steer"] = json!({"run_id":run.run_id});
         }
         let message = self.with_store(|st| {
             st.append_message_meta(

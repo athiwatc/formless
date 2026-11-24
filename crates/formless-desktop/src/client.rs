@@ -5636,6 +5636,7 @@ mod tests {
         engine
             .receive(ServerMessage::Event(Event::MessagesEdited {
                 session_id: "a".into(),
+                metadata_only: None,
             }))
             .unwrap();
         respond(&mut engine, id, snapshot("a", "canonical"));

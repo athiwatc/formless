@@ -292,6 +292,7 @@ pub struct Provider {
     native_sources: Option<Arc<FrozenAttachments>>,
     native_projection: Option<Arc<NativeProjection>>,
     request_policy: Option<RequestPolicy>,
+    request_dispatch_hook: Option<RequestDispatchHook>,
     probe_policy: Option<crate::probe_policy::ProbePolicy>,
     structured_output: Option<Arc<StructuredCall>>,
     http: reqwest::Client,
@@ -328,6 +329,7 @@ pub(crate) struct UsageAccountingFailure;
 /// Lifetime lease acquired before a model request and dropped after accounting.
 pub type RequestLease = Box<dyn std::any::Any + Send>;
 pub(crate) type RequestPolicy = Arc<dyn Fn(&Value) -> Result<()> + Send + Sync>;
+pub(crate) type RequestDispatchHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 pub type RequestHook = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RequestLease>> + Send>>
         + Send
@@ -1581,6 +1583,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            request_dispatch_hook: None,
             probe_policy: None,
             structured_output: None,
             cache_key: None,
@@ -1640,6 +1643,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            request_dispatch_hook: None,
             probe_policy: None,
             structured_output: None,
             cache_key: None,
@@ -1699,6 +1703,7 @@ impl Provider {
             native_sources: None,
             native_projection: None,
             request_policy: None,
+            request_dispatch_hook: None,
             probe_policy: None,
             structured_output: None,
             credential_paths: Some(paths),
@@ -1848,6 +1853,11 @@ impl Provider {
 
     pub(crate) fn with_request_policy(mut self, policy: RequestPolicy) -> Self {
         self.request_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn with_request_dispatch_hook(mut self, hook: RequestDispatchHook) -> Self {
+        self.request_dispatch_hook = Some(hook);
         self
     }
     fn completion_dispatch(&self, options: &CompletionOptions) -> Self {
@@ -2956,6 +2966,9 @@ impl Provider {
                 .json(&b);
                 if let Some(policy) = &self.probe_policy {
                     policy.before_send()?;
+                }
+                if let Some(hook) = &self.request_dispatch_hook {
+                    hook()?;
                 }
                 if let Some(projection) = &self.native_projection {
                     projection.sent_payloads.locked().observe(&b);
