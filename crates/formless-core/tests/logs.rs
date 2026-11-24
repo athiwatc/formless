@@ -49,7 +49,10 @@ fn zero_retention_unlinks_only_the_live_name_with_an_open_writer() {
     let contents = b"keep these bytes";
     std::fs::write(&live, contents).unwrap();
     std::fs::hard_link(&live, &other).unwrap();
-    let mut writer = std::fs::OpenOptions::new().append(true).open(&live).unwrap();
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap();
 
     assert!(rotate_if_needed(&f.paths, 1, 0).unwrap());
     assert_eq!(
