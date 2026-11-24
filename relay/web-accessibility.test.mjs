@@ -155,6 +155,46 @@ test('onEvent announces no streaming tokens or timer ticks and reads the final a
   assert.deepEqual(announceCalls, ['Run started', 'Running read_file', 'Answer finished. The complete answer']);
 });
 
+test('artifact Load more retry reopens its viewer when the original dialog has closed', async () => {
+  const { c } = fixture();
+  const id = '12345678-1234-1234-1234-123456789012';
+  const responses = [
+    { text: 'first', end: 5, total_chars: 10, bytes: 10 },
+    new Error('offline'),
+    { text: 'fresh', end: 5, total_chars: 10, bytes: 10 },
+  ];
+  const requests = [];
+  const viewers = [];
+  c.document = { activeElement: null };
+  c.request = async request => {
+    requests.push(request);
+    const response = responses.shift();
+    if (response instanceof Error) throw response;
+    return response;
+  };
+  c.openDialog = viewer => { viewer.isConnected = true; viewers.push(viewer); };
+  c.closeDialog = viewer => { viewer.isConnected = false; };
+  vm.runInContext(fn('openArtifact'), c);
+  await c.openArtifact(id);
+  const descendants = node => [node, ...node.children.flatMap(child => typeof child === 'object' ? descendants(child) : [])];
+  const button = (viewer, label) => descendants(viewer).find(node => node.tag === 'button' && node.children[0] === label);
+  const firstViewer = viewers[0];
+  const firstPre = descendants(firstViewer).find(node => node.tag === 'pre');
+  firstPre.textContent = 'first';
+  let retry;
+  c.toast = (_message, _error, action) => { retry = action.run; };
+  await button(firstViewer, 'Load more').onclick();
+  assert.equal(typeof retry, 'function');
+  button(firstViewer, 'Close').onclick();
+  await retry();
+  assert.equal(viewers.length, 2);
+  assert.equal(firstViewer.isConnected, false);
+  assert.equal(viewers[1].isConnected, true);
+  assert.equal(firstPre.textContent, 'first', 'retry does not mutate the detached viewer');
+  assert.equal(descendants(viewers[1]).find(node => node.tag === 'pre').children[0], 'fresh');
+  assert.deepEqual(requests.map(request => request.offset), [0, 5, 0]);
+});
+
 test('live tool status name includes completion state and duration without timer text', () => {
   const { c } = fixture();
   const attribute = () => {

@@ -3599,6 +3599,7 @@
     if (!first) return;
     let text = first.text;
     let end = first.end;
+    let viewer;
     const pre = h("pre", { class: "diff artifact-text" }, text);
     const more = h("button", { class: "btn small", type: "button" }, "Load more");
     const status = h("span", { class: "muted" });
@@ -3607,8 +3608,9 @@
       more.hidden = end >= first.total_chars;
     };
     const loadMore = async () => {
+      if (!viewer?.isConnected) return openArtifact(id);
       const r = await act({ type: "get_artifact", id, offset: end }, null, undefined, loadMore);
-      if (!r) return;
+      if (!r || !viewer.isConnected) return;
       text += r.text;
       end = r.end;
       pre.textContent = text;
@@ -3633,7 +3635,7 @@
       }
     };
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
-    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
+    viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
         h("h2", null, "Output " + id.slice(0, 8) + " · " + first.bytes + " bytes"),
         pre,
