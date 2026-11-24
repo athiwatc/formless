@@ -17,6 +17,21 @@ use std::{
 };
 
 const CAPABILITY: &str = local_harness::TOPIC_CAPABILITY_ENV;
+pub(crate) const ACP_PLANNER_READINESS: &str = "For ACP, only installed profiles with signed_in=true are executable; signed_in=null or false is unavailable. Cursor, Cline, Junie, Auggie, and Devin are unavailable because Formless has not integrated a supported non-model sign-in check for them. Signing in alone will not unblock them. Explain this limitation and request the user's explicit approval through topic_request_harness_substitute before using a supported substitute. For explicit sign-in errors on supported profiles, direct the user to sign in and retry.";
+
+#[cfg(test)]
+mod planner_readiness_tests {
+    use super::ACP_PLANNER_READINESS;
+
+    #[test]
+    fn unverified_profiles_are_never_advertised_as_ready() {
+        for id in ["Cursor", "Cline", "Junie", "Auggie", "Devin"] {
+            assert!(ACP_PLANNER_READINESS.contains(id));
+        }
+        assert!(ACP_PLANNER_READINESS.contains("Signing in alone will not unblock"));
+        assert!(ACP_PLANNER_READINESS.contains("explicit approval"));
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -487,7 +502,7 @@ impl Daemon {
             if self.shutdown.is_cancelled(){bail!("daemon shutting down");}
             if self.with_reader(|st|st.get_topic(&topic_id))?.is_none_or(|topic|topic.status!=TopicStatus::Running){bail!("topic stopped during readiness probes");}
             if self.runs.locked().contains_key(&session){bail!("Topic Chat already has an active model run");}
-            let kickoff=format!("{kickoff}\nFresh local harness availability (ready means installed && signed_in != false; unknown auth is ready):\n{}\nNever launch an unready harness. Ask the user through topic_request_harness_substitute to sign in and retry, approve a substitute for one feature+step, or skip. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
+            let kickoff=format!("{kickoff}\nFresh local harness availability:\n{}\n{ACP_PLANNER_READINESS}\nNever launch an unready harness. Saved permission rules and topic limits are user controls, not model tools.\n",serde_json::to_string(&availability)?);
             let daemon = self.clone();
             tokio::spawn(async move {
                 GENERATED_MESSAGE
@@ -705,7 +720,12 @@ impl Daemon {
                 } else {
                     "not signed in"
                 });
-            bail!("{:?} is not ready: {detail}. Install/sign in and retry, or ask the user with topic_request_harness_substitute",step.harness);
+            let retry_guidance = if availability.installed && missing_acp_executable {
+                "Check the selected ACP executable/profile"
+            } else {
+                "Install/sign in"
+            };
+            bail!("{:?} is not ready: {detail}. {retry_guidance} and retry, or ask the user with topic_request_harness_substitute",step.harness);
         }
         if step.harness == HarnessKind::Antigravity {
             local_harness::antigravity::require_selected_executable(

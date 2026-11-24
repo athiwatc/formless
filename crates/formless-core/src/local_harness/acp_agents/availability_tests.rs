@@ -89,13 +89,21 @@ done
         }
     }
 
-    fn probe(&self, id: &str) -> HarnessAvailability {
-        let result = availability(id, Some(self.executable.clone()), &self.environment);
+    fn probe_with_executable(&self, id: &str) -> AvailabilityWithExecutable {
+        let result =
+            availability_with_executable(id, Some(self.executable.clone()), &self.environment);
         let cwd = fs::read_to_string(self.root.0.join("cwd")).unwrap_or_else(|error| {
-            panic!("{id}: {result:?}; fixture did not record cwd: {error}")
+            panic!(
+                "{id}: {:?}; fixture did not record cwd: {error}",
+                result.availability
+            )
         });
         assert!(!Path::new(&cwd).exists(), "probe cwd must be removed");
         result
+    }
+
+    fn probe(&self, id: &str) -> HarnessAvailability {
+        self.probe_with_executable(id).availability
     }
 
     fn session(&mut self, value: Value) {
@@ -109,7 +117,8 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
     let captured: Value = serde_json::from_str(include_str!("captured.json")).unwrap();
     for id in agent_ids() {
         let fixture = Fixture::new(id);
-        let result = fixture.probe(id);
+        let readiness = fixture.probe_with_executable(id);
+        let result = &readiness.availability;
         assert_eq!(result.kind, HarnessKind::Acp);
         assert_eq!(result.acp_agent.as_deref(), Some(*id));
         assert!(result.installed, "{id}: {result:?}");
@@ -122,16 +131,38 @@ fn captured_readiness_auth_errors_and_unverifiable_successes() {
         );
         if matches!(*id, "junie" | "auggie" | "devin") {
             assert_eq!(result.signed_in, None, "{id}: {result:?}");
-            assert!(result
-                .detail
-                .unwrap()
-                .contains("not verifiable before a prompt"));
+            let detail = result.detail.as_deref().unwrap();
+            assert!(
+                detail.contains("unavailable for execution"),
+                "{id}: {detail}"
+            );
+            assert!(
+                detail.contains("Signing in alone will not unblock"),
+                "{id}: {detail}"
+            );
+            assert!(readiness.executable.is_none(), "{id}: {result:?}");
+            assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
         } else {
             assert_eq!(result.signed_in, Some(false), "{id}: {result:?}");
-            assert_eq!(
-                result.detail.as_deref(),
-                Some(spec(id).unwrap().not_signed_in)
+            let detail = result.detail.as_deref().unwrap();
+            assert!(
+                detail.contains(spec(id).unwrap().not_signed_in),
+                "{id}: {detail}"
             );
+            assert!(detail.contains("Formless did not perform ACP authentication"));
+            assert!(detail.contains("not launchable"));
+            if session_auth_policy(id) == Some(SessionAuthPolicy::Unverifiable) {
+                assert_eq!(result.signed_in, Some(false), "{id}: {result:?}");
+                assert!(detail.contains("Signing in alone will not unblock"));
+            }
+            if captured[id]["initialize"]["result"]["authMethods"]
+                .as_array()
+                .is_some_and(|methods| !methods.is_empty())
+            {
+                assert!(detail.contains("Advertised ACP authentication methods"));
+            }
+            assert!(readiness.executable.is_none(), "{id}: {result:?}");
+            assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
         }
     }
 }
@@ -144,10 +175,11 @@ fn grok_readiness_signed_in_signed_out_and_missing() {
     assert!(signed_out.installed);
     assert_eq!(signed_out.version.as_deref(), Some("1.0.92"));
     assert_eq!(signed_out.signed_in, Some(false));
-    assert_eq!(
-        signed_out.detail.as_deref(),
-        Some(crate::local_harness::grok::AUTH_HINT)
-    );
+    assert!(signed_out
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains(crate::local_harness::grok::AUTH_HINT));
 
     fixture.session(json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"grok-ready"}}));
     let signed_in = fixture.probe("grok");
@@ -218,31 +250,66 @@ fn readiness_initialize_auth_error_uses_the_sign_in_hint() {
             .to_string()
             .into(),
     );
-    let result = fixture.probe("gemini");
-    assert!(result.installed);
-    assert_eq!(result.signed_in, Some(false));
-    assert_eq!(result.version, None);
-    assert_eq!(
-        result.detail.as_deref(),
-        Some(spec("gemini").unwrap().not_signed_in)
-    );
+    let result = fixture.probe_with_executable("gemini");
+    assert!(result.availability.installed);
+    assert_eq!(result.availability.signed_in, Some(false));
+    assert_eq!(result.availability.version, None);
+    let detail = result.availability.detail.as_deref().unwrap();
+    assert!(detail.contains(spec("gemini").unwrap().not_signed_in));
+    assert!(detail.contains("No ACP authentication methods were advertised"));
+    assert!(detail.contains("not launchable"));
+    assert!(result.executable.is_none());
+    assert!(result.executable_argv0.is_none());
 }
 
 #[test]
-fn readiness_success_only_proves_sign_in_for_profiles_requiring_auth() {
+fn readiness_session_success_uses_profile_auth_policy_not_method_presence() {
+    let captured: Value = serde_json::from_str(include_str!("captured.json")).unwrap();
+    for id in ["gemini", "kimi"] {
+        assert!(!captured[id]["initialize"]["result"]["authMethods"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
     for id in agent_ids() {
         let mut fixture = Fixture::new(id);
         fixture.session(json!({"jsonrpc":"2.0", "id":2, "result":{"sessionId":"ready"}}));
-        let result = fixture.probe(id);
-        assert_eq!(
-            result.signed_in,
-            if matches!(*id, "junie" | "auggie" | "devin") {
-                None
-            } else {
-                Some(true)
-            },
-            "{id}: {result:?}"
-        );
+        let readiness = fixture.probe_with_executable(id);
+        let result = &readiness.availability;
+        match session_auth_policy(id).unwrap() {
+            SessionAuthPolicy::Required => {
+                assert_eq!(result.signed_in, Some(true), "{id}: {result:?}");
+                assert!(readiness.executable.is_some(), "{id}: {result:?}");
+            }
+            SessionAuthPolicy::Unverifiable => {
+                assert_eq!(result.signed_in, None, "{id}: {result:?}");
+                let detail = result.detail.as_deref().unwrap();
+                assert!(
+                    detail.contains("unavailable for execution"),
+                    "{id}: {detail}"
+                );
+                assert!(
+                    detail.contains("Signing in alone will not unblock"),
+                    "{id}: {detail}"
+                );
+                assert!(readiness.executable.is_none(), "{id}: {result:?}");
+                assert!(readiness.executable_argv0.is_none(), "{id}: {result:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn unverified_profile_successes_remain_unlaunchable() {
+    for id in ["cursor", "cline", "junie", "auggie", "devin"] {
+        let mut fixture = Fixture::new(id);
+        fixture.session(json!({"jsonrpc":"2.0", "id":2, "result":{"sessionId":"simulated"}}));
+        let readiness = fixture.probe_with_executable(id);
+        assert!(readiness.availability.installed, "{id}");
+        assert_eq!(readiness.availability.signed_in, None, "{id}");
+        assert!(readiness.executable.is_none(), "{id}");
+        assert!(readiness.executable_argv0.is_none(), "{id}");
     }
 }
 
@@ -277,16 +344,27 @@ fn readiness_unknown_agent_and_relative_override_have_actionable_details() {
 #[test]
 fn readiness_other_errors_and_empty_sessions_are_unknown() {
     let mut fixture = Fixture::new("gemini");
-    for session in [
-        json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"unavailable"}}),
-        json!({"jsonrpc":"2.0","id":2,"result":{}}),
+    for (session, expected_detail) in [
+        (
+            json!({"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"unavailable"}}),
+            "authentication status is unverified",
+        ),
+        (
+            json!({"jsonrpc":"2.0","id":2,"result":{}}),
+            "readiness is unverified",
+        ),
     ] {
         fixture.session(session);
-        let result = fixture.probe("gemini");
-        assert!(result.installed);
-        assert_eq!(result.version.as_deref(), Some("0.70.0"));
-        assert_eq!(result.signed_in, None);
-        assert!(result.detail.is_some());
+        let result = fixture.probe_with_executable("gemini");
+        assert!(result.availability.installed);
+        assert_eq!(result.availability.version.as_deref(), Some("0.70.0"));
+        assert_eq!(result.availability.signed_in, None);
+        let detail = result.availability.detail.as_deref().unwrap();
+        assert!(detail.contains(expected_detail));
+        assert!(detail.contains("not launchable"));
+        assert!(detail.contains("oauth-personal"));
+        assert!(result.executable.is_none());
+        assert!(result.executable_argv0.is_none());
     }
     fixture.environment.insert(
         "PROBE_INITIALIZE".into(),
@@ -294,10 +372,35 @@ fn readiness_other_errors_and_empty_sessions_are_unknown() {
             .to_string()
             .into(),
     );
-    let result = fixture.probe("gemini");
-    assert!(result.installed);
-    assert_eq!(result.signed_in, None);
-    assert!(result.detail.unwrap().contains("ACP v1"));
+    let result = fixture.probe_with_executable("gemini");
+    assert!(result.availability.installed);
+    assert_eq!(result.availability.signed_in, None);
+    let detail = result.availability.detail.as_deref().unwrap();
+    assert!(detail.contains("ACP protocol or identity mismatch"));
+    assert!(detail.contains("ACP v1"));
+    assert!(result.executable.is_none());
+    assert!(result.executable_argv0.is_none());
+}
+
+#[test]
+fn readiness_identity_mismatch_is_not_launchable() {
+    let mut fixture = Fixture::new("cline");
+    let mut initialize: Value = serde_json::from_str(include_str!("captured.json")).unwrap();
+    initialize["cline"]["initialize"]["result"]["agentInfo"]["name"] = json!("other-agent");
+    fixture.environment.insert(
+        "PROBE_INITIALIZE".into(),
+        initialize["cline"]["initialize"].to_string().into(),
+    );
+
+    let readiness = fixture.probe_with_executable("cline");
+
+    assert!(readiness.availability.installed);
+    assert_eq!(readiness.availability.signed_in, None);
+    let detail = readiness.availability.detail.as_deref().unwrap();
+    assert!(detail.contains("ACP protocol or identity mismatch"));
+    assert!(detail.contains("Expected ACP agentInfo.name `cline`."));
+    assert!(readiness.executable.is_none());
+    assert!(readiness.executable_argv0.is_none());
 }
 
 #[test]
@@ -312,24 +415,26 @@ fn readiness_timeout_is_unknown_and_retains_an_initialized_version() {
             fixture.root.0.join("pid").into_os_string(),
         );
         let start = Instant::now();
-        let result = with_timeout(
+        let result = with_timeout_with_executable(
             "gemini",
             Some(fixture.executable.clone()),
             &fixture.environment,
             Duration::from_millis(500),
         );
         assert!(start.elapsed() < Duration::from_secs(3));
-        assert!(result.installed);
-        assert_eq!(result.signed_in, None);
+        assert!(result.availability.installed);
+        assert_eq!(result.availability.signed_in, None);
         assert_eq!(
-            result.version.as_deref(),
+            result.availability.version.as_deref(),
             if method == "initialize" {
                 None
             } else {
                 Some("0.70.0")
             }
         );
-        assert!(result.detail.unwrap().contains("timed out"));
+        assert!(result.availability.detail.unwrap().contains("timed out"));
+        assert!(result.executable.is_none());
+        assert!(result.executable_argv0.is_none());
         let cwd = fs::read_to_string(fixture.root.0.join("cwd")).unwrap();
         assert!(!Path::new(&cwd).exists());
         #[cfg(target_os = "linux")]

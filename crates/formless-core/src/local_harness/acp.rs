@@ -503,16 +503,18 @@ pub fn probe(
 
 pub(super) struct SessionProbe {
     pub version: Option<String>,
+    pub auth_methods: Vec<String>,
     pub session: Result<std::result::Result<Value, i64>>,
 }
 
-/// A bounded readiness check, without a bridge, prompt or authentication request.
+/// A bounded readiness check that records auth methods but does not authenticate.
 pub(super) fn probe_session(
     spec: &AgentSpec,
     request: &HarnessRequest,
     timeout: Duration,
 ) -> SessionProbe {
     let mut version = None;
+    let mut auth_methods = Vec::new();
     let cancel = CancellationToken::new();
     let timer = cancel.clone();
     let (stop, stopped) = mpsc::channel();
@@ -529,6 +531,13 @@ pub(super) fn probe_session(
             Ok(initialized) => initialized,
             Err(code) => return Ok(Err(code)),
         };
+        auth_methods = initialized
+            .get("authMethods")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|method| method.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
         version = initialized
             .pointer("/agentInfo/version")
             .or_else(|| initialized.pointer("/_meta/agentVersion"))
@@ -544,6 +553,7 @@ pub(super) fn probe_session(
     let _ = stop.send(());
     SessionProbe {
         version,
+        auth_methods,
         session: if cancel.is_cancelled() {
             Err(anyhow!("ACP readiness probe timed out."))
         } else {
@@ -634,6 +644,43 @@ pub(super) fn agent_environment(request: &HarnessRequest) -> BTreeMap<OsString, 
         environment.remove(&OsString::from(name));
     }
     environment
+}
+
+fn anchor_relative_search_path(path: &OsStr, base: &Path) -> Result<OsString> {
+    let entries = if path.is_empty() {
+        vec![base.to_path_buf()]
+    } else {
+        std::env::split_paths(path)
+            .map(|entry| {
+                if entry.is_absolute() {
+                    entry
+                } else {
+                    base.join(entry)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    std::env::join_paths(entries).context("could not anchor relative ACP PATH entries")
+}
+
+fn path_for_agent_directory(path: &OsStr) -> Result<OsString> {
+    let entries = std::env::split_paths(path).collect::<Vec<_>>();
+    if !path.is_empty() && entries.iter().all(|entry| entry.is_absolute()) {
+        return Ok(path.to_os_string());
+    }
+    let base = std::env::current_dir().context("could not resolve daemon working directory")?;
+    anchor_relative_search_path(path, &base)
+}
+
+fn is_path_environment_variable(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().eq_ignore_ascii_case("PATH")
+    }
+    #[cfg(not(windows))]
+    {
+        name == OsStr::new("PATH")
+    }
 }
 
 /// The agent and every process it starts (MCP servers, tools); dropping it kills them all.
@@ -744,25 +791,37 @@ impl AgentProcess {
             use std::os::unix::process::CommandExt;
             command.arg0(argv0);
         }
-        command
-            .args((spec.args)(request))
-            .current_dir(&request.cwd)
-            .env_clear()
-            .envs(std::env::vars_os().filter(|(name, _)| {
+        let mut child_environment = std::env::vars_os()
+            .filter(|(name, _)| {
                 !request
                     .mcp_env_vars
                     .iter()
                     .map(String::as_str)
                     .chain(spec.strip_env.iter().copied())
                     .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(agent_environment(request).into_iter().filter(|(name, _)| {
-                !spec
-                    .strip_env
-                    .iter()
-                    .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
-            }))
-            .envs(spec.set_env.iter().copied())
+            })
+            .collect::<Vec<_>>();
+        child_environment.extend(agent_environment(request).into_iter().filter(|(name, _)| {
+            !spec
+                .strip_env
+                .iter()
+                .any(|var| name.as_os_str() == std::ffi::OsStr::new(var))
+        }));
+        child_environment.extend(
+            spec.set_env
+                .iter()
+                .map(|(name, value)| (OsString::from(*name), OsString::from(*value))),
+        );
+        for (name, value) in &mut child_environment {
+            if is_path_environment_variable(name) {
+                *value = path_for_agent_directory(value)?;
+            }
+        }
+        command
+            .args((spec.args)(request))
+            .current_dir(&request.cwd)
+            .env_clear()
+            .envs(child_environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -1525,6 +1584,49 @@ mod tests {
             override_path
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relative_path_entries_are_anchored_to_the_daemon_directory() {
+        let daemon_cwd = std::env::temp_dir().join("formless-daemon-cwd");
+        let relative = PathBuf::from("repository/bin");
+        let absolute = std::env::temp_dir().join("system/bin");
+        let path = std::env::join_paths([relative.as_os_str(), absolute.as_os_str()]).unwrap();
+
+        let anchored = anchor_relative_search_path(&path, &daemon_cwd).unwrap();
+
+        assert_eq!(
+            std::env::split_paths(&anchored).collect::<Vec<_>>(),
+            vec![daemon_cwd.join(&relative), absolute.clone()]
+        );
+
+        let path_with_empty_entries = std::env::join_paths([
+            relative.as_os_str(),
+            OsStr::new(""),
+            absolute.as_os_str(),
+            OsStr::new(""),
+        ])
+        .unwrap();
+        let anchored_with_empty_entries =
+            anchor_relative_search_path(&path_with_empty_entries, &daemon_cwd).unwrap();
+        assert_eq!(
+            std::env::split_paths(&anchored_with_empty_entries).collect::<Vec<_>>(),
+            vec![
+                daemon_cwd.join(&relative),
+                daemon_cwd.clone(),
+                absolute.clone(),
+                daemon_cwd.clone(),
+            ]
+        );
+
+        let anchored_empty = anchor_relative_search_path(OsStr::new(""), &daemon_cwd).unwrap();
+        assert_eq!(anchored_empty.as_os_str(), daemon_cwd.as_os_str());
+
+        let absolute_only = absolute.as_os_str().to_os_string();
+        assert_eq!(
+            path_for_agent_directory(&absolute_only).unwrap(),
+            absolute_only
+        );
     }
 
     #[cfg(unix)]

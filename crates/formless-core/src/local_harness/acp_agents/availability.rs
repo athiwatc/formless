@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, ffi::OsString, fs, path::PathBuf, time::Duratio
 
 use formless_protocol::{HarnessAvailability, HarnessKind};
 
-use super::{acp, require_spec, session_requires_auth, HarnessRequest, StepAccess};
+use super::{
+    acp, require_spec, session_auth_policy, AgentCompatibilityError, HarnessRequest,
+    SessionAuthPolicy, StepAccess,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const BRIDGE_ENV: &[&str] = &[
@@ -29,22 +32,38 @@ pub(crate) struct AvailabilityWithExecutable {
     pub executable_argv0: Option<OsString>,
 }
 
+fn unlaunchable(availability: HarnessAvailability) -> AvailabilityWithExecutable {
+    AvailabilityWithExecutable {
+        availability,
+        executable: None,
+        executable_argv0: None,
+    }
+}
+
+fn auth_methods_detail(methods: &[String]) -> String {
+    if methods.is_empty() {
+        "No ACP authentication methods were advertised.".into()
+    } else {
+        format!(
+            "Advertised ACP authentication methods: {}.",
+            methods.join(", ")
+        )
+    }
+}
+
+fn unverifiable_auth_detail(id: &str, sign_in: &str, methods: &[String]) -> String {
+    format!(
+        "ACP profile `{id}` is unavailable for execution because Formless has not integrated a supported non-model sign-in check. {sign_in} Signing in alone will not unblock it; ask the user to approve a supported substitute. This readiness result is not launchable. {}",
+        auth_methods_detail(methods)
+    )
+}
+
 pub(crate) fn availability_with_executable(
     id: &str,
     executable: Option<PathBuf>,
     environment: &BTreeMap<OsString, OsString>,
 ) -> AvailabilityWithExecutable {
     with_timeout_with_executable(id, executable, environment, TIMEOUT)
-}
-
-#[cfg(test)]
-fn with_timeout(
-    id: &str,
-    executable: Option<PathBuf>,
-    environment: &BTreeMap<OsString, OsString>,
-    timeout: Duration,
-) -> HarnessAvailability {
-    with_timeout_with_executable(id, executable, environment, timeout).availability
 }
 
 fn with_timeout_with_executable(
@@ -120,11 +139,7 @@ fn with_timeout_with_executable(
         Ok(cwd) => cwd,
         Err(error) => {
             result.detail = Some(format!("Could not create ACP probe directory: {error}"));
-            return AvailabilityWithExecutable {
-                availability: result,
-                executable: Some(program),
-                executable_argv0: Some(executable_argv0.clone()),
-            };
+            return unlaunchable(result);
         }
     };
     let mut environment = environment.clone();
@@ -147,27 +162,67 @@ fn with_timeout_with_executable(
     };
     let probe = acp::probe_session(spec, &request, timeout);
     result.version = probe.version;
+    let auth_methods = probe.auth_methods;
     match probe.session {
         Ok(Err(code)) if spec.auth_error_codes.contains(&code) => {
             result.signed_in = Some(false);
-            result.detail = Some(spec.not_signed_in.into());
+            result.detail = Some(
+                if session_auth_policy(id) == Some(SessionAuthPolicy::Unverifiable) {
+                    format!(
+                    "ACP readiness explicitly reported authentication required (JSON-RPC error {code}); signed-in status is false. Formless did not perform ACP authentication. {}",
+                    unverifiable_auth_detail(id, spec.not_signed_in, &auth_methods)
+                )
+                } else {
+                    format!(
+                    "ACP readiness reported authentication required (JSON-RPC error {code}). {} Formless did not perform ACP authentication; this readiness result is not launchable. {}",
+                    spec.not_signed_in,
+                    auth_methods_detail(&auth_methods)
+                )
+                },
+            );
+            return unlaunchable(result);
         }
         Ok(Ok(session))
             if session["sessionId"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty()) =>
         {
-            if session_requires_auth(id) {
-                result.signed_in = Some(true);
-            } else {
-                result.detail = Some("Sign-in not verifiable before a prompt: this agent opens unauthenticated sessions.".into());
+            match session_auth_policy(id).expect("registered ACP profile has an auth policy") {
+                SessionAuthPolicy::Required => result.signed_in = Some(true),
+                SessionAuthPolicy::Unverifiable => {
+                    result.detail = Some(unverifiable_auth_detail(
+                        id,
+                        spec.not_signed_in,
+                        &auth_methods,
+                    ));
+                    return unlaunchable(result);
+                }
             }
         }
-        Ok(Ok(_)) => result.detail = Some("ACP session/new returned no session id.".into()),
-        Ok(Err(code)) => {
-            result.detail = Some(format!("ACP readiness failed (JSON-RPC error {code})."))
+        Ok(Ok(_)) => {
+            result.detail = Some(format!(
+                "ACP session/new returned no session id; readiness is unverified and this result is not launchable. {}",
+                auth_methods_detail(&auth_methods)
+            ));
+            return unlaunchable(result);
         }
-        Err(error) => result.detail = Some(format!("ACP readiness is unknown: {error:#}")),
+        Ok(Err(code)) => {
+            result.detail = Some(format!(
+                "ACP readiness failed (JSON-RPC error {code}); authentication status is unverified and this result is not launchable. {} Formless does not perform ACP authentication.",
+                auth_methods_detail(&auth_methods)
+            ));
+            return unlaunchable(result);
+        }
+        Err(error) if error.downcast_ref::<AgentCompatibilityError>().is_some() => {
+            result.detail = Some(format!("ACP protocol or identity mismatch: {error:#}"));
+            return unlaunchable(result);
+        }
+        Err(error) => {
+            result.detail = Some(format!(
+                "ACP readiness is unknown and this result is not launchable: {error:#}"
+            ));
+            return unlaunchable(result);
+        }
     }
     AvailabilityWithExecutable {
         availability: result,

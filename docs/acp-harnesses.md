@@ -4,6 +4,13 @@
 13 harnesses. `agent_ids()`, `spec(id)`, `run(id, request, handler, cancel)` and
 `open_session(id, request)` are available to callers. Topic outlines and attempt
 inputs validate `HarnessKind::Acp` selectors against this registry.
+Cursor, Cline, Junie, and Auggie are registered but unavailable for execution
+because Formless has not integrated supported sign-in readiness checks for them.
+Devin is also unavailable: its SSO documentation shows `devin auth status`, but
+does not establish a universal output or exit-status contract, and Formless does
+not integrate that command. The IDs remain selectable, but selecting one does
+not make it executable; signing in alone does not unblock these profiles. Use a
+supported profile or request a user-approved substitute.
 `local_harness::run(request, interaction_handler, cancel)` dispatches ACP and
 Antigravity sessions through the core interaction handler; Antigravity retains
 its own spec. Core topic steps dispatch registered ACP profiles when
@@ -28,6 +35,25 @@ Install each vendor's CLI separately and put its executable on PATH, or supply
 or passes credentials in argv. Sign in using the vendor CLI or configure its
 environment outside Formless. Agent names and ACP v1 are checked, without minimum
 version requirements; Cursor does not report agentInfo and is protocol-checked only.
+Readiness sends `initialize` and `session/new` and records advertised
+`authMethods` IDs for diagnostics; it does not send ACP `authenticate` or launch
+a terminal-login helper. Advertised methods alone do not make a profile
+unready: profiles whose session creation requires authentication can use a
+successful session response as sign-in evidence. Cursor, Cline, Junie, Auggie,
+and Devin remain unavailable for execution because Formless has not integrated
+supported sign-in readiness checks for them; a successful session open is not
+proof of model authentication. Signing in
+alone does not unblock them. Auth-required failures report signed-in false,
+the profile sign-in hint, and advertised method IDs; other errors, empty
+sessions, and timeouts remain unknown and not launchable. The
+[ACP v1 authentication flow](https://agentclientprotocol.com/protocol/v1/authentication)
+defines agent-managed and terminal authentication. Cursor's [ACP guide](https://cursor.com/docs/cli/acp)
+describes `authenticate` with `cursor_login` and pre-authentication via `agent login`
+or API-key/token configuration; Cline's [ACP guide](https://docs.cline.bot/usage/acp)
+says ACP clients can prompt for sign-in when a session starts and reuse credentials
+saved by `cline auth`. Formless does not implement these authentication flows,
+so readiness does not verify signed-in model execution. No authenticated model
+turn is verified.
 
 ## Commands, access, and live evidence
 
@@ -45,17 +71,17 @@ the successful 13-agent check.
 |---|---|---|---|---|
 | gemini | `gemini --acp` | Run `gemini` to sign in with Google, or set `GEMINI_API_KEY` | Help-documented `--approval-mode plan`; try ACP `plan`, otherwise permission filter | 0.70.0 |
 | copilot | `copilot --acp --stdio` | `copilot login` | Help-documented `--plan`; try ACP `plan`, otherwise permission filter | 1.0.114 |
-| cursor | `cursor-agent acp` | `cursor-agent login` or `CURSOR_AUTH_TOKEN` | Help-documented `--mode plan`; try ACP `plan`, then `ask`, otherwise permission filter | 2026.11.19-f005e9d |
+| cursor (unavailable for execution) | `cursor-agent acp` | `cursor-agent login` or `CURSOR_AUTH_TOKEN` | Help-documented `--mode plan`; try ACP `plan`, then `ask`, otherwise permission filter | 2026.11.19-f005e9d |
 | droid | `droid exec --output-format acp` | Run `droid` to sign in, or set `FACTORY_API_KEY` | No extra flags/mode; permission filter. Exec help describes read-only by default; ACP enforcement not live-tested | 1.17.1 |
 | kiro | `kiro-cli acp` | `kiro-cli login` or `KIRO_API_KEY` | No documented read-only flag/mode in captured help; permission filter | 3.5.0 |
-| junie | `junie --acp=true` | Run `junie` and sign in with Junie Account in browser | Select `plan` in the actual `mode` option; fail closed if unavailable/refused | npm 3110.7.0; agent 26.9.7 (3110.7) |
+| junie (unavailable for execution) | `junie --acp=true` | Run `junie` and sign in with Junie Account in browser | Select `plan` in the actual `mode` option; fail closed if unavailable/refused | npm 3110.7.0; agent 26.9.7 (3110.7) |
 | qwen | `qwen --acp` | Run `qwen`, use `/auth` or configure model/`OPENAI_API_KEY` | Help-documented `--approval-mode plan`; try ACP `plan`, otherwise permission filter | 0.28.3 |
 | kimi | `kimi acp` | `kimi login` | Try ACP `plan`, otherwise permission filter; no extra argv (`acp --plan` is rejected) | Kimi Code CLI 2.7.2 |
 | vibe | `vibe-acp` | Run `vibe` to sign in through Mistral AI Studio, or set `MISTRAL_API_KEY` | No read-only flag/mode in captured help; permission filter | 3.1.4 |
-| auggie | `auggie --acp` | `auggie auth login` | No built-in read-only mode verified; permission filter (extension-specific `--plan` is not assumed) | 1.2.2 |
+| auggie (unavailable for execution) | `auggie --acp` | `auggie auth login` | No built-in read-only mode verified; permission filter (extension-specific `--plan` is not assumed) | 1.2.2 |
 | goose | `goose acp` | `goose configure`; configure `GOOSE_PROVIDER`, model and provider credentials | No read-only flag/mode in captured help; permission filter | 1.60.2 |
-| cline | `cline --acp` | `cline auth` | Help-documented `--plan`; try ACP `plan`, otherwise permission filter | 3.0.75 |
-| devin | `devin acp` | `devin auth login` | Select ACP `plan`, then `ask`; fail closed if unavailable/refused | 3000.14.30821 |
+| cline (unavailable for execution) | `cline --acp` | `cline auth` | Help-documented `--plan`; try ACP `plan`, otherwise permission filter | 3.0.75 |
+| devin (unavailable for execution) | `devin acp` | `devin auth login` | Select ACP `plan`, then `ask`; fail closed if unavailable/refused | 3000.14.30821 |
 
 Review-only argv is appended to the launch command shown. No auto-approve,
 yolo, trust-all, or bypass flag is passed. The shared review permission filter

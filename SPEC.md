@@ -7330,8 +7330,13 @@ a model or harness automatically. SetTopicLimits itself changes limits only.
 ListHarnesses refreshes all seven kinds concurrently, expanding ACP into one
 entry per ACP registry id with acp_agent set. Every probe is capped at
 10s overall (ProbeContext defaults to 10s); a timeout reports unknown auth with
-detail "probe timed out". A harness is ready iff installed and signed_in is
-not Some(false): unknown auth is ready. Planning receives fresh availability,
+detail "probe timed out". Legacy non-ACP readiness requires installed and
+signed_in is not Some(false). ACP requires signed_in=true and a resolved
+executable; unknown ACP authentication is unavailable. Cursor, Cline, Junie,
+Auggie, and Devin remain unavailable because Formless has not integrated a
+supported non-model sign-in readiness check for them, even if session/new
+succeeds. Signing in alone does not
+unblock them. Planning receives fresh availability,
 and each step refreshes its selected harness before launching. Claude uses
 --version and auth status; Codex uses --version and login status. Muse Code
 checks its version before using usage --json and only confirms sign-in when
@@ -7365,8 +7370,7 @@ on Unix, without rereading PATH or the ACP override and without executing the
 symlink path. Workspace-local PATH entries therefore cannot substitute a
 different ACP executable. If preparation does not produce an executable
 identity, the step stops before attempt launch with the existing
-retry/substitute guidance. Unknown authentication retains the existing ready
-behavior (`installed && signed_in != Some(false)`). If the selected path
+retry/substitute guidance. Unknown ACP authentication is unavailable. If the selected path
 disappears before spawn, launch fails without a PATH fallback. Resolution is
 fresh after each retry or approved substitute; this pins path selection, not
 executable contents.
