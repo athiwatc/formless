@@ -136,6 +136,19 @@ fn emoji_search_does_not_match_messages_by_variation_selector_alone() {
 }
 
 #[test]
+fn warning_search_ignores_leading_orphan_variation_selector() {
+    let store = Store::open_in_memory().unwrap();
+    let session = store.create_session(Some("warning search".into())).unwrap();
+    let warning = store
+        .append_message(&session.id, "user", "⚠️Warning")
+        .unwrap();
+
+    let hits = store.search_sessions("⚠️Warning", 20).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].message_id, warning.id);
+}
+
+#[test]
 fn thai_search_does_not_end_before_a_combining_tone_mark() {
     let store = Store::open_in_memory().unwrap();
     let session = store.create_session(Some("Thai search".into())).unwrap();
