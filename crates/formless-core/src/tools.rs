@@ -129,8 +129,14 @@ pub fn compile_schema(schema: &Value) -> Result<jsonschema::Validator> {
 }
 
 pub fn validate_object_input_schema(schema: &Value) -> Result<()> {
+    let ref_siblings_apply = draft_ref_siblings_apply(schema, true);
     if schema.is_object()
-        && schema_can_describe_object(schema, schema, &mut std::collections::HashSet::new())
+        && schema_can_describe_object(
+            schema,
+            schema,
+            ref_siblings_apply,
+            &mut std::collections::HashSet::new(),
+        )
     {
         Ok(())
     } else {
@@ -138,11 +144,28 @@ pub fn validate_object_input_schema(schema: &Value) -> Result<()> {
     }
 }
 
+fn draft_ref_siblings_apply(schema: &Value, inherited: bool) -> bool {
+    let Some(draft) = schema.get("$schema").and_then(Value::as_str) else {
+        return inherited;
+    };
+    let draft = draft.to_ascii_lowercase();
+    !["draft-03", "draft-04", "draft-06", "draft-07"]
+        .iter()
+        .any(|older_draft| draft.contains(older_draft))
+}
+
 fn schema_can_describe_object(
-    root: &Value,
+    resource_root: &Value,
     schema: &Value,
-    active_refs: &mut std::collections::HashSet<String>,
+    ref_siblings_apply: bool,
+    active_refs: &mut std::collections::HashSet<(usize, usize)>,
 ) -> bool {
+    let (resource_root, ref_siblings_apply) = if schema.get("$id").and_then(Value::as_str).is_some()
+    {
+        (schema, draft_ref_siblings_apply(schema, ref_siblings_apply))
+    } else {
+        (resource_root, ref_siblings_apply)
+    };
     let schema = match schema {
         Value::Bool(allowed) => return *allowed,
         Value::Object(schema) => schema,
@@ -151,26 +174,38 @@ fn schema_can_describe_object(
 
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let target = if reference == "#" {
-            Some(root)
+            Some(resource_root)
         } else if let Some(fragment) = reference.strip_prefix('#') {
             let Some(pointer) = decode_uri_fragment(fragment) else {
                 return false;
             };
             pointer
                 .starts_with('/')
-                .then(|| root.pointer(&pointer))
+                .then(|| resource_root.pointer(&pointer))
                 .flatten()
         } else {
             None
         };
         if let Some(target) = target {
-            if active_refs.insert(reference.to_string()) {
-                let allows_objects = schema_can_describe_object(root, target, active_refs);
-                active_refs.remove(reference);
+            let key = (
+                resource_root as *const Value as usize,
+                target as *const Value as usize,
+            );
+            if active_refs.insert(key) {
+                let allows_objects = schema_can_describe_object(
+                    resource_root,
+                    target,
+                    ref_siblings_apply,
+                    active_refs,
+                );
+                active_refs.remove(&key);
                 if !allows_objects {
                     return false;
                 }
             }
+        }
+        if !ref_siblings_apply {
+            return true;
         }
     }
 
@@ -217,10 +252,9 @@ fn schema_can_describe_object(
             {
                 return false;
             }
-            if !branches
-                .iter()
-                .any(|branch| schema_can_describe_object(root, branch, active_refs))
-            {
+            if !branches.iter().any(|branch| {
+                schema_can_describe_object(resource_root, branch, ref_siblings_apply, active_refs)
+            }) {
                 return false;
             }
         }
@@ -229,10 +263,9 @@ fn schema_can_describe_object(
         let Some(branches) = branches.as_array() else {
             return false;
         };
-        if branches
-            .iter()
-            .any(|branch| !schema_can_describe_object(root, branch, active_refs))
-        {
+        if branches.iter().any(|branch| {
+            !schema_can_describe_object(resource_root, branch, ref_siblings_apply, active_refs)
+        }) {
             return false;
         }
     }
@@ -1749,6 +1782,46 @@ mod tests {
             assert!(error.contains("input_schema"), "{error}");
             assert!(error.contains("provider function parameters"), "{error}");
         }
+    }
+
+    #[test]
+    fn object_input_schema_resolves_local_refs_within_nested_id_resources() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "$defs": {
+                "leaf": {"type": "string"},
+                "nested": {
+                    "$id": "https://example.test/nested.json",
+                    "type": "object",
+                    "$defs": {"leaf": {"type": "object"}},
+                    "allOf": [{"$ref": "#/$defs/leaf"}]
+                }
+            },
+            "allOf": [{"$ref": "#/$defs/nested"}]
+        });
+        compile_schema(&schema).unwrap();
+        validate_object_input_schema(&schema).unwrap();
+    }
+
+    #[test]
+    fn draft_7_ref_siblings_do_not_constrain_object_inputs() {
+        let legacy = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "$defs": {"object": {"type": "object"}},
+            "$ref": "#/$defs/object",
+            "not": {"type": "object"}
+        });
+        compile_schema(&legacy).unwrap();
+        validate_object_input_schema(&legacy).unwrap();
+
+        let current = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": {"object": {"type": "object"}},
+            "$ref": "#/$defs/object",
+            "not": {"type": "object"}
+        });
+        assert!(validate_object_input_schema(&current).is_err());
     }
 
     #[test]
