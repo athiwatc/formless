@@ -6,7 +6,7 @@ live download or a native Windows acceptance run. It defines a Windows x64
 sibling `.zip.sha256`. Choose an actually available matching ZIP and checksum
 from [Releases](https://github.com/athiwatc/formless/releases). Do not infer
 that an asset exists from its expected name. Other architectures need a
-matching supported release or the [source-build route](../README.md#32-install).
+matching supported release or the [source-build route](usage.md#install).
 
 The ZIP contains a nested directory with the same base name, containing
 `formless.exe`, `README.md`, `SPEC.md` and `LICENSE`. The checksum file contains
@@ -102,7 +102,7 @@ No administrator or machine-wide PATH change is needed.
 binary. For a manual update, choose a newer actually available matching release
 and repeat checksum verification and extraction into a new directory. Close
 clients and stop the relevant running daemon instances before replacing the
-installed executable or switching the selected PATH entry. See the existing [daemon controls](../README.md#36-daemon-diagnostics-and-reset).
+installed executable or switching the selected PATH entry. See the existing [daemon controls](usage.md#daemon-diagnostics-and-reset).
 Use the same `--profile NAME` when managing an instance belonging to a named profile.
 
 If PATH points to a version-specific directory, replace only that old entry

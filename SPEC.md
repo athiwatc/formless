@@ -55,6 +55,12 @@ without redesign.
 
 - One Daemon Core per data dir (single instance, enforced by lock; §9.4).
   Optional `--profile <name>` runs an additional isolated daemon + data dir.
+- Local Pi harness runs stage their extension in an attempt-private directory.
+  `FORMLESS_PI_MCP_CONFIG` carries per-attempt MCP command metadata and
+  allow-listed environment-variable names; values of those named variables
+  remain in the child environment and are not serialized into this value.
+  `FORMLESS_TOPIC_CAPABILITY` is the per-attempt MCP capability token; it is
+  passed through the selected child environment, never command arguments.
 - Clients: TUI (v1 UI), CLI (§12), and any future frontend. Clients are thin:
   they render streamed events and send intents; they hold no authoritative
   state and can disconnect/reattach without losing work (daemon persists all
@@ -2157,7 +2163,7 @@ pattern (§4.4).
   unique-local,
   multicast, unspecified, reserved (`240/4`), benchmarking, documentation,
   Teredo and discard addresses. The registry-entry test table
-  [`special_purpose_registry_addresses_are_not_public`](crates/formless-runtime/src/lib.rs)
+  [`special_purpose_registry_addresses_are_not_public`](https://github.com/athiwatc/formless/blob/main/crates/formless-runtime/src/lib.rs)
   covers the blocked special-purpose families,
   including IPv6 `fec0::/10`, `2001:2::/48` and `3fff::/20`.
   IPv6 forms that carry an IPv4 address
@@ -6336,11 +6342,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   reporting.
 - **Network activity.** Examples include configured provider calls for
   Sessions, optimisation and Compaction, connections to a
-  [user-enabled Relay](README.md#37-browser-access-via-the-relay-v2) and
+  [user-enabled Relay](docs/usage.md#browser-access-via-the-relay-v2) and
   explicit commands such as `formless update check`. Optimiser paths redact
   secrets (§8.3). In builds with embedded model support, naming an untitled
   or provisionally named Session with suitable user text can download weights
-  or a tokenizer when the selected [catalogue model](README.md#local-naming-models)
+  or a tokenizer when the selected [catalogue model](docs/architecture.md#local-naming-models)
   needs them. Automatic naming and downloads are enabled by default. Set
   `naming.auto_download = false` to disable automatic downloads or
   `naming.enabled = false` to disable automatic naming.
@@ -7097,10 +7103,10 @@ Each attempt has a private staging directory, including Git attempts.
 Directory/Scratch steps use private directories with copied read-only file
 inputs. File/text outputs are reported through scoped MCP. A failed step is
 returned to the model without automatically failing the feature; it can choose
-another harness. Antigravity, named ACP profiles, Muse Code, and OpenCode use
-integrated interactive adapters. ACP requires a valid acp_agent; OpenCode uses
-its ACP adapter; Muse Code requires one-run workspace trust from the user. Pi
-currently returns an actionable adapter-not-integrated step result.
+another harness. Pi uses its integrated RPC adapter; Antigravity, named ACP
+profiles and OpenCode use their ACP adapters. Muse Code uses its interactive
+session protocol and requires one-run workspace trust from the user. ACP
+requires a valid acp_agent.
 
 CancelTopic interrupts the Topic Chat Run and kills live CLI process groups
 on Unix (the direct child on Windows). The last launch check is serialized
@@ -7110,8 +7116,9 @@ topics become NeedsUser, with durable detail and no automatic restart.
 The private stdio bridge is `formless --profile <profile> topic-mcp --attempt <id>`.
 It receives `FORMLESS_TOPIC_CAPABILITY` only through the environment. Daemon
 CLI overrides `FORMLESS_TOPIC_CLAUDE_EXE`, `FORMLESS_TOPIC_CODEX_EXE`,
-`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
-`FORMLESS_TOPIC_MCP_EXE` must be absolute paths. Harnesses also receive the
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`, `FORMLESS_TOPIC_PI_EXE`,
+`FORMLESS_TOPIC_MUSE_EXE`, and `FORMLESS_TOPIC_MCP_EXE` must be absolute
+paths. Harnesses also receive the
 profile's `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR`,
 `FORMLESS_TOPIC_ATTEMPT_ID` and `FORMLESS_TOPIC_OUTPUTS_DIR`. Capabilities
 must never be included in prompts, argv or transcripts. The bridge exposes
@@ -7124,10 +7131,17 @@ OpenCode readiness uses `FORMLESS_TOPIC_OPENCODE_EXE`, or resolves `opencode`
 from PATH when unset. Its private-cwd probe runs only `--version`; sign-in stays
 unknown because credential-list commands can write state and access the network.
 OpenCode can still use its free default model without credentials.
+
+The Pi adapter's availability probe accepts an absolute `FORMLESS_TOPIC_PI_EXE`
+override before searching absolute PATH directories for `pi`; it skips relative
+or empty PATH entries and does not fall back to a bare `pi`. It only runs
+`--version`; sign-in remains unknown because Pi has no read-only, any-provider
+CLI auth probe. It does not write Pi configuration or isolate the user's agent
+directory.
+
 Developer-only live-test controls are `FORMLESS_AGY_BIN`,
 `FORMLESS_LIVE_AGY`, `FORMLESS_OPENCODE_BIN` and
 `FORMLESS_OPENCODE_SMOKE_DIR`; they do not configure runtime harness behavior.
-
 Claude ReadOnly uses plan permission mode and Read/Glob/Grep tools; Codex uses
 its read-only sandbox. On every harness the isolated worktree/private outputs
 directory is the real boundary. Pi ReadOnly is tool-restricted (`--tools`
@@ -7292,14 +7306,19 @@ checks its version before using usage --json and only confirms sign-in when
 it receives a Meta account allowance. These probes do not send model turns
 or copy raw auth output into detail or logs.
 
-CLI executable overrides are absolute `FORMLESS_TOPIC_<KIND>_EXE` paths;
-otherwise each kind resolves its command from PATH. This includes
-`FORMLESS_TOPIC_OPENCODE_EXE`, `FORMLESS_TOPIC_PI_EXE`, and
-`FORMLESS_TOPIC_MUSE_EXE`. Pi uses a bounded private-cwd version-only probe.
-OpenCode uses a bounded `--version` probe, requires V2 >= 2.3.2, and leaves
-credential status unknown because checking auth initializes providers and makes
-network requests. Muse Code checks its version before `usage --json` and
-confirms sign-in only when it receives a Meta account allowance.
+Readiness resolves absolute `FORMLESS_TOPIC_<KIND>_EXE` overrides or each
+kind's command on PATH. This includes `FORMLESS_TOPIC_OPENCODE_EXE`,
+`FORMLESS_TOPIC_PI_EXE`, `FORMLESS_TOPIC_MUSE_EXE`, and
+`FORMLESS_TOPIC_ANTIGRAVITY_EXE`. Pi has adapter-specific availability and an
+attempt-private RPC runner. OpenCode has a bounded `--version` probe in a
+private cwd with kill-on-drop and process-group cleanup; it requires V2 >= 2.3.2
+and leaves credential status unknown because checking auth initializes
+providers and makes network requests. Muse Code checks its version before
+`usage --json` and only confirms sign-in when it receives a Meta account
+allowance. Antigravity uses a bounded adapter-specific probe: ACP initialization
+checks installation/version and `agy models` checks existing sign-in. Topic
+steps carry the selected Antigravity executable identity from readiness through
+launch and fail closed if it is unavailable.
 
 ACP applies `FORMLESS_TOPIC_ACP_EXE` to each named-agent preparation; otherwise
 the agent's command is resolved from the daemon's PATH. Readiness canonicalizes
