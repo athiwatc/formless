@@ -6739,9 +6739,13 @@ override and does not authenticate or send prompts.
 
 The existing ignored Antigravity bridge test uses `FORMLESS_LIVE_AGY=1` as its
 opt-in gate and optional `FORMLESS_AGY_BIN` as its executable override.
-`FORMLESS_TOPIC_CAPABILITY` is the private bridge capability used in local-harness
-fixtures (including that live test); it is scoped to the MCP child, not agent argv
-or the agent process environment.
+`FORMLESS_TOPIC_CAPABILITY` is the per-attempt bearer capability for the private
+MCP bridge. Pi topic runs include it in the Pi RPC process environment and
+forward it to the MCP child through the extension's allow-listed `envVars`; it
+is not placed in argv, prompts, or transcripts. Pi and descendants inheriting
+the environment can access it. The Pi process also inherits the daemon's
+ambient environment, so native credentials already present there are not
+isolated from the harness.
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
