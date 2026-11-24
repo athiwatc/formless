@@ -1126,6 +1126,69 @@ test('legacy send preparation never saves a textarea after Session or pairing ch
   }
 });
 
+test('deferred enqueue clears only the unchanged source draft after a Session switch', async () => {
+  for (const [unpersistedDraft, newerSourceDraft] of [[false, false], [false, true], [true, false], [true, true]]) {
+    const enqueueStarted = deferred(), enqueueGate = deferred();
+    const prefs = memoryPrefs();
+    if (unpersistedDraft) {
+      const set = prefs.set.bind(prefs), remove = prefs.remove.bind(prefs);
+      prefs.set = (key, value) => key.startsWith('draft:') ? false : set(key, value);
+      prefs.remove = key => key.startsWith('draft:') ? false : remove(key);
+    }
+    const c = setup(['submit'], {
+      prefs,
+      crypto: { randomUUID: () => newerSourceDraft ? 'newer-source-draft' : 'unchanged-source-draft' },
+      askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [], renderOutbox() {},
+    });
+    c.S.settings = { limits: {} };
+    c.$('input').value = 'submitted source draft';
+    c.saveDraft('A', 'submitted source draft');
+    const enqueue = c.enqueueOutbox;
+    c.enqueueOutbox = async (...args) => {
+      enqueueStarted.resolve();
+      await enqueueGate.promise;
+      return enqueue(...args);
+    };
+    const submitting = c.submit(false);
+    await enqueueStarted.promise;
+    c.saveDraft('A', c.$('input').value);
+    c.S.current = 'B';
+    c.$('input').value = 'draft for Session B';
+    c.saveDraft('B', 'draft for Session B');
+    if (newerSourceDraft) c.saveDraft('A', 'newer source draft');
+    c.S.daemonOnline = false;
+    c.S.channel = null;
+    enqueueGate.resolve();
+    await submitting;
+    assert.equal(c.S.current, 'B');
+    assert.equal(c.$('input').value, 'draft for Session B');
+    assert.equal(c.loadDraft('test-room', 'A'), newerSourceDraft ? 'newer source draft' : '');
+    assert.equal(c.loadDraft('test-room', 'B'), 'draft for Session B');
+    if (unpersistedDraft) assert.equal(c.S.unpersistedDrafts.get(c.sessionCacheKey('test-room', 'A')), newerSourceDraft ? 'newer source draft' : '');
+  }
+});
+
+test('outbox submission explains that unsupported Web Locks fail closed', async () => {
+  const notes = [], calls = [];
+  const c = setup(['submit'], {
+    navigator: {}, pingFeatures: ['durable_outbox_v1'],
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn: () => [],
+    note: message => notes.push(message),
+    request: async request => {
+      calls.push(request);
+      return request.type === 'list_pending_attachments' ? { attachments: [] } : {};
+    },
+  });
+  c.S.settings = { limits: {} };
+  c.$('input').value = 'message remains available';
+  await c.submit(false);
+  assert.match(notes.at(-1), /Web Locks API/);
+  assert.match(notes.at(-1), /secure context/);
+  assert.match(notes.at(-1), /message remains in the composer/);
+  assert.equal(c.$('input').value, 'message remains available');
+  assert.equal(calls.some(request => request.type === 'send_message' || request.type === 'send_outbox_message'), false);
+});
+
 test('cross-tab outbox flushes serialize and draft keys do not clobber each other', async () => {
   const prefs = memoryPrefs(), locks = testLocks(), calls = [], gate = deferred(); let nextId = 0;
   const extra = { prefs, navigator: { locks }, renderOutbox() {}, crypto: { randomUUID: () => 'tab-' + (++nextId) } };

@@ -9063,7 +9063,8 @@
   async function submit(queued) {
     if (currentTopicAttempt()) return;
     const input = $("input");
-    const text = input.value.trim();
+    const draftSnapshot = input.value;
+    const text = draftSnapshot.trim();
     if (!text) return;
     if (text.startsWith("/") && !S.editMessageId) {
       input.value = "";
@@ -9254,12 +9255,25 @@
         storageScope: scope,
       });
       if (!item) {
-        note("Could not save this message to the outbox; it is still in the composer.", true);
+        note(hasOutboxLock()
+          ? "Could not save this message to the outbox; it is still in the composer."
+          : "This browser cannot safely save messages because the Web Locks API is unavailable. Open this page in a current browser in a secure context (HTTPS or localhost); the message remains in the composer.", true);
         return;
       }
-      if (S.current === sid && scope === S.storageScope) {
-        if (input.value.trim() === text) { input.value = ""; saveCurrentDraft(""); autosize(); }
-        else saveCurrentDraft(input.value);
+      const sourceIsCurrent = S.current === sid && scope === S.storageScope;
+      const fallbackKey = sessionCacheKey(scope, sid);
+      const hasFallbackDraft = S.unpersistedDrafts && S.unpersistedDrafts.has(fallbackKey);
+      const savedDraft = prefs.get(draftStorageKey(scope, sid), null);
+      const hasSavedDraft = hasFallbackDraft || typeof savedDraft === "string";
+      const latestSourceDraft = loadDraft(scope, sid);
+      if (sourceIsCurrent && input.value !== draftSnapshot && (latestSourceDraft === draftSnapshot || !hasSavedDraft)) {
+        saveCurrentDraft(input.value);
+      }
+      const sourceDraftStillSubmitted = (latestSourceDraft === draftSnapshot && (!sourceIsCurrent || input.value === draftSnapshot))
+        || (!hasSavedDraft && sourceIsCurrent && input.value === draftSnapshot);
+      if (sourceDraftStillSubmitted) {
+        saveDraft(sid, "", scope);
+        if (sourceIsCurrent && input.value === draftSnapshot) { input.value = ""; autosize(); }
       }
       if (item.status === "failed") { note(item.error, true); return; }
       return scope === S.storageScope ? flushOutbox() : undefined;
